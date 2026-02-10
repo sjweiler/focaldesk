@@ -1,0 +1,9 @@
+[package]
+name = "flowos-ui"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay.workspace = true
+serde.workspace = true
+tracing.workspace = true

@@ -1,0 +1,114 @@
+########################################
+# Rust / Cargo
+########################################
+target/
+**/target/
+Cargo.lock
+
+########################################
+# Build artifacts (non-Rust)
+########################################
+build/
+out/
+dist/
+*.o
+*.a
+*.so
+*.so.*
+*.rlib
+*.d
+*.tmp
+
+########################################
+# Wayland / graphics / compositor
+########################################
+wayland-protocols/
+protocols/wayland/generated/
+*.wlr
+*.drm
+*.gbm
+*.mesa
+
+########################################
+# Logs, dumps, runtime artifacts
+########################################
+*.log
+*.trace
+*.pid
+*.core
+core.*
+.coredump/
+perf.data*
+vgcore.*
+
+########################################
+# Editor / IDE
+########################################
+.vscode/
+.idea/
+*.swp
+*.swo
+*.bak
+*.orig
+*~
+
+########################################
+# OS / filesystem noise
+########################################
+.DS_Store
+Thumbs.db
+.nfs*
+.directory
+
+########################################
+# Debug / profiling
+########################################
+gdb.txt
+lldb.txt
+heaptrack.*
+callgrind.out.*
+cachegrind.out.*
+
+########################################
+# Environment / local config
+########################################
+.env
+.env.*
+config.local.*
+settings.local.*
+
+########################################
+# Containers / tooling
+########################################
+.docker/
+docker-compose.override.yml
+podman-compose.override.yml
+
+########################################
+# Documentation outputs
+########################################
+docs/_build/
+docs/site/
+*.pdf
+
+########################################
+# Temporary experiments
+########################################
+tmp/
+scratch/
+experiments/**/target/
+experiments/**/build/
+
+########################################
+# Coverage / testing
+########################################
+coverage/
+*.gcda
+*.gcno
+*.gcov
+
+########################################
+# CI / automation leftovers
+########################################
+.artifacts/
+.cache/
