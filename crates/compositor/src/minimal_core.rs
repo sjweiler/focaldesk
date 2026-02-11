@@ -1,3 +1,7 @@
+use smithay::backend::input::KeyState;
+use smithay::input::keyboard::keysyms::KEY_q;
+use flow::{FlowEvent, FlowState, FlowAction};
+use wayland_server::Resource;
 use std::sync::Arc;
 
 use smithay::reexports::winit;
@@ -64,6 +68,10 @@ impl XdgShellHandler for App {
             state.states.set(xdg_toplevel::State::Activated);
         });
         surface.send_configure();
+        
+        let wl = surface.wl_surface();
+        let wid = wl.id().protocol_id() as u64;
+        self.flow.handle(FlowEvent::WindowMapped { id: wid });  
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
@@ -124,6 +132,7 @@ impl SeatHandler for App {
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
 }
 
+
 struct App {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -132,6 +141,8 @@ struct App {
     data_device_state: DataDeviceState,
 
     seat: Seat<Self>,
+    
+    flow: FlowState,
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -153,6 +164,10 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
     let mut seat_state = SeatState::new();
     let seat = seat_state.new_wl_seat(&dh, "winit");
 
+    use std::cell::Cell;
+
+    let running = Cell::new(true);
+
     let mut state = {
         App {
             compositor_state,
@@ -161,6 +176,8 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
             seat_state,
             data_device_state: DataDeviceState::new::<App>(&dh),
             seat,
+            
+            flow: FlowState::new(),
         }
     };
 
@@ -173,42 +190,73 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
 
     let keyboard = state.seat.add_keyboard(Default::default(), 200, 200).unwrap();
 
-    std::env::set_var("WAYLAND_DISPLAY", "wayland-5");
-    std::process::Command::new("weston-terminal").spawn().ok();
+    //std::env::set_var("WAYLAND_DISPLAY", "wayland-5");
+    //std::process::Command::new("weston-terminal").spawn().ok();
 
-    loop {
-        let status = winit.dispatch_new_events(|event| match event {
-            WinitEvent::Resized { .. } => {}
-            WinitEvent::Input(event) => match event {
-                InputEvent::Keyboard { event } => {
-                    keyboard.input::<(), _>(
-                        &mut state,
-                        event.key_code(),
-                        event.state(),
-                        0.into(),
-                        0,
-                        |_, _, _| {
-                            //
-                            FilterResult::Forward
-                        },
-                    );
+    while running.get() {
+    let status = winit.dispatch_new_events(|event| {
+    match event {
+        WinitEvent::CloseRequested => {
+            running.set(false);
+        }
+
+        WinitEvent::Resized { .. } => {}
+
+        WinitEvent::Input(event) => match event {
+            InputEvent::Keyboard { event } => {
+                let keycode = event.key_code();
+                let keystate = event.state();
+                keyboard.input::<(), _>(
+                    &mut state,
+                    keycode,
+                    keystate,
+                    0.into(),
+                    0,
+                    |state, modifiers, keysym| {
+                        let mod_down = modifiers.logo;
+
+                        // IMPORTANT: keysym is a KeysymHandle in your build, so compare via raw/keysym accessor
+                        
+                        if mod_down && keystate == KeyState::Pressed && u32::from(keycode) == 24 {
+                            match state.flow.handle(FlowEvent::Key { combo: "Mod+Q".into() }) {
+                                FlowAction::Quit => running.set(false),
+                                _ => {}
+                            }
+                            return FilterResult::Intercept(());
+                        }
+
+                        FilterResult::Forward
+                    },
+                );
+            }
+
+            InputEvent::PointerMotionAbsolute { .. } => {
+                if let Some(toplevel) = state.xdg_shell_state.toplevel_surfaces().iter().next().cloned() {
+                    let surface = toplevel.wl_surface().clone();
+                    let wid = surface.id().protocol_id() as u64;
+
+                    keyboard.set_focus(&mut state, Some(surface), 0.into());
+                    state.flow.handle(FlowEvent::FocusChanged { id: Some(wid) });
                 }
-                InputEvent::PointerMotionAbsolute { .. } => {
-                    if let Some(surface) = state.xdg_shell_state.toplevel_surfaces().iter().next().cloned() {
-                        let surface = surface.wl_surface().clone();
-                        keyboard.set_focus(&mut state, Some(surface), 0.into());
-                    };
-                }
-                _ => {}
-            },
-            _ => (),
-        });
+            }
+
+            _ => {}
+        },
+
+        _ => {}
+    }
+});
+
 
         match status {
             PumpStatus::Continue => (),
             PumpStatus::Exit(_) => return Ok(()),
         };
-
+           
+        if !running.get() {
+             break;
+        }
+        
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
         {
@@ -259,6 +307,7 @@ pub fn run_winit() -> Result<(), Box<dyn std::error::Error>> {
         // swapping buffers because this operation may block.
         backend.submit(Some(&[damage])).unwrap();
     }
+    Ok(())
 }
 
 pub fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
