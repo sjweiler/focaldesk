@@ -7,22 +7,39 @@ on:
 jobs:
   rust:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
+      - name: Install Linux dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            pkg-config \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libudev-dev \
+            libinput-dev \
+            libegl1-mesa-dev \
+            libgles2-mesa-dev \
+            libgbm-dev \
+            libgtk-4-dev \
+            libadwaita-1-dev
+
       - name: Rustfmt
         run: cargo fmt --all -- --check
-        working-directory: compositor
+
+      - name: Cargo check
+        run: cargo check --workspace
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-        working-directory: compositor
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-features
-        working-directory: compositor
+        run: cargo test --workspace
