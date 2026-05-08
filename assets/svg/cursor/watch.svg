@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs>
+  <linearGradient id="tealGrad" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#A6C4C8"/><stop offset="55%" stop-color="#6E9198"/><stop offset="100%" stop-color="#355961"/>
+  </linearGradient>
+  <linearGradient id="creamGrad" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#FFF8EA"/><stop offset="100%" stop-color="#D6C8A8"/>
+  </linearGradient>
+  <linearGradient id="orangeGrad" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#F0A54A"/><stop offset="100%" stop-color="#C76A2A"/>
+  </linearGradient>
+  <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="1.7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  <style>
+    .outline { stroke:#EFE6CF; stroke-width:4; stroke-linejoin:round; stroke-linecap:round; }
+    .ink { stroke:#203746; stroke-width:2.2; stroke-linejoin:round; stroke-linecap:round; }
+    .thin { stroke:#EFE6CF; stroke-width:1.2; stroke-linejoin:round; stroke-linecap:round; opacity:.95; }
+    .panel { fill:url(#tealGrad); } .shell { fill:url(#creamGrad); } .amber { fill:url(#orangeGrad); }
+  </style>
+</defs>
+
+<g filter="url(#softGlow)">
+  <path d="M24 9 H40 L38 17 H26 Z" class="outline" fill="none"/>
+  <path d="M24 47 H40 L38 55 H26 Z" class="outline" fill="none"/>
+  <path d="M24 9 H40 L38 17 H26 Z" class="ink shell"/>
+  <path d="M24 47 H40 L38 55 H26 Z" class="ink shell"/>
+  <path d="M23 17 H41 Q43 17 42 20 L38 44 Q37.5 47 35 47 H29 Q26.5 47 26 44 L22 20 Q21 17 23 17 Z" class="outline" fill="none"/>
+  <path d="M23 17 H41 Q43 17 42 20 L38 44 Q37.5 47 35 47 H29 Q26.5 47 26 44 L22 20 Q21 17 23 17 Z" class="ink shell"/>
+</g>
+<path d="M26 21 H38 L32 30 Z" class="amber ink"/>
+<path d="M26 43 H38 L32 34 Z" class="amber ink"/>
+
+</svg>

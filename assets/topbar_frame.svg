@@ -1,0 +1,15 @@
+<svg width="3840" height="40" viewBox="0 0 3840 40" xmlns="http://www.w3.org/2000/svg">
+
+  <!-- outer highlight -->
+  <rect x="0" y="0" width="3840" height="40" fill="#7A8FA3"/>
+
+  <!-- outer shell -->
+  <rect x="1" y="1" width="3838" height="38" fill="#1B2430"/>
+
+  <!-- inner shell -->
+  <rect x="3" y="3" width="3834" height="34" fill="#0F1620"/>
+
+  <!-- inner highlight -->
+  <line x1="3" y1="3" x2="3837" y2="3" stroke="#2B3A4A" stroke-width="1"/>
+
+</svg>

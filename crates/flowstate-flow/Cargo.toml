@@ -1,0 +1,9 @@
+[package]
+name = "flowstate-flow"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay = { git = "https://github.com/Smithay/smithay", branch = "master", default-features = false }
+bitflags = "2"
+flowstate-types = { path = "../flowstate-types" }

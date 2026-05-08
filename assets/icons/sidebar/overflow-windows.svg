@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <!-- outer -->
+  <rect x="3.75" y="3.75" width="16.5" height="16.5" rx="4" stroke="currentColor" stroke-width="1.5"/>
+
+  <!-- stacked windows -->
+  <rect x="8.2" y="7.6" width="7.8" height="6.2" rx="1.6" stroke="currentColor" stroke-width="1.5"/>
+  <rect x="6.6" y="9.2" width="7.8" height="6.2" rx="1.6" stroke="currentColor" stroke-width="1.5"/>
+
+  <!-- overflow dots -->
+  <circle cx="16.9" cy="15.2" r="0.9" fill="currentColor"/>
+  <circle cx="16.9" cy="18.0" r="0.9" fill="currentColor"/>
+</svg>

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none">
+  <rect x="3.75" y="3.75" width="16.5" height="16.5" rx="4" stroke="currentColor" stroke-width="2.0"/>
+  <text x="12" y="12.6"
+        text-anchor="middle"
+        dominant-baseline="middle"
+        font-family="IBM Plex Sans"
+        font-weight="600"
+        font-size="11"
+        fill="currentColor">4</text>
+</svg>

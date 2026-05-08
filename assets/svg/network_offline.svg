@@ -1,0 +1,25 @@
+<svg width="48" height="48" viewBox="0 0 48 48" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .icon { fill: none; stroke: #9FB3C8; stroke-width: 2.25; stroke-linecap: round; stroke-linejoin: round; }
+      .accent { fill: none; stroke: #FF4D5A; stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
+    </style>
+  </defs>
+
+  <!-- antenna mast -->
+  <path class="icon" d="M24 27 L18 40 H30 Z"/>
+  <line class="icon" x1="24" y1="27" x2="24" y2="16"/>
+  <circle class="icon" cx="24" cy="13" r="2.5"/>
+
+  <!-- signal arcs -->
+  <path class="icon" d="M17 20 C14.5 17.5, 14.5 12.5, 17 10"/>
+  <path class="icon" d="M31 20 C33.5 17.5, 33.5 12.5, 31 10"/>
+
+  <path class="icon" d="M12.5 24 C8.5 19.5, 8.5 10.5, 12.5 6"/>
+  <path class="icon" d="M35.5 24 C39.5 19.5, 39.5 10.5, 35.5 6"/>
+
+  <!-- offline X badge -->
+  <circle cx="35.5" cy="34.5" r="6.5" fill="#0F1620" stroke="#FF4D5A" stroke-width="1.5"/>
+  <line class="accent" x1="32.5" y1="31.5" x2="38.5" y2="37.5"/>
+  <line class="accent" x1="38.5" y1="31.5" x2="32.5" y2="37.5"/>
+</svg>

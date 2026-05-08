@@ -1,0 +1,16 @@
+[package]
+name = "flowos-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay.workspace = true
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+swash.workspace = true
+fontdb.workspace = true
+usvg.workspace = true
+resvg.workspace = true
+chrono.workspace = true
+ab_glyph.workspace = true
+anyhow.workspace = true

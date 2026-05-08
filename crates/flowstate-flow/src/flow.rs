@@ -1,0 +1,54 @@
+use std::collections::HashMap;
+use flowstate_types::{WindowId, OutputId};
+
+/// Logical state of FlowOS.
+/// Owns window ordering, focus, slot assignments, and outputs.
+#[derive(Debug)]
+pub struct FlowState {
+
+    /// Slot assignments (slot index -> window)
+    slots: [Option<WindowId>; 9],
+
+    /// Outputs
+    outputs: HashMap<OutputId, OutputInfo>,
+}
+
+
+#[derive(Debug)]
+struct OutputInfo {
+    pub active: bool,
+}
+
+impl FlowState {
+    pub fn new() -> Self {
+        Self {
+            slots: [None; 9],
+            outputs: HashMap::new(),
+        }
+    }
+
+ 
+
+
+
+    /// Assign focused window to slot
+    pub fn assign_slot(&mut self, slot: usize, focused: WindowId) {
+        if slot >= self.slots.len() {
+            return;
+        }
+
+        self.slots[slot] = Some(focused);
+    }
+
+    /// Activate slot
+    pub fn activate_slot(&self, slot: usize) -> Option<WindowId> {
+        self.slots[slot]
+    }
+
+}
+
+impl Default for FlowState {
+    fn default() -> Self {
+        Self::new()
+    }
+}

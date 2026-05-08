@@ -1,19 +1,59 @@
 [workspace]
 members = [
-  "crates/compositor",
-  "crates/ui",
-  "crates/ai",
-  # add these if you want them in the workspace too:
-  "crates/shell",
-  "crates/ipc",
+
+    # library crates
+    "crates/flowstate-types",
+    "crates/flowstate-engine",
+    "crates/flowstate-flow",
+    "crates/flowstate-ai",
+    "crates/flowstate-memory",
+    "crates/flowstate-ipc",
+    "crates/flowstate-settings-core",
+    "crates/flowstate-automation",
+    "crates/flowstate-ui",
+    "crates/flowstate-network",
+    "crates/flowstate-logging",
+    "crates/flowstate-voice",
+    
+
+    # apps
+    "apps/flowstate-cli",
+    "apps/flowstate-desktop",
+    "apps/flowstate-settings",
+
+    # services
+    "services/flowstate-server", "crates/flowstate-types", "crates/flowstate-power", "crates/flowstate-audio", "crates/flowstate-bluetooth", "crates/flowstate-notifications", "crates/flowstate-resources", "crates/flowstate-cursor", "crates/flowstate-spawn", "crates/flowstate-config", "crates/flowstate-permissions", "apps/flowstate-portal", "apps/flowstate-settings", "crates/flowstate-themes", 
 ]
 resolver = "2"
 
 [workspace.dependencies]
-smithay = { git = "https://github.com/Smithay/smithay", default-features = false, branch="master" }
-calloop = "0.12"
+smithay = { git = "https://github.com/Smithay/smithay", default-features = false, branch = "master", features = [
+  "wayland_frontend",
+  "desktop",
+  "backend_winit",
+  "backend_drm",
+  "backend_gbm",
+  "backend_libinput",
+  "backend_udev",
+  "backend_session_libseat",
+  "renderer_gl"
+] }
 anyhow = "1"
+nix = "0.27"
+drm = "0.11"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 wayland-protocols = "0.32.10"
 serde = { version = "1.0", features = ["derive"] }
+cosmic-text = "0.11"
+swash = "0.1"
+fontdb = "0.16"
+usvg = "0.41"
+resvg = "0.41"
+tiny-skia = "0.11"
+chrono = "0.4"
+ab_glyph = "0.2"
+image = "0.25"
+glow = "0.16"
+
+

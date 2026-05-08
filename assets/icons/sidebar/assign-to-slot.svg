@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"
+viewBox="0 0 16 16" fill="none">
+
+  <!-- slot -->
+  <rect x="9.25" y="3.25" width="4.5" height="9.5" rx="1.5"
+        stroke="currentColor" stroke-width="1.5"/>
+
+  <!-- arrow -->
+  <path d="M2.25 8h6.5"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"/>
+
+  <path d="M6.75 5.75L9 8l-2.25 2.25"
+        stroke="currentColor"
+        stroke-width="1.5"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+</svg>

@@ -1,0 +1,9 @@
+pub mod compositor;
+pub mod shm;
+pub mod output;
+pub mod xdg_shell;
+pub mod xdg_activation;
+pub mod seat;
+pub mod data_device;
+pub mod client;
+pub mod portal_capture;

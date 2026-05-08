@@ -1,0 +1,28 @@
+[package]
+name = "flowstate-server"
+version = "0.1.0"
+edition = "2021"
+description = "FlowState background server and IPC daemon"
+license = "MIT"
+
+[[bin]]
+name = "flowstate-server"
+path = "src/main.rs"
+
+[dependencies]
+flowstate-ai = { path = "../../crates/flowstate-ai" }
+flowstate-memory = { path = "../../crates/flowstate-memory" }
+
+flowstate-engine = { path = "../../crates/flowstate-engine" }
+
+# Async runtime (server usually async)
+tokio = { version = "1", features = ["full"] }
+
+# Error handling and logging
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization for IPC
+serde = { workspace = true }
+serde_json = "1"
