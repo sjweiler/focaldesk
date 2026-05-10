@@ -44,7 +44,7 @@ use smithay::backend::renderer::gles::Uniform;
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
 use crate::core::chrome_shaders::ChromeShaders;
-use crate::core::chrome_layout::{scale_chrome_layout, ChromeLayout, ChromeLayoutPhysical};
+use crate::core::chrome_layout::{ChromeLayout, ChromeLayoutLogical};
 use flowstate_types::WorkspaceId;
 use crate::core::shell::ManagedWindow;
 use flowstate_ui::UiVisualStyle;
@@ -178,6 +178,14 @@ fn chrome_theme_from_flow_theme(
     legacy.top_bar.trim_color = chrome.trim_color;
 
     legacy
+}
+
+#[inline]
+fn to_physical_rect(
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+) -> Rectangle<i32, Physical> {
+    rect_logical.to_physical_precise_round(scale)
 }
 
 
@@ -364,7 +372,7 @@ fn draw_topbar_meta(
     &mut self,
     frame: &mut GlesFrame<'_, '_>,
     fonts: &FontSystem,
-    layout: &ChromeLayoutPhysical,
+    layout: &ChromeLayoutLogical,
     title: &str,
     output_number: u64,
     workspace_number: usize,
@@ -377,10 +385,10 @@ fn draw_topbar_meta(
     let style = style_for(FontRole::Meta, 18, builtin_id);
     let gap = theme.spacing.max(4);
 
-    let y = layout.title_rect.loc.y + 24;
+    let y_logical = layout.title_rect.loc.y + 24;
     // Same left inset as `draw_topbar_title`, then skip past measured title so meta never overlaps.
-    let title_left = layout.title_rect.loc.x + 14;
-    let mut x = title_left + fonts.advance_width(title, title_style) + gap;
+    let title_left_logical = layout.title_rect.loc.x + 14;
+    let mut x_logical = title_left_logical + fonts.advance_width(title, title_style) + gap;
 
     let output_s = output_number.to_string();
     let workspace_s = workspace_number.to_string();
@@ -389,47 +397,47 @@ fn draw_topbar_meta(
         frame,
         fonts,
         "OUT",
-        x,
-        y,
+        x_logical,
+        y_logical,
         style,
         theme.text.meta_label,
         scale,
     )?;
 
-    x += fonts.advance_width("OUT", style) + gap;
+    x_logical += fonts.advance_width("OUT", style) + gap;
 
     self.draw_text_cached(
         frame,
         fonts,
         &output_s,
-        x,
-        y,
+        x_logical,
+        y_logical,
         style,
         theme.text.meta_value,
         scale,
     )?;
 
-    x += fonts.advance_width(&output_s, style) + gap;
+    x_logical += fonts.advance_width(&output_s, style) + gap;
 
     self.draw_text_cached(
         frame,
         fonts,
         "WS",
-        x,
-        y,
+        x_logical,
+        y_logical,
         style,
         theme.text.meta_label,
         scale,
     )?;
 
-    x += fonts.advance_width("WS", style) + gap;
+    x_logical += fonts.advance_width("WS", style) + gap;
 
     self.draw_text_cached(
         frame,
         fonts,
         &workspace_s,
-        x,
-        y,
+        x_logical,
+        y_logical,
         style,
         theme.text.meta_value,
         scale,
@@ -442,7 +450,7 @@ fn draw_topbar_title(
     &mut self,
     frame: &mut GlesFrame<'_, '_>,
     fonts: &FontSystem,
-    layout: &ChromeLayoutPhysical,
+    layout: &ChromeLayoutLogical,
     title: &str,
     theme: &flowstate_themes::FlowTheme,
     scale: Scale<f64>,
@@ -458,15 +466,15 @@ fn draw_topbar_title(
 //    font: FontId::Debug,
 //    size_px: 24,
 //};
-    let x = layout.title_rect.loc.x + 14; // 120;
-    let y = layout.title_rect.loc.y + 24;
+    let x_logical = layout.title_rect.loc.x + 14; // 120;
+    let y_logical = layout.title_rect.loc.y + 24;
 
     self.draw_text_cached(
         frame,
         fonts,
         title,
-        x,
-        y,
+        x_logical,
+        y_logical,
         style,
         theme.text.title,
         scale,
@@ -660,11 +668,13 @@ fn render_icon_with_tint(
     frame: &mut GlesFrame<'_, '_>,
     atlas: &flowstate_ui::atlas::IconAtlas,
     icon: IconId,
-    rect: Rectangle<i32, Physical>,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
     style: UiVisualStyle,
     program: &GlesTexProgram,
 ) {
     if let Some(entry) = atlas.get(icon) {
+        let rect_physical = to_physical_rect(rect_logical, scale);
         let src = Rectangle::<f64, Buffer>::from_loc_and_size(
             (entry.x as f64, entry.y as f64),
             (entry.w as f64, entry.h as f64),
@@ -673,13 +683,14 @@ fn render_icon_with_tint(
         //let tint = icon_tint(state, alpha);
 
         // Smithay expects `damage` in dest-local space, not output coordinates.
-        let damage_local = Rectangle::from_loc_and_size((0, 0), (rect.size.w, rect.size.h));
+        let damage_local_physical =
+            Rectangle::from_loc_and_size((0, 0), (rect_physical.size.w, rect_physical.size.h));
 
         if let Err(e) = frame.render_texture_from_to(
             &atlas.texture,
             src,
-            rect,
-            &[damage_local],
+            rect_physical,
+            &[damage_local_physical],
             &[],
             Transform::Normal,
             style.alpha, //1.0,
@@ -695,9 +706,10 @@ fn render_icon_with_tint(
 fn draw_title_text(
     frame: &mut GlesFrame<'_, '_>,
     atlas: &flowstate_ui::atlas::IconAtlas,
-    title_rect: Rectangle<i32, Physical>,
+    title_rect_logical: Rectangle<i32, Logical>,
     text: &str,
     is_active: bool,
+    scale: Scale<f64>,
     program: &GlesTexProgram,
 ) -> Result<(), GlesError> {
     if text.is_empty() {
@@ -708,12 +720,12 @@ fn draw_title_text(
     let pad_y = 4;
     let gap = 1;
 
-    let glyph_h = (title_rect.size.h - pad_y * 2).max(8);
+    let glyph_h = (title_rect_logical.size.h - pad_y * 2).max(8);
     let glyph_w = ((glyph_h as f32) * 0.82) as i32;
 
-    let mut x = title_rect.loc.x + pad_x;
-    let y = title_rect.loc.y + ((title_rect.size.h - glyph_h) / 2);
-    let max_right = title_rect.loc.x + title_rect.size.w - pad_x;
+    let mut x_logical = title_rect_logical.loc.x + pad_x;
+    let y_logical = title_rect_logical.loc.y + ((title_rect_logical.size.h - glyph_h) / 2);
+    let max_right_logical = title_rect_logical.loc.x + title_rect_logical.size.w - pad_x;
 
     let mut in_meta = false;
 
@@ -725,12 +737,12 @@ fn draw_title_text(
         let style = title_glyph_style(token, in_meta, is_active);
 
         for glyph in glyphs_for_text(token) {
-            let dest = Rectangle::from_loc_and_size(
-                (x, y),
+            let dest_logical = Rectangle::from_loc_and_size(
+                (x_logical, y_logical),
                 (glyph_w, glyph_h),
             );
 
-            if dest.loc.x + dest.size.w > max_right {
+            if dest_logical.loc.x + dest_logical.size.w > max_right_logical {
                 return Ok(());
             }
 
@@ -738,17 +750,18 @@ fn draw_title_text(
                 frame,
                 atlas,
                 glyph,
-                dest,
+                dest_logical,
+                scale,
                 style,
                 program,
             );
 
-            x += glyph_w + gap;
+            x_logical += glyph_w + gap;
         }
 
-        x += glyph_w * 2;
+        x_logical += glyph_w * 2;
 
-        if x >= max_right {
+        if x_logical >= max_right_logical {
             break;
         }
 
@@ -878,11 +891,12 @@ fn draw_title_text(
         atlas: &flowstate_ui::atlas::IconAtlas,
         icon: IconId,
         state: IconState,
-        rect: Rectangle<i32, Physical>,
+        rect_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
         style: UiVisualStyle,
         program: &GlesTexProgram,
     ) {
-        RenderState::render_icon_with_tint(frame, atlas, icon, rect, style, program);
+        RenderState::render_icon_with_tint(frame, atlas, icon, rect_logical, scale, style, program);
     }
 
     pub fn ensure_shader_programs(
@@ -898,7 +912,8 @@ fn draw_title_text(
     frame: &mut GlesFrame<'_, '_>,
     atlas: &flowstate_ui::atlas::IconAtlas,
     text: &str,
-    rect: Rectangle<i32, Physical>,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
     program: &GlesTexProgram,
 ) {
     let glyphs: Vec<char> = text.chars().filter(|c| *c != ' ').collect();
@@ -906,7 +921,7 @@ fn draw_title_text(
         return;
     }
 
-    let digit_h = (rect.size.h - 6).max(8);
+    let digit_h = (rect_logical.size.h - 6).max(8);
     let digit_w = ((digit_h as f32) * 0.72) as i32;
     let colon_w = (digit_w / 2).max(4);
     let ampm_w = ((digit_w as f32) * 0.78) as i32;
@@ -924,17 +939,17 @@ fn draw_title_text(
     let spacing = 2;
     let total_w: i32 = widths.iter().sum::<i32>() + spacing * (widths.len().saturating_sub(1) as i32);
 
-    let start_x = rect.loc.x + ((rect.size.w - total_w).max(0) / 2);
-    let y = rect.loc.y + ((rect.size.h - digit_h) / 2);
+    let start_x_logical = rect_logical.loc.x + ((rect_logical.size.w - total_w).max(0) / 2);
+    let y_logical = rect_logical.loc.y + ((rect_logical.size.h - digit_h) / 2);
 
-    let mut x = start_x;
+    let mut x_logical = start_x_logical;
 
     for (idx, ch) in glyphs.iter().enumerate() {
         if let Some(icon) = char_to_clock_icon(*ch) {
             let w = widths[idx];
 
-            let glyph_rect = Rectangle::from_loc_and_size(
-                (x, y),
+            let glyph_rect_logical = Rectangle::from_loc_and_size(
+                (x_logical, y_logical),
                 (w, digit_h),
             );
 
@@ -949,13 +964,14 @@ fn draw_title_text(
                 frame,
                 atlas,
                 icon,
-                glyph_rect,
+                glyph_rect_logical,
+                scale,
                 style,
                 program,
             );
 
             //Self::draw_icon_in_rect(frame, atlas, icon, state, glyph_rect, 1.0, program);
-            x += w + spacing;
+            x_logical += w + spacing;
         }
     }
 }
@@ -965,24 +981,24 @@ fn draw_clock_font_text(
     frame: &mut GlesFrame<'_, '_>,
     fonts: &FontSystem,
     text: &str,
-    rect: Rectangle<i32, Physical>,
-    _scale: Scale<f64>,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
     style: TextStyle,
     color: [f32; 4],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let text_w = fonts.advance_width(text, style);
-    let x = rect.loc.x + ((rect.size.w - text_w).max(0) / 2);
-    let y = rect.loc.y + 24;
+    let x_logical = rect_logical.loc.x + ((rect_logical.size.w - text_w).max(0) / 2);
+    let y_logical = rect_logical.loc.y + 24;
 
     self.draw_text_cached(
         frame,
         fonts,
         text,
-        x,
-        y,
+        x_logical,
+        y_logical,
         style,
         color,
-        Scale::from(1.0),
+        scale,
     )?;
 
     Ok(())
@@ -1058,29 +1074,31 @@ fn draw_clock_font_text(
     fn draw_top_bar(
     frame: &mut GlesFrame<'_, '_>,
     program: &GlesPixelProgram,
-    rect: Rectangle<i32, Physical>,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
     damage: &[Rectangle<i32, Physical>],
     style: &TopBarStyle,
     ) -> Result<(), GlesError> {
         use smithay::backend::renderer::gles::Uniform;
         use smithay::utils::{Buffer, Rectangle, Size};
+        let rect_physical = to_physical_rect(rect_logical, scale);
 
         let src_rect = Rectangle::<f64, Buffer>::from_loc_and_size(
             (0.0, 0.0),
-            (rect.size.w as f64, rect.size.h as f64),
+            (rect_physical.size.w as f64, rect_physical.size.h as f64),
         );
 
-        let buffer_size = Size::<i32, Buffer>::from((rect.size.w, rect.size.h));
+        let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
 
         frame.render_pixel_shader_to(
             program,
             src_rect,
-            rect,
+            rect_physical,
             buffer_size,
             Some(damage),
             1.0,
             &[
-                Uniform::new("u_size", [rect.size.w as f32, rect.size.h as f32]),
+                Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
                 Uniform::new("u_radius", style.radius),
                 Uniform::new("u_softness", style.softness),
                 Uniform::new("u_bevel", style.bevel),
@@ -1098,27 +1116,29 @@ fn draw_clock_font_text(
     pub fn draw_recessed_button(
         frame: &mut GlesFrame<'_, '_>,
         button: &GlesPixelProgram,
-        rect: Rectangle<i32, smithay::utils::Physical>,
+        rect_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
         damage: &[Rectangle<i32, Physical>],
         style: &ButtonStyle,
     ) {
+     let rect_physical = to_physical_rect(rect_logical, scale);
     
      let src_rect = Rectangle::<f64, Buffer>::from_loc_and_size(
         (0.0, 0.0),
-        (rect.size.w as f64, rect.size.h as f64),
+        (rect_physical.size.w as f64, rect_physical.size.h as f64),
     );
 
-        let buffer_size = Size::<i32, Buffer>::from((rect.size.w, rect.size.h));
+        let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
         
         frame.render_pixel_shader_to(
             button,
             src_rect,
-            rect,
+            rect_physical,
             buffer_size,
             Some(damage),
             1.0,
             &[
-                Uniform::new("u_size", [rect.size.w as f32, rect.size.h as f32]),
+                Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
                 Uniform::new("u_bevel", style.bevel),
                 Uniform::new("u_softness", style.softness),
                 Uniform::new("u_inner_shadow", style.inner_shadow),
@@ -1217,16 +1237,12 @@ pub fn draw_rounded_rect(
         
         self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
 
-        let layout_phys = scale_chrome_layout(inputs.layout, inputs.ctx.output_scale.x);
-
-       
- 
         // Chrome draws opaque bevels over the work region; clients must be composited
         // after that shell (and work-area wallpaper), or they are fully covered.
         self.draw_chrome_below_work_wallpaper(
             frame,
             inputs.ctx,
-            &layout_phys,
+            inputs.layout,
             inputs.output,
             inputs.metrics,
             muts.ui,
@@ -1234,7 +1250,13 @@ pub fn draw_rounded_rect(
             theme.chrome,
         );
         
-        self.draw_wallpaper_in_rect(frame, inputs.ctx, layout_phys.work_recess, theme.wallpaper.clone());
+        self.draw_wallpaper_in_rect(
+            frame,
+            inputs.ctx,
+            inputs.layout.work_recess,
+            inputs.ctx.output_scale,
+            theme.wallpaper.clone(),
+        );
         
         self.draw_clients(
             frame,
@@ -1248,7 +1270,7 @@ pub fn draw_rounded_rect(
         self.draw_chrome_trim_glass_icons(
             frame,
             inputs.ctx,
-            &layout_phys,
+            inputs.layout,
             inputs.output,
             inputs.metrics,
             muts.ui,
@@ -1370,9 +1392,9 @@ fn draw_dialog(
     // Full framebuffer in physical px; dialogs are laid out in logical space (`layout`) then lifted.
     // Must use `Frame::draw_solid`, not `clear`: smithay `clear` disables blending, so translucent
     // RGBA wipes the scene (often reads as black) instead of dimming composited content.
-    let fb = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_pixels);
+    let fb_physical = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_pixels);
 
-    RenderState::draw_solid_rect(frame, fb, &[fb], [0.0, 0.0, 0.0, 0.45])?;
+    RenderState::draw_solid_rect(frame, fb_physical, &[fb_physical], [0.0, 0.0, 0.0, 0.45])?;
 
     if !draw_dialog_chrome {
         return Ok(());
@@ -1496,6 +1518,7 @@ fn draw_text(
     x: i32,
     y: i32,
     color: [f32; 4],
+    scale: Scale<f64>,
     program: &GlesTexProgram,
 ) -> Result<(), GlesError> {
     if text.is_empty() {
@@ -1522,7 +1545,7 @@ fn draw_text(
         }
 
         if let Some(icon) = glyph_for_char(ch) {
-            let rect = Rectangle::from_loc_and_size(
+            let rect_logical = Rectangle::from_loc_and_size(
                 (cursor_x, y),
                 (glyph_w, glyph_h),
             );
@@ -1531,7 +1554,8 @@ fn draw_text(
                 frame,
                 atlas,
                 icon,
-                rect,
+                rect_logical,
+                scale,
                 style,
                 program,
             );
@@ -1590,21 +1614,23 @@ fn get_char(&self, ch: char) -> Option<IconId>
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         program: &GlesPixelProgram,
-        rect: Rectangle<i32, Physical>,
+        rect_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
         damage: &[Rectangle<i32, Physical>],
         style: &GlassStyle,
     ) -> Result<(), GlesError> {
+        let rect_physical = to_physical_rect(rect_logical, scale);
         let src_rect = Rectangle::from_loc_and_size(
             (0.0, 0.0),
-            (rect.size.w as f64, rect.size.h as f64),   
+            (rect_physical.size.w as f64, rect_physical.size.h as f64),   
         );
-        let dst_rect = rect;
-        let size = Size::from((rect.size.w, rect.size.h));
+        let dst_rect_physical = rect_physical;
+        let size = Size::from((rect_physical.size.w, rect_physical.size.h));
 
         let t = ctx.now.duration_since(self.start_time).as_secs_f32();
 
         let uniforms = [
-            Uniform::new("u_size", [rect.size.w as f32, rect.size.h as f32]),
+            Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
             Uniform::new("u_opacity", style.opacity),
             Uniform::new("u_edge_width", style.edge_width),
             Uniform::new("u_edge_brightness", style.edge_brightness),
@@ -1618,7 +1644,7 @@ fn get_char(&self, ch: char) -> Option<IconId>
         frame.render_pixel_shader_to(
             program,
             src_rect,        // Rectangle<f64, Buffer>
-            dst_rect,        // Rectangle<i32, Physical>
+            dst_rect_physical,        // Rectangle<i32, Physical>
             size,            // Size<i32, Buffer>
             Some(damage),    // Option<&[Rectangle<i32, Physical>]>
             1.0,             // alpha
@@ -1629,16 +1655,18 @@ fn get_char(&self, ch: char) -> Option<IconId>
      fn draw_beveled_panel(
         frame: &mut GlesFrame<'_, '_>,
         program: &GlesPixelProgram,
-        rect: Rectangle<i32, Physical>,
+        rect_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
         damage: &[Rectangle<i32, Physical>],
         style: &BevelStyle,
     ) -> Result<(), GlesError> {
+        let rect_physical = to_physical_rect(rect_logical, scale);
         let src_rect = Rectangle::from_loc_and_size(
             (0.0, 0.0),
-            (rect.size.w as f64, rect.size.h as f64),   
+            (rect_physical.size.w as f64, rect_physical.size.h as f64),   
         );
-        let dst_rect = rect;
-        let size = Size::from((rect.size.w, rect.size.h));
+        let dst_rect_physical = rect_physical;
+        let size = Size::from((rect_physical.size.w, rect_physical.size.h));
 
         let uniforms = [
             Uniform::new("u_bevel", style.bevel),
@@ -1656,7 +1684,7 @@ fn get_char(&self, ch: char) -> Option<IconId>
         frame.render_pixel_shader_to(
             program,
             src_rect,        // Rectangle<f64, Buffer>
-            dst_rect,        // Rectangle<i32, Physical>
+            dst_rect_physical,        // Rectangle<i32, Physical>
             size,            // Size<i32, Buffer>
             Some(damage),    // Option<&[Rectangle<i32, Physical>]>
             1.0,             // alpha
@@ -1669,16 +1697,18 @@ fn get_char(&self, ch: char) -> Option<IconId>
 
         frame: &mut GlesFrame<'_, '_>,
         program: &GlesPixelProgram,
-        rect: Rectangle<i32, Physical>,
+        rect_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
         damage: &[Rectangle<i32, Physical>],
         style: &LightChannelStyle) -> Result<(), GlesError> {
-    let dst_rect = rect;
+    let rect_physical = to_physical_rect(rect_logical, scale);
+    let dst_rect_physical = rect_physical;
 
     let src_rect = Rectangle::from_loc_and_size(
         (0.0, 0.0),
-        (rect.size.w as f64, rect.size.h as f64),
+        (rect_physical.size.w as f64, rect_physical.size.h as f64),
     );
-    let size = Size::from((rect.size.w, rect.size.h));
+    let size = Size::from((rect_physical.size.w, rect_physical.size.h));
 
            let uniforms = [
                 Uniform::new("u_slot_inset", style.slot_inset),
@@ -1693,7 +1723,7 @@ fn get_char(&self, ch: char) -> Option<IconId>
         frame.render_pixel_shader_to(
             program,
             src_rect,        // Rectangle<f64, Buffer>
-            dst_rect,        // Rectangle<i32, Physical>
+            dst_rect_physical,        // Rectangle<i32, Physical>
             size,            // Size<i32, Buffer>
             Some(damage),    // Option<&[Rectangle<i32, Physical>]>
             1.0,             // alpha
@@ -1783,7 +1813,8 @@ fn inset_rect_xy(
         &self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        target: Rectangle<i32, Physical>,
+        target_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
         theme: WallpaperTheme,
     ) {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
@@ -1794,12 +1825,13 @@ fn inset_rect_xy(
         let Some(tex) = self.wallpaper_texture.as_ref() else {
             return;
         };
+        let target_physical = to_physical_rect(target_logical, scale);
 
         let out = RectI {
-            x: target.loc.x,
-            y: target.loc.y,
-            w: target.size.w,
-            h: target.size.h,
+            x: target_physical.loc.x,
+            y: target_physical.loc.y,
+            w: target_physical.size.w,
+            h: target_physical.size.h,
         };
 
         let sz = tex.size();
@@ -1819,7 +1851,7 @@ fn inset_rect_xy(
         let dst = dst_world;
 
         let dsts = [dst];
-        let damage = [target];
+        let damage = [target_physical];
 
         let tw = src.w as f64;
         let th = src.h as f64;
@@ -1988,7 +2020,7 @@ for window in space.elements() {
     &self,
     frame: &mut GlesFrame<'_, '_>,
     ctx: &FrameCtx,
-    layout: &ChromeLayoutPhysical,
+    layout: &ChromeLayoutLogical,
 ) {
     if ctx.active_output != ctx.rendering_output {
         return;
@@ -1998,7 +2030,7 @@ for window in space.elements() {
         return;
     };
 
-    let bar_rect = Rectangle::from_loc_and_size(
+    let bar_rect_logical = Rectangle::from_loc_and_size(
         layout.topbar_outer.loc,
         (layout.topbar_outer.size.w, 10),
     );
@@ -2009,7 +2041,8 @@ for window in space.elements() {
     let _ = Self::draw_amber_lightbar(
         frame,
         program,
-        bar_rect,
+        bar_rect_logical,
+        ctx.output_scale,
         damage,
     );
 }
@@ -2017,20 +2050,22 @@ for window in space.elements() {
     fn draw_amber_lightbar(
     frame: &mut GlesFrame<'_, '_>,
     program: &GlesPixelProgram,
-    rect: Rectangle<i32, Physical>,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
     damage: &[Rectangle<i32, Physical>],
 ) -> Result<(), GlesError> {
+    let rect_physical = to_physical_rect(rect_logical, scale);
     let src_rect = Rectangle::<f64, Buffer>::from_loc_and_size(
         (0.0, 0.0),
-        (rect.size.w as f64, rect.size.h as f64),
+        (rect_physical.size.w as f64, rect_physical.size.h as f64),
     );
 
-    let size = Size::<i32, Buffer>::from((rect.size.w, rect.size.h));
+    let size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
 
     frame.render_pixel_shader_to(
         program,
         src_rect,
-        rect,
+        rect_physical,
         size,
         Some(damage),
         1.0,
@@ -2073,7 +2108,7 @@ for window in space.elements() {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        layout: &ChromeLayoutPhysical,
+        layout: &ChromeLayoutLogical,
         _output: &OutputState,
         _metrics: &ChromeMetrics,
         _ui: &mut UiState<GlesTexture>,
@@ -2120,6 +2155,7 @@ for window in space.elements() {
             frame,
             top_bar,
             layout.topbar_outer,
+            ctx.output_scale,
             damage,
             &legacy_theme.top_bar,
         );
@@ -2128,6 +2164,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.topbar_outer,
+            ctx.output_scale,
             damage,
             &legacy_theme.frame_outer,
         );
@@ -2136,6 +2173,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.topbar_inner,
+            ctx.output_scale,
             damage,
             &legacy_theme.frame_inner,
         );
@@ -2144,6 +2182,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.sidebar_outer,
+            ctx.output_scale,
             damage,
             &legacy_theme.sidebar,
         );
@@ -2152,6 +2191,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.sidebar_inner,
+            ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
         );
@@ -2160,6 +2200,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.work_outer,
+            ctx.output_scale,
             damage,
             &legacy_theme.frame_outer,
         );
@@ -2168,6 +2209,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.work_inner_frame,
+            ctx.output_scale,
             damage,
             &legacy_theme.frame_inner,
         );
@@ -2176,6 +2218,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.work_recess,
+            ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
         );
@@ -2188,6 +2231,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.title_rect,
+            ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
         );
@@ -2196,6 +2240,7 @@ for window in space.elements() {
             frame,
             beveled,
             layout.topbar_trim,
+            ctx.output_scale,
             damage,
             &legacy_theme.trim,
         );
@@ -2205,6 +2250,7 @@ for window in space.elements() {
                 frame,
                 light,
                 rect,
+                ctx.output_scale,
                 damage,
                 &legacy_theme.light,
             );
@@ -2215,6 +2261,7 @@ for window in space.elements() {
                 frame,
                 button,
                 *rect,
+                ctx.output_scale,
                 damage,
                 &legacy_theme.button,
             );
@@ -2223,6 +2270,7 @@ for window in space.elements() {
                 frame,
                 light,
                 inset_rect(*rect, 3),
+                ctx.output_scale,
                 damage,
                 &legacy_theme.light,
             );
@@ -2232,6 +2280,7 @@ for window in space.elements() {
             frame,
             button,
             layout.clock_well,
+            ctx.output_scale,
             damage,
             &legacy_theme.button,
         );
@@ -2240,6 +2289,7 @@ for window in space.elements() {
             frame,
             light,
             inset_rect(layout.clock_well, 3),
+            ctx.output_scale,
             damage,
             &legacy_theme.light,
         );
@@ -2257,9 +2307,9 @@ for window in space.elements() {
         {
             let hovered = sidebar_hover_slot == Some(i);
 
-            let _ = Self::draw_beveled_panel(frame, beveled, *outer, damage, &legacy_theme.module);
-            let _ = Self::draw_beveled_panel(frame, beveled, *inner, damage, &legacy_theme.module_inner);
-            Self::draw_recessed_button(frame, button, *well, damage, &legacy_theme.button);
+            let _ = Self::draw_beveled_panel(frame, beveled, *outer, ctx.output_scale, damage, &legacy_theme.module);
+            let _ = Self::draw_beveled_panel(frame, beveled, *inner, ctx.output_scale, damage, &legacy_theme.module_inner);
+            Self::draw_recessed_button(frame, button, *well, ctx.output_scale, damage, &legacy_theme.button);
 
             //if hovered {
             let hover = if hovered { 1.0 } else { 0.0 };
@@ -2276,7 +2326,7 @@ for window in space.elements() {
             light_style.glow_radius = 8.0 + hover * 6.0;
             light_style.core_inset = 3.0 - hover * 0.75;
 
-            let _ = Self::draw_light_channel(frame, light, glow_rect, damage, &light_style);
+            let _ = Self::draw_light_channel(frame, light, glow_rect, ctx.output_scale, damage, &light_style);
             
                 //let glow_rect = inset_rect(*well, 3);
                 //let _ = Self::draw_light_channel(frame, light, glow_rect, damage, &legacy_theme.light);
@@ -2288,13 +2338,14 @@ for window in space.elements() {
                 frame,
                 light,
                 rect,
+                ctx.output_scale,
                 damage,
                 &legacy_theme.light,
             );
         }
 
         for rect in &layout.sidebar_caps {
-            Self::draw_beveled_panel(frame, beveled, *rect, damage, &legacy_theme.corner_cap);
+            Self::draw_beveled_panel(frame, beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
         }
 
         //
@@ -2302,11 +2353,11 @@ for window in space.elements() {
         //
 
         for rect in &layout.corner_caps {
-            Self::draw_beveled_panel(frame, beveled, *rect, damage, &legacy_theme.corner_cap);
+            Self::draw_beveled_panel(frame, beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
         }
 
         for rect in &layout.corner_joint_caps {
-            Self::draw_beveled_panel(frame, beveled, *rect, damage, &legacy_theme.corner_cap);
+            Self::draw_beveled_panel(frame, beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
         }
     }
 
@@ -2315,7 +2366,7 @@ for window in space.elements() {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        layout: &ChromeLayoutPhysical,
+        layout: &ChromeLayoutLogical,
         output: &OutputState,
         metrics: &ChromeMetrics,
         //ui: &mut UiState<GlesTexture>,
@@ -2354,6 +2405,7 @@ for window in space.elements() {
                 frame,
                 beveled,
                 rect,
+                ctx.output_scale,
                 damage,
                 &legacy_theme.trim,
             );
@@ -2364,6 +2416,7 @@ for window in space.elements() {
             ctx,
             glass,
             layout.glass_rect,
+            ctx.output_scale,
             damage,
             &legacy_theme.glass,
         );
@@ -2381,12 +2434,12 @@ for window in space.elements() {
             current_workspace.0
         );
 
-        let label_rect = title_label_rect(layout.title_rect);
+        let _label_rect_logical = title_label_rect(layout.title_rect);
         
         
         let is_active = ctx.rendering_output == ctx.active_output; // or output.output_id
         
-        //let _ = RenderState::draw_title_text(frame, atlas, label_rect, &text, is_active, tinted_icon);
+        //let _ = RenderState::draw_title_text(frame, atlas, _label_rect_logical, &text, is_active, ctx.output_scale, tinted_icon);
         
     let output_number = ctx.rendering_output.0;
     let workspace_number = 1;
@@ -2443,8 +2496,6 @@ let _ = self.draw_topbar_meta(
             (el.bounds.x, el.bounds.y),
             (el.bounds.w, el.bounds.h),
         );
-    
-    let mut base_rect = base_rect_logical.to_physical_precise_round(ctx.output_scale);
 
 // center-based scaling
 
@@ -2475,27 +2526,27 @@ style.glow *= output_factor;
     match el.kind {
         UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot => {
             if let Some(icon_id) = el.icon {
-                let mut icon_rect = icon_rect_in_module(base_rect, icon_px);
+                let mut icon_rect_logical = icon_rect_in_module(base_rect_logical, icon_px);
                 if scale != 1.0 {
-    let cx = icon_rect.loc.x + icon_rect.size.w / 2;
-    let cy = icon_rect.loc.y + icon_rect.size.h / 2;
+    let cx_logical = icon_rect_logical.loc.x + icon_rect_logical.size.w / 2;
+    let cy_logical = icon_rect_logical.loc.y + icon_rect_logical.size.h / 2;
 
-    let new_w = ((icon_rect.size.w as f32) * scale).round() as i32;
-    let new_h = ((icon_rect.size.h as f32) * scale).round() as i32;
+    let new_w_logical = ((icon_rect_logical.size.w as f32) * scale).round() as i32;
+    let new_h_logical = ((icon_rect_logical.size.h as f32) * scale).round() as i32;
 
-    icon_rect = Rectangle::from_loc_and_size(
-        (cx - new_w / 2, cy - new_h / 2),
-        (new_w, new_h),
+    icon_rect_logical = Rectangle::from_loc_and_size(
+        (cx_logical - new_w_logical / 2, cy_logical - new_h_logical / 2),
+        (new_w_logical, new_h_logical),
     );
     }
-                Self::draw_icon_in_rect(frame, atlas, icon_id, icon_state, icon_rect,style,&tinted_icon);
+                Self::draw_icon_in_rect(frame, atlas, icon_id, icon_state, icon_rect_logical, ctx.output_scale, style, &tinted_icon);
             }
         }
 
         UiElementKind::TopbarIndicator | UiElementKind::TopbarButton => {
             if let Some(icon_id) = el.icon {
-                let icon_rect = well_icon_rect(base_rect);
-                Self::draw_icon_in_rect(frame, atlas, icon_id, icon_state, icon_rect, style, &tinted_icon);
+                let icon_rect_logical = well_icon_rect(base_rect_logical);
+                Self::draw_icon_in_rect(frame, atlas, icon_id, icon_state, icon_rect_logical, ctx.output_scale, style, &tinted_icon);
             }
         }
 
@@ -2505,7 +2556,7 @@ style.glow *= output_factor;
             let now = Local::now();
             let time_str = now.format("%-I:%M %p").to_string();
 
-            let clock_rect = inset_rect(base_rect, 4);
+            let clock_rect_logical = inset_rect(base_rect_logical, 4);
             //self.draw_clock_text(frame, atlas, &time_str, clock_rect,tinted_icon);
             
             let clock_style = style_for(
@@ -2514,7 +2565,7 @@ style.glow *= output_factor;
                 active_theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle),
             );
             
-            self.draw_clock_font_text(frame,fonts,&time_str,clock_rect,ctx.output_scale,clock_style, active_theme.text.clock,);
+            self.draw_clock_font_text(frame,fonts,&time_str,clock_rect_logical,ctx.output_scale,clock_style, active_theme.text.clock,);
         }
 
         _ => {}
@@ -2573,7 +2624,7 @@ style.glow *= output_factor;
     
 
 
-fn title_label_rect(title_rect: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+fn title_label_rect(title_rect_logical: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
     let pad_x = 10;
     let pad_y = 4;
 
@@ -2590,23 +2641,24 @@ fn title_label_rect(title_rect: Rectangle<i32, Physical>) -> Rectangle<i32, Phys
    // )
     
      Rectangle::from_loc_and_size(
-        (title_rect.loc.x + pad_x, title_rect.loc.y + pad_y),
+        (title_rect_logical.loc.x + pad_x, title_rect_logical.loc.y + pad_y),
         (
-            title_rect.size.w - pad_x * 2,   // 👈 FULL WIDTH
-            (title_rect.size.h - pad_y * 2).max(1),
+            title_rect_logical.size.w - pad_x * 2,   // 👈 FULL WIDTH
+            (title_rect_logical.size.h - pad_y * 2).max(1),
         ),
     )
 }
 
 
-pub fn well_icon_rect(well: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+pub fn well_icon_rect(well_logical: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let well = well_logical;
     inset_rect(well, (well.size.h / 5).max(4))
 }
 
-pub fn clock_text_rect(well: Rectangle<i32, Physical>) -> Rectangle<i32, Physical> {
+pub fn clock_text_rect(well_logical: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
     Rectangle::from_loc_and_size(
-        (well.loc.x + 8, well.loc.y + 5),
-        ((well.size.w - 16).max(1), (well.size.h - 10).max(1)),
+        (well_logical.loc.x + 8, well_logical.loc.y + 5),
+        ((well_logical.size.w - 16).max(1), (well_logical.size.h - 10).max(1)),
     )
 }
 
@@ -2614,9 +2666,9 @@ pub fn clock_text_rect(well: Rectangle<i32, Physical>) -> Rectangle<i32, Physica
 
 #[inline]
 pub fn inset_rect(
-    r: Rectangle<i32, Physical>,
+    r: Rectangle<i32, Logical>,
     px: i32,
-) -> Rectangle<i32, Physical> {
+) -> Rectangle<i32, Logical> {
     Rectangle::from_loc_and_size(
         (r.loc.x + px, r.loc.y + px),
         (
@@ -2627,10 +2679,10 @@ pub fn inset_rect(
 }
 #[inline]
 fn center_rect_in(
-    outer: Rectangle<i32, Physical>,
+    outer: Rectangle<i32, Logical>,
     w: i32,
     h: i32,
-) -> Rectangle<i32, Physical> {
+) -> Rectangle<i32, Logical> {
     let x = outer.loc.x + ((outer.size.w - w).max(0) / 2);
     let y = outer.loc.y + ((outer.size.h - h).max(0) / 2);
     Rectangle::from_loc_and_size((x, y), (w, h))
@@ -2638,9 +2690,9 @@ fn center_rect_in(
 
 #[inline]
 fn icon_rect_in_module(
-    module: Rectangle<i32, Physical>,
+    module: Rectangle<i32, Logical>,
     icon_px: i32,
-) -> Rectangle<i32, Physical> {
+) -> Rectangle<i32, Logical> {
     center_rect_in(module, icon_px, icon_px)
 }
 
@@ -3070,5 +3122,3 @@ shadow_color: [0.0, 0.0, 0.0, 0.5],
     }
 }
 */
-
-
