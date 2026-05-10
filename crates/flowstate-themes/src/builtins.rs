@@ -76,7 +76,7 @@ pub fn moonbase_theme() -> FlowTheme {
         name: "Moonbase".to_string(),
 
         background: BackgroundTheme {
-            color: [0.92, 0.93, 0.95, 1.0],
+            color: [0.18, 0.19, 0.19, 1.0],
         },
 
         wallpaper: WallpaperTheme {
@@ -86,17 +86,17 @@ pub fn moonbase_theme() -> FlowTheme {
         },
 
         chrome: ChromeTheme {
-            bg_color: [0.92, 0.93, 0.95, 1.0],
-            panel_color: [1.0, 1.0, 1.0, 1.0],
-            accent_color: [0.2, 0.4, 0.8, 1.0],
-            trim_color: [0.55, 0.65, 0.85, 1.0],
-            glass_tint: [0.85, 0.90, 1.0, 0.25],
+            bg_color: [0.16, 0.17, 0.17, 1.0],
+            panel_color: [0.18, 0.19, 0.20, 1.0],
+            accent_color: [0.42, 0.68, 0.86, 1.0],
+            trim_color: [0.62, 0.68, 0.72, 1.0],
+            glass_tint: [0.75, 0.82, 0.88, 0.18],
             corner_radius: 10.0,
             border_width: 1.0,
-            glow_intensity: 0.2,
-            shadow_intensity: 0.2,
+            glow_intensity: 0.08,
+            shadow_intensity: 0.35,
         },
-
+        
         dialog: DialogTheme {
             panel_color: [1.0, 1.0, 1.0, 1.0],
             title_color: [0.2, 0.4, 0.8, 1.0],
@@ -106,22 +106,23 @@ pub fn moonbase_theme() -> FlowTheme {
         },
 
         text: TextTheme {
-            title: [0.2, 0.4, 0.8, 1.0],
+            title: [0.88, 0.94, 1.00, 1.0], //[0.2, 0.4, 0.8, 1.0],
             normal: [0.1, 0.1, 0.1, 1.0],
             dim: [0.45, 0.48, 0.52, 1.0],
             accent: [0.2, 0.4, 0.8, 1.0],
-            meta_label: [0.45, 0.50, 0.58, 1.0],
-            meta_value: [0.18, 0.38, 0.82, 1.0],
-            clock: [0.90, 0.90, 0.82, 1.0],
+            meta_label: [0.78, 0.84, 0.88, 1.0], //[0.45, 0.50, 0.58, 1.0],
+            meta_value: [1.00, 0.82, 0.35, 1.0], //[0.18, 0.38, 0.82, 1.0],
+            clock: [0.88, 0.94, 1.00, 1.0],
         },
 
-        icons: IconTheme {
-            inactive: [0.30, 0.35, 0.45, 0.85],
-            hover: [0.2, 0.4, 0.8, 1.0],
-            active: [0.1, 0.3, 0.75, 1.0],
-            disabled: [0.55, 0.58, 0.62, 0.55],
-            glow: [0.2, 0.4, 0.8, 0.35],
-        },
+icons: IconTheme {
+    inactive: [0.82, 0.90, 0.96, 0.95],
+    hover:    [1.00, 1.00, 1.00, 1.00],
+    active:   [0.55, 0.85, 1.00, 1.00],
+    disabled: [0.38, 0.42, 0.45, 0.55],
+    glow:     [0.65, 0.85, 1.00, 0.35],
+},
+        
 
         spacing: 10,
         density: UiDensity::Normal,
@@ -151,11 +152,11 @@ pub fn classic_theme() -> FlowTheme {
             bg_color: [0.02, 0.02, 0.02, 1.0],
             panel_color: [0.10, 0.05, 0.00, 1.0],
             accent_color: [1.0, 0.5, 0.0, 1.0],
-            trim_color: [0.75, 0.35, 0.05, 1.0],
+            trim_color: [0.45, 0.22, 0.04, 1.0],
             glass_tint: [1.0, 0.45, 0.08, 0.30],
             corner_radius: 6.0,
             border_width: 1.0,
-            glow_intensity: 0.8,
+            glow_intensity: 0.25,
             shadow_intensity: 0.6,
         },
 
@@ -168,19 +169,19 @@ pub fn classic_theme() -> FlowTheme {
         },
 
         text: TextTheme {
-            title: [1.0, 0.5, 0.0, 1.0],
+            title: [1.0, 0.72, 0.32, 1.0],   //  [1.0, 0.5, 0.0, 1.0],
             normal: [1.0, 0.6, 0.2, 1.0],
             dim: [0.65, 0.38, 0.18, 1.0],
             accent: [1.0, 0.5, 0.0, 1.0],
-            meta_label: [0.72, 0.42, 0.18, 1.0],
-            meta_value: [1.00, 0.68, 0.20, 1.0],
+            meta_label:  [0.82, 0.58, 0.30, 1.0],      // [0.72, 0.42, 0.18, 1.0],
+            meta_value:  [1.0, 0.82, 0.42, 1.0],      // [1.00, 0.68, 0.20, 1.0],
             clock: [1.00, 0.72, 0.22, 1.0],
         },
 
         icons: IconTheme {
             inactive: [0.85, 0.45, 0.18, 0.85],
             hover: [1.0, 0.65, 0.20, 1.0],
-            active: [1.0, 0.5, 0.0, 1.0],
+            active: [1.0, 0.65, 0.20, 1.0],
             disabled: [0.35, 0.22, 0.12, 0.55],
             glow: [1.0, 0.5, 0.0, 0.55],
         },

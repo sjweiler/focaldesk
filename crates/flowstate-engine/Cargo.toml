@@ -25,6 +25,7 @@ flowstate-notifications = { path = "../flowstate-notifications" }
 flowstate-settings-core = { path = "../flowstate-settings-core" }
 flowstate-ipc = { path = "../flowstate-ipc" }
 flowstate-themes = { path = "../flowstate-themes" }
+flowstate-config = { path = "../flowstate-config" }
 
 serde_json = "1"
 zbus = "3"

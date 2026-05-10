@@ -1386,6 +1386,12 @@ dependencies = [
 [[package]]
 name = "flowstate-config"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "flowstate-themes",
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "flowstate-cursor"
@@ -1418,6 +1424,7 @@ dependencies = [
  "calloop 0.12.4",
  "chrono",
  "egui",
+ "flowstate-config",
  "flowstate-cursor",
  "flowstate-flow",
  "flowstate-ipc",

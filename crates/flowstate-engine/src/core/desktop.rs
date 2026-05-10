@@ -124,6 +124,7 @@ pub struct DesktopInit {
     pub chrome: flowstate_ui::chrome::Chrome,
     pub keybinds: Keybinds,
     pub client_wayland_display: String,
+    pub theme_manager: ThemeManager,
 }
 
 pub struct DesktopState {
@@ -791,66 +792,64 @@ impl DesktopState {
         self.mark_redraw();
     }
 
- 
-        pub fn new(init: DesktopInit) -> Self {
-            Self {
-                fonts: FontSystem::new().expect("failed to initialize font system"),
-                dialogs: Vec::new(),
-                active_dialog: None,
-                xdg_activation_state: init.xdg_activation_state,
-                winit_scale_factor: 1.0,
-                ui: UiTree::default(),
-                active_workspace: WorkspaceId(1),
-                next_window_id: WindowId(1),
-                primary_output: OutputId(1),
-                focused_output: OutputId(1),
-                input: InputState::default(),
-                compositor_state: init.compositor_state,
-                render: init.render,
-                xdg_shell_state: init.xdg_shell_state,
-                shm_state: init.shm_state,
-                seat_state: init.seat_state,
-                output_manager_state: init.output_manager_state,
-                data_device_state: init.data_device_state,
-                layer_shell_state: init.layer_shell_state,
-                image_capture_source_state: init.image_capture_source_state,
-                output_capture_source_state: init.output_capture_source_state,
-                image_copy_capture_state: init.image_copy_capture_state,
-                portal_dispatch_ctx: None,
-                backend_kind: init.backend_kind,
-                cursor_manager: init.cursor_manager,
-                seat: init.seat,
-                chrome: Chrome::new(ChromeMetrics::default()),
-                space: Space::default(),
-                popups: PopupManager::default(),
-                windows: Vec::new(),
-                outputs: IndexMap::<OutputId,OutputState>::new(),
-                current_workspace: 0,
+    pub fn new(init: DesktopInit) -> Self {
+        Self {
+            fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
+            dialogs: Vec::new(),
+            active_dialog: None,
+            xdg_activation_state: init.xdg_activation_state,
+            winit_scale_factor: 1.0,
+            ui: UiTree::default(),
+            active_workspace: WorkspaceId(1),
+            next_window_id: WindowId(1),
+            primary_output: init.primary_output,
+            focused_output: init.primary_output,
+            input: InputState::default(),
+            compositor_state: init.compositor_state,
+            render: init.render,
+            xdg_shell_state: init.xdg_shell_state,
+            shm_state: init.shm_state,
+            seat_state: init.seat_state,
+            output_manager_state: init.output_manager_state,
+            data_device_state: init.data_device_state,
+            layer_shell_state: init.layer_shell_state,
+            image_capture_source_state: init.image_capture_source_state,
+            output_capture_source_state: init.output_capture_source_state,
+            image_copy_capture_state: init.image_copy_capture_state,
+            portal_dispatch_ctx: None,
+            backend_kind: init.backend_kind,
+            cursor_manager: init.cursor_manager,
+            seat: init.seat,
+            chrome: init.chrome,
+            space: Space::default(),
+            popups: PopupManager::default(),
+            windows: Vec::new(),
+            outputs: IndexMap::<OutputId, OutputState>::new(),
+            current_workspace: 0,
 
-                seat_name: "seat-0".to_string(),
-                focused_window: None,
-                pointer_pos: (0.0, 0.0).into(),
-                toplevel_pointer: None,
+            seat_name: "seat-0".to_string(),
+            focused_window: None,
+            pointer_pos: (0.0, 0.0).into(),
+            toplevel_pointer: None,
 
-                notifications: init.notifications,
-                unmapped_windows: Vec::new(),
-                keybinds: Keybinds::default(),
-                client_wayland_display: init.client_wayland_display,
-                host_window_drag_requested: false,
-                pending_compositor_move: None,
-                running: true,
-                drm_cursor_render_id: Id::new(),
-                drm_submit_hw_cursor: false,
-                drm_try_pass_cursor_this_frame: false,
-                screenshot_requested: None,
-                screenshot_all_requested: false,
-                screenshot_seq: 0,
-                theme: ThemeManager::new(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle)
-    )
-            }
-        }  
-   
-   pub fn alloc_window_id(&mut self) -> WindowId {
+            notifications: init.notifications,
+            unmapped_windows: Vec::new(),
+            keybinds: init.keybinds,
+            client_wayland_display: init.client_wayland_display,
+            host_window_drag_requested: false,
+            pending_compositor_move: None,
+            running: init.running,
+            drm_cursor_render_id: Id::new(),
+            drm_submit_hw_cursor: false,
+            drm_try_pass_cursor_this_frame: false,
+            screenshot_requested: None,
+            screenshot_all_requested: false,
+            screenshot_seq: 0,
+            theme: init.theme_manager,
+        }
+    }
+
+    pub fn alloc_window_id(&mut self) -> WindowId {
         let id = self.next_window_id.0;
         self.next_window_id = WindowId(
             id.checked_add(1).expect("window id counter overflowed")

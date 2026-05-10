@@ -26,6 +26,11 @@ use crate::core::OutputState;
 use crate::core::SceneState;
 use flowstate_flow::keybinds::BackendKind;
 use smithay::wayland::xdg_activation::XdgActivationState;
+use flowstate_themes::FlowThemeId;
+use flowstate_themes::theme::BuiltInThemeId;
+use flowstate_themes::ThemeManager;
+use flowstate_config::FlowConfig;
+
 
 /// Wayland socket + [`DesktopState`] and render helpers used by nested backend loops.
 pub(crate) struct NestedDesktop {
@@ -101,6 +106,24 @@ pub(crate) fn bootstrap_compositor_core(
     let notifications = NotificationManager::new();
     let chrome = Chrome::new(ChromeMetrics::default());
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
+    
+    let config = FlowConfig::load().unwrap_or_default();
+
+    let theme_id = config
+        .theme
+        .active
+        .unwrap_or(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+        
+   eprintln!("FLOWSTATE selected theme_id = {:?}", theme_id);
+ 
+
+    let theme_manager = ThemeManager::new(theme_id);
+    
+    eprintln!(
+    "FLOWSTATE active theme after manager init = {:?}",
+    theme_manager.active_theme().id
+);
+
     let init = DesktopInit {
         xdg_activation_state,
         chrome,
@@ -123,6 +146,7 @@ pub(crate) fn bootstrap_compositor_core(
         keybinds: Keybinds::default(),
         running: true,
         client_wayland_display: wayland_display.clone(),
+        theme_manager,
     };
 
     let mut state = DesktopState::new(init);

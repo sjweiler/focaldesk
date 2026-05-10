@@ -12,6 +12,8 @@ use crate::core::ui_builder::build_ui_for_output;
 use flowstate_types::OutputId;
 use crate::core::fonts::{FontId, TextStyle};
 use flowstate_themes::FlowTheme;
+use flowstate_themes::theme::BuiltInThemeId;
+
 
 pub struct PreparedOutput {
     pub frame_ctx: FrameCtx,
@@ -67,37 +69,61 @@ pub fn prepare_output(
     state.render.ensure_shader_programs(renderer)?;
     // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
     state.render.ensure_wallpaper_loaded(renderer);
+
+let active_theme = state.theme.active_theme();
+let active_theme_id =
+    active_theme.id.builtin_id().unwrap_or(BuiltInThemeId::Classic);
     
+let preload_fonts = match active_theme_id {
+    BuiltInThemeId::Classic => [
+        FontId::IbmPlexSansRegular,
+        FontId::IbmPlexSansMedium,
+        FontId::IbmPlexSansSemiBold,
+    ],
+
+    BuiltInThemeId::Moonbase => [
+        FontId::RajdhaniRegular,
+        FontId::RajdhaniMedium,
+        FontId::RajdhaniSemiBold,
+    ],
+
+    BuiltInThemeId::Eagle => [
+        FontId::OrbitronRegular,
+        FontId::OrbitronMedium,
+        FontId::OrbitronSemiBold,
+    ],
+};
+
+for font in preload_fonts {
   for size_px in [10, 12, 14, 16, 18, 20, 24] {
-    let style = TextStyle {
-        font: FontId::DebugMono,
-        size_px,
-    };
+        let style = TextStyle { font, size_px };
 
-    state.fonts.prepare_text("FlowState", style)?;
-    state.fonts.prepare_text("FlowState Debug", style)?;
-    state.fonts.prepare_text("OK", style)?;
-    state.fonts.prepare_text("Cancel", style)?;
-    const BASIC_ASCII: &str =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\
-     .,;:!?()[]{}<>+-=*/_@#%&$'\"\\|`~^ ";
+        state.fonts.prepare_text("FlowState", style)?;
+        state.fonts.prepare_text("FlowState Debug", style)?;
+        state.fonts.prepare_text("OK", style)?;
+        state.fonts.prepare_text("Cancel", style)?;
+        const BASIC_ASCII: &str =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\
+         .,;:!?()[]{}<>+-=*/_@#%&$'\"\\|`~^ ";
 
-    state.fonts.prepare_text(BASIC_ASCII, style)?;
+        state.fonts.prepare_text(BASIC_ASCII, style)?;
+    }
 }
 
     // Dialog text uses 16px in draw_dialog; glyph keys include size, so we must
     // rasterize at 16px or draw_text_cached finds no glyphs.
-    let dialog_text_style = TextStyle {
-        font: FontId::DebugMono,
-        size_px: 16,
-    };
-    for d in &state.dialogs {
-        state.fonts.prepare_text(&d.title, dialog_text_style)?;
-        state.fonts.prepare_text(&d.message, dialog_text_style)?;
-        for b in &d.buttons {
-            state.fonts.prepare_text(&b.label, dialog_text_style)?;
-        }
-    }
+   // let dialog_text_style = TextStyle {
+   //     font: FontId::Debug,
+   //     size_px: 16,
+   // };
+   //let dialog_text_style = 
+   // for d in &state.dialogs {
+    //    state.fonts.prepare_text(&d.title, dialog_text_style)?;
+    //    state.fonts.prepare_text(&d.message, dialog_text_style)?;
+    //    for b in &d.buttons {
+     //       state.fonts.prepare_text(&b.label, dialog_text_style)?;
+     //   }
+    //}
 
 if state.fonts.atlas_dirty {
     state.render.upload_font_atlas(renderer, &state.fonts)?;

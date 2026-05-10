@@ -1,31 +1,42 @@
-#[derive(Debug, Clone, Deserialize)]
+use anyhow::{Context, Result};
+use flowstate_themes::FlowThemeId;
+use serde::Deserialize;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct FlowConfig {
-    pub apps: AppsConfig,
-    pub spawn: SpawnConfig,
-    pub ui: UiConfig,
+    #[serde(default)]
+    pub theme: ThemeSection,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct AppsConfig {
-    pub terminal: String,
-    pub browser: String,
-    pub file_manager: String,
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ThemeSection {
+    #[serde(default)]
+    pub active: Option<FlowThemeId>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct SpawnConfig {
-    pub default_workspace: Option<u32>,
-    pub focus_new_windows: Option<bool>,
+impl FlowConfig {
+    pub fn load() -> Result<Self> {
+        let path = config_file_path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {:?}", path))?;
+        eprintln!("FLOWSTATE config path = {:?}", path);
+        eprintln!("FLOWSTATE raw config:\n{}", raw);
+        
+        
+        toml::from_str(&raw).with_context(|| format!("parse {:?}", path))
+    }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct UiConfig {
-    pub bars: BarsConfig,
-    pub theme: ThemeConfig,
+fn config_file_path() -> PathBuf {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".config"))
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+    xdg.join("flowstate").join("config.toml")
 }
-
-use once_cell::sync::Lazy;
-
-pub static CONFIG: Lazy<FlowConfig> = Lazy::new(|| {
-    load().expect("Failed to load FlowState config")
-});

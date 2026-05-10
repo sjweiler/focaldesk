@@ -117,3 +117,11 @@ impl Default for FlowThemeId {
         Self::BuiltIn(BuiltInThemeId::Eagle)
     }
 }
+impl FlowThemeId {
+    pub fn builtin_id(&self) -> Option<BuiltInThemeId> {
+        match self {
+            FlowThemeId::BuiltIn(id) => Some(*id),
+            FlowThemeId::Custom(_) => None,
+        }
+    }
+}

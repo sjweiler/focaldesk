@@ -58,6 +58,11 @@ use flowstate_themes::BackgroundTheme;
 use flowstate_themes::WallpaperTheme;
 use flowstate_themes::IconTheme;
 use flowstate_themes::TextTheme;
+use crate::core::fonts::style_for;
+use crate::core::fonts::FontRole::Title;
+use crate::core::fonts::FontRole;
+use flowstate_themes::theme::BuiltInThemeId;
+
 
 //use crate::core::chrome_svg::ChromeSvgCache;
 
@@ -360,18 +365,25 @@ fn draw_topbar_meta(
     frame: &mut GlesFrame<'_, '_>,
     fonts: &FontSystem,
     layout: &ChromeLayoutPhysical,
+    title: &str,
     output_number: u64,
     workspace_number: usize,
     theme: &flowstate_themes::FlowTheme,
     scale: Scale<f64>,
 ) -> Result<(), GlesError> {
-    let style = TextStyle {
-    font: FontId::DebugMono,
-    size_px: 18,
-};
+
+    let builtin_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+    let title_style = style_for(FontRole::Title, 24, builtin_id);
+    let style = style_for(FontRole::Meta, 18, builtin_id);
+    let gap = theme.spacing.max(4);
 
     let y = layout.title_rect.loc.y + 24;
-    let mut x = layout.title_rect.loc.x + 160; //14;
+    // Same left inset as `draw_topbar_title`, then skip past measured title so meta never overlaps.
+    let title_left = layout.title_rect.loc.x + 14;
+    let mut x = title_left + fonts.advance_width(title, title_style) + gap;
+
+    let output_s = output_number.to_string();
+    let workspace_s = workspace_number.to_string();
 
     self.draw_text_cached(
         frame,
@@ -384,12 +396,12 @@ fn draw_topbar_meta(
         scale,
     )?;
 
-    x += 38;
+    x += fonts.advance_width("OUT", style) + gap;
 
     self.draw_text_cached(
         frame,
         fonts,
-        &output_number.to_string(),
+        &output_s,
         x,
         y,
         style,
@@ -397,7 +409,7 @@ fn draw_topbar_meta(
         scale,
     )?;
 
-    x += 24;
+    x += fonts.advance_width(&output_s, style) + gap;
 
     self.draw_text_cached(
         frame,
@@ -410,12 +422,12 @@ fn draw_topbar_meta(
         scale,
     )?;
 
-    x += 28;
+    x += fonts.advance_width("WS", style) + gap;
 
     self.draw_text_cached(
         frame,
         fonts,
-        &workspace_number.to_string(),
+        &workspace_s,
         x,
         y,
         style,
@@ -435,10 +447,17 @@ fn draw_topbar_title(
     theme: &flowstate_themes::FlowTheme,
     scale: Scale<f64>,
 ) -> Result<(), GlesError> {
- let style = TextStyle {
-    font: FontId::DebugMono,
-    size_px: 24,
-};
+
+     let builtin_id = theme
+        .id
+        .builtin_id()
+        .unwrap_or(BuiltInThemeId::Eagle);
+
+ let style = style_for(FontRole::Title, 24, builtin_id);
+// let style = TextStyle {
+//    font: FontId::Debug,
+//    size_px: 24,
+//};
     let x = layout.title_rect.loc.x + 14; // 120;
     let y = layout.title_rect.loc.y + 24;
 
@@ -533,72 +552,6 @@ let damage_local =
     Ok(())
 }
 
-pub fn draw_text_test(
-    &mut self,
-    frame: &mut GlesFrame<'_, '_>,
-    fonts: &FontSystem,
-) -> Result<(), GlesError> {
-    let style = TextStyle {
-        font: FontId::DebugMono,
-        size_px: 14,
-    };
-
-    let key = (style.font, style.size_px, 'A');
-
-    let glyph = match fonts.glyph(key) {
-        Some(g) => g,
-        None => return Ok(()),
-    };
-
-    let tex = match self.font_atlas_texture.as_ref() {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-
-    let program = self
-        .chrome_shaders
-        .font_text
-        .as_ref()
-        .expect("font_text shader missing");
-
-    let x = 100;
-    let baseline_y = 100;
-
-    let dst_logical = Rectangle::<i32, Logical>::from_loc_and_size(
-        (
-            x + glyph.xmin,
-            baseline_y - glyph.ymin - glyph.h as i32,
-        ),
-        (
-            glyph.w as i32,
-            glyph.h as i32,
-        ),
-    );
-
-    let src = Rectangle::<f64, smithay::utils::Buffer>::from_loc_and_size(
-        (glyph.atlas_x as f64, glyph.atlas_y as f64),
-        (glyph.w as f64, glyph.h as f64),
-    );
-
-let dst = dst_logical.to_physical_precise_round(1.0);
-
-    let damage_local =
-        Rectangle::<i32, Physical>::from_loc_and_size((0, 0), (dst.size.w, dst.size.h));
-
-    frame.render_texture_from_to(
-        tex,
-        src,
-        dst,
-        &[damage_local],
-        &[],
-        Transform::Normal,
-        1.0,
-        Some(program),
-        &[Uniform::new("u_tint", [1.0, 1.0, 1.0, 1.0])],
-    )?;
-
-    Ok(())
-}
 
 pub fn upload_font_atlas(
     &mut self,
@@ -1013,15 +966,12 @@ fn draw_clock_font_text(
     fonts: &FontSystem,
     text: &str,
     rect: Rectangle<i32, Physical>,
-    scale: Scale<f64>,
+    _scale: Scale<f64>,
+    style: TextStyle,
     color: [f32; 4],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let style = TextStyle {
-        font: FontId::DebugMono,
-        size_px: 24,
-    };
-
-    let x = rect.loc.x  + 8;
+    let text_w = fonts.advance_width(text, style);
+    let x = rect.loc.x + ((rect.size.w - text_w).max(0) / 2);
     let y = rect.loc.y + 24;
 
     self.draw_text_cached(
@@ -1305,9 +1255,7 @@ pub fn draw_rounded_rect(
             inputs.ui_tree,
             inputs.current_workspace,
             inputs.fonts,
-            theme.chrome,
-            theme.icons,
-            theme.text,
+            theme,
         );
 
         // xdg popups are included in [`Window::render_elements`] when [`PopupManager::commit`] runs.
@@ -1348,6 +1296,7 @@ pub fn draw_rounded_rect(
                 program,
                 inputs.fonts,
                 inputs.ctx.output_scale,
+                theme,
             )?;
         }
             
@@ -1376,6 +1325,7 @@ pub fn draw_rounded_rect(
         program: &GlesTexProgram,
         fonts: &FontSystem,
         scale: Scale<f64>,
+        theme: &FlowTheme,
     ) -> Result<(), GlesError> {
         let Some(dialog_id) = active_dialog else {
             return Ok(());
@@ -1397,6 +1347,7 @@ pub fn draw_rounded_rect(
             output_pixels,
             scale,
             draw_dialog_chrome,
+            theme,
         )?;
 
         Ok(())
@@ -1414,6 +1365,7 @@ fn draw_dialog(
     scale: Scale<f64>,
     // When false: fullscreen dim scrim only (other DRM heads while modal is up).
     draw_dialog_chrome: bool,
+    theme: &FlowTheme,
 ) -> Result<(), GlesError> {
     // Full framebuffer in physical px; dialogs are laid out in logical space (`layout`) then lifted.
     // Must use `Frame::draw_solid`, not `clear`: smithay `clear` disables blending, so translucent
@@ -1458,10 +1410,11 @@ flog(&format!("DRAW REAL FONT TITLE: {}", dialog.title));
         &dialog.title,
         layout.title_rect.loc.x,
         title_baseline,
-        TextStyle {
-            font: FontId::DebugMono,
-            size_px: 16,
-        },
+        style_for(FontRole::Title, 16, theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle)), 
+        //TextStyle {
+        //    font: FontId::Title,
+        //    size_px: 16,
+        //},
         [1.0, 0.97, 0.90, 1.0],
         scale,
     )?;
@@ -1474,10 +1427,11 @@ flog(&format!("DRAW REAL FONT TITLE: {}", dialog.title));
             line,
             layout.message_rect.loc.x,
             y,
-            TextStyle {
-                font: FontId::DebugMono,
-                size_px: 16,
-            },
+            style_for(FontRole::Body, 16, theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle)),
+            //TextStyle {
+            //    font: FontId::Debug,
+            //    size_px: 16,
+            //},
             [0.78, 0.86, 1.0, 0.9],
             scale,
         )?;
@@ -1513,10 +1467,11 @@ flog(&format!("DRAW REAL FONT TITLE: {}", dialog.title));
                 &button.label,
                 rect.loc.x + 18,
                 rect.loc.y + 26,
-                TextStyle {
-                    font: FontId::DebugMono,
-                    size_px: 16,
-                },
+                style_for(FontRole::Label, 16, theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle)),
+               // TextStyle {
+               //     font: FontId::Debug,
+                //    size_px: 16,
+               // },
                 [1.0, 1.0, 1.0, 1.0],
                 scale,
             )?;
@@ -2368,11 +2323,9 @@ for window in space.elements() {
         ui_tree: &UiTree,
         current_workspace: WorkspaceId, 
         fonts: &FontSystem,
-        chrome: flowstate_themes::ChromeTheme,
-        icons: IconTheme,
-        text: TextTheme,
+        theme: &FlowTheme,
     ) {
-       let legacy_theme = chrome_theme_from_flow_theme(&chrome);
+       let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
 
         let beveled = self
             .chrome_shaders
@@ -2437,7 +2390,7 @@ for window in space.elements() {
         
     let output_number = ctx.rendering_output.0;
     let workspace_number = 1;
-    let active_theme = flowstate_themes::FlowTheme::default();  
+    let active_theme = theme;
         
 
 let _ = self.draw_topbar_title(
@@ -2453,6 +2406,7 @@ let _ = self.draw_topbar_meta(
     frame,
     fonts,
     layout,
+    "FLOWSTATE",
     output_number,
     workspace_number,
     &active_theme,
@@ -2553,7 +2507,14 @@ style.glow *= output_factor;
 
             let clock_rect = inset_rect(base_rect, 4);
             //self.draw_clock_text(frame, atlas, &time_str, clock_rect,tinted_icon);
-            self.draw_clock_font_text(frame,fonts,&time_str,clock_rect,ctx.output_scale, active_theme.text.clock,);
+            
+            let clock_style = style_for(
+                FontRole::Clock,
+                24,
+                active_theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle),
+            );
+            
+            self.draw_clock_font_text(frame,fonts,&time_str,clock_rect,ctx.output_scale,clock_style, active_theme.text.clock,);
         }
 
         _ => {}
