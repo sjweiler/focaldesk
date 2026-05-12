@@ -47,8 +47,7 @@ use crate::core::chrome_shaders::ChromeShaders;
 use crate::core::chrome_layout::{ChromeLayout, ChromeLayoutLogical};
 use flowstate_types::WorkspaceId;
 use crate::core::shell::ManagedWindow;
-use flowstate_ui::UiVisualStyle;
-use flowstate_ui::visual_style;
+use flowstate_ui::{UiVisualState, UiVisualStyle};
 use flowstate_ui::dialog_layout::layout_dialog;
 use flowstate_ui::dialog_layout::DialogLayout;
 use flowstate_ui::dialog::{Dialog, DialogId};
@@ -186,6 +185,47 @@ fn to_physical_rect(
     scale: Scale<f64>,
 ) -> Rectangle<i32, Physical> {
     rect_logical.to_physical_precise_round(scale)
+}
+
+fn themed_icon_style(theme: &FlowTheme, state: UiVisualState) -> UiVisualStyle {
+    let (tint, glow, alpha, scale) = match state {
+        UiVisualState::Inactive => (theme.icons.inactive, 0.0, theme.icons.inactive[3], 1.0),
+        UiVisualState::Hover => (theme.icons.hover, 0.14, theme.icons.hover[3], theme.hover_scale),
+        UiVisualState::Active => (theme.icons.active, 0.32, theme.icons.active[3], theme.press_scale),
+        UiVisualState::Selected => (theme.icons.active, 0.28, theme.icons.active[3], 1.02),
+        UiVisualState::Disabled => (theme.icons.disabled, 0.0, theme.icons.disabled[3], 1.0),
+    };
+
+    UiVisualStyle {
+        tint,
+        glow,
+        alpha,
+        scale,
+    }
+}
+
+fn selected_sidebar_style(theme: &FlowTheme, hovered: bool) -> BevelStyle {
+    let mut face_color = theme.chrome.panel_color;
+    face_color[3] = 0.34;
+
+    let mut glow_color = theme.icons.glow;
+    glow_color[3] = if hovered {
+        (glow_color[3] + 0.22).min(0.85)
+    } else {
+        (glow_color[3] + 0.12).min(0.70)
+    };
+
+    BevelStyle {
+        bevel: 2.0,
+        softness: 1.25,
+        glow_width: 5.0,
+        glow_alpha: if hovered { 0.72 } else { 0.52 },
+        inner_shadow: 0.10,
+        face_color,
+        light_color: theme.chrome.accent_color,
+        shadow_color: [0.0, 0.0, 0.0, 0.45],
+        glow_color,
+    }
 }
 
 
@@ -385,9 +425,9 @@ fn draw_topbar_meta(
     let style = style_for(FontRole::Meta, 18, builtin_id);
     let gap = theme.spacing.max(4);
 
-    let y_logical = layout.title_rect.loc.y + 24;
+    let y_logical = layout.topbar.title.loc.y + 24;
     // Same left inset as `draw_topbar_title`, then skip past measured title so meta never overlaps.
-    let title_left_logical = layout.title_rect.loc.x + 14;
+    let title_left_logical = layout.topbar.title.loc.x + 14;
     let mut x_logical = title_left_logical + fonts.advance_width(title, title_style) + gap;
 
     let output_s = output_number.to_string();
@@ -466,8 +506,8 @@ fn draw_topbar_title(
 //    font: FontId::Debug,
 //    size_px: 24,
 //};
-    let x_logical = layout.title_rect.loc.x + 14; // 120;
-    let y_logical = layout.title_rect.loc.y + 24;
+    let x_logical = layout.topbar.title.loc.x + 14; // 120;
+    let y_logical = layout.topbar.title.loc.y + 24;
 
     self.draw_text_cached(
         frame,
@@ -1253,7 +1293,7 @@ pub fn draw_rounded_rect(
         self.draw_wallpaper_in_rect(
             frame,
             inputs.ctx,
-            inputs.layout.work_recess,
+            inputs.layout.work_area.recess,
             inputs.ctx.output_scale,
             theme.wallpaper.clone(),
         );
@@ -2031,8 +2071,8 @@ for window in space.elements() {
     };
 
     let bar_rect_logical = Rectangle::from_loc_and_size(
-        layout.topbar_outer.loc,
-        (layout.topbar_outer.size.w, 10),
+        layout.topbar.outer.loc,
+        (layout.topbar.outer.size.w, 10),
     );
 
     let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
@@ -2120,7 +2160,7 @@ for window in space.elements() {
         let beveled = self
             .chrome_shaders
             .beveled_panel
-            .as_ref()
+            .clone()
             .expect("beveled_panel shader not compiled");
 
         let light = self
@@ -2154,7 +2194,7 @@ for window in space.elements() {
         let _ = Self::draw_top_bar(
             frame,
             top_bar,
-            layout.topbar_outer,
+            layout.topbar.outer,
             ctx.output_scale,
             damage,
             &legacy_theme.top_bar,
@@ -2162,8 +2202,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.topbar_outer,
+            &beveled,
+            layout.topbar.outer,
             ctx.output_scale,
             damage,
             &legacy_theme.frame_outer,
@@ -2171,8 +2211,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.topbar_inner,
+            &beveled,
+            layout.topbar.inner,
             ctx.output_scale,
             damage,
             &legacy_theme.frame_inner,
@@ -2180,8 +2220,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.sidebar_outer,
+            &beveled,
+            layout.sidebar.outer,
             ctx.output_scale,
             damage,
             &legacy_theme.sidebar,
@@ -2189,8 +2229,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.sidebar_inner,
+            &beveled,
+            layout.sidebar.inner,
             ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
@@ -2198,8 +2238,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.work_outer,
+            &beveled,
+            layout.work_area.outer,
             ctx.output_scale,
             damage,
             &legacy_theme.frame_outer,
@@ -2207,8 +2247,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.work_inner_frame,
+            &beveled,
+            layout.work_area.inner_frame,
             ctx.output_scale,
             damage,
             &legacy_theme.frame_inner,
@@ -2216,8 +2256,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.work_recess,
+            &beveled,
+            layout.work_area.recess,
             ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
@@ -2229,8 +2269,8 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.title_rect,
+            &beveled,
+            layout.topbar.title,
             ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
@@ -2238,14 +2278,14 @@ for window in space.elements() {
 
         Self::draw_beveled_panel(
             frame,
-            beveled,
-            layout.topbar_trim,
+            &beveled,
+            layout.topbar.trim,
             ctx.output_scale,
             damage,
             &legacy_theme.trim,
         );
 
-        if let Some(rect) = layout.topbar_light {
+        if let Some(rect) = layout.topbar.light {
             Self::draw_light_channel(
                 frame,
                 light,
@@ -2256,7 +2296,7 @@ for window in space.elements() {
             );
         }
 
-        for rect in &layout.status_wells {
+        for rect in &layout.topbar.status_wells {
             Self::draw_recessed_button(
                 frame,
                 button,
@@ -2279,7 +2319,7 @@ for window in space.elements() {
         Self::draw_recessed_button(
             frame,
             button,
-            layout.clock_well,
+            layout.topbar.clock_well,
             ctx.output_scale,
             damage,
             &legacy_theme.button,
@@ -2288,7 +2328,7 @@ for window in space.elements() {
         Self::draw_light_channel(
             frame,
             light,
-            inset_rect(layout.clock_well, 3),
+            inset_rect(layout.topbar.clock_well, 3),
             ctx.output_scale,
             damage,
             &legacy_theme.light,
@@ -2298,23 +2338,21 @@ for window in space.elements() {
         // 3. SIDEBAR MODULESFtopbar
         //
 
-        for (i, ((outer, inner), well)) in layout
-            .slot_outer_rects
-            .iter()
-            .zip(layout.slot_inner_rects.iter())
-            .zip(layout.slot_icon_wells.iter())
-            .enumerate()
-        {
+       for (i, slot) in layout.sidebar.slots.iter().enumerate()  {
+            let outer = slot.outer;
+            let inner = slot.inner;
+            let well = slot.icon_well;
+        
             let hovered = sidebar_hover_slot == Some(i);
 
-            let _ = Self::draw_beveled_panel(frame, beveled, *outer, ctx.output_scale, damage, &legacy_theme.module);
-            let _ = Self::draw_beveled_panel(frame, beveled, *inner, ctx.output_scale, damage, &legacy_theme.module_inner);
-            Self::draw_recessed_button(frame, button, *well, ctx.output_scale, damage, &legacy_theme.button);
+            let _ = Self::draw_beveled_panel(frame, &beveled, outer, ctx.output_scale, damage, &legacy_theme.module);
+            let _ = Self::draw_beveled_panel(frame, &beveled, inner, ctx.output_scale, damage, &legacy_theme.module_inner);
+            Self::draw_recessed_button(frame, button, well, ctx.output_scale, damage, &legacy_theme.button);
 
             //if hovered {
             let hover = if hovered { 1.0 } else { 0.0 };
 
-            let glow_rect = inset_rect(*well, 3);
+            let glow_rect = inset_rect(well, 3);
 
             let mut light_style = legacy_theme.light;
             
@@ -2333,7 +2371,7 @@ for window in space.elements() {
            // }
         }
 
-        if let Some(rect) = layout.sidebar_light_rect {
+        if let Some(rect) = layout.sidebar.light {
             Self::draw_light_channel(
                 frame,
                 light,
@@ -2344,20 +2382,20 @@ for window in space.elements() {
             );
         }
 
-        for rect in &layout.sidebar_caps {
-            Self::draw_beveled_panel(frame, beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
+        for rect in &layout.sidebar.caps {
+            Self::draw_beveled_panel(frame, &beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
         }
 
         //
         // 4. DECORATIVE CAPS / JOINTS
         //
 
-        for rect in &layout.corner_caps {
-            Self::draw_beveled_panel(frame, beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
+        for rect in &layout.decoration.corner_caps {
+            Self::draw_beveled_panel(frame, &beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
         }
 
-        for rect in &layout.corner_joint_caps {
-            Self::draw_beveled_panel(frame, beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
+        for rect in &layout.decoration.corner_joint_caps {
+            Self::draw_beveled_panel(frame, &beveled, *rect, ctx.output_scale, damage, &legacy_theme.corner_cap);
         }
     }
 
@@ -2381,7 +2419,7 @@ for window in space.elements() {
         let beveled = self
             .chrome_shaders
             .beveled_panel
-            .as_ref()
+            .clone()
             .expect("beveled_panel shader not compiled");
 
         let glass = self
@@ -2400,10 +2438,10 @@ for window in space.elements() {
         );
         let damage = &[fullscreen_rect];
 
-        if let Some(rect) = layout.work_trim {
+        if let Some(rect) = layout.work_area.trim {
             Self::draw_beveled_panel(
                 frame,
-                beveled,
+                &beveled,
                 rect,
                 ctx.output_scale,
                 damage,
@@ -2415,7 +2453,7 @@ for window in space.elements() {
             frame,
             ctx,
             glass,
-            layout.glass_rect,
+            layout.work_area.glass,
             ctx.output_scale,
             damage,
             &legacy_theme.glass,
@@ -2434,7 +2472,7 @@ for window in space.elements() {
             current_workspace.0
         );
 
-        let _label_rect_logical = title_label_rect(layout.title_rect);
+        let _label_rect_logical = title_label_rect(layout.topbar.title);
         
         
         let is_active = ctx.rendering_output == ctx.active_output; // or output.output_id
@@ -2501,6 +2539,8 @@ let _ = self.draw_topbar_meta(
 
     let icon_state = if el.active {
         IconState::Active
+    } else if el.selected {
+        IconState::Active
     } else if el.hovered {
         IconState::Hover
     } else if !el.enabled {
@@ -2510,7 +2550,7 @@ let _ = self.draw_topbar_meta(
     };
 
 let state = el.visual_state();
-let mut style = visual_style(state);
+let mut style = themed_icon_style(active_theme, state);
 
 let is_active_output = ctx.rendering_output == ctx.active_output;
 let output_factor = if is_active_output { 1.0 } else { 0.75 };
@@ -2525,6 +2565,19 @@ style.glow *= output_factor;
 
     match el.kind {
         UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot => {
+            if el.selected || el.active {
+                let selected_rect_logical = inset_rect(base_rect_logical, 3);
+                let selected_style = selected_sidebar_style(active_theme, el.hovered || el.active);
+                let _ = Self::draw_beveled_panel(
+                    frame,
+                    &beveled,
+                    selected_rect_logical,
+                    ctx.output_scale,
+                    damage,
+                    &selected_style,
+                );
+            }
+
             if let Some(icon_id) = el.icon {
                 let mut icon_rect_logical = icon_rect_in_module(base_rect_logical, icon_px);
                 if scale != 1.0 {

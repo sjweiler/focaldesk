@@ -10,15 +10,15 @@ pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
 /// True when `(lx, ly)` (output-local **logical** coords) is in the top bar host-drag strip
 /// but not on status/clock wells.
 pub fn chrome_host_drag_hit(layout: &ChromeLayout, lx: i32, ly: i32) -> bool {
-    if !layout.topbar_outer.contains((lx, ly)) {
+    if !layout.topbar.outer.contains((lx, ly)) {
         return false;
     }
-    for well in &layout.status_wells {
+    for well in &layout.topbar.status_wells {
         if well.contains((lx, ly)) {
             return false;
         }
     }
-    if layout.clock_well.contains((lx, ly)) {
+    if layout.topbar.clock_well.contains((lx, ly)) {
         return false;
     }
     true
@@ -26,11 +26,12 @@ pub fn chrome_host_drag_hit(layout: &ChromeLayout, lx: i32, ly: i32) -> bool {
 
 /// Index of the sidebar slot under output-local **logical** `(lx, ly)`, using each slot's outer module rect.
 pub fn sidebar_slot_index_at(layout: &ChromeLayout, lx: i32, ly: i32) -> Option<usize> {
-    layout
-        .slot_outer_rects
+     layout
+        .sidebar
+        .slots
         .iter()
         .enumerate()
-        .find(|(_, r)| r.contains((lx, ly)))
+        .find(|(_, slot)| slot.outer.contains((lx, ly)))
         .map(|(i, _)| i)
 }
 
@@ -48,27 +49,37 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
     let sc_vec =
         |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(|r| sc(r)).collect();
     ChromeLayout {
-        topbar_outer: sc(layout.topbar_outer),
-        topbar_inner: sc(layout.topbar_inner),
-        title_rect: sc(layout.title_rect),
-        topbar_trim: sc(layout.topbar_trim),
-        status_wells: sc_vec(&layout.status_wells),
-        clock_well: sc(layout.clock_well),
-        topbar_light: sc_opt(layout.topbar_light),
-        sidebar_outer: sc(layout.sidebar_outer),
-        sidebar_inner: sc(layout.sidebar_inner),
-        slot_outer_rects: sc_vec(&layout.slot_outer_rects),
-        slot_inner_rects: sc_vec(&layout.slot_inner_rects),
-        slot_icon_wells: sc_vec(&layout.slot_icon_wells),
-        sidebar_light_rect: sc_opt(layout.sidebar_light_rect),
-        sidebar_caps: sc_vec(&layout.sidebar_caps),
-        work_outer: sc(layout.work_outer),
-        work_inner_frame: sc(layout.work_inner_frame),
-        work_recess: sc(layout.work_recess),
-        glass_rect: sc(layout.glass_rect),
-        work_trim: sc_opt(layout.work_trim),
-        corner_caps: sc_vec(&layout.corner_caps),
-        corner_joint_caps: sc_vec(&layout.corner_joint_caps),
+        topbar: TopBarLayout {
+            outer: sc(layout.topbar.outer),
+            inner: sc(layout.topbar.inner),
+            title: sc(layout.topbar.title),
+            trim: sc(layout.topbar.trim),
+            status_wells: sc_vec(&layout.topbar.status_wells),
+            clock_well: sc(layout.topbar.clock_well),
+            light: sc_opt(layout.topbar.light),
+        },
+        sidebar: SidebarLayout {
+            outer: sc(layout.sidebar.outer),
+            inner: sc(layout.sidebar.inner),
+            slots: layout.sidebar.slots.iter().map(|slot| SidebarSlotLayout {
+                outer: sc(slot.outer),
+                inner: sc(slot.inner),
+                icon_well: sc(slot.icon_well),
+            }).collect(),
+            light: sc_opt(layout.sidebar.light),
+            caps: sc_vec(&layout.sidebar.caps),
+        },
+        work_area: WorkAreaLayout {
+            outer: sc(layout.work_area.outer),
+            inner_frame: sc(layout.work_area.inner_frame),
+            recess: sc(layout.work_area.recess),
+            glass: sc(layout.work_area.glass),
+            trim: sc_opt(layout.work_area.trim),
+        },
+        decoration: ChromeDecorationLayout {
+            corner_caps: sc_vec(&layout.decoration.corner_caps),
+            corner_joint_caps: sc_vec(&layout.decoration.corner_joint_caps),
+        },
     }
 }
 
@@ -80,35 +91,54 @@ pub type ChromeLayoutPhysical = ChromeLayout<Physical>;
 
 #[derive(Debug, Clone)]
 pub struct ChromeLayout<Kind = Logical> {
-    // Top bar
-    pub topbar_outer: Rectangle<i32, Kind>,
-    pub topbar_inner: Rectangle<i32, Kind>,
-    pub title_rect: Rectangle<i32, Kind>,
-    pub topbar_trim: Rectangle<i32, Kind>,
+    pub topbar: TopBarLayout<Kind>,
+    pub sidebar: SidebarLayout<Kind>,
+    pub work_area: WorkAreaLayout<Kind>,
+    pub decoration: ChromeDecorationLayout<Kind>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TopBarLayout<Kind = Logical> {
+    pub outer: Rectangle<i32, Kind>,
+    pub inner: Rectangle<i32, Kind>,
+    pub title: Rectangle<i32, Kind>,
+    pub trim: Rectangle<i32, Kind>,
     pub status_wells: Vec<Rectangle<i32, Kind>>,
     pub clock_well: Rectangle<i32, Kind>,
-    pub topbar_light: Option<Rectangle<i32, Kind>>,
+    pub light: Option<Rectangle<i32, Kind>>,
+}
 
-    // Sidebar
-    pub sidebar_outer: Rectangle<i32, Kind>,
-    pub sidebar_inner: Rectangle<i32, Kind>,
-    pub slot_outer_rects: Vec<Rectangle<i32, Kind>>,
-    pub slot_inner_rects: Vec<Rectangle<i32, Kind>>,
-    pub slot_icon_wells: Vec<Rectangle<i32, Kind>>,
-    pub sidebar_light_rect: Option<Rectangle<i32, Kind>>,
-    pub sidebar_caps: Vec<Rectangle<i32, Kind>>,
+#[derive(Debug, Clone)]
+pub struct SidebarLayout<Kind = Logical> {
+    pub outer: Rectangle<i32, Kind>,
+    pub inner: Rectangle<i32, Kind>,
+    pub slots: Vec<SidebarSlotLayout<Kind>>,
+    pub light: Option<Rectangle<i32, Kind>>,
+    pub caps: Vec<Rectangle<i32, Kind>>,
+}
 
-    // Work area
-    pub work_outer: Rectangle<i32, Kind>,
-    pub work_inner_frame: Rectangle<i32, Kind>,
-    pub work_recess: Rectangle<i32, Kind>,
-    pub glass_rect: Rectangle<i32, Kind>,
-    pub work_trim: Option<Rectangle<i32, Kind>>,
+#[derive(Debug, Clone)]
+pub struct SidebarSlotLayout<Kind = Logical> {
+    pub outer: Rectangle<i32, Kind>,
+    pub inner: Rectangle<i32, Kind>,
+    pub icon_well: Rectangle<i32, Kind>,
+}
 
-    // Decorative joints
+#[derive(Debug, Clone)]
+pub struct WorkAreaLayout<Kind = Logical> {
+    pub outer: Rectangle<i32, Kind>,
+    pub inner_frame: Rectangle<i32, Kind>,
+    pub recess: Rectangle<i32, Kind>,
+    pub glass: Rectangle<i32, Kind>,
+    pub trim: Option<Rectangle<i32, Kind>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChromeDecorationLayout<Kind = Logical> {
     pub corner_caps: Vec<Rectangle<i32, Kind>>,
     pub corner_joint_caps: Vec<Rectangle<i32, Kind>>,
 }
+
 
 fn inset_rect<Kind>(rect: Rectangle<i32, Kind>, inset: i32) -> Rectangle<i32, Kind> {
     let x = rect.loc.x + inset;
@@ -249,52 +279,17 @@ pub fn build_chrome_layout(
         ),
     );
 
-/*
-    let well_y = 8;
-    let well_h = (top_h - 16).max(12);
-
-    // Reserve the far-right well for the clock.
-    let clock_w = 78;
-    let clock_well = Rectangle::from_loc_and_size(
-        (w - 10 - clock_w, well_y),
-        (clock_w.max(24), well_h),
-    );
-
-    // Title area occupies the main left/middle portion of the top bar.
-    let title_left = left_w + 10;
-    let title_right_limit = (clock_well.loc.x - 8).max(title_left + 24);
-    let title_rect = Rectangle::from_loc_and_size(
-        (title_left, well_y),
-        ((title_right_limit - title_left).max(24), well_h),
-    );
-
-    // Status wells fill the space between the title and the clock.
-    let mut status_wells = Vec::new();
-    let well_w = 22;
-    let well_gap = 6;
-
-    let wells_right_edge = clock_well.loc.x - 8;
-    let wells_left_edge = title_rect.loc.x + title_rect.size.w + 8;
-
-    let mut well_x = wells_right_edge - well_w;
-    while well_x >= wells_left_edge {
-        status_wells.push(Rectangle::from_loc_and_size(
-            (well_x, well_y),
-            (well_w, well_h),
-        ));
-        well_x -= well_w + well_gap;
-    }
-    status_wells.reverse();
-*/
     // -------------------------------------------------------------------------
     // 4. SIDEBAR STACK
     // -------------------------------------------------------------------------
 
+    let mut slots = Vec::new();
+
     let sidebar_inner = inset_rect(sidebar_outer, 4);
 
-    let mut slot_outer_rects = Vec::new();
-    let mut slot_inner_rects = Vec::new();
-    let mut slot_icon_wells = Vec::new();
+    //let mut slot_outer_rects = Vec::new();
+   // let mut slot_inner_rects = Vec::new();
+   // let mut slot_icon_wells = Vec::new();
 
     let module_h = 48;
     let module_gap = 8;
@@ -310,9 +305,15 @@ pub fn build_chrome_layout(
         let inner = inset_rect(outer, 2);
         let well = inset_rect(inner, 3);
 
-        slot_outer_rects.push(outer);
-        slot_inner_rects.push(inner);
-        slot_icon_wells.push(well);
+        slots.push(SidebarSlotLayout {
+            outer,
+            inner,
+            icon_well: well,
+        });
+
+        //slot_outer_rects.push(outer);
+        //slot_inner_rects.push(inner);
+        //slot_icon_wells.push(well);
 
         y += module_h + module_gap;
     }
@@ -366,32 +367,35 @@ pub fn build_chrome_layout(
 
     ChromeLayout {
         // Top bar
-        topbar_outer,
-        topbar_inner,
-        title_rect,
-        topbar_trim,
-        status_wells,
-        clock_well,
-        topbar_light,
-
+        topbar: TopBarLayout {
+            outer: topbar_outer,
+            inner: topbar_inner,
+            title: title_rect,
+            trim: topbar_trim,
+            status_wells,
+            clock_well,
+            light: topbar_light,
+        },
         // Sidebar
-        sidebar_outer,
-        sidebar_inner,
-        slot_outer_rects,
-        slot_inner_rects,
-        slot_icon_wells,
-        sidebar_light_rect,
-        sidebar_caps,
-
+        sidebar: SidebarLayout {
+            outer: sidebar_outer,
+            inner: sidebar_inner,
+            slots,
+            light: sidebar_light_rect,
+            caps: sidebar_caps,
+        },
         // Work area
-        work_outer,
-        work_inner_frame,
-        work_recess,
-        glass_rect,
-        work_trim,
-
+        work_area: WorkAreaLayout {
+            outer: work_outer,
+            inner_frame: work_inner_frame,
+            recess: work_recess,
+            glass: glass_rect,
+            trim: work_trim,
+        },
         // Decorative joints
-        corner_caps,
-        corner_joint_caps,
+        decoration: ChromeDecorationLayout {
+            corner_caps,
+            corner_joint_caps,
+        },
     }
 }

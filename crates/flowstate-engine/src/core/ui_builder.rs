@@ -12,8 +12,9 @@ const CLOCK_ID: u32 = 100_000;
 pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
     ui.elements.clear();
 
-    for (i, rect) in layout.slot_outer_rects.iter().enumerate() {
+    for (i, slot) in layout.sidebar.slots.iter().enumerate() {
         let id = SIDEBAR_BASE + i as u32;
+        let rect = slot.outer;
     
         let icon = match i {
         0 => IconId::Launcher,
@@ -63,7 +64,7 @@ pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
         ui.elements.push(el);
     }
 
-    for (i, rect) in layout.status_wells.iter().enumerate() {
+    for (i, rect) in layout.topbar.status_wells.iter().enumerate() {
            let (icon, tooltip, action) = match i {
                 0 => (IconId::Wifi, "Network", UiAction::OpenPanel(PanelKind::Network)),
                 1 => (IconId::Bluetooth, "Bluetooth", UiAction::OpenPanel(PanelKind::Bluetooth)),
@@ -101,10 +102,10 @@ pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
         id: CLOCK_ID,
         kind: UiElementKind::Clock,
         bounds: UiRect {
-            x: layout.clock_well.loc.x,
-            y: layout.clock_well.loc.y,
-            w: layout.clock_well.size.w,
-            h: layout.clock_well.size.h,
+            x: layout.topbar.clock_well.loc.x,
+            y: layout.topbar.clock_well.loc.y,
+            w: layout.topbar.clock_well.size.w,
+            h: layout.topbar.clock_well.size.h,
         },
         icon: None,
         label: None,

@@ -672,7 +672,7 @@ impl DesktopState {
             self.chrome.metrics.sidebar_w,
         );
 
-        layout.work_recess.contains((px, py))
+        layout.work_area.recess.contains((px, py))
     }
     
     /// Hovered sidebar slot for this output only (global pointer + per-output chrome layout).
