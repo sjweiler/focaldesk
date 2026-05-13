@@ -179,70 +179,71 @@ impl Chrome
         );
 
         // Draw icons (example positions).
-        self.draw_topbar_icons(frame);
-        self.draw_sidebar_slots(frame);
+        self.draw_topbar_icons(frame, output_size);
+        self.draw_sidebar_slots(frame, output_size);
     }
 
     
-    fn draw_topbar_icons(&self, frame: &mut impl Frame<
-    TextureId = GlesTexture,
-    Error = smithay::backend::renderer::gles::GlesError,
->)
-    {
+    fn draw_topbar_icons(
+        &self,
+        frame: &mut impl Frame<
+            TextureId = GlesTexture,
+            Error = smithay::backend::renderer::gles::GlesError,
+        >,
+        output_size: Size<i32, Physical>,
+    ) {
+        let Some(atlas) = self.atlas.as_ref() else {
+            return;
+        };
 
-        //let Some(ui) = self.ui.as_ref() else {
-        //    return;
-        //};
-        
-    let Some(atlas) = self.atlas.as_ref() else {
-        return;
-    };
+        let x = self.metrics.sidebar_w + self.metrics.icon_padding;
+        let y = (self.metrics.topbar_h - self.metrics.icon_base_px as i32) / 2;
 
-    let x = self.metrics.sidebar_w + self.metrics.icon_padding;
-    let y = (self.metrics.topbar_h - self.metrics.icon_base_px as i32) / 2;
-
-    if let Some(entry) = atlas.get(IconId::Launcher) {
-        let _ = render_atlas_icon(
-            frame,
-            &atlas.texture,
-            *entry,
-            x,
-            y,
-            self.metrics.icon_base_px as i32,
-            self.metrics.icon_base_px as i32,
-        );
-    }
-        
-    }
-
-    
-    fn draw_sidebar_slots(&self, frame: &mut impl Frame<
-    TextureId = GlesTexture,
-    Error = smithay::backend::renderer::gles::GlesError,
->) 
-    {
-        //let icons = self.icons();
-    let Some(atlas) = self.atlas.as_ref() else {
-        return;
-    };
-
-    let base_x = (self.metrics.sidebar_w - self.metrics.icon_base_px as i32) / 2;
-    let mut y = self.metrics.topbar_h + self.metrics.icon_padding;
-
-    for n in 1..=9 {
-        if let Some(entry) = atlas.get(IconId::Slot(n)) {
+        if let Some(entry) = atlas.get(IconId::Launcher) {
             let _ = render_atlas_icon(
                 frame,
                 &atlas.texture,
                 *entry,
-                base_x,
+                x,
                 y,
                 self.metrics.icon_base_px as i32,
                 self.metrics.icon_base_px as i32,
+                output_size,
             );
         }
-
-        y += self.metrics.icon_base_px as i32 + self.metrics.slot_spacing;
     }
+
+    
+    fn draw_sidebar_slots(
+        &self,
+        frame: &mut impl Frame<
+            TextureId = GlesTexture,
+            Error = smithay::backend::renderer::gles::GlesError,
+        >,
+        output_size: Size<i32, Physical>,
+    ) {
+        let Some(atlas) = self.atlas.as_ref() else {
+            return;
+        };
+
+        let base_x = (self.metrics.sidebar_w - self.metrics.icon_base_px as i32) / 2;
+        let mut y = self.metrics.topbar_h + self.metrics.icon_padding;
+
+        for n in 1..=9 {
+            if let Some(entry) = atlas.get(IconId::Slot(n)) {
+                let _ = render_atlas_icon(
+                    frame,
+                    &atlas.texture,
+                    *entry,
+                    base_x,
+                    y,
+                    self.metrics.icon_base_px as i32,
+                    self.metrics.icon_base_px as i32,
+                    output_size,
+                );
+            }
+
+            y += self.metrics.icon_base_px as i32 + self.metrics.slot_spacing;
+        }
     }
 }

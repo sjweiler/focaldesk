@@ -237,8 +237,9 @@ pub fn render_atlas_icon(
     y: i32,
     w: i32,
     h: i32,    
+    output_size: Size<i32, Physical>,
 ) -> Result<(), GlesError> {
-    render_atlas_icon_with_alpha(frame, atlas, entry, x, y, w, h, 1.0)
+    render_atlas_icon_with_alpha(frame, atlas, entry, x, y, w, h, output_size, 1.0)
 }
 
 pub fn render_atlas_icon_with_alpha(
@@ -252,6 +253,7 @@ pub fn render_atlas_icon_with_alpha(
     y: i32,
     w: i32,
     h: i32,
+    output_size: Size<i32, Physical>,
     alpha: f32,
 ) -> Result<(), GlesError> {
 let size = atlas.size();
@@ -271,7 +273,7 @@ let atlas_h = size.h as f64;
 
         
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
-    let full =  Rectangle::<i32, Physical>::from_loc_and_size((0,0),(2560,1440));
+    let full =  Rectangle::<i32, Physical>::from_loc_and_size((0,0), output_size);
     
     
     frame.render_texture_from_to(
