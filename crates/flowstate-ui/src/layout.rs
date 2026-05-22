@@ -113,10 +113,10 @@ impl LayoutEngine {
         let work_area = Rectangle::new((wx, wy).into(), (ww, wh).into());
 
         // Pip fous area
-        let mut px = side_bar_w;
-        let mut py = top_bar_h;
-        let mut pw = (out_w - side_bar_w).max(1);
-        let mut ph = (out_h - top_bar_h).max(1);
+        let px = side_bar_w;
+        let py = top_bar_h;
+        let pw = (out_w - side_bar_w).max(1);
+        let ph = (out_h - top_bar_h).max(1);
         
         let pip_focus = Rectangle::new((px, py).into(), (pw, ph).into());
 

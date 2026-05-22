@@ -1,5 +1,12 @@
 // crates/flowstate-ui/src/dialog.rs
 use flowstate_types::OutputId;
+use smithay::utils::Point;
+use smithay::utils::Logical;
+use crate::uicomponent::UiHit;
+use smithay::utils::Rectangle;
+use crate::uicomponent::UiHitTarget;
+use flowstate_types::WidgetId;
+
 
 pub type DialogId = u32;
 
@@ -44,10 +51,28 @@ pub struct Dialog {
     pub dismissible: bool,
     pub state: DialogState,
     pub owner_output: OutputId,
+    pub bounds: Rectangle<i32, Logical>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiModal {
     None,
     Dialog(DialogId),
+}
+
+impl Dialog {
+    pub fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
+        if self.bounds.contains(point) {
+            return Some(UiHit {
+                target: UiHitTarget::Dialog,
+                widget_id: WidgetId(0),
+                point,
+            });
+        }
+
+        None
+    }
+    pub fn layout(&mut self)
+    {
+    }
 }

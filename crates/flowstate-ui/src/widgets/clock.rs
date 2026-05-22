@@ -1,12 +1,9 @@
-use chrono::{DateTime, Local, Utc};
-use smithay::utils::{Point, Physical};
 use smithay::backend::renderer::gles::GlesTexture;
 use std::time::Instant;
 
 
 
 
-use super::{WidgetCtx, WidgetRect};
 
 
 pub struct ClockWidget {

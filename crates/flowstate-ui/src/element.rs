@@ -1,6 +1,8 @@
 use crate::atlas::IconId;
 use crate::types::{ElementId, UiAction, UiElementKind};
 use crate::UiVisualState;
+use smithay::utils::Logical;
+ use smithay::utils::Rectangle;
 
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -17,6 +19,17 @@ impl UiRect {
             && px < self.x + self.w
             && py >= self.y
             && py < self.y + self.h
+    }
+}
+
+impl From<Rectangle<i32, Logical>> for UiRect {
+    fn from(rect: Rectangle<i32, Logical>) -> Self {
+        Self {
+            x: rect.loc.x,
+            y: rect.loc.y,
+            w: rect.size.w,
+            h: rect.size.h,
+        }
     }
 }
 
@@ -68,7 +81,7 @@ impl UiElement {
 }
 pub fn new(
         id: ElementId,
-        bounds: UiRect,
+        _bounds: UiRect,
         kind: UiElementKind,
         icon: Option<IconId>,
         action: Option<UiAction>,

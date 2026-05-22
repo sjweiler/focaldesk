@@ -2,14 +2,13 @@ use anyhow::{anyhow, Result};
 
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::{ImportMem, Renderer, RendererSuper};
-use smithay::utils::{Physical, Point, Rectangle, Size, Scale, Transform, Buffer};
+use smithay::utils::{Physical, Rectangle, Size};
 use smithay::backend::renderer::Frame;
 //use crate::icons::{IconCache, IconId, IconKey, IconState};
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
-use crate::atlas::{build_icon_atlas, render_atlas_icon, IconAtlas, IconId, IconState};
+use crate::atlas::{build_icon_atlas, render_atlas_icon, IconAtlas, IconId};
 use crate::svg::rasterize_svg;
-use std::time::Instant;
 
 pub fn load_svg_texture<R>(
     renderer: &mut R,
@@ -133,7 +132,7 @@ impl Chrome
     pub fn ensure_gpu_resources<R>(
         &mut self,
         renderer: &mut R,
-        scale: f64,
+        _scale: f64,
     ) -> Result<()>
     where
         R: Renderer<TextureId = GlesTexture> + ImportMem,

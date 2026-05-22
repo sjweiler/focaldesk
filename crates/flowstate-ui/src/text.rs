@@ -1,5 +1,5 @@
 use cosmic_text::{
-    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, SwashCache,
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache,
 };
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 

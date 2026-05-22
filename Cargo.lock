@@ -1593,6 +1593,8 @@ dependencies = [
  "chrono",
  "cosmic-text",
  "egui",
+ "flowstate-logging",
+ "flowstate-themes",
  "flowstate-types",
  "fontdb 0.16.2",
  "image",

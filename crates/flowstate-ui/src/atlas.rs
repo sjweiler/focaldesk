@@ -9,7 +9,6 @@ use image::RgbaImage;
 
 use crate::svg::rasterize_svg;
 use smithay::backend::renderer::Texture;
-use smithay::backend::renderer::gles::GlesFrame;
     
 
 #[derive(Clone, Copy, Debug)]
@@ -257,8 +256,8 @@ pub fn render_atlas_icon_with_alpha(
     alpha: f32,
 ) -> Result<(), GlesError> {
 let size = atlas.size();
-let atlas_w = size.w as f64;
-let atlas_h = size.h as f64;
+let _atlas_w = size.w as f64;
+let _atlas_h = size.h as f64;
     let src = Rectangle::<f64, Buffer>::from_loc_and_size(
         (
             entry.x as f64,
@@ -496,7 +495,7 @@ where
         px.swap(0, 2); // swap R and B
     }
 
-    let mut atlas_upload = atlas_rgba.clone();
+    let atlas_upload = atlas_rgba.clone();
 
 
 

@@ -1068,13 +1068,34 @@ impl DesktopState {
 
             KeyAction::ToggleLauncher => {
                 let owner_output = self.focused_output;
-            
+                //let output = self.outputs.get(&output_id).unwrap();
+
+                
+                
+                let dialog_w = 800;
+                let dialog_h = 480;
+
+                 let (x, y) = if let Some((_id, output)) = self.outputs.iter().next() {
+                    let output_width = output.logical_size.w;
+                    let output_height = output.logical_size.h;
+
+                    let dialog_w = 800;
+                    let dialog_h = 480;
+
+                    (
+                        (output_width - dialog_w) / 2,
+                        (output_height - dialog_h) / 2,
+                    )
+                } else {
+                    (560, 300)
+                };
+                
                 let dialog = Dialog {
                     id: 1,
                     kind: DialogKind::Info,
                     title: "FlowState Test".into(),
-                   message: "Dialog system is alive.".into(),
-                   owner_output,
+                    message: "Dialog system is alive.".into(),
+                    owner_output,
                     buttons: vec![
                         DialogButton {
                            label: "OK".into(),
@@ -1085,10 +1106,13 @@ impl DesktopState {
                             action: DialogAction::Cancel,
                        },
                    ],
-                    modal: true,
+                   modal: true,
                    dismissible: true,
                    state: DialogState::Open,
-                   
+                   bounds: Rectangle::<i32, Logical>::from_loc_and_size(
+                        (x, y),
+                        (dialog_w, dialog_h),
+                    ),
                 };
 
                 self.open_dialog(dialog);

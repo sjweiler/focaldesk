@@ -2,6 +2,11 @@
 
 use smithay::utils::{Logical, Rectangle};
 use crate::dialog::Dialog;
+use smithay::backend::renderer::gles::GlesFrame;
+use crate::uicomponent::RenderCtx;
+use flowstate_themes::FlowTheme;
+use smithay::utils::Physical;
+
 
 pub struct DialogLayout {
     pub screen_rect: Rectangle<i32, Logical>,
