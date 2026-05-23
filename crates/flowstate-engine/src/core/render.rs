@@ -45,6 +45,8 @@ use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
 use flowstate_ui::chrome_shaders::ChromeShaders;
 use flowstate_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical};
+use flowstate_ui::desktop_frame::DesktopFrameCtx;
+use flowstate_ui::egui_layer::EguiLayer;
 use flowstate_types::WorkspaceId;
 use crate::core::shell::ManagedWindow;
 use flowstate_ui::{UiVisualState, UiVisualStyle};
@@ -132,6 +134,7 @@ pub struct RenderState {
     pub resources: RenderResources,
     pub redraw_all: bool,
     pub chrome_shaders: ChromeShaders,
+    pub egui: EguiLayer,
     pub start_time: Instant,
     //pub chrome_svg: ChromeSvgCache,
     pub font_atlas_texture: Option<GlesTexture>,
@@ -401,6 +404,7 @@ impl RenderState {
             resources: RenderResources::new(), 
             redraw_all: true,
             chrome_shaders: ChromeShaders::new(),
+            egui: EguiLayer::default(),
             start_time: Instant::now(),
             
             font_atlas_texture: None,
@@ -1361,10 +1365,25 @@ pub fn draw_rounded_rect(
                 theme,
             )?;
         }
-            
-          
-        
-           //self.draw_text_test(frame, inputs.fonts)?; 
+
+        let egui_frame_ctx = DesktopFrameCtx {
+            output_size: inputs.ctx.output_size,
+            output_scale: inputs.ctx.output_scale,
+            work: inputs.ctx.work,
+            active_output: inputs.ctx.active_output,
+            rendering_output: inputs.ctx.rendering_output,
+            now: inputs.ctx.now,
+            start_time: self.start_time,
+        };
+        self.egui.render(
+            frame,
+            &egui_frame_ctx,
+            &inputs.ctx.damage,
+            &self.chrome_shaders,
+            theme,
+        )?;
+
+        //self.draw_text_test(frame, inputs.fonts)?; 
         
         
         if inputs.draw_software_cursor {

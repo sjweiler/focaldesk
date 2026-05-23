@@ -224,5 +224,8 @@ pub fn draw_output(
    
     
     state.render.render_output(frame, inputs, muts)?; //.render_into_frame(frame, inputs, muts)?;
+    for action in state.render.egui.take_actions() {
+        state.dispatch_ui_action(action);
+    }
     Ok(())
 }

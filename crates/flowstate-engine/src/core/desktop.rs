@@ -17,6 +17,9 @@ use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::keysyms;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use flowstate_ui::types::UiAction;
+use flowstate_ui::egui_layer::{
+    EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta,
+};
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
@@ -268,6 +271,124 @@ impl DesktopState {
         true
     }
 
+    fn egui_modifiers(modifiers: FlowModifiers) -> EguiModifiers {
+        EguiModifiers {
+            alt: modifiers.alt,
+            ctrl: modifiers.ctrl,
+            shift: modifiers.shift,
+            mac_cmd: modifiers.super_key,
+            command: modifiers.ctrl || modifiers.super_key,
+        }
+    }
+
+    fn egui_pointer_button(button: FlowMouseButton) -> Option<EguiPointerButton> {
+        match button {
+            FlowMouseButton::Left => Some(EguiPointerButton::Primary),
+            FlowMouseButton::Right => Some(EguiPointerButton::Secondary),
+            FlowMouseButton::Middle => Some(EguiPointerButton::Middle),
+            FlowMouseButton::Back => Some(EguiPointerButton::Extra1),
+            FlowMouseButton::Forward => Some(EguiPointerButton::Extra2),
+            FlowMouseButton::Other(_) => None,
+        }
+    }
+
+    fn egui_key(keycode: u32) -> Option<egui::Key> {
+        // Smithay `KeyboardKeyEvent::key_code()` is evdev-style, while
+        // `smithay::input::keyboard::keysyms` are XKB keysyms.
+        match keycode {
+            1 => Some(egui::Key::Escape),
+            15 => Some(egui::Key::Tab),
+            14 => Some(egui::Key::Backspace),
+            28 | 96 => Some(egui::Key::Enter),
+            57 => Some(egui::Key::Space),
+            105 => Some(egui::Key::ArrowLeft),
+            106 => Some(egui::Key::ArrowRight),
+            103 => Some(egui::Key::ArrowUp),
+            108 => Some(egui::Key::ArrowDown),
+            102 => Some(egui::Key::Home),
+            107 => Some(egui::Key::End),
+            104 => Some(egui::Key::PageUp),
+            109 => Some(egui::Key::PageDown),
+            111 => Some(egui::Key::Delete),
+            _ => None,
+        }
+    }
+
+    fn handle_egui_input(&mut self, event: &FlowInputEvent) -> bool {
+        let egui_event = match *event {
+            FlowInputEvent::PointerMoved { position } => {
+                let Some(output_id) = self.output_under_pointer(position) else {
+                    return false;
+                };
+                let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+                    return false;
+                };
+                EguiInputEvent::PointerMoved { position: local }
+            }
+            FlowInputEvent::PointerButton {
+                button,
+                state,
+                position,
+                ..
+            } => {
+                let Some(button) = Self::egui_pointer_button(button) else {
+                    return false;
+                };
+                let Some(output_id) = self.output_under_pointer(position) else {
+                    return false;
+                };
+                let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+                    return false;
+                };
+                EguiInputEvent::PointerButton {
+                    button,
+                    pressed: matches!(state, FlowKeyState::Pressed),
+                    position: local,
+                    modifiers: Self::egui_modifiers(self.input.modifiers),
+                }
+            }
+            FlowInputEvent::PointerScroll {
+                delta,
+                position,
+                ..
+            } => {
+                let Some(output_id) = self.output_under_pointer(position) else {
+                    return false;
+                };
+                let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+                    return false;
+                };
+                let delta = match delta {
+                    FlowScrollDelta::Line { x, y } => EguiScrollDelta::Line { x, y },
+                    FlowScrollDelta::Pixel { x, y } => EguiScrollDelta::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                };
+                EguiInputEvent::PointerScroll {
+                    delta,
+                    position: local,
+                    modifiers: Self::egui_modifiers(self.input.modifiers),
+                }
+            }
+            FlowInputEvent::PointerLeft => EguiInputEvent::PointerGone,
+            FlowInputEvent::Key {
+                keycode,
+                state,
+                repeat,
+                modifiers,
+            } => EguiInputEvent::Key {
+                key: Self::egui_key(keycode),
+                pressed: matches!(state, FlowKeyState::Pressed),
+                repeat,
+                modifiers: Self::egui_modifiers(modifiers),
+            },
+            _ => return false,
+        };
+
+        self.render.egui.handle_input(egui_event)
+    }
+
     fn wl_pointer_time_ms() -> u32 {
         use std::time::{SystemTime, UNIX_EPOCH};
         SystemTime::now()
@@ -415,7 +536,7 @@ impl DesktopState {
         pointer.frame(self);
     }
     
-        fn dispatch_ui_action(&mut self, action: UiAction) {
+    pub(crate) fn dispatch_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::LaunchApp(cmd) => {
                 self.launch_app(cmd.to_string());
@@ -1450,6 +1571,10 @@ impl DesktopState {
             state,
             ..
         } => {
+            if self.handle_egui_input(&event) {
+                self.mark_redraw();
+                return;
+            }
             // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
             self.handle_key_event(keycode, state);
             self.mark_redraw();
@@ -1460,6 +1585,11 @@ impl DesktopState {
             self.pointer_pos = position;
             if let Some(id) = self.output_under_pointer(position) {
                 self.focused_output = id;
+            }
+            if self.handle_egui_input(&event) {
+                self.clear_client_pointer_focus(self.pointer_pos);
+                self.mark_redraw();
+                return;
             }
             if self.handle_dialog_input(&event) {
                 self.clear_client_pointer_focus(self.pointer_pos);
@@ -1494,6 +1624,12 @@ impl DesktopState {
 
             if let Some(id) = self.output_under_pointer(position) {
                 self.focused_output = id;
+            }
+
+            if self.handle_egui_input(&event) {
+                self.clear_client_pointer_focus(self.pointer_pos);
+                self.mark_redraw();
+                return;
             }
 
             if self.handle_dialog_input(&event) {
@@ -1564,6 +1700,11 @@ impl DesktopState {
             if let Some(id) = self.output_under_pointer(position) {
                 self.focused_output = id;
             }
+            if self.handle_egui_input(&event) {
+                self.clear_client_pointer_focus(self.pointer_pos);
+                self.mark_redraw();
+                return;
+            }
             if self.handle_dialog_input(&event) {
                 self.clear_client_pointer_focus(self.pointer_pos);
                 self.mark_redraw();
@@ -1581,6 +1722,7 @@ impl DesktopState {
         }
 
         FlowInputEvent::PointerLeft => {
+            let _ = self.handle_egui_input(&event);
             self.cursor_manager.set_visible(false);
             self.mark_redraw();
         }
@@ -1988,5 +2130,3 @@ impl OutputHandler for DesktopState {}
 
 delegate_output!(DesktopState);
     
-
-

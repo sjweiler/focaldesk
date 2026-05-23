@@ -63,7 +63,7 @@ impl DesktopOutput {
             workarea: WorkArea::new(),
             overlays: Some(OverlayManager::default()),
             dialog: None,
-            egui: EguiLayer,
+            egui: EguiLayer::default(),
             chrome_shaders: ChromeShaders::new(),
             render_start: Instant::now(),
         }
@@ -111,7 +111,7 @@ impl DesktopOutput {
     }
 
     pub fn render(
-        &self,
+        &mut self,
         frame: &mut GlesFrame<'_, '_>,
         frame_ctx: &DesktopFrameCtx,
         theme: &FlowTheme,
@@ -144,7 +144,7 @@ impl DesktopOutput {
             draw_dialog_on_this_output,
         )?;
         self.render_overlays(frame, frame_ctx, damage)?;
-        self.render_egui(frame, frame_ctx, damage);
+        self.render_egui(frame, frame_ctx, theme, damage)?;
         Ok(())
     }
 
@@ -283,12 +283,14 @@ impl DesktopOutput {
 
     /// egui is composited last so debug / tooling UI stays on top.
     fn render_egui(
-        &self,
+        &mut self,
         frame: &mut GlesFrame<'_, '_>,
         frame_ctx: &DesktopFrameCtx,
+        theme: &FlowTheme,
         damage: &[Rectangle<i32, Physical>],
-    ) {
-        self.egui.render(frame, frame_ctx, damage);
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        self.egui
+            .render(frame, frame_ctx, damage, &self.chrome_shaders, theme)
     }
 
     pub fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {

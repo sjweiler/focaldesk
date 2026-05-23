@@ -837,7 +837,7 @@ void main() {
 }
 "#;
 
-const EGUI_VERT: &str = r#"
+pub const EGUI_VERT: &str = r#"
 attribute vec2 a_pos;
 attribute vec2 a_uv;
 attribute vec4 a_color;
@@ -856,7 +856,7 @@ void main() {
 "#;
 
 
-const EGUI_FRAG: &str = r#"
+pub const EGUI_FRAG: &str = r#"
 #ifdef GL_ES
 precision mediump float;
 #endif
@@ -865,7 +865,8 @@ varying vec4 v_color;     // receive interpolated per-vertex color
 uniform sampler2D tex;
 void main() {
     vec4 src = texture2D(tex, v_uv);
-    gl_FragColor = src * v_color;  // modulate texture by egui's vertex color
+    vec4 color = src * v_color;
+    gl_FragColor = vec4(color.rgb * color.a, color.a);
 }
 "#;
 
@@ -887,4 +888,3 @@ void main() {
     gl_FragColor = vec4(rgb, src.a);
 }
 "#;
-
