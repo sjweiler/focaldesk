@@ -9,6 +9,7 @@ use smithay::utils::Logical;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
 use flowstate_types::WidgetId;
+use smithay::backend::renderer::gles::GlesError;
 
 
 
@@ -58,7 +59,8 @@ impl UiComponent for SideBar {
         None 
    }
 
-    fn render(&self, renderer: &mut RenderCtx) {
+    fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // existing or temporary no-op
+        Ok(())
     }
 }

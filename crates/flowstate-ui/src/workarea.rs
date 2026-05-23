@@ -7,6 +7,7 @@ use smithay::utils::Logical;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
 use flowstate_types::WidgetId;
+use smithay::backend::renderer::gles::GlesError;
 
 
 pub struct WorkArea {
@@ -47,9 +48,9 @@ impl UiComponent for WorkArea {
         None 
     }
 
-    fn render(&self, _renderer: &mut RenderCtx) {
+    fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // WorkArea probably does not draw anything yet.
         // Client/window rendering still happens elsewhere.
-        
+        Ok(())
     }
 }

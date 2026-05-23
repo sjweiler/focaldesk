@@ -11,6 +11,7 @@ use smithay::utils::Logical;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
 use flowstate_types::WidgetId;
+use smithay::backend::renderer::gles::GlesError;
 
 
 
@@ -92,9 +93,9 @@ impl UiComponent for ClockComponent {
         None 
     }
     
-    fn render(&self, renderer: &mut RenderCtx) {
+    fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // temporary no-op is fine
+        Ok(())
     }
 }
-
 

@@ -1,7 +1,16 @@
+use crate::chrome_shaders::ChromeShaders;
+use crate::dialog::DialogId;
 use crate::element::UiElement;
 use smithay::utils::Rectangle;
 use smithay::utils::Logical;
 use flowstate_types::WidgetId;
+use smithay::backend::renderer::gles::GlesError;
+use smithay::backend::renderer::gles::GlesFrame;
+use crate::desktop_frame::DesktopFrameCtx;
+use smithay::utils::Physical;
+use smithay::backend::renderer::gles::GlesRenderer;
+use flowstate_types::OutputId;
+use flowstate_themes::FlowTheme;
 
 
 use smithay::utils::Point;
@@ -32,12 +41,26 @@ pub struct LayoutCtx {
     pub scale: f32,
 }
 
-pub struct RenderCtx;
+pub struct RenderCtx<'a, 'b> {
+    pub frame: &'a mut GlesFrame<'b, 'b>,
+    pub frame_ctx: &'a DesktopFrameCtx,
+    pub damage: &'a [Rectangle<i32, Physical>],
+
+
+    pub output_scale: f64,
+    pub output_id: OutputId,
+    
+    // NEW
+    pub shaders: &'a ChromeShaders,
+    pub theme: &'a FlowTheme,
+    pub active_dialog: Option<DialogId>,
+    pub draw_on_this_output: bool,
+}
 
 pub trait UiComponent {
     fn layout(&mut self, ctx: &LayoutCtx);
 
     fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit>;
 
-    fn render(&self, ctx: &mut RenderCtx);
+    fn render(&self, ctx: &mut RenderCtx) -> Result<(), GlesError>;
 }

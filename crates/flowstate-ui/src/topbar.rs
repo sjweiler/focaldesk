@@ -10,6 +10,7 @@ use crate::uicomponent::UiHitTarget;
 use flowstate_types::WidgetId;
 use smithay::utils::Logical;
 use smithay::utils::Point;
+use smithay::backend::renderer::gles::GlesError;
 
 
 
@@ -81,12 +82,10 @@ impl UiComponent for TopBar {
         None 
     }
 
-    fn render(&self, renderer: &mut RenderCtx) {
-        self.clock.render(renderer);
-
+    fn render(&self, ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // Later: render topbar background, title, meta text, indicators.
+        self.clock.render(ctx)
     }   
 
 }
-
 

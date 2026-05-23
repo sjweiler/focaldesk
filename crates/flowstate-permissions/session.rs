@@ -1,6 +1,6 @@
 use crate::identity::AppIdentity;
 use crate::request::{PermissionResource, PermissionTarget};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GrantToken(pub String);

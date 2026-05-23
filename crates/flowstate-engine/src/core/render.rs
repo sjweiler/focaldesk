@@ -1374,6 +1374,15 @@ pub fn draw_rounded_rect(
         Ok(())
     }
 
+pub fn render_output(
+    &mut self,
+    frame: &mut GlesFrame<'_, '_>,
+    inputs: RenderInputs<'_>,
+    muts: RenderInputsMut<'_>,
+) -> Result<(), GlesError> {
+    self.render_into_frame(frame, inputs, muts)
+}
+
      fn render_active_dialog_for_output(
         &mut self,
         frame: &mut GlesFrame<'_, '_>,

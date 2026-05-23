@@ -1,10 +1,12 @@
-use crate::identity::AppIdentity;
 use crate::policy::PolicyEngine;
 use crate::prompt::PermissionPrompter;
 use crate::request::PermissionRequest;
 use crate::session::{ActiveGrant, GrantToken};
 use crate::store::PermissionStore;
 use crate::types::{PermissionDecision, PermissionScope, PermissionState};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_GRANT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 pub struct PermissionManager<S, P, U> {
     pub store: S,
@@ -80,7 +82,11 @@ where
         &mut self,
         request: PermissionRequest,
     ) -> GrantToken {
-        let token = GrantToken(uuid::Uuid::new_v4().to_string());
+        let token = GrantToken(format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT_GRANT_TOKEN.fetch_add(1, Ordering::Relaxed),
+        ));
 
         self.active_grants.push(ActiveGrant {
             token: token.clone(),

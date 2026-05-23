@@ -4,6 +4,10 @@ use smithay::utils::{Logical, Physical, Point, Rectangle};
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::uicomponent::{UiHit, UiHitTarget};
 use flowstate_types::WidgetId;
+use crate::uicomponent::UiComponent;
+use crate::uicomponent::LayoutCtx;
+use crate::uicomponent::RenderCtx;
+use smithay::backend::renderer::gles::GlesError;
 
 #[derive(Default)]
 pub struct OverlayManager;
@@ -19,5 +23,16 @@ impl OverlayManager {
 
     pub fn hit_test(&self, _point: Point<i32, Logical>) -> Option<UiHit> {
         None
+    }
+}
+
+impl UiComponent for OverlayManager {
+    fn layout(&mut self, _ctx: &LayoutCtx) {
+    }
+    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
+        self.hit_test(point)
+    }
+    fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {
+        Ok(())
     }
 }

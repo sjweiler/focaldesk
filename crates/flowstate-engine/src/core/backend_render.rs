@@ -223,6 +223,6 @@ pub fn draw_output(
 
    
     
-    state.render.render_into_frame(frame, inputs, muts)?;
+    state.render.render_output(frame, inputs, muts)?; //.render_into_frame(frame, inputs, muts)?;
     Ok(())
 }
