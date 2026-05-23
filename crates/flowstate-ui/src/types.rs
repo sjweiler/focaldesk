@@ -1,4 +1,3 @@
-
 pub type ElementId = u32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

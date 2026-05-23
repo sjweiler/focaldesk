@@ -1,25 +1,23 @@
+use flowstate_types::types::{OutputId, WindowId, WorkspaceId};
+use flowstate_ui::uitree::UiTree;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
 };
-use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::compositor::with_surface_tree_downward;
+use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
-use flowstate_types::types::{WindowId, OutputId, WorkspaceId};
-use flowstate_ui::uitree::UiTree;
 
-use crate::core::window_store::WindowStore;
 use crate::core::output_store::OutputStore;
+use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
+use flowstate_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
+use flowstate_ui::types::UiAction;
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::keysyms;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
-use flowstate_ui::types::UiAction;
-use flowstate_ui::egui_layer::{
-    EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta,
-};
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
@@ -27,67 +25,69 @@ use flowstate_cursor::CursorManager;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
-use std::borrow::Cow;
-use smithay::wayland::seat::WaylandFocus;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::wayland::seat::WaylandFocus;
+use std::borrow::Cow;
 
-use smithay::wayland::buffer::BufferHandler;
-use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::wayland::shell::xdg::PopupSurface;
-use smithay::wayland::selection::data_device::DataDeviceState;
-use flowstate_notifications::NotificationManager;
-use crate::core::shell::ManagedWindow;
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel, Scale as OutputScaleSmithay};
-use smithay::wayland::shell::xdg::ToplevelSurface;
-use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
-use smithay::utils::Serial;
-use smithay::input::Seat;
-use crate::core::RenderState;
-use smithay::utils::{Logical, Physical, Point, Scale, Size, Rectangle, Transform};
-use crate::core::input::{FlowInputEvent, InputState};
-use indexmap::IndexMap;
-use smithay::delegate_output;
-use smithay::wayland::output::{OutputHandler};
-use flowstate_ui::chrome::Chrome;
-use flowstate_ui::chrome::ChromeMetrics;
-use flowstate_flow::Keybinds;
-use flowstate_flow::keybinds::BackendKind;
-use smithay::utils::SERIAL_COUNTER;
-use smithay::input::keyboard::FilterResult;
-use tracing_subscriber::fmt::time;
 use crate::core::input::FlowKeyState;
-use flowstate_flow::actions::KeyAction;
-use std::process::Command;
 use crate::core::input::FlowModifiers;
 use crate::core::input::FlowMouseButton;
 use crate::core::input::FlowScrollDelta;
-use smithay::backend::input::AbsolutePositionEvent;
+use crate::core::input::{FlowInputEvent, InputState};
+use crate::core::shell::ManagedWindow;
+use crate::core::RenderState;
+use flowstate_flow::actions::KeyAction;
+use flowstate_flow::keybinds::BackendKind;
+use flowstate_flow::Keybinds;
 use flowstate_flow::ModMask;
+use flowstate_notifications::NotificationManager;
+use flowstate_ui::chrome::Chrome;
+use flowstate_ui::chrome::ChromeMetrics;
+use indexmap::IndexMap;
+use smithay::backend::input::AbsolutePositionEvent;
+use smithay::delegate_output;
+use smithay::input::keyboard::FilterResult;
+use smithay::input::Seat;
+use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
+use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
+use smithay::utils::Serial;
+use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::wayland::buffer::BufferHandler;
+use smithay::wayland::output::OutputHandler;
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::xdg::PopupSurface;
+use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::process::id;
+use std::process::Command;
+use tracing_subscriber::fmt::time;
+use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
 
+use smithay::wayland::compositor::TraversalAction;
+use smithay::wayland::compositor::{self, SurfaceAttributes};
+use smithay::wayland::shell::xdg::SurfaceCachedState;
+use smithay::wayland::xdg_activation::XdgActivationState;
 use std::io::{self, Write};
 use wayland_server::protocol::wl_surface;
-use smithay::wayland::shell::xdg::SurfaceCachedState;
-use smithay::wayland::compositor::{self, SurfaceAttributes};
-use smithay::wayland::compositor::TraversalAction;
-use smithay::wayland::xdg_activation::XdgActivationState;
 
+use crate::core::chrome_layout::{
+    build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at,
+};
+use crate::core::focus::KeyboardFocusTarget;
+use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
     handle_resize_surface_commit, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
 };
-use crate::core::chrome_layout::{build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at};
 use flowstate_logging::flog;
-use crate::core::focus::KeyboardFocusTarget;
-use flowstate_ui::dialog::{Dialog, DialogId};
-use flowstate_ui::dialog::DialogAction;
-use flowstate_ui::dialog_layout::layout_dialog;
-use flowstate_ui::dialog::DialogButton;
-use flowstate_ui::dialog::DialogState;
-use crate::core::fonts::FontSystem;
-use flowstate_ui::dialog::DialogKind;
-use flowstate_themes::ThemeManager;
-use flowstate_themes::FlowThemeId;
 use flowstate_themes::theme::BuiltInThemeId;
+use flowstate_themes::FlowThemeId;
+use flowstate_themes::ThemeManager;
+use flowstate_ui::dialog::DialogAction;
+use flowstate_ui::dialog::DialogButton;
+use flowstate_ui::dialog::DialogKind;
+use flowstate_ui::dialog::DialogState;
+use flowstate_ui::dialog::{Dialog, DialogId};
+use flowstate_ui::dialog_layout::layout_dialog;
 
 pub(crate) fn dbg_flush(msg: &str) {
     let mut stderr = io::stderr();
@@ -118,7 +118,8 @@ pub struct DesktopInit {
     pub data_device_state: DataDeviceState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
-    pub output_capture_source_state: smithay::wayland::image_capture_source::OutputCaptureSourceState,
+    pub output_capture_source_state:
+        smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
@@ -140,7 +141,7 @@ pub struct DesktopState {
     pub primary_output: OutputId,
     pub focused_output: OutputId, //keyboard shit
     pub input: InputState,
-   // pub keybinds: Keybinds,
+    // pub keybinds: Keybinds,
     pub running: bool,
     pub compositor_state: CompositorState,
     pub render: RenderState,
@@ -151,7 +152,8 @@ pub struct DesktopState {
     pub data_device_state: DataDeviceState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
-    pub output_capture_source_state: smithay::wayland::image_capture_source::OutputCaptureSourceState,
+    pub output_capture_source_state:
+        smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub backend_kind: BackendKind,
@@ -163,7 +165,7 @@ pub struct DesktopState {
     pub windows: Vec<ManagedWindow>,
     pub dialogs: Vec<Dialog>,
     pub active_dialog: Option<DialogId>,
-    pub outputs: IndexMap::<OutputId,OutputState>,
+    pub outputs: IndexMap<OutputId, OutputState>,
     pub current_workspace: u64,
     pub chrome: flowstate_ui::chrome::Chrome,
     // focus/input
@@ -179,15 +181,12 @@ pub struct DesktopState {
     pub notifications: NotificationManager,
 
     // xwayland and special surfaces
-    
     pub unmapped_windows: Vec<ManagedWindow>,
-    
+
     pub keybinds: Keybinds,
-    
+
     pub client_wayland_display: String,
 
-    
-    
     /// Undecorated winit window: set on left-press over chrome top bar; backend calls platform window drag.
     host_window_drag_requested: bool,
 
@@ -201,35 +200,33 @@ pub struct DesktopState {
     pub drm_submit_hw_cursor: bool,
     /// One frame: attempt a separate DRM cursor element while suppressing the in-buffer software draw.
     pub drm_try_pass_cursor_this_frame: bool,
-    
+
     pub screenshot_requested: Option<OutputId>,
     pub screenshot_all_requested: bool,
     pub screenshot_seq: u64,
-    
+
     pub fonts: FontSystem,
-    
+
     pub theme: ThemeManager,
-    
     //pub popups: Vec<PopupState>,
 }
-
 
 impl DesktopState {
     /// Clears and returns whether the host (nested) window should begin a platform move drag.
     pub fn output_at_logical_point(&self, p: Point<f64, Logical>) -> Option<OutputId> {
-    self.outputs
-        .iter()
-        .find(|(_, o)| {
-            let x = p.x as i32;
-            let y = p.y as i32;
+        self.outputs
+            .iter()
+            .find(|(_, o)| {
+                let x = p.x as i32;
+                let y = p.y as i32;
 
-            x >= o.logical_origin.x
-                && y >= o.logical_origin.y
-                && x < o.logical_origin.x + o.logical_size.w
-                && y < o.logical_origin.y + o.logical_size.h
-        })
-        .map(|(id, _)| *id)
-}
+                x >= o.logical_origin.x
+                    && y >= o.logical_origin.y
+                    && x < o.logical_origin.x + o.logical_size.w
+                    && y < o.logical_origin.y + o.logical_size.h
+            })
+            .map(|(id, _)| *id)
+    }
     pub fn update_ui_hover_for_output(&mut self, output_id: OutputId) {
         if !self.output_contains_pointer(output_id) {
             self.ui.hovered = None;
@@ -253,7 +250,6 @@ impl DesktopState {
             el.hovered = Some(el.id) == self.ui.hovered;
         }
     }
-
 
     /// Compositor chrome hit (sidebar/topbar UI), if any, without consuming the event.
     pub(crate) fn peek_ui_action_at_pointer(&self) -> Option<flowstate_ui::types::UiAction> {
@@ -348,9 +344,7 @@ impl DesktopState {
                 }
             }
             FlowInputEvent::PointerScroll {
-                delta,
-                position,
-                ..
+                delta, position, ..
             } => {
                 let Some(output_id) = self.output_under_pointer(position) else {
                     return false;
@@ -415,11 +409,7 @@ impl DesktopState {
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         let ws = self.focused_workspace();
         for w in self.space.elements().rev() {
-            let Some(managed) = self
-                .windows
-                .iter()
-                .find(|mw| mw.mapped && &mw.window == w)
-            else {
+            let Some(managed) = self.windows.iter().find(|mw| mw.mapped && &mw.window == w) else {
                 continue;
             };
             if managed.workspace != ws {
@@ -535,7 +525,7 @@ impl DesktopState {
         pointer.axis(self, frame);
         pointer.frame(self);
     }
-    
+
     pub(crate) fn dispatch_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::LaunchApp(cmd) => {
@@ -544,7 +534,8 @@ impl DesktopState {
             }
 
             UiAction::OpenPanel(panel) => {
-                eprintln!("TODO open panel: {:?}", panel);
+                self.render.egui.open_panel(panel);
+                self.mark_redraw();
             }
 
             UiAction::Custom(id) => {
@@ -563,8 +554,8 @@ impl DesktopState {
             }
         }
     }
-//}
-    
+    //}
+
     fn output_local_point(
         &self,
         position: Point<f64, Logical>,
@@ -579,7 +570,7 @@ impl DesktopState {
 
         Some((output_id, local))
     }
-    
+
     pub fn request_screenshot(&mut self) {
         self.screenshot_requested = Some(self.focused_output);
         self.mark_redraw();
@@ -594,14 +585,14 @@ impl DesktopState {
     pub fn take_screenshot_request(&mut self) -> Option<OutputId> {
         self.screenshot_requested.take()
     }
-    
+
     pub fn workspace_under_pointer(&self, pos: Point<f64, Logical>) -> WorkspaceId {
-    self.output_under_pointer(pos)
-        .and_then(|id| self.outputs.get(&id))
-        .map(|o| o.active_workspace)
-        .unwrap_or_else(|| self.focused_workspace())
+        self.output_under_pointer(pos)
+            .and_then(|id| self.outputs.get(&id))
+            .map(|o| o.active_workspace)
+            .unwrap_or_else(|| self.focused_workspace())
     }
-    
+
     pub fn focused_output_state(&self) -> Option<&OutputState> {
         self.outputs.get(&self.focused_output)
     }
@@ -644,7 +635,7 @@ impl DesktopState {
         //    .unwrap_or(0);
         //    Point::<i32, Logical>::from((x, 0))
         //};
-        
+
         let entry = self.outputs.entry(output_id).or_insert_with(|| {
             // Replace this with your real output-state struct constructor/default.
             crate::core::desktop::OutputState {
@@ -670,24 +661,24 @@ impl DesktopState {
             self.primary_output = output_id;
         }
     }
-    
-     pub fn output_contains_pointer(&self, output_id: OutputId) -> bool {
-    let pointer = self.pointer_pos; // logical coords
 
-    if let Some(output) = self.outputs.get(&output_id) {
-        let ox = output.logical_origin.x;
-        let oy = output.logical_origin.y;
-        let ow = output.logical_size.w;
-        let oh = output.logical_size.h;
+    pub fn output_contains_pointer(&self, output_id: OutputId) -> bool {
+        let pointer = self.pointer_pos; // logical coords
 
-        return pointer.x >= ox as f64
-            && pointer.x < (ox + ow) as f64
-            && pointer.y >= oy as f64
-            && pointer.y < (oy + oh) as f64;
+        if let Some(output) = self.outputs.get(&output_id) {
+            let ox = output.logical_origin.x;
+            let oy = output.logical_origin.y;
+            let ow = output.logical_size.w;
+            let oh = output.logical_size.h;
+
+            return pointer.x >= ox as f64
+                && pointer.x < (ox + ow) as f64
+                && pointer.y >= oy as f64
+                && pointer.y < (oy + oh) as f64;
+        }
+
+        false
     }
-
-    false
-}
 
     /// Bounding rectangle of all outputs in global logical space (for clamping pointer motion).
     pub fn logical_pointer_clamp_rect(&self) -> Rectangle<i32, Logical> {
@@ -736,7 +727,6 @@ impl DesktopState {
         )))
     }
 
-    
     pub fn take_host_window_drag_request(&mut self) -> bool {
         let v = self.host_window_drag_requested;
         self.host_window_drag_requested = false;
@@ -755,10 +745,7 @@ impl DesktopState {
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
 
-        let size = Size::<i32, Logical>::from((
-            output.logical_size.w,
-            output.logical_size.h,
-        ));
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
 
         let layout = build_chrome_layout(
             size,
@@ -782,10 +769,7 @@ impl DesktopState {
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
 
-        let size = Size::<i32, Logical>::from((
-            output.logical_size.w,
-            output.logical_size.h,
-        ));
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
 
         let layout = build_chrome_layout(
             size,
@@ -795,7 +779,7 @@ impl DesktopState {
 
         layout.work_area.recess.contains((px, py))
     }
-    
+
     /// Hovered sidebar slot for this output only (global pointer + per-output chrome layout).
     pub fn sidebar_hover_for_output(&self, output_id: OutputId) -> Option<usize> {
         if !self.output_contains_pointer(output_id) {
@@ -972,16 +956,17 @@ impl DesktopState {
 
     pub fn alloc_window_id(&mut self) -> WindowId {
         let id = self.next_window_id.0;
-        self.next_window_id = WindowId(
-            id.checked_add(1).expect("window id counter overflowed")
-        );
+        self.next_window_id = WindowId(id.checked_add(1).expect("window id counter overflowed"));
         WindowId(id)
     }
-    
+
     pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) {
         dbg_flush("entered add_xdg_toplevel");
         dbg_flush(&format!("self={:p}", self));
-        dbg_flush(&format!("before map space={}", self.space.elements().count()));
+        dbg_flush(&format!(
+            "before map space={}",
+            self.space.elements().count()
+        ));
 
         let id = self.alloc_window_id();
         let window = Window::new_wayland_window(surface.clone());
@@ -997,18 +982,17 @@ impl DesktopState {
 
         self.mark_redraw();
     }
-    
+
     pub fn open_dialog(&mut self, dialog: Dialog) {
-    
         self.active_dialog = Some(dialog.id);
         self.dialogs.push(dialog);
-        
+
         println!(
-    "after open_dialog: dialogs={}, active_dialog={:?}",
-    self.dialogs.len(),
-    self.active_dialog
-);
-        
+            "after open_dialog: dialogs={}, active_dialog={:?}",
+            self.dialogs.len(),
+            self.active_dialog
+        );
+
         self.mark_redraw();
     }
 
@@ -1021,27 +1005,27 @@ impl DesktopState {
 
         self.mark_redraw();
     }
-    
+
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
-    match action {
-        DialogAction::Confirm => {
-            println!("Dialog {} confirmed", id);
+        match action {
+            DialogAction::Confirm => {
+                println!("Dialog {} confirmed", id);
 
-            // Example: allow screenshot
-            // self.allow_screenshot = true;
+                // Example: allow screenshot
+                // self.allow_screenshot = true;
+            }
+
+            DialogAction::Cancel => {
+                println!("Dialog {} canceled", id);
+            }
+
+            DialogAction::Custom(v) => {
+                println!("Dialog {} custom action {}", id, v);
+            }
         }
 
-        DialogAction::Cancel => {
-            println!("Dialog {} canceled", id);
-        }
-
-        DialogAction::Custom(v) => {
-            println!("Dialog {} custom action {}", id, v);
-        }
+        self.close_dialog(id);
     }
-
-    self.close_dialog(id);
-}
 
     pub fn handle_commit(&mut self, surface: &WlSurface) {
         dbg_flush("handle_commit hit");
@@ -1060,7 +1044,9 @@ impl DesktopState {
 
             if belongs {
                 managed.window.on_commit();
-                dbg_flush(&format!("commit matched window idx={idx} (toplevel or subsurface)"));
+                dbg_flush(&format!(
+                    "commit matched window idx={idx} (toplevel or subsurface)"
+                ));
                 dbg_flush(&format!(
                     "already in space={}",
                     self.space.elements().any(|e| e == &managed.window)
@@ -1076,26 +1062,26 @@ impl DesktopState {
 
         if let Some(idx) = to_map {
             let window = self.windows[idx].window.clone();
-            
+
             let output_id = self
                 .output_under_pointer(self.input.pointer_pos)
                 .unwrap_or(self.primary_output);
-    
+
             let (mx, my) = if let Some(out) = self.outputs.get(&output_id) {
-                (
-                    out.logical_origin.x + 100,
-                    out.logical_origin.y + 100,
-                )
+                (out.logical_origin.x + 100, out.logical_origin.y + 100)
             } else {
                 (100, 100)
             };
-            
+
             self.space.map_element(window, (mx, my), false);
             self.windows[idx].mapped = true;
             let window_id = self.windows[idx].id;
             self.focus_window_id(window_id);
             dbg_flush("mapped window from commit");
-            dbg_flush(&format!("space count after map={}", self.space.elements().count()));
+            dbg_flush(&format!(
+                "space count after map={}",
+                self.space.elements().count()
+            ));
         }
 
         let _ = handle_resize_surface_commit(&mut self.space, surface);
@@ -1179,24 +1165,21 @@ impl DesktopState {
 
             KeyAction::LaunchTerminal => {
                 println!("Launch terminal");
-               
+
                 let _ = Command::new("weston-terminal")
                     .env("WAYLAND_DISPLAY", &self.client_wayland_display)
                     .env_remove("DISPLAY")
                     .spawn();
-                
             }
 
             KeyAction::ToggleLauncher => {
                 let owner_output = self.focused_output;
                 //let output = self.outputs.get(&output_id).unwrap();
 
-                
-                
                 let dialog_w = 800;
                 let dialog_h = 480;
 
-                 let (x, y) = if let Some((_id, output)) = self.outputs.iter().next() {
+                let (x, y) = if let Some((_id, output)) = self.outputs.iter().next() {
                     let output_width = output.logical_size.w;
                     let output_height = output.logical_size.h;
 
@@ -1210,7 +1193,7 @@ impl DesktopState {
                 } else {
                     (560, 300)
                 };
-                
+
                 let dialog = Dialog {
                     id: 1,
                     kind: DialogKind::Info,
@@ -1219,27 +1202,25 @@ impl DesktopState {
                     owner_output,
                     buttons: vec![
                         DialogButton {
-                           label: "OK".into(),
-                           action: DialogAction::Confirm,
-                       },
-                    DialogButton {
-                           label: "Cancel".into(),
+                            label: "OK".into(),
+                            action: DialogAction::Confirm,
+                        },
+                        DialogButton {
+                            label: "Cancel".into(),
                             action: DialogAction::Cancel,
-                       },
-                   ],
-                   modal: true,
-                   dismissible: true,
-                   state: DialogState::Open,
-                   bounds: Rectangle::<i32, Logical>::from_loc_and_size(
+                        },
+                    ],
+                    modal: true,
+                    dismissible: true,
+                    state: DialogState::Open,
+                    bounds: Rectangle::<i32, Logical>::from_loc_and_size(
                         (x, y),
                         (dialog_w, dialog_h),
                     ),
                 };
 
                 self.open_dialog(dialog);
-            }                
-                
-                
+            }
 
             KeyAction::ActivateSlot(n) => {
                 println!("Activate slot {} (not implemented yet)", n);
@@ -1252,28 +1233,27 @@ impl DesktopState {
             KeyAction::OverflowView => {
                 println!("Overflow view (not implemented yet)");
             }
-            
+
             KeyAction::TakeScreenshot => {
                 self.request_screenshot();
                 dbg_flush("SCREENSHOT ACTION FIRED");
             }
-            
-             KeyAction::TakeScreenshotAll => {
+
+            KeyAction::TakeScreenshotAll => {
                 self.request_screenshot_all();
                 dbg_flush("SCREENSHOT ALL ACTION FIRED");
             }
-            
+
             KeyAction::ForceExit => {
-              panic!("Emergency shutdown");
+                panic!("Emergency shutdown");
             }
-            
-            
+
             KeyAction::LaunchBrowser => {
-              todo!();
-            }  
-            
+                todo!();
+            }
+
             KeyAction::LaunchFiles => {
-              todo!();
+                todo!();
             }
         }
     }
@@ -1291,12 +1271,7 @@ impl DesktopState {
         let managed = self.windows.remove(idx);
         self.space.unmap_elem(&managed.window);
 
-        let next_focus = self
-            .windows
-            .iter()
-            .rev()
-            .find(|w| w.mapped)
-            .map(|w| w.id);
+        let next_focus = self.windows.iter().rev().find(|w| w.mapped).map(|w| w.id);
 
         self.focused_window = None;
         if let Some(next_id) = next_focus {
@@ -1317,22 +1292,25 @@ impl DesktopState {
         println!("Assign slot {} (not implemented yet)", slot);
     }
 
-    fn update_focus(&mut self) {
-    }
+    fn update_focus(&mut self) {}
 
     pub fn launch_terminal(&self) {
         use std::process::Command;
 
         let _ = Command::new("alacritty").spawn();
     }
-    
+
     pub fn launch_app(&self, app: String) {
-        let _ = Command::new(app)
+        let app_name = app.clone();
+        if let Err(err) = Command::new(app)
             .env("WAYLAND_DISPLAY", &self.client_wayland_display)
             .env_remove("DISPLAY")
-            .spawn();
+            .spawn()
+        {
+            eprintln!("failed to launch {app_name}: {err}");
+        }
     }
-    
+
     pub fn handle_key_event(&mut self, keycode: u32, state: FlowKeyState) {
         use smithay::backend::input::KeyState as SmithayKeyState;
         use smithay::input::keyboard::ModifiersState;
@@ -1378,10 +1356,7 @@ impl DesktopState {
 
                 flog(&format!(
                     "KEY DEBUG: keycode={} sym={} state={:?} mods={:?}",
-                    keycode,
-                    sym,
-                    state,
-                    mods
+                    keycode, sym, state, mods
                 ));
 
                 // Modal dialogs: keyboard still updates XKB via `keyboard.input`, but compositor
@@ -1394,9 +1369,7 @@ impl DesktopState {
                                     ds.close_dialog(did);
                                     return FilterResult::<()>::Intercept(());
                                 }
-                                if sym == keysyms::KEY_Return
-                                    || sym == keysyms::KEY_KP_Enter
-                                {
+                                if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
                                     let choice = dialog
                                         .buttons
                                         .iter()
@@ -1438,14 +1411,11 @@ impl DesktopState {
         );
 
         if let Some(action) = resolved_action {
-            flog(&format!(
-                "ACTION={:?}",
-                action,
-            ));
-            
+            flog(&format!("ACTION={:?}", action,));
+
             self.handle_action(action);
         }
-}
+    }
 
     fn process_toplevel_pointer_motion(&mut self, pos: Point<f64, Logical>) {
         match &self.toplevel_pointer {
@@ -1502,8 +1472,16 @@ impl DesktopState {
 
                 let min_width = min_size.w.max(1);
                 let min_height = min_size.h.max(1);
-                let max_width = if max_size.w == 0 { i32::MAX } else { max_size.w };
-                let max_height = if max_size.h == 0 { i32::MAX } else { max_size.h };
+                let max_width = if max_size.w == 0 {
+                    i32::MAX
+                } else {
+                    max_size.w
+                };
+                let max_height = if max_size.h == 0 {
+                    i32::MAX
+                } else {
+                    max_size.h
+                };
 
                 let last_window_size = Size::from((
                     new_window_width.max(min_width).min(max_width),
@@ -1555,7 +1533,11 @@ impl DesktopState {
                             st.size = Some(last_window_size);
                         });
                         tl.send_pending_configure();
-                        ResizeSurfaceState::set_waiting_for_commit(tl.wl_surface(), edges, initial_rect);
+                        ResizeSurfaceState::set_waiting_for_commit(
+                            tl.wl_surface(),
+                            edges,
+                            initial_rect,
+                        );
                     }
                 }
             }
@@ -1564,211 +1546,209 @@ impl DesktopState {
         self.mark_redraw();
     }
 
-     pub fn handle_input(&mut self, event: FlowInputEvent) {
-    match event {
-        FlowInputEvent::Key {
-            keycode,
-            state,
-            ..
-        } => {
-            if self.handle_egui_input(&event) {
+    pub fn handle_input(&mut self, event: FlowInputEvent) {
+        match event {
+            FlowInputEvent::Key { keycode, state, .. } => {
+                if self.handle_egui_input(&event) {
+                    self.mark_redraw();
+                    return;
+                }
+                // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
+                self.handle_key_event(keycode, state);
                 self.mark_redraw();
-                return;
             }
-            // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
-            self.handle_key_event(keycode, state);
-            self.mark_redraw();
-        }
 
-        FlowInputEvent::PointerMoved { position } => {
-            self.input.pointer_pos = position;
-            self.pointer_pos = position;
-            if let Some(id) = self.output_under_pointer(position) {
-                self.focused_output = id;
-            }
-            if self.handle_egui_input(&event) {
-                self.clear_client_pointer_focus(self.pointer_pos);
-                self.mark_redraw();
-                return;
-            }
-            if self.handle_dialog_input(&event) {
-                self.clear_client_pointer_focus(self.pointer_pos);
-                self.mark_redraw();
-                return;
-            }
-            self.cursor_manager.move_to(position.x, position.y);
-            // Nested compositor: start moving a client after a small drag from a work-area press.
-            const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
-            if self.input.pointer_left_down {
-                if let Some((id, start)) = self.pending_compositor_move {
-                    let d = position - start;
-                    if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
-                        self.pending_compositor_move = None;
-                        self.try_begin_compositor_move(id);
+            FlowInputEvent::PointerMoved { position } => {
+                self.input.pointer_pos = position;
+                self.pointer_pos = position;
+                if let Some(id) = self.output_under_pointer(position) {
+                    self.focused_output = id;
+                }
+                if self.handle_egui_input(&event) {
+                    self.clear_client_pointer_focus(self.pointer_pos);
+                    self.mark_redraw();
+                    return;
+                }
+                if self.handle_dialog_input(&event) {
+                    self.clear_client_pointer_focus(self.pointer_pos);
+                    self.mark_redraw();
+                    return;
+                }
+                self.cursor_manager.move_to(position.x, position.y);
+                // Nested compositor: start moving a client after a small drag from a work-area press.
+                const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
+                if self.input.pointer_left_down {
+                    if let Some((id, start)) = self.pending_compositor_move {
+                        let d = position - start;
+                        if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
+                            self.pending_compositor_move = None;
+                            self.try_begin_compositor_move(id);
+                        }
                     }
                 }
-            }
-            self.process_toplevel_pointer_motion(position);
-            self.forward_pointer_to_clients(position);
-            self.mark_redraw();
-        }
-
-        FlowInputEvent::PointerButton {
-            button,
-            state,
-            position,
-            ..
-        } => {
-            self.input.pointer_pos = position;
-            self.pointer_pos = position;
-
-            if let Some(id) = self.output_under_pointer(position) {
-                self.focused_output = id;
-            }
-
-            if self.handle_egui_input(&event) {
-                self.clear_client_pointer_focus(self.pointer_pos);
+                self.process_toplevel_pointer_motion(position);
+                self.forward_pointer_to_clients(position);
                 self.mark_redraw();
-                return;
             }
 
-            if self.handle_dialog_input(&event) {
-                self.clear_client_pointer_focus(self.pointer_pos);
-                self.mark_redraw();
-                return;
-            }
+            FlowInputEvent::PointerButton {
+                button,
+                state,
+                position,
+                ..
+            } => {
+                self.input.pointer_pos = position;
+                self.pointer_pos = position;
 
-            if matches!(button, FlowMouseButton::Left)
-                && matches!(state, FlowKeyState::Pressed)
-                && self.peek_ui_action_at_pointer().is_some()
-            {
-                self.input.pointer_left_down = true;
-                self.clear_client_pointer_focus(position);
-                let _ = self.click_ui_at_pointer();
-                self.mark_redraw();
-                return;
-            }
-
-            if matches!(button, FlowMouseButton::Left) {
-                match state {
-                    FlowKeyState::Pressed => {
-                        self.input.pointer_left_down = true;
-                    }
-                    FlowKeyState::Released => {
-                        self.input.pointer_left_down = false;
-                        self.pending_compositor_move = None;
-                    }
+                if let Some(id) = self.output_under_pointer(position) {
+                    self.focused_output = id;
                 }
-            }
 
-            if let Some(id) = self.output_under_pointer(position) {
-                self.focused_output = id;
-            }
-            self.cursor_manager.move_to(position.x, position.y);
-            self.process_toplevel_pointer_motion(position);
-            self.forward_pointer_to_clients(position);
-            self.forward_pointer_button(position, button, state);
-            if matches!(state, FlowKeyState::Pressed) {
+                if self.handle_egui_input(&event) {
+                    self.clear_client_pointer_focus(self.pointer_pos);
+                    self.mark_redraw();
+                    return;
+                }
+
+                if self.handle_dialog_input(&event) {
+                    self.clear_client_pointer_focus(self.pointer_pos);
+                    self.mark_redraw();
+                    return;
+                }
+
                 if matches!(button, FlowMouseButton::Left)
-                    && self.pointer_on_chrome_host_drag_region(position)
+                    && matches!(state, FlowKeyState::Pressed)
+                    && self.peek_ui_action_at_pointer().is_some()
                 {
-                    self.host_window_drag_requested = true;
-                    self.pending_compositor_move = None;
-                } else {
-                    self.focus_window_at(position);
-                    if matches!(button, FlowMouseButton::Left)
-                        && self.pointer_in_work_recess(position)
-                    {
-                        self.pending_compositor_move = self
-                            .top_mapped_window_id_at(position)
-                            .filter(|&id| {
-                                self.window(id).is_some_and(|w| {
-                                    w.mapped && !w.maximized && !w.fullscreen && !w.minimized
-                                })
-                            })
-                            .map(|id| (id, position));
+                    self.input.pointer_left_down = true;
+                    self.clear_client_pointer_focus(position);
+                    let _ = self.click_ui_at_pointer();
+                    self.mark_redraw();
+                    return;
+                }
+
+                if matches!(button, FlowMouseButton::Left) {
+                    match state {
+                        FlowKeyState::Pressed => {
+                            self.input.pointer_left_down = true;
+                        }
+                        FlowKeyState::Released => {
+                            self.input.pointer_left_down = false;
+                            self.pending_compositor_move = None;
+                        }
                     }
                 }
-            }
-            self.process_toplevel_pointer_button(button, state);
-            self.mark_redraw();
-        }
 
-        FlowInputEvent::PointerScroll { position, delta, .. } => {
-            self.input.pointer_pos = position;
-            self.pointer_pos = position;
-            if let Some(id) = self.output_under_pointer(position) {
-                self.focused_output = id;
-            }
-            if self.handle_egui_input(&event) {
-                self.clear_client_pointer_focus(self.pointer_pos);
+                if let Some(id) = self.output_under_pointer(position) {
+                    self.focused_output = id;
+                }
+                self.cursor_manager.move_to(position.x, position.y);
+                self.process_toplevel_pointer_motion(position);
+                self.forward_pointer_to_clients(position);
+                self.forward_pointer_button(position, button, state);
+                if matches!(state, FlowKeyState::Pressed) {
+                    if matches!(button, FlowMouseButton::Left)
+                        && self.pointer_on_chrome_host_drag_region(position)
+                    {
+                        self.host_window_drag_requested = true;
+                        self.pending_compositor_move = None;
+                    } else {
+                        self.focus_window_at(position);
+                        if matches!(button, FlowMouseButton::Left)
+                            && self.pointer_in_work_recess(position)
+                        {
+                            self.pending_compositor_move = self
+                                .top_mapped_window_id_at(position)
+                                .filter(|&id| {
+                                    self.window(id).is_some_and(|w| {
+                                        w.mapped && !w.maximized && !w.fullscreen && !w.minimized
+                                    })
+                                })
+                                .map(|id| (id, position));
+                        }
+                    }
+                }
+                self.process_toplevel_pointer_button(button, state);
                 self.mark_redraw();
-                return;
             }
-            if self.handle_dialog_input(&event) {
-                self.clear_client_pointer_focus(self.pointer_pos);
+
+            FlowInputEvent::PointerScroll {
+                position, delta, ..
+            } => {
+                self.input.pointer_pos = position;
+                self.pointer_pos = position;
+                if let Some(id) = self.output_under_pointer(position) {
+                    self.focused_output = id;
+                }
+                if self.handle_egui_input(&event) {
+                    self.clear_client_pointer_focus(self.pointer_pos);
+                    self.mark_redraw();
+                    return;
+                }
+                if self.handle_dialog_input(&event) {
+                    self.clear_client_pointer_focus(self.pointer_pos);
+                    self.mark_redraw();
+                    return;
+                }
+                self.cursor_manager.move_to(position.x, position.y);
+                self.forward_pointer_to_clients(position);
+                self.forward_pointer_scroll(delta);
                 self.mark_redraw();
-                return;
             }
-            self.cursor_manager.move_to(position.x, position.y);
-            self.forward_pointer_to_clients(position);
-            self.forward_pointer_scroll(delta);
-            self.mark_redraw();
-        }
 
-        FlowInputEvent::PointerEntered => {
-            self.cursor_manager.set_visible(true);
-            self.mark_redraw();
-        }
+            FlowInputEvent::PointerEntered => {
+                self.cursor_manager.set_visible(true);
+                self.mark_redraw();
+            }
 
-        FlowInputEvent::PointerLeft => {
-            let _ = self.handle_egui_input(&event);
-            self.cursor_manager.set_visible(false);
-            self.mark_redraw();
-        }
+            FlowInputEvent::PointerLeft => {
+                let _ = self.handle_egui_input(&event);
+                self.cursor_manager.set_visible(false);
+                self.mark_redraw();
+            }
 
-        FlowInputEvent::Resized {
-            output_id,
-            width,
-            height,
-            scale_factor,
-        } => {
-            //let id = OutputId(1);
-            let size = Size::<i32, Physical>::from((width as i32, height as i32));
-            self.update_output_size(output_id, size, scale_factor);
-            
-           // if let Some(output) = self.outputs.get_mut(&id) {
-           //     output.scale_factor = scale_factor;
-           //     output.scale = Scale::from((scale_factor, scale_factor));
-           //     output.physical_size = size;
-           //     let logical_w = (size.w as f64 / scale_factor).round() as i32;
-           //     let logical_h = (size.h as f64 / scale_factor).round() as i32;
-           //     output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
-           // }
-            self.mark_redraw();
-        }
+            FlowInputEvent::Resized {
+                output_id,
+                width,
+                height,
+                scale_factor,
+            } => {
+                //let id = OutputId(1);
+                let size = Size::<i32, Physical>::from((width as i32, height as i32));
+                self.update_output_size(output_id, size, scale_factor);
 
-        FlowInputEvent::CloseRequested => {
-            self.running = false;
+                // if let Some(output) = self.outputs.get_mut(&id) {
+                //     output.scale_factor = scale_factor;
+                //     output.scale = Scale::from((scale_factor, scale_factor));
+                //     output.physical_size = size;
+                //     let logical_w = (size.w as f64 / scale_factor).round() as i32;
+                //     let logical_h = (size.h as f64 / scale_factor).round() as i32;
+                //     output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
+                // }
+                self.mark_redraw();
+            }
+
+            FlowInputEvent::CloseRequested => {
+                self.running = false;
+            }
         }
     }
-}
-    
+
     fn handle_dialog_input(&mut self, event: &FlowInputEvent) -> bool {
-    let Some(dialog_id) = self.active_dialog else {
-        return false;
-    };
+        let Some(dialog_id) = self.active_dialog else {
+            return false;
+        };
 
-    let Some(dialog) = self.dialogs.iter().find(|d| d.id == dialog_id) else {
-        return false;
-    };
+        let Some(dialog) = self.dialogs.iter().find(|d| d.id == dialog_id) else {
+            return false;
+        };
 
-    let Some(output) = self.outputs.get(&dialog.owner_output) else {
-        return false;
-    };
+        let Some(output) = self.outputs.get(&dialog.owner_output) else {
+            return false;
+        };
 
-    let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
-    let layout = layout_dialog(dialog, screen);
+        let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
+        let layout = layout_dialog(dialog, screen);
 
         match event {
             FlowInputEvent::PointerButton { state, .. } => {
@@ -1810,13 +1790,13 @@ impl DesktopState {
 
             _ => false,
         }
-}
-    
+    }
+
     pub fn update_output_size(
-    &mut self,
-    output_id: OutputId,
-    physical_size: Size<i32, Physical>,
-    scale_factor: f64,
+        &mut self,
+        output_id: OutputId,
+        physical_size: Size<i32, Physical>,
+        scale_factor: f64,
     ) {
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.scale_factor = scale_factor;
@@ -1839,33 +1819,33 @@ impl DesktopState {
     pub fn clear_repaint_request(&mut self) {
         self.render.redraw_all = false;
     }
-    
+
     pub fn mark_redraw(&mut self) {
         self.render.redraw_all = true;
     }
-    
-/*
-    pub fn handle_resize(
-        &mut self,
-        size: smithay::utils::Size<i32, smithay::utils::Physical>,
-        output_id: OutputId,
-    ) {
-        let id = output_id;
-        
-        if let Some(output) = self.outputs.get_mut(&id) {
-                let logical_w = (size.w as f64 / output.scale_factor).round() as i32;
-                let logical_h = (size.h as f64 / output.scale_factor).round() as i32;
-        
-                output.physical_size = size;
-                output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
-                //output.scale = Scale::from((scale_factor, scale_factor));
-            }
-        
-        // For now: just mark redraw
-        // Later: update layout/output metrics properly
-        self.render.redraw_all = true;
-    }
-*/
+
+    /*
+        pub fn handle_resize(
+            &mut self,
+            size: smithay::utils::Size<i32, smithay::utils::Physical>,
+            output_id: OutputId,
+        ) {
+            let id = output_id;
+
+            if let Some(output) = self.outputs.get_mut(&id) {
+                    let logical_w = (size.w as f64 / output.scale_factor).round() as i32;
+                    let logical_h = (size.h as f64 / output.scale_factor).round() as i32;
+
+                    output.physical_size = size;
+                    output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
+                    //output.scale = Scale::from((scale_factor, scale_factor));
+                }
+
+            // For now: just mark redraw
+            // Later: update layout/output metrics properly
+            self.render.redraw_all = true;
+        }
+    */
     /// Wire the nested compositor's single `wl_output` ([`Output`] with [`Output::create_global`])
     /// into desktop state. Must be the **same** [`Output`] advertised to clients so
     /// `ext-output-image-capture-source-v1` and [`crate::core::portal::output_id_for_session`]
@@ -1920,43 +1900,34 @@ impl DesktopState {
         self.cursor_manager
             .set_base_size_and_scale(24, scale as f32);
     }
-    
-    pub fn insert_nested_output(&mut self, output: Output, size: Size::<i32, Physical>, scale: f64) 
-    {
-    
-    }
-    
-   
-    
-     pub fn tick_layout(&mut self) {
+
+    pub fn insert_nested_output(&mut self, output: Output, size: Size<i32, Physical>, scale: f64) {}
+
+    pub fn tick_layout(&mut self) {
         self.popups.cleanup();
     }
 
-
-    
     pub fn send_frame_callbacks(&mut self, _millis: u32) {
         for surface in self.xdg_shell_state.toplevel_surfaces().iter() {
             Self::send_frames_surface_tree(surface.wl_surface(), _millis);
         }
     }
 
-   
-
     pub fn window_mut(&mut self, id: WindowId) -> Option<&mut ManagedWindow> {
         self.windows.iter_mut().find(|w| w.id == id)
     }
-    
+
     pub fn window(&self, id: WindowId) -> Option<&ManagedWindow> {
         self.windows.iter().find(|w| w.id == id)
     }
 
-pub fn window_id_for_wl_surface(&self, surface: &WlSurface) -> Option<WindowId> {
-    self.windows.iter().find_map(|w| {
-        w.wl_surface()
-            .as_ref()
-            .and_then(|wl| if &**wl == surface { Some(w.id) } else { None })
-    })
-}
+    pub fn window_id_for_wl_surface(&self, surface: &WlSurface) -> Option<WindowId> {
+        self.windows.iter().find_map(|w| {
+            w.wl_surface()
+                .as_ref()
+                .and_then(|wl| if &**wl == surface { Some(w.id) } else { None })
+        })
+    }
 
     fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
         with_surface_tree_downward(
@@ -2065,14 +2036,14 @@ pub fn window_id_for_wl_surface(&self, surface: &WlSurface) -> Option<WindowId> 
         self.render
             .upload_cursor_texture_for_desktop(renderer, &mut self.cursor_manager)?;
 
-        let need_sw = self.cursor_manager.software_cursor_needed()
-            && !self.drm_try_pass_cursor_this_frame;
+        let need_sw =
+            self.cursor_manager.software_cursor_needed() && !self.drm_try_pass_cursor_this_frame;
         if need_sw {
             let rel = self
                 .pointer_relative_to_output_logical(output_id)
                 .unwrap_or(self.pointer_pos);
-            let phys: Point<i32, Physical> = rel
-                .to_physical_precise_round::<f64, i32>(desk_output.scale);
+            let phys: Point<i32, Physical> =
+                rel.to_physical_precise_round::<f64, i32>(desk_output.scale);
             let (hx, hy) = self.render.sw_cursor_hotspot;
             let (tw, th) = self.render.sw_cursor_tex_size;
             self.render.sw_cursor_dst_rect = Some((phys.x - hx, phys.y - hy, tw, th));
@@ -2114,19 +2085,12 @@ pub fn window_id_for_wl_surface(&self, surface: &WlSurface) -> Option<WindowId> 
             }
         }
     }
-    
 }
-
-
 
 impl BufferHandler for DesktopState {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}
 }
 
-
 impl OutputHandler for DesktopState {}
 
-
-
 delegate_output!(DesktopState);
-    

@@ -2,15 +2,31 @@ use smithay::backend::renderer::gles::GlesFrame;
 use smithay::utils::{Logical, Physical, Point, Rectangle};
 
 use crate::desktop_frame::DesktopFrameCtx;
-use crate::uicomponent::{UiHit, UiHitTarget};
-use flowstate_types::WidgetId;
-use crate::uicomponent::UiComponent;
 use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
+use crate::uicomponent::UiComponent;
+use crate::uicomponent::{UiHit, UiHitTarget};
+use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
 
 #[derive(Default)]
-pub struct OverlayManager;
+pub struct OverlayManager {
+    active: Vec<OverlayKind>,
+}
+
+pub enum OverlayKind {
+    Settings,
+    Launcher,
+    CommandPalette,
+    AppSwitcher,
+    WorkspaceSwitcher,
+    Notifications,
+    PowerMenu,
+    ScreenshotTool,
+    DisplayLayout,
+    DebugHud,
+    AiAssistant,
+}
 
 impl OverlayManager {
     pub fn render(
@@ -27,8 +43,7 @@ impl OverlayManager {
 }
 
 impl UiComponent for OverlayManager {
-    fn layout(&mut self, _ctx: &LayoutCtx) {
-    }
+    fn layout(&mut self, _ctx: &LayoutCtx) {}
     fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
         self.hit_test(point)
     }

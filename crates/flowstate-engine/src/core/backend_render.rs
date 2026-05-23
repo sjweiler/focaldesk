@@ -9,6 +9,7 @@ use crate::core::render::{FlowRenderElement, FrameCtx, RenderInputs, RenderInput
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use crate::core::ui_builder::build_ui_for_output;
+use flowstate_flow::keybinds::BackendKind;
 use flowstate_types::OutputId;
 use crate::core::fonts::{FontId, TextStyle};
 use flowstate_themes::FlowTheme;
@@ -217,6 +218,7 @@ pub fn draw_output(
         active_dialog: state.active_dialog,
         fonts: &state.fonts,
         theme: &state.theme.active_theme(),
+        flip_egui_y: state.backend_kind == BackendKind::Drm,
     };
 
     let muts = RenderInputsMut { ui: ui_state };

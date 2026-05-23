@@ -9,6 +9,8 @@ flowstate-themes = { path = "../flowstate-themes" }
 flowstate-logging = { path = "../flowstate-logging" }
 image = "0.25"
 egui = "0.31"
+egui_glow = "0.31"
+glow.workspace = true
 
 tiny-skia.workspace = true
 cosmic-text.workspace = true

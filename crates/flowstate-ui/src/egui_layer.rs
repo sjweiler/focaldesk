@@ -1,47 +1,43 @@
 //! egui overlay — rendered last, above dialogs and compositor chrome.
 
-use std::{collections::HashMap, mem, ptr};
+use std::{mem, sync::Arc};
 
 use egui::{
-    epaint::Primitive, ClippedPrimitive, Context, Event, ImageData, Modifiers, MouseWheelUnit,
-    PointerButton, Pos2, RawInput, Rect, TextureId, TexturesDelta, Vec2,
+    epaint::Primitive,
+    ClippedPrimitive, Context, Event, FontData, FontDefinitions, FontFamily, ImageData, Modifiers,
+    MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TextureId, TexturesDelta, Vec2,
 };
+use egui_glow::Painter;
 use flowstate_themes::FlowTheme;
-use smithay::backend::renderer::gles::{ffi, GlesError, GlesFrame, GlesPixelProgram, Uniform};
+use glow;
+use smithay::backend::egl::get_proc_address;
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesPixelProgram, Uniform};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Size};
 
-use crate::chrome_shaders::{ChromeShaders, EGUI_FRAG, EGUI_VERT};
+use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
+use crate::egui_panels::{DebugPanel, EguiPanelView, LauncherPanel, SettingsPanel};
 use crate::types::{PanelKind, UiAction};
 
 pub struct EguiLayer {
     ctx: Context,
     raw_input: RawInput,
     actions: Vec<UiAction>,
+    settings: SettingsPanel,
+    launcher: LauncherPanel,
+    debug: DebugPanel,
+
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
-    gl_textures: HashMap<TextureId, EguiGlTexture>,
-    gl_program: Option<EguiGlProgram>,
-    gl_vbo: u32,
-    gl_ibo: u32,
+    glow_painter: Option<Painter>,
     wants_pointer_input: bool,
     wants_keyboard_input: bool,
-    demo_open: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EguiGlTexture {
-    id: u32,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct EguiGlProgram {
-    id: u32,
-    a_pos: i32,
-    a_uv: i32,
-    a_color: i32,
-    u_screen_size: i32,
-    u_tex: i32,
+    logged_texture_delta: bool,
+    logged_mesh_sample: bool,
+    dumped_font_atlas: bool,
+    dumped_font_mesh: bool,
+    last_font_atlas_rgba: Option<Vec<u8>>,
+    //demo_open: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -95,21 +91,59 @@ pub enum EguiScrollDelta {
 
 impl Default for EguiLayer {
     fn default() -> Self {
+        let ctx = Context::default();
+        ctx.set_fonts(flowstate_egui_fonts());
+
         Self {
-            ctx: Context::default(),
+            ctx,
             raw_input: RawInput::default(),
             actions: Vec::new(),
             textures_delta: TexturesDelta::default(),
             primitives: Vec::new(),
-            gl_textures: HashMap::new(),
-            gl_program: None,
-            gl_vbo: 0,
-            gl_ibo: 0,
+            glow_painter: None,
             wants_pointer_input: false,
             wants_keyboard_input: false,
-            demo_open: true,
+            logged_texture_delta: false,
+            logged_mesh_sample: false,
+            dumped_font_atlas: false,
+            dumped_font_mesh: false,
+            last_font_atlas_rgba: None,
+            //demo_open: true,
+            settings: SettingsPanel::default(),
+            launcher: LauncherPanel::default(),
+            debug: DebugPanel::default(),
         }
     }
+}
+
+fn flowstate_egui_fonts() -> FontDefinitions {
+    let mut fonts = FontDefinitions::default();
+
+    fonts.font_data.insert(
+        "FlowStateSans".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../../../assets/fonts/IBMPlexSans-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "FlowStateMono".to_owned(),
+        Arc::new(FontData::from_static(include_bytes!(
+            "../../../assets/fonts/IBMPlexMono-Regular.ttf"
+        ))),
+    );
+
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "FlowStateSans".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "FlowStateMono".to_owned());
+
+    fonts
 }
 
 /// Gives egui overlay code access to FlowState's compiled shader set and current GLES frame.
@@ -137,8 +171,7 @@ impl<'a, 'frame, 'buffer> EguiShaderBridge<'a, 'frame, 'buffer> {
             (0.0, 0.0),
             (rect_physical.size.w as f64, rect_physical.size.h as f64),
         );
-        let buffer_size =
-            Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
+        let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
 
         self.frame.render_pixel_shader_to(
             program,
@@ -167,7 +200,10 @@ impl<'a, 'frame, 'buffer> EguiShaderBridge<'a, 'frame, 'buffer> {
             program,
             rect,
             &[
-                Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
+                Uniform::new(
+                    "u_size",
+                    [rect_physical.size.w as f32, rect_physical.size.h as f32],
+                ),
                 Uniform::new("u_radius", radius),
                 Uniform::new("u_color", color),
             ],
@@ -176,12 +212,39 @@ impl<'a, 'frame, 'buffer> EguiShaderBridge<'a, 'frame, 'buffer> {
 }
 
 impl EguiLayer {
+    pub fn open_panel(&mut self, panel: PanelKind) {
+        match panel {
+            PanelKind::Settings => self.settings.open = true,
+            PanelKind::AppLauncher => self.launcher.open = true,
+            _ => {}
+        }
+    }
+
+    fn has_open_panel(&self) -> bool {
+        self.settings.open || self.launcher.open || self.debug.open
+    }
+
+    fn run_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
+        self.prepare_raw_input(frame_ctx);
+
+        let output = self.ctx.run(self.raw_input.take(), |ctx| {
+            self.settings.show(ctx, frame_ctx, &mut self.actions);
+            self.launcher.show(ctx, frame_ctx, &mut self.actions);
+            self.debug.show(ctx, frame_ctx, &mut self.actions);
+        });
+
+        self.textures_delta.append(output.textures_delta);
+        self.primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+        self.wants_pointer_input = self.ctx.wants_pointer_input() || self.ctx.is_using_pointer();
+        self.wants_keyboard_input = self.ctx.wants_keyboard_input();
+    }
     pub fn handle_input(&mut self, event: EguiInputEvent) -> bool {
         match event {
             EguiInputEvent::PointerMoved { position } => {
-                self.raw_input
-                    .events
-                    .push(Event::PointerMoved(Pos2::new(position.x as f32, position.y as f32)));
+                self.raw_input.events.push(Event::PointerMoved(Pos2::new(
+                    position.x as f32,
+                    position.y as f32,
+                )));
             }
             EguiInputEvent::PointerButton {
                 button,
@@ -197,9 +260,7 @@ impl EguiLayer {
                 });
             }
             EguiInputEvent::PointerScroll {
-                delta,
-                modifiers,
-                ..
+                delta, modifiers, ..
             } => {
                 let (unit, delta) = match delta {
                     EguiScrollDelta::Line { x, y } => (MouseWheelUnit::Line, Vec2::new(x, y)),
@@ -259,7 +320,9 @@ impl EguiLayer {
             return Ok(());
         }
 
-        self.run_default_overlay(frame_ctx);
+        //self.run_default_overlay(frame_ctx);
+
+        self.run_panels(frame_ctx);
 
         let mut bridge = EguiShaderBridge {
             frame,
@@ -297,8 +360,6 @@ impl EguiLayer {
         build: impl FnOnce(&Context, &mut Vec<UiAction>),
     ) {
         self.prepare_raw_input(frame_ctx);
-        self.ctx
-            .set_pixels_per_point(frame_ctx.output_scale.x as f32);
         let mut actions = Vec::new();
         let mut build = Some(build);
         let output = self.ctx.run(self.raw_input.take(), |ctx| {
@@ -313,15 +374,17 @@ impl EguiLayer {
         self.wants_keyboard_input = self.ctx.wants_keyboard_input();
     }
 
+    /*
     fn run_default_overlay(&mut self, frame_ctx: &DesktopFrameCtx) {
         let demo_open = self.demo_open;
         self.run_ui(frame_ctx, |ctx, actions| {
             if !demo_open {
                 return;
             }
+            let work = egui_work_rect(frame_ctx);
 
             egui::Area::new("flowstate_egui_overlay".into())
-                .fixed_pos(egui::pos2(24.0, 96.0))
+                .fixed_pos(work.min + egui::vec2(16.0, 16.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(220.0);
                     ui.heading("FlowState");
@@ -338,23 +401,35 @@ impl EguiLayer {
                 });
         });
     }
+    */
 
     fn paint_shader_effects(
         &self,
         bridge: &mut EguiShaderBridge<'_, '_, '_>,
     ) -> Result<(), GlesError> {
-        if !self.demo_open {
+        if !self.has_open_panel() || egui_debug_uv_enabled() {
             return Ok(());
         }
 
-        bridge.draw_rounded_rect(
-            Rectangle::from_loc_and_size((18, 88), (244, 184)),
-            18.0,
-            [0.03, 0.05, 0.075, 0.34],
-        )
+        let work = bridge.frame_ctx.work;
+        let margin = 8;
+        let rect = Rectangle::from_loc_and_size(
+            (work.loc.x + margin, work.loc.y + margin),
+            (
+                (244).min(work.size.w - margin * 2).max(1),
+                (184).min(work.size.h - margin * 2).max(1),
+            ),
+        );
+
+        bridge.draw_rounded_rect(rect, 18.0, [0.03, 0.05, 0.075, 0.34])
     }
 
     fn prepare_raw_input(&mut self, frame_ctx: &DesktopFrameCtx) {
+        self.raw_input
+            .viewports
+            .entry(self.raw_input.viewport_id)
+            .or_default()
+            .native_pixels_per_point = Some(frame_ctx.output_scale.x as f32);
         self.raw_input.screen_rect = Some(Rect::from_min_size(
             Pos2::ZERO,
             Vec2::new(
@@ -376,192 +451,171 @@ impl EguiLayer {
         frame: &mut GlesFrame<'_, '_>,
         frame_ctx: &DesktopFrameCtx,
     ) -> Result<(), GlesError> {
-        let screen_size = [
-            (frame_ctx.output_size.0 as f64 / frame_ctx.output_scale.x) as f32,
-            (frame_ctx.output_size.1 as f64 / frame_ctx.output_scale.y) as f32,
-        ];
-        let output_height = frame_ctx.output_size.1;
-        let scale = frame_ctx.output_scale.x as f32;
+        if egui_debug_uv_enabled() {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "egui: FLOWSTATE_EGUI_DEBUG_UV is ignored when using the egui_glow painter"
+                );
+            });
+        }
 
-        frame.with_context(|gl| unsafe {
-            self.ensure_gl_resources(gl);
-            self.upload_egui_textures(gl);
-            self.paint_primitives(gl, screen_size, output_height, scale);
-            self.free_egui_textures(gl);
+        self.log_debug_dumps();
+
+        let screen_size_px = [
+            frame_ctx.output_size.0 as u32,
+            frame_ctx.output_size.1 as u32,
+        ];
+        let pixels_per_point = frame_ctx.output_scale.x as f32;
+
+        frame.with_context(|_gl| {
+            if let Err(err) =
+                self.paint_with_glow(frame_ctx, screen_size_px, pixels_per_point)
+            {
+                eprintln!("egui glow paint failed: {err}");
+            }
         })
     }
 
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn ensure_gl_resources(&mut self, gl: &ffi::Gles2) {
-        if self.gl_program.is_none() {
-            self.gl_program = compile_egui_program(gl);
-        }
-
-        if self.gl_vbo == 0 {
-            gl.GenBuffers(1, &mut self.gl_vbo);
-        }
-        if self.gl_ibo == 0 {
-            gl.GenBuffers(1, &mut self.gl_ibo);
-        }
-    }
-
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn upload_egui_textures(&mut self, gl: &ffi::Gles2) {
-        for (id, delta) in self.textures_delta.set.drain(..) {
-            let rgba = image_delta_rgba(&delta.image);
+    fn log_debug_dumps(&mut self) {
+        for (id, delta) in &self.textures_delta.set {
             let [w, h] = delta.image.size();
-
-            let texture = self.gl_textures.entry(id).or_insert_with(|| {
-                let mut tex = 0;
-                unsafe {
-                    gl.GenTextures(1, &mut tex);
-                }
-                EguiGlTexture { id: tex }
-            });
-
-            gl.BindTexture(ffi::TEXTURE_2D, texture.id);
-            gl.PixelStorei(ffi::UNPACK_ALIGNMENT, 1);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
-
-            if let Some([x, y]) = delta.pos {
-                gl.TexSubImage2D(
-                    ffi::TEXTURE_2D,
-                    0,
-                    x as i32,
-                    y as i32,
-                    w as i32,
-                    h as i32,
-                    ffi::RGBA,
-                    ffi::UNSIGNED_BYTE,
-                    rgba.as_ptr() as *const _,
-                );
-            } else {
-                gl.TexImage2D(
-                    ffi::TEXTURE_2D,
-                    0,
-                    ffi::RGBA as i32,
-                    w as i32,
-                    h as i32,
-                    0,
-                    ffi::RGBA,
-                    ffi::UNSIGNED_BYTE,
-                    rgba.as_ptr() as *const _,
-                );
-            }
-        }
-    }
-
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn free_egui_textures(&mut self, gl: &ffi::Gles2) {
-        for id in self.textures_delta.free.drain(..) {
-            if let Some(texture) = self.gl_textures.remove(&id) {
-                gl.DeleteTextures(1, &texture.id);
-            }
-        }
-    }
-
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn paint_primitives(
-        &mut self,
-        gl: &ffi::Gles2,
-        screen_size: [f32; 2],
-        output_height: i32,
-        scale: f32,
-    ) {
-        let Some(program) = self.gl_program else {
-            return;
-        };
-
-        gl.UseProgram(program.id);
-        gl.Uniform2f(program.u_screen_size, screen_size[0], screen_size[1]);
-        gl.Uniform1i(program.u_tex, 0);
-        gl.ActiveTexture(ffi::TEXTURE0);
-
-        gl.Enable(ffi::BLEND);
-        gl.BlendEquation(ffi::FUNC_ADD);
-        gl.BlendFunc(ffi::ONE, ffi::ONE_MINUS_SRC_ALPHA);
-        gl.Disable(ffi::CULL_FACE);
-        gl.Disable(ffi::DEPTH_TEST);
-        gl.Enable(ffi::SCISSOR_TEST);
-
-        gl.BindBuffer(ffi::ARRAY_BUFFER, self.gl_vbo);
-        gl.BindBuffer(ffi::ELEMENT_ARRAY_BUFFER, self.gl_ibo);
-
-        let stride = (8 * mem::size_of::<f32>()) as i32;
-        gl.EnableVertexAttribArray(program.a_pos as u32);
-        gl.EnableVertexAttribArray(program.a_uv as u32);
-        gl.EnableVertexAttribArray(program.a_color as u32);
-        gl.VertexAttribPointer(program.a_pos as u32, 2, ffi::FLOAT, ffi::FALSE, stride, ptr::null());
-        gl.VertexAttribPointer(
-            program.a_uv as u32,
-            2,
-            ffi::FLOAT,
-            ffi::FALSE,
-            stride,
-            (2 * mem::size_of::<f32>()) as *const _,
-        );
-        gl.VertexAttribPointer(
-            program.a_color as u32,
-            4,
-            ffi::FLOAT,
-            ffi::FALSE,
-            stride,
-            (4 * mem::size_of::<f32>()) as *const _,
-        );
-
-        for primitive in self.primitives.iter().cloned() {
-            let Primitive::Mesh(mesh) = primitive.primitive else {
-                continue;
-            };
-            let Some(texture) = self.gl_textures.get(&mesh.texture_id) else {
-                continue;
-            };
-
-            let clip = primitive.clip_rect;
-            let x = (clip.min.x * scale).floor().max(0.0) as i32;
-            let y_top = (clip.min.y * scale).floor().max(0.0) as i32;
-            let x_max = (clip.max.x * scale).ceil().min(screen_size[0] * scale) as i32;
-            let y_max = (clip.max.y * scale).ceil().min(screen_size[1] * scale) as i32;
-            let w = (x_max - x).max(0);
-            let h = (y_max - y_top).max(0);
             if w == 0 || h == 0 {
                 continue;
             }
-            gl.Scissor(x, output_height - y_max, w, h);
-            gl.BindTexture(ffi::TEXTURE_2D, texture.id);
 
-            for mesh in mesh.split_to_u16() {
-                let vertices = mesh_vertices(&mesh.vertices);
-                gl.BufferData(
-                    ffi::ARRAY_BUFFER,
-                    (vertices.len() * mem::size_of::<f32>()) as isize,
-                    vertices.as_ptr() as *const _,
-                    ffi::STREAM_DRAW,
+            if !self.logged_texture_delta {
+                let stats = image_alpha_stats(&delta.image);
+                eprintln!(
+                    "egui texture delta: id={id:?} kind={} pos={:?} size={}x{} alpha_nonzero={} alpha_min={} alpha_max={}",
+                    image_kind(&delta.image),
+                    delta.pos,
+                    w,
+                    h,
+                    stats.nonzero,
+                    stats.min,
+                    stats.max
                 );
-                gl.BufferData(
-                    ffi::ELEMENT_ARRAY_BUFFER,
-                    (mesh.indices.len() * mem::size_of::<u16>()) as isize,
-                    mesh.indices.as_ptr() as *const _,
-                    ffi::STREAM_DRAW,
-                );
-                gl.DrawElements(
-                    ffi::TRIANGLES,
-                    mesh.indices.len() as i32,
-                    ffi::UNSIGNED_SHORT,
-                    ptr::null(),
-                );
+                self.logged_texture_delta = true;
+            }
+
+            if !self.dumped_font_atlas && matches!(delta.image, ImageData::Font(_)) {
+                let rgba = image_delta_rgba_raw(&delta.image);
+                if let Err(err) =
+                    dump_egui_atlas_png("/tmp/flowstate-egui-font-atlas.png", &rgba, [w, h])
+                {
+                    eprintln!("egui texture warning: failed to dump font atlas: {err}");
+                } else {
+                    eprintln!("egui texture dump: /tmp/flowstate-egui-font-atlas.png");
+                }
+                self.dumped_font_atlas = true;
+            }
+
+            if matches!(delta.image, ImageData::Font(_)) && delta.pos.is_none() {
+                self.last_font_atlas_rgba = Some(image_delta_rgba_raw(&delta.image));
             }
         }
 
-        gl.DisableVertexAttribArray(program.a_pos as u32);
-        gl.DisableVertexAttribArray(program.a_uv as u32);
-        gl.DisableVertexAttribArray(program.a_color as u32);
-        gl.BindBuffer(ffi::ARRAY_BUFFER, 0);
-        gl.BindBuffer(ffi::ELEMENT_ARRAY_BUFFER, 0);
-        gl.Disable(ffi::SCISSOR_TEST);
+        for clipped in &self.primitives {
+            let Primitive::Mesh(mesh) = &clipped.primitive else {
+                continue;
+            };
+            if !self.logged_mesh_sample && mesh.texture_id == TextureId::default() {
+                let uv = mesh_uv_bounds(&mesh.vertices);
+                if mesh_has_atlas_uvs(uv) {
+                    let atlas_size = self
+                        .textures_delta
+                        .set
+                        .iter()
+                        .find(|(tid, _)| *tid == TextureId::default())
+                        .map(|(_, d)| d.image.size())
+                        .unwrap_or([0, 0]);
+                    eprintln!(
+                        "egui text mesh sample: texture={:?} texture_size={:?} vertices={} indices={} uv_min={:?} uv_max={:?}",
+                        mesh.texture_id,
+                        atlas_size,
+                        mesh.vertices.len(),
+                        mesh.indices.len(),
+                        uv.0,
+                        uv.1
+                    );
+                    self.logged_mesh_sample = true;
+                }
+            }
+            if self.dumped_font_mesh || mesh.texture_id != TextureId::default() {
+                continue;
+            }
+            let uv = mesh_uv_bounds(&mesh.vertices);
+            if !mesh_has_atlas_uvs(uv) {
+                continue;
+            }
+            let Some(font_rgba) = self.last_font_atlas_rgba.as_ref() else {
+                continue;
+            };
+            let [atlas_w, atlas_h] = self
+                .textures_delta
+                .set
+                .iter()
+                .find(|(tid, _)| *tid == TextureId::default())
+                .map(|(_, d)| d.image.size())
+                .unwrap_or([0, 0]);
+            if atlas_w == 0 || atlas_h == 0 {
+                continue;
+            }
+            match dump_egui_mesh_png(
+                "/tmp/flowstate-egui-font-mesh.png",
+                font_rgba,
+                [atlas_w, atlas_h],
+                &mesh.vertices,
+                &mesh.indices,
+            ) {
+                Ok(()) => eprintln!("egui mesh dump: /tmp/flowstate-egui-font-mesh.png"),
+                Err(err) => eprintln!("egui mesh warning: failed to dump font mesh: {err}"),
+            }
+            self.dumped_font_mesh = true;
+        }
+    }
+
+    fn paint_with_glow(
+        &mut self,
+        frame_ctx: &DesktopFrameCtx,
+        screen_size_px: [u32; 2],
+        pixels_per_point: f32,
+    ) -> Result<(), egui_glow::PainterError> {
+        if self.glow_painter.is_none() {
+            let gl = Arc::new(unsafe {
+                glow::Context::from_loader_function(|symbol| get_proc_address(symbol) as *const _)
+            });
+            let painter = Painter::new(gl, "", None, false)?;
+            eprintln!("egui: using egui_glow painter");
+            self.glow_painter = Some(painter);
+        }
+
+        let height_pts = screen_size_px[1] as f32 / pixels_per_point;
+        let primitives = if frame_ctx.flip_egui_y {
+            flip_clipped_primitives_y(&self.primitives, height_pts)
+        } else {
+            self.primitives.clone()
+        };
+
+        let painter = self.glow_painter.as_mut().expect("initialized above");
+        painter.paint_and_update_textures(
+            screen_size_px,
+            pixels_per_point,
+            &primitives,
+            &self.textures_delta,
+        );
+        self.textures_delta.set.clear();
+        self.textures_delta.free.clear();
+        Ok(())
+    }
+}
+
+impl Drop for EguiLayer {
+    fn drop(&mut self) {
+        if let Some(mut painter) = self.glow_painter.take() {
+            painter.destroy();
+        }
     }
 }
 
@@ -587,7 +641,7 @@ impl From<EguiModifiers> for Modifiers {
     }
 }
 
-fn image_delta_rgba(image: &ImageData) -> Vec<u8> {
+fn image_delta_rgba_raw(image: &ImageData) -> Vec<u8> {
     match image {
         ImageData::Color(image) => image
             .pixels
@@ -601,73 +655,236 @@ fn image_delta_rgba(image: &ImageData) -> Vec<u8> {
     }
 }
 
-fn mesh_vertices(vertices: &[egui::epaint::Vertex]) -> Vec<f32> {
-    let mut out = Vec::with_capacity(vertices.len() * 8);
+fn image_kind(image: &ImageData) -> &'static str {
+    match image {
+        ImageData::Color(_) => "color",
+        ImageData::Font(_) => "font",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AlphaStats {
+    nonzero: usize,
+    min: u8,
+    max: u8,
+}
+
+fn image_alpha_stats(image: &ImageData) -> AlphaStats {
+    let mut stats = AlphaStats {
+        nonzero: 0,
+        min: u8::MAX,
+        max: 0,
+    };
+
+    match image {
+        ImageData::Color(image) => {
+            for pixel in &image.pixels {
+                let alpha = pixel.a();
+                stats.nonzero += usize::from(alpha != 0);
+                stats.min = stats.min.min(alpha);
+                stats.max = stats.max.max(alpha);
+            }
+        }
+        ImageData::Font(image) => {
+            for coverage in &image.pixels {
+                let alpha = (coverage.powf(0.55) * 255.0).round().clamp(0.0, 255.0) as u8;
+                stats.nonzero += usize::from(alpha != 0);
+                stats.min = stats.min.min(alpha);
+                stats.max = stats.max.max(alpha);
+            }
+        }
+    }
+
+    if stats.min == u8::MAX {
+        stats.min = 0;
+    }
+    stats
+}
+
+fn mesh_uv_bounds(vertices: &[egui::epaint::Vertex]) -> ([f32; 2], [f32; 2]) {
+    let mut min = [f32::INFINITY, f32::INFINITY];
+    let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+
     for vertex in vertices {
-        let [r, g, b, a] = vertex.color.to_array();
-        out.extend_from_slice(&[
-            vertex.pos.x,
-            vertex.pos.y,
-            vertex.uv.x,
-            vertex.uv.y,
-            r as f32 / 255.0,
-            g as f32 / 255.0,
-            b as f32 / 255.0,
-            a as f32 / 255.0,
-        ]);
+        min[0] = min[0].min(vertex.uv.x);
+        min[1] = min[1].min(vertex.uv.y);
+        max[0] = max[0].max(vertex.uv.x);
+        max[1] = max[1].max(vertex.uv.y);
     }
-    out
+
+    if vertices.is_empty() {
+        ([0.0, 0.0], [0.0, 0.0])
+    } else {
+        (min, max)
+    }
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn compile_egui_program(gl: &ffi::Gles2) -> Option<EguiGlProgram> {
-    let vert = compile_shader(gl, ffi::VERTEX_SHADER, EGUI_VERT)?;
-    let frag = compile_shader(gl, ffi::FRAGMENT_SHADER, EGUI_FRAG)?;
-    let program = gl.CreateProgram();
-    gl.AttachShader(program, vert);
-    gl.AttachShader(program, frag);
-    gl.LinkProgram(program);
-    gl.DetachShader(program, vert);
-    gl.DetachShader(program, frag);
-    gl.DeleteShader(vert);
-    gl.DeleteShader(frag);
-
-    let mut status = ffi::FALSE as i32;
-    gl.GetProgramiv(program, ffi::LINK_STATUS, &mut status);
-    if status == ffi::FALSE as i32 {
-        gl.DeleteProgram(program);
-        return None;
-    }
-
-    Some(EguiGlProgram {
-        id: program,
-        a_pos: gl.GetAttribLocation(program, b"a_pos\0".as_ptr() as *const _),
-        a_uv: gl.GetAttribLocation(program, b"a_uv\0".as_ptr() as *const _),
-        a_color: gl.GetAttribLocation(program, b"a_color\0".as_ptr() as *const _),
-        u_screen_size: gl.GetUniformLocation(program, b"u_screen_size\0".as_ptr() as *const _),
-        u_tex: gl.GetUniformLocation(program, b"tex\0".as_ptr() as *const _),
-    })
+fn mesh_has_atlas_uvs((min, max): ([f32; 2], [f32; 2])) -> bool {
+    let span_x = max[0] - min[0];
+    let span_y = max[1] - min[1];
+    min[0].is_finite()
+        && min[1].is_finite()
+        && max[0].is_finite()
+        && max[1].is_finite()
+        && (span_x > 0.0001 || span_y > 0.0001)
+        && (max[0] > 0.001 || max[1] > 0.001)
 }
 
-#[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn compile_shader(gl: &ffi::Gles2, variant: u32, src: &str) -> Option<u32> {
-    let shader = gl.CreateShader(variant);
-    if shader == 0 {
-        return None;
-    }
-    gl.ShaderSource(
-        shader,
-        1,
-        &(src.as_ptr() as *const i8),
-        &(src.len() as i32),
-    );
-    gl.CompileShader(shader);
+fn egui_debug_uv_enabled() -> bool {
+    std::env::var_os("FLOWSTATE_EGUI_DEBUG_UV").is_some()
+}
 
-    let mut status = ffi::FALSE as i32;
-    gl.GetShaderiv(shader, ffi::COMPILE_STATUS, &mut status);
-    if status == ffi::FALSE as i32 {
-        gl.DeleteShader(shader);
-        return None;
+fn flip_clipped_primitives_y(
+    primitives: &[ClippedPrimitive],
+    height_pts: f32,
+) -> Vec<ClippedPrimitive> {
+    primitives
+        .iter()
+        .map(|clipped| {
+            let mut flipped = clipped.clone();
+            flipped.clip_rect = Rect::from_min_max(
+                Pos2::new(
+                    clipped.clip_rect.min.x,
+                    height_pts - clipped.clip_rect.max.y,
+                ),
+                Pos2::new(
+                    clipped.clip_rect.max.x,
+                    height_pts - clipped.clip_rect.min.y,
+                ),
+            );
+            if let Primitive::Mesh(mesh) = &mut flipped.primitive {
+                for vertex in &mut mesh.vertices {
+                    vertex.pos.y = height_pts - vertex.pos.y;
+                }
+            }
+            flipped
+        })
+        .collect()
+}
+
+fn dump_egui_atlas_png(
+    path: &str,
+    rgba: &[u8],
+    [w, h]: [usize; 2],
+) -> Result<(), image::ImageError> {
+    let Some(image) = image::RgbaImage::from_raw(w as u32, h as u32, rgba.to_vec()) else {
+        return Err(image::ImageError::Parameter(
+            image::error::ParameterError::from_kind(
+                image::error::ParameterErrorKind::DimensionMismatch,
+            ),
+        ));
+    };
+    image.save(path)
+}
+
+fn dump_egui_mesh_png(
+    path: &str,
+    atlas_rgba: &[u8],
+    [atlas_w, atlas_h]: [usize; 2],
+    vertices: &[egui::epaint::Vertex],
+    indices: &[u32],
+) -> Result<(), image::ImageError> {
+    if vertices.is_empty() || indices.is_empty() || atlas_w == 0 || atlas_h == 0 {
+        return Ok(());
     }
-    Some(shader)
+
+    let mut min = [f32::INFINITY, f32::INFINITY];
+    let mut max = [f32::NEG_INFINITY, f32::NEG_INFINITY];
+    for vertex in vertices {
+        min[0] = min[0].min(vertex.pos.x);
+        min[1] = min[1].min(vertex.pos.y);
+        max[0] = max[0].max(vertex.pos.x);
+        max[1] = max[1].max(vertex.pos.y);
+    }
+
+    let margin = 8.0;
+    let width = ((max[0] - min[0] + margin * 2.0).ceil() as u32).clamp(1, 2048);
+    let height = ((max[1] - min[1] + margin * 2.0).ceil() as u32).clamp(1, 2048);
+    let origin = [min[0] - margin, min[1] - margin];
+    let mut out = image::RgbaImage::new(width, height);
+
+    for triangle in indices.chunks_exact(3) {
+        let [Some(a), Some(b), Some(c)] = [
+            vertices.get(triangle[0] as usize),
+            vertices.get(triangle[1] as usize),
+            vertices.get(triangle[2] as usize),
+        ] else {
+            continue;
+        };
+
+        let ax = a.pos.x - origin[0];
+        let ay = a.pos.y - origin[1];
+        let bx = b.pos.x - origin[0];
+        let by = b.pos.y - origin[1];
+        let cx = c.pos.x - origin[0];
+        let cy = c.pos.y - origin[1];
+
+        let x0 = ax.min(bx).min(cx).floor().max(0.0) as u32;
+        let y0 = ay.min(by).min(cy).floor().max(0.0) as u32;
+        let x1 = ax.max(bx).max(cx).ceil().min(width as f32 - 1.0) as u32;
+        let y1 = ay.max(by).max(cy).ceil().min(height as f32 - 1.0) as u32;
+        let denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+        if denom.abs() < f32::EPSILON {
+            continue;
+        }
+
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let wa = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / denom;
+                let wb = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / denom;
+                let wc = 1.0 - wa - wb;
+                if wa < -0.001 || wb < -0.001 || wc < -0.001 {
+                    continue;
+                }
+
+                let u = wa * a.uv.x + wb * b.uv.x + wc * c.uv.x;
+                let v = wa * a.uv.y + wb * b.uv.y + wc * c.uv.y;
+                let tx = ((u * atlas_w as f32).floor() as isize).clamp(0, atlas_w as isize - 1);
+                let ty = ((v * atlas_h as f32).floor() as isize).clamp(0, atlas_h as isize - 1);
+                let atlas_idx = ((ty as usize * atlas_w + tx as usize) * 4)
+                    .min(atlas_rgba.len().saturating_sub(4));
+                let src = &atlas_rgba[atlas_idx..atlas_idx + 4];
+                let color = a.color.to_array();
+                let alpha = ((src[3] as u16 * color[3] as u16) / 255) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                out.put_pixel(
+                    x,
+                    y,
+                    image::Rgba([
+                        ((src[0] as u16 * color[0] as u16) / 255) as u8,
+                        ((src[1] as u16 * color[1] as u16) / 255) as u8,
+                        ((src[2] as u16 * color[2] as u16) / 255) as u8,
+                        alpha,
+                    ]),
+                );
+            }
+        }
+    }
+
+    out.save(path)
+}
+
+fn egui_work_rect(frame_ctx: &DesktopFrameCtx) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(frame_ctx.work.loc.x as f32, frame_ctx.work.loc.y as f32),
+        egui::vec2(frame_ctx.work.size.w as f32, frame_ctx.work.size.h as f32),
+    )
+}
+
+#[cfg(test)]
+mod egui_vertex_layout_tests {
+    use egui::epaint::Vertex;
+    use std::mem;
+
+    #[test]
+    fn vertex_layout_matches_gl_attribs() {
+        assert_eq!(mem::size_of::<Vertex>(), 20);
+        assert_eq!(mem::offset_of!(Vertex, pos), 0);
+        assert_eq!(mem::offset_of!(Vertex, uv), 8);
+        assert_eq!(mem::offset_of!(Vertex, color), 16);
+    }
 }

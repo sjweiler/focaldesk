@@ -13,6 +13,8 @@ pub struct DesktopFrameCtx {
     pub rendering_output: OutputId,
     pub now: Instant,
     pub start_time: Instant,
+    /// Flip egui geometry vertically for raw egui_glow painting on DRM framebuffers.
+    pub flip_egui_y: bool,
 }
 
 impl DesktopFrameCtx {

@@ -1,11 +1,11 @@
 // crates/flowstate-engine/src/core/chrome_shader.rs
 use flowstate_logging::flog;
 
+use smithay::backend::renderer::gles::GlesTexProgram;
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
 };
 use smithay::utils::{Physical, Rectangle, Size};
-use smithay::backend::renderer::gles::GlesTexProgram;
 
 pub struct ChromeShaders {
     pub beveled_panel: Option<GlesPixelProgram>,
@@ -36,35 +36,35 @@ impl ChromeShaders {
         }
     }
 
-pub fn ensure_compiled(&mut self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
-
-  if self.beveled_panel.is_none() {
-    flog("compiling beveled_panel shader");
-    match renderer.compile_custom_pixel_shader(
-        BEVELED_PANEL_FRAG_V2,
-        &[
-            UniformName::new("u_bevel", UniformType::_1f),
-            UniformName::new("u_softness", UniformType::_1f),
-            UniformName::new("u_glow_width", UniformType::_1f),
-            UniformName::new("u_glow_alpha", UniformType::_1f),
-            UniformName::new("u_inner_shadow", UniformType::_1f),
-            UniformName::new("u_face_color", UniformType::_4f),
-            UniformName::new("u_light_color", UniformType::_4f),
-            UniformName::new("u_shadow_color", UniformType::_4f),
-            UniformName::new("u_glow_color", UniformType::_4f),
-        ],
-        ) {
-            Ok(program) => {
-                flog("beveled_panel compiled OK");
-                self.beveled_panel = Some(program);
+    pub fn ensure_compiled(&mut self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
+        if self.beveled_panel.is_none() {
+            flog("compiling beveled_panel shader");
+            match renderer.compile_custom_pixel_shader(
+                BEVELED_PANEL_FRAG_V2,
+                &[
+                    UniformName::new("u_bevel", UniformType::_1f),
+                    UniformName::new("u_softness", UniformType::_1f),
+                    UniformName::new("u_glow_width", UniformType::_1f),
+                    UniformName::new("u_glow_alpha", UniformType::_1f),
+                    UniformName::new("u_inner_shadow", UniformType::_1f),
+                    UniformName::new("u_face_color", UniformType::_4f),
+                    UniformName::new("u_light_color", UniformType::_4f),
+                    UniformName::new("u_shadow_color", UniformType::_4f),
+                    UniformName::new("u_glow_color", UniformType::_4f),
+                ],
+            ) {
+                Ok(program) => {
+                    flog("beveled_panel compiled OK");
+                    self.beveled_panel = Some(program);
+                }
+                Err(e) => {
+                    flog(&format!("beveled_panel compile failed: {:?}", e));
+                    flog("==== BEVELED_PANEL_FRAG V2 ====");
+                    flog(BEVELED_PANEL_FRAG_V2);
+                    return Err(e);
+                }
             }
-            Err(e) => {
-            flog(&format!("beveled_panel compile failed: {:?}", e));
-            flog("==== BEVELED_PANEL_FRAG V2 ====");
-            flog(BEVELED_PANEL_FRAG_V2);
-            return Err(e);         }
-         }
-    }             
+        }
         if self.light_channel.is_none() {
             self.light_channel = Some(renderer.compile_custom_pixel_shader(
                 LIGHT_CHANNEL_FRAG,
@@ -79,9 +79,9 @@ pub fn ensure_compiled(&mut self, renderer: &mut GlesRenderer) -> Result<(), Gle
                 ],
             )?);
         }
-        
+
         if self.glass.is_none() {
-           self.glass = Some(renderer.compile_custom_pixel_shader(
+            self.glass = Some(renderer.compile_custom_pixel_shader(
                 WORKAREA_GLASS_FRAG,
                 &[
                     UniformName::new("u_size", UniformType::_2f),
@@ -90,13 +90,13 @@ pub fn ensure_compiled(&mut self, renderer: &mut GlesRenderer) -> Result<(), Gle
                     UniformName::new("u_edge_brightness", UniformType::_1f),
                     UniformName::new("u_highlight_strength", UniformType::_1f),
                     UniformName::new("u_tint", UniformType::_4f),
-                    UniformName::new("u_edge_color", UniformType::_4f),                
+                    UniformName::new("u_edge_color", UniformType::_4f),
                 ],
-            )?);    
+            )?);
         }
-        
+
         if self.recessed_button.is_none() {
-               self.recessed_button = Some(renderer.compile_custom_pixel_shader(
+            self.recessed_button = Some(renderer.compile_custom_pixel_shader(
                 RECESSED_BUTTON_FRAG,
                 &[
                     UniformName::new("u_size", UniformType::_2f),
@@ -105,63 +105,52 @@ pub fn ensure_compiled(&mut self, renderer: &mut GlesRenderer) -> Result<(), Gle
                     UniformName::new("u_inner_shadow", UniformType::_1f),
                     UniformName::new("u_glow_strength", UniformType::_1f),
                     UniformName::new("u_glow_radius", UniformType::_1f),
-                    UniformName::new("u_face_color", UniformType::_4f),           
-                    UniformName::new("u_shadow_color", UniformType::_4f),           
-                    UniformName::new("u_glow_color", UniformType::_4f),           
+                    UniformName::new("u_face_color", UniformType::_4f),
+                    UniformName::new("u_shadow_color", UniformType::_4f),
+                    UniformName::new("u_glow_color", UniformType::_4f),
                 ],
-             )?);   
+            )?);
         }
 
         if self.tinted_icon.is_none() {
             self.tinted_icon = Some(renderer.compile_custom_texture_shader(
                 TINTED_ICON_FRAG,
-                &[
-                    UniformName::new("u_tint", UniformType::_4f),
-                ],
-            )?);    
+                &[UniformName::new("u_tint", UniformType::_4f)],
+            )?);
         }
-        
+
         if self.font_text.is_none() {
             self.font_text = Some(renderer.compile_custom_texture_shader(
                 FONT_TEXT_FRAG,
-                &[
-                    UniformName::new("u_tint", UniformType::_4f),
-                ],
-            )?);    
+                &[UniformName::new("u_tint", UniformType::_4f)],
+            )?);
         }
-        
+
         if self.wallpaper_tint.is_none() {
             self.wallpaper_tint = Some(renderer.compile_custom_texture_shader(
                 WALLPAPER_TINT_FRAG,
-                &[
-                    UniformName::new("u_tint", UniformType::_4f),
-                ],
+                &[UniformName::new("u_tint", UniformType::_4f)],
             )?);
         }
-        
+
         if self.amber_lightbar.is_none() {
             self.amber_lightbar = Some(renderer.compile_custom_pixel_shader(
                 AMBER_LIGHTBAR_FRAG,
-                &[
-                    UniformName::new("u_color", UniformType::_4f),
-                ],
-            )?);    
-                
+                &[UniformName::new("u_color", UniformType::_4f)],
+            )?);
         }
-        
+
         if self.rounded_rect.is_none() {
             self.rounded_rect = Some(renderer.compile_custom_pixel_shader(
                 ROUNDED_RECT_FRAG,
                 &[
-                    UniformName::new("u_size", UniformType::_2f),        // rect size in pixels
-                    UniformName::new("u_radius", UniformType::_1f),     // corner radius
-                    UniformName::new("u_color", UniformType::_4f),        // fill color (rgba)
-                 ],
-            )?);   
+                    UniformName::new("u_size", UniformType::_2f), // rect size in pixels
+                    UniformName::new("u_radius", UniformType::_1f), // corner radius
+                    UniformName::new("u_color", UniformType::_4f), // fill color (rgba)
+                ],
+            )?);
         }
-        
- 
-        
+
         if self.top_bar.is_none() {
             self.top_bar = Some(renderer.compile_custom_pixel_shader(
                 TOP_BAR_FRAG,
@@ -179,7 +168,6 @@ pub fn ensure_compiled(&mut self, renderer: &mut GlesRenderer) -> Result<(), Gle
                     UniformName::new("u_trim_color", UniformType::_4f),
                 ],
             )?);
-            
         }
 
         Ok(())
@@ -361,7 +349,6 @@ void main() {
     gl_FragColor = color;
 }
 "#;
-
 
 const CHAMFER_OLD__PANEL_FRAG: &str = r#"
 #ifdef GL_ES
@@ -834,39 +821,6 @@ void main() {
 
     // Premultiplied for smithay's ONE / ONE_MINUS_SRC_ALPHA blending.
     gl_FragColor = vec4(u_color.rgb * a, a);
-}
-"#;
-
-pub const EGUI_VERT: &str = r#"
-attribute vec2 a_pos;
-attribute vec2 a_uv;
-attribute vec4 a_color;
-uniform vec2 u_screen_size;
-varying vec2 v_uv;
-varying vec4 v_color;
-void main() {
-    vec2 ndc = vec2(
-        (a_pos.x / u_screen_size.x) * 2.0 - 1.0,
-        1.0 - (a_pos.y / u_screen_size.y) * 2.0
-    );
-    gl_Position = vec4(ndc, 0.0, 1.0);
-    v_uv = a_uv;
-    v_color = a_color;
-}
-"#;
-
-
-pub const EGUI_FRAG: &str = r#"
-#ifdef GL_ES
-precision mediump float;
-#endif
-varying vec2 v_uv;        // renamed from v_coords → must match vertex shader
-varying vec4 v_color;     // receive interpolated per-vertex color
-uniform sampler2D tex;
-void main() {
-    vec4 src = texture2D(tex, v_uv);
-    vec4 color = src * v_color;
-    gl_FragColor = vec4(color.rgb * color.a, color.a);
 }
 "#;
 
