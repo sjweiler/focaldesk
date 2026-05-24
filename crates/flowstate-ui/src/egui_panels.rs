@@ -1,5 +1,8 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
+pub mod settings;
+
+pub use settings::SettingsPanel;
 
 // egui_panel.rs
 pub trait EguiPanelView {
@@ -12,10 +15,10 @@ pub trait EguiPanelView {
     );
 }
 
-#[derive(Default)]
-pub struct SettingsPanel {
-    pub open: bool,
-}
+//#[derive(Default)]
+//pub struct SettingsPanel {
+//    pub open: bool,
+//}
 
 #[derive(Default)]
 pub struct LauncherPanel {
@@ -27,7 +30,7 @@ pub struct DebugPanel {
     pub open: bool,
 }
 
-impl EguiPanelView for SettingsPanel {
+/*impl EguiPanelView for SettingsPanel {
     fn title(&self) -> &'static str {
         "Settings"
     }
@@ -54,6 +57,7 @@ impl EguiPanelView for SettingsPanel {
             });
     }
 }
+*/
 
 impl EguiPanelView for LauncherPanel {
     fn title(&self) -> &'static str {

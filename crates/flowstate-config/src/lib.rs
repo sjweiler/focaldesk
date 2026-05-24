@@ -2,4 +2,8 @@
 
 mod config;
 
-pub use config::FlowConfig;
+pub use config::{
+    FlowStateConfig,
+    load_config,
+    save_config,
+};

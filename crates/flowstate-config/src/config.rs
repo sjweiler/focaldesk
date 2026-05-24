@@ -1,42 +1,91 @@
-use anyhow::{Context, Result};
-use flowstate_themes::FlowThemeId;
-use serde::Deserialize;
-use std::path::PathBuf;
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct FlowConfig {
-    #[serde(default)]
-    pub theme: ThemeSection,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowStateConfig {
+    pub appearance: AppearanceConfig,
+    pub displays: DisplaysConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct ThemeSection {
-    #[serde(default)]
-    pub active: Option<FlowThemeId>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppearanceConfig {
+    pub theme: String,
+    pub glow_strength: f64,
+    pub font_scale: f64,
+    pub output_focus_glow: bool,
+    pub shader_chrome: bool,
 }
 
-impl FlowConfig {
-    pub fn load() -> Result<Self> {
-        let path = config_file_path();
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let raw = std::fs::read_to_string(&path).with_context(|| format!("read {:?}", path))?;
-        eprintln!("FLOWSTATE config path = {:?}", path);
-        eprintln!("FLOWSTATE raw config:\n{}", raw);
-        
-        
-        toml::from_str(&raw).with_context(|| format!("parse {:?}", path))
+impl FlowStateConfig {
+    pub fn load() -> anyhow::Result<Self> {
+        Ok(load_config())
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        save_config(self)
     }
 }
 
-fn config_file_path() -> PathBuf {
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .unwrap_or_else(|| PathBuf::from("."))
-        });
-    xdg.join("flowstate").join("config.toml")
+impl Default for FlowStateConfig {
+    fn default() -> Self {
+        Self {
+            appearance: AppearanceConfig {
+                theme: "Eagle".into(),
+                glow_strength: 0.75,
+                font_scale: 1.0,
+                output_focus_glow: true,
+                shader_chrome: true,
+            },
+            displays: DisplaysConfig::default(),
+        }
+    }
+}
+
+pub fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("flowstate")
+        .join("config.toml")
+}
+
+pub fn load_config() -> FlowStateConfig {
+    let path = config_path();
+
+    match fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).unwrap_or_default(),
+        Err(_) => FlowStateConfig::default(),
+    }
+}
+
+pub fn save_config(config: &FlowStateConfig) -> Result<()> {
+    let path = config_path();
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let text = toml::to_string_pretty(config)?;
+    fs::write(path, text)?;
+
+    Ok(())
+}
+
+
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DisplaysConfig {
+    pub topbar_on_all_outputs: bool,
+    pub sidebar_on_all_outputs: bool,
+    pub remember_focused_output: bool,
+}
+
+impl Default for DisplaysConfig {
+    fn default() -> Self {
+        Self {
+            topbar_on_all_outputs: true,
+            sidebar_on_all_outputs: true,
+            remember_focused_output: true,
+        }
+    }
 }

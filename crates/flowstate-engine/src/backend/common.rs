@@ -29,7 +29,7 @@ use smithay::wayland::xdg_activation::XdgActivationState;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::ThemeManager;
-use flowstate_config::FlowConfig;
+use flowstate_config::FlowStateConfig;
 
 
 /// Wayland socket + [`DesktopState`] and render helpers used by nested backend loops.
@@ -107,15 +107,23 @@ pub(crate) fn bootstrap_compositor_core(
     let chrome = Chrome::new(ChromeMetrics::default());
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
     
-    let config = FlowConfig::load().unwrap_or_default();
+    let config = FlowStateConfig::load().unwrap_or_default();
 
-    let theme_id = config
-        .theme
-        .active
-        .unwrap_or(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+    let theme_id = if config.appearance.theme.is_empty() {
+        "Eagle".to_string()
+    } else {
+        config.appearance.theme.clone()
+    };
         
    eprintln!("FLOWSTATE selected theme_id = {:?}", theme_id);
  
+    let theme_id = match config.appearance.theme.as_str() {
+        "Eagle" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
+        "Moonbase" => FlowThemeId::BuiltIn(BuiltInThemeId::Moonbase),
+        "Classic" => FlowThemeId::BuiltIn(BuiltInThemeId::Classic),
+        other => FlowThemeId::Custom(other.to_string()),
+    };
+
 
     let theme_manager = ThemeManager::new(theme_id);
     
