@@ -13,7 +13,7 @@ use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
 use flowstate_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
-use flowstate_ui::types::UiAction;
+use flowstate_ui::types::{PanelKind, UiAction};
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::keysyms;
@@ -83,9 +83,6 @@ use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
 use flowstate_ui::dialog::DialogAction;
-use flowstate_ui::dialog::DialogButton;
-use flowstate_ui::dialog::DialogKind;
-use flowstate_ui::dialog::DialogState;
 use flowstate_ui::dialog::{Dialog, DialogId};
 use flowstate_ui::dialog_layout::layout_dialog;
 
@@ -1173,53 +1170,8 @@ impl DesktopState {
             }
 
             KeyAction::ToggleLauncher => {
-                let owner_output = self.focused_output;
-                //let output = self.outputs.get(&output_id).unwrap();
-
-                let dialog_w = 800;
-                let dialog_h = 480;
-
-                let (x, y) = if let Some((_id, output)) = self.outputs.iter().next() {
-                    let output_width = output.logical_size.w;
-                    let output_height = output.logical_size.h;
-
-                    let dialog_w = 800;
-                    let dialog_h = 480;
-
-                    (
-                        (output_width - dialog_w) / 2,
-                        (output_height - dialog_h) / 2,
-                    )
-                } else {
-                    (560, 300)
-                };
-
-                let dialog = Dialog {
-                    id: 1,
-                    kind: DialogKind::Info,
-                    title: "FlowState Test".into(),
-                    message: "Dialog system is alive.".into(),
-                    owner_output,
-                    buttons: vec![
-                        DialogButton {
-                            label: "OK".into(),
-                            action: DialogAction::Confirm,
-                        },
-                        DialogButton {
-                            label: "Cancel".into(),
-                            action: DialogAction::Cancel,
-                        },
-                    ],
-                    modal: true,
-                    dismissible: true,
-                    state: DialogState::Open,
-                    bounds: Rectangle::<i32, Logical>::from_loc_and_size(
-                        (x, y),
-                        (dialog_w, dialog_h),
-                    ),
-                };
-
-                self.open_dialog(dialog);
+                self.render.egui.open_panel(PanelKind::AppLauncher);
+                self.mark_redraw();
             }
 
             KeyAction::ActivateSlot(n) => {

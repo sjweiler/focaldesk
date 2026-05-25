@@ -1619,6 +1619,7 @@ dependencies = [
  "egui_glow",
  "flowstate-config",
  "flowstate-logging",
+ "flowstate-permissions",
  "flowstate-themes",
  "flowstate-types",
  "fontdb 0.16.2",

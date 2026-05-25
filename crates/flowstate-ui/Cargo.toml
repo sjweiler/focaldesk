@@ -8,6 +8,7 @@ flowstate-types = { path = "../flowstate-types" }
 flowstate-themes = { path = "../flowstate-themes" }
 flowstate-logging = { path = "../flowstate-logging" }
 flowstate-config = { path = "../flowstate-config" }
+flowstate-permissions = { path = "../flowstate-permissions" }
 image = "0.25"
 egui = "0.31"
 egui_glow = "0.31"

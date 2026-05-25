@@ -21,6 +21,7 @@ pub mod dialog_render;
 pub mod egui_layer;
 pub mod egui_panels;
 pub mod overlay;
+pub mod portalpermission;
 pub mod sidebar;
 pub mod topbar;
 pub mod ui_builder;

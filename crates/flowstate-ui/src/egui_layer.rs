@@ -3,9 +3,9 @@
 use std::{mem, sync::Arc};
 
 use egui::{
-    epaint::Primitive,
-    ClippedPrimitive, Context, Event, FontData, FontDefinitions, FontFamily, ImageData, Modifiers,
-    MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TextureId, TexturesDelta, Vec2,
+    epaint::Primitive, ClippedPrimitive, Context, Event, FontData, FontDefinitions, FontFamily,
+    ImageData, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TextureId,
+    TexturesDelta, Vec2,
 };
 use egui_glow::Painter;
 use flowstate_themes::FlowTheme;
@@ -89,10 +89,43 @@ pub enum EguiScrollDelta {
     Point { x: f32, y: f32 },
 }
 
+pub fn apply_flowstate_egui_style(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+
+    visuals.window_corner_radius = egui::CornerRadius::same(14);
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: [0, 18],
+        blur: 40,
+        spread: 0,
+        color: egui::Color32::from_black_alpha(160),
+    };
+
+    visuals.panel_fill = egui::Color32::from_rgba_premultiplied(6, 14, 28, 220);
+    visuals.window_fill = egui::Color32::from_rgba_premultiplied(8, 18, 34, 230);
+    visuals.extreme_bg_color = egui::Color32::from_rgb(5, 10, 18);
+    visuals.faint_bg_color = egui::Color32::from_rgb(10, 25, 45);
+
+    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(14, 32, 56);
+    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(20, 72, 120);
+    visuals.widgets.active.bg_fill = egui::Color32::from_rgb(28, 115, 190);
+
+    visuals.selection.bg_fill = egui::Color32::from_rgb(28, 135, 220);
+    visuals.hyperlink_color = egui::Color32::from_rgb(80, 170, 255);
+
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(14.0, 12.0);
+    style.spacing.window_margin = egui::Margin::same(18);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    ctx.set_style(style);
+}
+
 impl Default for EguiLayer {
     fn default() -> Self {
         let ctx = Context::default();
         ctx.set_fonts(flowstate_egui_fonts());
+        apply_flowstate_egui_style(&ctx);
 
         Self {
             ctx,
@@ -218,10 +251,6 @@ impl EguiLayer {
             PanelKind::AppLauncher => self.launcher.open = true,
             _ => {}
         }
-    }
-
-    fn has_open_panel(&self) -> bool {
-        self.settings.open || self.launcher.open || self.debug.open
     }
 
     fn run_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
@@ -407,21 +436,8 @@ impl EguiLayer {
         &self,
         bridge: &mut EguiShaderBridge<'_, '_, '_>,
     ) -> Result<(), GlesError> {
-        if !self.has_open_panel() || egui_debug_uv_enabled() {
-            return Ok(());
-        }
-
-        let work = bridge.frame_ctx.work;
-        let margin = 8;
-        let rect = Rectangle::from_loc_and_size(
-            (work.loc.x + margin, work.loc.y + margin),
-            (
-                (244).min(work.size.w - margin * 2).max(1),
-                (184).min(work.size.h - margin * 2).max(1),
-            ),
-        );
-
-        bridge.draw_rounded_rect(rect, 18.0, [0.03, 0.05, 0.075, 0.34])
+        let _ = bridge;
+        Ok(())
     }
 
     fn prepare_raw_input(&mut self, frame_ctx: &DesktopFrameCtx) {
@@ -469,9 +485,7 @@ impl EguiLayer {
         let pixels_per_point = frame_ctx.output_scale.x as f32;
 
         frame.with_context(|_gl| {
-            if let Err(err) =
-                self.paint_with_glow(frame_ctx, screen_size_px, pixels_per_point)
-            {
+            if let Err(err) = self.paint_with_glow(frame_ctx, screen_size_px, pixels_per_point) {
                 eprintln!("egui glow paint failed: {err}");
             }
         })
