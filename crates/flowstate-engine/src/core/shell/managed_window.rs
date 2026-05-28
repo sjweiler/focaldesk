@@ -1,35 +1,35 @@
+use flowstate_types::types::{OutputId, WindowId, WorkspaceId};
 use smithay::desktop::{PopupManager, Space};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
-use flowstate_types::types::{WindowId, OutputId, WorkspaceId};
 
-
-
+use crate::core::desktop::DesktopState;
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
-use std::borrow::Cow;
-use smithay::wayland::seat::WaylandFocus;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use crate::core::desktop::DesktopState;
-use smithay::input::pointer::PointerTarget;
-use smithay::input::pointer::MotionEvent;
-use smithay::input::Seat;
-use smithay::utils::Serial;
+use smithay::desktop::WindowSurface;
+use smithay::input::dnd::{DndFocus, OfferData as DndOfferDataTrait, Source};
 use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
+use smithay::input::pointer::MotionEvent;
+use smithay::input::pointer::PointerTarget;
+use smithay::input::Seat;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::utils::Point;
+use smithay::utils::Serial;
+use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::shell::xdg::ToplevelSurface;
+#[cfg(feature = "xwayland")]
+use smithay::xwayland::X11Surface;
 use smithay::{
     desktop::Window,
     utils::{IsAlive, Logical, Rectangle},
 };
-use smithay::input::dnd::{DndFocus, OfferData as DndOfferDataTrait, Source};
-use smithay::utils::Point;
-use wayland_server::DisplayHandle;
-use smithay::desktop::WindowSurface;
+use std::borrow::Cow;
 use tracing_subscriber::fmt::time;
-use smithay::wayland::shell::xdg::ToplevelSurface;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
+use wayland_server::DisplayHandle;
 
 impl PartialEq for ManagedWindow {
     fn eq(&self, other: &Self) -> bool {
@@ -53,8 +53,8 @@ impl IsAlive for ManagedWindow {
 }
 
 impl DndFocus<DesktopState> for ManagedWindow {
-    type OfferData<S> =
-        <WlSurface as DndFocus<DesktopState>>::OfferData<S>
+    type OfferData<S>
+        = <WlSurface as DndFocus<DesktopState>>::OfferData<S>
     where
         S: Source;
 
@@ -67,16 +67,11 @@ impl DndFocus<DesktopState> for ManagedWindow {
         location: Point<f64, Logical>,
         serial: &Serial,
     ) -> Option<Self::OfferData<S>> {
-        #[cfg(feature = "xwayland")]
-        if let Some(x11) = self.window.x11_surface() {
-            return DndFocus::enter(x11, data, dh, source, seat, location, serial);
-        }
-
         if let Some(surface) = self.window.wl_surface() {
             return DndFocus::enter(&*surface, data, dh, source, seat, location, serial);
         }
 
-        None        
+        None
     }
 
     fn motion<S: Source>(
@@ -87,12 +82,6 @@ impl DndFocus<DesktopState> for ManagedWindow {
         location: Point<f64, Logical>,
         time: u32,
     ) {
-        #[cfg(feature = "xwayland")]
-        if let Some(x11) = self.window.x11_surface() {
-            DndFocus::motion(x11, data, offer, seat, location, time);
-            return;
-        }
-
         if let Some(surface) = self.window.wl_surface() {
             DndFocus::motion(&*surface, data, offer, seat, location, time);
         }
@@ -104,12 +93,6 @@ impl DndFocus<DesktopState> for ManagedWindow {
         offer: Option<&mut Self::OfferData<S>>,
         seat: &Seat<DesktopState>,
     ) {
-        #[cfg(feature = "xwayland")]
-        if let Some(x11) = self.window.x11_surface() {
-            DndFocus::leave(x11, data, offer, seat);
-            return;
-        }
-
         if let Some(surface) = self.window.wl_surface() {
             DndFocus::leave(&*surface, data, offer, seat);
         }
@@ -121,15 +104,9 @@ impl DndFocus<DesktopState> for ManagedWindow {
         offer: Option<&mut Self::OfferData<S>>,
         seat: &Seat<DesktopState>,
     ) {
-        #[cfg(feature = "xwayland")]
-        if let Some(x11) = self.window.x11_surface() {
-            DndFocus::drop(x11, data, offer, seat);
-            return;
-        }
-
         if let Some(surface) = self.window.wl_surface() {
             DndFocus::drop(&*surface, data, offer, seat);
-        }   
+        }
     }
 }
 
@@ -145,15 +122,12 @@ pub enum ManagedWindowKind {
     Xwayland(XwaylandWindowMeta),
 }
 
-
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ManagedSurface {
     Wayland(Window),
     #[cfg(feature = "xwayland")]
     X11(X11Surface),
 }
-
 
 #[derive(Debug, Clone)]
 pub struct ManagedWindow {
@@ -169,8 +143,8 @@ pub struct ManagedWindow {
     pub minimized: bool,
     pub activated: bool,
     pub urgent: bool,
-pub pending_move: bool,
-pub pending_resize: Option<ResizeEdge>,
+    pub pending_move: bool,
+    pub pending_resize: Option<ResizeEdge>,
     pub workspace: WorkspaceId,
     pub output: Option<OutputId>,
 
@@ -178,8 +152,6 @@ pub pending_resize: Option<ResizeEdge>,
     pub tile_rect: Option<Rectangle<i32, Logical>>,
     pub float_rect: Option<Rectangle<i32, Logical>>,
 }
-
-
 
 impl ManagedWindow {
     pub fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
@@ -240,13 +212,11 @@ impl ManagedWindow {
             float_rect: None,
             pending_move: false,
             pending_resize: None,
-
         }
     }
 
-    pub fn maximize() {
-    }
-    
+    pub fn maximize() {}
+
     pub fn protocol(&self) -> WindowProtocol {
         match self.kind {
             ManagedWindowKind::Wayland(_) => WindowProtocol::Wayland,
@@ -256,10 +226,13 @@ impl ManagedWindow {
 
     pub fn title(&self) -> String {
         match &self.kind {
-            ManagedWindowKind::Wayland(meta) => meta.title.clone().unwrap_or_else(|| "Untitled".into()),
-            ManagedWindowKind::Xwayland(meta) => meta.title.clone().unwrap_or_else(|| {
-                meta.class.clone().unwrap_or_else(|| "X11 App".into())
-            }),
+            ManagedWindowKind::Wayland(meta) => {
+                meta.title.clone().unwrap_or_else(|| "Untitled".into())
+            }
+            ManagedWindowKind::Xwayland(meta) => meta
+                .title
+                .clone()
+                .unwrap_or_else(|| meta.class.clone().unwrap_or_else(|| "X11 App".into())),
         }
     }
 
@@ -299,7 +272,10 @@ impl ManagedWindow {
         match &self.kind {
             ManagedWindowKind::Wayland(meta) => meta.is_dialog,
             ManagedWindowKind::Xwayland(meta) => {
-                matches!(meta.role, XwaylandSurfaceRole::Dialog | XwaylandSurfaceRole::Transient)
+                matches!(
+                    meta.role,
+                    XwaylandSurfaceRole::Dialog | XwaylandSurfaceRole::Transient
+                )
             }
         }
     }
@@ -350,17 +326,13 @@ impl ManagedWindow {
             self.tile_rect.unwrap_or_else(|| self.geometry())
         }
     }
-    
 }
-
 
 impl WaylandFocus for ManagedWindow {
     fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
         self.wl_surface()
     }
 }
-
-
 
 use smithay::input::pointer::*;
 
@@ -383,7 +355,7 @@ impl PointerTarget<DesktopState> for ManagedWindow {
         data: &mut DesktopState,
         event: &RelativeMotionEvent,
     ) {
-            if let Some(surface) = self.window.wl_surface() {
+        if let Some(surface) = self.window.wl_surface() {
             PointerTarget::relative_motion(&*surface, seat, data, event);
         }
     }
@@ -398,13 +370,13 @@ impl PointerTarget<DesktopState> for ManagedWindow {
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::axis(&*surface, seat, data, frame);
         }
-     }
+    }
 
     fn frame(&self, seat: &Seat<DesktopState>, data: &mut DesktopState) {
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::frame(&*surface, seat, data);
         }
-   }
+    }
 
     fn leave(
         &self,
@@ -441,7 +413,7 @@ impl PointerTarget<DesktopState> for ManagedWindow {
         data: &mut DesktopState,
         event: &GestureSwipeUpdateEvent,
     ) {
-         if let Some(surface) = self.window.wl_surface() {
+        if let Some(surface) = self.window.wl_surface() {
             PointerTarget::gesture_swipe_update(&*surface, seat, data, event);
         }
     }
@@ -463,7 +435,7 @@ impl PointerTarget<DesktopState> for ManagedWindow {
         data: &mut DesktopState,
         event: &GesturePinchBeginEvent,
     ) {
-         if let Some(surface) = self.window.wl_surface() {
+        if let Some(surface) = self.window.wl_surface() {
             PointerTarget::gesture_pinch_begin(&*surface, seat, data, event);
         }
     }

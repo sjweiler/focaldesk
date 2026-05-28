@@ -37,7 +37,9 @@ pub struct EguiLayer {
     dumped_font_atlas: bool,
     dumped_font_mesh: bool,
     last_font_atlas_rgba: Option<Vec<u8>>,
-    //demo_open: bool,
+    last_pointer_pos: Option<Pos2>,
+    pub screen_height_pts: f32,
+    pub last_frame_ctx: Option<DesktopFrameCtx>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -141,7 +143,9 @@ impl Default for EguiLayer {
             dumped_font_atlas: false,
             dumped_font_mesh: false,
             last_font_atlas_rgba: None,
-            //demo_open: true,
+            last_pointer_pos: None,
+            screen_height_pts: 1.0,
+            last_frame_ctx: None,
             settings: SettingsPanel::default(),
             launcher: LauncherPanel::default(),
             debug: DebugPanel::default(),
@@ -245,15 +249,21 @@ impl<'a, 'frame, 'buffer> EguiShaderBridge<'a, 'frame, 'buffer> {
 }
 
 impl EguiLayer {
+    pub fn has_open_panels(&self) -> bool {
+        self.settings.open || self.launcher.open || self.debug.open
+    }
+
     pub fn open_panel(&mut self, panel: PanelKind) {
         match panel {
-            PanelKind::Settings => self.settings.open = true,
-            PanelKind::AppLauncher => self.launcher.open = true,
+            PanelKind::Settings => self.settings.open = !self.settings.open,
+            PanelKind::AppLauncher => self.launcher.open = !self.launcher.open,
             _ => {}
         }
     }
 
-    fn run_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
+    /// Run egui panel logic and collect [`UiAction`]s (without painting).
+    pub fn update_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
+        self.last_frame_ctx = Some(frame_ctx.clone());
         self.prepare_raw_input(frame_ctx);
 
         let output = self.ctx.run(self.raw_input.take(), |ctx| {
@@ -267,13 +277,17 @@ impl EguiLayer {
         self.wants_pointer_input = self.ctx.wants_pointer_input() || self.ctx.is_using_pointer();
         self.wants_keyboard_input = self.ctx.wants_keyboard_input();
     }
+
+    fn run_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
+        self.update_panels(frame_ctx);
+    }
+
     pub fn handle_input(&mut self, event: EguiInputEvent) -> bool {
         match event {
             EguiInputEvent::PointerMoved { position } => {
-                self.raw_input.events.push(Event::PointerMoved(Pos2::new(
-                    position.x as f32,
-                    position.y as f32,
-                )));
+                let pos = Pos2::new(position.x as f32, position.y as f32);
+                self.last_pointer_pos = Some(pos);
+                self.raw_input.events.push(Event::PointerMoved(pos));
             }
             EguiInputEvent::PointerButton {
                 button,
@@ -281,8 +295,10 @@ impl EguiLayer {
                 position,
                 modifiers,
             } => {
+                let pos = Pos2::new(position.x as f32, position.y as f32);
+                self.last_pointer_pos = Some(pos);
                 self.raw_input.events.push(Event::PointerButton {
-                    pos: Pos2::new(position.x as f32, position.y as f32),
+                    pos,
                     button: pointer_button(button),
                     pressed,
                     modifiers: modifiers.into(),
@@ -325,6 +341,12 @@ impl EguiLayer {
         self.wants_pointer_input || self.wants_keyboard_input
     }
 
+    pub fn close_all_panels(&mut self) {
+        self.settings.open = false;
+        self.launcher.open = false;
+        self.debug.open = false;
+    }
+
     pub fn wants_pointer_input(&self) -> bool {
         self.wants_pointer_input
     }
@@ -335,6 +357,12 @@ impl EguiLayer {
 
     pub fn take_actions(&mut self) -> Vec<UiAction> {
         mem::take(&mut self.actions)
+    }
+
+    pub fn clear_paint(&mut self) {
+        self.primitives.clear();
+        self.wants_pointer_input = false;
+        self.wants_keyboard_input = false;
     }
 
     pub fn render(
@@ -349,9 +377,13 @@ impl EguiLayer {
             return Ok(());
         }
 
-        //self.run_default_overlay(frame_ctx);
+        if !self.has_open_panels() {
+            self.clear_paint();
+            return Ok(());
+        }
 
-        self.run_panels(frame_ctx);
+        // Panel logic runs in [`DesktopState::sync_egui`] before paint so input events
+        // are not consumed mid-click by a separate ctx.run during render.
 
         let mut bridge = EguiShaderBridge {
             frame,
@@ -441,6 +473,8 @@ impl EguiLayer {
     }
 
     fn prepare_raw_input(&mut self, frame_ctx: &DesktopFrameCtx) {
+        self.screen_height_pts =
+            (frame_ctx.output_size.1 as f32) / frame_ctx.output_scale.y as f32;
         self.raw_input
             .viewports
             .entry(self.raw_input.viewport_id)
@@ -450,7 +484,7 @@ impl EguiLayer {
             Pos2::ZERO,
             Vec2::new(
                 (frame_ctx.output_size.0 as f64 / frame_ctx.output_scale.x) as f32,
-                (frame_ctx.output_size.1 as f64 / frame_ctx.output_scale.y) as f32,
+                self.screen_height_pts,
             ),
         ));
         self.raw_input.time = Some(

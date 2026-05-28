@@ -36,7 +36,8 @@ smithay = { git = "https://github.com/Smithay/smithay", default-features = false
   "backend_libinput",
   "backend_udev",
   "backend_session_libseat",
-  "renderer_gl"
+  "renderer_gl",
+  "xwayland"
 ] }
 anyhow = "1"
 nix = "0.27"
@@ -55,5 +56,4 @@ chrono = "0.4"
 ab_glyph = "0.2"
 image = "0.25"
 glow = "0.16"
-
 

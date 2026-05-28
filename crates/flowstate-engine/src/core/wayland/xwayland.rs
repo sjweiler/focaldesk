@@ -1,0 +1,291 @@
+use std::os::fd::OwnedFd;
+
+use smithay::delegate_xwayland_shell;
+use smithay::utils::{Logical, Rectangle};
+use smithay::wayland::selection::data_device::{
+    clear_data_device_selection, current_data_device_selection_userdata,
+    request_data_device_client_selection, set_data_device_selection,
+};
+use smithay::wayland::selection::primary_selection::{
+    clear_primary_selection, current_primary_selection_userdata, request_primary_client_selection,
+    set_primary_selection,
+};
+use smithay::wayland::selection::SelectionTarget;
+use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
+use smithay::xwayland::xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, XwmId};
+use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
+use wayland_server::protocol::wl_surface::WlSurface;
+
+use crate::core::desktop::DesktopState;
+use crate::core::focus::KeyboardFocusTarget;
+
+impl XWaylandShellHandler for DesktopState {
+    fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
+        &mut self.xwayland_shell_state
+    }
+
+    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, surface: X11Surface) {
+        self.sync_xwayland_window_meta(&surface);
+    }
+}
+
+impl XwmHandler for DesktopState {
+    fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
+        self.xwm
+            .as_mut()
+            .expect("XWayland WM not ready — Wayland clients were dispatched before X11Wm::start_wm completed")
+    }
+
+    fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if self.window_id_for_x11_surface(&window).is_none() {
+            self.add_xwayland_window(window.clone(), false);
+        }
+        self.sync_xwayland_window_meta(&window);
+    }
+
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        if self.window_id_for_x11_surface(&window).is_none() {
+            self.add_xwayland_window(window.clone(), true);
+        }
+        self.sync_xwayland_window_meta(&window);
+    }
+
+    fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.map_xwayland_window(window);
+    }
+
+    fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        self.map_xwayland_window(window);
+    }
+
+    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(id) = self.window_id_for_x11_surface(&window) else {
+            return;
+        };
+        if let Some(idx) = self.windows.iter().position(|managed| managed.id == id) {
+            let managed = self.windows.remove(idx);
+            self.space.unmap_elem(&managed.window);
+        }
+        if !window.is_override_redirect() {
+            let _ = window.set_mapped(false);
+        }
+        if self.focused_window == Some(id) {
+            self.focused_window = None;
+        }
+        self.mark_redraw();
+    }
+
+    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        let Some(id) = self.window_id_for_x11_surface(&window) else {
+            return;
+        };
+        if let Some(idx) = self.windows.iter().position(|managed| managed.id == id) {
+            let managed = self.windows.remove(idx);
+            self.space.unmap_elem(&managed.window);
+        }
+        if self.focused_window == Some(id) {
+            self.focused_window = None;
+        }
+        self.mark_redraw();
+    }
+
+    fn configure_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        x: Option<i32>,
+        y: Option<i32>,
+        w: Option<u32>,
+        h: Option<u32>,
+        _reorder: Option<Reorder>,
+    ) {
+        let mut geometry = window.geometry();
+        if let Some(x) = x {
+            geometry.loc.x = x;
+        }
+        if let Some(y) = y {
+            geometry.loc.y = y;
+        }
+        if let Some(w) = w {
+            geometry.size.w = w as i32;
+        }
+        if let Some(h) = h {
+            geometry.size.h = h as i32;
+        }
+        let _ = window.configure(geometry);
+    }
+
+    fn configure_notify(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
+        _above: Option<u32>,
+    ) {
+        let Some(id) = self.window_id_for_x11_surface(&window) else {
+            return;
+        };
+        let Some(managed) = self.window(id).map(|managed| managed.window.clone()) else {
+            return;
+        };
+        self.space.map_element(managed, geometry.loc, false);
+        self.mark_redraw();
+    }
+
+    fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, _property: WmWindowProperty) {
+        self.sync_xwayland_window_meta(&window);
+        self.mark_redraw();
+    }
+
+    fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.request_maximize(id);
+            let _ = window.set_maximized(true);
+        }
+    }
+
+    fn unmaximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            if let Some(managed) = self.window_mut(id) {
+                managed.set_maximized(false);
+            }
+            let _ = window.set_maximized(false);
+        }
+    }
+
+    fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.request_fullscreen(id);
+            let _ = window.set_fullscreen(true);
+        }
+    }
+
+    fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            if let Some(managed) = self.window_mut(id) {
+                managed.set_fullscreen(false);
+            }
+            let _ = window.set_fullscreen(false);
+        }
+    }
+
+    fn resize_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _button: u32,
+        edge: X11ResizeEdge,
+    ) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.request_resize(id, x11_resize_edge_to_xdg(edge));
+        }
+    }
+
+    fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.request_move(id);
+        }
+    }
+
+    fn active_window_request(
+        &mut self,
+        _xwm: XwmId,
+        window: X11Surface,
+        _timestamp: u32,
+        _currently_active_window: Option<X11Surface>,
+    ) {
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.focus_window_id(id);
+        }
+    }
+
+    fn allow_selection_access(&mut self, xwm: XwmId, selection: SelectionTarget) -> bool {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return false;
+        };
+        let Some(KeyboardFocusTarget::Window(window)) = keyboard.current_focus() else {
+            return false;
+        };
+        let Some(surface) = window.x11_surface() else {
+            return false;
+        };
+        matches!(
+            selection,
+            SelectionTarget::Clipboard | SelectionTarget::Primary
+        ) && surface.xwm_id().map(|id| id == xwm).unwrap_or(false)
+    }
+
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                if let Err(err) = request_data_device_client_selection(&self.seat, mime_type, fd) {
+                    flowstate_logging::flog(&format!(
+                        "failed to request Wayland clipboard for XWayland: {err}"
+                    ));
+                }
+            }
+            SelectionTarget::Primary => {
+                if let Err(err) = request_primary_client_selection(&self.seat, mime_type, fd) {
+                    flowstate_logging::flog(&format!(
+                        "failed to request Wayland primary selection for XWayland: {err}"
+                    ));
+                }
+            }
+        }
+    }
+
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                set_data_device_selection(&self.display_handle, &self.seat, mime_types, ());
+            }
+            SelectionTarget::Primary => {
+                set_primary_selection(&self.display_handle, &self.seat, mime_types, ());
+            }
+        }
+    }
+
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                if current_data_device_selection_userdata(&self.seat).is_some() {
+                    clear_data_device_selection(&self.display_handle, &self.seat);
+                }
+            }
+            SelectionTarget::Primary => {
+                if current_primary_selection_userdata(&self.seat).is_some() {
+                    clear_primary_selection(&self.display_handle, &self.seat);
+                }
+            }
+        }
+    }
+
+    fn disconnected(&mut self, _xwm: XwmId) {
+        self.disable_xwayland();
+    }
+}
+
+fn x11_resize_edge_to_xdg(
+    edge: X11ResizeEdge,
+) -> wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge {
+    use wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
+
+    match edge {
+        X11ResizeEdge::Top => ResizeEdge::Top,
+        X11ResizeEdge::Bottom => ResizeEdge::Bottom,
+        X11ResizeEdge::Left => ResizeEdge::Left,
+        X11ResizeEdge::Right => ResizeEdge::Right,
+        X11ResizeEdge::TopLeft => ResizeEdge::TopLeft,
+        X11ResizeEdge::TopRight => ResizeEdge::TopRight,
+        X11ResizeEdge::BottomLeft => ResizeEdge::BottomLeft,
+        X11ResizeEdge::BottomRight => ResizeEdge::BottomRight,
+    }
+}
+
+delegate_xwayland_shell!(DesktopState);

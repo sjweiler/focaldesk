@@ -1,36 +1,31 @@
 // DRM/KMS backend — uses the same [`DesktopState`] path as winit via [`crate::backend::common::NestedDesktop`].
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
-use drm::control::{
-    crtc,
-    connector,
-    Mode,
+use crate::backend::common::{
+    bootstrap_compositor_core, finish_xwayland_startup, start_xwayland, NestedDesktop,
 };
-use smithay::backend::renderer::Offscreen;
- use smithay::backend::allocator::Allocator;
 use crate::backend::drm::drm::buffer::DrmModifier;
+use drm::control::{connector, crtc, Mode};
 use smithay::backend::allocator::gbm::GbmBuffer;
-use smithay::backend::renderer::gles::GlesError;
-use crate::backend::common::{bootstrap_compositor_core, NestedDesktop};
-use smithay::reexports::drm::control::Device as _;
+use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, KeyState};
+use smithay::backend::renderer::gles::GlesError;
+use smithay::backend::renderer::Offscreen;
+use smithay::reexports::drm::control::Device as _;
 // `DrmOutput::render_frame` / `initialize_output` drive an internal [`smithay::backend::drm::compositor::DrmCompositor`].
 
 use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
-use smithay::backend::renderer::utils::CommitCounter;
 use crate::core::backend_render::prepare_output;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
-    render_elements,
-    texture::TextureRenderElement,
-    Id,
-    Kind,
+    render_elements, texture::TextureRenderElement, Id, Kind,
 };
 
-use flowstate_flow::keybinds::BackendKind;
 use crate::core::backend_render::PreparedOutput;
+use flowstate_flow::keybinds::BackendKind;
 
 // DRM/KMS backend for FlowState.
 //
@@ -43,10 +38,10 @@ use crate::core::backend_render::PreparedOutput;
 // - device/output attach points are real
 // - many internals are still TODO so you can connect them to your existing FlowState code
 
-use anyhow::{anyhow, Context, Result};
-use smithay::utils::DeviceFd;
 use crate::core::backend_render::draw_output;
+use anyhow::{anyhow, Context, Result};
 use smithay::backend::renderer::Bind;
+use smithay::utils::DeviceFd;
 
 use std::{
     collections::HashMap,
@@ -55,82 +50,56 @@ use std::{
     time::{Duration, Instant},
 };
 
-
+use crate::backend::common::translate_backend_input;
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
-use flowstate_logging::flog;
 use flowstate_flow::Keybinds;
+use flowstate_logging::flog;
 use flowstate_notifications::NotificationManager;
 use flowstate_resources::RenderResources;
 use flowstate_types::OutputId;
 use flowstate_ui::chrome::{Chrome, ChromeMetrics};
-use crate::backend::winit::translate_backend_input;
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
 
 use smithay::{
     backend::{
-        allocator::{
-            gbm::GbmAllocator,
-            gbm::GbmBufferFlags,
-            dmabuf::Dmabuf,
-            Fourcc,
-        },
-        drm::{
-            DrmDevice,
-            DrmDeviceFd,
-            DrmEvent,
-            DrmNode,
-            GbmBufferedSurface,
-        },
-        egl::{
-            self,
-            context::ContextPriority,
-            EGLContext,
-        },
+        allocator::{dmabuf::Dmabuf, gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc},
+        drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface},
+        egl::{self, context::ContextPriority, EGLContext},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Color32F,
             damage::Error as OutputDamageTrackerError,
-            element::solid::SolidColorRenderElement,
             element::memory::MemoryRenderBuffer,
+            element::solid::SolidColorRenderElement,
             gles::{Capability, GlesRenderer, GlesTarget, GlesTexture},
-            ImportDma,
-            ImportMemWl,
-            ExportMem,
+            Color32F, ExportMem, ImportDma, ImportMemWl,
         },
         session::{
-            Event as SessionEvent,
-            Session,
             libseat::{self, LibSeatSession},
+            Event as SessionEvent, Session,
         },
         udev::{primary_gpu, UdevBackend, UdevEvent},
     },
     desktop::utils::OutputPresentationFeedback,
-    input::{
-        keyboard::LedState,
-        SeatState,
-    },
+    input::{keyboard::LedState, SeatState},
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop,
         gbm::Device as GbmDevice,
-        input::{Libinput, event::EventTrait},
+        input::{event::EventTrait, Libinput},
         wayland_server::{Client, Display, DisplayHandle, ListeningSocket},
     },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
-        compositor::CompositorState,
-        output::OutputManagerState,
-        selection::data_device::DataDeviceState,
-        shell::xdg::XdgShellState,
-        shm::ShmState,
+        compositor::CompositorState, output::OutputManagerState,
+        selection::data_device::DataDeviceState, shell::xdg::XdgShellState, shm::ShmState,
     },
 };
 
 use smithay::backend::drm::{
     compositor::{FrameError, FrameFlags},
-    output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
     exporter::gbm::{GbmFramebufferExporter, NodeFilter},
+    output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
 };
 
 use crate::backend::common::bind_wayland_socket;
@@ -138,19 +107,18 @@ use crate::core::{
     desktop::{DesktopInit, DesktopState},
     render::{FlowRenderElement, RenderState},
     ui_state::UiState,
-    OutputState,
-    SceneState,
+    OutputState, SceneState,
 };
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 
-use smithay::reexports::drm;
 use nix::fcntl::OFlag;
+use smithay::reexports::drm;
 
 use smithay::reexports::rustix::fs::OFlags;
 
-use image::{ImageBuffer, Rgba};
 use chrono::Local;
+use image::{ImageBuffer, Rgba};
 use std::fs;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -230,6 +198,8 @@ pub struct DrmOutputState {
 /// Shared compositor core, without any synthetic nested-output assumptions.
 pub(crate) struct CompositorCore {
     pub display: Display<DesktopState>,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_event_loop: EventLoop<'static, DesktopState>,
     pub listener: ListeningSocket,
     pub wayland_display: String,
     pub state: DesktopState,
@@ -249,14 +219,14 @@ pub struct DrmSurfaceState {
     pub size: Size<i32, Physical>,
     pub output_id: OutputId,
     pub origin: Point<i32, Logical>,
-    
+
     pub drm_output: DrmOutput<
-    GbmAllocator<DrmDeviceFd>,
-    GbmFramebufferExporter<DrmDeviceFd>,
-    Option<OutputPresentationFeedback>,
-    DrmDeviceFd,
->,
-  pub offscreen: Option<OffscreenOutput>,
+        GbmAllocator<DrmDeviceFd>,
+        GbmFramebufferExporter<DrmDeviceFd>,
+        Option<OutputPresentationFeedback>,
+        DrmDeviceFd,
+    >,
+    pub offscreen: Option<OffscreenOutput>,
 }
 
 type FlowDrmOutputManager = DrmOutputManager<
@@ -293,8 +263,7 @@ fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-                .join(".config")
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
         });
 
     let dir = base.join("flowstate");
@@ -402,12 +371,7 @@ fn capture_surface_pixels(
         .bind(&mut offscreen.texture)
         .map_err(|e| anyhow!("bind offscreen for capture: {e}"))?;
 
-    copy_framebuffer_target_to_png_rgba(
-        renderer,
-        &target,
-        offscreen.size.w,
-        offscreen.size.h,
-    )
+    copy_framebuffer_target_to_png_rgba(renderer, &target, offscreen.size.w, offscreen.size.h)
 }
 
 fn blit_rgba(
@@ -495,7 +459,6 @@ fn save_all_outputs_screenshot(
     )
 }
 
-
 fn flip_rgba_horizontal(data: &[u8], width: usize, height: usize) -> Vec<u8> {
     let stride = width * 4;
     let mut out = vec![0u8; data.len()];
@@ -510,8 +473,6 @@ fn flip_rgba_horizontal(data: &[u8], width: usize, height: usize) -> Vec<u8> {
 
     out
 }
-
-
 
 fn flip_rgba_vertical(data: &[u8], width: usize, height: usize) -> Vec<u8> {
     let stride = width * 4;
@@ -538,11 +499,10 @@ fn save_rgba_png(
     use std::fs;
     use std::path::PathBuf;
 
-    let screenshot_dir = PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-    )
-    .join("Pictures")
-    .join("Screenshots");
+    let screenshot_dir =
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+            .join("Pictures")
+            .join("Screenshots");
 
     fs::create_dir_all(&screenshot_dir)?;
 
@@ -568,18 +528,13 @@ fn save_offscreen_screenshot(
 
     let pixels = capture_surface_pixels(renderer, surface)?;
 
-    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(
-        size.w as u32,
-        size.h as u32,
-        pixels,
-    )
-    .ok_or_else(|| anyhow!("failed to construct image buffer from screenshot bytes"))?;
+    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(size.w as u32, size.h as u32, pixels)
+        .ok_or_else(|| anyhow!("failed to construct image buffer from screenshot bytes"))?;
 
-    let screenshot_dir = PathBuf::from(
-        std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string())
-    )
-    .join("Pictures")
-    .join("Screenshots");
+    let screenshot_dir =
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+            .join("Pictures")
+            .join("Screenshots");
 
     fs::create_dir_all(&screenshot_dir)?;
 
@@ -602,8 +557,7 @@ fn ensure_offscreen_texture(
 ) -> Result<(), GlesError> {
     let recreate = match offscreen {
         Some(existing) => {
-            existing.size != size
-                || existing.texture.format() != Some(Fourcc::Abgr8888)
+            existing.size != size || existing.texture.format() != Some(Fourcc::Abgr8888)
         }
         None => true,
     };
@@ -656,7 +610,7 @@ pub fn collect_display_configs(
             logical_x,
             logical_y,
 
-            physical_width_mm: None,   // we’ll fix this next
+            physical_width_mm: None, // we’ll fix this next
             physical_height_mm: None,
 
             primary,
@@ -693,7 +647,7 @@ fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
         .get(&output_id)
         .map(|o| o.scale_factor as f64)
         .unwrap_or(1.0);
-    
+
     if let Some(event) = translate_backend_input(
         input,
         state.input.pointer_pos,
@@ -713,8 +667,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     // Session / seat ownership
     //
-    let (mut session, notifier) = LibSeatSession::new()
-        .map_err(|e| anyhow!("Could not initialize libseat session: {e}"))?;
+    let (mut session, notifier) =
+        LibSeatSession::new().map_err(|e| anyhow!("Could not initialize libseat session: {e}"))?;
 
     //
     // Shared compositor state
@@ -730,14 +684,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // Pick primary KMS device (same node udev will report for the card — open only in `device_added`).
     //
     let primary_node = primary_drm_node(&session)?;
-    flog(&format!("Primary DRM node for seat {}: {:?}", session.seat(), primary_node));
+    flog(&format!(
+        "Primary DRM node for seat {}: {:?}",
+        session.seat(),
+        primary_node
+    ));
 
     //
     // libinput
     //
-    let mut libinput = Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(
-        session.clone().into(),
-    );
+    let mut libinput =
+        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
     libinput
         .udev_assign_seat(&session.seat())
         .map_err(|e| anyhow!("Failed to assign libinput seat: {:?}", e))?;
@@ -750,9 +707,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let udev = UdevBackend::new(session.seat())
         .map_err(|e| anyhow!("Failed to initialize udev backend: {e}"))?;
 
+    #[cfg(feature = "xwayland")]
+    let xwayland_event_loop = EventLoop::<DesktopState>::try_new()?;
+
     let mut data = DrmLoopData {
         core: CompositorCore {
             display: desktop.display,
+            #[cfg(feature = "xwayland")]
+            xwayland_event_loop,
             listener: desktop.listener,
             wayland_display: desktop.wayland_display,
             state: desktop.state,
@@ -772,6 +734,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         should_stop: false,
     };
 
+    #[cfg(feature = "xwayland")]
+    {
+        start_xwayland(
+            &mut data.core.state,
+            &data.core.display.handle(),
+            data.core.xwayland_event_loop.handle(),
+        )?;
+        finish_xwayland_startup(
+            &mut data.core.xwayland_event_loop,
+            &mut data.core.state,
+            Duration::from_secs(30),
+        )?;
+    }
+
     let _libinput_token = loop_handle.insert_source(libinput_backend, |event, _, data| {
         dispatch_backend_input_event::<LibinputInputBackend>(&mut data.core.state, &event);
 
@@ -790,7 +766,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
     })?;
 
-     for (device_id, path) in udev.device_list() {
+    for (device_id, path) in udev.device_list() {
         let node = DrmNode::from_dev_id(device_id)
             .map_err(|e| anyhow!("Failed to build DrmNode from dev id {device_id:?}: {e}"))?;
 
@@ -813,23 +789,27 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // Main loop
     //
     while !data.should_stop && data.core.state.running {
-        if let Some(stream) = data.core.listener.accept()? {
-            let client = data
-                .core
-                .display
-                .handle()
-                .insert_client(stream, std::sync::Arc::new(crate::core::wayland::client::ClientState::default()))?;
-            data.core.clients.push(client);
-        }
+        #[cfg(feature = "xwayland")]
+        data.core
+            .xwayland_event_loop
+            .dispatch(Some(Duration::ZERO), &mut data.core.state)?;
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+
+        if let Some(stream) = data.core.listener.accept()? {
+            let client = data.core.display.handle().insert_client(
+                stream,
+                std::sync::Arc::new(crate::core::wayland::client::ClientState::default()),
+            )?;
+            data.core.clients.push(client);
+        }
 
         let now = Instant::now();
         let dt = now.saturating_duration_since(data.core.last_now);
         {
             let core = &mut data.core;
             let backend = &mut data.backend;
-            
+
             if let Some(device) = backend.devices.values_mut().next() {
                 core.state.begin_portal_dispatch(
                     &mut device.renderer,
@@ -841,7 +821,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 );
             }
         }
-        data.core.display.dispatch_clients(&mut data.core.state)?;
+        if data.core.state.wayland_clients_may_dispatch() {
+            data.core.display.dispatch_clients(&mut data.core.state)?;
+        }
         data.core.state.end_portal_dispatch();
 
         data.core.display.handle().flush_clients()?;
@@ -852,7 +834,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         for (_node, device) in data.backend.devices.iter_mut() {
             let drm_surface_count = device.surfaces.len();
-            
+
             for (_crtc, surface) in device.surfaces.iter_mut() {
                 let owns_cursor = data.core.state.output_contains_pointer(surface.output_id);
                 data.core.state.drm_try_pass_cursor_this_frame = owns_cursor
@@ -876,14 +858,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     &mut surface.offscreen,
                     surface.size,
                 )?;
-                
-                
+
                 {
                     let offscreen = surface
                         .offscreen
                         .as_mut()
                         .ok_or_else(|| anyhow!("offscreen texture missing before draw"))?;
-
 
                     let mut target = device
                         .renderer
@@ -894,7 +874,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .renderer
                         .render(&mut target, buffer_size, Transform::Normal)
                         .map_err(|e| anyhow!("begin offscreen frame: {e}"))?;
-    
+
                     draw_output(
                         &mut data.core.state,
                         &mut frame,
@@ -910,29 +890,29 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             "screenshot: GPU sync wait failed (readback may be wrong): {e}"
                         ));
                     }
-            }
+                }
                 //let should_capture = data.core.state.take_screenshot_request();
 
-if screenshot_output == Some(surface.output_id) {
-    data.core.state.screenshot_seq += 1;
-    let seq = data.core.state.screenshot_seq;
-    let output_name = format!("output-{}", surface.output_id.0);
+                if screenshot_output == Some(surface.output_id) {
+                    data.core.state.screenshot_seq += 1;
+                    let seq = data.core.state.screenshot_seq;
+                    let output_name = format!("output-{}", surface.output_id.0);
 
-    match save_offscreen_screenshot(
-        &mut device.renderer,
-        surface,
-        &output_name,
-        seq,
-    ) {
-        Ok(path) => {
-            flog(&format!("Screenshot saved to {}", path.display()));
-        }
-        Err(err) => {
-            flog(&format!("Screenshot failed: {err}"));
-        }
-    }
-}    
-               
+                    match save_offscreen_screenshot(
+                        &mut device.renderer,
+                        surface,
+                        &output_name,
+                        seq,
+                    ) {
+                        Ok(path) => {
+                            flog(&format!("Screenshot saved to {}", path.display()));
+                        }
+                        Err(err) => {
+                            flog(&format!("Screenshot failed: {err}"));
+                        }
+                    }
+                }
+
                 // now borrow immutably after the mutable borrow is gone
                 let texture = surface
                     .offscreen
@@ -954,8 +934,6 @@ if screenshot_output == Some(surface.output_id) {
                     None,
                     Kind::Unspecified,
                 );
-                
-                
 
                 let mut present_elements: Vec<DrmPresentElement> =
                     Vec::with_capacity(if data.core.state.drm_try_pass_cursor_this_frame {
@@ -1025,18 +1003,12 @@ if screenshot_output == Some(surface.output_id) {
                 data.core.state.screenshot_seq += 1;
                 let seq = data.core.state.screenshot_seq;
 
-                match save_all_outputs_screenshot(
-                    &mut device.renderer,
-                    &mut device.surfaces,
-                    seq,
-                ) {
+                match save_all_outputs_screenshot(&mut device.renderer, &mut device.surfaces, seq) {
                     Ok(path) => flog(&format!(
                         "All-outputs screenshot saved to {}",
                         path.display()
                     )),
-                    Err(err) => flog(&format!(
-                        "All-outputs screenshot failed: {err}"
-                    )),
+                    Err(err) => flog(&format!("All-outputs screenshot failed: {err}")),
                 }
 
                 data.core.state.screenshot_all_requested = false;
@@ -1068,15 +1040,21 @@ pub fn make_drm_gpu(
         let display = unsafe { EGLDisplay::new(gbm.clone())? };
         let egl_device = EGLDevice::device_for_display(&display)?;
         let context = EGLContext::new(&display)?;
-         if egl_device.is_software() {
+        if egl_device.is_software() {
             None
         } else {
-            egl_device.try_get_render_node().ok().flatten().or(Some(node))
+            egl_device
+                .try_get_render_node()
+                .ok()
+                .flatten()
+                .or(Some(node))
         }
     };
 
-    let allocator =
-        GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let allocator = GbmAllocator::new(
+        gbm.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+    );
 
     let framebuffer_exporter = GbmFramebufferExporter::new(gbm.clone(), render_node.into());
 
@@ -1113,25 +1091,37 @@ fn device_added(
     node: DrmNode,
     path: &Path,
 ) -> Result<()> {
-    flog(&format!("DRM device added: {:?} ({})", node, path.display()));
-flog(&format!("About to open device-added DRM node {}", path.display()));
+    flog(&format!(
+        "DRM device added: {:?} ({})",
+        node,
+        path.display()
+    ));
+    flog(&format!(
+        "About to open device-added DRM node {}",
+        path.display()
+    ));
     // Open device through the active seat
-let fd = match data.backend.session.open(
-    path,
-    OFlags::RDWR | OFlags::CLOEXEC,
-) {
-    Ok(fd) => fd,
-    Err(err) => {
-        flog(&format!(
-            "Failed to open DRM device {} via libseat/session: {:?}",
-            path.display(),
-            err
-        ));
-        return Err(anyhow!("Failed to open DRM device {}: {:?}", path.display(), err));
-    }
-};
+    let fd = match data
+        .backend
+        .session
+        .open(path, OFlags::RDWR | OFlags::CLOEXEC)
+    {
+        Ok(fd) => fd,
+        Err(err) => {
+            flog(&format!(
+                "Failed to open DRM device {} via libseat/session: {:?}",
+                path.display(),
+                err
+            ));
+            return Err(anyhow!(
+                "Failed to open DRM device {}: {:?}",
+                path.display(),
+                err
+            ));
+        }
+    };
 
-flog("Device-added DRM node open succeeded");
+    flog("Device-added DRM node open succeeded");
 
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
 
@@ -1139,9 +1129,10 @@ flog("Device-added DRM node open succeeded");
         DrmDevice::new(fd.clone(), true).context("Failed to create DrmDevice for added node")?;
     let gbm = GbmDevice::new(fd.clone()).context("Failed to create GBM device for node")?;
 
-    let egl_display =
-        unsafe { egl::EGLDisplay::new(gbm.clone()) }.context("Failed to create EGLDisplay for DRM node")?;
-    let egl_device = EGLDevice::device_for_display(&egl_display).context("Failed to query EGLDevice")?;
+    let egl_display = unsafe { egl::EGLDisplay::new(gbm.clone()) }
+        .context("Failed to create EGLDisplay for DRM node")?;
+    let egl_device =
+        EGLDevice::device_for_display(&egl_display).context("Failed to query EGLDevice")?;
 
     if egl_device.is_software() {
         flog("EGL reports a software rasterizer (e.g. llvmpipe). Check drivers if you expected GPU acceleration.");
@@ -1160,8 +1151,8 @@ flog("Device-added DRM node open succeeded");
 
     let egl_context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
         .context("Failed to create EGLContext for DRM node")?;
-    let mut renderer =
-        unsafe { GlesRenderer::new(egl_context) }.context("Failed to create GLES renderer for DRM node")?;
+    let mut renderer = unsafe { GlesRenderer::new(egl_context) }
+        .context("Failed to create GLES renderer for DRM node")?;
 
     let render_formats = renderer
         .egl_context()
@@ -1170,7 +1161,10 @@ flog("Device-added DRM node open succeeded");
         .copied()
         .collect::<Vec<_>>();
 
-    let allocator = GbmAllocator::new(gbm.clone(), GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+    let allocator = GbmAllocator::new(
+        gbm.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+    );
     let framebuffer_exporter = GbmFramebufferExporter::new(gbm.clone(), render_node_for_gpu.into());
     let mut drm_output_manager = DrmOutputManager::new(
         drm,
@@ -1184,210 +1178,201 @@ flog("Device-added DRM node open succeeded");
     let mut surfaces = HashMap::new();
 
     // Scan connectors and attach anything connected
-let res = drm_output_manager
-    .device()
-    .resource_handles()
-    .context("Failed to get DRM resources")?;
-
-let mut used_crtcs = std::collections::HashSet::new();
-let mut initialized_one = false;
-
-let mut id: u64 = 1;
-
-let mut next_x = 0;
-
-for conn in res.connectors() {
-    
-    let info = drm_output_manager
+    let res = drm_output_manager
         .device()
-        .get_connector(*conn, false)
-        .context("Failed to get connector info")?;
+        .resource_handles()
+        .context("Failed to get DRM resources")?;
 
-    if info.state() != drm::control::connector::State::Connected {
-        continue;
-    }
+    let mut used_crtcs = std::collections::HashSet::new();
+    let mut initialized_one = false;
 
-    //flog(&format!("Found connected connector: {:?}", conn));
-    let name = connector_name(&info);
+    let mut id: u64 = 1;
 
-flog(&format!(
-    "CONNECTOR: name={} handle={:?} state={:?} size_mm={}x{} encoders={:?} modes={}",
-    name,
-    info.handle(),
-    info.state(),
-    info.size().unwrap().0,
-    info.size().unwrap().1,
-    info.encoders(),
-    info.modes().len(),
-));
+    let mut next_x = 0;
 
-for (i, m) in info.modes().iter().enumerate() {
-    flog(&format!(
-        "  mode[{}]: {}x{} @ {}Hz type={:?}",
-        i,
-        m.size().0,
-        m.size().1,
-        m.vrefresh(),
-        m.mode_type(),
-    ));
-}
-
-    let mode = info
-        .modes()
-        .iter()
-        .find(|m| m.mode_type().contains(drm::control::ModeTypeFlags::PREFERRED))
-        .cloned()
-        .or_else(|| info.modes().first().cloned());
-
-    if let Some(mode) = mode {
-        let (w, h) = mode.size();
-
-        flog(&format!(
-            "Selected mode: {}x{} @ {}",
-            w,
-            h,
-            mode.vrefresh()
-        ));
-
-    let output_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
-
-        let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
-         
-        let output = Output::new(
-            output_name,
-            PhysicalProperties {
-                size: (mm_w as i32, mm_h as i32).into(),
-                subpixel: Subpixel::Unknown,
-                make: "FlowState".into(),
-                model: "DRM".into(),
-                serial_number: "drm-output".into(),
-            },
-        );
-
-        output.create_global::<DesktopState>(&data.core.display.handle());
-
-        // Logical layout in global compositor space (must match `register_output_entry` / `map_output`).
-        // wl_output + xdg_output advertise this to clients; leaving (0,0) stacks every head at the origin
-        // (e.g. OBS projector shows all DRM outputs on top of each other).
-        let origin = Point::<i32, Logical>::from((next_x, 0));
-
-        output.change_current_state(
-            Some(WlMode {
-                size: (w as i32, h as i32).into(),
-                refresh: mode.vrefresh() as i32,
-            }),
-            Some(Transform::Normal),
-            Some(smithay::output::Scale::Integer(1)),
-            Some(origin),
-        );
-        output.set_preferred(WlMode {
-            size: (w as i32, h as i32).into(),
-            refresh: mode.vrefresh() as i32,
-        });
-
-       
-
-        let crtc = info.encoders().iter().find_map(|enc| {
-            let enc_info = drm_output_manager.device().get_encoder(*enc).ok()?;
-
-            res.filter_crtcs(enc_info.possible_crtcs())
-                .into_iter()
-                .find(|candidate| !used_crtcs.contains(candidate))
-        });
-
-        let Some(crtc) = crtc else {
-            flog(&format!("No CRTC available for connector {:?}", conn));
-            continue;
-        };
-
-used_crtcs.insert(crtc);
-
-        let planes = drm_output_manager
+    for conn in res.connectors() {
+        let info = drm_output_manager
             .device()
-            .planes(&crtc)
-            .context("Failed to query planes for connector")?;
+            .get_connector(*conn, false)
+            .context("Failed to get connector info")?;
 
-let mut allocator = GbmAllocator::new(
-    gbm.clone(),
-    GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
-);
-
-let tex_phys_size: Size<i32, Physical> = Size::from((i32::from(w), i32::from(h)));
-
-let gbm_buffer = allocator.create_buffer(
-    tex_phys_size.w as u32,
-    tex_phys_size.h as u32,
-    Fourcc::Argb8888,
-    &[DrmModifier::Linear],
-)?;
-
-       let drm_output = drm_output_manager
-            .lock()
-            .initialize_output::<_, SolidColorRenderElement>(
-                crtc,
-                mode,
-                &[*conn],
-                &output,
-                Some(planes),
-                &mut renderer,
-                &DrmOutputRenderElements::default(),
-            )?;
-
-
-
-//let offscreen = OffscreenOutput {
-//    size: tex_phys_size,
-//    texture: None,
-//};
-
-let output_id = OutputId(id);
- if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
-            out.handle = output.clone();
-            out.physical_size = Size::<i32, Physical>::from((w as i32, h as i32));
-            out.logical_size = Size::<i32, Logical>::from((w as i32, h as i32));
-            out.scale_factor = 1.0;
-            out.scale = smithay::utils::Scale::from((1.0, 1.0));
+        if info.state() != drm::control::connector::State::Connected {
+            continue;
         }
 
-data.core.state.register_output_entry(
-    output_id,
-    output.clone(),
-    origin,
-    Size::<i32, Physical>::from((w as i32, h as i32)),
-    1.0, // or real scale later
-);
+        //flog(&format!("Found connected connector: {:?}", conn));
+        let name = connector_name(&info);
 
-if !initialized_one {
-    data.core.state.primary_output = output_id;
-}
+        flog(&format!(
+            "CONNECTOR: name={} handle={:?} state={:?} size_mm={}x{} encoders={:?} modes={}",
+            name,
+            info.handle(),
+            info.state(),
+            info.size().unwrap().0,
+            info.size().unwrap().1,
+            info.encoders(),
+            info.modes().len(),
+        ));
 
-        
-        surfaces.insert(
-            crtc,
-            DrmSurfaceState {
-                output,
-                mode: WlMode {
+        for (i, m) in info.modes().iter().enumerate() {
+            flog(&format!(
+                "  mode[{}]: {}x{} @ {}Hz type={:?}",
+                i,
+                m.size().0,
+                m.size().1,
+                m.vrefresh(),
+                m.mode_type(),
+            ));
+        }
+
+        let mode = info
+            .modes()
+            .iter()
+            .find(|m| {
+                m.mode_type()
+                    .contains(drm::control::ModeTypeFlags::PREFERRED)
+            })
+            .cloned()
+            .or_else(|| info.modes().first().cloned());
+
+        if let Some(mode) = mode {
+            let (w, h) = mode.size();
+
+            flog(&format!("Selected mode: {}x{} @ {}", w, h, mode.vrefresh()));
+
+            let output_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+
+            let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
+
+            let output = Output::new(
+                output_name,
+                PhysicalProperties {
+                    size: (mm_w as i32, mm_h as i32).into(),
+                    subpixel: Subpixel::Unknown,
+                    make: "FlowState".into(),
+                    model: "DRM".into(),
+                    serial_number: "drm-output".into(),
+                },
+            );
+
+            output.create_global::<DesktopState>(&data.core.display.handle());
+
+            // Logical layout in global compositor space (must match `register_output_entry` / `map_output`).
+            // wl_output + xdg_output advertise this to clients; leaving (0,0) stacks every head at the origin
+            // (e.g. OBS projector shows all DRM outputs on top of each other).
+            let origin = Point::<i32, Logical>::from((next_x, 0));
+
+            output.change_current_state(
+                Some(WlMode {
                     size: (w as i32, h as i32).into(),
                     refresh: mode.vrefresh() as i32,
-                },
-                size: Size::<i32, Physical>::from((w as i32, h as i32)),
-                output_id: output_id ,
+                }),
+                Some(Transform::Normal),
+                Some(smithay::output::Scale::Integer(1)),
+                Some(origin),
+            );
+            output.set_preferred(WlMode {
+                size: (w as i32, h as i32).into(),
+                refresh: mode.vrefresh() as i32,
+            });
+
+            let crtc = info.encoders().iter().find_map(|enc| {
+                let enc_info = drm_output_manager.device().get_encoder(*enc).ok()?;
+
+                res.filter_crtcs(enc_info.possible_crtcs())
+                    .into_iter()
+                    .find(|candidate| !used_crtcs.contains(candidate))
+            });
+
+            let Some(crtc) = crtc else {
+                flog(&format!("No CRTC available for connector {:?}", conn));
+                continue;
+            };
+
+            used_crtcs.insert(crtc);
+
+            let planes = drm_output_manager
+                .device()
+                .planes(&crtc)
+                .context("Failed to query planes for connector")?;
+
+            let mut allocator = GbmAllocator::new(
+                gbm.clone(),
+                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+            );
+
+            let tex_phys_size: Size<i32, Physical> = Size::from((i32::from(w), i32::from(h)));
+
+            let gbm_buffer = allocator.create_buffer(
+                tex_phys_size.w as u32,
+                tex_phys_size.h as u32,
+                Fourcc::Argb8888,
+                &[DrmModifier::Linear],
+            )?;
+
+            let drm_output = drm_output_manager
+                .lock()
+                .initialize_output::<_, SolidColorRenderElement>(
+                    crtc,
+                    mode,
+                    &[*conn],
+                    &output,
+                    Some(planes),
+                    &mut renderer,
+                    &DrmOutputRenderElements::default(),
+                )?;
+
+            //let offscreen = OffscreenOutput {
+            //    size: tex_phys_size,
+            //    texture: None,
+            //};
+
+            let output_id = OutputId(id);
+            if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
+                out.handle = output.clone();
+                out.physical_size = Size::<i32, Physical>::from((w as i32, h as i32));
+                out.logical_size = Size::<i32, Logical>::from((w as i32, h as i32));
+                out.scale_factor = 1.0;
+                out.scale = smithay::utils::Scale::from((1.0, 1.0));
+            }
+
+            data.core.state.register_output_entry(
+                output_id,
+                output.clone(),
                 origin,
-                drm_output,
-                offscreen: None,
-            },
-        );
-        id  += 1; 
-        next_x += w as i32;
-        flog("Output initialized (Wayland + DRM)");
-        data.core.state.drm_submit_hw_cursor = true;
-initialized_one = true;
+                Size::<i32, Physical>::from((w as i32, h as i32)),
+                1.0, // or real scale later
+            );
+
+            if !initialized_one {
+                data.core.state.primary_output = output_id;
+            }
+
+            surfaces.insert(
+                crtc,
+                DrmSurfaceState {
+                    output,
+                    mode: WlMode {
+                        size: (w as i32, h as i32).into(),
+                        refresh: mode.vrefresh() as i32,
+                    },
+                    size: Size::<i32, Physical>::from((w as i32, h as i32)),
+                    output_id: output_id,
+                    origin,
+                    drm_output,
+                    offscreen: None,
+                },
+            );
+            id += 1;
+            next_x += w as i32;
+            flog("Output initialized (Wayland + DRM)");
+            data.core.state.drm_submit_hw_cursor = true;
+            initialized_one = true;
+        }
     }
-}
 
-
-    let registration_token = loop_handle.insert_source(notifier, move |event, _, state| {
-        match event {
+    let registration_token =
+        loop_handle.insert_source(notifier, move |event, _, state| match event {
             DrmEvent::VBlank(crtc) => {
                 if let Some(device) = state.backend.devices.get_mut(&node) {
                     if let Some(surface) = device.surfaces.get_mut(&crtc) {
@@ -1403,35 +1388,34 @@ initialized_one = true;
             DrmEvent::Error(err) => {
                 flog(&format!("DRM event error on {:?}: {}", node, err));
             }
-        }
-    })?;
+        })?;
 
     //data.backend.devices.insert(
     //    node,
     //    DrmDeviceState {
     //        registration_token,
     //        render_node: render_node_for_gpu,
-     //       renderer,
-   //         drm_output_manager,
-   //         surfaces,
-   //     },
-   // );
+    //       renderer,
+    //         drm_output_manager,
+    //         surfaces,
+    //     },
+    // );
 
-let temp_device = DrmDeviceState {
-    registration_token,
-    render_node: render_node_for_gpu,
-    renderer,
-    drm_output_manager,
-    surfaces,
-};
+    let temp_device = DrmDeviceState {
+        registration_token,
+        render_node: render_node_for_gpu,
+        renderer,
+        drm_output_manager,
+        surfaces,
+    };
 
-let displays = collect_display_configs(&temp_device, &data.core);
+    let displays = collect_display_configs(&temp_device, &data.core);
 
-if let Err(err) = write_display_config(&displays) {
-    flog(&format!("Failed to write display config: {err}"));
-}
+    if let Err(err) = write_display_config(&displays) {
+        flog(&format!("Failed to write display config: {err}"));
+    }
 
-data.backend.devices.insert(node, temp_device);
+    data.backend.devices.insert(node, temp_device);
 
     Ok(())
 }

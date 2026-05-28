@@ -66,24 +66,49 @@ impl EguiPanelView for LauncherPanel {
     fn show(
         &mut self,
         ctx: &egui::Context,
-        _frame_ctx: &DesktopFrameCtx,
+        frame_ctx: &DesktopFrameCtx,
         actions: &mut Vec<UiAction>,
     ) {
         if !self.open {
             return;
         }
 
-        egui::Window::new("Launcher")
+        let mut open = self.open;
+        let mut close_requested = false;
+        let response = egui::Window::new("Launcher")
             .default_pos(egui::pos2(
-                _frame_ctx.work.loc.x as f32 + 24.0,
-                _frame_ctx.work.loc.y as f32 + 24.0,
+                frame_ctx.work.loc.x as f32 + 24.0,
+                frame_ctx.work.loc.y as f32 + 24.0,
             ))
-            .open(&mut self.open)
+            .title_bar(false)
+            .open(&mut open)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Launcher");
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("✕").clicked() {
+                                close_requested = true;
+                            }
+                        },
+                    );
+                });
+                ui.separator();
                 if ui.button("Terminal").clicked() {
-                    actions.push(UiAction::LaunchApp("weston-terminal"));
+                    actions.push(UiAction::LaunchApp("@terminal"));
+                }
+                if ui.button("Browser").clicked() {
+                    actions.push(UiAction::LaunchApp("@browser"));
+                }
+                if ui.button("Files").clicked() {
+                    actions.push(UiAction::LaunchApp("@files"));
                 }
             });
+
+        if close_requested || response.is_none() || !open {
+            self.open = false;
+        }
     }
 }
 

@@ -68,7 +68,7 @@ pub fn default_settings() -> Settings {
         },
         apps: AppSettings {
             terminal: "alacritty".into(),
-            browser: "firefox".into(),
+            browser: "google-chrome".into(),
             file_manager: "nautilus".into(),
         },
     }

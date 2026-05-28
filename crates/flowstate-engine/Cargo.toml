@@ -45,4 +45,5 @@ glow.workspace = true
 [features]
 default = ["winit"]
 winit = ["dep:winit"]
+xwayland = ["smithay/xwayland"]
 drm = []

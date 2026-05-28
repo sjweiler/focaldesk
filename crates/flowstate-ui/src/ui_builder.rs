@@ -1,7 +1,7 @@
 use crate::atlas::IconId;
 use crate::chrome_layout::ChromeLayout;
-use crate::element::UiRect;
 use crate::element::UiElement;
+use crate::element::UiRect;
 use crate::types::{PanelKind, UiAction, UiElementKind};
 use crate::uitree::UiTree;
 
@@ -31,9 +31,9 @@ pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
             1 => UiAction::OpenPanel(PanelKind::Settings),
             2 => UiAction::Custom(SIDEBAR_BASE + i as u32),
             3 => UiAction::Custom(SIDEBAR_BASE + i as u32),
-            4 => UiAction::LaunchApp("chrome"),
-            5 => UiAction::LaunchApp("weston-terminal"),
-            6 => UiAction::LaunchApp("nautilus"),
+            4 => UiAction::Custom(SIDEBAR_BASE + 4),
+            5 => UiAction::Custom(SIDEBAR_BASE + 5),
+            6 => UiAction::Custom(SIDEBAR_BASE + 6),
             _ => continue,
         };
 

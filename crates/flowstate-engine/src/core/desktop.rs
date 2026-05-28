@@ -12,6 +12,7 @@ use smithay::wayland::shm::ShmState;
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
+use flowstate_ui::desktop_frame::DesktopFrameCtx;
 use flowstate_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
 use flowstate_ui::types::{PanelKind, UiAction};
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
@@ -38,6 +39,8 @@ use crate::core::shell::ManagedWindow;
 use crate::core::RenderState;
 use flowstate_flow::actions::KeyAction;
 use flowstate_flow::keybinds::BackendKind;
+use flowstate_logging::flog;
+use flowstate_settings_core::AppSettings;
 use flowstate_flow::Keybinds;
 use flowstate_flow::ModMask;
 use flowstate_notifications::NotificationManager;
@@ -60,15 +63,22 @@ use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::process::id;
 use std::process::Command;
+use std::time::Instant;
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
 
 use smithay::wayland::compositor::TraversalAction;
 use smithay::wayland::compositor::{self, SurfaceAttributes};
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 use smithay::wayland::xdg_activation::XdgActivationState;
+#[cfg(feature = "xwayland")]
+use smithay::wayland::xwayland_shell::XWaylandShellState;
+#[cfg(feature = "xwayland")]
+use smithay::xwayland::X11Wm;
 use std::io::{self, Write};
 use wayland_server::protocol::wl_surface;
+use wayland_server::DisplayHandle;
 
 use crate::core::chrome_layout::{
     build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at,
@@ -78,7 +88,6 @@ use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
     handle_resize_surface_commit, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
 };
-use flowstate_logging::flog;
 use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
@@ -103,7 +112,10 @@ pub struct OutputState {
 }
 
 pub struct DesktopInit {
+    pub display_handle: DisplayHandle,
     pub xdg_activation_state: XdgActivationState,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_shell_state: XWaylandShellState,
     pub primary_output: OutputId,
     pub running: bool,
     pub compositor_state: CompositorState,
@@ -113,6 +125,7 @@ pub struct DesktopInit {
     pub seat_state: smithay::input::SeatState<DesktopState>,
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
     pub output_capture_source_state:
@@ -126,11 +139,21 @@ pub struct DesktopInit {
     pub keybinds: Keybinds,
     pub client_wayland_display: String,
     pub theme_manager: ThemeManager,
+    pub apps: AppSettings,
 }
 
 pub struct DesktopState {
     // smithay protocol state
+    pub display_handle: DisplayHandle,
     pub xdg_activation_state: XdgActivationState,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_shell_state: XWaylandShellState,
+    #[cfg(feature = "xwayland")]
+    pub xwm: Option<X11Wm>,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_client: Option<smithay::reexports::wayland_server::Client>,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_display: Option<String>,
     pub winit_scale_factor: f64,
     pub ui: UiTree,
     pub active_workspace: WorkspaceId,
@@ -147,6 +170,7 @@ pub struct DesktopState {
     pub seat_state: smithay::input::SeatState<Self>,
     pub output_manager_state: smithay::wayland::output::OutputManagerState,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
     pub output_capture_source_state:
@@ -183,6 +207,7 @@ pub struct DesktopState {
     pub keybinds: Keybinds,
 
     pub client_wayland_display: String,
+    pub apps: AppSettings,
 
     /// Undecorated winit window: set on left-press over chrome top bar; backend calls platform window drag.
     host_window_drag_requested: bool,
@@ -274,6 +299,51 @@ impl DesktopState {
         }
     }
 
+    fn egui_frame_ctx_for_output(&self, output_id: OutputId, now: Instant) -> Option<DesktopFrameCtx> {
+        let output = self.outputs.get(&output_id)?;
+        let layout = build_chrome_layout(
+            output.logical_size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        Some(DesktopFrameCtx {
+            output_size: (output.physical_size.w, output.physical_size.h),
+            output_scale: output.scale,
+            work: layout.work_area.recess,
+            active_output: self.focused_output,
+            rendering_output: output_id,
+            now,
+            start_time: self.render.start_time,
+            flip_egui_y: self.backend_kind == BackendKind::Drm,
+        })
+    }
+
+    pub fn sync_egui(&mut self, frame_ctx: &DesktopFrameCtx) {
+        if !self.render.egui.has_open_panels() {
+            self.render.egui.clear_paint();
+            return;
+        }
+        self.render.egui.update_panels(frame_ctx);
+        for action in self.render.egui.take_actions() {
+            self.dispatch_ui_action(action);
+        }
+        if !self.render.egui.has_open_panels() {
+            self.render.egui.clear_paint();
+        }
+    }
+
+    fn process_egui_actions(&mut self) {
+        if !self.render.egui.has_open_panels() {
+            return;
+        }
+        let output_id = self.focused_output;
+        let Some(frame_ctx) = self.egui_frame_ctx_for_output(output_id, Instant::now()) else {
+            return;
+        };
+        self.sync_egui(&frame_ctx);
+        self.mark_redraw();
+    }
+
     fn egui_pointer_button(button: FlowMouseButton) -> Option<EguiPointerButton> {
         match button {
             FlowMouseButton::Left => Some(EguiPointerButton::Primary),
@@ -308,6 +378,10 @@ impl DesktopState {
     }
 
     fn handle_egui_input(&mut self, event: &FlowInputEvent) -> bool {
+        if !self.render.egui.has_open_panels() {
+            return false;
+        }
+
         let egui_event = match *event {
             FlowInputEvent::PointerMoved { position } => {
                 let Some(output_id) = self.output_under_pointer(position) else {
@@ -316,7 +390,9 @@ impl DesktopState {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
-                EguiInputEvent::PointerMoved { position: local }
+                EguiInputEvent::PointerMoved {
+                    position: local,
+                }
             }
             FlowInputEvent::PointerButton {
                 button,
@@ -523,11 +599,19 @@ impl DesktopState {
         pointer.frame(self);
     }
 
+    fn resolve_launch_command(&self, cmd: &str) -> String {
+        match cmd {
+            "weston-terminal" | "@terminal" => self.apps.terminal.clone(),
+            "google-chrome" | "@browser" => self.apps.browser.clone(),
+            "nautilus" | "@files" => self.apps.file_manager.clone(),
+            other => other.to_string(),
+        }
+    }
+
     pub(crate) fn dispatch_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::LaunchApp(cmd) => {
-                self.launch_app(cmd.to_string());
-                //let _ = std::process::Command::new(cmd.to_string*().spawn();
+                self.launch_app(self.resolve_launch_command(cmd));
             }
 
             UiAction::OpenPanel(panel) => {
@@ -536,10 +620,12 @@ impl DesktopState {
             }
 
             UiAction::Custom(id) => {
-                eprintln!("TODO custom ui action: {}", id);
-
-                // Example: workspace slot IDs
-                // self.set_focused_workspace(WorkspaceId(id as u64));
+                match id {
+                    1004 => self.launch_app(self.apps.browser.clone()),
+                    1005 => self.launch_app(self.apps.terminal.clone()),
+                    1006 => self.launch_app(self.apps.file_manager.clone()),
+                    _ => eprintln!("unhandled custom ui action: {id}"),
+                }
             }
 
             UiAction::SystemCommand(cmd) => {
@@ -899,7 +985,16 @@ impl DesktopState {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
             active_dialog: None,
+            display_handle: init.display_handle,
             xdg_activation_state: init.xdg_activation_state,
+            #[cfg(feature = "xwayland")]
+            xwayland_shell_state: init.xwayland_shell_state,
+            #[cfg(feature = "xwayland")]
+            xwm: None,
+            #[cfg(feature = "xwayland")]
+            xwayland_client: None,
+            #[cfg(feature = "xwayland")]
+            xwayland_display: None,
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
             active_workspace: WorkspaceId(1),
@@ -914,6 +1009,7 @@ impl DesktopState {
             seat_state: init.seat_state,
             output_manager_state: init.output_manager_state,
             data_device_state: init.data_device_state,
+            primary_selection_state: init.primary_selection_state,
             layer_shell_state: init.layer_shell_state,
             image_capture_source_state: init.image_capture_source_state,
             output_capture_source_state: init.output_capture_source_state,
@@ -938,6 +1034,7 @@ impl DesktopState {
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
+            apps: init.apps,
             host_window_drag_requested: false,
             pending_compositor_move: None,
             running: init.running,
@@ -976,6 +1073,103 @@ impl DesktopState {
         let managed = ManagedWindow::new_wayland(id, window.clone(), meta, workspace);
         self.windows.push(managed);
         dbg_flush(&format!("after push windows={}", self.windows.len()));
+
+        self.mark_redraw();
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn add_xwayland_window(
+        &mut self,
+        surface: smithay::xwayland::X11Surface,
+        override_redirect: bool,
+    ) -> WindowId {
+        let id = self.alloc_window_id();
+        let window = Window::new_x11_window(surface.clone());
+        let workspace = self.focused_workspace();
+        let meta = XwaylandWindowMeta::from_surface(&surface)
+            .with_override_redirect(override_redirect)
+            .with_role(XwaylandSurfaceRole::from_surface(&surface));
+        let mut managed = ManagedWindow::new_xwayland(id, window, meta.clone(), workspace);
+        managed.floating = meta.should_float();
+        managed.mapped = false;
+        self.windows.push(managed);
+        id
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn window_id_for_x11_surface(
+        &self,
+        surface: &smithay::xwayland::X11Surface,
+    ) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|managed| {
+                managed
+                    .window
+                    .x11_surface()
+                    .map(|x11| x11 == surface)
+                    .unwrap_or(false)
+            })
+            .map(|managed| managed.id)
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn sync_xwayland_window_meta(&mut self, surface: &smithay::xwayland::X11Surface) {
+        let Some(id) = self.window_id_for_x11_surface(surface) else {
+            return;
+        };
+        let Some(window) = self.window_mut(id) else {
+            return;
+        };
+        if let crate::core::shell::managed_window::ManagedWindowKind::Xwayland(meta) =
+            &mut window.kind
+        {
+            *meta = XwaylandWindowMeta::from_surface(surface)
+                .with_override_redirect(surface.is_override_redirect())
+                .with_role(XwaylandSurfaceRole::from_surface(surface));
+            window.floating = meta.should_float();
+        }
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub fn map_xwayland_window(&mut self, surface: smithay::xwayland::X11Surface) {
+        let id = self.window_id_for_x11_surface(&surface).unwrap_or_else(|| {
+            self.add_xwayland_window(surface.clone(), surface.is_override_redirect())
+        });
+
+        self.sync_xwayland_window_meta(&surface);
+
+        if !surface.is_override_redirect() {
+            let _ = surface.set_mapped(true);
+        }
+
+        let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
+            return;
+        };
+
+        let window = self.windows[idx].window.clone();
+        let location = if surface.is_override_redirect() {
+            surface.geometry().loc
+        } else {
+            let output_id = self
+                .output_under_pointer(self.input.pointer_pos)
+                .unwrap_or(self.primary_output);
+            self.outputs
+                .get(&output_id)
+                .map(|out| (out.logical_origin.x + 100, out.logical_origin.y + 100).into())
+                .unwrap_or_else(|| (100, 100).into())
+        };
+
+        self.space
+            .map_element(window.clone(), location, surface.is_override_redirect());
+        self.windows[idx].mapped = true;
+
+        if !surface.is_override_redirect() {
+            if let Some(bbox) = self.space.element_bbox(&window) {
+                let _ = surface.configure(bbox);
+            }
+            self.focus_window_id(id);
+        }
 
         self.mark_redraw();
     }
@@ -1161,12 +1355,7 @@ impl DesktopState {
             }
 
             KeyAction::LaunchTerminal => {
-                println!("Launch terminal");
-
-                let _ = Command::new("weston-terminal")
-                    .env("WAYLAND_DISPLAY", &self.client_wayland_display)
-                    .env_remove("DISPLAY")
-                    .spawn();
+                self.launch_app(self.apps.terminal.clone());
             }
 
             KeyAction::ToggleLauncher => {
@@ -1247,19 +1436,116 @@ impl DesktopState {
     fn update_focus(&mut self) {}
 
     pub fn launch_terminal(&self) {
-        use std::process::Command;
+        self.launch_app(self.apps.terminal.clone());
+    }
 
-        let _ = Command::new("alacritty").spawn();
+    /// True when it is safe to run [`wayland_server::Display::dispatch_clients`].
+    /// While the XWayland Wayland client is connected but the X11 WM is not attached yet,
+    /// dispatching would panic in smithay's XWayland shell commit hook.
+    #[cfg(feature = "xwayland")]
+    pub fn wayland_clients_may_dispatch(&self) -> bool {
+        self.xwayland_client.is_none() || self.xwm.is_some()
+    }
+
+    #[cfg(not(feature = "xwayland"))]
+    pub fn wayland_clients_may_dispatch(&self) -> bool {
+        true
+    }
+
+    /// Tear down a failed or exited XWayland instance so normal Wayland clients can run.
+    #[cfg(feature = "xwayland")]
+    pub fn disable_xwayland(&mut self) {
+        use smithay::reexports::wayland_server::backend::DisconnectReason;
+
+        if let Some(client) = self.xwayland_client.take() {
+            let _ = self.display_handle.backend_handle().kill_client(
+                client.id(),
+                DisconnectReason::ConnectionClosed,
+            );
+        }
+        self.xwm = None;
+        self.xwayland_display = None;
+        flog("XWayland disabled");
     }
 
     pub fn launch_app(&self, app: String) {
         let app_name = app.clone();
-        if let Err(err) = Command::new(app)
-            .env("WAYLAND_DISPLAY", &self.client_wayland_display)
-            .env_remove("DISPLAY")
-            .spawn()
-        {
-            eprintln!("failed to launch {app_name}: {err}");
+        let force_xwayland = should_force_xwayland(&app_name);
+
+        #[cfg(feature = "xwayland")]
+        let xwayland_display = self.xwayland_display.as_deref();
+
+        #[cfg(not(feature = "xwayland"))]
+        let xwayland_display: Option<&str> = None;
+
+        let display_env = xwayland_display.map(str::to_string);
+        let mut launch_candidates = vec![app_name.clone()];
+        if force_xwayland && is_chrome_like(&app_name) {
+            launch_candidates = chrome_exec_fallbacks(&app_name);
+        }
+        let prefer_xwayland = force_xwayland && xwayland_display.is_some();
+        let mut xwayland_attempted = false;
+
+        let mut last_error = None;
+        for candidate in launch_candidates {
+            let mut command = Command::new(&candidate);
+            if prefer_xwayland {
+                xwayland_attempted = true;
+                let display = xwayland_display.expect("checked above");
+                command.env_remove("WAYLAND_DISPLAY");
+                command.env("DISPLAY", display);
+                if is_chrome_like(&candidate) {
+                    command.arg("--ozone-platform=x11");
+                }
+            } else {
+                command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
+                command.env_remove("DISPLAY");
+                if let Some(display) = xwayland_display {
+                    command.env("DISPLAY", display);
+                }
+            }
+
+            match command.spawn() {
+                Ok(child) => {
+                    flog(&format!(
+                        "launched {candidate} pid={} WAYLAND_DISPLAY={} DISPLAY={display_env:?}",
+                        child.id(),
+                        self.client_wayland_display,
+                    ));
+                    return;
+                }
+                Err(err) => {
+                    last_error = Some((candidate, err));
+                }
+            }
+        }
+
+        if force_xwayland && !xwayland_attempted {
+            // XWayland not ready: still try native Wayland launch for Chrome-like apps.
+            let mut command = Command::new(&app_name);
+            command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
+            command.env_remove("DISPLAY");
+            if is_chrome_like(&app_name) {
+                command.arg("--ozone-platform=wayland");
+            }
+            match command.spawn() {
+                Ok(child) => {
+                    flog(&format!(
+                        "launched {app_name} (wayland fallback) pid={} WAYLAND_DISPLAY={} DISPLAY={display_env:?}",
+                        child.id(),
+                        self.client_wayland_display,
+                    ));
+                    return;
+                }
+                Err(err) => {
+                    last_error = Some((app_name.clone(), err));
+                }
+            }
+        }
+
+        if let Some((candidate, err)) = last_error {
+            flog(&format!("failed to launch {candidate}: {err}"));
+            eprintln!("failed to launch {candidate}: {err}");
         }
     }
 
@@ -1501,6 +1787,13 @@ impl DesktopState {
     pub fn handle_input(&mut self, event: FlowInputEvent) {
         match event {
             FlowInputEvent::Key { keycode, state, .. } => {
+                if matches!(state, FlowKeyState::Pressed) && keycode == 1 {
+                    if self.render.egui.has_open_panels() {
+                        self.render.egui.close_all_panels();
+                        self.mark_redraw();
+                        return;
+                    }
+                }
                 if self.handle_egui_input(&event) {
                     self.mark_redraw();
                     return;
@@ -1516,7 +1809,14 @@ impl DesktopState {
                 if let Some(id) = self.output_under_pointer(position) {
                     self.focused_output = id;
                 }
-                if self.handle_egui_input(&event) {
+                if self.render.egui.has_open_panels() {
+                    let _ = self.handle_egui_input(&event);
+                    if self.render.egui.wants_pointer_input() {
+                        self.clear_client_pointer_focus(self.pointer_pos);
+                        self.mark_redraw();
+                        return;
+                    }
+                } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
                     self.mark_redraw();
                     return;
@@ -1556,7 +1856,9 @@ impl DesktopState {
                     self.focused_output = id;
                 }
 
-                if self.handle_egui_input(&event) {
+                if self.render.egui.has_open_panels() {
+                    let _ = self.handle_egui_input(&event);
+                } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
                     self.mark_redraw();
                     return;
@@ -1577,6 +1879,20 @@ impl DesktopState {
                     let _ = self.click_ui_at_pointer();
                     self.mark_redraw();
                     return;
+                }
+
+                if self.render.egui.has_open_panels()
+                    && matches!(button, FlowMouseButton::Left)
+                    && matches!(state, FlowKeyState::Pressed | FlowKeyState::Released)
+                {
+                    self.process_egui_actions();
+                    if matches!(state, FlowKeyState::Released)
+                        && self.render.egui.wants_pointer_input()
+                    {
+                        self.clear_client_pointer_focus(self.pointer_pos);
+                        self.mark_redraw();
+                        return;
+                    }
                 }
 
                 if matches!(button, FlowMouseButton::Left) {
@@ -1632,7 +1948,14 @@ impl DesktopState {
                 if let Some(id) = self.output_under_pointer(position) {
                     self.focused_output = id;
                 }
-                if self.handle_egui_input(&event) {
+                if self.render.egui.has_open_panels() {
+                    let _ = self.handle_egui_input(&event);
+                    if self.render.egui.wants_pointer_input() {
+                        self.clear_client_pointer_focus(self.pointer_pos);
+                        self.mark_redraw();
+                        return;
+                    }
+                } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
                     self.mark_redraw();
                     return;
@@ -2037,6 +2360,46 @@ impl DesktopState {
             }
         }
     }
+}
+
+fn should_force_xwayland(app_name: &str) -> bool {
+    is_chrome_like(app_name)
+}
+
+fn chrome_exec_fallbacks(app_name: &str) -> Vec<String> {
+    let executable = app_name.rsplit('/').next().unwrap_or(app_name);
+    let mut candidates = vec![
+        "google-chrome".to_string(),
+        "google-chrome-stable".to_string(),
+        "google-chrome-beta".to_string(),
+        "google-chrome-unstable".to_string(),
+        "chromium".to_string(),
+        "chromium-browser".to_string(),
+    ];
+
+    if let Some(idx) = candidates.iter().position(|name| name == executable) {
+        if idx != 0 {
+            let preferred = candidates.remove(idx);
+            candidates.insert(0, preferred);
+        }
+    } else {
+        candidates.insert(0, executable.to_string());
+    }
+
+    candidates
+}
+
+fn is_chrome_like(app_name: &str) -> bool {
+    let executable = app_name.rsplit('/').next().unwrap_or(app_name);
+    matches!(
+        executable,
+        "google-chrome"
+            | "google-chrome-stable"
+            | "google-chrome-beta"
+            | "google-chrome-unstable"
+            | "chromium"
+            | "chromium-browser"
+    )
 }
 
 impl BufferHandler for DesktopState {

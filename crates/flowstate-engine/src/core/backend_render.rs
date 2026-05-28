@@ -11,6 +11,7 @@ use crate::core::{OutputState, SceneState};
 use crate::core::ui_builder::build_ui_for_output;
 use flowstate_flow::keybinds::BackendKind;
 use flowstate_types::OutputId;
+use flowstate_ui::desktop_frame::DesktopFrameCtx;
 use crate::core::fonts::{FontId, TextStyle};
 use flowstate_themes::FlowTheme;
 use flowstate_themes::theme::BuiltInThemeId;
@@ -200,7 +201,20 @@ pub fn draw_output(
     scene: &SceneState,
     output_state: &OutputState,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    
+    let egui_frame_ctx = DesktopFrameCtx {
+        output_size: prepared.frame_ctx.output_size,
+        output_scale: prepared.frame_ctx.output_scale,
+        work: prepared.layout.work_area.recess,
+        active_output: prepared.frame_ctx.active_output,
+        rendering_output: prepared.frame_ctx.rendering_output,
+        now: prepared.frame_ctx.now,
+        start_time: state.render.start_time,
+        flip_egui_y: state.backend_kind == BackendKind::Drm,
+    };
+    if prepared.frame_ctx.rendering_output == prepared.frame_ctx.active_output {
+        state.sync_egui(&egui_frame_ctx);
+    }
+
     let inputs = RenderInputs {
         ctx: &prepared.frame_ctx,
         layout: &prepared.layout,
@@ -223,11 +237,6 @@ pub fn draw_output(
 
     let muts = RenderInputsMut { ui: ui_state };
 
-   
-    
-    state.render.render_output(frame, inputs, muts)?; //.render_into_frame(frame, inputs, muts)?;
-    for action in state.render.egui.take_actions() {
-        state.dispatch_ui_action(action);
-    }
+    state.render.render_output(frame, inputs, muts)?;
     Ok(())
 }
