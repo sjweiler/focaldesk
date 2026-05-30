@@ -1486,6 +1486,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "flowstate-files"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 5.0.1",
+ "gtk4",
+ "libadwaita",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "flowstate-flow"
 version = "0.1.0"
 dependencies = [

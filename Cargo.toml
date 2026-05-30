@@ -19,6 +19,7 @@ members = [
     # apps
     "apps/flowstate-cli",
     "apps/flowstate-desktop",
+    "apps/flowstate-files",
     "apps/flowstate-settings",
 
     # services
@@ -56,4 +57,3 @@ chrono = "0.4"
 ab_glyph = "0.2"
 image = "0.25"
 glow = "0.16"
-

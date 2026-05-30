@@ -69,7 +69,7 @@ pub fn default_settings() -> Settings {
         apps: AppSettings {
             terminal: "alacritty".into(),
             browser: "google-chrome".into(),
-            file_manager: "nautilus".into(),
+            file_manager: "flowstate-files".into(),
         },
     }
 }

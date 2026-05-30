@@ -151,18 +151,38 @@ impl SettingsPanel {
     pub fn show(
         &mut self,
         ctx: &egui::Context,
-        _frame_ctx: &DesktopFrameCtx,
+        frame_ctx: &DesktopFrameCtx,
         _actions: &mut Vec<UiAction>,
     ) {
         if !self.open {
             return;
         }
 
-        egui::Window::new("FlowState Settings")
+        let mut open = self.open;
+        let mut close_requested = false;
+        let response = egui::Window::new("FlowState Settings")
+            .default_pos(egui::pos2(
+                frame_ctx.work.loc.x as f32 + 24.0,
+                frame_ctx.work.loc.y as f32 + 24.0,
+            ))
             .default_size(egui::vec2(900.0, 430.0))
             .resizable(true)
             .collapsible(false)
+            .title_bar(false)
+            .open(&mut open)
             .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Settings");
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            if ui.small_button("✕").clicked() {
+                                close_requested = true;
+                            }
+                        },
+                    );
+                });
+                ui.separator();
                 ui.horizontal(|ui| {
                     ui.set_height(ui.available_height());
 
@@ -188,6 +208,10 @@ impl SettingsPanel {
                     });
                 });
             });
+
+        if close_requested || response.is_none() || !open {
+            self.open = false;
+        }
     }
 
     fn show_placeholder(&mut self, ui: &mut egui::Ui, title: &str) {

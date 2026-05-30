@@ -18,7 +18,7 @@ use flowstate_ui::types::{PanelKind, UiAction};
 use smithay::backend::input::{Axis, AxisSource, ButtonState};
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::keysyms;
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
+use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
@@ -63,6 +63,7 @@ use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::process::id;
 use std::process::Command;
+use std::path::PathBuf;
 use std::time::Instant;
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
@@ -86,7 +87,8 @@ use crate::core::chrome_layout::{
 use crate::core::focus::KeyboardFocusTarget;
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
-    handle_resize_surface_commit, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
+    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
+    ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
 use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
@@ -603,7 +605,7 @@ impl DesktopState {
         match cmd {
             "weston-terminal" | "@terminal" => self.apps.terminal.clone(),
             "google-chrome" | "@browser" => self.apps.browser.clone(),
-            "nautilus" | "@files" => self.apps.file_manager.clone(),
+            "nautilus" | "@files" => flowstate_files_command(),
             other => other.to_string(),
         }
     }
@@ -623,7 +625,7 @@ impl DesktopState {
                 match id {
                     1004 => self.launch_app(self.apps.browser.clone()),
                     1005 => self.launch_app(self.apps.terminal.clone()),
-                    1006 => self.launch_app(self.apps.file_manager.clone()),
+                    1006 => self.launch_app(flowstate_files_command()),
                     _ => eprintln!("unhandled custom ui action: {id}"),
                 }
             }
@@ -901,6 +903,65 @@ impl DesktopState {
             return;
         }
         self.request_move(id);
+    }
+
+    fn try_begin_compositor_resize(&mut self, id: WindowId, edge: ResizeEdge) {
+        if self.toplevel_pointer.is_some() {
+            return;
+        }
+        let Some(w) = self.window(id) else {
+            return;
+        };
+        if !w.mapped || w.maximized || w.fullscreen || w.minimized {
+            return;
+        }
+        self.focus_window_id(id);
+        self.request_resize(id, edge);
+    }
+
+    /// Top-most mapped window resize edge at `position` (work area only).
+    fn top_window_resize_edge_at(
+        &self,
+        position: Point<f64, Logical>,
+    ) -> Option<(WindowId, ResizeEdgeMask)> {
+        if !self.pointer_in_work_recess(position) {
+            return None;
+        }
+        let px = position.x.round() as i32;
+        let py = position.y.round() as i32;
+        self.windows.iter().rev().find_map(|w| {
+            if !w.mapped || w.maximized || w.fullscreen || w.minimized {
+                return None;
+            }
+            let bbox = self.space.element_bbox(&w.window)?;
+            let edges = resize_edges_at(bbox, px, py, RESIZE_BORDER_PX)?;
+            Some((w.id, edges))
+        })
+    }
+
+    fn update_pointer_cursor(&mut self, position: Point<f64, Logical>) {
+        if let Some(interaction) = &self.toplevel_pointer {
+            let icon = match interaction {
+                ToplevelPointerInteraction::Resize { edges, .. } => {
+                    cursor_for_resize_edges(*edges)
+                }
+                ToplevelPointerInteraction::Move { .. } => CursorIcon::Move,
+            };
+            self.cursor_manager.set_icon(icon);
+            return;
+        }
+
+        if self.render.egui.has_open_panels() || self.active_dialog.is_some() {
+            return;
+        }
+
+        if let Some((_, edges)) = self.top_window_resize_edge_at(position) {
+            self.cursor_manager.set_icon(cursor_for_resize_edges(edges));
+        } else if self.pending_compositor_move.is_some() {
+            self.cursor_manager.set_icon(CursorIcon::Move);
+        } else {
+            self.cursor_manager.set_icon(CursorIcon::Default);
+        }
     }
 
     pub(crate) fn focus_window_id(&mut self, window_id: WindowId) {
@@ -1394,7 +1455,7 @@ impl DesktopState {
             }
 
             KeyAction::LaunchFiles => {
-                todo!();
+                self.launch_app(flowstate_files_command());
             }
         }
     }
@@ -1470,7 +1531,7 @@ impl DesktopState {
 
     pub fn launch_app(&self, app: String) {
         let app_name = app.clone();
-        let force_xwayland = should_force_xwayland(&app_name);
+        let chrome_like = is_chrome_like(&app_name);
 
         #[cfg(feature = "xwayland")]
         let xwayland_display = self.xwayland_display.as_deref();
@@ -1479,30 +1540,22 @@ impl DesktopState {
         let xwayland_display: Option<&str> = None;
 
         let display_env = xwayland_display.map(str::to_string);
-        let mut launch_candidates = vec![app_name.clone()];
-        if force_xwayland && is_chrome_like(&app_name) {
-            launch_candidates = chrome_exec_fallbacks(&app_name);
-        }
-        let prefer_xwayland = force_xwayland && xwayland_display.is_some();
-        let mut xwayland_attempted = false;
+        let launch_candidates = if chrome_like {
+            chrome_exec_fallbacks(&app_name)
+        } else {
+            vec![app_name.clone()]
+        };
 
         let mut last_error = None;
         for candidate in launch_candidates {
             let mut command = Command::new(&candidate);
-            if prefer_xwayland {
-                xwayland_attempted = true;
-                let display = xwayland_display.expect("checked above");
-                command.env_remove("WAYLAND_DISPLAY");
+            command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
+            command.env_remove("DISPLAY");
+            if let Some(display) = xwayland_display {
                 command.env("DISPLAY", display);
-                if is_chrome_like(&candidate) {
-                    command.arg("--ozone-platform=x11");
-                }
-            } else {
-                command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
-                command.env_remove("DISPLAY");
-                if let Some(display) = xwayland_display {
-                    command.env("DISPLAY", display);
-                }
+            }
+            if chrome_like {
+                configure_chrome_command(&mut command);
             }
 
             match command.spawn() {
@@ -1516,29 +1569,6 @@ impl DesktopState {
                 }
                 Err(err) => {
                     last_error = Some((candidate, err));
-                }
-            }
-        }
-
-        if force_xwayland && !xwayland_attempted {
-            // XWayland not ready: still try native Wayland launch for Chrome-like apps.
-            let mut command = Command::new(&app_name);
-            command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
-            command.env_remove("DISPLAY");
-            if is_chrome_like(&app_name) {
-                command.arg("--ozone-platform=wayland");
-            }
-            match command.spawn() {
-                Ok(child) => {
-                    flog(&format!(
-                        "launched {app_name} (wayland fallback) pid={} WAYLAND_DISPLAY={} DISPLAY={display_env:?}",
-                        child.id(),
-                        self.client_wayland_display,
-                    ));
-                    return;
-                }
-                Err(err) => {
-                    last_error = Some((app_name.clone(), err));
                 }
             }
         }
@@ -1839,6 +1869,7 @@ impl DesktopState {
                     }
                 }
                 self.process_toplevel_pointer_motion(position);
+                self.update_pointer_cursor(position);
                 self.forward_pointer_to_clients(position);
                 self.mark_redraw();
             }
@@ -1925,17 +1956,28 @@ impl DesktopState {
                         if matches!(button, FlowMouseButton::Left)
                             && self.pointer_in_work_recess(position)
                         {
-                            self.pending_compositor_move = self
-                                .top_mapped_window_id_at(position)
-                                .filter(|&id| {
-                                    self.window(id).is_some_and(|w| {
-                                        w.mapped && !w.maximized && !w.fullscreen && !w.minimized
+                            if let Some((id, edges)) = self.top_window_resize_edge_at(position) {
+                                self.pending_compositor_move = None;
+                                if let Ok(edge) = ResizeEdge::try_from(edges) {
+                                    self.try_begin_compositor_resize(id, edge);
+                                }
+                            } else {
+                                self.pending_compositor_move = self
+                                    .top_mapped_window_id_at(position)
+                                    .filter(|&id| {
+                                        self.window(id).is_some_and(|w| {
+                                            w.mapped
+                                                && !w.maximized
+                                                && !w.fullscreen
+                                                && !w.minimized
+                                        })
                                     })
-                                })
-                                .map(|id| (id, position));
+                                    .map(|id| (id, position));
+                            }
                         }
                     }
                 }
+                self.update_pointer_cursor(position);
                 self.process_toplevel_pointer_button(button, state);
                 self.mark_redraw();
             }
@@ -2362,8 +2404,33 @@ impl DesktopState {
     }
 }
 
-fn should_force_xwayland(app_name: &str) -> bool {
-    is_chrome_like(app_name)
+fn chrome_profile_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
+        })
+        .join("flowstate")
+        .join("chrome-profile")
+}
+
+fn flowstate_files_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join("flowstate-files")))
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "flowstate-files".to_string())
+}
+
+fn configure_chrome_command(command: &mut Command) {
+    let profile = chrome_profile_dir();
+    command
+        .arg("--ozone-platform=wayland")
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--new-window");
 }
 
 fn chrome_exec_fallbacks(app_name: &str) -> Vec<String> {
