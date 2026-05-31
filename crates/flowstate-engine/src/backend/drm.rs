@@ -638,15 +638,25 @@ fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
     state: &mut DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
 ) {
-    let clamp_rect = state.logical_pointer_clamp_rect();
+    use smithay::backend::input::InputEvent;
+
     let output_id = state
         .output_at_logical_point(state.pointer_pos)
         .unwrap_or(state.focused_output);
     let scale = state
         .outputs
         .get(&output_id)
-        .map(|o| o.scale_factor as f64)
+        .map(|o| o.scale_factor)
         .unwrap_or(1.0);
+
+    // Absolute devices (touchpad/tablet in absolute mode) must transform against the
+    // focused output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
+    let clamp_rect = match input {
+        InputEvent::PointerMotionAbsolute { .. } => {
+            state.pointer_transform_rect_for_output(output_id)
+        }
+        _ => state.logical_pointer_clamp_rect(),
+    };
 
     if let Some(event) = translate_backend_input(
         input,
@@ -1314,7 +1324,7 @@ fn device_added(
                     refresh: mode.vrefresh() as i32,
                 }),
                 Some(Transform::Normal),
-                Some(smithay::output::Scale::Integer(1)),
+                Some(smithay::output::Scale::Fractional(1.0)),
                 Some(origin),
             );
             output.set_preferred(WlMode {

@@ -1954,10 +1954,12 @@ impl RenderState {
                 continue;
             }
 
-            let geometry = space
-                .element_geometry(window)
-                .unwrap_or_else(|| window.bbox());
-            if !region.overlaps(geometry) {
+            let bbox = space.element_bbox(window).unwrap_or_else(|| {
+                let mut bbox = window.bbox_with_popups();
+                bbox.loc -= window.geometry().loc;
+                bbox
+            });
+            if !region.overlaps(bbox) {
                 continue;
             }
 

@@ -51,14 +51,7 @@ fn dispatch_backend_events(
         }
 
         WinitEvent::Input(input) => {
-            let clamp_rect = Rectangle::from_loc_and_size(
-                (0, 0),
-                state
-                    .outputs
-                    .get(&state.primary_output)
-                    .expect("active output missing")
-                    .logical_size,
-            );
+            let clamp_rect = state.pointer_transform_rect_for_output(state.primary_output);
 
             let scale_factor = state.winit_scale_factor;
 

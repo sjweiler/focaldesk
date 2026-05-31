@@ -40,9 +40,12 @@ impl XdgShellHandler for DesktopState {
         }
     }
 
-    fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
+    fn move_request(&mut self, surface: ToplevelSurface, _seat: wl_seat::WlSeat, serial: Serial) {
+        if !self.xdg_toplevel_pointer_grab_valid(surface.wl_surface(), serial) {
+            return;
+        }
         if let Some(id) = self.window_id_for_toplevel(&surface) {
-            self.request_move(id);
+            self.queue_xdg_move_request(id);
         }
     }
 
@@ -88,10 +91,13 @@ impl XdgShellHandler for DesktopState {
     fn resize_request(
         &mut self,
         surface: ToplevelSurface,
-        seat: wl_seat::WlSeat,
+        _seat: wl_seat::WlSeat,
         serial: Serial,
         edges: ResizeEdge,
     ) {
+        if !self.xdg_toplevel_pointer_grab_valid(surface.wl_surface(), serial) {
+            return;
+        }
         if let Some(id) = self.window_id_for_toplevel(&surface) {
             self.request_resize(id, edges);
         }

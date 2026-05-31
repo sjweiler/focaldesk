@@ -198,7 +198,7 @@ impl XwmHandler for DesktopState {
 
     fn move_request(&mut self, _xwm: XwmId, window: X11Surface, _button: u32) {
         if let Some(id) = self.window_id_for_x11_surface(&window) {
-            self.request_move(id);
+            self.queue_deferred_move(id);
         }
     }
 

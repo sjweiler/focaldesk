@@ -231,8 +231,11 @@ pub struct DesktopState {
     host_window_drag_requested: bool,
 
     /// Left press on a client in the work area: after pointer moves past a threshold, start compositor move.
-    /// (Nested mode does not forward pointer to clients, so xdg_toplevel.move from apps never runs.)
     pending_compositor_move: Option<(WindowId, Point<f64, Logical>)>,
+
+    /// GTK/Wayland titlebar drag: `xdg_toplevel.move` is deferred until the pointer crosses a threshold
+    /// so a simple click still reaches the client (immediate compositor grab blocks forwarding).
+    pending_xdg_move: Option<(WindowId, Point<f64, Logical>)>,
 
     /// Stable [`Id`] for the DRM cursor [`TextureRenderElement`] so [`RenderElementStates`] can be inspected.
     pub drm_cursor_render_id: Id,
@@ -500,47 +503,58 @@ impl DesktopState {
         }
     }
 
+    fn global_window_bbox(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
+        self.space.element_bbox(window)
+    }
+
     /// Topmost client subsurface or xdg popup under `pos` (global logical), if any.
     pub(crate) fn pointer_surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         let ws = self.focused_workspace();
+        for window in self.space.elements() {
+            window.on_commit();
+        }
+
+        if let Some((window, render_loc)) = self.space.element_under(pos) {
+            let on_ws = self.windows.iter().any(|mw| {
+                mw.mapped && mw.workspace == ws && &mw.window == window
+            });
+            if on_ws {
+                if let Some(hit) = window
+                    .surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
+                    .map(|(surface, surf_loc)| (surface, (surf_loc + render_loc).to_f64()))
+                {
+                    return Some(hit);
+                }
+            }
+        }
+
+        // XWayland/GTK can briefly have empty input regions while geometry catches up;
+        // fall back to bbox + surface_under (matches render visibility).
         for window in self.space.elements().rev() {
-            let Some(managed) = self
-                .windows
-                .iter()
-                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)
-            else {
+            let on_ws = self.windows.iter().any(|mw| {
+                mw.mapped && mw.workspace == ws && &mw.window == window
+            });
+            if !on_ws {
                 continue;
-            };
+            }
             let Some(loc) = self.space.element_location(window) else {
                 continue;
             };
             let render_loc = loc - window.geometry().loc;
-            let bbox = window.bbox_with_popups();
-            let global = Rectangle::from_loc_and_size(bbox.loc + render_loc, bbox.size);
-            if !global.contains(pos.to_i32_round()) {
-                continue;
-            }
-
-            let surface_under =
-                window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL);
-            let Some((surface, surface_loc)) = (match window.underlying_surface() {
-                WindowSurface::Wayland(toplevel) => {
-                    surface_under.or_else(|| Some((toplevel.wl_surface().clone(), (0, 0).into())))
-                }
-                WindowSurface::X11(x11) => {
-                    let surface_loc = surface_under
-                        .map(|(_, surface_loc)| surface_loc)
-                        .unwrap_or_else(|| (0, 0).into());
-                    x11.wl_surface().map(|surface| (surface, surface_loc))
-                }
-            }) else {
+            let Some(global) = self.space.element_bbox(window) else {
                 continue;
             };
-
-            return Some((surface, (surface_loc + render_loc).to_f64()));
+            if !global.to_f64().contains(pos) {
+                continue;
+            }
+            if let Some((surface, surf_loc)) = window
+                .surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (surf_loc + render_loc).to_f64()));
+            }
         }
 
         None
@@ -561,6 +575,33 @@ impl DesktopState {
             },
         );
         pointer.frame(self);
+    }
+
+    fn compositor_pointer_grab_active(&self) -> bool {
+        self.toplevel_pointer.is_some()
+    }
+
+    /// True when the seat pointer has an active click grab matching `serial` on `surface`.
+    pub(crate) fn xdg_toplevel_pointer_grab_valid(
+        &self,
+        surface: &WlSurface,
+        serial: Serial,
+    ) -> bool {
+        use wayland_server::Resource;
+
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
+        if !pointer.has_grab(serial) {
+            return false;
+        }
+        let Some(start_data) = pointer.grab_start_data() else {
+            return false;
+        };
+        let Some((focus, _)) = start_data.focus.as_ref() else {
+            return false;
+        };
+        focus.id().same_client_as(&surface.id())
     }
 
     /// Deliver pointer motion to Wayland clients (nested compositor path).
@@ -961,6 +1002,64 @@ impl DesktopState {
         layout.work_area.recess.contains((px, py))
     }
 
+    fn work_recess_for_output(&self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+        let output = self.outputs.get(&output_id)?;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        let mut recess = layout.work_area.recess;
+        recess.loc += output.logical_origin;
+        Some(recess)
+    }
+
+    /// Default map location for a new toplevel: top-left of the work recess (global logical).
+    fn default_toplevel_map_location(&self, output_id: OutputId) -> Point<i32, Logical> {
+        self.work_recess_for_output(output_id)
+            .map(|work| work.loc)
+            .unwrap_or_else(|| {
+                self.outputs
+                    .get(&output_id)
+                    .map(|out| {
+                        Point::from((
+                            out.logical_origin.x + 100,
+                            out.logical_origin.y + 100,
+                        ))
+                    })
+                    .unwrap_or(Point::from((100, 100)))
+            })
+    }
+
+    fn clamp_window_location_to_work_recess(
+        &self,
+        window: &Window,
+        proposed_loc: Point<i32, Logical>,
+        pointer_pos: Point<f64, Logical>,
+    ) -> Point<i32, Logical> {
+        let output_id = self
+            .output_under_pointer(pointer_pos)
+            .unwrap_or(self.focused_output);
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return proposed_loc;
+        };
+
+        let geometry = window.geometry();
+        let bbox = window.bbox_with_popups();
+        let render_offset = geometry.loc - bbox.loc;
+
+        let min_x = work.loc.x + render_offset.x;
+        let min_y = work.loc.y + render_offset.y;
+        let max_x = work.loc.x + work.size.w - bbox.size.w + render_offset.x;
+        let max_y = work.loc.y + work.size.h - bbox.size.h + render_offset.y;
+
+        Point::from((
+            proposed_loc.x.clamp(min_x.min(max_x), max_x.max(min_x)),
+            proposed_loc.y.clamp(min_y.min(max_y), max_y.max(min_y)),
+        ))
+    }
+
     /// Hovered sidebar slot for this output only (global pointer + per-output chrome layout).
     pub fn sidebar_hover_for_output(&self, output_id: OutputId) -> Option<usize> {
         if !self.output_contains_pointer(output_id) {
@@ -982,13 +1081,18 @@ impl DesktopState {
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
         let ws = self.focused_workspace();
-        self.windows
-            .iter()
+        self.space
+            .elements()
             .rev()
-            .find(|managed| {
-                managed.mapped && managed.workspace == ws && managed.bbox().contains((px, py))
+            .find_map(|window| {
+                let managed = self
+                    .windows
+                    .iter()
+                    .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
+                self.global_window_bbox(window)
+                    .is_some_and(|bbox| bbox.contains((px, py)))
+                    .then_some(managed.id)
             })
-            .map(|managed| managed.id)
     }
 
     fn try_begin_compositor_move(&mut self, id: WindowId) {
@@ -1015,6 +1119,7 @@ impl DesktopState {
             return;
         }
         self.focus_window_id(id);
+        self.clear_client_pointer_focus(self.pointer_pos);
         self.request_resize(id, edge);
     }
 
@@ -1028,14 +1133,19 @@ impl DesktopState {
         }
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
-        self.windows.iter().rev().find_map(|w| {
+        let ws = self.focused_workspace();
+        self.space.elements().rev().find_map(|window| {
+            let w = self
+                .windows
+                .iter()
+                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
             if !w.mapped || w.maximized || w.fullscreen || w.minimized {
                 return None;
             }
-            if w.window.x11_surface().is_none() {
+            if window.x11_surface().is_none() {
                 return None;
             }
-            let bbox = self.space.element_bbox(&w.window)?;
+            let bbox = self.global_window_bbox(window)?;
             let edges = resize_edges_at(bbox, px, py, RESIZE_BORDER_PX)?;
             Some((w.id, edges))
         })
@@ -1095,13 +1205,18 @@ impl DesktopState {
         let py = position.y.round() as i32;
         let ws = self.focused_workspace();
         let target_id = self
-            .windows
-            .iter()
+            .space
+            .elements()
             .rev()
-            .find(|managed| {
-                managed.mapped && managed.workspace == ws && managed.bbox().contains((px, py))
-            })
-            .map(|managed| managed.id);
+            .find_map(|window| {
+                let managed = self
+                    .windows
+                    .iter()
+                    .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
+                self.global_window_bbox(window)
+                    .is_some_and(|bbox| bbox.contains((px, py)))
+                    .then_some(managed.id)
+            });
 
         if let Some(id) = target_id {
             self.focus_window_id(id);
@@ -1199,6 +1314,7 @@ impl DesktopState {
             apps: init.apps,
             host_window_drag_requested: false,
             pending_compositor_move: None,
+            pending_xdg_move: None,
             running: init.running,
             drm_cursor_render_id: Id::new(),
             drm_submit_hw_cursor: false,
@@ -1331,9 +1447,7 @@ impl DesktopState {
         let location = if surface.is_override_redirect() {
             requested_geometry.loc
         } else {
-            fallback_output
-                .map(|out| (out.logical_origin.x + 100, out.logical_origin.y + 100).into())
-                .unwrap_or_else(|| (100, 100).into())
+            self.default_toplevel_map_location(output_id)
         };
 
         window.on_commit();
@@ -1430,7 +1544,7 @@ impl DesktopState {
         if let Some(window) = self.window_for_wl_surface(&root) {
             window.on_commit();
 
-            if !is_sync_subsurface(surface) && &root == surface {
+            if window.x11_surface().is_some() && !is_sync_subsurface(surface) && &root == surface {
                 let buffer_offset = with_states(surface, |states| {
                     states
                         .cached_state
@@ -1497,13 +1611,9 @@ impl DesktopState {
                 .output_under_pointer(self.input.pointer_pos)
                 .unwrap_or(self.primary_output);
 
-            let (mx, my) = if let Some(out) = self.outputs.get(&output_id) {
-                (out.logical_origin.x + 100, out.logical_origin.y + 100)
-            } else {
-                (100, 100)
-            };
+            let map_loc = self.default_toplevel_map_location(output_id);
 
-            self.space.map_element(window, (mx, my), false);
+            self.space.map_element(window, map_loc, false);
             self.windows[idx].mapped = true;
             let window_id = self.windows[idx].id;
             self.focus_window_id(window_id);
@@ -1866,7 +1976,10 @@ impl DesktopState {
                 let delta = pos - *pointer_start;
                 let new_loc = (initial_location.to_f64() + delta).to_i32_round();
                 if let Some(w) = self.window(*window_id) {
+                    let new_loc =
+                        self.clamp_window_location_to_work_recess(&w.window, new_loc, pos);
                     self.space.map_element(w.window.clone(), new_loc, false);
+                    self.space.refresh();
                 }
             }
             Some(ToplevelPointerInteraction::Resize {
@@ -1980,8 +2093,20 @@ impl DesktopState {
                     }
                 }
             }
-            ToplevelPointerInteraction::Move { .. } => {}
+            ToplevelPointerInteraction::Move { window_id, .. } => {
+                if let Some(w) = self.window(window_id) {
+                    if let Some(x11) = w.window.x11_surface() {
+                        if let (Some(loc), Some(bbox)) = (
+                            self.space.element_location(&w.window),
+                            self.space.element_bbox(&w.window),
+                        ) {
+                            let _ = x11.configure(Rectangle::from_loc_and_size(loc, bbox.size));
+                        }
+                    }
+                }
+            }
         }
+        self.forward_pointer_to_clients(self.pointer_pos);
         self.mark_redraw();
     }
 
@@ -2028,9 +2153,15 @@ impl DesktopState {
                     return;
                 }
                 self.cursor_manager.move_to(position.x, position.y);
-                // Nested compositor: start moving a client after a small drag from a work-area press.
                 const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
                 if self.input.pointer_left_down {
+                    if let Some((id, start)) = self.pending_xdg_move {
+                        let d = position - start;
+                        if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
+                            self.pending_xdg_move = None;
+                            self.request_move(id);
+                        }
+                    }
                     if let Some((id, start)) = self.pending_compositor_move {
                         let d = position - start;
                         if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
@@ -2038,10 +2169,21 @@ impl DesktopState {
                             self.try_begin_compositor_move(id);
                         }
                     }
+                } else {
+                    self.pending_xdg_move = None;
+                    if matches!(
+                        self.toplevel_pointer,
+                        Some(ToplevelPointerInteraction::Move { .. })
+                    ) {
+                        self.toplevel_pointer = None;
+                        self.forward_pointer_to_clients(self.pointer_pos);
+                    }
                 }
                 self.process_toplevel_pointer_motion(position);
                 self.update_pointer_cursor(position);
-                self.forward_pointer_to_clients(position);
+                if !self.compositor_pointer_grab_active() {
+                    self.forward_pointer_to_clients(position);
+                }
                 self.mark_redraw();
             }
 
@@ -2132,6 +2274,7 @@ impl DesktopState {
                         FlowKeyState::Released => {
                             self.input.pointer_left_down = false;
                             self.pending_compositor_move = None;
+                            self.pending_xdg_move = None;
                         }
                     }
                 }
@@ -2166,7 +2309,6 @@ impl DesktopState {
                                                 && !w.maximized
                                                 && !w.fullscreen
                                                 && !w.minimized
-                                                && w.window.x11_surface().is_some()
                                         })
                                     })
                                     .map(|id| (id, position));
@@ -2174,10 +2316,19 @@ impl DesktopState {
                         }
                     }
                 }
-                self.forward_pointer_to_clients(position);
-                self.forward_pointer_button(position, button, state);
+                if self.compositor_pointer_grab_active() {
+                    if matches!(button, FlowMouseButton::Left)
+                        && matches!(state, FlowKeyState::Released)
+                    {
+                        self.process_toplevel_pointer_button(button, state);
+                        self.forward_pointer_button(position, button, state);
+                    }
+                } else {
+                    self.forward_pointer_to_clients(position);
+                    self.forward_pointer_button(position, button, state);
+                    self.process_toplevel_pointer_button(button, state);
+                }
                 self.update_pointer_cursor(position);
-                self.process_toplevel_pointer_button(button, state);
                 self.mark_redraw();
             }
 
@@ -2207,8 +2358,10 @@ impl DesktopState {
                     return;
                 }
                 self.cursor_manager.move_to(position.x, position.y);
-                self.forward_pointer_to_clients(position);
-                self.forward_pointer_scroll(delta);
+                if !self.compositor_pointer_grab_active() {
+                    self.forward_pointer_to_clients(position);
+                    self.forward_pointer_scroll(delta);
+                }
                 self.mark_redraw();
             }
 
@@ -2219,6 +2372,10 @@ impl DesktopState {
 
             FlowInputEvent::PointerLeft => {
                 let _ = self.handle_egui_input(&event);
+                self.process_toplevel_pointer_button(FlowMouseButton::Left, FlowKeyState::Released);
+                self.input.pointer_left_down = false;
+                self.pending_compositor_move = None;
+                self.pending_xdg_move = None;
                 self.cursor_manager.set_visible(false);
                 self.mark_redraw();
             }
@@ -2308,21 +2465,50 @@ impl DesktopState {
         }
     }
 
+    /// Rectangle used to map winit/libinput absolute pointer coords into global logical space.
+    /// Must match [`Space::output_geometry`] so hit testing and pointer forwarding agree (see anvil/smallvil).
+    pub fn pointer_transform_rect_for_output(&self, output_id: OutputId) -> Rectangle<i32, Logical> {
+        if let Some(output) = self.outputs.get(&output_id) {
+            if let Some(geo) = self.space.output_geometry(&output.handle) {
+                return geo;
+            }
+            return Rectangle::from_loc_and_size(output.logical_origin, output.logical_size);
+        }
+        Rectangle::from_loc_and_size((0, 0), (8192, 8192))
+    }
+
     pub fn update_output_size(
         &mut self,
         output_id: OutputId,
         physical_size: Size<i32, Physical>,
         scale_factor: f64,
     ) {
+        let mode = Mode {
+            size: (physical_size.w, physical_size.h).into(),
+            refresh: 60_000,
+        };
+        let scale_int = scale_factor.round().max(1.0) as i32;
+        let logical_w = (physical_size.w as f64 / scale_factor).round() as i32;
+        let logical_h = (physical_size.h as f64 / scale_factor).round() as i32;
+        let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
+
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.scale_factor = scale_factor;
             output.scale = Scale::from((scale_factor, scale_factor));
             output.physical_size = physical_size;
+            output.logical_size = logical_size;
 
-            let logical_w = (physical_size.w as f64 / scale_factor).round() as i32;
-            let logical_h = (physical_size.h as f64 / scale_factor).round() as i32;
-
-            output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
+            output.handle.change_current_state(
+                Some(mode),
+                None,
+                Some(OutputScaleSmithay::Custom {
+                    advertised_integer: scale_int,
+                    fractional: scale_factor,
+                }),
+                None,
+            );
+            output.handle.set_preferred(mode);
+            self.space.map_output(&output.handle, output.logical_origin);
         }
 
         self.mark_redraw();
@@ -2385,7 +2571,10 @@ impl DesktopState {
         handle.change_current_state(
             Some(mode.clone()),
             Some(Transform::Normal),
-            Some(OutputScaleSmithay::Integer(scale_int)),
+            Some(OutputScaleSmithay::Custom {
+                advertised_integer: scale_int,
+                fractional: scale,
+            }),
             Some((0, 0).into()),
         );
         handle.set_preferred(mode);
@@ -2444,14 +2633,9 @@ impl DesktopState {
         let output_rect = Rectangle::from_loc_and_size(origin, logical_size);
 
         for window in self.space.elements() {
-            let Some(element_loc) = self.space.element_location(window) else {
+            let Some(global_bbox) = self.global_window_bbox(window) else {
                 continue;
             };
-            let bbox = window.bbox();
-            let global_bbox = Rectangle::from_loc_and_size(
-                (bbox.loc.x + element_loc.x, bbox.loc.y + element_loc.y),
-                bbox.size,
-            );
             if !global_bbox.overlaps(output_rect) {
                 continue;
             }
@@ -2543,13 +2727,25 @@ impl DesktopState {
         self.window_id_for_toplevel(surface)
     }
 
+    pub fn queue_deferred_move(&mut self, id: WindowId) {
+        self.pending_xdg_move = Some((id, self.pointer_pos));
+    }
+
+    pub fn queue_xdg_move_request(&mut self, id: WindowId) {
+        self.queue_deferred_move(id);
+    }
+
     pub fn request_move(&mut self, id: WindowId) {
+        if self.toplevel_pointer.is_some() {
+            return;
+        }
         let Some(w) = self.window(id) else {
             return;
         };
         let Some(loc) = self.space.element_location(&w.window) else {
             return;
         };
+        self.clear_client_pointer_focus(self.pointer_pos);
         self.toplevel_pointer = Some(ToplevelPointerInteraction::Move {
             window_id: id,
             pointer_start: self.pointer_pos,
@@ -2561,22 +2757,37 @@ impl DesktopState {
     }
 
     pub fn request_resize(&mut self, id: WindowId, edges: ResizeEdge) {
+        if matches!(
+            self.toplevel_pointer,
+            Some(ToplevelPointerInteraction::Move { .. })
+        ) {
+            return;
+        }
         let edges_m = ResizeEdgeMask::from(edges);
-        let Some(w) = self.window(id) else {
+        let pointer_pos = self.pointer_pos;
+        let Some((tl, initial_rect, last_window_size)) = self.window(id).and_then(|w| {
+            let map_loc = self.space.element_location(&w.window)?;
+            let geometry = w.window.geometry();
+            let initial_rect = Rectangle::from_loc_and_size(map_loc, geometry.size);
+            Some((
+                w.window.toplevel()?.clone(),
+                initial_rect,
+                geometry.size,
+            ))
+        }) else {
             return;
         };
-        let Some(initial_rect) = self.space.element_bbox(&w.window) else {
-            return;
-        };
-        let Some(tl) = w.window.toplevel() else {
-            return;
-        };
+
+        self.clear_client_pointer_focus(pointer_pos);
+        tl.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Resizing);
+        });
+        tl.send_pending_configure();
         ResizeSurfaceState::set_resizing(tl.wl_surface(), edges_m, initial_rect);
-        let last_window_size = initial_rect.size;
         self.toplevel_pointer = Some(ToplevelPointerInteraction::Resize {
             window_id: id,
             edges: edges_m,
-            pointer_start: self.pointer_pos,
+            pointer_start: pointer_pos,
             initial_rect,
             last_window_size,
         });
