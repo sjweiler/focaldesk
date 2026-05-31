@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 
 use crate::backend::NetworkBackend;
 use crate::backend::networkmanager::NetworkManagerBackend;
@@ -12,4 +12,3 @@ pub async fn auto_backend() -> Result<Arc<dyn NetworkBackend>> {
 
     Ok(Arc::new(RtnetlinkBackend::new()?))
 }
-

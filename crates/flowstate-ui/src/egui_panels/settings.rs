@@ -1,6 +1,6 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
-use flowstate_config::{save_config, FlowStateConfig};
+use flowstate_config::{FlowStateConfig, save_config};
 
 fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fill = if selected {
@@ -173,14 +173,11 @@ impl SettingsPanel {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Settings");
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("✕").clicked() {
-                                close_requested = true;
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            close_requested = true;
+                        }
+                    });
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -193,19 +190,21 @@ impl SettingsPanel {
 
                     ui.separator();
 
-                    ui.vertical(|ui| {
-                        ui.add_space(12.0);
-                        match self.tab {
-                            SettingsPage::Appearance => self.appearance_page(ui),
-                            SettingsPage::Displays => self.displays_page(ui),
-                            SettingsPage::Workspaces => self.show_placeholder(ui, "Workspaces"),
-                            SettingsPage::Keyboard => self.show_placeholder(ui, "Keyboard"),
-                            SettingsPage::Privacy => self.show_placeholder(ui, "Privacy"),
-                            SettingsPage::Power => self.show_placeholder(ui, "Power"),
-                            SettingsPage::Debug => self.show_placeholder(ui, "Debug"),
-                            SettingsPage::About => self.show_placeholder(ui, "About"),
-                        }
-                    });
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.add_space(12.0);
+                            match self.tab {
+                                SettingsPage::Appearance => self.appearance_page(ui),
+                                SettingsPage::Displays => self.displays_page(ui),
+                                SettingsPage::Workspaces => self.show_placeholder(ui, "Workspaces"),
+                                SettingsPage::Keyboard => self.show_placeholder(ui, "Keyboard"),
+                                SettingsPage::Privacy => self.show_placeholder(ui, "Privacy"),
+                                SettingsPage::Power => self.show_placeholder(ui, "Power"),
+                                SettingsPage::Debug => self.show_placeholder(ui, "Debug"),
+                                SettingsPage::About => self.show_placeholder(ui, "About"),
+                            }
+                        });
                 });
             });
 

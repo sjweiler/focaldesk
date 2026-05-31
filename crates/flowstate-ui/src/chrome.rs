@@ -1,14 +1,14 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
+use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::{ImportMem, Renderer, RendererSuper};
 use smithay::utils::{Physical, Rectangle, Size};
-use smithay::backend::renderer::Frame;
 //use crate::icons::{IconCache, IconId, IconKey, IconState};
+use crate::atlas::{IconAtlas, IconId, build_icon_atlas, render_atlas_icon};
+use crate::svg::rasterize_svg;
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
-use crate::atlas::{build_icon_atlas, render_atlas_icon, IconAtlas, IconId};
-use crate::svg::rasterize_svg;
 
 pub fn load_svg_texture<R>(
     renderer: &mut R,
@@ -25,21 +25,13 @@ where
     let size = Size::from((rgba.width() as i32, rgba.height() as i32));
 
     let tex = renderer
-        .import_memory(
-            &rgba.as_raw(),
-            Fourcc::Abgr8888,
-            size,
-            false,
-        )
+        .import_memory(&rgba.as_raw(), Fourcc::Abgr8888, size, false)
         .map_err(|e| anyhow!("import_memory failed for SVG texture: {:?}", e))?;
 
     Ok(tex)
 }
 
-pub fn load_png_texture<R>(
-    renderer: &mut R,
-    path: &str,
-) -> Result<GlesTexture>
+pub fn load_png_texture<R>(renderer: &mut R, path: &str) -> Result<GlesTexture>
 where
     R: Renderer<TextureId = GlesTexture> + ImportMem,
     <R as RendererSuper>::Error: std::fmt::Debug,
@@ -51,12 +43,7 @@ where
     let size = Size::from((width as i32, height as i32));
 
     let tex = renderer
-        .import_memory(
-            rgba.as_raw(),
-            Fourcc::Abgr8888,
-            size,
-            false,
-        )
+        .import_memory(rgba.as_raw(), Fourcc::Abgr8888, size, false)
         .map_err(|e| anyhow!("import_memory failed for {path}: {:?}", e))?;
 
     Ok(tex)
@@ -80,9 +67,9 @@ impl ClockCache {
 pub struct ChromeMetrics {
     pub sidebar_w: i32,
     pub topbar_h: i32,
-    pub icon_base_px: u32,   // design icon size (24 recommended)
-    pub icon_padding: i32,   // padding from edges
-    pub slot_spacing: i32,   // vertical spacing between slot icons
+    pub icon_base_px: u32, // design icon size (24 recommended)
+    pub icon_padding: i32, // padding from edges
+    pub slot_spacing: i32, // vertical spacing between slot icons
 }
 
 impl Default for ChromeMetrics {
@@ -97,24 +84,16 @@ impl Default for ChromeMetrics {
     }
 }
 
-
-
-
-
 /// Chrome state: owns cached textures.
-pub struct Chrome
-{
+pub struct Chrome {
     pub metrics: ChromeMetrics,
     //icon_cache: Option<IconCache<GlesTexture>>,
-    
     pub topbar_tex: Option<GlesTexture>,
     pub sidebar_tex: Option<GlesTexture>,
     pub atlas: Option<IconAtlas>,
 }
 
-
-impl Chrome
-{
+impl Chrome {
     pub fn new(metrics: ChromeMetrics) -> Self {
         Self {
             metrics,
@@ -125,64 +104,49 @@ impl Chrome
         }
     }
 
-    
- 
     /// Ensure icon textures exist for this scale.
     /// Call from App::render() before drawing.
-    pub fn ensure_gpu_resources<R>(
-        &mut self,
-        renderer: &mut R,
-        _scale: f64,
-    ) -> Result<()>
+    pub fn ensure_gpu_resources<R>(&mut self, renderer: &mut R, _scale: f64) -> Result<()>
     where
         R: Renderer<TextureId = GlesTexture> + ImportMem,
     {
-   
-
         if self.atlas.is_none() {
-    self.atlas = Some(build_icon_atlas(renderer)?);
-}
-        
+            self.atlas = Some(build_icon_atlas(renderer)?);
+        }
+
         //if self.topbar_tex.is_none() {
         //    self.topbar_tex = Some(load_png_texture(renderer, "assets/topbar_frame.png")?);
-       // }
+        // }
 
-       // if self.sidebar_tex.is_none() {
-       //     self.sidebar_tex = Some(load_png_texture(renderer, "assets/sidebar_frame.png")?);
-      //  }
-    
+        // if self.sidebar_tex.is_none() {
+        //     self.sidebar_tex = Some(load_png_texture(renderer, "assets/sidebar_frame.png")?);
+        //  }
+
         Ok(())
-}
+    }
 
- 
     /// Draw the chrome. No renderer required — only a Frame.
     pub fn render_chrome(
-    &self,
-    frame: &mut impl Frame<
-        TextureId = GlesTexture,
-        Error = smithay::backend::renderer::gles::GlesError,
-    >,
-    output_size: Size<i32, Physical>,
-) {
+        &self,
+        frame: &mut impl Frame<
+            TextureId = GlesTexture,
+            Error = smithay::backend::renderer::gles::GlesError,
+        >,
+        output_size: Size<i32, Physical>,
+    ) {
         // Sidebar & topbar rectangles are placeholders.
         // Replace these with your own rect-fill helpers if you already have them.
         let _sidebar_rect: Rectangle<i32, Physical> =
-            Rectangle::from_loc_and_size(
-                (0, 0),
-                (self.metrics.sidebar_w, output_size.h),
-        );
+            Rectangle::from_loc_and_size((0, 0), (self.metrics.sidebar_w, output_size.h));
 
-        let _topbar_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
-            (0, 0),
-            (output_size.w, self.metrics.topbar_h),
-        );
+        let _topbar_rect: Rectangle<i32, Physical> =
+            Rectangle::from_loc_and_size((0, 0), (output_size.w, self.metrics.topbar_h));
 
         // Draw icons (example positions).
         self.draw_topbar_icons(frame, output_size);
         self.draw_sidebar_slots(frame, output_size);
     }
 
-    
     fn draw_topbar_icons(
         &self,
         frame: &mut impl Frame<
@@ -212,7 +176,6 @@ impl Chrome
         }
     }
 
-    
     fn draw_sidebar_slots(
         &self,
         frame: &mut impl Frame<

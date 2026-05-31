@@ -1,12 +1,11 @@
 // crates/flowstate-ui/src/dialog.rs
-use flowstate_types::OutputId;
-use smithay::utils::Point;
-use smithay::utils::Logical;
 use crate::uicomponent::UiHit;
-use smithay::utils::Rectangle;
 use crate::uicomponent::UiHitTarget;
+use flowstate_types::OutputId;
 use flowstate_types::WidgetId;
-
+use smithay::utils::Logical;
+use smithay::utils::Point;
+use smithay::utils::Rectangle;
 
 pub type DialogId = u32;
 
@@ -17,8 +16,6 @@ pub enum DialogKind {
     Destructive,
     Permission,
 }
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DialogState {
@@ -72,7 +69,5 @@ impl Dialog {
 
         None
     }
-    pub fn layout(&mut self)
-    {
-    }
+    pub fn layout(&mut self) {}
 }

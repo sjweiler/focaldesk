@@ -25,7 +25,13 @@ impl XWaylandShellHandler for DesktopState {
     }
 
     fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, surface: X11Surface) {
+        let known_window = self.window_id_for_x11_surface(&surface).is_some();
         self.sync_xwayland_window_meta(&surface);
+        if known_window {
+            self.map_xwayland_window(surface);
+            return;
+        }
+        self.mark_redraw();
     }
 }
 
@@ -36,22 +42,29 @@ impl XwmHandler for DesktopState {
             .expect("XWayland WM not ready — Wayland clients were dispatched before X11Wm::start_wm completed")
     }
 
-    fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if self.window_id_for_x11_surface(&window).is_none() {
-            self.add_xwayland_window(window.clone(), false);
-        }
-        self.sync_xwayland_window_meta(&window);
-    }
+    fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
-    fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if self.window_id_for_x11_surface(&window).is_none() {
-            self.add_xwayland_window(window.clone(), true);
-        }
-        self.sync_xwayland_window_meta(&window);
-    }
+    fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
         self.map_xwayland_window(window);
+    }
+
+    fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
+        if let Some(managed) = self
+            .windows
+            .iter()
+            .find(|managed| {
+                managed
+                    .window
+                    .x11_surface()
+                    .is_some_and(|x11| x11 == &window)
+            })
+            .map(|managed| managed.window.clone())
+        {
+            managed.on_commit();
+        }
+        self.mark_redraw();
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -128,7 +141,9 @@ impl XwmHandler for DesktopState {
         let Some(managed) = self.window(id).map(|managed| managed.window.clone()) else {
             return;
         };
-        self.space.map_element(managed, geometry.loc, false);
+        if window.is_override_redirect() {
+            self.space.map_element(managed, geometry.loc, false);
+        }
         self.mark_redraw();
     }
 

@@ -1,13 +1,13 @@
-use flowstate_types::{WindowId, OutputId};
-use indexmap::IndexMap;
-use wayland_server::backend::ObjectId;
-use std::collections::HashSet;
-use std::collections::HashMap;
-use smithay::wayland::shell::xdg::ToplevelSurface;
-use smithay::desktop::Window;
 use crate::core::consts::MRU_CAP;
 use crate::core::layout::LayoutSnapshot;
+use flowstate_types::{OutputId, WindowId};
+use indexmap::IndexMap;
 use smithay::desktop::Space;
+use smithay::desktop::Window;
+use smithay::wayland::shell::xdg::ToplevelSurface;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use wayland_server::backend::ObjectId;
 
 pub struct SceneState {
     pub space: Space<Window>,
@@ -32,7 +32,7 @@ pub struct SceneState {
 }
 
 impl SceneState {
-pub fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             space: Space::<Window>::default(),
             windows: IndexMap::new(),
@@ -48,22 +48,21 @@ pub fn new() -> Self {
     }
     pub fn next_mru_window(&mut self) -> Option<WindowId> {
         if self.mru.len() < 2 {
-        return None;
+            return None;
         }
 
         self.mru.rotate_left(1);
         let id = self.mru.first().copied();
-    
+
         //let id = self.mru.remove(1);
         //self.mru.insert(0, id);
         id
     }
 
-
     pub fn prev_mru_window(&mut self) -> Option<WindowId> {
         if self.mru.len() < 2 {
             return None;
-        }   
+        }
 
         self.mru.rotate_right(1);
         let id = self.mru.first().copied();
@@ -72,7 +71,7 @@ pub fn new() -> Self {
         id
     }
 
- pub fn cycle_mru_window(&self, current: Option<WindowId>, direction: i32) -> Option<WindowId> {
+    pub fn cycle_mru_window(&self, current: Option<WindowId>, direction: i32) -> Option<WindowId> {
         if self.mru.len() < 2 {
             return None;
         }
@@ -86,9 +85,7 @@ pub fn new() -> Self {
         self.mru.get(next_idx).copied()
     }
 
-    
-
- pub fn close_focused(&mut self) -> Option<WindowId> {
+    pub fn close_focused(&mut self) -> Option<WindowId> {
         let wid = self.focused?;
 
         self.windows.shift_remove(&wid);
@@ -102,12 +99,13 @@ pub fn new() -> Self {
 
         Some(wid)
     }
-    
-    pub fn focus_window(&mut self, id: WindowId) {
-        let Some(window) = self.windows.get(&id).cloned() else { return; };
-       // set focus
-        self.focused = Some(id);
 
+    pub fn focus_window(&mut self, id: WindowId) {
+        let Some(window) = self.windows.get(&id).cloned() else {
+            return;
+        };
+        // set focus
+        self.focused = Some(id);
 
         // MRU update
         self.mru.retain(|&x| x != id);
@@ -123,7 +121,7 @@ pub fn new() -> Self {
             self.windows.insert(key, win); // end = top
         }
     }
-    
+
     pub fn layout_snapshot(&self) -> LayoutSnapshot {
         // Option 1: if you already have a constructor/helper:
         // LayoutSnapshot::from_scene(self)
@@ -131,7 +129,7 @@ pub fn new() -> Self {
         // Option 2: if LayoutSnapshot implements Default (good for “get it compiling”):
         LayoutSnapshot::default()
     }
-    
+
     #[inline]
     pub fn next_wid(&mut self) -> WindowId {
         let id = self.next_wid;

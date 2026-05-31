@@ -16,8 +16,8 @@ pub mod store;
 #[path = "../types.rs"]
 pub mod types;
 
-pub use manager::PermissionManager;
 pub use identity::AppIdentity;
+pub use manager::PermissionManager;
 pub use request::{PermissionRequest, PermissionResource};
+pub use session::{ActiveGrant, GrantToken};
 pub use types::{PermissionDecision, PermissionScope, PermissionState};
-pub use session::{GrantToken, ActiveGrant};

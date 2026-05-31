@@ -1,8 +1,6 @@
 //! Keyboard focus types for [`crate::core::wayland::seat::DesktopState`] so xdg popup grabs
 //! (`PopupManager::grab_popup`) can be installed (requires [`KeyboardFocus`]: [`From<PopupKind>`](PopupKind)).
 
-use std::fmt;
-
 use smithay::backend::input::KeyState;
 use smithay::desktop::{PopupKind, Window};
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
@@ -11,8 +9,14 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Serial};
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
+use std::fmt;
+use tracing::warn;
 
 use crate::core::desktop::DesktopState;
+
+fn x11_surface(window: &Window) -> Option<&smithay::xwayland::X11Surface> {
+    window.x11_surface()
+}
 
 #[derive(Clone, PartialEq)]
 pub enum KeyboardFocusTarget {
@@ -48,11 +52,15 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
     ) {
         match self {
             KeyboardFocusTarget::Window(w) => {
-                let cow = w
-                    .wl_surface()
-                    .expect("keyboard focus: wayland window has no wl_surface");
-                let s: &WlSurface = cow.as_ref();
-                KeyboardTarget::enter(s, seat, data, keys, serial)
+                if let Some(x11) = x11_surface(w) {
+                    KeyboardTarget::enter(x11, seat, data, keys, serial);
+                    return;
+                }
+                if let Some(cow) = w.wl_surface() {
+                    KeyboardTarget::enter(cow.as_ref(), seat, data, keys, serial);
+                    return;
+                }
+                warn!(?w, "keyboard focus enter skipped: window has no wl_surface");
             }
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::enter(p.wl_surface(), seat, data, keys, serial)
@@ -63,11 +71,15 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
     fn leave(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, serial: Serial) {
         match self {
             KeyboardFocusTarget::Window(w) => {
-                let cow = w
-                    .wl_surface()
-                    .expect("keyboard focus: wayland window has no wl_surface");
-                let s: &WlSurface = cow.as_ref();
-                KeyboardTarget::leave(s, seat, data, serial)
+                if let Some(x11) = x11_surface(w) {
+                    KeyboardTarget::leave(x11, seat, data, serial);
+                    return;
+                }
+                if let Some(cow) = w.wl_surface() {
+                    KeyboardTarget::leave(cow.as_ref(), seat, data, serial);
+                    return;
+                }
+                warn!(?w, "keyboard focus leave skipped: window has no wl_surface");
             }
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::leave(p.wl_surface(), seat, data, serial)
@@ -86,11 +98,15 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
     ) {
         match self {
             KeyboardFocusTarget::Window(w) => {
-                let cow = w
-                    .wl_surface()
-                    .expect("keyboard focus: wayland window has no wl_surface");
-                let s: &WlSurface = cow.as_ref();
-                KeyboardTarget::key(s, seat, data, key, state, serial, time)
+                if let Some(x11) = x11_surface(w) {
+                    KeyboardTarget::key(x11, seat, data, key, state, serial, time);
+                    return;
+                }
+                if let Some(cow) = w.wl_surface() {
+                    KeyboardTarget::key(cow.as_ref(), seat, data, key, state, serial, time);
+                    return;
+                }
+                warn!(?w, "keyboard focus key skipped: window has no wl_surface");
             }
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::key(p.wl_surface(), seat, data, key, state, serial, time)
@@ -107,11 +123,18 @@ impl KeyboardTarget<DesktopState> for KeyboardFocusTarget {
     ) {
         match self {
             KeyboardFocusTarget::Window(w) => {
-                let cow = w
-                    .wl_surface()
-                    .expect("keyboard focus: wayland window has no wl_surface");
-                let s: &WlSurface = cow.as_ref();
-                KeyboardTarget::modifiers(s, seat, data, modifiers, serial)
+                if let Some(x11) = x11_surface(w) {
+                    KeyboardTarget::modifiers(x11, seat, data, modifiers, serial);
+                    return;
+                }
+                if let Some(cow) = w.wl_surface() {
+                    KeyboardTarget::modifiers(cow.as_ref(), seat, data, modifiers, serial);
+                    return;
+                }
+                warn!(
+                    ?w,
+                    "keyboard focus modifiers skipped: window has no wl_surface"
+                );
             }
             KeyboardFocusTarget::Popup(p) => {
                 KeyboardTarget::modifiers(p.wl_surface(), seat, data, modifiers, serial)

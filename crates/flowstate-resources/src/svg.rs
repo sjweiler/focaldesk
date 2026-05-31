@@ -1,8 +1,8 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use image::{Rgba, RgbaImage};
 use resvg::{
     tiny_skia::{Pixmap, Transform},
-    usvg::{fontdb::Database, Options, Tree},
+    usvg::{Options, Tree, fontdb::Database},
 };
 
 /// Rasterize an SVG into an RGBA pixmap at (width x height).
@@ -15,8 +15,8 @@ pub fn rasterize_svg(svg_bytes: &[u8], width: u32, height: u32) -> Result<RgbaIm
     let tree = Tree::from_data(svg_bytes, &opt, &fontdb)
         .map_err(|e| anyhow!("failed to parse svg: {e}"))?;
 
-    let mut pixmap = Pixmap::new(width, height)
-        .ok_or_else(|| anyhow!("failed to allocate pixmap"))?;
+    let mut pixmap =
+        Pixmap::new(width, height).ok_or_else(|| anyhow!("failed to allocate pixmap"))?;
 
     let svg_size = tree.size();
     let sx = width as f32 / svg_size.width();
@@ -51,6 +51,6 @@ pub fn rasterize_svg(svg_bytes: &[u8], width: u32, height: u32) -> Result<RgbaIm
             img.put_pixel(x, y, Rgba([r, g, b, a]));
         }
     }
-img.save("/tmp/icon_rgba_test.png")?;
+    img.save("/tmp/icon_rgba_test.png")?;
     Ok(img)
 }

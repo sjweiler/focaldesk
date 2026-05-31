@@ -1,29 +1,27 @@
 use std::time::{Duration, Instant};
 
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
+use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Rectangle, Size};
 
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
+use crate::core::fonts::{FontId, TextStyle};
 use crate::core::render::{FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
+use crate::core::ui_builder::build_ui_for_output;
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
-use crate::core::ui_builder::build_ui_for_output;
 use flowstate_flow::keybinds::BackendKind;
+use flowstate_themes::theme::BuiltInThemeId;
+use flowstate_themes::FlowTheme;
 use flowstate_types::OutputId;
 use flowstate_ui::desktop_frame::DesktopFrameCtx;
-use crate::core::fonts::{FontId, TextStyle};
-use flowstate_themes::FlowTheme;
-use flowstate_themes::theme::BuiltInThemeId;
-
 
 pub struct PreparedOutput {
     pub frame_ctx: FrameCtx,
     pub layout: ChromeLayout,
-    pub elements: Vec<FlowRenderElement>,
     pub draw_software_cursor: bool,
 }
-
 
 pub fn prepare_output(
     state: &mut DesktopState,
@@ -49,8 +47,7 @@ pub fn prepare_output(
     };
 
     state.prepare_cursor_for_frame(renderer, output_id)?;
-    
-    
+
     let pointer_on_this_output = state.output_contains_pointer(output_id);
 
     let draw_software_cursor = pointer_on_this_output
@@ -72,65 +69,67 @@ pub fn prepare_output(
     // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
     state.render.ensure_wallpaper_loaded(renderer);
 
-let active_theme = state.theme.active_theme();
-let active_theme_id =
-    active_theme.id.builtin_id().unwrap_or(BuiltInThemeId::Classic);
-    
-let preload_fonts = match active_theme_id {
-    BuiltInThemeId::Classic => [
-        FontId::IbmPlexSansRegular,
-        FontId::IbmPlexSansMedium,
-        FontId::IbmPlexSansSemiBold,
-    ],
+    let active_theme = state.theme.active_theme();
+    let active_theme_id = active_theme
+        .id
+        .builtin_id()
+        .unwrap_or(BuiltInThemeId::Classic);
 
-    BuiltInThemeId::Moonbase => [
-        FontId::RajdhaniRegular,
-        FontId::RajdhaniMedium,
-        FontId::RajdhaniSemiBold,
-    ],
+    let preload_fonts = match active_theme_id {
+        BuiltInThemeId::Classic => [
+            FontId::IbmPlexSansRegular,
+            FontId::IbmPlexSansMedium,
+            FontId::IbmPlexSansSemiBold,
+        ],
 
-    BuiltInThemeId::Eagle => [
-        FontId::OrbitronRegular,
-        FontId::OrbitronMedium,
-        FontId::OrbitronSemiBold,
-    ],
-};
+        BuiltInThemeId::Moonbase => [
+            FontId::RajdhaniRegular,
+            FontId::RajdhaniMedium,
+            FontId::RajdhaniSemiBold,
+        ],
 
-for font in preload_fonts {
-  for size_px in [10, 12, 14, 16, 18, 20, 24] {
-        let style = TextStyle { font, size_px };
+        BuiltInThemeId::Eagle => [
+            FontId::OrbitronRegular,
+            FontId::OrbitronMedium,
+            FontId::OrbitronSemiBold,
+        ],
+    };
 
-        state.fonts.prepare_text("FlowState", style)?;
-        state.fonts.prepare_text("FlowState Debug", style)?;
-        state.fonts.prepare_text("OK", style)?;
-        state.fonts.prepare_text("Cancel", style)?;
-        const BASIC_ASCII: &str =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\
+    for font in preload_fonts {
+        for size_px in [10, 12, 14, 16, 18, 20, 24] {
+            let style = TextStyle { font, size_px };
+
+            state.fonts.prepare_text("FlowState", style)?;
+            state.fonts.prepare_text("FlowState Debug", style)?;
+            state.fonts.prepare_text("OK", style)?;
+            state.fonts.prepare_text("Cancel", style)?;
+            const BASIC_ASCII: &str =
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\
          .,;:!?()[]{}<>+-=*/_@#%&$'\"\\|`~^ ";
 
-        state.fonts.prepare_text(BASIC_ASCII, style)?;
+            state.fonts.prepare_text(BASIC_ASCII, style)?;
+        }
     }
-}
 
     // Dialog text uses 16px in draw_dialog; glyph keys include size, so we must
     // rasterize at 16px or draw_text_cached finds no glyphs.
-   // let dialog_text_style = TextStyle {
-   //     font: FontId::Debug,
-   //     size_px: 16,
-   // };
-   //let dialog_text_style = 
-   // for d in &state.dialogs {
+    // let dialog_text_style = TextStyle {
+    //     font: FontId::Debug,
+    //     size_px: 16,
+    // };
+    //let dialog_text_style =
+    // for d in &state.dialogs {
     //    state.fonts.prepare_text(&d.title, dialog_text_style)?;
     //    state.fonts.prepare_text(&d.message, dialog_text_style)?;
     //    for b in &d.buttons {
-     //       state.fonts.prepare_text(&b.label, dialog_text_style)?;
-     //   }
+    //       state.fonts.prepare_text(&b.label, dialog_text_style)?;
+    //   }
     //}
 
-if state.fonts.atlas_dirty {
-    state.render.upload_font_atlas(renderer, &state.fonts)?;
-    state.fonts.atlas_dirty = false;
-}
+    if state.fonts.atlas_dirty {
+        state.render.upload_font_atlas(renderer, &state.fonts)?;
+        state.fonts.atlas_dirty = false;
+    }
 
     let frame_ctx = FrameCtx {
         output_size: (buffer_size.w, buffer_size.h),
@@ -140,10 +139,7 @@ if state.fonts.atlas_dirty {
             (0, 0),
             (buffer_size.w, buffer_size.h),
         )],
-        work: Rectangle::from_loc_and_size(
-            (0, 0),
-            (logical_w, logical_h),
-        ),
+        work: Rectangle::from_loc_and_size((0, 0), (logical_w, logical_h)),
         frame_no: state.render.frame_no,
         now,
         dt,
@@ -151,52 +147,55 @@ if state.fonts.atlas_dirty {
         rendering_output: output_id,
     };
 
-
-
-        let (origin, logical_size) = {
-            let o = state
-                .outputs
-                .get(&output_id)
-                .expect("active output missing");
-            (o.logical_origin, o.logical_size)
-        };
-
-        let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
-        
-        let active_workspace = state
-        .outputs
-        .get(&output_id)
-        .map(|o| o.active_workspace)
-        .unwrap_or_else(|| state.focused_workspace());
-        
-        let elements = state.render.build_client_elements(
-            &state.space,
-            &state.windows,
-            active_workspace,
-            origin,
-            logical_size,
-            renderer,
-            &frame_ctx,
-            layers_on,
-        );
-    
     ui_state
         .chrome
         .ensure_gpu_resources(renderer, scale_factor)?;
 
-
     Ok(PreparedOutput {
         frame_ctx,
         layout,
-        elements,
         draw_software_cursor,
     })
+}
+
+/// Import and build client surfaces for an output. Call after `GlesRenderer::bind` and before
+/// `GlesRenderer::render` on the same renderer.
+pub fn build_output_client_elements(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+) -> Vec<FlowRenderElement> {
+    let (output_handle, output_origin, output_logical_size) = state
+        .outputs
+        .get(&output_id)
+        .map(|o| (o.handle.clone(), o.logical_origin, o.logical_size))
+        .expect("output missing");
+
+    let active_workspace = state
+        .outputs
+        .get(&output_id)
+        .map(|o| o.active_workspace)
+        .unwrap_or_else(|| state.focused_workspace());
+
+    let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
+
+    state.import_mapped_surfaces_for_output(renderer, output_origin, output_logical_size);
+
+    state.render.build_client_elements_for_output(
+        &state.space,
+        &state.windows,
+        active_workspace,
+        &output_handle,
+        layers_on,
+        renderer,
+    )
 }
 
 pub fn draw_output(
     state: &mut DesktopState,
     frame: &mut GlesFrame<'_, '_>,
     prepared: &PreparedOutput,
+    elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
@@ -221,12 +220,16 @@ pub fn draw_output(
         scene,
         output: output_state,
         metrics: &state.chrome.metrics,
-        elements: &prepared.elements,
+        elements: &elements,
         popup_elements: &[],
         sidebar_hover_slot: state.sidebar_hover_for_output(prepared.frame_ctx.active_output),
         draw_software_cursor: prepared.draw_software_cursor,
         ui_tree: &state.ui,
-        current_workspace: state.active_workspace,
+        current_workspace: state
+            .outputs
+            .get(&prepared.frame_ctx.rendering_output)
+            .map(|o| o.active_workspace)
+            .unwrap_or(state.active_workspace),
         // 👇 ADD THESE
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,

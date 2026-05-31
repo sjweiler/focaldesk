@@ -1,12 +1,11 @@
 // crates/flowstate-ui/src/dialog_layout.rs
 
-use smithay::utils::{Logical, Rectangle};
 use crate::dialog::Dialog;
-use smithay::backend::renderer::gles::GlesFrame;
 use crate::uicomponent::RenderCtx;
 use flowstate_themes::FlowTheme;
+use smithay::backend::renderer::gles::GlesFrame;
 use smithay::utils::Physical;
-
+use smithay::utils::{Logical, Rectangle};
 
 pub struct DialogLayout {
     pub screen_rect: Rectangle<i32, Logical>,
@@ -31,8 +30,14 @@ pub fn layout_dialog(_dialog: &Dialog, screen: Rectangle<i32, Logical>) -> Dialo
         title_rect: Rectangle::from_loc_and_size((x + 24, y + 20), (w - 48, 32)),
         message_rect: Rectangle::from_loc_and_size((x + 24, y + 64), (w - 48, 80)),
         button_rects: vec![
-            (0, Rectangle::from_loc_and_size((x + w - 220, y + h - 56), (90, 36))),
-            (1, Rectangle::from_loc_and_size((x + w - 116, y + h - 56), (90, 36))),
+            (
+                0,
+                Rectangle::from_loc_and_size((x + w - 220, y + h - 56), (90, 36)),
+            ),
+            (
+                1,
+                Rectangle::from_loc_and_size((x + w - 116, y + h - 56), (90, 36)),
+            ),
         ],
     }
 }

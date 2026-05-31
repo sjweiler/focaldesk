@@ -1,20 +1,18 @@
 use crate::chrome_shaders::ChromeShaders;
+use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::DialogId;
 use crate::element::UiElement;
-use smithay::utils::Rectangle;
-use smithay::utils::Logical;
+use flowstate_themes::FlowTheme;
+use flowstate_types::OutputId;
 use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesFrame;
-use crate::desktop_frame::DesktopFrameCtx;
-use smithay::utils::Physical;
 use smithay::backend::renderer::gles::GlesRenderer;
-use flowstate_types::OutputId;
-use flowstate_themes::FlowTheme;
-
+use smithay::utils::Logical;
+use smithay::utils::Physical;
+use smithay::utils::Rectangle;
 
 use smithay::utils::Point;
-
 
 pub type UiRect = Rectangle<i32, Logical>;
 pub type UiPoint = Point<i32, Logical>;
@@ -46,10 +44,9 @@ pub struct RenderCtx<'a, 'b> {
     pub frame_ctx: &'a DesktopFrameCtx,
     pub damage: &'a [Rectangle<i32, Physical>],
 
-
     pub output_scale: f64,
     pub output_id: OutputId,
-    
+
     // NEW
     pub shaders: &'a ChromeShaders,
     pub theme: &'a FlowTheme,

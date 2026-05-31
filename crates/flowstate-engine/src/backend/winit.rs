@@ -1,21 +1,15 @@
 // winit backend
 
-use crate::backend::common::{
-    bootstrap_compositor_core,
-    translate_backend_input,
-};
+use crate::backend::common::{bootstrap_compositor_core, translate_backend_input};
 //use crate::backend::common::{
 //    bootstrap_compositor_core, finish_xwayland_startup, start_xwayland, translate_backend_input,
 //};
 #[cfg(feature = "xwayland")]
-use crate::backend::common::{
-    finish_xwayland_startup,
-    start_xwayland,
-};
+use crate::backend::common::{finish_xwayland_startup, start_xwayland};
 
-use smithay::reexports::calloop::EventLoop;
 use smithay::backend::winit as winit_backend; // Smithay backend glue (has init, WinitEvent, etc.)
 use smithay::backend::winit::WinitEvent; // (optional) import event type
+use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::winit;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,7 +25,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 use crate::core::input::FlowInputEvent;
 
 use crate::core::backend_render::draw_output;
-use crate::core::backend_render::prepare_output;
+use crate::core::backend_render::{build_output_client_elements, prepare_output};
 use crate::core::desktop::DesktopState;
 use flowstate_logging::flog;
 use flowstate_themes::theme::BuiltInThemeId;
@@ -130,6 +124,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         finish_xwayland_startup(
             &mut xwayland_event_loop,
+            &mut nested.display,
             &mut nested.state,
             Duration::from_secs(30),
         )?;
@@ -175,6 +170,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             std::mem::drop(framebuffer);
         }
 
+        nested.state.refresh_space();
         nested.display.flush_clients()?;
 
         //tick layout
@@ -198,6 +194,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     dt,
                 )?;
 
+                let client_elements =
+                    build_output_client_elements(&mut nested.state, renderer, OutputId(1));
+
                 let mut frame =
                     renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
 
@@ -205,6 +204,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &mut nested.state,
                     &mut frame,
                     &prepared,
+                    &client_elements,
                     &mut nested.ui_state,
                     &nested.scene,
                     &nested.output_state,

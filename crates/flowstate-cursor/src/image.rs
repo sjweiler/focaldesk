@@ -6,5 +6,3 @@ pub struct CursorImage {
     pub hotspot: CursorHotspot,
     pub pixels: Vec<u8>, // RGBA8888
 }
-
-

@@ -1,9 +1,8 @@
-pub mod model;
 pub mod backend;
-pub mod service;
 pub mod factory;
+pub mod model;
+pub mod service;
 
-
+pub use factory::*;
 pub use model::*;
 pub use service::*;
-pub use factory::*;

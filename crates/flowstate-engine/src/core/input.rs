@@ -1,5 +1,5 @@
-use smithay::utils::{Logical, Point};
 use flowstate_types::OutputId;
+use smithay::utils::{Logical, Point};
 
 /// Key press/release state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,8 +31,33 @@ pub struct FlowModifiers {
 /// Scroll delta (line vs pixel precise)
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FlowScrollDelta {
-    Line { x: f32, y: f32 },
-    Pixel { x: f64, y: f64 },
+    Line {
+        x: f32,
+        y: f32,
+    },
+    Pixel {
+        x: f64,
+        y: f64,
+    },
+    Axis {
+        x: f64,
+        y: f64,
+        x_v120: Option<i32>,
+        y_v120: Option<i32>,
+        source: FlowScrollSource,
+        x_inverted: bool,
+        y_inverted: bool,
+        stop_x: bool,
+        stop_y: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowScrollSource {
+    Finger,
+    Continuous,
+    Wheel,
+    WheelTilt,
 }
 
 /// Core FlowState input event

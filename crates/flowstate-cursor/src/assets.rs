@@ -1,7 +1,7 @@
 // assets.rs
-use std::collections::HashMap;
-use anyhow::{anyhow, Result};
 use crate::cursor::CursorIcon;
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct CursorImage {
@@ -57,36 +57,25 @@ impl CursorAssets {
             self.cache.insert(key, image);
         }
 
-        self.cache.get(&key).ok_or_else(|| anyhow!("missing cached cursor image"))
+        self.cache
+            .get(&key)
+            .ok_or_else(|| anyhow!("missing cached cursor image"))
     }
 }
 
-const BD_DOUBLE_ARROW: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/bd_double_arrow.svg");
-const CROSSHAIR: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/crosshair.svg");
-const FD_DOUBLE_ARROW: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/fd_double_arrow.svg");
-const GRABBING: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/grabbing.svg");
-const HAND1: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/hand1.svg");
-const LEFT_PTR: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/left_ptr.svg");
+const BD_DOUBLE_ARROW: &[u8] = include_bytes!("../../../assets/svg/cursor/bd_double_arrow.svg");
+const CROSSHAIR: &[u8] = include_bytes!("../../../assets/svg/cursor/crosshair.svg");
+const FD_DOUBLE_ARROW: &[u8] = include_bytes!("../../../assets/svg/cursor/fd_double_arrow.svg");
+const GRABBING: &[u8] = include_bytes!("../../../assets/svg/cursor/grabbing.svg");
+const HAND1: &[u8] = include_bytes!("../../../assets/svg/cursor/hand1.svg");
+const LEFT_PTR: &[u8] = include_bytes!("../../../assets/svg/cursor/left_ptr.svg");
 #[allow(dead_code)]
-const LEFT_PTR_ACTIVE: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/left_ptr_active.svg");
-const NOT_ALLOWED: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/not-allowed.svg");
-const SB_H_DOUBLE_ARROW: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/sb_h_double_arrow.svg");
-const SB_V_DOUBLE_ARROW: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/sb_v_double_arrow.svg");
-const WATCH: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/watch.svg");
-const XTERM: &[u8] =
-    include_bytes!("../../../assets/svg/cursor/xterm.svg");
-
+const LEFT_PTR_ACTIVE: &[u8] = include_bytes!("../../../assets/svg/cursor/left_ptr_active.svg");
+const NOT_ALLOWED: &[u8] = include_bytes!("../../../assets/svg/cursor/not-allowed.svg");
+const SB_H_DOUBLE_ARROW: &[u8] = include_bytes!("../../../assets/svg/cursor/sb_h_double_arrow.svg");
+const SB_V_DOUBLE_ARROW: &[u8] = include_bytes!("../../../assets/svg/cursor/sb_v_double_arrow.svg");
+const WATCH: &[u8] = include_bytes!("../../../assets/svg/cursor/watch.svg");
+const XTERM: &[u8] = include_bytes!("../../../assets/svg/cursor/xterm.svg");
 
 fn svg_bytes_for(icon: CursorIcon) -> &'static [u8] {
     match icon {
@@ -127,8 +116,8 @@ fn rasterize_svg(
     let opt = usvg::Options::default();
     let tree = usvg::Tree::from_data(svg_bytes, &opt)?;
 
-    let mut pixmap = tiny_skia::Pixmap::new(width, height)
-        .ok_or_else(|| anyhow!("failed to create pixmap"))?;
+    let mut pixmap =
+        tiny_skia::Pixmap::new(width, height).ok_or_else(|| anyhow!("failed to create pixmap"))?;
 
     let svg_size = tree.size();
     let transform = tiny_skia::Transform::from_scale(

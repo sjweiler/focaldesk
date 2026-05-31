@@ -26,7 +26,7 @@ pub fn chrome_host_drag_hit(layout: &ChromeLayout, lx: i32, ly: i32) -> bool {
 
 /// Index of the sidebar slot under output-local **logical** `(lx, ly)`, using each slot's outer module rect.
 pub fn sidebar_slot_index_at(layout: &ChromeLayout, lx: i32, ly: i32) -> Option<usize> {
-     layout
+    layout
         .sidebar
         .slots
         .iter()
@@ -46,8 +46,7 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
         Rectangle::from_loc_and_size((x, y), (w.max(1), h.max(1)))
     };
     let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(|r| sc(r));
-    let sc_vec =
-        |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(|r| sc(r)).collect();
+    let sc_vec = |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(|r| sc(r)).collect();
     ChromeLayout {
         topbar: TopBarLayout {
             outer: sc(layout.topbar.outer),
@@ -61,11 +60,16 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
         sidebar: SidebarLayout {
             outer: sc(layout.sidebar.outer),
             inner: sc(layout.sidebar.inner),
-            slots: layout.sidebar.slots.iter().map(|slot| SidebarSlotLayout {
-                outer: sc(slot.outer),
-                inner: sc(slot.inner),
-                icon_well: sc(slot.icon_well),
-            }).collect(),
+            slots: layout
+                .sidebar
+                .slots
+                .iter()
+                .map(|slot| SidebarSlotLayout {
+                    outer: sc(slot.outer),
+                    inner: sc(slot.inner),
+                    icon_well: sc(slot.icon_well),
+                })
+                .collect(),
             light: sc_opt(layout.sidebar.light),
             caps: sc_vec(&layout.sidebar.caps),
         },
@@ -138,7 +142,6 @@ pub struct ChromeDecorationLayout<Kind = Logical> {
     pub corner_caps: Vec<Rectangle<i32, Kind>>,
     pub corner_joint_caps: Vec<Rectangle<i32, Kind>>,
 }
-
 
 fn inset_rect<Kind>(rect: Rectangle<i32, Kind>, inset: i32) -> Rectangle<i32, Kind> {
     let x = rect.loc.x + inset;
@@ -221,13 +224,10 @@ pub fn build_chrome_layout(
 
     let topbar_outer = Rectangle::from_loc_and_size((0, 0), (w, top_h));
 
-    let sidebar_outer =
-        Rectangle::from_loc_and_size((0, top_h), (left_w, (h - top_h).max(1)));
+    let sidebar_outer = Rectangle::from_loc_and_size((0, top_h), (left_w, (h - top_h).max(1)));
 
-    let work_outer = Rectangle::from_loc_and_size(
-        (left_w, top_h),
-        ((w - left_w).max(1), (h - top_h).max(1)),
-    );
+    let work_outer =
+        Rectangle::from_loc_and_size((left_w, top_h), ((w - left_w).max(1), (h - top_h).max(1)));
 
     // -------------------------------------------------------------------------
     // 2. WORK AREA STACK
@@ -252,14 +252,13 @@ pub fn build_chrome_layout(
         ((w - left_w - 8).max(1), (top_h - 6).max(1)),
     );
 
-    let topbar_trim = Rectangle::from_loc_and_size(
-        (left_w + 6, 4),
-        ((w - left_w - 12).max(1), 6),
-    );
-
+    let topbar_trim = Rectangle::from_loc_and_size((left_w + 6, 4), ((w - left_w - 12).max(1), 6));
 
     let topbar_light = Some(Rectangle::from_loc_and_size(
-        (topbar_inner.loc.x + 6, topbar_inner.loc.y + topbar_inner.size.h - 5),
+        (
+            topbar_inner.loc.x + 6,
+            topbar_inner.loc.y + topbar_inner.size.h - 5,
+        ),
         ((topbar_inner.size.w - 12).max(1), 3),
     ));
 
@@ -288,8 +287,8 @@ pub fn build_chrome_layout(
     let sidebar_inner = inset_rect(sidebar_outer, 4);
 
     //let mut slot_outer_rects = Vec::new();
-   // let mut slot_inner_rects = Vec::new();
-   // let mut slot_icon_wells = Vec::new();
+    // let mut slot_inner_rects = Vec::new();
+    // let mut slot_icon_wells = Vec::new();
 
     let module_h = 48;
     let module_gap = 8;

@@ -1,3 +1,3 @@
 pub mod types;
 
-pub use types::{OutputId, WindowId, WorkspaceId, WidgetId, TextureId};
+pub use types::{OutputId, TextureId, WidgetId, WindowId, WorkspaceId};

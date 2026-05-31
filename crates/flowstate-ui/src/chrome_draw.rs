@@ -11,8 +11,8 @@ use crate::chrome::ChromeMetrics;
 use crate::chrome_layout::ChromeLayoutLogical;
 use crate::chrome_shaders::ChromeShaders;
 use crate::chrome_theme::{
-    chrome_theme_from_flow_theme, BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle,
-    TopBarStyle,
+    BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle, TopBarStyle,
+    chrome_theme_from_flow_theme,
 };
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiElementKind;
@@ -41,7 +41,10 @@ pub fn draw_chrome_below_work_wallpaper(
         .recessed_button
         .as_ref()
         .expect("button shader not compiled");
-    let top_bar = shaders.top_bar.as_ref().expect("top bar shader not compiled");
+    let top_bar = shaders
+        .top_bar
+        .as_ref()
+        .expect("top bar shader not compiled");
 
     let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
         Point::<i32, Physical>::from((0, 0)),
@@ -380,10 +383,8 @@ fn draw_active_lightbar(
     let Some(program) = shaders.amber_lightbar.as_ref() else {
         return;
     };
-    let bar_rect = Rectangle::from_loc_and_size(
-        layout.topbar.outer.loc,
-        (layout.topbar.outer.size.w, 10),
-    );
+    let bar_rect =
+        Rectangle::from_loc_and_size(layout.topbar.outer.loc, (layout.topbar.outer.size.w, 10));
     let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
         Point::<i32, Physical>::from((0, 0)),
         Size::<i32, Physical>::from(frame_ctx.output_size),
@@ -407,12 +408,7 @@ fn themed_icon_style(theme: &FlowTheme, state: UiVisualState) -> UiVisualStyle {
             theme.icons.active[3],
             theme.press_scale,
         ),
-        UiVisualState::Selected => (
-            theme.icons.active,
-            0.28,
-            theme.icons.active[3],
-            1.02,
-        ),
+        UiVisualState::Selected => (theme.icons.active, 0.28, theme.icons.active[3], 1.02),
         UiVisualState::Disabled => (theme.icons.disabled, 0.0, theme.icons.disabled[3], 1.0),
     };
     UiVisualStyle {
@@ -493,7 +489,10 @@ pub fn draw_top_bar(
         Some(damage),
         1.0,
         &[
-            Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
+            Uniform::new(
+                "u_size",
+                [rect_physical.size.w as f32, rect_physical.size.h as f32],
+            ),
             Uniform::new("u_radius", style.radius),
             Uniform::new("u_softness", style.softness),
             Uniform::new("u_bevel", style.bevel),
@@ -530,7 +529,10 @@ pub fn draw_recessed_button(
         Some(damage),
         1.0,
         &[
-            Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
+            Uniform::new(
+                "u_size",
+                [rect_physical.size.w as f32, rect_physical.size.h as f32],
+            ),
             Uniform::new("u_bevel", style.bevel),
             Uniform::new("u_softness", style.softness),
             Uniform::new("u_inner_shadow", style.inner_shadow),
@@ -570,7 +572,10 @@ pub fn draw_workarea_glass(
         Some(damage),
         1.0,
         &[
-            Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
+            Uniform::new(
+                "u_size",
+                [rect_physical.size.w as f32, rect_physical.size.h as f32],
+            ),
             Uniform::new("u_opacity", style.opacity),
             Uniform::new("u_edge_width", style.edge_width),
             Uniform::new("u_edge_brightness", style.edge_brightness),

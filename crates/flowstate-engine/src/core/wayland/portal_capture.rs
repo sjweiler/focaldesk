@@ -5,8 +5,8 @@ use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::utils::Transform;
 use smithay::wayland::image_capture_source::{
-    ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState, OutputCaptureSourceHandler,
-    OutputCaptureSourceState,
+    ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState,
+    OutputCaptureSourceHandler, OutputCaptureSourceState,
 };
 use smithay::wayland::image_copy_capture::{
     BufferConstraints, Frame, ImageCopyCaptureHandler, ImageCopyCaptureState, Session, SessionRef,
@@ -39,20 +39,14 @@ impl ImageCopyCaptureHandler for DesktopState {
         &mut self.image_copy_capture_state
     }
 
-    fn capture_constraints(
-        &mut self,
-        source: &ImageCaptureSource,
-    ) -> Option<BufferConstraints> {
+    fn capture_constraints(&mut self, source: &ImageCaptureSource) -> Option<BufferConstraints> {
         use smithay::output::WeakOutput;
         let weak_output = source.user_data().get::<WeakOutput>()?;
         let output = weak_output.upgrade()?;
         let mode = output.current_mode()?;
 
         Some(BufferConstraints {
-            size: mode
-                .size
-                .to_logical(1)
-                .to_buffer(1, Transform::Normal),
+            size: mode.size.to_logical(1).to_buffer(1, Transform::Normal),
             shm: vec![
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,

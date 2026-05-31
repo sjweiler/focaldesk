@@ -25,11 +25,10 @@ where
         &mut self,
         request: PermissionRequest,
     ) -> Result<Option<GrantToken>, crate::error::PermissionError> {
-        if let Some(existing) = self.store.get(
-            &request.app.identity,
-            request.resource,
-            &request.target,
-        ) {
+        if let Some(existing) =
+            self.store
+                .get(&request.app.identity, request.resource, &request.target)
+        {
             return self.resolve_existing_rule(request, existing);
         }
 
@@ -78,10 +77,7 @@ where
         }
     }
 
-    fn issue_session_grant(
-        &mut self,
-        request: PermissionRequest,
-    ) -> GrantToken {
+    fn issue_session_grant(&mut self, request: PermissionRequest) -> GrantToken {
         let token = GrantToken(format!(
             "{}-{}",
             std::process::id(),

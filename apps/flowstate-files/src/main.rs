@@ -2,12 +2,10 @@ use adw::prelude::*;
 use gtk::gio;
 use gtk::glib;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -107,6 +105,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scroller.set_vexpand(true);
     scroller.set_child(Some(&list));
 
     let status = gtk::Label::new(None);
@@ -601,115 +600,71 @@ fn open_file(path: &Path) -> Result<(), glib::Error> {
         });
     }
 
+    let force_x11 = path
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
     let uri = gio::File::for_path(path).uri();
     if let Some(display) = gtk::gdk::Display::default() {
         let context = display.app_launch_context();
-        apply_launch_environment(&context);
+        apply_launch_environment(&context, force_x11);
         gio::AppInfo::launch_default_for_uri(&uri, Some(&context))
     } else {
         let context = gio::AppLaunchContext::new();
-        apply_launch_environment(&context);
+        apply_launch_environment(&context, force_x11);
         gio::AppInfo::launch_default_for_uri(&uri, Some(&context))
     }
 }
 
 fn launch_desktop_entry(path: &Path) -> io::Result<()> {
-    let entry = DesktopEntry::read(path)?;
-    log_launch(&format!("launch desktop entry {}", path.display()));
-    if entry.entry_type.as_deref() != Some("Application") {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "desktop entry is not an application",
-        ));
-    }
-
-    let exec = entry.exec.as_deref().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, "desktop entry has no Exec line")
+    let path_str = path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "desktop path is not valid UTF-8",
+        )
     })?;
-    let command_line = strip_desktop_field_codes(exec);
 
-    if let Some(windows_target) = wine_target_from_exec(&command_line, entry.path.as_deref()) {
-        if let Some(mut command) = lutris_command_for_prefix(entry.path.as_deref()) {
-            log_launch(&format!(
-                "launching Windows desktop entry through Lutris fallback: {command:?}"
-            ));
-            command.spawn()?;
-            return Ok(());
-        }
+    log_launch(&format!("launch desktop entry {}", path.display()));
+    log_launch_environment();
 
-        let mut command = Command::new("wine");
-        command.arg("start").arg("/unix").arg(&windows_target);
-        if let Some(working_dir) = entry.path.as_deref() {
-            command.current_dir(working_dir);
-        }
-        if let Some(prefix) = wine_prefix_from_path(entry.path.as_deref()) {
-            command.env("WINEPREFIX", prefix);
-        }
-        log_launch(&format!(
-            "launching Windows desktop entry target {}: {command:?}",
-            windows_target.display()
-        ));
-        command.spawn()?;
-        return Ok(());
+    let app_info = gio::DesktopAppInfo::from_filename(path_str).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "failed to parse desktop entry")
+    })?;
+
+    let force_x11 = desktop_entry_targets_exe(&app_info);
+    let context = gio::AppLaunchContext::new();
+    apply_launch_environment(&context, force_x11);
+    if force_x11 {
+        log_launch("unset WAYLAND_DISPLAY for .exe desktop entry (XWayland-only launch)");
     }
 
-    let mut command = Command::new("sh");
-    command.arg("-c").arg(format!("exec {command_line}"));
-    if let Some(working_dir) = entry.path.as_deref() {
-        command.current_dir(working_dir);
-    }
+    app_info.launch(&[], Some(&context)).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("desktop entry launch failed: {err}"),
+        )
+    })?;
+
     log_launch(&format!(
-        "launching desktop Exec through shell: {command:?}"
+        "desktop entry launched via GIO: {}",
+        app_info.name()
     ));
-    command.spawn()?;
     Ok(())
 }
 
-#[derive(Debug, Default)]
-struct DesktopEntry {
-    entry_type: Option<String>,
-    exec: Option<String>,
-    path: Option<PathBuf>,
-}
+const LAUNCH_ENV_KEYS: &[&str] = &[
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
 
-impl DesktopEntry {
-    fn read(path: &Path) -> io::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let mut values = HashMap::new();
-        let mut in_entry = false;
-
-        for raw_line in content.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                in_entry = line == "[Desktop Entry]";
-                continue;
-            }
-            if !in_entry {
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                values.insert(key.to_string(), value.to_string());
-            }
+/// When `force_x11` is true, omit `WAYLAND_DISPLAY` so Wine/Proton uses XWayland via `DISPLAY`.
+fn apply_launch_environment(context: &impl IsA<gio::AppLaunchContext>, force_x11: bool) {
+    for key in LAUNCH_ENV_KEYS {
+        if force_x11 && *key == "WAYLAND_DISPLAY" {
+            context.unsetenv(key);
+            continue;
         }
-
-        Ok(Self {
-            entry_type: values.remove("Type"),
-            exec: values.remove("Exec"),
-            path: values.remove("Path").map(PathBuf::from),
-        })
-    }
-}
-
-fn apply_launch_environment(context: &impl IsA<gio::AppLaunchContext>) {
-    for key in [
-        "WAYLAND_DISPLAY",
-        "DISPLAY",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
         if let Some(value) = std::env::var_os(key) {
             context.setenv(key, value);
         } else {
@@ -718,117 +673,16 @@ fn apply_launch_environment(context: &impl IsA<gio::AppLaunchContext>) {
     }
 }
 
-fn strip_desktop_field_codes(exec: &str) -> String {
-    let mut output = String::with_capacity(exec.len());
-    let mut chars = exec.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '%' {
-            match chars.peek().copied() {
-                Some('%') => {
-                    output.push('%');
-                    chars.next();
-                }
-                Some(code) if "fFuUdDnNickvm".contains(code) => {
-                    chars.next();
-                }
-                _ => output.push(ch),
-            }
-        } else {
-            output.push(ch);
+fn desktop_entry_targets_exe(app_info: &gio::DesktopAppInfo) -> bool {
+    if let Some(exec) = app_info.string("Exec") {
+        if exec.to_ascii_lowercase().contains(".exe") {
+            return true;
         }
     }
-
-    output.trim().to_string()
-}
-
-fn wine_target_from_exec(exec: &str, working_dir: Option<&Path>) -> Option<PathBuf> {
-    let windows_path = unescape_desktop_value(exec);
-    if !looks_like_windows_path(&windows_path) {
-        return None;
-    }
-
-    let prefix = wine_prefix_from_path(working_dir)?;
-    windows_path_to_unix(&prefix, &windows_path)
-}
-
-fn wine_prefix_from_path(path: Option<&Path>) -> Option<PathBuf> {
-    let path = path?;
-    let text = path.to_string_lossy();
-    let (prefix, _) = text.split_once("/dosdevices/")?;
-    Some(PathBuf::from(prefix))
-}
-
-fn windows_path_to_unix(prefix: &Path, path: &str) -> Option<PathBuf> {
-    let mut chars = path.chars();
-    let drive = chars.next()?.to_ascii_lowercase();
-    if chars.next()? != ':' {
-        return None;
-    }
-
-    let rest = chars
-        .as_str()
-        .trim_start_matches(['\\', '/'])
-        .replace('\\', "/");
-    Some(
-        prefix
-            .join("dosdevices")
-            .join(format!("{drive}:"))
-            .join(rest),
-    )
-}
-
-fn lutris_command_for_prefix(path: Option<&Path>) -> Option<Command> {
-    let prefix = wine_prefix_from_path(path)?;
-    let game_dir = prefix.parent()?;
-    let desktop_name = format!(
-        "net.lutris.{}-1.desktop",
-        game_dir.file_name()?.to_string_lossy()
-    );
-
-    for desktop_path in [
-        dirs::home_dir()?
-            .join(".local/share/applications")
-            .join(&desktop_name),
-        dirs::home_dir()?.join("Desktop").join(&desktop_name),
-    ] {
-        let Ok(entry) = DesktopEntry::read(&desktop_path) else {
-            continue;
-        };
-        let Some(exec) = entry.exec.as_deref() else {
-            continue;
-        };
-        let command_line = strip_desktop_field_codes(exec);
-        if command_line.contains("lutris:rungameid/") {
-            let mut command = Command::new("sh");
-            command.arg("-c").arg(format!("exec {command_line}"));
-            return Some(command);
-        }
-    }
-
-    None
-}
-
-fn looks_like_windows_path(path: &str) -> bool {
-    let mut chars = path.chars();
-    chars.next().is_some_and(|ch| ch.is_ascii_alphabetic()) && chars.next() == Some(':')
-}
-
-fn unescape_desktop_value(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut chars = value.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.next() {
-                output.push(next);
-            }
-        } else {
-            output.push(ch);
-        }
-    }
-
-    output
+    app_info
+        .commandline()
+        .and_then(|path| path.to_str().map(str::to_ascii_lowercase))
+        .is_some_and(|cmd| cmd.contains(".exe"))
 }
 
 fn log_launch(msg: &str) {
@@ -838,6 +692,13 @@ fn log_launch(msg: &str) {
         .open("/tmp/flowstate-files.log")
     {
         let _ = writeln!(file, "{msg}");
+    }
+}
+
+fn log_launch_environment() {
+    for key in LAUNCH_ENV_KEYS {
+        let value = std::env::var(key).unwrap_or_else(|_| "<unset>".to_string());
+        log_launch(&format!("launch env {key}={value}"));
     }
 }
 

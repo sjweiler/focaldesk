@@ -1,6 +1,5 @@
-
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 use tokio::sync::watch;
 
 use crate::backend::NetworkBackend;
@@ -32,4 +31,3 @@ impl NetworkService {
         self.backend.name()
     }
 }
- 

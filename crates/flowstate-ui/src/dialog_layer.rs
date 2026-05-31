@@ -2,17 +2,16 @@ use flowstate_themes::FlowTheme;
 use smithay::backend::renderer::gles::GlesFrame;
 use smithay::utils::{Logical, Physical, Point, Rectangle};
 
+use crate::chrome_shaders::ChromeShaders;
+use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::{Dialog, DialogId};
 use crate::dialog_layout::layout_dialog;
 use crate::dialog_render::draw_dialog;
-use crate::desktop_frame::DesktopFrameCtx;
-use crate::uicomponent::UiHit;
-use crate::chrome_shaders::ChromeShaders;
-use crate::uicomponent::UiComponent;
 use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
+use crate::uicomponent::UiComponent;
+use crate::uicomponent::UiHit;
 use smithay::backend::renderer::gles::GlesError;
-
 
 pub struct DialogLayer {
     pub dialogs: Vec<Dialog>,
@@ -81,7 +80,7 @@ impl DialogLayer {
 
 impl UiComponent for DialogLayer {
     fn layout(&mut self, ctx: &LayoutCtx) {
-            for dialog in &mut self.dialogs {
+        for dialog in &mut self.dialogs {
             let laid_out = layout_dialog(dialog, ctx.screen);
             dialog.bounds = laid_out.bounds;
         }
@@ -95,7 +94,7 @@ impl UiComponent for DialogLayer {
         }
         None
     }
-    
+
     fn render(&self, ctx: &mut RenderCtx) -> Result<(), GlesError> {
         let Some(dialog_id) = ctx.active_dialog else {
             return Ok(());
@@ -120,6 +119,5 @@ impl UiComponent for DialogLayer {
             ctx.draw_on_this_output,
             ctx.theme,
         )
-    
     }
 }

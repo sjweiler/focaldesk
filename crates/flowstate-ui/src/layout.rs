@@ -1,5 +1,5 @@
-use smithay::utils::{Point, Rectangle, Size};
 use smithay::utils::Logical;
+use smithay::utils::{Point, Rectangle, Size};
 
 /// Layout configuration (tweakable, eventually from settings)
 #[derive(Debug, Clone)]
@@ -12,7 +12,7 @@ pub struct LayoutConfig {
     pub work_pad_t: i32,
     pub work_pad_r: i32,
     pub work_pad_b: i32,
-    
+
     // pip focus
     pub pip_l: i32,
     pub pip_t: i32,
@@ -45,7 +45,6 @@ pub struct LayoutSnapshot {
     pub side_bar: Rectangle<i32, Logical>,
     pub work_area: Rectangle<i32, Logical>,
     pub pip_focus: Rectangle<i32, Logical>,
-    
 }
 
 impl LayoutSnapshot {
@@ -117,7 +116,7 @@ impl LayoutEngine {
         let py = top_bar_h;
         let pw = (out_w - side_bar_w).max(1);
         let ph = (out_h - top_bar_h).max(1);
-        
+
         let pip_focus = Rectangle::new((px, py).into(), (pw, ph).into());
 
         LayoutSnapshot {
@@ -129,5 +128,3 @@ impl LayoutEngine {
         }
     }
 }
-
-

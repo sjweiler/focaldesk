@@ -49,5 +49,3 @@ pub fn visual_style(state: UiVisualState) -> UiVisualStyle {
         },
     }
 }
-
-

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-use flowstate_types::WindowId;
 use crate::core::shell::ManagedWindow;
+use flowstate_types::WindowId;
 
 #[derive(Default)]
 pub struct WindowStore {
@@ -57,5 +57,3 @@ impl WindowStore {
         self.stacking.iter().filter_map(|id| self.by_id.get(id))
     }
 }
-
-

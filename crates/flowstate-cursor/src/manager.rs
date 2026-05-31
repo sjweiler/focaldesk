@@ -1,7 +1,7 @@
-use anyhow::Result;
 use crate::assets::{CursorAssets, CursorImage};
 use crate::cursor::{CursorIcon as FlowCursorIcon, CursorState};
 use crate::hardware::CursorPlaneState;
+use anyhow::Result;
 use smithay::input::pointer::CursorIcon;
 
 /// Compositor-facing cursor: theme bitmaps plus whether the KMS / backend cursor plane is in use.

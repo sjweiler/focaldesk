@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::watch;
-use zbus::{proxy, Connection};
+use zbus::{Connection, proxy};
 
 use crate::backend::NetworkBackend;
 use crate::model::{Connectivity, NetTransport, NetworkState};
@@ -90,4 +90,3 @@ impl NetworkBackend for NetworkManagerBackend {
         "networkmanager"
     }
 }
-

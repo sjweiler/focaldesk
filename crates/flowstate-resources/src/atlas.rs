@@ -1,16 +1,15 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
+use image::RgbaImage;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesTexture};
 use smithay::backend::renderer::{ImportMem, Renderer, RendererSuper};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
-use image::RgbaImage;
 
-
+use crate::svg::rasterize_svg;
 use smithay::backend::renderer::Texture;
 use smithay::backend::renderer::gles::GlesFrame;
-use crate::svg::rasterize_svg;   
 
 #[derive(Clone, Copy, Debug)]
 pub struct AtlasRect {
@@ -60,17 +59,17 @@ pub enum IconId {
     PowerMenu,
     HDR,
     DiagonalResize,
-    CrossHair, 
-    OppositeDiagonalResize, 
-    Grabbing, 
-    OpenHand, 
-    NormalPointer, 
-    ActivePointer, 
-    NotAllowed, 
-    HorizontalResize, 
-    VerticslResize, 
-    Busy, 
-    Xterm, 
+    CrossHair,
+    OppositeDiagonalResize,
+    Grabbing,
+    OpenHand,
+    NormalPointer,
+    ActivePointer,
+    NotAllowed,
+    HorizontalResize,
+    VerticslResize,
+    Busy,
+    Xterm,
 }
 
 #[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
@@ -86,11 +85,7 @@ pub struct IconAtlas {
     pub height: u32,
 }
 
-const STATES: [IconState; 3] = [
-    IconState::Inactive,
-    IconState::Hover,
-    IconState::Active,
-];
+const STATES: [IconState; 3] = [IconState::Inactive, IconState::Hover, IconState::Active];
 
 fn icon_color(icon: IconId, state: IconState) -> &'static str {
     match (icon, state) {
@@ -139,7 +134,6 @@ fn blit_rgba(
         dst_slice.copy_from_slice(src_slice);
     }
 
-
     Ok(())
 }
 
@@ -149,45 +143,26 @@ impl IconAtlas {
     }
 }
 
-
 pub fn render_atlas_icon(
-    frame: &mut impl smithay::backend::renderer::Frame<
-        TextureId = GlesTexture,
-        Error = GlesError,
-    >,
+    frame: &mut impl smithay::backend::renderer::Frame<TextureId = GlesTexture, Error = GlesError>,
     atlas: &GlesTexture,
     entry: AtlasRect,
     x: i32,
     y: i32,
     w: i32,
-    h: i32,    
+    h: i32,
 ) -> Result<(), GlesError> {
-let size = atlas.size();
-let atlas_w = size.w as f64;
-let atlas_h = size.h as f64;
+    let size = atlas.size();
+    let atlas_w = size.w as f64;
+    let atlas_h = size.h as f64;
     let src = Rectangle::<f64, Buffer>::from_loc_and_size(
-        (
-            entry.x as f64,
-            entry.y as f64,
-        ),
-        (
-            entry.w as f64,
-            entry.h as f64,
-        ),
+        (entry.x as f64, entry.y as f64),
+        (entry.w as f64, entry.h as f64),
     );
 
-
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
-    let full =  Rectangle::<i32, Physical>::from_loc_and_size((0,0),(2560,1440));
-    frame.render_texture_from_to(
-        atlas,
-        src,
-        dst,
-        &[full],
-        &[],
-        Transform::Normal,
-        1.0,
-    )
+    let full = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), (2560, 1440));
+    frame.render_texture_from_to(atlas, src, dst, &[full], &[], Transform::Normal, 1.0)
 }
 
 /*
@@ -212,13 +187,13 @@ let src = Rectangle::<f64, Buffer>::from_loc_and_size(
 
 
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
-   
+
 
 eprintln!(
         "render_atlas_icon: src=({}, {}) {}x{}, dst=({}, {}) {}x{}",
         entry.x, entry.y, entry.w, entry.h, x, y, w, h
     );
-   
+
     frame.render_texture_from_to(
         atlas,
         src,
@@ -238,50 +213,161 @@ where
     const ATLAS_W: u32 = 1024;
     const ATLAS_H: u32 = 1024;
     const CELL: u32 = 64;
-    const ICON:u32 = 48;
+    const ICON: u32 = 48;
     const PAD: u32 = 8;
 
     let mut atlas_rgba = vec![0u8; (ATLAS_W * ATLAS_H * 4) as usize];
 
     let all_icons: &[(IconId, &[u8])] = &[
-        (IconId::Launcher, include_bytes!("../../../assets/svg/launcher.svg")),
-        (IconId::Overflow, include_bytes!("../../../assets/svg/overflow.svg")),
-        (IconId::Settings, include_bytes!("../../../assets/svg/settings.svg")),
-        (IconId::Battery, include_bytes!("../../../assets/svg/battery.svg")),
-        (IconId::LinePower, include_bytes!("../../../assets/svg/plug.svg")),
-        (IconId::FocusPip, include_bytes!("../../../assets/svg/focus_pip.svg")),
-        (IconId::Ethernet, include_bytes!("../../../assets/svg/ethernet.svg")),
-        (IconId::EthernetOff, include_bytes!("../../../assets/svg/ethernet-disabled.svg")),
+        (
+            IconId::Launcher,
+            include_bytes!("../../../assets/svg/launcher.svg"),
+        ),
+        (
+            IconId::Overflow,
+            include_bytes!("../../../assets/svg/overflow.svg"),
+        ),
+        (
+            IconId::Settings,
+            include_bytes!("../../../assets/svg/settings.svg"),
+        ),
+        (
+            IconId::Battery,
+            include_bytes!("../../../assets/svg/battery.svg"),
+        ),
+        (
+            IconId::LinePower,
+            include_bytes!("../../../assets/svg/plug.svg"),
+        ),
+        (
+            IconId::FocusPip,
+            include_bytes!("../../../assets/svg/focus_pip.svg"),
+        ),
+        (
+            IconId::Ethernet,
+            include_bytes!("../../../assets/svg/ethernet.svg"),
+        ),
+        (
+            IconId::EthernetOff,
+            include_bytes!("../../../assets/svg/ethernet-disabled.svg"),
+        ),
         (IconId::Wifi, include_bytes!("../../../assets/svg/wifi.svg")),
-        (IconId::WifiOff, include_bytes!("../../../assets/svg/wifi-off.svg")),
-        (IconId::Bluetooth, include_bytes!("../../../assets/svg/bluetooth.svg")),
-        (IconId::BluetoothOff, include_bytes!("../../../assets/svg/bluetooth-off.svg")),
-        (IconId::AssignToSlot, include_bytes!("../../../assets/svg/assign-to-slot.svg")),
-        (IconId::Slot(1), include_bytes!("../../../assets/svg/slot-1.svg")),
-        (IconId::Slot(2), include_bytes!("../../../assets/svg/slot-2.svg")),
-        (IconId::Slot(3), include_bytes!("../../../assets/svg/slot-3.svg")),
-        (IconId::Slot(4), include_bytes!("../../../assets/svg/slot-4.svg")),
-        (IconId::Slot(5), include_bytes!("../../../assets/svg/slot-5.svg")),
-        (IconId::Slot(6), include_bytes!("../../../assets/svg/slot-6.svg")),
-        (IconId::Slot(7), include_bytes!("../../../assets/svg/slot-7.svg")),
-        (IconId::Slot(8), include_bytes!("../../../assets/svg/slot-8.svg")),
-        (IconId::Slot(9), include_bytes!("../../../assets/svg/slot-9.svg")),
-        (IconId::Microphone, include_bytes!("../../../assets/svg/microphone.svg")),
-        (IconId::MicrophoneOff, include_bytes!("../../../assets/svg/microphone-off.svg")),
-        (IconId::FlowStateLabel, include_bytes!("../../../assets/svg/flowstate-logo.svg")),
-        (IconId::HDR, include_bytes!("../../../assets/svg/hdr-enabled.svg")),
-        (IconId::DiagonalResize, include_bytes!("../../../assets/cursor/bd_double_arrow.png")),
-        (IconId::CrossHair, include_bytes!("../../../assets/cursor/crosshair.png")),
-        (IconId::OppositeDiagonalResize, include_bytes!("../../../assets/cursor/fd_double_arrow.png")),
-        (IconId::Grabbing, include_bytes!("../../../assets/cursor/grabbing.png")),
-        (IconId::OpenHand, include_bytes!("../../../assets/cursor/hand1.png")),
-        (IconId::NormalPointer, include_bytes!("../../../assets/cursor/left_ptr.png")),
-        (IconId::ActivePointer, include_bytes!("../../../assets/cursor/left_ptr_active.png")),
-        (IconId::NotAllowed, include_bytes!("../../../assets/cursor/not-allowed.png")),
-        (IconId::HorizontalResize, include_bytes!("../../../assets/cursor/sb_h_double_arrow.png")),
-        (IconId::VerticslResize, include_bytes!("../../../assets/cursor/sb_v_double_arrow.png")),
-        (IconId::Busy, include_bytes!("../../../assets/cursor/watch.png")),
-        (IconId::Xterm, include_bytes!("../../../assets/cursor/xterm.png")),
+        (
+            IconId::WifiOff,
+            include_bytes!("../../../assets/svg/wifi-off.svg"),
+        ),
+        (
+            IconId::Bluetooth,
+            include_bytes!("../../../assets/svg/bluetooth.svg"),
+        ),
+        (
+            IconId::BluetoothOff,
+            include_bytes!("../../../assets/svg/bluetooth-off.svg"),
+        ),
+        (
+            IconId::AssignToSlot,
+            include_bytes!("../../../assets/svg/assign-to-slot.svg"),
+        ),
+        (
+            IconId::Slot(1),
+            include_bytes!("../../../assets/svg/slot-1.svg"),
+        ),
+        (
+            IconId::Slot(2),
+            include_bytes!("../../../assets/svg/slot-2.svg"),
+        ),
+        (
+            IconId::Slot(3),
+            include_bytes!("../../../assets/svg/slot-3.svg"),
+        ),
+        (
+            IconId::Slot(4),
+            include_bytes!("../../../assets/svg/slot-4.svg"),
+        ),
+        (
+            IconId::Slot(5),
+            include_bytes!("../../../assets/svg/slot-5.svg"),
+        ),
+        (
+            IconId::Slot(6),
+            include_bytes!("../../../assets/svg/slot-6.svg"),
+        ),
+        (
+            IconId::Slot(7),
+            include_bytes!("../../../assets/svg/slot-7.svg"),
+        ),
+        (
+            IconId::Slot(8),
+            include_bytes!("../../../assets/svg/slot-8.svg"),
+        ),
+        (
+            IconId::Slot(9),
+            include_bytes!("../../../assets/svg/slot-9.svg"),
+        ),
+        (
+            IconId::Microphone,
+            include_bytes!("../../../assets/svg/microphone.svg"),
+        ),
+        (
+            IconId::MicrophoneOff,
+            include_bytes!("../../../assets/svg/microphone-off.svg"),
+        ),
+        (
+            IconId::FlowStateLabel,
+            include_bytes!("../../../assets/svg/flowstate-logo.svg"),
+        ),
+        (
+            IconId::HDR,
+            include_bytes!("../../../assets/svg/hdr-enabled.svg"),
+        ),
+        (
+            IconId::DiagonalResize,
+            include_bytes!("../../../assets/cursor/bd_double_arrow.png"),
+        ),
+        (
+            IconId::CrossHair,
+            include_bytes!("../../../assets/cursor/crosshair.png"),
+        ),
+        (
+            IconId::OppositeDiagonalResize,
+            include_bytes!("../../../assets/cursor/fd_double_arrow.png"),
+        ),
+        (
+            IconId::Grabbing,
+            include_bytes!("../../../assets/cursor/grabbing.png"),
+        ),
+        (
+            IconId::OpenHand,
+            include_bytes!("../../../assets/cursor/hand1.png"),
+        ),
+        (
+            IconId::NormalPointer,
+            include_bytes!("../../../assets/cursor/left_ptr.png"),
+        ),
+        (
+            IconId::ActivePointer,
+            include_bytes!("../../../assets/cursor/left_ptr_active.png"),
+        ),
+        (
+            IconId::NotAllowed,
+            include_bytes!("../../../assets/cursor/not-allowed.png"),
+        ),
+        (
+            IconId::HorizontalResize,
+            include_bytes!("../../../assets/cursor/sb_h_double_arrow.png"),
+        ),
+        (
+            IconId::VerticslResize,
+            include_bytes!("../../../assets/cursor/sb_v_double_arrow.png"),
+        ),
+        (
+            IconId::Busy,
+            include_bytes!("../../../assets/cursor/watch.png"),
+        ),
+        (
+            IconId::Xterm,
+            include_bytes!("../../../assets/cursor/xterm.png"),
+        ),
     ];
 
     let mut rects = HashMap::new();
@@ -302,7 +388,7 @@ where
             if y + CELL > ATLAS_H {
                 return Err(anyhow!("icon atlas overflow: atlas too small"));
             }
-            
+
             blit_rgba(
                 &mut atlas_rgba,
                 ATLAS_W,
@@ -315,7 +401,12 @@ where
             )?;
             rects.insert(
                 AtlasIcon { id: icon_id, state },
-                AtlasRect { x: x+PAD, y: y+PAD, w: ICON, h: ICON },
+                AtlasRect {
+                    x: x + PAD,
+                    y: y + PAD,
+                    w: ICON,
+                    h: ICON,
+                },
             );
 
             cell_index += 1;
@@ -332,8 +423,6 @@ where
     }
 
     let mut atlas_upload = atlas_rgba.clone();
-
-
 
     let tex = renderer
         .import_memory(

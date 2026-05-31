@@ -1,16 +1,16 @@
+use flowstate_types::OutputId;
 use indexmap::IndexMap;
-use smithay::utils::{Rectangle, Physical, Scale};
-use flowstate_types::OutputId; // your custom OutputId
-//#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-//pub struct OutputId(pub u32);
-use std::collections::HashMap;
-use std::time::Instant;
-use std::time::Duration;
+use smithay::utils::{Physical, Rectangle, Scale}; // your custom OutputId
+                                                  //#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+                                                  //pub struct OutputId(pub u32);
 use crate::core::FrameCtx;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::utils::Transform;
-use wayland_server::DisplayHandle;
+use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
 use wayland_server::backend::GlobalId;
+use wayland_server::DisplayHandle;
 
 pub struct OutputState {
     pub active_output: OutputId,
@@ -24,84 +24,87 @@ pub struct OutputCtx {
     pub buffer_scale: i32,
 
     // user-configurable layout
-    pub logical_origin: (i32, i32),  // desktop space
+    pub logical_origin: (i32, i32), // desktop space
     pub logical_size: (i32, i32),
 
     pub enabled: bool,
     pub is_primary: bool,
 
     // user-configurable ordering override (optional)
-    pub ui_order: Option<i32>,       // if set, overrides positional sort
+    pub ui_order: Option<i32>, // if set, overrides positional sort
 
     pub last_damage: Vec<Rectangle<i32, Physical>>,
-    
+
     pub global: Option<GlobalId>,
 }
 
-
 impl OutputState {
-pub fn new_single_nested(size: (i32, i32), scale: f64) -> Self {
-    let id = OutputId(1);
-    let s = Scale::from(scale);
-    let buffer_scale = scale.round().max(1.0) as i32;
-    let physical_size = size;
-    let logical_size = (
-        (size.0 as f64 / scale).round() as i32,
-        (size.1 as f64 / scale).round() as i32,
-    );
+    pub fn new_single_nested(size: (i32, i32), scale: f64) -> Self {
+        let id = OutputId(1);
+        let s = Scale::from(scale);
+        let buffer_scale = scale.round().max(1.0) as i32;
+        let physical_size = size;
+        let logical_size = (
+            (size.0 as f64 / scale).round() as i32,
+            (size.1 as f64 / scale).round() as i32,
+        );
 
+        let output = Output::new(
+            "flowstate-nested".to_string(),
+            PhysicalProperties {
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+                make: "FlowState".into(),
+                model: "Winit".into(),
+                serial_number: "nested-0".into(),
+            },
+        );
 
-let output = Output::new(
-    "flowstate-nested".to_string(),
-    PhysicalProperties {
-        size: (0, 0).into(),
-        subpixel: Subpixel::Unknown,
-        make: "FlowState".into(),
-        model: "Winit".into(),
-        serial_number: "nested-0".into(),
-    },
-);
+        let mode = Mode {
+            size: size.into(),
+            refresh: 60_000,
+        };
 
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Normal),
+            Some(smithay::output::Scale::Integer(
+                scale.round().max(1.0) as i32
+            )),
+            Some((0, 0).into()),
+        );
 
+        output.set_preferred(mode.clone());
 
-let mode = Mode {
-    size: size.into(),
-    refresh: 60_000,
-};
+        let mut outputs = IndexMap::new();
+        outputs.insert(
+            id,
+            OutputCtx {
+                output: Some(output),
+                physical_size: size,
+                scale: s,
+                buffer_scale,
+                logical_origin: (0, 0),
+                logical_size,
+                enabled: true,
+                is_primary: true,
+                ui_order: None,
+                last_damage: Vec::new(),
+                global: None,
+            },
+        );
 
-output.change_current_state(
-    Some(mode),
-    Some(Transform::Normal),
-    Some(smithay::output::Scale::Integer(scale.round().max(1.0) as i32)),
-    Some((0, 0).into()),
-);
-
-output.set_preferred(mode.clone());
-
-
-
-    let mut outputs = IndexMap::new();
-    outputs.insert(
-        id,
-        OutputCtx {
-            output: Some(output),
-            physical_size: size,
-            scale: s,
-            buffer_scale,
-            logical_origin: (0, 0),
-            logical_size,
-            enabled: true,
-            is_primary: true,
-            ui_order: None,
-            last_damage: Vec::new(),
-            global: None,
-        },
-    
-    );
-
-    Self { active_output: id, outputs }
-}
-        pub fn ensure_nested_output(&mut self, output: Output, size: (i32, i32), scale: f64) -> OutputId {
+        Self {
+            active_output: id,
+            outputs,
+        }
+    }
+    pub fn ensure_nested_output(
+        &mut self,
+        output: Output,
+        size: (i32, i32),
+        scale: f64,
+    ) -> OutputId {
         // pick ONE id and stick with it
         let id = self.active_output; // or OutputId(1) if you want to keep that convention
         let id = if id.0 == 0 { OutputId(1) } else { id }; // optional; remove if you prefer OutputId(0)
@@ -151,11 +154,13 @@ output.set_preferred(mode.clone());
         self.active_output = id;
         id
     }
-    
 
     pub fn full_damage(&self, out_id: OutputId) -> Vec<Rectangle<i32, Physical>> {
         let o = &self.outputs[&out_id];
-        vec![Rectangle::from_loc_and_size((0, 0), (o.physical_size.0, o.physical_size.1))]
+        vec![Rectangle::from_loc_and_size(
+            (0, 0),
+            (o.physical_size.0, o.physical_size.1),
+        )]
     }
     pub fn new_single(output: Output, size: (i32, i32), scale: f64) -> Self {
         let id = OutputId(1);
@@ -199,7 +204,7 @@ output.set_preferred(mode.clone());
     pub fn iter_enabled_mut(&mut self) -> impl Iterator<Item = (&OutputId, &mut OutputCtx)> {
         self.outputs.iter_mut().filter(|(_, o)| o.enabled)
     }
-       pub fn build_frame_ctx<'a>(
+    pub fn build_frame_ctx<'a>(
         &'a self,
         out_id: OutputId,
         damage: &'a [Rectangle<i32, Physical>],
@@ -224,8 +229,7 @@ output.set_preferred(mode.clone());
             active_output: self.active_output,
             rendering_output: out_id,
         }
-    } 
-    
+    }
 }
 
 impl Default for OutputState {
@@ -235,5 +239,4 @@ impl Default for OutputState {
             outputs: IndexMap::new(),
         }
     }
-
 }

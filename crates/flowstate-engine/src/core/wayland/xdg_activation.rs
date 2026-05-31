@@ -1,9 +1,6 @@
 use smithay::delegate_xdg_activation;
 use smithay::wayland::xdg_activation::{
-    XdgActivationHandler,
-    XdgActivationState,
-    XdgActivationToken,
-    XdgActivationTokenData,
+    XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
 use wayland_server::protocol::wl_surface::WlSurface;
 

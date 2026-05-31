@@ -14,8 +14,9 @@ use flowstate_resources::RenderResources;
 use flowstate_types::OutputId;
 use flowstate_ui::chrome::{Chrome, ChromeMetrics};
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, ButtonState, InputEvent, KeyState, KeyboardKeyEvent,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, InputEvent,
+    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
+    PointerMotionEvent,
 };
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::output::{Output, PhysicalProperties, Subpixel};
@@ -24,6 +25,7 @@ use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, ListeningSocket};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -31,15 +33,15 @@ use smithay::wayland::shm::ShmState;
 
 use crate::core::desktop::{DesktopInit, DesktopState};
 use crate::core::input::{
-    FlowInputEvent, FlowKeyState, FlowModifiers, FlowMouseButton, FlowScrollDelta,
+    FlowInputEvent, FlowKeyState, FlowModifiers, FlowMouseButton, FlowScrollDelta, FlowScrollSource,
 };
 use crate::core::render::RenderState;
 use crate::core::ui_state::UiState;
 use crate::core::OutputState;
 use crate::core::SceneState;
 use flowstate_config::FlowStateConfig;
-use flowstate_settings_core::load_settings;
 use flowstate_flow::keybinds::BackendKind;
+use flowstate_settings_core::load_settings;
 use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
@@ -57,13 +59,28 @@ pub fn start_xwayland(
     handle: LoopHandle<'static, DesktopState>,
 ) -> anyhow::Result<()> {
     flog("XWAYLAND: preparing to launch XWayland server");
+    state.xwayland_loop_handle = Some(handle.clone());
+    let xwayland_env = std::env::vars().filter(|(key, _)| {
+        matches!(
+            key.as_str(),
+            "DRI_PRIME"
+                | "GBM_BACKEND"
+                | "LIBGL_DEBUG"
+                | "LIBGL_DRIVERS_PATH"
+                | "MESA_LOADER_DRIVER_OVERRIDE"
+                | "VK_ICD_FILENAMES"
+                | "__GLX_VENDOR_LIBRARY_NAME"
+                | "__NV_PRIME_RENDER_OFFLOAD"
+                | "__VK_LAYER_NV_optimus"
+        )
+    });
     let (xwayland, xwayland_client) = XWayland::spawn(
         display_handle,
         None,
-        std::iter::empty::<(String, String)>(),
+        xwayland_env,
         true,
-        Stdio::null(),
-        Stdio::null(),
+        Stdio::inherit(),
+        Stdio::inherit(),
         |_| (),
     )?;
     state.xwayland_client = Some(xwayland_client.clone());
@@ -88,18 +105,25 @@ pub fn start_xwayland(
                 "XWAYLAND READY: display={display} socket_fd={x11_socket:?}"
             ));
 
-            match X11Wm::start_wm(wm_handle.clone(), &wm_dh, x11_socket, xwayland_client.clone()) {
+            match X11Wm::start_wm(
+                wm_handle.clone(),
+                &wm_dh,
+                x11_socket,
+                xwayland_client.clone(),
+            ) {
                 Ok(wm) => {
                     data.xwm = Some(wm);
                     flog(&format!("XWayland WM attached on DISPLAY={display}"));
                 }
                 Err(err) => {
                     flog(&format!("failed to start XWayland WM: {err}"));
+                    data.disable_xwayland();
                 }
             }
         }
         XWaylandEvent::Error => {
             flog("XWayland failed to start");
+            data.disable_xwayland();
         }
     })?;
     Ok(())
@@ -109,15 +133,23 @@ pub fn start_xwayland(
 #[cfg(feature = "xwayland")]
 pub fn pump_xwayland_ready(
     event_loop: &mut EventLoop<DesktopState>,
+    display: &mut Display<DesktopState>,
     state: &mut DesktopState,
     timeout: Duration,
 ) -> anyhow::Result<bool> {
     let deadline = Instant::now() + timeout;
     while state.xwm.is_none() {
+        if state.xwayland_client.is_none() {
+            flog("XWayland client disconnected during startup");
+            return Ok(false);
+        }
         if Instant::now() >= deadline {
             flog("XWayland WM not ready before timeout");
             return Ok(false);
         }
+        // XWayland cannot finish startup until its Wayland client roundtrips with the compositor.
+        display.dispatch_clients(state)?;
+        display.handle().flush_clients()?;
         event_loop.dispatch(Some(Duration::ZERO), state)?;
     }
     Ok(true)
@@ -127,10 +159,11 @@ pub fn pump_xwayland_ready(
 #[cfg(feature = "xwayland")]
 pub fn finish_xwayland_startup(
     event_loop: &mut EventLoop<DesktopState>,
+    display: &mut Display<DesktopState>,
     state: &mut DesktopState,
     timeout: Duration,
 ) -> anyhow::Result<()> {
-    if pump_xwayland_ready(event_loop, state, timeout)? {
+    if pump_xwayland_ready(event_loop, display, state, timeout)? {
         flog("XWayland startup complete");
     } else {
         state.disable_xwayland();
@@ -204,16 +237,39 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
             })
         }
         InputEvent::PointerAxis { event, .. } => {
-            let delta = if event.source() == smithay::backend::input::AxisSource::Wheel {
-                FlowScrollDelta::Line {
-                    x: event.amount(Axis::Horizontal).unwrap_or(0.0) as f32,
-                    y: event.amount(Axis::Vertical).unwrap_or(0.0) as f32,
-                }
-            } else {
-                FlowScrollDelta::Pixel {
-                    x: event.amount(Axis::Horizontal).unwrap_or(0.0),
-                    y: event.amount(Axis::Vertical).unwrap_or(0.0),
-                }
+            let x_v120 = event
+                .amount_v120(Axis::Horizontal)
+                .map(|value| value as i32);
+            let y_v120 = event.amount_v120(Axis::Vertical).map(|value| value as i32);
+            let x = event.amount(Axis::Horizontal).unwrap_or_else(|| {
+                x_v120
+                    .map(|value| f64::from(value) * 15.0 / 120.0)
+                    .unwrap_or(0.0)
+            });
+            let y = event.amount(Axis::Vertical).unwrap_or_else(|| {
+                y_v120
+                    .map(|value| f64::from(value) * 15.0 / 120.0)
+                    .unwrap_or(0.0)
+            });
+            let is_finger = event.source() == AxisSource::Finger;
+            let source = match event.source() {
+                AxisSource::Finger => FlowScrollSource::Finger,
+                AxisSource::Continuous => FlowScrollSource::Continuous,
+                AxisSource::Wheel => FlowScrollSource::Wheel,
+                AxisSource::WheelTilt => FlowScrollSource::WheelTilt,
+            };
+            let delta = FlowScrollDelta::Axis {
+                x,
+                y,
+                x_v120,
+                y_v120,
+                source,
+                x_inverted: event.relative_direction(Axis::Horizontal)
+                    == AxisRelativeDirection::Inverted,
+                y_inverted: event.relative_direction(Axis::Vertical)
+                    == AxisRelativeDirection::Inverted,
+                stop_x: is_finger && event.amount(Axis::Horizontal) == Some(0.0),
+                stop_y: is_finger && event.amount(Axis::Vertical) == Some(0.0),
             };
 
             Some(FlowInputEvent::PointerScroll {
@@ -278,6 +334,7 @@ pub(crate) fn bootstrap_compositor_core(
 
     let compositor_state = CompositorState::new::<DesktopState>(&dh);
     let xdg_shell_state = XdgShellState::new::<DesktopState>(&dh);
+    let dmabuf_state = DmabufState::new();
     let shm_state = ShmState::new::<DesktopState>(&dh, vec![]);
     let output_manager_state = OutputManagerState::new_with_xdg_output::<DesktopState>(&dh);
     let data_device_state = DataDeviceState::new::<DesktopState>(&dh);
@@ -342,6 +399,7 @@ pub(crate) fn bootstrap_compositor_core(
         compositor_state,
         render,
         xdg_shell_state,
+        dmabuf_state,
         shm_state,
         seat_state,
         output_manager_state,

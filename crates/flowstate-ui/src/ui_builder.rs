@@ -28,7 +28,7 @@ pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
 
         let action = match i {
             0 => UiAction::OpenPanel(PanelKind::AppLauncher),
-            1 => UiAction::OpenPanel(PanelKind::Settings),
+            1 => UiAction::Custom(SIDEBAR_BASE + i as u32), //OpenPanel(PanelKind::Settings),
             2 => UiAction::Custom(SIDEBAR_BASE + i as u32),
             3 => UiAction::Custom(SIDEBAR_BASE + i as u32),
             4 => UiAction::Custom(SIDEBAR_BASE + 4),

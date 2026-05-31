@@ -4,24 +4,24 @@ use flowstate_themes::{FlowTheme, FlowThemeId};
 use flowstate_types::OutputId;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::backend::renderer::Texture;
+use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::utils::{Logical, Physical, Rectangle, Scale, Size};
 
 use crate::atlas::IconAtlas;
 use crate::chrome::ChromeMetrics;
 use crate::chrome_draw::{draw_chrome_below_work_wallpaper, draw_chrome_trim_glass_icons};
-use crate::chrome_layout::{build_chrome_layout, ChromeLayout};
+use crate::chrome_layout::{ChromeLayout, build_chrome_layout};
 use crate::chrome_shaders::ChromeShaders;
+use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::DialogId;
 use crate::dialog_layer::DialogLayer;
-use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_layer::EguiLayer;
 use crate::overlay::OverlayManager;
 use crate::sidebar::SideBar;
 use crate::topbar::TopBar;
-use crate::uicomponent::{LayoutCtx, UiComponent, UiHit};
 use crate::ui_builder::build_ui_for_output;
+use crate::uicomponent::{LayoutCtx, UiComponent, UiHit};
 use crate::uitree::UiTree;
 use crate::workarea::WorkArea;
 use smithay::utils::Point;
@@ -106,7 +106,10 @@ impl DesktopOutput {
             .layout_from_chrome(&self.chrome_layout, &layout_ctx);
     }
 
-    pub fn ensure_shaders(&mut self, renderer: &mut GlesRenderer) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+    pub fn ensure_shaders(
+        &mut self,
+        renderer: &mut GlesRenderer,
+    ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
         self.chrome_shaders.ensure_compiled(renderer)
     }
 
@@ -156,10 +159,7 @@ impl DesktopOutput {
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
         let c = theme.background.color;
-        frame.clear(
-            Color32F::new(c[0], c[1], c[2], c[3]),
-            damage,
-        )
+        frame.clear(Color32F::new(c[0], c[1], c[2], c[3]), damage)
     }
 
     fn render_wallpaper(
@@ -180,10 +180,8 @@ impl DesktopOutput {
         }
         use smithay::backend::renderer::gles::GlesTexProgram;
         use smithay::utils::Transform;
-        let src = smithay::utils::Rectangle::from_loc_and_size(
-            (0.0, 0.0),
-            (sz.w as f64, sz.h as f64),
-        );
+        let src =
+            smithay::utils::Rectangle::from_loc_and_size((0.0, 0.0), (sz.w as f64, sz.h as f64));
         let damage_local = [Rectangle::from_loc_and_size(
             (0, 0),
             (target_physical.size.w, target_physical.size.h),

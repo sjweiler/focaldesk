@@ -1,5 +1,5 @@
-use smithay::utils::{Point, Rectangle, Size};
 use smithay::utils::Logical;
+use smithay::utils::{Point, Rectangle, Size};
 
 /// Layout configuration (tweakable, eventually from settings)
 #[derive(Debug, Clone)]
@@ -12,7 +12,7 @@ pub struct LayoutConfig {
     pub work_pad_t: i32,
     pub work_pad_r: i32,
     pub work_pad_b: i32,
-    
+
     // pip focus
     pub pip_l: i32,
     pub pip_t: i32,
@@ -38,14 +38,13 @@ impl Default for LayoutConfig {
 }
 
 /// One computed layout snapshot for a given output size
-#[derive(Debug, Clone,Default)]
+#[derive(Debug, Clone, Default)]
 pub struct LayoutSnapshot {
     pub output: Rectangle<i32, Logical>,
     pub top_bar: Rectangle<i32, Logical>,
     pub side_bar: Rectangle<i32, Logical>,
     pub work_area: Rectangle<i32, Logical>,
     pub pip_focus: Rectangle<i32, Logical>,
-    
 }
 
 impl LayoutSnapshot {
@@ -58,11 +57,7 @@ impl LayoutSnapshot {
     pub fn client_size(&self) -> Size<i32, Logical> {
         self.work_area.size
     }
-        pub fn compute(
-        output: Rectangle<i32, Logical>,
-        top_bar_h: i32,
-        side_bar_w: i32,
-    ) -> Self {
+    pub fn compute(output: Rectangle<i32, Logical>, top_bar_h: i32, side_bar_w: i32) -> Self {
         let (ox, oy) = (output.loc.x, output.loc.y);
         let (ow, oh) = (output.size.w, output.size.h);
 
@@ -90,8 +85,6 @@ impl LayoutSnapshot {
         }
     }
 }
-
-
 
 /// Stateless pure layout engine.
 /// (You can make it store config and expose `compute()`.)
@@ -150,7 +143,7 @@ impl LayoutEngine {
         let mut py = top_bar_h;
         let mut pw = (out_w - side_bar_w).max(1);
         let mut ph = (out_h - top_bar_h).max(1);
-        
+
         let pip_focus = Rectangle::new((px, py).into(), (pw, ph).into());
 
         LayoutSnapshot {
@@ -162,5 +155,3 @@ impl LayoutEngine {
         }
     }
 }
-
-

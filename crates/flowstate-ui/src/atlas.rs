@@ -1,15 +1,14 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 
+use image::RgbaImage;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesTexture};
 use smithay::backend::renderer::{ImportMem, Renderer, RendererSuper};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
-use image::RgbaImage;
 
 use crate::svg::rasterize_svg;
 use smithay::backend::renderer::Texture;
-    
 
 #[derive(Clone, Copy, Debug)]
 pub struct AtlasRect {
@@ -61,17 +60,17 @@ pub enum IconId {
     Power,
     HDR,
     DiagonalResize,
-    CrossHair, 
-    OppositeDiagonalResize, 
-    Grabbing, 
-    OpenHand, 
-    NormalPointer, 
-    ActivePointer, 
-    NotAllowed, 
-    HorizontalResize, 
-    VerticslResize, 
-    Busy, 
-    Xterm, 
+    CrossHair,
+    OppositeDiagonalResize,
+    Grabbing,
+    OpenHand,
+    NormalPointer,
+    ActivePointer,
+    NotAllowed,
+    HorizontalResize,
+    VerticslResize,
+    Busy,
+    Xterm,
     Clock0,
     Clock1,
     Clock2,
@@ -86,9 +85,42 @@ pub enum IconId {
     ClockA,
     ClockP,
     ClockM,
-    A, B, C, D, E, F, G, H, I, J, K, L, M,
-    N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
-    Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
     Colon,
     Dash,
     Dot,
@@ -98,7 +130,7 @@ pub enum IconId {
     Terminal,
     Files,
     Plus,
-    Minus
+    Minus,
 }
 
 //#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
@@ -114,11 +146,7 @@ pub struct IconAtlas {
     pub height: u32,
 }
 
-const STATES: [IconState; 3] = [
-    IconState::Inactive,
-    IconState::Hover,
-    IconState::Active,
-];
+const STATES: [IconState; 3] = [IconState::Inactive, IconState::Hover, IconState::Active];
 
 fn icon_color(icon: IconId, state: IconState) -> &'static str {
     let is_text_glyph = matches!(
@@ -214,7 +242,6 @@ fn blit_rgba(
         dst_slice.copy_from_slice(src_slice);
     }
 
-
     Ok(())
 }
 
@@ -224,28 +251,21 @@ impl IconAtlas {
     }
 }
 
-
 pub fn render_atlas_icon(
-    frame: &mut impl smithay::backend::renderer::Frame<
-        TextureId = GlesTexture,
-        Error = GlesError,
-    >,
+    frame: &mut impl smithay::backend::renderer::Frame<TextureId = GlesTexture, Error = GlesError>,
     atlas: &GlesTexture,
     entry: AtlasRect,
     x: i32,
     y: i32,
     w: i32,
-    h: i32,    
+    h: i32,
     output_size: Size<i32, Physical>,
 ) -> Result<(), GlesError> {
     render_atlas_icon_with_alpha(frame, atlas, entry, x, y, w, h, output_size, 1.0)
 }
 
 pub fn render_atlas_icon_with_alpha(
-    frame: &mut impl smithay::backend::renderer::Frame<
-        TextureId = GlesTexture,
-        Error = GlesError,
-    >,
+    frame: &mut impl smithay::backend::renderer::Frame<TextureId = GlesTexture, Error = GlesError>,
     atlas: &GlesTexture,
     entry: AtlasRect,
     x: i32,
@@ -255,26 +275,17 @@ pub fn render_atlas_icon_with_alpha(
     output_size: Size<i32, Physical>,
     alpha: f32,
 ) -> Result<(), GlesError> {
-let size = atlas.size();
-let _atlas_w = size.w as f64;
-let _atlas_h = size.h as f64;
+    let size = atlas.size();
+    let _atlas_w = size.w as f64;
+    let _atlas_h = size.h as f64;
     let src = Rectangle::<f64, Buffer>::from_loc_and_size(
-        (
-            entry.x as f64,
-            entry.y as f64,
-        ),
-        (
-            entry.w as f64,
-            entry.h as f64,
-        ),
+        (entry.x as f64, entry.y as f64),
+        (entry.w as f64, entry.h as f64),
     );
 
-
-        
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
-    let full =  Rectangle::<i32, Physical>::from_loc_and_size((0,0), output_size);
-    
-    
+    let full = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_size);
+
     frame.render_texture_from_to(
         atlas,
         src,
@@ -308,13 +319,13 @@ let src = Rectangle::<f64, Buffer>::from_loc_and_size(
 
 
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
-   
+
 
 eprintln!(
         "render_atlas_icon: src=({}, {}) {}x{}, dst=({}, {}) {}x{}",
         entry.x, entry.y, entry.w, entry.h, x, y, w, h
     );
-   
+
     frame.render_texture_from_to(
         atlas,
         src,
@@ -350,102 +361,281 @@ where
     const ATLAS_W: u32 = 2048;
     const ATLAS_H: u32 = 2048;
     const CELL: u32 = 64;
-    const ICON:u32 = 48;
+    const ICON: u32 = 48;
     const PAD: u32 = 8;
 
     let mut atlas_rgba = vec![0u8; (ATLAS_W * ATLAS_H * 4) as usize];
 
     let all_icons: &[(IconId, &[u8])] = &[
-        (IconId::Launcher, include_bytes!("../../../assets/svg/launcher.svg")),
-        (IconId::Overflow, include_bytes!("../../../assets/svg/overflow.svg")),
-        (IconId::Settings, include_bytes!("../../../assets/svg/settings.svg")),
-        (IconId::Battery, include_bytes!("../../../assets/svg/battery.svg")),
-        (IconId::LinePower, include_bytes!("../../../assets/svg/plug.svg")),
-        (IconId::FocusPip, include_bytes!("../../../assets/svg/focus_pip.svg")),
-        (IconId::Ethernet, include_bytes!("../../../assets/svg/ethernet.svg")),
-        (IconId::EthernetOff, include_bytes!("../../../assets/svg/ethernet-disabled.svg")),
+        (
+            IconId::Launcher,
+            include_bytes!("../../../assets/svg/launcher.svg"),
+        ),
+        (
+            IconId::Overflow,
+            include_bytes!("../../../assets/svg/overflow.svg"),
+        ),
+        (
+            IconId::Settings,
+            include_bytes!("../../../assets/svg/settings.svg"),
+        ),
+        (
+            IconId::Battery,
+            include_bytes!("../../../assets/svg/battery.svg"),
+        ),
+        (
+            IconId::LinePower,
+            include_bytes!("../../../assets/svg/plug.svg"),
+        ),
+        (
+            IconId::FocusPip,
+            include_bytes!("../../../assets/svg/focus_pip.svg"),
+        ),
+        (
+            IconId::Ethernet,
+            include_bytes!("../../../assets/svg/ethernet.svg"),
+        ),
+        (
+            IconId::EthernetOff,
+            include_bytes!("../../../assets/svg/ethernet-disabled.svg"),
+        ),
         (IconId::Wifi, include_bytes!("../../../assets/svg/wifi.svg")),
-        (IconId::WifiOff, include_bytes!("../../../assets/svg/wifi-off.svg")),
-        (IconId::Bluetooth, include_bytes!("../../../assets/svg/bluetooth.svg")),
-        (IconId::BluetoothOff, include_bytes!("../../../assets/svg/bluetooth-off.svg")),
-        (IconId::AssignToSlot, include_bytes!("../../../assets/svg/assign-to-slot.svg")),
-        (IconId::Slot(1), include_bytes!("../../../assets/svg/slot-1.svg")),
-        (IconId::Slot(2), include_bytes!("../../../assets/svg/slot-2.svg")),
-        (IconId::Slot(3), include_bytes!("../../../assets/svg/slot-3.svg")),
-        (IconId::Slot(4), include_bytes!("../../../assets/svg/slot-4.svg")),
-        (IconId::Slot(5), include_bytes!("../../../assets/svg/slot-5.svg")),
-        (IconId::Slot(6), include_bytes!("../../../assets/svg/slot-6.svg")),
-        (IconId::Slot(7), include_bytes!("../../../assets/svg/slot-7.svg")),
-        (IconId::Slot(8), include_bytes!("../../../assets/svg/slot-8.svg")),
-        (IconId::Slot(9), include_bytes!("../../../assets/svg/slot-9.svg")),
-        (IconId::Microphone, include_bytes!("../../../assets/svg/microphone.svg")),
-        (IconId::MicrophoneOff, include_bytes!("../../../assets/svg/microphone-off.svg")),
+        (
+            IconId::WifiOff,
+            include_bytes!("../../../assets/svg/wifi-off.svg"),
+        ),
+        (
+            IconId::Bluetooth,
+            include_bytes!("../../../assets/svg/bluetooth.svg"),
+        ),
+        (
+            IconId::BluetoothOff,
+            include_bytes!("../../../assets/svg/bluetooth-off.svg"),
+        ),
+        (
+            IconId::AssignToSlot,
+            include_bytes!("../../../assets/svg/assign-to-slot.svg"),
+        ),
+        (
+            IconId::Slot(1),
+            include_bytes!("../../../assets/svg/slot-1.svg"),
+        ),
+        (
+            IconId::Slot(2),
+            include_bytes!("../../../assets/svg/slot-2.svg"),
+        ),
+        (
+            IconId::Slot(3),
+            include_bytes!("../../../assets/svg/slot-3.svg"),
+        ),
+        (
+            IconId::Slot(4),
+            include_bytes!("../../../assets/svg/slot-4.svg"),
+        ),
+        (
+            IconId::Slot(5),
+            include_bytes!("../../../assets/svg/slot-5.svg"),
+        ),
+        (
+            IconId::Slot(6),
+            include_bytes!("../../../assets/svg/slot-6.svg"),
+        ),
+        (
+            IconId::Slot(7),
+            include_bytes!("../../../assets/svg/slot-7.svg"),
+        ),
+        (
+            IconId::Slot(8),
+            include_bytes!("../../../assets/svg/slot-8.svg"),
+        ),
+        (
+            IconId::Slot(9),
+            include_bytes!("../../../assets/svg/slot-9.svg"),
+        ),
+        (
+            IconId::Microphone,
+            include_bytes!("../../../assets/svg/microphone.svg"),
+        ),
+        (
+            IconId::MicrophoneOff,
+            include_bytes!("../../../assets/svg/microphone-off.svg"),
+        ),
         //(IconId::FlowStateLabel, include_bytes!("../../../assets/svg/flowstate-logo.svg")),
-        (IconId::HDR, include_bytes!("../../../assets/svg/hdr-enabled.svg")),
-        (IconId::Clock0, include_bytes!("../../../assets/svg/clock_0.svg")),
-        (IconId::Clock1, include_bytes!("../../../assets/svg/clock_1.svg")),
-        (IconId::Clock2, include_bytes!("../../../assets/svg/clock_2.svg")),
-        (IconId::Clock3, include_bytes!("../../../assets/svg/clock_3.svg")),
-        (IconId::Clock4, include_bytes!("../../../assets/svg/clock_4.svg")),
-        (IconId::Clock5, include_bytes!("../../../assets/svg/clock_5.svg")),
-        (IconId::Clock6, include_bytes!("../../../assets/svg/clock_6.svg")),
-        (IconId::Clock7, include_bytes!("../../../assets/svg/clock_7.svg")),
-        (IconId::Clock8, include_bytes!("../../../assets/svg/clock_8.svg")),
-        (IconId::Clock9, include_bytes!("../../../assets/svg/clock_9.svg")),
-        (IconId::ClockColon, include_bytes!("../../../assets/svg/clock_colon.svg")),
-        (IconId::ClockA, include_bytes!("../../../assets/svg/clock_a.svg")),
-        (IconId::ClockP, include_bytes!("../../../assets/svg/clock_p.svg")),
-        (IconId::ClockM, include_bytes!("../../../assets/svg/clock_m.svg")),
-        (IconId::A,  include_bytes!("../../../assets/svg/glyph_A.svg")),
-        (IconId::B,  include_bytes!("../../../assets/svg/glyph_B.svg")), 
-        (IconId::C,  include_bytes!("../../../assets/svg/glyph_C.svg")),  
-        (IconId::D,  include_bytes!("../../../assets/svg/glyph_D.svg")),  
-        (IconId::E,  include_bytes!("../../../assets/svg/glyph_E.svg")),  
-        (IconId::F,  include_bytes!("../../../assets/svg/glyph_F.svg")),  
-        (IconId::G,  include_bytes!("../../../assets/svg/glyph_G.svg")),  
-        (IconId::H,  include_bytes!("../../../assets/svg/glyph_H.svg")),  
-        (IconId::I,  include_bytes!("../../../assets/svg/glyph_I.svg")),  
-        (IconId::J,  include_bytes!("../../../assets/svg/glyph_J.svg")),  
-        (IconId::K,  include_bytes!("../../../assets/svg/glyph_K.svg")),  
-        (IconId::L,  include_bytes!("../../../assets/svg/glyph_L.svg")),  
-        (IconId::M,  include_bytes!("../../../assets/svg/glyph_M.svg")), 
-        (IconId::N,  include_bytes!("../../../assets/svg/glyph_N.svg")),  
-        (IconId::O,  include_bytes!("../../../assets/svg/glyph_O.svg")),  
-        (IconId::P,  include_bytes!("../../../assets/svg/glyph_P.svg")), 
-        (IconId::Q,  include_bytes!("../../../assets/svg/glyph_Q.svg")),  
-        (IconId::R,  include_bytes!("../../../assets/svg/glyph_R.svg")),  
-        (IconId::S,  include_bytes!("../../../assets/svg/glyph_S.svg")),  
-        (IconId::T,  include_bytes!("../../../assets/svg/glyph_T.svg")),  
-        (IconId::U,  include_bytes!("../../../assets/svg/glyph_U.svg")),  
-        (IconId::V,  include_bytes!("../../../assets/svg/glyph_V.svg")),  
-        (IconId::W,  include_bytes!("../../../assets/svg/glyph_W.svg")),  
-        (IconId::X,  include_bytes!("../../../assets/svg/glyph_X.svg")),  
-        (IconId::Y,  include_bytes!("../../../assets/svg/glyph_Y.svg")),  
-        (IconId::Z,  include_bytes!("../../../assets/svg/glyph_Z.svg")), 
-        (IconId::Num0,  include_bytes!("../../../assets/svg/glyph_0.svg")), 
-        (IconId::Num1,  include_bytes!("../../../assets/svg/glyph_1.svg")),  
-        (IconId::Num2,  include_bytes!("../../../assets/svg/glyph_2.svg")),  
-        (IconId::Num3,  include_bytes!("../../../assets/svg/glyph_3.svg")),  
-        (IconId::Num4,  include_bytes!("../../../assets/svg/glyph_4.svg")),  
-        (IconId::Num5,  include_bytes!("../../../assets/svg/glyph_5.svg")),  
-        (IconId::Num6,  include_bytes!("../../../assets/svg/glyph_6.svg")),  
-        (IconId::Num7,  include_bytes!("../../../assets/svg/glyph_7.svg")),  
-        (IconId::Num8,  include_bytes!("../../../assets/svg/glyph_8.svg")),  
-        (IconId::Num9,  include_bytes!("../../../assets/svg/glyph_9.svg")), 
-        (IconId::Colon,  include_bytes!("../../../assets/svg/glyph_colon.svg")), 
-        (IconId::Dash,  include_bytes!("../../../assets/svg/glyph_dash.svg")), 
-        (IconId::Dot,  include_bytes!("../../../assets/svg/glyph_dot.svg")), 
-        (IconId::Slash,  include_bytes!("../../../assets/svg/glyph_slash.svg")), 
-        (IconId::Percent,  include_bytes!("../../../assets/svg/glyph_percent.svg")), 
-        (IconId::Power, include_bytes!("../../../assets/svg/power-menu.svg")),
-        (IconId::Speaker, include_bytes!("../../../assets/svg/volume.svg")),
-        (IconId::SpeakerOff, include_bytes!("../../../assets/svg/volume-off.svg")),
-        (IconId::Browser, include_bytes!("../../../assets/svg/browser.svg")),
-        (IconId::Terminal, include_bytes!("../../../assets/svg/terminal.svg")),
-        (IconId::Files, include_bytes!("../../../assets/svg/files.svg")),
+        (
+            IconId::HDR,
+            include_bytes!("../../../assets/svg/hdr-enabled.svg"),
+        ),
+        (
+            IconId::Clock0,
+            include_bytes!("../../../assets/svg/clock_0.svg"),
+        ),
+        (
+            IconId::Clock1,
+            include_bytes!("../../../assets/svg/clock_1.svg"),
+        ),
+        (
+            IconId::Clock2,
+            include_bytes!("../../../assets/svg/clock_2.svg"),
+        ),
+        (
+            IconId::Clock3,
+            include_bytes!("../../../assets/svg/clock_3.svg"),
+        ),
+        (
+            IconId::Clock4,
+            include_bytes!("../../../assets/svg/clock_4.svg"),
+        ),
+        (
+            IconId::Clock5,
+            include_bytes!("../../../assets/svg/clock_5.svg"),
+        ),
+        (
+            IconId::Clock6,
+            include_bytes!("../../../assets/svg/clock_6.svg"),
+        ),
+        (
+            IconId::Clock7,
+            include_bytes!("../../../assets/svg/clock_7.svg"),
+        ),
+        (
+            IconId::Clock8,
+            include_bytes!("../../../assets/svg/clock_8.svg"),
+        ),
+        (
+            IconId::Clock9,
+            include_bytes!("../../../assets/svg/clock_9.svg"),
+        ),
+        (
+            IconId::ClockColon,
+            include_bytes!("../../../assets/svg/clock_colon.svg"),
+        ),
+        (
+            IconId::ClockA,
+            include_bytes!("../../../assets/svg/clock_a.svg"),
+        ),
+        (
+            IconId::ClockP,
+            include_bytes!("../../../assets/svg/clock_p.svg"),
+        ),
+        (
+            IconId::ClockM,
+            include_bytes!("../../../assets/svg/clock_m.svg"),
+        ),
+        (IconId::A, include_bytes!("../../../assets/svg/glyph_A.svg")),
+        (IconId::B, include_bytes!("../../../assets/svg/glyph_B.svg")),
+        (IconId::C, include_bytes!("../../../assets/svg/glyph_C.svg")),
+        (IconId::D, include_bytes!("../../../assets/svg/glyph_D.svg")),
+        (IconId::E, include_bytes!("../../../assets/svg/glyph_E.svg")),
+        (IconId::F, include_bytes!("../../../assets/svg/glyph_F.svg")),
+        (IconId::G, include_bytes!("../../../assets/svg/glyph_G.svg")),
+        (IconId::H, include_bytes!("../../../assets/svg/glyph_H.svg")),
+        (IconId::I, include_bytes!("../../../assets/svg/glyph_I.svg")),
+        (IconId::J, include_bytes!("../../../assets/svg/glyph_J.svg")),
+        (IconId::K, include_bytes!("../../../assets/svg/glyph_K.svg")),
+        (IconId::L, include_bytes!("../../../assets/svg/glyph_L.svg")),
+        (IconId::M, include_bytes!("../../../assets/svg/glyph_M.svg")),
+        (IconId::N, include_bytes!("../../../assets/svg/glyph_N.svg")),
+        (IconId::O, include_bytes!("../../../assets/svg/glyph_O.svg")),
+        (IconId::P, include_bytes!("../../../assets/svg/glyph_P.svg")),
+        (IconId::Q, include_bytes!("../../../assets/svg/glyph_Q.svg")),
+        (IconId::R, include_bytes!("../../../assets/svg/glyph_R.svg")),
+        (IconId::S, include_bytes!("../../../assets/svg/glyph_S.svg")),
+        (IconId::T, include_bytes!("../../../assets/svg/glyph_T.svg")),
+        (IconId::U, include_bytes!("../../../assets/svg/glyph_U.svg")),
+        (IconId::V, include_bytes!("../../../assets/svg/glyph_V.svg")),
+        (IconId::W, include_bytes!("../../../assets/svg/glyph_W.svg")),
+        (IconId::X, include_bytes!("../../../assets/svg/glyph_X.svg")),
+        (IconId::Y, include_bytes!("../../../assets/svg/glyph_Y.svg")),
+        (IconId::Z, include_bytes!("../../../assets/svg/glyph_Z.svg")),
+        (
+            IconId::Num0,
+            include_bytes!("../../../assets/svg/glyph_0.svg"),
+        ),
+        (
+            IconId::Num1,
+            include_bytes!("../../../assets/svg/glyph_1.svg"),
+        ),
+        (
+            IconId::Num2,
+            include_bytes!("../../../assets/svg/glyph_2.svg"),
+        ),
+        (
+            IconId::Num3,
+            include_bytes!("../../../assets/svg/glyph_3.svg"),
+        ),
+        (
+            IconId::Num4,
+            include_bytes!("../../../assets/svg/glyph_4.svg"),
+        ),
+        (
+            IconId::Num5,
+            include_bytes!("../../../assets/svg/glyph_5.svg"),
+        ),
+        (
+            IconId::Num6,
+            include_bytes!("../../../assets/svg/glyph_6.svg"),
+        ),
+        (
+            IconId::Num7,
+            include_bytes!("../../../assets/svg/glyph_7.svg"),
+        ),
+        (
+            IconId::Num8,
+            include_bytes!("../../../assets/svg/glyph_8.svg"),
+        ),
+        (
+            IconId::Num9,
+            include_bytes!("../../../assets/svg/glyph_9.svg"),
+        ),
+        (
+            IconId::Colon,
+            include_bytes!("../../../assets/svg/glyph_colon.svg"),
+        ),
+        (
+            IconId::Dash,
+            include_bytes!("../../../assets/svg/glyph_dash.svg"),
+        ),
+        (
+            IconId::Dot,
+            include_bytes!("../../../assets/svg/glyph_dot.svg"),
+        ),
+        (
+            IconId::Slash,
+            include_bytes!("../../../assets/svg/glyph_slash.svg"),
+        ),
+        (
+            IconId::Percent,
+            include_bytes!("../../../assets/svg/glyph_percent.svg"),
+        ),
+        (
+            IconId::Power,
+            include_bytes!("../../../assets/svg/power-menu.svg"),
+        ),
+        (
+            IconId::Speaker,
+            include_bytes!("../../../assets/svg/volume.svg"),
+        ),
+        (
+            IconId::SpeakerOff,
+            include_bytes!("../../../assets/svg/volume-off.svg"),
+        ),
+        (
+            IconId::Browser,
+            include_bytes!("../../../assets/svg/browser.svg"),
+        ),
+        (
+            IconId::Terminal,
+            include_bytes!("../../../assets/svg/terminal.svg"),
+        ),
+        (
+            IconId::Files,
+            include_bytes!("../../../assets/svg/files.svg"),
+        ),
         (IconId::Plus, include_bytes!("../../../assets/svg/plus.svg")),
-        (IconId::Minus, include_bytes!("../../../assets/svg/minus.svg")),
-    
+        (
+            IconId::Minus,
+            include_bytes!("../../../assets/svg/minus.svg"),
+        ),
     ];
 
     let mut rects = HashMap::new();
@@ -454,35 +644,40 @@ where
 
     for &(icon_id, svg_bytes) in all_icons {
         //for state in STATES {
-            let styled_svg = style_svg_white(svg_bytes)?;
-            let rgba = rasterize_svg_bytes(&styled_svg, ICON, ICON)?;
+        let styled_svg = style_svg_white(svg_bytes)?;
+        let rgba = rasterize_svg_bytes(&styled_svg, ICON, ICON)?;
 
-            let col = cell_index % cells_per_row;
-            let row = cell_index / cells_per_row;
+        let col = cell_index % cells_per_row;
+        let row = cell_index / cells_per_row;
 
-            let x = col * CELL;
-            let y = row * CELL;
+        let x = col * CELL;
+        let y = row * CELL;
 
-            if y + CELL > ATLAS_H {
-                return Err(anyhow!("icon atlas overflow: atlas too small"));
-            }
-            
-            blit_rgba(
-                &mut atlas_rgba,
-                ATLAS_W,
-                ATLAS_H,
-                x + PAD,
-                y + PAD,
-                ICON,
-                ICON,
-                &rgba,
-            )?;
-            rects.insert(
-                icon_id,
-                AtlasRect { x: x+PAD, y: y+PAD, w: ICON, h: ICON },
-            );
+        if y + CELL > ATLAS_H {
+            return Err(anyhow!("icon atlas overflow: atlas too small"));
+        }
 
-            cell_index += 1;
+        blit_rgba(
+            &mut atlas_rgba,
+            ATLAS_W,
+            ATLAS_H,
+            x + PAD,
+            y + PAD,
+            ICON,
+            ICON,
+            &rgba,
+        )?;
+        rects.insert(
+            icon_id,
+            AtlasRect {
+                x: x + PAD,
+                y: y + PAD,
+                w: ICON,
+                h: ICON,
+            },
+        );
+
+        cell_index += 1;
         //}
     }
 
@@ -496,8 +691,6 @@ where
     }
 
     let atlas_upload = atlas_rgba.clone();
-
-
 
     let tex = renderer
         .import_memory(

@@ -12,7 +12,6 @@ pub enum PermissionScope {
     Persistent,
 }
 
-
 use crate::identity::AppIdentity;
 use crate::request::{PermissionResource, PermissionTarget};
 use std::time::SystemTime;

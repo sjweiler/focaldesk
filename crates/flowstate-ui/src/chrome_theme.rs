@@ -92,39 +92,37 @@ pub struct TopBarStyle {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ChromeTheme {  
+pub struct ChromeTheme {
     // frame
-    pub frame_outer: BevelStyle,  // frame outer    
-    pub frame_inner: BevelStyle,  // frame inner
-    
+    pub frame_outer: BevelStyle, // frame outer
+    pub frame_inner: BevelStyle, // frame inner
+
     // Surface layers
     pub panel_base: BevelStyle,  // panael base
     pub panel_inner: BevelStyle, // panel recess
-    
-    
-    
+
     // functional areas
     pub sidebar: BevelStyle,
     pub module: BevelStyle,
     pub module_inner: BevelStyle,
-    pub icon_well: BevelStyle,    
+    pub icon_well: BevelStyle,
     pub icon_well_active: BevelStyle,
-    
+
     // decorative / trim
     pub trim: BevelStyle,
     pub corner_cap: BevelStyle,
-    
+
     // Effects
-    pub light: LightChannelStyle,    
+    pub light: LightChannelStyle,
     pub glass: GlassStyle,
-    
+
     pub line_highlight: LineStyle,
     pub line_groove: LineStyle,
 
     pub glow_active: GlowStyle,
-    
+
     pub button: ButtonStyle,
-    
+
     pub top_bar: TopBarStyle,
 }
 
@@ -137,9 +135,9 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_alpha: 0.0,
             face_color: [0.030, 0.050, 0.090, 1.0],
             inner_shadow: 3.5,
-            light_color:  [0.165, 0.215, 0.305, 1.0],
+            light_color: [0.165, 0.215, 0.305, 1.0],
             shadow_color: [0.006, 0.010, 0.018, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         frame_inner: BevelStyle {
@@ -149,9 +147,9 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_alpha: 0.0,
             inner_shadow: 2.2,
             face_color: [0.050, 0.075, 0.120, 1.0],
-            light_color:  [0.185, 0.235, 0.325, 1.0],
+            light_color: [0.185, 0.235, 0.325, 1.0],
             shadow_color: [0.010, 0.016, 0.026, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         panel_base: BevelStyle {
@@ -160,10 +158,10 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_width: 0.0,
             glow_alpha: 0.0,
             inner_shadow: 1.8,
-            face_color: [0.060, 0.085, 0.135, 1.0],   // was too bright
-            light_color:  [0.205, 0.255, 0.345, 1.0],
+            face_color: [0.060, 0.085, 0.135, 1.0], // was too bright
+            light_color: [0.205, 0.255, 0.345, 1.0],
             shadow_color: [0.014, 0.020, 0.032, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         panel_inner: BevelStyle {
@@ -171,11 +169,11 @@ pub fn default_chrome_theme() -> ChromeTheme {
             softness: 1.35,
             glow_width: 0.0,
             glow_alpha: 0.0,
-            face_color:   [0.025, 0.045, 0.080, 1.0],
-            inner_shadow: 4.8,   // increase
-            light_color:  [0.105, 0.145, 0.220, 1.0],
+            face_color: [0.025, 0.045, 0.080, 1.0],
+            inner_shadow: 4.8, // increase
+            light_color: [0.105, 0.145, 0.220, 1.0],
             shadow_color: [0.004, 0.008, 0.015, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         trim: BevelStyle {
@@ -184,10 +182,10 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_width: 0.0,
             glow_alpha: 0.0,
             inner_shadow: 1.2,
-            face_color:  [0.075, 0.105, 0.160, 1.0],
-            light_color:  [0.235, 0.290, 0.380, 1.0],
+            face_color: [0.075, 0.105, 0.160, 1.0],
+            light_color: [0.235, 0.290, 0.380, 1.0],
             shadow_color: [0.020, 0.028, 0.040, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         sidebar: BevelStyle {
@@ -196,22 +194,22 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_width: 0.0,
             glow_alpha: 0.0,
             inner_shadow: 2.4,
-            face_color:   [0.050, 0.073, 0.118, 1.0],
-            light_color:  [0.155, 0.205, 0.290, 1.0],
+            face_color: [0.050, 0.073, 0.118, 1.0],
+            light_color: [0.155, 0.205, 0.290, 1.0],
             shadow_color: [0.008, 0.013, 0.022, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
-        
+
         module: BevelStyle {
             bevel: 2.4,
             softness: 1.1,
             glow_width: 0.0,
             glow_alpha: 0.0,
             inner_shadow: 1.8,
-            face_color:   [0.070, 0.098, 0.150, 1.0],
-            light_color:  [0.200, 0.250, 0.335, 1.0],
+            face_color: [0.070, 0.098, 0.150, 1.0],
+            light_color: [0.200, 0.250, 0.335, 1.0],
             shadow_color: [0.012, 0.018, 0.028, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         module_inner: BevelStyle {
@@ -220,10 +218,10 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_width: 0.0,
             glow_alpha: 0.0,
             inner_shadow: 3.0,
-            face_color:   [0.040, 0.060, 0.102, 1.0],
-            light_color:  [0.105, 0.145, 0.215, 1.0],
+            face_color: [0.040, 0.060, 0.102, 1.0],
+            light_color: [0.105, 0.145, 0.215, 1.0],
             shadow_color: [0.004, 0.008, 0.014, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         icon_well: BevelStyle {
@@ -256,10 +254,10 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_width: 0.0,
             glow_alpha: 0.0,
             inner_shadow: 1.8,
-            face_color:   [0.055, 0.078, 0.120, 1.0],
-            light_color:  [0.170, 0.220, 0.305, 1.0],
+            face_color: [0.055, 0.078, 0.120, 1.0],
+            light_color: [0.170, 0.220, 0.305, 1.0],
             shadow_color: [0.008, 0.013, 0.022, 1.0],
-            glow_color:   [0.0, 0.0, 0.0, 1.0],
+            glow_color: [0.0, 0.0, 0.0, 1.0],
         },
 
         light: LightChannelStyle {
@@ -271,16 +269,16 @@ pub fn default_chrome_theme() -> ChromeTheme {
             glow_color: [0.18, 0.30, 0.55, 1.0],
             core_color: [0.10, 0.18, 0.34, 1.0],
         },
-        
+
         glass: GlassStyle {
-            opacity: 0.08,              // down from 0.90+
-            edge_width: 12.0,           // tighter
-            edge_brightness: 0.75,      // WAS TOO HIGH
-            highlight_strength: 0.10,   // cut this a lot
-            tint: [0.035, 0.085, 0.200, 1.0],   // darker tint
+            opacity: 0.08,                    // down from 0.90+
+            edge_width: 12.0,                 // tighter
+            edge_brightness: 0.75,            // WAS TOO HIGH
+            highlight_strength: 0.10,         // cut this a lot
+            tint: [0.035, 0.085, 0.200, 1.0], // darker tint
             edge_color: [0.30, 0.55, 0.95, 0.14],
         },
-        
+
         line_highlight: LineStyle {
             color: [0.55, 0.75, 1.00, 1.0],
             thickness: 1,
@@ -298,7 +296,7 @@ pub fn default_chrome_theme() -> ChromeTheme {
             alpha: 0.08,
             inset: 0,
         },
-        
+
         button: ButtonStyle {
             bevel: 3.0,
             softness: 1.5,
@@ -313,7 +311,7 @@ pub fn default_chrome_theme() -> ChromeTheme {
             // teal
             glow_color: [0.2, 0.9, 0.8, 1.0],
         },
-        
+
         top_bar: TopBarStyle {
             radius: 10.0,
             softness: 1.8,
@@ -326,10 +324,8 @@ pub fn default_chrome_theme() -> ChromeTheme {
             edge_color: [0.01, 0.015, 0.03, 1.0],
             trim_color: [0.72, 0.82, 0.95, 1.0],
         },
-                
     }
 }
-
 
 /*
 pub fn default_chrome_theme() -> ChromeTheme {
@@ -404,7 +400,7 @@ shadow_color: [0.0, 0.0, 0.0, 0.5],
             light_dir: [0.7, -0.7],
             face_color:   [0.050, 0.070, 0.11, 1.0],
             light_color:  [0.16, 0.22, 0.30, 1.0],
-            shadow_color: [0.006, 0.010, 0.018, 1.0],        
+            shadow_color: [0.006, 0.010, 0.018, 1.0],
         },
         icon_well: BevelStyle {
             chamfer: 4.0,
@@ -414,7 +410,7 @@ shadow_color: [0.0, 0.0, 0.0, 0.5],
             face_color:   [0.035, 0.050, 0.085, 1.0],
             light_color:  [0.10, 0.14, 0.20, 1.0],
             shadow_color: [0.003, 0.005, 0.010, 1.0],
-        },   
+        },
         corner_cap: BevelStyle {
             chamfer: 2.0,
             bevel: 2.0,
@@ -433,7 +429,7 @@ shadow_color: [0.0, 0.0, 0.0, 0.5],
             glow_color: [0.20, 0.55, 1.00, 1.0],
             core_color: [0.75, 0.90, 1.00, 1.0],
         },
-        
+
     }
 }
 */

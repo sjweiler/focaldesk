@@ -1,6 +1,5 @@
 use flowstate_types::WindowId;
 
-
 #[derive(Debug)]
 pub enum FlowAction {
     None,
@@ -13,7 +12,7 @@ pub enum FlowAction {
     Close(WindowId),
     Launch(String),
     ToggleLauncher,
-    
+
     Spawn { cmd: String, args: Vec<String> },
     // later: MoveToWorkspace, SwitchWorkspace, etc.
 }
@@ -35,4 +34,3 @@ pub enum KeyAction {
     LaunchBrowser,
     LaunchFiles,
 }
-

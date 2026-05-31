@@ -4,10 +4,10 @@ use adw::prelude::*;
 use gtk::prelude::*;
 
 use config::{load_config, save_config, FlowStateConfig};
+use gtk::cairo;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use gtk::cairo;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayConfig {
@@ -105,9 +105,7 @@ fn monitor_arrangement_area(displays: Rc<RefCell<Vec<DisplayConfig>>>) -> gtk::D
                 cr.move_to(x + 14.0, y + 50.0);
                 let _ = cr.show_text(&format!(
                     "{}×{} @ {}Hz",
-                    d.mode_width,
-                    d.mode_height,
-                    d.refresh_mhz
+                    d.mode_width, d.mode_height, d.refresh_mhz
                 ));
             }
         });
@@ -173,7 +171,13 @@ fn monitor_arrangement_area(displays: Rc<RefCell<Vec<DisplayConfig>>>) -> gtk::D
 fn rounded_rect(cr: &cairo::Context, x: f64, y: f64, w: f64, h: f64, r: f64) {
     cr.new_sub_path();
     cr.arc(x + w - r, y + r, r, -90f64.to_radians(), 0f64.to_radians());
-    cr.arc(x + w - r, y + h - r, r, 0f64.to_radians(), 90f64.to_radians());
+    cr.arc(
+        x + w - r,
+        y + h - r,
+        r,
+        0f64.to_radians(),
+        90f64.to_radians(),
+    );
     cr.arc(x + r, y + h - r, r, 90f64.to_radians(), 180f64.to_radians());
     cr.arc(x + r, y + r, r, 180f64.to_radians(), 270f64.to_radians());
     cr.close_path();
@@ -183,8 +187,7 @@ fn displays_path() -> std::path::PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
-            std::path::PathBuf::from(std::env::var("HOME").unwrap())
-                .join(".config")
+            std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".config")
         })
         .join("flowstate")
         .join("displays.json")
@@ -257,15 +260,9 @@ fn build_ui(app: &adw::Application) {
     // ----- content pages -----
     let mut pages: HashMap<String, adw::NavigationPage> = HashMap::new();
 
-    pages.insert(
-        "Appearance".to_string(),
-        appearance_page(config.clone()),
-    );
-    pages.insert(
-        "Displays".to_string(), 
-        displays_page(config.clone()),
-    );
-    
+    pages.insert("Appearance".to_string(), appearance_page(config.clone()));
+    pages.insert("Displays".to_string(), displays_page(config.clone()));
+
     for name in [
         "Workspaces",
         "Keyboard",
@@ -375,44 +372,37 @@ fn appearance_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage 
     let glow_row = adw::ActionRow::new();
     glow_row.set_title("Glow strength");
 
-    let glow_scale = gtk::Scale::with_range(
-        gtk::Orientation::Horizontal,
-        0.0,
-        1.0,
-        0.05,
-    );
+    let glow_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
     glow_scale.set_hexpand(true);
     glow_scale.set_value(config.borrow().appearance.glow_strength);
     glow_scale.set_draw_value(true);
 
-let theme_row = adw::ActionRow::new();
-theme_row.set_title("Theme");
+    let theme_row = adw::ActionRow::new();
+    theme_row.set_title("Theme");
 
-let combo = gtk::ComboBoxText::new();
-combo.append_text("Eagle");
-combo.append_text("Moonbase");
-combo.append_text("Classic");
+    let combo = gtk::ComboBoxText::new();
+    combo.append_text("Eagle");
+    combo.append_text("Moonbase");
+    combo.append_text("Classic");
 
-combo.set_active(Some(match config.borrow().appearance.theme.as_str() {
-    "Moonbase" => 1,
-    "Classic" => 2,
-    _ => 0,
-}));
+    combo.set_active(Some(match config.borrow().appearance.theme.as_str() {
+        "Moonbase" => 1,
+        "Classic" => 2,
+        _ => 0,
+    }));
 
+    {
+        let config = config.clone();
+        combo.connect_changed(move |c| {
+            if let Some(text) = c.active_text() {
+                config.borrow_mut().appearance.theme = text.to_string();
+                let _ = save_config(&config.borrow());
+            }
+        });
+    }
 
-
-{
-    let config = config.clone();
-    combo.connect_changed(move |c| {
-        if let Some(text) = c.active_text() {
-            config.borrow_mut().appearance.theme = text.to_string();
-            let _ = save_config(&config.borrow());
-        }
-    });
-}
-
-theme_row.add_suffix(&combo);
-visual_group.add(&theme_row);
+    theme_row.add_suffix(&combo);
+    visual_group.add(&theme_row);
 
     {
         let config = config.clone();
@@ -429,12 +419,7 @@ visual_group.add(&theme_row);
     let font_row = adw::ActionRow::new();
     font_row.set_title("Font scale");
 
-    let font_scale = gtk::Scale::with_range(
-        gtk::Orientation::Horizontal,
-        0.75,
-        1.5,
-        0.05,
-    );
+    let font_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.75, 1.5, 0.05);
     font_scale.set_hexpand(true);
     font_scale.set_value(config.borrow().appearance.font_scale);
     font_scale.set_draw_value(true);
@@ -451,27 +436,24 @@ visual_group.add(&theme_row);
     tuning_group.add(&font_row);
 
     page.add(&tuning_group);
-    
-let reset_button = gtk::Button::with_label("Reset to Defaults");
-reset_button.add_css_class("destructive-action");
-reset_button.set_halign(gtk::Align::Start);
 
-{
-    let config = config.clone();
-    reset_button.connect_clicked(move |_| {
-        *config.borrow_mut() = FlowStateConfig::default();
-        let _ = save_config(&config.borrow());
-        println!("Reset config");
-    });
-}
+    let reset_button = gtk::Button::with_label("Reset to Defaults");
+    reset_button.add_css_class("destructive-action");
+    reset_button.set_halign(gtk::Align::Start);
 
+    {
+        let config = config.clone();
+        reset_button.connect_clicked(move |_| {
+            *config.borrow_mut() = FlowStateConfig::default();
+            let _ = save_config(&config.borrow());
+            println!("Reset config");
+        });
+    }
 
-let reset_group = adw::PreferencesGroup::new();
-reset_group.add(&reset_button);
-reset_group.set_description(Some(
-    "Restore all appearance settings to their defaults"
-));
-page.add(&reset_group);
+    let reset_group = adw::PreferencesGroup::new();
+    reset_group.add(&reset_button);
+    reset_group.set_description(Some("Restore all appearance settings to their defaults"));
+    page.add(&reset_group);
 
     adw::NavigationPage::new(&page, "Appearance")
 }
@@ -480,39 +462,41 @@ fn displays_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Displays");
 
-let detected_displays = Rc::new(RefCell::new(load_displays()));
-let arrangement_group = adw::PreferencesGroup::new();
-arrangement_group.set_title("Arrangement");
-arrangement_group.set_description(Some("Drag displays to arrange their logical desktop positions"));
-
-let area = monitor_arrangement_area(detected_displays.clone());
-arrangement_group.add(&area);
-
-page.add(&arrangement_group);
-
-let displays = load_displays();
-let outputs_group = adw::PreferencesGroup::new();
-outputs_group.set_title("Connected Displays");
-
-for d in displays {
-    let row = adw::ActionRow::new();
-
-    row.set_title(&d.name);
-
-    row.set_subtitle(&format!(
-        "{}×{} @ {} Hz  •  Scale {:.2}  •  Pos {}, {}{}",
-        d.mode_width,
-        d.mode_height,
-        d.refresh_mhz,
-        d.scale,
-        d.logical_x,
-        d.logical_y,
-        if d.primary { "  •  Primary" } else { "" }
+    let detected_displays = Rc::new(RefCell::new(load_displays()));
+    let arrangement_group = adw::PreferencesGroup::new();
+    arrangement_group.set_title("Arrangement");
+    arrangement_group.set_description(Some(
+        "Drag displays to arrange their logical desktop positions",
     ));
 
-    outputs_group.add(&row);
-}
-page.add(&outputs_group);
+    let area = monitor_arrangement_area(detected_displays.clone());
+    arrangement_group.add(&area);
+
+    page.add(&arrangement_group);
+
+    let displays = load_displays();
+    let outputs_group = adw::PreferencesGroup::new();
+    outputs_group.set_title("Connected Displays");
+
+    for d in displays {
+        let row = adw::ActionRow::new();
+
+        row.set_title(&d.name);
+
+        row.set_subtitle(&format!(
+            "{}×{} @ {} Hz  •  Scale {:.2}  •  Pos {}, {}{}",
+            d.mode_width,
+            d.mode_height,
+            d.refresh_mhz,
+            d.scale,
+            d.logical_x,
+            d.logical_y,
+            if d.primary { "  •  Primary" } else { "" }
+        ));
+
+        outputs_group.add(&row);
+    }
+    page.add(&outputs_group);
 
     // Layout group
     let layout_group = adw::PreferencesGroup::new();
@@ -591,41 +575,41 @@ page.add(&outputs_group);
 fn workspaces_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Workspaces");
-    
-    adw::NavigationPage::new(&page, "Workspaces")  
+
+    adw::NavigationPage::new(&page, "Workspaces")
 }
 
 fn keyboard_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Keyboard");
-    
-    adw::NavigationPage::new(&page, "Keyboard")  
+
+    adw::NavigationPage::new(&page, "Keyboard")
 }
 
 fn privacy_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Privacy");
-    
-    adw::NavigationPage::new(&page, "Privacy")  
+
+    adw::NavigationPage::new(&page, "Privacy")
 }
 
 fn power_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Power");
-    
-    adw::NavigationPage::new(&page, "Power")  
+
+    adw::NavigationPage::new(&page, "Power")
 }
 
 fn debug_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Debug");
-    
-    adw::NavigationPage::new(&page, "Debug")  
+
+    adw::NavigationPage::new(&page, "Debug")
 }
 
 fn about_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("About");
-    
-    adw::NavigationPage::new(&page, "About")  
+
+    adw::NavigationPage::new(&page, "About")
 }

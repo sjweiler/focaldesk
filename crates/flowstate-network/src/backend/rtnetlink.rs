@@ -6,12 +6,8 @@ use tokio::sync::watch;
 use crate::backend::NetworkBackend;
 use crate::model::{Connectivity, NetTransport, NetworkState};
 
-use rtnetlink::packet_route::{
-    AddressFamily,
-    link::LinkAttribute,
-    route::RouteAttribute,
-};
 use rtnetlink::RouteMessageBuilder;
+use rtnetlink::packet_route::{AddressFamily, link::LinkAttribute, route::RouteAttribute};
 
 pub struct RtnetlinkBackend {
     handle: rtnetlink::Handle,
@@ -30,12 +26,12 @@ impl NetworkBackend for RtnetlinkBackend {
     async fn current_state(&self) -> Result<NetworkState> {
         let mut primary_ifindex: Option<u32> = None;
 
-    let mut routes_v4 = self
-        .handle
-        .route()
-        .get(RouteMessageBuilder::<std::net::Ipv4Addr>::new().build())
-        .execute();
-    while let Some(route) = routes_v4.try_next().await? {
+        let mut routes_v4 = self
+            .handle
+            .route()
+            .get(RouteMessageBuilder::<std::net::Ipv4Addr>::new().build())
+            .execute();
+        while let Some(route) = routes_v4.try_next().await? {
             if route.header.address_family != AddressFamily::Inet {
                 continue;
             }
@@ -59,7 +55,7 @@ impl NetworkBackend for RtnetlinkBackend {
                 .handle
                 .route()
                 .get(RouteMessageBuilder::<std::net::Ipv6Addr>::new().build())
-                .execute(); 
+                .execute();
             while let Some(route) = routes_v6.try_next().await? {
                 if route.header.address_family != AddressFamily::Inet6 {
                     continue;

@@ -17,18 +17,17 @@ use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Size, T
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
-use crate::core::backend_render::{draw_output, prepare_output};
+use crate::core::backend_render::{build_output_client_elements, draw_output, prepare_output};
 use crate::core::desktop::DesktopState;
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
 use crate::core::OutputState;
-use smithay::backend::renderer::Frame as RendererFrame;
-use smithay::wayland::image_copy_capture::SessionRef;
-use smithay::wayland::image_capture_source::ImageCaptureSource;
-use flowstate_themes::ThemeManager;
-use flowstate_themes::FlowThemeId;
 use flowstate_themes::theme::BuiltInThemeId;
-
+use flowstate_themes::FlowThemeId;
+use flowstate_themes::ThemeManager;
+use smithay::backend::renderer::Frame as RendererFrame;
+use smithay::wayland::image_capture_source::ImageCaptureSource;
+use smithay::wayland::image_copy_capture::SessionRef;
 
 /// Pointers to objects that must be live for the duration of `dispatch_clients` only.
 #[derive(Clone, Copy)]
@@ -66,26 +65,20 @@ impl DesktopState {
     }
 }
 
-pub fn output_id_for_session(
-    state: &DesktopState,
-    session: &SessionRef,
-) -> Option<OutputId> {
+pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Option<OutputId> {
     use smithay::output::WeakOutput;
 
     let source: ImageCaptureSource = session.source();
     let weak_output = source.user_data().get::<WeakOutput>()?;
     let output = weak_output.upgrade()?;
 
-    state
-        .outputs
-        .iter()
-        .find_map(|(id, out)| {
-            if out.handle == output {
-                Some(*id)
-            } else {
-                None
-            }
-        })
+    state.outputs.iter().find_map(|(id, out)| {
+        if out.handle == output {
+            Some(*id)
+        } else {
+            None
+        }
+    })
 }
 
 /// Renders the active output into the portal client's SHM buffer, if dispatch context is set.
@@ -122,7 +115,8 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         }
     };
 
-    if buffer_size.w != desk_output.physical_size.w || buffer_size.h != desk_output.physical_size.h {
+    if buffer_size.w != desk_output.physical_size.w || buffer_size.h != desk_output.physical_size.h
+    {
         frame.fail(CaptureFailureReason::BufferConstraints);
         return;
     }
@@ -146,28 +140,19 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
 
     let render_res = (|| -> Result<(), Box<dyn std::error::Error>> {
         let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
-        let prepared = prepare_output(
-            state,
-            renderer,
-            output_id,
-            render_size,
-            ui_state,
-            now,
-            dt,
-        )?;
+        let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt)?;
 
         {
             let mut target = renderer.bind(&mut capture_tex)?;
+            let client_elements = build_output_client_elements(state, renderer, output_id);
             let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
-    let mut theme_manager =
-        ThemeManager::new(
-        FlowThemeId::BuiltIn(BuiltInThemeId::Eagle)
-    );
-    let theme = theme_manager.active_theme();
+            let mut theme_manager = ThemeManager::new(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+            let theme = theme_manager.active_theme();
             draw_output(
                 state,
                 &mut gles_frame,
                 &prepared,
+                &client_elements,
                 ui_state,
                 scene,
                 output_state,
@@ -187,10 +172,8 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
     let width = buffer_size.w as usize;
     let height = buffer_size.h as usize;
     let mut rgba = vec![0u8; width * height * 4];
-    let region = Rectangle::<i32, BufferCoords>::from_loc_and_size(
-        Point::from((0, 0)),
-        buffer_size,
-    );
+    let region =
+        Rectangle::<i32, BufferCoords>::from_loc_and_size(Point::from((0, 0)), buffer_size);
     let read_res = (|| -> Result<(), smithay::backend::renderer::gles::GlesError> {
         // Match `create_buffer(Fourcc::Argb8888)` (`GL_BGRA8_EXT`): read as BGRA then swizzle to RGBA
         // for the SHM conversion loop below (it expects `rgba[..]` in R,G,B,A order per pixel).
@@ -282,12 +265,14 @@ pub fn push_layer_elements_for_output(
         }
         let local_loc = geo.loc - origin;
         let render_pos = local_loc.to_physical_precise_round(output_scale);
-        out.extend(layer.render_elements::<crate::core::render::FlowRenderElement>(
-            renderer,
-            render_pos,
-            output_scale,
-            1.0,
-        ));
+        out.extend(
+            layer.render_elements::<crate::core::render::FlowRenderElement>(
+                renderer,
+                render_pos,
+                output_scale,
+                1.0,
+            ),
+        );
     }
 }
 

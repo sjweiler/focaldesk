@@ -8,11 +8,9 @@ use crate::uicomponent::UiComponent;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
 use flowstate_types::WidgetId;
+use smithay::backend::renderer::gles::GlesError;
 use smithay::utils::Logical;
 use smithay::utils::Point;
-use smithay::backend::renderer::gles::GlesError;
-
-
 
 pub struct TopBarMeta {
     pub title: String,
@@ -48,7 +46,12 @@ impl Default for TopBar {
             },
             indicators: Vec::new(),
             clock: ClockComponent::default(),
-            bounds: UiRect { x: 0, y: 0, w: 1, h: 1 },
+            bounds: UiRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
             elements: Vec::new(),
         }
     }
@@ -66,10 +69,9 @@ impl UiComponent for TopBar {
     fn layout(&mut self, ctx: &LayoutCtx) {
         self.bounds = ctx.screen.into();
     }
-    
-    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit>
-    {
-       for element in self.elements.iter().rev() {
+
+    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
+        for element in self.elements.iter().rev() {
             if element.bounds.contains(point.x, point.y) {
                 return Some(UiHit {
                     target: UiHitTarget::TopBar,
@@ -79,13 +81,11 @@ impl UiComponent for TopBar {
             }
         }
 
-        None 
+        None
     }
 
     fn render(&self, ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // Later: render topbar background, title, meta text, indicators.
         self.clock.render(ctx)
-    }   
-
+    }
 }
-

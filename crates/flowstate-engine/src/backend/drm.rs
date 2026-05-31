@@ -16,7 +16,7 @@ use smithay::reexports::drm::control::Device as _;
 
 use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
-use crate::core::backend_render::prepare_output;
+use crate::core::backend_render::{build_output_client_elements, prepare_output};
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -72,7 +72,7 @@ use smithay::{
             element::memory::MemoryRenderBuffer,
             element::solid::SolidColorRenderElement,
             gles::{Capability, GlesRenderer, GlesTarget, GlesTexture},
-            Color32F, ExportMem, ImportDma, ImportMemWl,
+            Color32F, ExportMem, ImportDma, ImportEgl, ImportMemWl,
         },
         session::{
             libseat::{self, LibSeatSession},
@@ -91,7 +91,7 @@ use smithay::{
     },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::{
-        compositor::CompositorState, output::OutputManagerState,
+        compositor::CompositorState, dmabuf::DmabufFeedbackBuilder, output::OutputManagerState,
         selection::data_device::DataDeviceState, shell::xdg::XdgShellState, shm::ShmState,
     },
 };
@@ -676,7 +676,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let desktop = bootstrap_compositor_core(
         "drm".into(),
         Size::from((2560, 1440)),
-        1.25,
+        1.0,
         BackendKind::Drm,
     )?;
 
@@ -734,20 +734,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         should_stop: false,
     };
 
-    #[cfg(feature = "xwayland")]
-    {
-        start_xwayland(
-            &mut data.core.state,
-            &data.core.display.handle(),
-            data.core.xwayland_event_loop.handle(),
-        )?;
-        finish_xwayland_startup(
-            &mut data.core.xwayland_event_loop,
-            &mut data.core.state,
-            Duration::from_secs(30),
-        )?;
-    }
-
     let _libinput_token = loop_handle.insert_source(libinput_backend, |event, _, data| {
         dispatch_backend_input_event::<LibinputInputBackend>(&mut data.core.state, &event);
 
@@ -776,6 +762,28 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         device_added(&mut data, &loop_handle, node, &path)?;
+    }
+
+    #[cfg(feature = "xwayland")]
+    {
+        start_xwayland(
+            &mut data.core.state,
+            &data.core.display.handle(),
+            data.core.xwayland_event_loop.handle(),
+        )?;
+        finish_xwayland_startup(
+            &mut data.core.xwayland_event_loop,
+            &mut data.core.display,
+            &mut data.core.state,
+            Duration::from_secs(30),
+        )?;
+        if let Some(display) = data.core.state.xwayland_display.as_deref() {
+            flog(&format!(
+                "DRM backend: XWayland active on DISPLAY={display}"
+            ));
+        } else {
+            flog("DRM backend: XWayland is not active (startup failed or disabled)");
+        }
     }
 
     //let (renderer, mut framebuffer) = acquire_drm_framebuffer(...)?
@@ -826,6 +834,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
         data.core.state.end_portal_dispatch();
 
+        data.core.state.refresh_space();
         data.core.display.handle().flush_clients()?;
         data.core.state.tick_layout();
         data.core.last_now = now;
@@ -870,6 +879,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .bind(&mut offscreen.texture)
                         .map_err(|e| anyhow!("bind offscreen for draw: {e}"))?;
 
+                    let client_elements = build_output_client_elements(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        surface.output_id,
+                    );
+
                     let mut frame = device
                         .renderer
                         .render(&mut target, buffer_size, Transform::Normal)
@@ -879,6 +894,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &mut data.core.state,
                         &mut frame,
                         &prepared,
+                        &client_elements,
                         &mut data.core.ui_state,
                         &data.core.scene,
                         &data.core.output_state,
@@ -1153,6 +1169,36 @@ fn device_added(
         .context("Failed to create EGLContext for DRM node")?;
     let mut renderer = unsafe { GlesRenderer::new(egl_context) }
         .context("Failed to create GLES renderer for DRM node")?;
+
+    match renderer.bind_wl_display(&data.core.display.handle()) {
+        Ok(_) => flog("EGL Wayland display bound for DRM renderer"),
+        Err(err) => flog(&format!(
+            "Failed to bind EGL Wayland display for DRM renderer: {err:?}"
+        )),
+    }
+
+    if data.core.state.dmabuf_global.is_none() {
+        let dmabuf_node = render_node_for_gpu.unwrap_or(node);
+        let default_feedback =
+            DmabufFeedbackBuilder::new(dmabuf_node.dev_id(), renderer.dmabuf_formats())
+                .build()
+                .context("Failed to build linux-dmabuf feedback")?;
+        let global = data
+            .core
+            .state
+            .dmabuf_state
+            .create_global_with_default_feedback::<DesktopState>(
+                &data.core.display.handle(),
+                &default_feedback,
+            );
+
+        data.core.state.dmabuf_global = Some(global);
+        data.core.state.dmabuf_node = Some(dmabuf_node);
+        flog(&format!(
+            "linux-dmabuf enabled on DRM node {:?}",
+            dmabuf_node
+        ));
+    }
 
     let render_formats = renderer
         .egl_context()

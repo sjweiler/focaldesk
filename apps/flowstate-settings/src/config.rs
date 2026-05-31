@@ -61,8 +61,6 @@ pub fn save_config(config: &FlowStateConfig) -> Result<()> {
     Ok(())
 }
 
-
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DisplaysConfig {
     pub topbar_on_all_outputs: bool,

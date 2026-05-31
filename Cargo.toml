@@ -38,6 +38,7 @@ smithay = { git = "https://github.com/Smithay/smithay", default-features = false
   "backend_udev",
   "backend_session_libseat",
   "renderer_gl",
+  "use_system_lib",
   "xwayland"
 ] }
 anyhow = "1"

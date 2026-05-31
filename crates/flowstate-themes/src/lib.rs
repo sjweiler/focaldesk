@@ -1,16 +1,10 @@
-pub mod theme;
-pub mod manager;
 pub mod builtins;
+pub mod manager;
+pub mod theme;
 
 pub use theme::{
-    BackgroundTheme,
+    BackgroundTheme, ChromeTheme, DialogTheme, FlowTheme, FlowThemeId, IconTheme, TextTheme,
     WallpaperTheme,
-    ChromeTheme,
-    DialogTheme,
-    TextTheme,
-    IconTheme,
-    FlowTheme,
-    FlowThemeId,
 };
 
 pub use manager::{ActiveTheme, ThemeManager};

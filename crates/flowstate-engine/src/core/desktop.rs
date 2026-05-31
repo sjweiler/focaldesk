@@ -1,10 +1,15 @@
 use flowstate_types::types::{OutputId, WindowId, WorkspaceId};
 use flowstate_ui::uitree::UiTree;
+use smithay::backend::renderer::utils::import_surface_tree;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
 };
+use smithay::wayland::compositor::get_parent;
+use smithay::wayland::compositor::is_sync_subsurface;
+use smithay::wayland::compositor::with_states;
 use smithay::wayland::compositor::with_surface_tree_downward;
 use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
@@ -15,8 +20,8 @@ use crate::core::workspace_store::WorkspaceStore;
 use flowstate_ui::desktop_frame::DesktopFrameCtx;
 use flowstate_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
 use flowstate_ui::types::{PanelKind, UiAction};
-use smithay::backend::input::{Axis, AxisSource, ButtonState};
-use smithay::desktop::WindowSurfaceType;
+use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState};
+use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::keysyms;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
@@ -26,24 +31,28 @@ use flowstate_cursor::CursorManager;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
+#[cfg(feature = "xwayland")]
+use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
 use crate::core::input::FlowMouseButton;
 use crate::core::input::FlowScrollDelta;
+use crate::core::input::FlowScrollSource;
 use crate::core::input::{FlowInputEvent, InputState};
 use crate::core::shell::ManagedWindow;
 use crate::core::RenderState;
 use flowstate_flow::actions::KeyAction;
 use flowstate_flow::keybinds::BackendKind;
-use flowstate_logging::flog;
-use flowstate_settings_core::AppSettings;
 use flowstate_flow::Keybinds;
 use flowstate_flow::ModMask;
+use flowstate_logging::flog;
 use flowstate_notifications::NotificationManager;
+use flowstate_settings_core::AppSettings;
 use flowstate_ui::chrome::Chrome;
 use flowstate_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
@@ -61,15 +70,16 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
+use std::path::PathBuf;
 use std::process::id;
 use std::process::Command;
-use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
 
+use smithay::wayland::compositor;
+use smithay::wayland::compositor::SurfaceAttributes;
 use smithay::wayland::compositor::TraversalAction;
-use smithay::wayland::compositor::{self, SurfaceAttributes};
 use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::xdg::SurfaceCachedState;
 use smithay::wayland::xdg_activation::XdgActivationState;
@@ -123,6 +133,7 @@ pub struct DesktopInit {
     pub compositor_state: CompositorState,
     pub render: RenderState,
     pub xdg_shell_state: XdgShellState,
+    pub dmabuf_state: DmabufState,
     pub shm_state: ShmState,
     pub seat_state: smithay::input::SeatState<DesktopState>,
     pub output_manager_state: OutputManagerState,
@@ -156,6 +167,8 @@ pub struct DesktopState {
     pub xwayland_client: Option<smithay::reexports::wayland_server::Client>,
     #[cfg(feature = "xwayland")]
     pub xwayland_display: Option<String>,
+    #[cfg(feature = "xwayland")]
+    pub xwayland_loop_handle: Option<LoopHandle<'static, DesktopState>>,
     pub winit_scale_factor: f64,
     pub ui: UiTree,
     pub active_workspace: WorkspaceId,
@@ -168,6 +181,9 @@ pub struct DesktopState {
     pub compositor_state: CompositorState,
     pub render: RenderState,
     pub xdg_shell_state: smithay::wayland::shell::xdg::XdgShellState,
+    pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
+    pub dmabuf_global: Option<DmabufGlobal>,
+    pub dmabuf_node: Option<smithay::backend::drm::DrmNode>,
     pub shm_state: smithay::wayland::shm::ShmState,
     pub seat_state: smithay::input::SeatState<Self>,
     pub output_manager_state: smithay::wayland::output::OutputManagerState,
@@ -287,6 +303,7 @@ impl DesktopState {
         let Some(action) = self.peek_ui_action_at_pointer() else {
             return false;
         };
+        flog(&format!("ACTION={:?}", action));
         self.dispatch_ui_action(action);
         true
     }
@@ -301,7 +318,11 @@ impl DesktopState {
         }
     }
 
-    fn egui_frame_ctx_for_output(&self, output_id: OutputId, now: Instant) -> Option<DesktopFrameCtx> {
+    fn egui_frame_ctx_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<DesktopFrameCtx> {
         let output = self.outputs.get(&output_id)?;
         let layout = build_chrome_layout(
             output.logical_size,
@@ -392,9 +413,7 @@ impl DesktopState {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
-                EguiInputEvent::PointerMoved {
-                    position: local,
-                }
+                EguiInputEvent::PointerMoved { position: local }
             }
             FlowInputEvent::PointerButton {
                 button,
@@ -430,6 +449,10 @@ impl DesktopState {
                 let delta = match delta {
                     FlowScrollDelta::Line { x, y } => EguiScrollDelta::Line { x, y },
                     FlowScrollDelta::Pixel { x, y } => EguiScrollDelta::Point {
+                        x: x as f32,
+                        y: y as f32,
+                    },
+                    FlowScrollDelta::Axis { x, y, .. } => EguiScrollDelta::Point {
                         x: x as f32,
                         y: y as f32,
                     },
@@ -483,28 +506,43 @@ impl DesktopState {
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         let ws = self.focused_workspace();
-        for w in self.space.elements().rev() {
-            let Some(managed) = self.windows.iter().find(|mw| mw.mapped && &mw.window == w) else {
+        for window in self.space.elements().rev() {
+            let Some(managed) = self
+                .windows
+                .iter()
+                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)
+            else {
                 continue;
             };
-            if managed.workspace != ws {
-                continue;
-            }
-            let Some(loc) = self.space.element_location(w) else {
+            let Some(loc) = self.space.element_location(window) else {
                 continue;
             };
-            let bbox = w.bbox_with_popups();
-            let global = Rectangle::from_loc_and_size(bbox.loc + loc, bbox.size);
+            let render_loc = loc - window.geometry().loc;
+            let bbox = window.bbox_with_popups();
+            let global = Rectangle::from_loc_and_size(bbox.loc + render_loc, bbox.size);
             if !global.contains(pos.to_i32_round()) {
                 continue;
             }
-            if let Some((surf, surf_loc)) =
-                w.surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)
-            {
-                let global_surf_origin = surf_loc.to_f64() + loc.to_f64();
-                return Some((surf, global_surf_origin));
-            }
+
+            let surface_under =
+                window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL);
+            let Some((surface, surface_loc)) = (match window.underlying_surface() {
+                WindowSurface::Wayland(toplevel) => {
+                    surface_under.or_else(|| Some((toplevel.wl_surface().clone(), (0, 0).into())))
+                }
+                WindowSurface::X11(x11) => {
+                    let surface_loc = surface_under
+                        .map(|(_, surface_loc)| surface_loc)
+                        .unwrap_or_else(|| (0, 0).into());
+                    x11.wl_surface().map(|surface| (surface, surface_loc))
+                }
+            }) else {
+                continue;
+            };
+
+            return Some((surface, (surface_loc + render_loc).to_f64()));
         }
+
         None
     }
 
@@ -531,6 +569,17 @@ impl DesktopState {
             return;
         };
         let under = self.pointer_surface_under(pos).map(|(s, p)| (s, p));
+        static POINTER_FORWARD_LOGS: AtomicUsize = AtomicUsize::new(0);
+        let seq = POINTER_FORWARD_LOGS.fetch_add(1, Ordering::Relaxed);
+        if seq < 120 {
+            flog(&format!(
+                "Pointer forward pos={:?} target={:?}",
+                pos,
+                under
+                    .as_ref()
+                    .map(|(target, surface_loc)| (target, surface_loc))
+            ));
+        }
         let serial = SERIAL_COUNTER.next_serial();
         pointer.motion(
             self,
@@ -578,6 +627,15 @@ impl DesktopState {
         let mut frame = match delta {
             FlowScrollDelta::Line { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
             FlowScrollDelta::Pixel { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
+            FlowScrollDelta::Axis { source, .. } => {
+                let source = match source {
+                    FlowScrollSource::Finger => AxisSource::Finger,
+                    FlowScrollSource::Continuous => AxisSource::Continuous,
+                    FlowScrollSource::Wheel => AxisSource::Wheel,
+                    FlowScrollSource::WheelTilt => AxisSource::WheelTilt,
+                };
+                AxisFrame::new(time).source(source)
+            }
         };
         match delta {
             FlowScrollDelta::Line { x, y } => {
@@ -596,6 +654,44 @@ impl DesktopState {
                     frame = frame.value(Axis::Vertical, y);
                 }
             }
+            FlowScrollDelta::Axis {
+                x,
+                y,
+                x_v120,
+                y_v120,
+                x_inverted,
+                y_inverted,
+                stop_x,
+                stop_y,
+                ..
+            } => {
+                if x != 0.0 {
+                    if x_inverted {
+                        frame = frame
+                            .relative_direction(Axis::Horizontal, AxisRelativeDirection::Inverted);
+                    }
+                    frame = frame.value(Axis::Horizontal, x);
+                    if let Some(v120) = x_v120 {
+                        frame = frame.v120(Axis::Horizontal, v120);
+                    }
+                }
+                if y != 0.0 {
+                    if y_inverted {
+                        frame = frame
+                            .relative_direction(Axis::Vertical, AxisRelativeDirection::Inverted);
+                    }
+                    frame = frame.value(Axis::Vertical, y);
+                    if let Some(v120) = y_v120 {
+                        frame = frame.v120(Axis::Vertical, v120);
+                    }
+                }
+                if stop_x {
+                    frame = frame.stop(Axis::Horizontal);
+                }
+                if stop_y {
+                    frame = frame.stop(Axis::Vertical);
+                }
+            }
         }
         pointer.axis(self, frame);
         pointer.frame(self);
@@ -606,6 +702,7 @@ impl DesktopState {
             "weston-terminal" | "@terminal" => self.apps.terminal.clone(),
             "google-chrome" | "@browser" => self.apps.browser.clone(),
             "nautilus" | "@files" => flowstate_files_command(),
+            "@settings" | "flowstate-settings" => flowstate_settings_command(),
             other => other.to_string(),
         }
     }
@@ -621,14 +718,13 @@ impl DesktopState {
                 self.mark_redraw();
             }
 
-            UiAction::Custom(id) => {
-                match id {
-                    1004 => self.launch_app(self.apps.browser.clone()),
-                    1005 => self.launch_app(self.apps.terminal.clone()),
-                    1006 => self.launch_app(flowstate_files_command()),
-                    _ => eprintln!("unhandled custom ui action: {id}"),
-                }
-            }
+            UiAction::Custom(id) => match id {
+                1001 => self.launch_app(flowstate_settings_command()),
+                1004 => self.launch_app(self.apps.browser.clone()),
+                1005 => self.launch_app(self.apps.terminal.clone()),
+                1006 => self.launch_app(flowstate_files_command()),
+                _ => eprintln!("unhandled custom ui action: {id}"),
+            },
 
             UiAction::SystemCommand(cmd) => {
                 eprintln!("TODO system command: {:?}", cmd);
@@ -885,10 +981,13 @@ impl DesktopState {
     fn top_mapped_window_id_at(&self, position: Point<f64, Logical>) -> Option<WindowId> {
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
+        let ws = self.focused_workspace();
         self.windows
             .iter()
             .rev()
-            .find(|managed| managed.mapped && managed.bbox().contains((px, py)))
+            .find(|managed| {
+                managed.mapped && managed.workspace == ws && managed.bbox().contains((px, py))
+            })
             .map(|managed| managed.id)
     }
 
@@ -933,6 +1032,9 @@ impl DesktopState {
             if !w.mapped || w.maximized || w.fullscreen || w.minimized {
                 return None;
             }
+            if w.window.x11_surface().is_none() {
+                return None;
+            }
             let bbox = self.space.element_bbox(&w.window)?;
             let edges = resize_edges_at(bbox, px, py, RESIZE_BORDER_PX)?;
             Some((w.id, edges))
@@ -942,9 +1044,7 @@ impl DesktopState {
     fn update_pointer_cursor(&mut self, position: Point<f64, Logical>) {
         if let Some(interaction) = &self.toplevel_pointer {
             let icon = match interaction {
-                ToplevelPointerInteraction::Resize { edges, .. } => {
-                    cursor_for_resize_edges(*edges)
-                }
+                ToplevelPointerInteraction::Resize { edges, .. } => cursor_for_resize_edges(*edges),
                 ToplevelPointerInteraction::Move { .. } => CursorIcon::Move,
             };
             self.cursor_manager.set_icon(icon);
@@ -993,17 +1093,13 @@ impl DesktopState {
     fn focus_window_at(&mut self, position: Point<f64, Logical>) {
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
-
-        // Iterate from top-most to bottom-most.
+        let ws = self.focused_workspace();
         let target_id = self
             .windows
             .iter()
             .rev()
             .find(|managed| {
-                if !managed.mapped {
-                    return false;
-                }
-                managed.bbox().contains((px, py))
+                managed.mapped && managed.workspace == ws && managed.bbox().contains((px, py))
             })
             .map(|managed| managed.id);
 
@@ -1056,6 +1152,8 @@ impl DesktopState {
             xwayland_client: None,
             #[cfg(feature = "xwayland")]
             xwayland_display: None,
+            #[cfg(feature = "xwayland")]
+            xwayland_loop_handle: None,
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
             active_workspace: WorkspaceId(1),
@@ -1066,6 +1164,9 @@ impl DesktopState {
             compositor_state: init.compositor_state,
             render: init.render,
             xdg_shell_state: init.xdg_shell_state,
+            dmabuf_state: init.dmabuf_state,
+            dmabuf_global: None,
+            dmabuf_node: None,
             shm_state: init.shm_state,
             seat_state: init.seat_state,
             output_manager_state: init.output_manager_state,
@@ -1208,27 +1309,50 @@ impl DesktopState {
             return;
         };
 
+        if surface.wl_surface().is_none() {
+            let window = self.windows[idx].window.clone();
+            self.space.unmap_elem(&window);
+            self.windows[idx].mapped = false;
+            flog(&format!(
+                "XWayland map deferred id={:?}: no associated wl_surface yet",
+                id
+            ));
+            self.mark_redraw();
+            return;
+        }
+
         let window = self.windows[idx].window.clone();
+        let requested_geometry = surface.geometry();
+        let output_id = self
+            .output_under_pointer(self.input.pointer_pos)
+            .unwrap_or(self.primary_output);
+        let fallback_output = self.outputs.get(&output_id);
+
         let location = if surface.is_override_redirect() {
-            surface.geometry().loc
+            requested_geometry.loc
         } else {
-            let output_id = self
-                .output_under_pointer(self.input.pointer_pos)
-                .unwrap_or(self.primary_output);
-            self.outputs
-                .get(&output_id)
+            fallback_output
                 .map(|out| (out.logical_origin.x + 100, out.logical_origin.y + 100).into())
                 .unwrap_or_else(|| (100, 100).into())
         };
 
-        self.space
-            .map_element(window.clone(), location, surface.is_override_redirect());
+        window.on_commit();
+        self.space.map_element(window.clone(), location, true);
         self.windows[idx].mapped = true;
 
         if !surface.is_override_redirect() {
-            if let Some(bbox) = self.space.element_bbox(&window) {
-                let _ = surface.configure(bbox);
-            }
+            let configure_size = self
+                .space
+                .element_bbox(&window)
+                .map(|bbox| bbox.size)
+                .filter(|size| size.w > 0 && size.h > 0)
+                .unwrap_or(requested_geometry.size);
+
+            flog(&format!(
+                "XWayland map configure id={:?} requested={:?} size={:?} space_loc={:?}",
+                id, requested_geometry, configure_size, location
+            ));
+            let _ = surface.configure(Some(Rectangle::from_loc_and_size(location, configure_size)));
             self.focus_window_id(id);
         }
 
@@ -1279,6 +1403,18 @@ impl DesktopState {
         self.close_dialog(id);
     }
 
+    /// Import the committed surface tree into the active renderer (during Wayland dispatch).
+    pub fn early_import_surface(&mut self, surface: &WlSurface) {
+        let Some(ctx) = self.portal_dispatch_ctx.as_mut() else {
+            return;
+        };
+        // SAFETY: only called synchronously from `dispatch_clients` while ctx is set.
+        let renderer = unsafe { &mut *ctx.renderer.as_ptr() };
+        if let Err(err) = import_surface_tree(renderer, surface) {
+            flowstate_logging::flog(&format!("early surface import failed: {err:?}"));
+        }
+    }
+
     pub fn handle_commit(&mut self, surface: &WlSurface) {
         dbg_flush("handle_commit hit");
 
@@ -1286,29 +1422,71 @@ impl DesktopState {
 
         let mut to_map: Option<usize> = None;
 
-        for (idx, managed) in self.windows.iter().enumerate() {
-            let mut belongs = false;
-            managed.window.with_surfaces(|s, _| {
-                if s == surface {
-                    belongs = true;
-                }
-            });
+        let mut root = surface.clone();
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
 
-            if belongs {
-                managed.window.on_commit();
+        if let Some(window) = self.window_for_wl_surface(&root) {
+            window.on_commit();
+
+            if !is_sync_subsurface(surface) && &root == surface {
+                let buffer_offset = with_states(surface, |states| {
+                    states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer_delta
+                        .take()
+                });
+                if let Some(buffer_offset) = buffer_offset {
+                    if let Some(current_loc) = self.space.element_location(&window) {
+                        flog(&format!(
+                            "XWayland buffer_delta {:?} for window at {:?}",
+                            buffer_offset, current_loc
+                        ));
+                        self.space
+                            .map_element(window.clone(), current_loc + buffer_offset, false);
+                    }
+                }
+            }
+
+            if let Some(idx) = self
+                .windows
+                .iter()
+                .position(|managed| managed.window == window)
+            {
                 dbg_flush(&format!(
                     "commit matched window idx={idx} (toplevel or subsurface)"
                 ));
                 dbg_flush(&format!(
                     "already in space={}",
-                    self.space.elements().any(|e| e == &managed.window)
+                    self.space.elements().any(|e| e == &window)
                 ));
-                dbg_flush(&format!("managed.mapped={}", managed.mapped));
-
-                if !self.space.elements().any(|e| e == &managed.window) {
+                dbg_flush(&format!("managed.mapped={}", self.windows[idx].mapped));
+                if !self.space.elements().any(|e| e == &window) {
                     to_map = Some(idx);
                 }
-                break;
+            }
+        } else {
+            for (idx, managed) in self.windows.iter().enumerate() {
+                let mut belongs = false;
+                managed.window.with_surfaces(|s, _| {
+                    if s == surface {
+                        belongs = true;
+                    }
+                });
+
+                if belongs {
+                    managed.window.on_commit();
+                    dbg_flush(&format!(
+                        "commit matched window idx={idx} (toplevel or subsurface)"
+                    ));
+                    if !self.space.elements().any(|e| e == &managed.window) {
+                        to_map = Some(idx);
+                    }
+                    break;
+                }
             }
         }
 
@@ -1465,24 +1643,12 @@ impl DesktopState {
             return;
         };
 
-        let Some(idx) = self.windows.iter().position(|w| w.id == focused_id) else {
+        let Some(managed) = self.window(focused_id) else {
             self.focused_window = None;
             return;
         };
 
-        let managed = self.windows.remove(idx);
-        self.space.unmap_elem(&managed.window);
-
-        let next_focus = self.windows.iter().rev().find(|w| w.mapped).map(|w| w.id);
-
-        self.focused_window = None;
-        if let Some(next_id) = next_focus {
-            self.focus_window_id(next_id);
-        } else if let Some(keyboard) = self.seat.get_keyboard() {
-            let serial = SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, Option::<KeyboardFocusTarget>::None, serial);
-        }
-
+        managed.request_close();
         self.mark_redraw();
     }
 
@@ -1519,10 +1685,10 @@ impl DesktopState {
         use smithay::reexports::wayland_server::backend::DisconnectReason;
 
         if let Some(client) = self.xwayland_client.take() {
-            let _ = self.display_handle.backend_handle().kill_client(
-                client.id(),
-                DisconnectReason::ConnectionClosed,
-            );
+            let _ = self
+                .display_handle
+                .backend_handle()
+                .kill_client(client.id(), DisconnectReason::ConnectionClosed);
         }
         self.xwm = None;
         self.xwayland_display = None;
@@ -1565,6 +1731,11 @@ impl DesktopState {
                         child.id(),
                         self.client_wayland_display,
                     ));
+                    if xwayland_display.is_none() && !chrome_like {
+                        flog(
+                            "warning: launched without DISPLAY; X11 apps (Steam/Proton/Wine) need XWayland",
+                        );
+                    }
                     return;
                 }
                 Err(err) => {
@@ -1695,7 +1866,7 @@ impl DesktopState {
                 let delta = pos - *pointer_start;
                 let new_loc = (initial_location.to_f64() + delta).to_i32_round();
                 if let Some(w) = self.window(*window_id) {
-                    self.space.map_element(w.window.clone(), new_loc, true);
+                    self.space.map_element(w.window.clone(), new_loc, false);
                 }
             }
             Some(ToplevelPointerInteraction::Resize {
@@ -1902,12 +2073,39 @@ impl DesktopState {
                 }
 
                 if matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Pressed)
                     && self.peek_ui_action_at_pointer().is_some()
                 {
-                    self.input.pointer_left_down = true;
                     self.clear_client_pointer_focus(position);
-                    let _ = self.click_ui_at_pointer();
+                    match state {
+                        FlowKeyState::Pressed => {
+                            self.input.pointer_left_down = true;
+                            self.ui.pressed = self
+                                .pointer_relative_to_output_logical(self.focused_output)
+                                .and_then(|local| {
+                                    self.ui
+                                        .hit_test(local.x.round() as i32, local.y.round() as i32)
+                                        .map(|el| el.id)
+                                });
+                            let _ = self.click_ui_at_pointer();
+                        }
+                        FlowKeyState::Released => {
+                            self.input.pointer_left_down = false;
+                            self.ui.pressed = None;
+                            self.pending_compositor_move = None;
+                        }
+                    }
+                    self.mark_redraw();
+                    return;
+                }
+
+                if matches!(button, FlowMouseButton::Left)
+                    && matches!(state, FlowKeyState::Released)
+                    && self.ui.pressed.is_some()
+                {
+                    self.input.pointer_left_down = false;
+                    self.ui.pressed = None;
+                    self.pending_compositor_move = None;
+                    self.clear_client_pointer_focus(position);
                     self.mark_redraw();
                     return;
                 }
@@ -1943,8 +2141,6 @@ impl DesktopState {
                 }
                 self.cursor_manager.move_to(position.x, position.y);
                 self.process_toplevel_pointer_motion(position);
-                self.forward_pointer_to_clients(position);
-                self.forward_pointer_button(position, button, state);
                 if matches!(state, FlowKeyState::Pressed) {
                     if matches!(button, FlowMouseButton::Left)
                         && self.pointer_on_chrome_host_drag_region(position)
@@ -1970,6 +2166,7 @@ impl DesktopState {
                                                 && !w.maximized
                                                 && !w.fullscreen
                                                 && !w.minimized
+                                                && w.window.x11_surface().is_some()
                                         })
                                     })
                                     .map(|id| (id, position));
@@ -1977,6 +2174,8 @@ impl DesktopState {
                         }
                     }
                 }
+                self.forward_pointer_to_clients(position);
+                self.forward_pointer_button(position, button, state);
                 self.update_pointer_cursor(position);
                 self.process_toplevel_pointer_button(button, state);
                 self.mark_redraw();
@@ -2224,26 +2423,77 @@ impl DesktopState {
         self.popups.cleanup();
     }
 
+    /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
+    pub fn refresh_space(&mut self) {
+        self.space.refresh();
+    }
+
+    /// Import committed buffers for mapped windows on this output before building render elements.
+    pub fn import_mapped_surfaces_for_output<R>(
+        &self,
+        renderer: &mut R,
+        origin: Point<i32, Logical>,
+        logical_size: Size<i32, Logical>,
+    ) where
+        R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
+        R::TextureId: 'static,
+    {
+        use smithay::backend::renderer::utils::import_surface_tree;
+        use smithay::utils::Rectangle;
+
+        let output_rect = Rectangle::from_loc_and_size(origin, logical_size);
+
+        for window in self.space.elements() {
+            let Some(element_loc) = self.space.element_location(window) else {
+                continue;
+            };
+            let bbox = window.bbox();
+            let global_bbox = Rectangle::from_loc_and_size(
+                (bbox.loc.x + element_loc.x, bbox.loc.y + element_loc.y),
+                bbox.size,
+            );
+            if !global_bbox.overlaps(output_rect) {
+                continue;
+            }
+            let Some(surface) = window.wl_surface() else {
+                continue;
+            };
+            if let Err(err) = import_surface_tree(renderer, &surface) {
+                flowstate_logging::flog(&format!("frame surface import failed: {err:?}"));
+            }
+        }
+    }
+
     pub fn send_frame_callbacks(&mut self, _millis: u32) {
         for surface in self.xdg_shell_state.toplevel_surfaces().iter() {
             Self::send_frames_surface_tree(surface.wl_surface(), _millis);
         }
-    }
 
-    pub fn window_mut(&mut self, id: WindowId) -> Option<&mut ManagedWindow> {
-        self.windows.iter_mut().find(|w| w.id == id)
-    }
+        #[cfg(feature = "xwayland")]
+        {
+            let time = Duration::from_millis(_millis.into());
+            let fallback_output = self
+                .outputs
+                .get(&self.focused_output)
+                .or_else(|| self.outputs.get(&self.primary_output))
+                .map(|output| output.handle.clone());
 
-    pub fn window(&self, id: WindowId) -> Option<&ManagedWindow> {
-        self.windows.iter().find(|w| w.id == id)
-    }
+            for window in self.space.elements() {
+                if window.x11_surface().is_none() {
+                    continue;
+                }
 
-    pub fn window_id_for_wl_surface(&self, surface: &WlSurface) -> Option<WindowId> {
-        self.windows.iter().find_map(|w| {
-            w.wl_surface()
-                .as_ref()
-                .and_then(|wl| if &**wl == surface { Some(w.id) } else { None })
-        })
+                let mut outputs = self.space.outputs_for_element(window);
+                if outputs.is_empty() {
+                    if let Some(output) = fallback_output.clone() {
+                        outputs.push(output);
+                    }
+                }
+                for output in outputs {
+                    window.send_frame(&output, time, None, |_, _| None);
+                }
+            }
+        }
     }
 
     fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
@@ -2264,6 +2514,22 @@ impl DesktopState {
             },
             |_, _, &()| true,
         );
+    }
+
+    pub fn window_mut(&mut self, id: WindowId) -> Option<&mut ManagedWindow> {
+        self.windows.iter_mut().find(|w| w.id == id)
+    }
+
+    pub fn window(&self, id: WindowId) -> Option<&ManagedWindow> {
+        self.windows.iter().find(|w| w.id == id)
+    }
+
+    pub fn window_id_for_wl_surface(&self, surface: &WlSurface) -> Option<WindowId> {
+        self.windows.iter().find_map(|w| {
+            w.wl_surface()
+                .as_ref()
+                .and_then(|wl| if &**wl == surface { Some(w.id) } else { None })
+        })
     }
 
     pub fn window_id_for_toplevel(&self, surface: &ToplevelSurface) -> Option<WindowId> {
@@ -2421,6 +2687,18 @@ fn flowstate_files_command() -> String {
         .filter(|path| path.exists())
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "flowstate-files".to_string())
+}
+
+fn flowstate_settings_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("flowstate-settings"))
+        })
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "flowstate-settings".to_string())
 }
 
 fn configure_chrome_command(command: &mut Command) {

@@ -1,7 +1,5 @@
+use crate::builtins::{builtin_theme, classic_theme, eagle_theme, moonbase_theme};
 use serde::{Deserialize, Serialize};
-use crate::builtins::{eagle_theme, moonbase_theme, classic_theme, builtin_theme};
-
-
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BuiltInThemeId {
@@ -84,7 +82,7 @@ pub struct TextTheme {
     pub dim: [f32; 4],
     pub accent: [f32; 4],
     pub meta_label: [f32; 4],
-    pub meta_value: [f32; 4],  
+    pub meta_value: [f32; 4],
     pub clock: [f32; 4],
 }
 

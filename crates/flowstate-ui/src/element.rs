@@ -1,9 +1,8 @@
+use crate::UiVisualState;
 use crate::atlas::IconId;
 use crate::types::{ElementId, UiAction, UiElementKind};
-use crate::UiVisualState;
 use smithay::utils::Logical;
- use smithay::utils::Rectangle;
-
+use smithay::utils::Rectangle;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UiRect {
@@ -15,10 +14,7 @@ pub struct UiRect {
 
 impl UiRect {
     pub fn contains(&self, px: i32, py: i32) -> bool {
-        px >= self.x
-            && px < self.x + self.w
-            && py >= self.y
-            && py < self.y + self.h
+        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
     }
 }
 
@@ -32,7 +28,6 @@ impl From<Rectangle<i32, Logical>> for UiRect {
         }
     }
 }
-
 
 #[derive(Debug, Clone)]
 pub struct UiElement {
@@ -48,8 +43,8 @@ pub struct UiElement {
     pub hovered: bool,
     pub active: bool,
     pub selected: bool,
-    pub hover_scale: f32,   // e.g. 1.10
-    pub press_scale: f32,   // e.g. 0.96
+    pub hover_scale: f32, // e.g. 1.10
+    pub press_scale: f32, // e.g. 0.96
 }
 
 impl UiElement {
@@ -67,19 +62,19 @@ impl UiElement {
         }
     }
     pub fn visual_state_for_element(el: &UiElement, selected: bool) -> UiVisualState {
-    if !el.enabled {
-        UiVisualState::Disabled
-    } else if el.active {
-        UiVisualState::Active
-    } else if selected {
-        UiVisualState::Selected
-    } else if el.hovered {
-        UiVisualState::Hover
-    } else {
-        UiVisualState::Inactive
+        if !el.enabled {
+            UiVisualState::Disabled
+        } else if el.active {
+            UiVisualState::Active
+        } else if selected {
+            UiVisualState::Selected
+        } else if el.hovered {
+            UiVisualState::Hover
+        } else {
+            UiVisualState::Inactive
+        }
     }
-}
-pub fn new(
+    pub fn new(
         id: ElementId,
         _bounds: UiRect,
         kind: UiElementKind,
@@ -108,7 +103,6 @@ pub fn new(
         icon: IconId,
         tooltip: impl Into<String>,
         action: UiAction,
-        
     ) -> Self {
         Self {
             id,
@@ -124,14 +118,11 @@ pub fn new(
             active: false,
             selected: false,
             hover_scale: 1.10,
-            press_scale: 0.96,        }
+            press_scale: 0.96,
+        }
     }
 
-    pub fn topbar_indicator(
-        id: ElementId,
-        icon: IconId,
-        tooltip: impl Into<String>,
-    ) -> Self {
+    pub fn topbar_indicator(id: ElementId, icon: IconId, tooltip: impl Into<String>) -> Self {
         Self {
             id,
             kind: UiElementKind::TopbarIndicator,

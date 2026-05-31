@@ -91,6 +91,7 @@ impl ChromeShaders {
                     UniformName::new("u_highlight_strength", UniformType::_1f),
                     UniformName::new("u_tint", UniformType::_4f),
                     UniformName::new("u_edge_color", UniformType::_4f),
+                    UniformName::new("u_time", UniformType::_1f),
                 ],
             )?);
         }

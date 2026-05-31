@@ -119,7 +119,10 @@ mod tests {
             resize_edges_at(rect, 299, 199, 8),
             Some(ResizeEdgeMask::BOTTOM | ResizeEdgeMask::RIGHT)
         );
-        assert_eq!(resize_edges_at(rect, 200, 100, 8), Some(ResizeEdgeMask::TOP));
+        assert_eq!(
+            resize_edges_at(rect, 200, 100, 8),
+            Some(ResizeEdgeMask::TOP)
+        );
         assert_eq!(resize_edges_at(rect, 150, 150, 8), None);
     }
 }
@@ -155,15 +158,29 @@ pub(crate) enum ResizeSurfaceState {
 }
 
 impl ResizeSurfaceState {
-    pub fn set_resizing(surface: &WlSurface, edges: ResizeEdgeMask, initial_rect: Rectangle<i32, Logical>) {
+    pub fn set_resizing(
+        surface: &WlSurface,
+        edges: ResizeEdgeMask,
+        initial_rect: Rectangle<i32, Logical>,
+    ) {
         Self::with(surface, |state| {
-            *state = ResizeSurfaceState::Resizing { edges, initial_rect };
+            *state = ResizeSurfaceState::Resizing {
+                edges,
+                initial_rect,
+            };
         });
     }
 
-    pub fn set_waiting_for_commit(surface: &WlSurface, edges: ResizeEdgeMask, initial_rect: Rectangle<i32, Logical>) {
+    pub fn set_waiting_for_commit(
+        surface: &WlSurface,
+        edges: ResizeEdgeMask,
+        initial_rect: Rectangle<i32, Logical>,
+    ) {
         Self::with(surface, |state| {
-            *state = ResizeSurfaceState::WaitingForLastCommit { edges, initial_rect };
+            *state = ResizeSurfaceState::WaitingForLastCommit {
+                edges,
+                initial_rect,
+            };
         });
     }
 
@@ -172,17 +189,30 @@ impl ResizeSurfaceState {
         F: FnOnce(&mut Self) -> T,
     {
         compositor::with_states(surface, |states| {
-            states.data_map.insert_if_missing(|| RefCell::new(ResizeSurfaceState::Idle));
-            let cell = states.data_map.get::<RefCell<ResizeSurfaceState>>().unwrap();
+            states
+                .data_map
+                .insert_if_missing(|| RefCell::new(ResizeSurfaceState::Idle));
+            let cell = states
+                .data_map
+                .get::<RefCell<ResizeSurfaceState>>()
+                .unwrap();
             f(&mut cell.borrow_mut())
         })
     }
 
     /// Called from the surface commit handler; matches smallvil's `ResizeSurfaceState::commit`.
-    pub fn on_surface_commit(surface: &WlSurface) -> Option<(ResizeEdgeMask, Rectangle<i32, Logical>)> {
+    pub fn on_surface_commit(
+        surface: &WlSurface,
+    ) -> Option<(ResizeEdgeMask, Rectangle<i32, Logical>)> {
         Self::with(surface, |state| match *state {
-            ResizeSurfaceState::Resizing { edges, initial_rect } => Some((edges, initial_rect)),
-            ResizeSurfaceState::WaitingForLastCommit { edges, initial_rect } => {
+            ResizeSurfaceState::Resizing {
+                edges,
+                initial_rect,
+            } => Some((edges, initial_rect)),
+            ResizeSurfaceState::WaitingForLastCommit {
+                edges,
+                initial_rect,
+            } => {
                 *state = ResizeSurfaceState::Idle;
                 Some((edges, initial_rect))
             }

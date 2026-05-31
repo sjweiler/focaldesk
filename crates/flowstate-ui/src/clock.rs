@@ -1,20 +1,17 @@
-use crate::uicomponent::UiComponent;
-use crate::uicomponent::LayoutCtx;
 use crate::element::UiElement;
-use smithay::backend::renderer::gles::GlesFrame;
+use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
-use flowstate_themes::FlowTheme;
-use smithay::utils::Rectangle;
-use smithay::utils::Physical;
-use smithay::utils::Point;
-use smithay::utils::Logical;
+use crate::uicomponent::UiComponent;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
+use flowstate_themes::FlowTheme;
 use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
-
-
-
+use smithay::backend::renderer::gles::GlesFrame;
+use smithay::utils::Logical;
+use smithay::utils::Physical;
+use smithay::utils::Point;
+use smithay::utils::Rectangle;
 
 #[derive(Debug, Clone)]
 pub enum ClockHourFormat {
@@ -37,7 +34,12 @@ impl Default for ClockComponent {
             hour_format: ClockHourFormat::Twelve,
             show_seconds: false,
             show_date: false,
-            bounds: crate::element::UiRect { x: 0, y: 0, w: 1, h: 1 },
+            bounds: crate::element::UiRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
             elements: Vec::new(),
         }
     }
@@ -63,7 +65,7 @@ impl ClockComponent {
             }
         }
     }
-    
+
     pub fn format_date(&self, now: chrono::DateTime<chrono::Local>) -> Option<String> {
         if self.show_date {
             Some(now.format("%b %-d, %Y").to_string())
@@ -78,9 +80,8 @@ impl UiComponent for ClockComponent {
         // clock layout
     }
 
-    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit>
-    {
-       for element in self.elements.iter().rev() {
+    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
+        for element in self.elements.iter().rev() {
             if element.bounds.contains(point.x, point.y) {
                 return Some(UiHit {
                     target: UiHitTarget::TopBar,
@@ -90,12 +91,11 @@ impl UiComponent for ClockComponent {
             }
         }
 
-        None 
+        None
     }
-    
+
     fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // temporary no-op is fine
         Ok(())
     }
 }
-

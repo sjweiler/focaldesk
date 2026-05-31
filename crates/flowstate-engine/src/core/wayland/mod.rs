@@ -1,6 +1,7 @@
 pub mod client;
 pub mod compositor;
 pub mod data_device;
+pub mod dmabuf;
 pub mod output;
 pub mod portal_capture;
 pub mod seat;

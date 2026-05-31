@@ -17,6 +17,7 @@ use smithay::backend::renderer::ImportMem;
 use smithay::backend::renderer::Texture;
 use smithay::desktop::Space;
 use smithay::desktop::Window;
+use smithay::output::Output;
 use smithay::utils::Buffer;
 use smithay::utils::Transform;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
@@ -63,6 +64,8 @@ use flowstate_ui::{UiVisualState, UiVisualStyle};
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
 use smithay::backend::renderer::gles::Uniform;
+#[cfg(feature = "xwayland")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 //use crate::core::chrome_svg::ChromeSvgCache;
 
@@ -73,6 +76,9 @@ render_elements! {
     pub FlowRenderElement<=GlesRenderer>;
     Surface=WaylandSurfaceRenderElement<GlesRenderer>,
 }
+
+#[cfg(feature = "xwayland")]
+static XWAYLAND_RENDER_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Debug)]
 pub struct FrameCtx {
@@ -1270,6 +1276,25 @@ impl RenderState {
             theme.wallpaper.clone(),
         );
 
+        // Work-area glass must sit under client surfaces (trim/icons stay above).
+        if let Some(glass) = self.chrome_shaders.glass.as_ref() {
+            let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
+            let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
+                Point::<i32, Physical>::from((0, 0)),
+                Size::<i32, Physical>::from(inputs.ctx.output_size),
+            );
+            let damage = &[fullscreen_rect];
+            self.draw_workarea_glass(
+                frame,
+                inputs.ctx,
+                glass,
+                inputs.layout.work_area.glass,
+                inputs.ctx.output_scale,
+                damage,
+                &legacy_theme.glass,
+            )?;
+        }
+
         self.draw_clients(
             frame,
             inputs.ctx,
@@ -1894,68 +1919,98 @@ impl RenderState {
             .unwrap();
     }
 
-    pub fn build_client_elements(
+    /// Build client render elements for one output using smithay's Space region logic.
+    ///
+    /// Must run while the GLES renderer is current (during an active `GlesFrame`), so dmabuf
+    /// textures are imported at draw time rather than during Wayland dispatch.
+    pub fn build_client_elements_for_output(
         &mut self,
         space: &Space<Window>,
         windows: &[ManagedWindow],
         active_workspace: WorkspaceId,
-        origin: Point<i32, smithay::utils::Logical>,
-        logical_size: Size<i32, Logical>,
+        output: &Output,
+        layers_on: Option<&Output>,
         renderer: &mut GlesRenderer,
-        ctx: &FrameCtx,
-        layers_on: Option<&smithay::output::Output>,
     ) -> Vec<FlowRenderElement> {
         use smithay::backend::renderer::element::AsRenderElements;
-        use smithay::utils::{Logical, Physical, Point, Rectangle, Scale};
+        use smithay::utils::{Logical, Point, Rectangle, Scale};
 
+        let Some(region) = space.output_geometry(output) else {
+            flog("build_client_elements_for_output: output not mapped in Space");
+            return Vec::new();
+        };
+
+        let scale = output.current_scale().fractional_scale();
         let mut out = Vec::new();
 
-        let output_rect = Rectangle::<i32, Logical>::from_loc_and_size(origin, logical_size);
+        let on_workspace: std::collections::HashSet<_> = windows
+            .iter()
+            .filter(|mw| mw.mapped && mw.workspace == active_workspace)
+            .map(|mw| &mw.window)
+            .collect();
 
         for window in space.elements() {
-            let Some(managed) = windows.iter().find(|mw| mw.mapped && &mw.window == window) else {
-                continue;
-            };
-
-            if managed.workspace != active_workspace {
+            if !on_workspace.contains(window) {
                 continue;
             }
 
-            let Some(global_loc) = space.element_location(window) else {
-                continue;
-            };
-
-            // Window bbox is local-to-window-space; move it into global desktop space.
-            let bbox = window.bbox();
-            let global_bbox = Rectangle::from_loc_and_size(
-                (bbox.loc.x + global_loc.x, bbox.loc.y + global_loc.y),
-                bbox.size,
-            );
-
-            if !global_bbox.overlaps(output_rect) {
+            let geometry = space
+                .element_geometry(window)
+                .unwrap_or_else(|| window.bbox());
+            if !region.overlaps(geometry) {
                 continue;
             }
 
-            // Convert desktop-global position into this output's local coordinate space.
-            let local_loc = global_loc - origin;
+            window.on_commit();
 
-            let render_pos = local_loc.to_physical_precise_round(ctx.output_scale);
+            let render_loc = space
+                .element_location(window)
+                .map(|element_loc| {
+                    let geo = window.geometry();
+                    Point::<i32, Logical>::from((
+                        element_loc.x - geo.loc.x,
+                        element_loc.y - geo.loc.y,
+                    ))
+                })
+                .unwrap_or(Point::from((0, 0)));
 
-            out.extend(window.render_elements::<FlowRenderElement>(
+            let location = render_loc - region.loc;
+            let render_pos = location.to_physical_precise_round(scale);
+
+            let elems = window.render_elements::<FlowRenderElement>(
                 renderer,
                 render_pos,
-                ctx.output_scale,
+                Scale::from(scale),
                 1.0,
-            ));
+            );
+
+            #[cfg(feature = "xwayland")]
+            if window.x11_surface().is_some() {
+                if let Some(managed) = windows.iter().find(|mw| &mw.window == window) {
+                    let seq = XWAYLAND_RENDER_LOGS.fetch_add(1, Ordering::Relaxed);
+                    if seq < 300 {
+                        flog(&format!(
+                            "XWayland render id={:?} title={:?} region={:?} render_pos={:?} elems={}",
+                            managed.id,
+                            managed.title(),
+                            region,
+                            render_pos,
+                            elems.len()
+                        ));
+                    }
+                }
+            }
+
+            out.extend(elems);
         }
 
         if let Some(out_handle) = layers_on {
             crate::core::portal::push_layer_elements_for_output(
                 renderer,
                 out_handle,
-                origin,
-                logical_size,
-                ctx.output_scale,
+                region.loc,
+                region.size,
+                Scale::from(scale),
                 &mut out,
             );
         }
@@ -2389,7 +2444,7 @@ impl RenderState {
         }
     }
 
-    /// Work trim, glass tint, and chrome icons — drawn above client surfaces.
+    /// Work trim and chrome icons — drawn above client surfaces (glass is under clients).
     fn draw_chrome_trim_glass_icons(
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
@@ -2412,12 +2467,6 @@ impl RenderState {
             .clone()
             .expect("beveled_panel shader not compiled");
 
-        let glass = self
-            .chrome_shaders
-            .glass
-            .as_ref()
-            .expect("glass shader not compiled");
-
         let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
             Point::<i32, Physical>::from((0, 0)),
             Size::<i32, Physical>::from(ctx.output_size),
@@ -2434,16 +2483,6 @@ impl RenderState {
                 &legacy_theme.trim,
             );
         }
-
-        self.draw_workarea_glass(
-            frame,
-            ctx,
-            glass,
-            layout.work_area.glass,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.glass,
-        );
 
         self.draw_active_lightbar(frame, ctx, layout);
 

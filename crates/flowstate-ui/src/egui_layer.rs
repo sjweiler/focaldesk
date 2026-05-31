@@ -3,9 +3,9 @@
 use std::{mem, sync::Arc};
 
 use egui::{
-    epaint::Primitive, ClippedPrimitive, Context, Event, FontData, FontDefinitions, FontFamily,
-    ImageData, Modifiers, MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TextureId,
-    TexturesDelta, Vec2,
+    ClippedPrimitive, Context, Event, FontData, FontDefinitions, FontFamily, ImageData, Modifiers,
+    MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TextureId, TexturesDelta, Vec2,
+    epaint::Primitive,
 };
 use egui_glow::Painter;
 use flowstate_themes::FlowTheme;
@@ -473,8 +473,7 @@ impl EguiLayer {
     }
 
     fn prepare_raw_input(&mut self, frame_ctx: &DesktopFrameCtx) {
-        self.screen_height_pts =
-            (frame_ctx.output_size.1 as f32) / frame_ctx.output_scale.y as f32;
+        self.screen_height_pts = (frame_ctx.output_size.1 as f32) / frame_ctx.output_scale.y as f32;
         self.raw_input
             .viewports
             .entry(self.raw_input.viewport_id)

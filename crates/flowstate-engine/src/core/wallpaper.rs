@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, Copy)]
 pub enum WallpaperMode {
-    Fill,     // cover
-    Fit,      // contain
+    Fill, // cover
+    Fit,  // contain
     Stretch,
     Center,
 }
@@ -35,10 +35,17 @@ pub struct Blit {
     pub uv: Uv,
 }
 
-fn clamp01(x: f32) -> f32 { x.max(0.0).min(1.0) }
+fn clamp01(x: f32) -> f32 {
+    x.max(0.0).min(1.0)
+}
 
 fn uv_full() -> Uv {
-    Uv { u0: 0.0, v0: 0.0, u1: 1.0, v1: 1.0 }
+    Uv {
+        u0: 0.0,
+        v0: 0.0,
+        u1: 1.0,
+        v1: 1.0,
+    }
 }
 
 pub fn compute_wallpaper_blit(src: SizeI, out: RectI, mode: WallpaperMode) -> Option<Blit> {
@@ -52,7 +59,10 @@ pub fn compute_wallpaper_blit(src: SizeI, out: RectI, mode: WallpaperMode) -> Op
     let oh = out.h as f32;
 
     match mode {
-        WallpaperMode::Stretch => Some(Blit { dst: out, uv: uv_full() }),
+        WallpaperMode::Stretch => Some(Blit {
+            dst: out,
+            uv: uv_full(),
+        }),
 
         WallpaperMode::Fit => {
             // contain
@@ -61,7 +71,15 @@ pub fn compute_wallpaper_blit(src: SizeI, out: RectI, mode: WallpaperMode) -> Op
             let dh = (sh * s).round() as i32;
             let dx = out.x + (out.w - dw) / 2;
             let dy = out.y + (out.h - dh) / 2;
-            Some(Blit { dst: RectI { x: dx, y: dy, w: dw, h: dh }, uv: uv_full() })
+            Some(Blit {
+                dst: RectI {
+                    x: dx,
+                    y: dy,
+                    w: dw,
+                    h: dh,
+                },
+                uv: uv_full(),
+            })
         }
 
         WallpaperMode::Fill => {
@@ -78,7 +96,10 @@ pub fn compute_wallpaper_blit(src: SizeI, out: RectI, mode: WallpaperMode) -> Op
             let u1 = clamp01((cx + cw) / sw);
             let v1 = clamp01((cy + ch) / sh);
 
-            Some(Blit { dst: out, uv: Uv { u0, v0, u1, v1 } })
+            Some(Blit {
+                dst: out,
+                uv: Uv { u0, v0, u1, v1 },
+            })
         }
 
         WallpaperMode::Center => {
@@ -97,7 +118,12 @@ pub fn compute_wallpaper_blit(src: SizeI, out: RectI, mode: WallpaperMode) -> Op
             let v1 = (cy + dh) as f32 / sh;
 
             Some(Blit {
-                dst: RectI { x: dx, y: dy, w: dw, h: dh },
+                dst: RectI {
+                    x: dx,
+                    y: dy,
+                    w: dw,
+                    h: dh,
+                },
                 uv: Uv { u0, v0, u1, v1 },
             })
         }

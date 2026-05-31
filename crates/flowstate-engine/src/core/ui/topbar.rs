@@ -34,10 +34,7 @@ pub struct TopBarLayout {
     pub system: Rectangle<f64, Logical>,
 }
 
-pub fn compute_topbar_layout(
-    output_size: Size<f64, Logical>,
-    cfg: &TopBarConfig,
-) -> TopBarLayout {
+pub fn compute_topbar_layout(output_size: Size<f64, Logical>, cfg: &TopBarConfig) -> TopBarLayout {
     let outer = Rectangle::new(
         Point::from((0.0, 0.0)),
         Size::from((output_size.w, cfg.height)),
@@ -69,21 +66,14 @@ pub fn compute_topbar_layout(
     }
 }
 
-fn logical_rect_to_physical(
-    rect: Rectangle<f64, Logical>,
-    scale: f64,
-) -> Rectangle<i32, Physical> {
+fn logical_rect_to_physical(rect: Rectangle<f64, Logical>, scale: f64) -> Rectangle<i32, Physical> {
     Rectangle::new(
         rect.loc.to_physical(scale).to_i32_round(),
         rect.size.to_physical(scale).to_i32_round(),
     )
 }
 
-pub fn draw_topbar(
-    frame: &mut impl QuadRenderer,
-    layout: &TopBarLayout,
-    scale: f64,
-) {
+pub fn draw_topbar(frame: &mut impl QuadRenderer, layout: &TopBarLayout, scale: f64) {
     let outer_style = ResolvedPanelStyle::from_logical(
         PanelStyle {
             shadow_extent: 6.0,
@@ -106,15 +96,15 @@ pub fn draw_topbar(
             ..Default::default()
         },
         PanelPalette {
-            body:         [0.08, 0.09, 0.11, 0.96],
-            body_top:     [0.18, 0.20, 0.24, 0.10],
-            body_bottom:  [0.00, 0.00, 0.00, 0.16],
+            body: [0.08, 0.09, 0.11, 0.96],
+            body_top: [0.18, 0.20, 0.24, 0.10],
+            body_bottom: [0.00, 0.00, 0.00, 0.16],
             outer_border: [0.02, 0.03, 0.04, 0.95],
-            inner_line:   [0.45, 0.50, 0.58, 0.10],
-            accent:       [0.24, 0.62, 0.98, 0.55],
-            shadow:       [0.00, 0.00, 0.00, 0.14],
-            bracket:      [0.28, 0.32, 0.38, 0.18],
-            specular:     [0.90, 0.94, 1.00, 0.03],
+            inner_line: [0.45, 0.50, 0.58, 0.10],
+            accent: [0.24, 0.62, 0.98, 0.55],
+            shadow: [0.00, 0.00, 0.00, 0.14],
+            bracket: [0.28, 0.32, 0.38, 0.18],
+            specular: [0.90, 0.94, 1.00, 0.03],
         },
         scale,
     );
@@ -153,7 +143,10 @@ fn draw_slot_dividers(
     for i in 1..count {
         let x = inner.loc.x + slot_w * i;
         frame.fill_rect(
-            Rectangle::new((x, inner.loc.y + 4).into(), (divider_w, inner.size.h - 8).into()),
+            Rectangle::new(
+                (x, inner.loc.y + 4).into(),
+                (divider_w, inner.size.h - 8).into(),
+            ),
             [0.40, 0.46, 0.54, 0.12],
         );
     }

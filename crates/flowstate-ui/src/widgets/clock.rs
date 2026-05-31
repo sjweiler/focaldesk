@@ -1,11 +1,6 @@
 use smithay::backend::renderer::gles::GlesTexture;
 use std::time::Instant;
 
-
-
-
-
-
 pub struct ClockWidget {
     pub texture: Option<GlesTexture>,
     pub last_string: String,

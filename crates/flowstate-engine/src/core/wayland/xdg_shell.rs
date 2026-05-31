@@ -12,8 +12,8 @@ use smithay::wayland::shell::xdg::{
 use wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
 use wayland_server::protocol::{wl_output, wl_seat, wl_surface};
 
-use crate::core::focus::KeyboardFocusTarget;
 use crate::core::desktop::DesktopState;
+use crate::core::focus::KeyboardFocusTarget;
 use flowstate_logging::flog;
 use flowstate_types::WindowId;
 
@@ -25,9 +25,9 @@ impl XdgShellHandler for DesktopState {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         self.add_xdg_toplevel(surface.clone());
         surface.with_pending_state(|state| {
-            state.states.set(
-                wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated,
-            );
+            state
+                .states
+                .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
             state.size = Some((1280, 720).into());
         });
         surface.send_configure();
@@ -103,7 +103,11 @@ impl XdgShellHandler for DesktopState {
         }
     }
 
-    fn fullscreen_request(&mut self, surface: ToplevelSurface, output: Option<wl_output::WlOutput>) {
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        output: Option<wl_output::WlOutput>,
+    ) {
         if let Some(id) = self.window_id_for_toplevel(&surface) {
             self.request_fullscreen(id);
         }
@@ -111,7 +115,12 @@ impl XdgShellHandler for DesktopState {
 
     fn ack_configure(&mut self, _surface: wl_surface::WlSurface, _configure: Configure) {}
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             let geometry = positioner.get_geometry();
             state.geometry = geometry;

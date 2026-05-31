@@ -1,13 +1,10 @@
-use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache,
-};
+use cosmic_text::{Attrs, Buffer, Family, FontSystem, Metrics, Shaping, SwashCache};
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 
 pub struct TextSystem {
     pub font_system: FontSystem,
     pub swash_cache: SwashCache,
 }
-
 
 pub fn rasterize_text_to_texture(
     _renderer: &mut GlesRenderer,

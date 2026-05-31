@@ -32,9 +32,9 @@ pub enum Scope {
 /// “Why did this happen?” helps enforce “no focus theft”.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Intent {
-    User,      // keyboard shortcut, click, selection
-    System,    // hardware change, output hotplug, app event
-    App,       // client request (should rarely cause focus changes)
+    User,   // keyboard shortcut, click, selection
+    System, // hardware change, output hotplug, app event
+    App,    // client request (should rarely cause focus changes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +71,6 @@ pub enum FlowEvent {
         slot: u8,
         intent: Intent,
     },
-
 
     // --- System indicators (top bar) ---
     NetworkRouteChanged {

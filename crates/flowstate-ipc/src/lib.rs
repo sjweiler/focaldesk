@@ -9,13 +9,8 @@ pub const SOCKET_PATH: &str = "/tmp/flowstate-settings.sock";
 #[serde(tag = "type")]
 pub enum IpcRequest {
     GetAll,
-    SetValue {
-        path: String,
-        value: Value,
-    },
-    SetDisplays {
-        outputs: Vec<OutputConfig>,
-    },
+    SetValue { path: String, value: Value },
+    SetDisplays { outputs: Vec<OutputConfig> },
     IdentifyDisplays,
     Reload,
 }

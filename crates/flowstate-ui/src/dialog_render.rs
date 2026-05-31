@@ -4,9 +4,9 @@ use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesPixelProgram, Uniform};
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size};
 
+use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::Dialog;
 use crate::dialog_layout::DialogLayout;
-use crate::desktop_frame::DesktopFrameCtx;
 
 pub fn draw_solid_rect(
     frame: &mut GlesFrame<'_, '_>,
@@ -56,7 +56,10 @@ pub fn draw_rounded_rect(
         Some(damage),
         1.0,
         &[
-            Uniform::new("u_size", [rect_physical.size.w as f32, rect_physical.size.h as f32]),
+            Uniform::new(
+                "u_size",
+                [rect_physical.size.w as f32, rect_physical.size.h as f32],
+            ),
             Uniform::new("u_radius", radius * scale.x as f32),
             Uniform::new("u_color", color),
         ],
@@ -73,8 +76,7 @@ pub fn draw_dialog(
     theme: &FlowTheme,
 ) -> Result<(), GlesError> {
     let output_pixels = Size::<i32, Physical>::from(frame_ctx.output_size);
-    let fb_physical =
-        Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_pixels);
+    let fb_physical = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_pixels);
     let damage = frame_ctx.fullscreen_damage();
 
     let dim = theme.dialog.overlay_dim;

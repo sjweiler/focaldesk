@@ -1,15 +1,11 @@
 // crates/flowstate-engine/src/core/ui.rs
 //use flowstate_ui::widgets::ClockCache;
-use std::marker::PhantomData;
 use std::collections::HashMap;
+use std::marker::PhantomData;
 //use crate::core::chrome_sdf::{SdfBeveledPanel, SdfLightChannel};
 use smithay::backend::renderer::gles::GlesRenderer;
 
-use flowstate_ui::{
-    chrome::Chrome,
-    text::TextSystem,
-    widgets::ClockCache,
-};
+use flowstate_ui::{chrome::Chrome, text::TextSystem, widgets::ClockCache};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeCacheKey {
@@ -33,17 +29,15 @@ impl ChromeCacheState {
     }
 }
 
-
 pub struct UiState<Tex: 'static> {
     pub chrome: Chrome,
     pub launcher_open: bool,
     pub text: flowstate_ui::text::TextSystem,
     pub clock: flowstate_ui::chrome::ClockCache,
-   // pub sdf_light: Option<SdfLightChannel>,
-   // pub sdf_panel: Option<SdfBeveledPanel>,
-    pub chrome_cache: ChromeCacheState, 
+    // pub sdf_light: Option<SdfLightChannel>,
+    // pub sdf_panel: Option<SdfBeveledPanel>,
+    pub chrome_cache: ChromeCacheState,
     // pub icons: IconCache<...>
-    
     _phantom: PhantomData<Tex>,
 }
 
@@ -53,14 +47,18 @@ impl<Tex: 'static> UiState<Tex> {
     }
     pub fn bootstrap() -> Self {
         Self::new(
-            Chrome::new(flowstate_ui::chrome::ChromeMetrics::default()),      // or Chrome::default()
-            TextSystem::new(),    // or TextSystem::default(),
-            ClockCache::new(),    // or ClockCache::default(),
+            Chrome::new(flowstate_ui::chrome::ChromeMetrics::default()), // or Chrome::default()
+            TextSystem::new(), // or TextSystem::default(),
+            ClockCache::new(), // or ClockCache::default(),
             ChromeCacheState::new(),
-
         )
     }
-    pub fn new(chrome: Chrome, text: TextSystem, clock: ClockCache, chrome_cache: ChromeCacheState) -> Self {
+    pub fn new(
+        chrome: Chrome,
+        text: TextSystem,
+        clock: ClockCache,
+        chrome_cache: ChromeCacheState,
+    ) -> Self {
         Self {
             chrome,
             text,
@@ -91,5 +89,3 @@ impl<Tex: 'static> UiState<Tex> {
         self.chrome.sidebar_tex = None;
     }*/
 }
-
-

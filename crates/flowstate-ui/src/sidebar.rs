@@ -1,19 +1,15 @@
 use crate::chrome_layout::ChromeLayout;
 use crate::element::UiElement;
 use crate::element::UiRect;
-use crate::uicomponent::UiComponent;
 use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
-use smithay::utils::Point;
-use smithay::utils::Logical;
+use crate::uicomponent::UiComponent;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
 use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
-
-
-
-
+use smithay::utils::Logical;
+use smithay::utils::Point;
 
 pub struct SideBar {
     pub buttons: Vec<UiElement>,
@@ -27,7 +23,12 @@ impl Default for SideBar {
         Self {
             buttons: Vec::new(),
             workspace_buttons: Vec::new(),
-            bounds: UiRect { x: 0, y: 0, w: 1, h: 1 },
+            bounds: UiRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
             elements: Vec::new(),
         }
     }
@@ -44,9 +45,8 @@ impl UiComponent for SideBar {
         self.bounds = ctx.screen.into();
     }
 
-   fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit>
-   {
-       for element in self.elements.iter().rev() {
+    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
+        for element in self.elements.iter().rev() {
             if element.bounds.contains(point.x, point.y) {
                 return Some(UiHit {
                     target: UiHitTarget::SideBar,
@@ -56,8 +56,8 @@ impl UiComponent for SideBar {
             }
         }
 
-        None 
-   }
+        None
+    }
 
     fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {
         // existing or temporary no-op

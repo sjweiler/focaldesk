@@ -73,21 +73,14 @@ pub fn compute_sidebar_layout(
     }
 }
 
-fn logical_rect_to_physical(
-    rect: Rectangle<f64, Logical>,
-    scale: f64,
-) -> Rectangle<i32, Physical> {
+fn logical_rect_to_physical(rect: Rectangle<f64, Logical>, scale: f64) -> Rectangle<i32, Physical> {
     Rectangle::new(
         rect.loc.to_physical(scale).to_i32_round(),
         rect.size.to_physical(scale).to_i32_round(),
     )
 }
 
-pub fn draw_sidebar(
-    frame: &mut impl QuadRenderer,
-    layout: &SideBarLayout,
-    scale: f64,
-) {
+pub fn draw_sidebar(frame: &mut impl QuadRenderer, layout: &SideBarLayout, scale: f64) {
     let outer_style = ResolvedPanelStyle::from_logical(
         PanelStyle {
             shadow_extent: 8.0,
@@ -99,15 +92,15 @@ pub fn draw_sidebar(
             ..Default::default()
         },
         PanelPalette {
-            body:         [0.06, 0.07, 0.09, 0.96],
-            body_top:     [0.14, 0.16, 0.20, 0.10],
-            body_bottom:  [0.00, 0.00, 0.00, 0.24],
+            body: [0.06, 0.07, 0.09, 0.96],
+            body_top: [0.14, 0.16, 0.20, 0.10],
+            body_bottom: [0.00, 0.00, 0.00, 0.24],
             outer_border: [0.01, 0.02, 0.03, 1.00],
-            inner_line:   [0.42, 0.48, 0.56, 0.11],
-            accent:       [0.20, 0.58, 0.96, 0.60],
-            shadow:       [0.00, 0.00, 0.00, 0.24],
-            bracket:      [0.28, 0.32, 0.38, 0.24],
-            specular:     [0.88, 0.92, 1.00, 0.03],
+            inner_line: [0.42, 0.48, 0.56, 0.11],
+            accent: [0.20, 0.58, 0.96, 0.60],
+            shadow: [0.00, 0.00, 0.00, 0.24],
+            bracket: [0.28, 0.32, 0.38, 0.24],
+            specular: [0.88, 0.92, 1.00, 0.03],
         },
         scale,
     );
@@ -166,11 +159,7 @@ fn draw_slot_segments(
     }
 }
 
-fn draw_status_lines(
-    frame: &mut impl QuadRenderer,
-    rect: Rectangle<i32, Physical>,
-    scale: f64,
-) {
+fn draw_status_lines(frame: &mut impl QuadRenderer, rect: Rectangle<i32, Physical>, scale: f64) {
     let line_h = ((1.0 * scale).round() as i32).max(1);
     let pad_x = ((8.0 * scale).round() as i32).max(1);
 

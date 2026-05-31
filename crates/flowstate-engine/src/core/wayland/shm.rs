@@ -1,4 +1,3 @@
-
 use smithay::delegate_shm;
 use smithay::wayland::shm::{ShmHandler, ShmState};
 
@@ -11,4 +10,3 @@ impl ShmHandler for DesktopState {
 }
 
 delegate_shm!(DesktopState);
-

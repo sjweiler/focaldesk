@@ -295,8 +295,18 @@ impl ManagedWindow {
     }
 
     pub fn request_close(&self) {
-        // dispatch protocol-specific close later
-        // for now keep the entry point centralized here
+        match self.window.underlying_surface() {
+            WindowSurface::Wayland(toplevel) => {
+                toplevel.send_close();
+            }
+            WindowSurface::X11(surface) => {
+                if let Err(err) = surface.close() {
+                    flowstate_logging::flog(&format!(
+                        "failed to send XWayland close request: {err:?}"
+                    ));
+                }
+            }
+        }
     }
 
     pub fn set_fullscreen(&mut self, value: bool) {

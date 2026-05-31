@@ -99,10 +99,18 @@ pub fn map_icon(state: &NetworkState) -> NetworkIcon {
         Connectivity::LocalOnly | Connectivity::SiteOnly => NetworkIcon::Limited,
         Connectivity::Internet => match state.primary_transport {
             Some(NetTransport::Ethernet) => {
-                if vpn { NetworkIcon::EthernetVpn } else { NetworkIcon::Ethernet }
+                if vpn {
+                    NetworkIcon::EthernetVpn
+                } else {
+                    NetworkIcon::Ethernet
+                }
             }
             Some(NetTransport::Wifi) => {
-                if vpn { wifi_vpn_icon } else { wifi_icon }
+                if vpn {
+                    wifi_vpn_icon
+                } else {
+                    wifi_icon
+                }
             }
             _ => NetworkIcon::Ethernet,
         },

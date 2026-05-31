@@ -58,15 +58,15 @@ pub struct PanelPalette {
 impl Default for PanelPalette {
     fn default() -> Self {
         Self {
-            body:         [0.07, 0.08, 0.10, 0.94],
-            body_top:     [0.17, 0.19, 0.23, 0.16],
-            body_bottom:  [0.00, 0.00, 0.00, 0.20],
+            body: [0.07, 0.08, 0.10, 0.94],
+            body_top: [0.17, 0.19, 0.23, 0.16],
+            body_bottom: [0.00, 0.00, 0.00, 0.20],
             outer_border: [0.02, 0.03, 0.04, 1.00],
-            inner_line:   [0.45, 0.50, 0.58, 0.14],
-            accent:       [0.24, 0.62, 0.98, 0.70],
-            shadow:       [0.00, 0.00, 0.00, 0.22],
-            bracket:      [0.32, 0.36, 0.42, 0.28],
-            specular:     [0.88, 0.92, 1.00, 0.05],
+            inner_line: [0.45, 0.50, 0.58, 0.14],
+            accent: [0.24, 0.62, 0.98, 0.70],
+            shadow: [0.00, 0.00, 0.00, 0.22],
+            bracket: [0.32, 0.36, 0.42, 0.28],
+            specular: [0.88, 0.92, 1.00, 0.05],
         }
     }
 }
@@ -111,7 +111,11 @@ pub fn px(v: f64, scale: f64) -> i32 {
 pub fn inset_rect(rect: Rectangle<i32, Physical>, amt: i32) -> Rectangle<i32, Physical> {
     Rectangle::new(
         (rect.loc.x + amt, rect.loc.y + amt).into(),
-        ((rect.size.w - amt * 2).max(0), (rect.size.h - amt * 2).max(0)).into(),
+        (
+            (rect.size.w - amt * 2).max(0),
+            (rect.size.h - amt * 2).max(0),
+        )
+            .into(),
     )
 }
 
@@ -209,35 +213,55 @@ pub fn draw_corner_brackets(
 
     // TR
     frame.fill_rect(
-        Rectangle::new((rect.loc.x + rect.size.w - len, rect.loc.y).into(), (len, thickness).into()),
-        color,
-    );
-    frame.fill_rect(
-        Rectangle::new((rect.loc.x + rect.size.w - thickness, rect.loc.y).into(), (thickness, len).into()),
-        color,
-    );
-
-    // BL
-    frame.fill_rect(
-        Rectangle::new((rect.loc.x, rect.loc.y + rect.size.h - thickness).into(), (len, thickness).into()),
-        color,
-    );
-    frame.fill_rect(
-        Rectangle::new((rect.loc.x, rect.loc.y + rect.size.h - len).into(), (thickness, len).into()),
-        color,
-    );
-
-    // BR
-    frame.fill_rect(
         Rectangle::new(
-            (rect.loc.x + rect.size.w - len, rect.loc.y + rect.size.h - thickness).into(),
+            (rect.loc.x + rect.size.w - len, rect.loc.y).into(),
             (len, thickness).into(),
         ),
         color,
     );
     frame.fill_rect(
         Rectangle::new(
-            (rect.loc.x + rect.size.w - thickness, rect.loc.y + rect.size.h - len).into(),
+            (rect.loc.x + rect.size.w - thickness, rect.loc.y).into(),
+            (thickness, len).into(),
+        ),
+        color,
+    );
+
+    // BL
+    frame.fill_rect(
+        Rectangle::new(
+            (rect.loc.x, rect.loc.y + rect.size.h - thickness).into(),
+            (len, thickness).into(),
+        ),
+        color,
+    );
+    frame.fill_rect(
+        Rectangle::new(
+            (rect.loc.x, rect.loc.y + rect.size.h - len).into(),
+            (thickness, len).into(),
+        ),
+        color,
+    );
+
+    // BR
+    frame.fill_rect(
+        Rectangle::new(
+            (
+                rect.loc.x + rect.size.w - len,
+                rect.loc.y + rect.size.h - thickness,
+            )
+                .into(),
+            (len, thickness).into(),
+        ),
+        color,
+    );
+    frame.fill_rect(
+        Rectangle::new(
+            (
+                rect.loc.x + rect.size.w - thickness,
+                rect.loc.y + rect.size.h - len,
+            )
+                .into(),
             (thickness, len).into(),
         ),
         color,
@@ -273,37 +297,65 @@ pub fn draw_panel_frame(
     let spec = Rectangle::new(
         (
             rect.loc.x + style.content_inset_px,
-            rect.loc.y + style.outer_border_px + style.bevel_inset_px
-        ).into(),
+            rect.loc.y + style.outer_border_px + style.bevel_inset_px,
+        )
+            .into(),
         (
             (rect.size.w - style.content_inset_px * 2).max(1),
-            style.inner_border_px.max(1)
-        ).into(),
+            style.inner_border_px.max(1),
+        )
+            .into(),
     );
     frame.fill_rect(spec, p.specular);
 
     let accent = match accent_edge {
         AccentEdge::Top => Rectangle::new(
-            (rect.loc.x + style.outer_border_px, rect.loc.y + style.outer_border_px).into(),
-            ((rect.size.w - style.outer_border_px * 2).max(1), style.accent_thickness_px).into(),
+            (
+                rect.loc.x + style.outer_border_px,
+                rect.loc.y + style.outer_border_px,
+            )
+                .into(),
+            (
+                (rect.size.w - style.outer_border_px * 2).max(1),
+                style.accent_thickness_px,
+            )
+                .into(),
         ),
         AccentEdge::Bottom => Rectangle::new(
             (
                 rect.loc.x + style.outer_border_px,
                 rect.loc.y + rect.size.h - style.outer_border_px - style.accent_thickness_px,
-            ).into(),
-            ((rect.size.w - style.outer_border_px * 2).max(1), style.accent_thickness_px).into(),
+            )
+                .into(),
+            (
+                (rect.size.w - style.outer_border_px * 2).max(1),
+                style.accent_thickness_px,
+            )
+                .into(),
         ),
         AccentEdge::Left => Rectangle::new(
-            (rect.loc.x + style.outer_border_px, rect.loc.y + style.outer_border_px).into(),
-            (style.accent_thickness_px, (rect.size.h - style.outer_border_px * 2).max(1)).into(),
+            (
+                rect.loc.x + style.outer_border_px,
+                rect.loc.y + style.outer_border_px,
+            )
+                .into(),
+            (
+                style.accent_thickness_px,
+                (rect.size.h - style.outer_border_px * 2).max(1),
+            )
+                .into(),
         ),
         AccentEdge::Right => Rectangle::new(
             (
                 rect.loc.x + rect.size.w - style.outer_border_px - style.accent_thickness_px,
                 rect.loc.y + style.outer_border_px,
-            ).into(),
-            (style.accent_thickness_px, (rect.size.h - style.outer_border_px * 2).max(1)).into(),
+            )
+                .into(),
+            (
+                style.accent_thickness_px,
+                (rect.size.h - style.outer_border_px * 2).max(1),
+            )
+                .into(),
         ),
     };
     frame.fill_rect(accent, p.accent);

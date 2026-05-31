@@ -1,9 +1,7 @@
-use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Result, Context};
-use crate::{FlowTheme, FlowThemeId};
 use crate::builtins::builtin_theme;
-
-
+use crate::{FlowTheme, FlowThemeId};
+use anyhow::{anyhow, Context, Result};
+use std::path::{Path, PathBuf};
 
 pub fn load_custom_theme(path: &Path) -> anyhow::Result<FlowTheme> {
     let text = std::fs::read_to_string(path)?;
@@ -33,14 +31,13 @@ impl ThemeManager {
         }
     }
 
-
     pub fn resolve_theme(id: &FlowThemeId) -> FlowTheme {
         match id {
             FlowThemeId::BuiltIn(builtin_id) => builtin_theme(*builtin_id),
             FlowThemeId::Custom(_name) => FlowTheme::default(),
         }
     }
-    
+
     pub fn active_theme(&self) -> &FlowTheme {
         &self.resolved
     }

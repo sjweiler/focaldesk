@@ -1,7 +1,6 @@
 use crate::element::UiElement;
 use crate::types::ElementId;
 
-
 pub struct UiTree {
     pub elements: Vec<UiElement>,
     pub hovered: Option<ElementId>,

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use fontdue::Font;
 use flowstate_themes::theme::BuiltInThemeId;
+use fontdue::Font;
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontId {
@@ -63,19 +63,18 @@ pub struct FontSystem {
     pub atlas_dirty: bool,
 }
 
-
 impl FontSystem {
     pub fn new(theme_id: BuiltInThemeId) -> anyhow::Result<Self> {
         let mut system = Self::empty();
 
-       // system.load_fallback_fonts()?;
-       // system.load_theme_fonts(theme_id)?;
+        // system.load_fallback_fonts()?;
+        // system.load_theme_fonts(theme_id)?;
 
-system.load_all_fonts()?;
+        system.load_all_fonts()?;
 
         Ok(system)
     }
-     fn empty() -> Self {
+    fn empty() -> Self {
         Self {
             fonts: HashMap::new(),
             glyphs: HashMap::new(),
@@ -115,8 +114,7 @@ system.load_all_fonts()?;
         Ok(())
     }
 
-
- fn load_all_fonts(&mut self) -> anyhow::Result<()> {
+    fn load_all_fonts(&mut self) -> anyhow::Result<()> {
         self.load_font(
             FontId::IbmPlexMonoRegular,
             include_bytes!("../../../../assets/fonts/IBMPlexMono-Regular.ttf"),
@@ -180,7 +178,6 @@ system.load_all_fonts()?;
         Ok(())
     }
 
-
     fn load_theme_fonts(&mut self, theme_id: BuiltInThemeId) -> anyhow::Result<()> {
         match theme_id {
             BuiltInThemeId::Classic => {
@@ -241,26 +238,25 @@ system.load_all_fonts()?;
         Ok(())
     }
     pub fn reload_for_theme(&mut self, theme_id: BuiltInThemeId) -> anyhow::Result<()> {
-    self.fonts.clear();
-    self.glyphs.clear();
+        self.fonts.clear();
+        self.glyphs.clear();
 
-    self.atlas_pixels.fill(0);
-    self.pen_x = 0;
-    self.pen_y = 0;
-    self.row_h = 0;
-    self.atlas_dirty = true;
+        self.atlas_pixels.fill(0);
+        self.pen_x = 0;
+        self.pen_y = 0;
+        self.row_h = 0;
+        self.atlas_dirty = true;
 
-    self.load_fallback_fonts()?;
-    self.load_theme_fonts(theme_id)?;
+        self.load_fallback_fonts()?;
+        self.load_theme_fonts(theme_id)?;
 
-    Ok(())
-}
+        Ok(())
+    }
 
     pub fn glyph(&self, key: (FontId, u32, char)) -> Option<&GlyphEntry> {
         self.glyphs.get(&key)
     }
 
-    
     pub fn prepare_text(&mut self, text: &str, style: TextStyle) -> anyhow::Result<()> {
         for ch in text.chars() {
             if ch == '\n' || ch == '\r' {
@@ -297,7 +293,8 @@ system.load_all_fonts()?;
             return Ok(());
         }
 
-        let font = self.fonts
+        let font = self
+            .fonts
             .get(&style.font)
             .ok_or_else(|| anyhow::anyhow!("Missing font {:?}", style.font))?;
 
@@ -307,15 +304,18 @@ system.load_all_fonts()?;
         let h = metrics.height as u32;
 
         if w == 0 || h == 0 {
-            self.glyphs.insert(key, GlyphEntry {
-                atlas_x: 0,
-                atlas_y: 0,
-                w: 0,
-                h: 0,
-                advance: metrics.advance_width,
-                xmin: metrics.xmin,
-                ymin: metrics.ymin,
-            });
+            self.glyphs.insert(
+                key,
+                GlyphEntry {
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    w: 0,
+                    h: 0,
+                    advance: metrics.advance_width,
+                    xmin: metrics.xmin,
+                    ymin: metrics.ymin,
+                },
+            );
 
             return Ok(());
         }
@@ -341,15 +341,18 @@ system.load_all_fonts()?;
             }
         }
 
-        self.glyphs.insert(key, GlyphEntry {
-            atlas_x,
-            atlas_y,
-            w,
-            h,
-            advance: metrics.advance_width,
-            xmin: metrics.xmin,
-            ymin: metrics.ymin,
-        });
+        self.glyphs.insert(
+            key,
+            GlyphEntry {
+                atlas_x,
+                atlas_y,
+                w,
+                h,
+                advance: metrics.advance_width,
+                xmin: metrics.xmin,
+                ymin: metrics.ymin,
+            },
+        );
 
         self.pen_x += w + 1;
         self.row_h = self.row_h.max(h);
@@ -357,7 +360,7 @@ system.load_all_fonts()?;
 
         Ok(())
     }
-    
+
     pub fn atlas_size(&self) -> (u32, u32) {
         (self.atlas_w, self.atlas_h)
     }

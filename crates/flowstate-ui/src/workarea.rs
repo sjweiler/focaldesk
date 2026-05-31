@@ -1,14 +1,13 @@
 use crate::chrome_layout::ChromeLayout;
 use crate::element::UiElement;
 use crate::element::UiRect;
-use crate::uicomponent::{LayoutCtx, RenderCtx, UiComponent};
-use smithay::utils::Point;
-use smithay::utils::Logical;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
+use crate::uicomponent::{LayoutCtx, RenderCtx, UiComponent};
 use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
-
+use smithay::utils::Logical;
+use smithay::utils::Point;
 
 pub struct WorkArea {
     pub bounds: UiRect,
@@ -18,7 +17,12 @@ pub struct WorkArea {
 impl WorkArea {
     pub fn new() -> Self {
         Self {
-            bounds: UiRect { x: 0, y: 0, w: 1, h: 1 },
+            bounds: UiRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
             elements: Vec::new(),
         }
     }
@@ -33,9 +37,8 @@ impl UiComponent for WorkArea {
         self.bounds = ctx.screen.into();
     }
 
-    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit>
-    {
-       for element in self.elements.iter().rev() {
+    fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
+        for element in self.elements.iter().rev() {
             if element.bounds.contains(point.x, point.y) {
                 return Some(UiHit {
                     target: UiHitTarget::WorkArea,
@@ -45,7 +48,7 @@ impl UiComponent for WorkArea {
             }
         }
 
-        None 
+        None
     }
 
     fn render(&self, _ctx: &mut RenderCtx) -> Result<(), GlesError> {

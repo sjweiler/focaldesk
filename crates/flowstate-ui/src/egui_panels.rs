@@ -85,14 +85,11 @@ impl EguiPanelView for LauncherPanel {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.heading("Launcher");
-                    ui.with_layout(
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            if ui.small_button("✕").clicked() {
-                                close_requested = true;
-                            }
-                        },
-                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("✕").clicked() {
+                            close_requested = true;
+                        }
+                    });
                 });
                 ui.separator();
                 if ui.button("Terminal").clicked() {
