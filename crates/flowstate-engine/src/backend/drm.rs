@@ -745,21 +745,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let _libinput_token = loop_handle.insert_source(libinput_backend, |event, _, data| {
-        dispatch_backend_input_event::<LibinputInputBackend>(&mut data.core.state, &event);
-
         if let InputEvent::Keyboard { event, .. } = &event {
             let keycode = event.key_code();
             let state = event.state();
-            flog(&format!("key event: code={:?} state={:?}", keycode, state));
-            // raw Linux evdev Escape key
-            const KEY_ESC: u32 = 1;
-
             if state == KeyState::Pressed && (keycode == 1u32.into() || keycode == 9u32.into()) {
                 flog("Emergency exit: ESC pressed");
                 data.should_stop = true;
                 data.core.state.running = false;
+                return;
             }
+            flog(&format!("key event: code={:?} state={:?}", keycode, state));
         }
+
+        dispatch_backend_input_event::<LibinputInputBackend>(&mut data.core.state, &event);
     })?;
 
     for (device_id, path) in udev.device_list() {

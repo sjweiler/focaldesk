@@ -1827,10 +1827,10 @@ impl DesktopState {
             let mut command = Command::new(&candidate);
             command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
             command.env_remove("DISPLAY");
-            if let Some(display) = xwayland_display {
-                command.env("DISPLAY", display);
-            }
             if chrome_like {
+                if let Some(display) = xwayland_display {
+                    command.env("DISPLAY", display);
+                }
                 configure_chrome_command(&mut command);
             }
 

@@ -127,7 +127,8 @@ impl CompositorHandler for DesktopState {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<DesktopState>(surface);
-        self.early_import_surface(surface);
+        // Import deferred to the render path (`import_mapped_surfaces_for_output`). Importing
+        // during `dispatch_clients` wedged the GPU when GTK apps commit many subsurfaces at once.
         self.handle_commit(surface);
         for output in self.space.outputs() {
             layer_map_for_output(output).arrange();

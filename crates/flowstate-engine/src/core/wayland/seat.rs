@@ -1,3 +1,4 @@
+use flowstate_flow::keybinds::BackendKind;
 use smithay::delegate_seat;
 use smithay::input::{
     pointer::CursorIcon, pointer::CursorImageStatus, Seat, SeatHandler, SeatState,
@@ -23,6 +24,12 @@ impl SeatHandler for DesktopState {
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         self.drm_submit_hw_cursor = true;
         match image {
+            // GTK/XWayland often hides the seat cursor while using a subsurface cursor; keep the
+            // compositor fallback visible on DRM so the pointer does not disappear entirely.
+            CursorImageStatus::Hidden if self.backend_kind == BackendKind::Drm => {
+                self.cursor_manager.set_visible(true);
+                self.cursor_manager.set_icon(CursorIcon::Default);
+            }
             CursorImageStatus::Hidden => self.cursor_manager.set_visible(false),
             CursorImageStatus::Named(icon) => {
                 self.cursor_manager.set_visible(true);
