@@ -10,11 +10,11 @@ use smithay::wayland::selection::primary_selection::set_primary_focus;
 use wayland_server::Resource;
 
 use crate::core::desktop::DesktopState;
-use crate::core::focus::KeyboardFocusTarget;
+use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 
 impl SeatHandler for DesktopState {
     type KeyboardFocus = KeyboardFocusTarget;
-    type PointerFocus = WlSurface;
+    type PointerFocus = PointerFocusTarget;
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Self> {

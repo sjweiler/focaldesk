@@ -1949,7 +1949,10 @@ impl RenderState {
             .map(|mw| &mw.window)
             .collect();
 
-        for window in space.elements() {
+        // `Space::elements()` is back-to-front. `draw_render_elements` expects
+        // front-to-back input so opaque-region culling cannot hide top windows
+        // behind older mapped windows.
+        for window in space.elements().rev() {
             if !on_workspace.contains(window) {
                 continue;
             }

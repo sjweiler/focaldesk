@@ -94,7 +94,7 @@ use wayland_server::DisplayHandle;
 use crate::core::chrome_layout::{
     build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at,
 };
-use crate::core::focus::KeyboardFocusTarget;
+use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
     cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
@@ -507,24 +507,52 @@ impl DesktopState {
         self.space.element_bbox(window)
     }
 
+    pub(crate) fn map_window_bbox_location(
+        &mut self,
+        window: Window,
+        bbox_loc: Point<i32, Logical>,
+        activate: bool,
+    ) {
+        let space_loc = bbox_loc + window.geometry().loc;
+        self.space.map_element(window, space_loc, activate);
+    }
+
     /// Topmost client subsurface or xdg popup under `pos` (global logical), if any.
     pub(crate) fn pointer_surface_under(
         &self,
         pos: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+    ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
         let ws = self.focused_workspace();
         for window in self.space.elements() {
             window.on_commit();
         }
 
         if let Some((window, render_loc)) = self.space.element_under(pos) {
-            let on_ws = self.windows.iter().any(|mw| {
-                mw.mapped && mw.workspace == ws && &mw.window == window
-            });
+            let on_ws = self
+                .windows
+                .iter()
+                .any(|mw| mw.mapped && mw.workspace == ws && &mw.window == window);
             if on_ws {
+                #[cfg(feature = "xwayland")]
+                if let Some(x11) = window.x11_surface() {
+                    if let Some((_, surf_loc)) =
+                        window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
+                    {
+                        return Some((
+                            PointerFocusTarget::Xwayland(x11.clone()),
+                            (surf_loc + render_loc).to_f64(),
+                        ));
+                    }
+                }
+
                 if let Some(hit) = window
                     .surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(surface, surf_loc)| (surface, (surf_loc + render_loc).to_f64()))
+                    .map(|(surface, surf_loc)| {
+                        (
+                            PointerFocusTarget::Wayland(surface),
+                            (surf_loc + render_loc).to_f64(),
+                        )
+                    })
                 {
                     return Some(hit);
                 }
@@ -534,9 +562,10 @@ impl DesktopState {
         // XWayland/GTK can briefly have empty input regions while geometry catches up;
         // fall back to bbox + surface_under (matches render visibility).
         for window in self.space.elements().rev() {
-            let on_ws = self.windows.iter().any(|mw| {
-                mw.mapped && mw.workspace == ws && &mw.window == window
-            });
+            let on_ws = self
+                .windows
+                .iter()
+                .any(|mw| mw.mapped && mw.workspace == ws && &mw.window == window);
             if !on_ws {
                 continue;
             }
@@ -550,10 +579,24 @@ impl DesktopState {
             if !global.to_f64().contains(pos) {
                 continue;
             }
-            if let Some((surface, surf_loc)) = window
-                .surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
+            #[cfg(feature = "xwayland")]
+            if let Some(x11) = window.x11_surface() {
+                if let Some((_, surf_loc)) =
+                    window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
+                {
+                    return Some((
+                        PointerFocusTarget::Xwayland(x11.clone()),
+                        (surf_loc + render_loc).to_f64(),
+                    ));
+                }
+            }
+            if let Some((surface, surf_loc)) =
+                window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
             {
-                return Some((surface, (surf_loc + render_loc).to_f64()));
+                return Some((
+                    PointerFocusTarget::Wayland(surface),
+                    (surf_loc + render_loc).to_f64(),
+                ));
             }
         }
 
@@ -601,7 +644,10 @@ impl DesktopState {
         let Some((focus, _)) = start_data.focus.as_ref() else {
             return false;
         };
-        focus.id().same_client_as(&surface.id())
+        focus
+            .wl_surface()
+            .map(|focus| focus.id().same_client_as(&surface.id()))
+            .unwrap_or(false)
     }
 
     /// Deliver pointer motion to Wayland clients (nested compositor path).
@@ -1023,10 +1069,7 @@ impl DesktopState {
                 self.outputs
                     .get(&output_id)
                     .map(|out| {
-                        Point::from((
-                            out.logical_origin.x + 100,
-                            out.logical_origin.y + 100,
-                        ))
+                        Point::from((out.logical_origin.x + 100, out.logical_origin.y + 100))
                     })
                     .unwrap_or(Point::from((100, 100)))
             })
@@ -1081,18 +1124,15 @@ impl DesktopState {
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
         let ws = self.focused_workspace();
-        self.space
-            .elements()
-            .rev()
-            .find_map(|window| {
-                let managed = self
-                    .windows
-                    .iter()
-                    .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
-                self.global_window_bbox(window)
-                    .is_some_and(|bbox| bbox.contains((px, py)))
-                    .then_some(managed.id)
-            })
+        self.space.elements().rev().find_map(|window| {
+            let managed = self
+                .windows
+                .iter()
+                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
+            self.global_window_bbox(window)
+                .is_some_and(|bbox| bbox.contains((px, py)))
+                .then_some(managed.id)
+        })
     }
 
     fn try_begin_compositor_move(&mut self, id: WindowId) {
@@ -1192,11 +1232,9 @@ impl DesktopState {
             }
         }
 
-        if self.windows[idx].wl_surface().is_some() {
-            if let Some(keyboard) = self.seat.get_keyboard() {
-                let serial = SERIAL_COUNTER.next_serial();
-                keyboard.set_focus(self, Some(KeyboardFocusTarget::Window(window)), serial);
-            }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            let serial = SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, Some(KeyboardFocusTarget::Window(window)), serial);
         }
     }
 
@@ -1204,19 +1242,15 @@ impl DesktopState {
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
         let ws = self.focused_workspace();
-        let target_id = self
-            .space
-            .elements()
-            .rev()
-            .find_map(|window| {
-                let managed = self
-                    .windows
-                    .iter()
-                    .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
-                self.global_window_bbox(window)
-                    .is_some_and(|bbox| bbox.contains((px, py)))
-                    .then_some(managed.id)
-            });
+        let target_id = self.space.elements().rev().find_map(|window| {
+            let managed = self
+                .windows
+                .iter()
+                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
+            self.global_window_bbox(window)
+                .is_some_and(|bbox| bbox.contains((px, py)))
+                .then_some(managed.id)
+        });
 
         if let Some(id) = target_id {
             self.focus_window_id(id);
@@ -1444,32 +1478,38 @@ impl DesktopState {
             .unwrap_or(self.primary_output);
         let fallback_output = self.outputs.get(&output_id);
 
-        let location = if surface.is_override_redirect() {
+        let bbox_location = if surface.is_override_redirect() {
             requested_geometry.loc
         } else {
             self.default_toplevel_map_location(output_id)
         };
 
+        self.windows[idx].float_rect = Some(Rectangle::from_loc_and_size(
+            bbox_location,
+            requested_geometry.size,
+        ));
+
         window.on_commit();
-        self.space.map_element(window.clone(), location, true);
+        self.map_window_bbox_location(window.clone(), bbox_location, true);
         self.windows[idx].mapped = true;
 
         if !surface.is_override_redirect() {
-            let configure_size = self
+            let configure_rect = self
                 .space
                 .element_bbox(&window)
-                .map(|bbox| bbox.size)
-                .filter(|size| size.w > 0 && size.h > 0)
-                .unwrap_or(requested_geometry.size);
-
+                .filter(|bbox| bbox.size.w > 0 && bbox.size.h > 0)
+                .unwrap_or_else(|| {
+                    Rectangle::from_loc_and_size(bbox_location, requested_geometry.size)
+                });
             flog(&format!(
-                "XWayland map configure id={:?} requested={:?} size={:?} space_loc={:?}",
-                id, requested_geometry, configure_size, location
+                "XWayland map configure id={:?} requested={:?} configure={:?}",
+                id, requested_geometry, configure_rect
             ));
-            let _ = surface.configure(Some(Rectangle::from_loc_and_size(location, configure_size)));
+            let _ = surface.configure(Some(configure_rect));
             self.focus_window_id(id);
         }
 
+        self.space.refresh();
         self.mark_redraw();
     }
 
@@ -1559,8 +1599,11 @@ impl DesktopState {
                             "XWayland buffer_delta {:?} for window at {:?}",
                             buffer_offset, current_loc
                         ));
-                        self.space
-                            .map_element(window.clone(), current_loc + buffer_offset, false);
+                        self.map_window_bbox_location(
+                            window.clone(),
+                            current_loc - window.geometry().loc + buffer_offset,
+                            false,
+                        );
                     }
                 }
             }
@@ -1578,7 +1621,11 @@ impl DesktopState {
                     self.space.elements().any(|e| e == &window)
                 ));
                 dbg_flush(&format!("managed.mapped={}", self.windows[idx].mapped));
-                if !self.space.elements().any(|e| e == &window) {
+                if window.x11_surface().is_some() {
+                    if !self.space.elements().any(|e| e == &window) {
+                        to_map = Some(idx);
+                    }
+                } else if !self.space.elements().any(|e| e == &window) {
                     to_map = Some(idx);
                 }
             }
@@ -1611,9 +1658,12 @@ impl DesktopState {
                 .output_under_pointer(self.input.pointer_pos)
                 .unwrap_or(self.primary_output);
 
-            let map_loc = self.default_toplevel_map_location(output_id);
+            let map_loc = self.windows[idx]
+                .float_rect
+                .map(|rect| rect.loc)
+                .unwrap_or_else(|| self.default_toplevel_map_location(output_id));
 
-            self.space.map_element(window, map_loc, false);
+            self.map_window_bbox_location(window, map_loc, false);
             self.windows[idx].mapped = true;
             let window_id = self.windows[idx].id;
             self.focus_window_id(window_id);
@@ -1827,10 +1877,10 @@ impl DesktopState {
             let mut command = Command::new(&candidate);
             command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
             command.env_remove("DISPLAY");
+            if let Some(display) = xwayland_display {
+                command.env("DISPLAY", display);
+            }
             if chrome_like {
-                if let Some(display) = xwayland_display {
-                    command.env("DISPLAY", display);
-                }
                 configure_chrome_command(&mut command);
             }
 
@@ -1978,7 +2028,8 @@ impl DesktopState {
                 if let Some(w) = self.window(*window_id) {
                     let new_loc =
                         self.clamp_window_location_to_work_recess(&w.window, new_loc, pos);
-                    self.space.map_element(w.window.clone(), new_loc, false);
+                    let window = w.window.clone();
+                    self.map_window_bbox_location(window, new_loc, false);
                     self.space.refresh();
                 }
             }
@@ -2096,11 +2147,11 @@ impl DesktopState {
             ToplevelPointerInteraction::Move { window_id, .. } => {
                 if let Some(w) = self.window(window_id) {
                     if let Some(x11) = w.window.x11_surface() {
-                        if let (Some(loc), Some(bbox)) = (
-                            self.space.element_location(&w.window),
-                            self.space.element_bbox(&w.window),
-                        ) {
-                            let _ = x11.configure(Rectangle::from_loc_and_size(loc, bbox.size));
+                        if let Some(bbox) = self.space.element_bbox(&w.window) {
+                            let _ =
+                                x11.configure(Rectangle::from_loc_and_size(bbox.loc, bbox.size));
+                            let window = w.window.clone();
+                            self.map_window_bbox_location(window, bbox.loc, false);
                         }
                     }
                 }
@@ -2467,7 +2518,10 @@ impl DesktopState {
 
     /// Rectangle used to map winit/libinput absolute pointer coords into global logical space.
     /// Must match [`Space::output_geometry`] so hit testing and pointer forwarding agree (see anvil/smallvil).
-    pub fn pointer_transform_rect_for_output(&self, output_id: OutputId) -> Rectangle<i32, Logical> {
+    pub fn pointer_transform_rect_for_output(
+        &self,
+        output_id: OutputId,
+    ) -> Rectangle<i32, Logical> {
         if let Some(output) = self.outputs.get(&output_id) {
             if let Some(geo) = self.space.output_geometry(&output.handle) {
                 return geo;
@@ -2674,7 +2728,7 @@ impl DesktopState {
                     }
                 }
                 for output in outputs {
-                    window.send_frame(&output, time, None, |_, _| None);
+                    window.send_frame(&output, time, None, |_, _| Some(output.clone()));
                 }
             }
         }
@@ -2769,11 +2823,7 @@ impl DesktopState {
             let map_loc = self.space.element_location(&w.window)?;
             let geometry = w.window.geometry();
             let initial_rect = Rectangle::from_loc_and_size(map_loc, geometry.size);
-            Some((
-                w.window.toplevel()?.clone(),
-                initial_rect,
-                geometry.size,
-            ))
+            Some((w.window.toplevel()?.clone(), initial_rect, geometry.size))
         }) else {
             return;
         };

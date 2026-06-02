@@ -348,12 +348,24 @@ use smithay::input::pointer::*;
 
 impl PointerTarget<DesktopState> for ManagedWindow {
     fn enter(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, event: &MotionEvent) {
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = self.window.x11_surface() {
+            PointerTarget::enter(x11, seat, data, event);
+            return;
+        }
+
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::enter(&*surface, seat, data, event);
         }
     }
 
     fn motion(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, event: &MotionEvent) {
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = self.window.x11_surface() {
+            PointerTarget::motion(x11, seat, data, event);
+            return;
+        }
+
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::motion(&*surface, seat, data, event);
         }
@@ -365,24 +377,48 @@ impl PointerTarget<DesktopState> for ManagedWindow {
         data: &mut DesktopState,
         event: &RelativeMotionEvent,
     ) {
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = self.window.x11_surface() {
+            PointerTarget::relative_motion(x11, seat, data, event);
+            return;
+        }
+
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::relative_motion(&*surface, seat, data, event);
         }
     }
 
     fn button(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, event: &ButtonEvent) {
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = self.window.x11_surface() {
+            PointerTarget::button(x11, seat, data, event);
+            return;
+        }
+
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::button(&*surface, seat, data, event);
         }
     }
 
     fn axis(&self, seat: &Seat<DesktopState>, data: &mut DesktopState, frame: AxisFrame) {
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = self.window.x11_surface() {
+            PointerTarget::axis(x11, seat, data, frame);
+            return;
+        }
+
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::axis(&*surface, seat, data, frame);
         }
     }
 
     fn frame(&self, seat: &Seat<DesktopState>, data: &mut DesktopState) {
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = self.window.x11_surface() {
+            PointerTarget::frame(x11, seat, data);
+            return;
+        }
+
         if let Some(surface) = self.window.wl_surface() {
             PointerTarget::frame(&*surface, seat, data);
         }

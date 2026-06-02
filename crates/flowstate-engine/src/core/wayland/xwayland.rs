@@ -113,11 +113,15 @@ impl XwmHandler for DesktopState {
         _reorder: Option<Reorder>,
     ) {
         let mut geometry = window.geometry();
-        if let Some(x) = x {
-            geometry.loc.x = x;
-        }
-        if let Some(y) = y {
-            geometry.loc.y = y;
+        if window.is_override_redirect() {
+            if let Some(x) = x {
+                geometry.loc.x = x;
+            }
+            if let Some(y) = y {
+                geometry.loc.y = y;
+            }
+        } else {
+            let _ = (x, y);
         }
         if let Some(w) = w {
             geometry.size.w = w as i32;
@@ -142,8 +146,27 @@ impl XwmHandler for DesktopState {
             return;
         };
         if window.is_override_redirect() {
-            self.space.map_element(managed, geometry.loc, false);
+            if let Some(state) = self.window_mut(id) {
+                state.float_rect = Some(geometry);
+            }
+            self.map_window_bbox_location(managed, geometry.loc, false);
+        } else {
+            let current_loc = self
+                .space
+                .element_bbox(&managed)
+                .map(|bbox| bbox.loc)
+                .or_else(|| {
+                    self.window(id)
+                        .and_then(|state| state.float_rect.map(|rect| rect.loc))
+                })
+                .unwrap_or(geometry.loc);
+            let rect = Rectangle::from_loc_and_size(current_loc, geometry.size);
+            if let Some(state) = self.window_mut(id) {
+                state.float_rect = Some(rect);
+            }
+            self.map_window_bbox_location(managed, current_loc, false);
         }
+        self.space.refresh();
         self.mark_redraw();
     }
 
