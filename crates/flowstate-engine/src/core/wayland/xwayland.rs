@@ -193,8 +193,34 @@ impl XwmHandler for DesktopState {
 
     fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
         if let Some(id) = self.window_id_for_x11_surface(&window) {
-            self.request_fullscreen(id);
+            let output_id = self
+                .output_under_pointer(self.input.pointer_pos)
+                .unwrap_or(self.focused_output);
+            let rect = self
+                .outputs
+                .get(&output_id)
+                .and_then(|output| self.space.output_geometry(&output.handle))
+                .or_else(|| {
+                    self.outputs
+                        .get(&self.primary_output)
+                        .and_then(|output| self.space.output_geometry(&output.handle))
+                });
+
+            if let Some(rect) = rect {
+                if let Some(managed) = self.window_mut(id) {
+                    managed.set_fullscreen(true);
+                    managed.float_rect = Some(rect);
+                }
+                let _ = window.configure(rect);
+                if let Some(managed) = self.window(id).map(|managed| managed.window.clone()) {
+                    self.map_window_bbox_location(managed, rect.loc, true);
+                }
+                self.space.refresh();
+            } else {
+                self.request_fullscreen(id);
+            }
             let _ = window.set_fullscreen(true);
+            self.mark_redraw();
         }
     }
 
