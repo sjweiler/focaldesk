@@ -2,7 +2,8 @@
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
 use crate::backend::common::{
-    bootstrap_compositor_core, finish_xwayland_startup, start_xwayland, NestedDesktop,
+    bootstrap_compositor_core, finish_xwayland_startup, physical_size_mm_from_pixels,
+    start_xwayland, NestedDesktop,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, Mode};
@@ -634,6 +635,85 @@ where
         .map_err(|e| anyhow!("Failed to create DrmNode from {:?}: {e}", primary_path))
 }
 
+#[derive(Debug, Clone)]
+struct EdidMonitorIdentity {
+    make: String,
+    model: String,
+    serial_number: String,
+}
+
+fn connector_edid(
+    device: &impl drm::control::Device,
+    connector: connector::Handle,
+) -> Option<Vec<u8>> {
+    let props = device.get_properties(connector).ok()?;
+    for (prop, raw_value) in props.iter() {
+        let info = device.get_property(*prop).ok()?;
+        if info.name().to_bytes() == b"EDID" && *raw_value != 0 {
+            return device.get_property_blob(*raw_value).ok();
+        }
+    }
+    None
+}
+
+fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
+    if edid.len() < 128 || edid.get(0..8)? != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] {
+        return None;
+    }
+
+    let manufacturer = u16::from_be_bytes([edid[8], edid[9]]);
+    let make = [
+        (((manufacturer >> 10) & 0x1f) as u8 + b'A' - 1) as char,
+        (((manufacturer >> 5) & 0x1f) as u8 + b'A' - 1) as char,
+        ((manufacturer & 0x1f) as u8 + b'A' - 1) as char,
+    ]
+    .iter()
+    .collect::<String>();
+
+    let product_code = u16::from_le_bytes([edid[10], edid[11]]);
+    let numeric_serial = u32::from_le_bytes([edid[12], edid[13], edid[14], edid[15]]);
+
+    let mut monitor_name = None;
+    let mut descriptor_serial = None;
+
+    for descriptor in edid[54..126].chunks_exact(18) {
+        if descriptor[0..3] != [0, 0, 0] {
+            continue;
+        }
+
+        match descriptor[3] {
+            0xfc => monitor_name = edid_descriptor_text(descriptor),
+            0xff => descriptor_serial = edid_descriptor_text(descriptor),
+            _ => {}
+        }
+    }
+
+    let model = monitor_name.unwrap_or_else(|| format!("0x{product_code:04x}"));
+    let serial_number = descriptor_serial.unwrap_or_else(|| {
+        if numeric_serial != 0 {
+            numeric_serial.to_string()
+        } else {
+            "unknown".to_string()
+        }
+    });
+
+    Some(EdidMonitorIdentity {
+        make,
+        model,
+        serial_number,
+    })
+}
+
+fn edid_descriptor_text(descriptor: &[u8]) -> Option<String> {
+    let text = descriptor.get(5..18)?;
+    let end = text
+        .iter()
+        .position(|byte| matches!(*byte, b'\n' | b'\r' | 0))
+        .unwrap_or(text.len());
+    let value = String::from_utf8_lossy(&text[..end]).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
 fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
     state: &mut DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
@@ -683,12 +763,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     // Shared compositor state
     //
-    let desktop = bootstrap_compositor_core(
-        "drm".into(),
-        Size::from((2560, 1440)),
-        1.0,
-        BackendKind::Drm,
-    )?;
+    let desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
 
     //
     // Pick primary KMS device (same node udev will report for the card — open only in `device_added`).
@@ -1257,13 +1332,14 @@ fn device_added(
         //flog(&format!("Found connected connector: {:?}", conn));
         let name = connector_name(&info);
 
+        let connector_size = info.size();
         flog(&format!(
             "CONNECTOR: name={} handle={:?} state={:?} size_mm={}x{} encoders={:?} modes={}",
             name,
             info.handle(),
             info.state(),
-            info.size().unwrap().0,
-            info.size().unwrap().1,
+            connector_size.map(|size| size.0).unwrap_or(0),
+            connector_size.map(|size| size.1).unwrap_or(0),
             info.encoders(),
             info.modes().len(),
         ));
@@ -1296,39 +1372,74 @@ fn device_added(
 
             let output_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
 
-            let (mm_w, mm_h) = info.size().unwrap_or((0, 0));
+            let fallback_mm =
+                physical_size_mm_from_pixels(Size::<i32, Physical>::from((w as i32, h as i32)));
+            let (mm_w, mm_h) = info
+                .size()
+                .filter(|(mm_w, mm_h)| *mm_w > 0 && *mm_h > 0)
+                .map(|(mm_w, mm_h)| (mm_w as i32, mm_h as i32))
+                .unwrap_or(fallback_mm);
+
+            let edid_identity = connector_edid(drm_output_manager.device(), *conn)
+                .and_then(|edid| parse_edid_identity(&edid));
+            let make = edid_identity
+                .as_ref()
+                .map(|identity| identity.make.clone())
+                .unwrap_or_else(|| "FlowState".to_string());
+            let model = edid_identity
+                .as_ref()
+                .map(|identity| identity.model.clone())
+                .unwrap_or_else(|| info.interface().as_str().to_string());
+            let serial_number = edid_identity
+                .as_ref()
+                .map(|identity| identity.serial_number.clone())
+                .unwrap_or_else(|| {
+                    format!("{}-{}", info.interface().as_str(), info.interface_id())
+                });
 
             let output = Output::new(
-                output_name,
+                output_name.clone(),
                 PhysicalProperties {
-                    size: (mm_w as i32, mm_h as i32).into(),
+                    size: (mm_w, mm_h).into(),
                     subpixel: Subpixel::Unknown,
-                    make: "FlowState".into(),
-                    model: "DRM".into(),
-                    serial_number: "drm-output".into(),
+                    make: make.clone(),
+                    model: model.clone(),
+                    serial_number: serial_number.clone(),
                 },
             );
-
-            output.create_global::<DesktopState>(&data.core.display.handle());
 
             // Logical layout in global compositor space (must match `register_output_entry` / `map_output`).
             // wl_output + xdg_output advertise this to clients; leaving (0,0) stacks every head at the origin
             // (e.g. OBS projector shows all DRM outputs on top of each other).
             let origin = Point::<i32, Logical>::from((next_x, 0));
 
+            let refresh_mhz = ((mode.vrefresh() as i32).max(60)) * 1000;
+            let wl_mode = WlMode {
+                size: (w as i32, h as i32).into(),
+                refresh: refresh_mhz,
+            };
+
             output.change_current_state(
-                Some(WlMode {
-                    size: (w as i32, h as i32).into(),
-                    refresh: mode.vrefresh() as i32,
-                }),
+                Some(wl_mode),
                 Some(Transform::Normal),
                 Some(smithay::output::Scale::Fractional(1.0)),
                 Some(origin),
             );
-            output.set_preferred(WlMode {
-                size: (w as i32, h as i32).into(),
-                refresh: mode.vrefresh() as i32,
-            });
+            output.set_preferred(wl_mode);
+            output.create_global::<DesktopState>(&data.core.display.handle());
+
+            flog(&format!(
+                "Wayland output advertised: name={} px={}x{} mm={}x{} refresh_mhz={} make={:?} model={:?} serial={:?}",
+                output_name,
+                w,
+                h,
+                mm_w,
+                mm_h,
+                wl_mode.refresh,
+                make,
+                model,
+                serial_number,
+            ));
 
             let crtc = info.encoders().iter().find_map(|enc| {
                 let enc_info = drm_output_manager.device().get_encoder(*enc).ok()?;
@@ -1406,10 +1517,7 @@ fn device_added(
                 crtc,
                 DrmSurfaceState {
                     output,
-                    mode: WlMode {
-                        size: (w as i32, h as i32).into(),
-                        refresh: mode.vrefresh() as i32,
-                    },
+                    mode: wl_mode,
                     size: Size::<i32, Physical>::from((w as i32, h as i32)),
                     output_id: output_id,
                     origin,

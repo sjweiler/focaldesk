@@ -6,6 +6,9 @@ use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportN
 
 use crate::core::desktop::DesktopState;
 use flowstate_logging::flog;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DMABUF_IMPORT_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 impl DmabufHandler for DesktopState {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
@@ -35,12 +38,24 @@ impl DmabufHandler for DesktopState {
         // SAFETY: `portal_dispatch_ctx` is set immediately around `dispatch_clients` and cleared
         // after dispatch returns. `dmabuf_imported` runs synchronously from that dispatch path.
         let renderer = unsafe { &mut *ctx.renderer.as_ptr() };
-        if renderer.has_dmabuf_format(dmabuf.format()) {
+        let format = dmabuf.format();
+        let seq = DMABUF_IMPORT_LOGS.fetch_add(1, Ordering::Relaxed);
+        if renderer.has_dmabuf_format(format) {
+            if seq < 200 {
+                flog(&format!(
+                    "linux-dmabuf accepted format={:?} planes={} y_inverted={}",
+                    format,
+                    dmabuf.num_planes(),
+                    dmabuf.y_inverted()
+                ));
+            }
             let _ = notifier.successful::<DesktopState>();
         } else {
             flog(&format!(
-                "linux-dmabuf rejected unsupported format {:?}",
-                dmabuf.format()
+                "linux-dmabuf rejected unsupported format={:?} planes={} y_inverted={}",
+                format,
+                dmabuf.num_planes(),
+                dmabuf.y_inverted()
             ));
             notifier.failed();
         }

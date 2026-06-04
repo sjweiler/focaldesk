@@ -1,6 +1,6 @@
 // winit backend
 
-use crate::backend::common::{bootstrap_compositor_core, translate_backend_input};
+use crate::backend::common::{bootstrap_compositor_core, translate_backend_input, BootstrapOutput};
 //use crate::backend::common::{
 //    bootstrap_compositor_core, finish_xwayland_startup, start_xwayland, translate_backend_input,
 //};
@@ -100,9 +100,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let size = backend.window_size();
     let scale = backend.scale_factor();
     let mut nested = bootstrap_compositor_core(
-        "flowstate-winit".to_string(),
-        size,
-        scale,
+        Some(BootstrapOutput {
+            name: "flowstate-winit".to_string(),
+            buffer_size: size,
+            scale_factor: scale,
+        }),
         BackendKind::Winit,
     )?;
 

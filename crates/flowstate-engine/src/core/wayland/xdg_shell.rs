@@ -115,7 +115,13 @@ impl XdgShellHandler for DesktopState {
         output: Option<wl_output::WlOutput>,
     ) {
         if let Some(id) = self.window_id_for_toplevel(&surface) {
-            self.request_fullscreen(id);
+            self.request_fullscreen(id, output);
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.window_id_for_toplevel(&surface) {
+            self.request_unfullscreen(id);
         }
     }
 

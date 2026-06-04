@@ -151,6 +151,7 @@ pub struct ManagedWindow {
     // layout state
     pub tile_rect: Option<Rectangle<i32, Logical>>,
     pub float_rect: Option<Rectangle<i32, Logical>>,
+    pub restore_rect: Option<Rectangle<i32, Logical>>,
 }
 
 impl ManagedWindow {
@@ -184,6 +185,7 @@ impl ManagedWindow {
             output: None,
             tile_rect: None,
             float_rect: None,
+            restore_rect: None,
             pending_move: false,
             pending_resize: None,
         }
@@ -210,6 +212,7 @@ impl ManagedWindow {
             output: None,
             tile_rect: None,
             float_rect: None,
+            restore_rect: None,
             pending_move: false,
             pending_resize: None,
         }

@@ -22,7 +22,7 @@ use crate::core::desktop::DesktopState;
 use smithay::reexports::wayland_server::Client;
 
 static XWAYLAND_BUFFER_LOGS: AtomicUsize = AtomicUsize::new(0);
-static XWAYLAND_BLOCKER_LOGS: AtomicUsize = AtomicUsize::new(0);
+static DMABUF_BLOCKER_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 impl CompositorHandler for DesktopState {
     fn compositor_state(&mut self) -> &mut SmithayCompositorState {
@@ -56,14 +56,20 @@ impl CompositorHandler for DesktopState {
 
             if let Some(dmabuf) = maybe_dmabuf {
                 #[cfg(feature = "xwayland")]
-                if let (Some(client), Some(handle)) =
-                    (surface.client(), state.xwayland_loop_handle.clone())
-                {
+                if let Some(client) = surface.client() {
                     if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                        let res = handle.insert_source(source, move |_, _, data| {
-                            let seq = XWAYLAND_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
+                        let Some(handle) = state.xwayland_loop_handle.clone() else {
+                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
                             if seq < 100 {
-                                flog("XWayland dmabuf read blocker cleared");
+                                flog("dmabuf read blocker skipped: no compositor source loop");
+                            }
+                            return;
+                        };
+
+                        let res = handle.insert_source(source, move |_, _, data| {
+                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
+                            if seq < 100 {
+                                flog("dmabuf read blocker cleared");
                             }
                             let dh = data.display_handle.clone();
                             data.client_compositor_state(&client)
@@ -71,21 +77,21 @@ impl CompositorHandler for DesktopState {
                             Ok(())
                         });
                         if res.is_ok() {
-                            let seq = XWAYLAND_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
+                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
                             if seq < 100 {
-                                flog("XWayland dmabuf read blocker added");
+                                flog("dmabuf read blocker added");
                             }
                             add_blocker(surface, blocker);
                         } else {
-                            let seq = XWAYLAND_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
+                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
                             if seq < 100 {
-                                flog("XWayland dmabuf read blocker source insert failed");
+                                flog("dmabuf read blocker source insert failed");
                             }
                         }
                     } else {
-                        let seq = XWAYLAND_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
+                        let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
                         if seq < 100 {
-                            flog("XWayland dmabuf read blocker already ready");
+                            flog("dmabuf read blocker already ready");
                         }
                     }
                 }

@@ -1,0 +1,39 @@
+Screen 0: minimum 16 x 16, current 5120 x 1440, maximum 32767 x 32767
+DP-3 connected 2560x1440+0+0 (0x25) normal (normal left inverted right x axis y axis) 700mm x 390mm
+	Identifier: 0x21
+	Timestamp:  22266588
+	Subpixel:   unknown
+	Gamma:      1.0:1.0:1.0
+	Brightness: 0.0
+	Clones:    
+	CRTC:       0
+	CRTCs:      0
+	Transform:  1.000000 0.000000 0.000000
+	            0.000000 1.000000 0.000000
+	            0.000000 0.000000 1.000000
+	           filter: 
+	RANDR Emulation: 1 
+	non-desktop: 0 
+		supported: 0, 1
+  2560x1440 (0x25) 938.500MHz -HSync +VSync *current +preferred
+        h: width  2560 start 2792 end 3072 total 3584 skew    0 clock 261.86KHz
+        v: height 1440 start 1443 end 1448 total 1588           clock 164.90Hz
+DP-4 connected 2560x1440+2560+0 (0x25) normal (normal left inverted right x axis y axis) 700mm x 390mm
+	Identifier: 0x23
+	Timestamp:  22266588
+	Subpixel:   unknown
+	Gamma:      1.0:1.0:1.0
+	Brightness: 0.0
+	Clones:    
+	CRTC:       1
+	CRTCs:      1
+	Transform:  1.000000 0.000000 0.000000
+	            0.000000 1.000000 0.000000
+	            0.000000 0.000000 1.000000
+	           filter: 
+	RANDR Emulation: 1 
+	non-desktop: 0 
+		supported: 0, 1
+  2560x1440 (0x25) 938.500MHz -HSync +VSync *current +preferred
+        h: width  2560 start 2792 end 3072 total 3584 skew    0 clock 261.86KHz
+        v: height 1440 start 1443 end 1448 total 1588           clock 164.90Hz

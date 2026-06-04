@@ -51,6 +51,21 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
 
+pub(crate) fn physical_size_mm_from_pixels(size: Size<i32, Physical>) -> (i32, i32) {
+    const MM_PER_INCH: f64 = 25.4;
+    const FALLBACK_DPI: f64 = 96.0;
+
+    let width = ((size.w.max(1) as f64) * MM_PER_INCH / FALLBACK_DPI).round() as i32;
+    let height = ((size.h.max(1) as f64) * MM_PER_INCH / FALLBACK_DPI).round() as i32;
+    (width.max(1), height.max(1))
+}
+
+pub(crate) struct BootstrapOutput {
+    pub name: String,
+    pub buffer_size: Size<i32, Physical>,
+    pub scale_factor: f64,
+}
+
 /// Spawn XWayland and register it on `handle`. Sets `DISPLAY` once the server is up.
 #[cfg(feature = "xwayland")]
 pub fn start_xwayland(
@@ -308,9 +323,7 @@ pub(crate) fn bind_wayland_socket() -> anyhow::Result<(ListeningSocket, String)>
 
 /// Build [`Display`], globals, and [`DesktopState`] for a nested output of the given size and scale.
 pub(crate) fn bootstrap_compositor_core(
-    output_name: String,
-    buffer_size: Size<i32, Physical>,
-    scale_factor: f64,
+    bootstrap_output: Option<BootstrapOutput>,
     backend: BackendKind,
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
@@ -320,17 +333,20 @@ pub(crate) fn bootstrap_compositor_core(
     let mut display = Display::<DesktopState>::new()?;
     let dh = display.handle();
 
-    let output = Output::new(
-        output_name,
-        PhysicalProperties {
-            size: (0, 0).into(),
-            subpixel: Subpixel::Unknown,
-            make: "FlowState".into(),
-            model: "Nested".into(),
-            serial_number: "flowstate-nested".into(),
-        },
-    );
-    output.create_global::<DesktopState>(&dh);
+    let output = bootstrap_output.as_ref().map(|bootstrap_output| {
+        let output = Output::new(
+            bootstrap_output.name.clone(),
+            PhysicalProperties {
+                size: physical_size_mm_from_pixels(bootstrap_output.buffer_size).into(),
+                subpixel: Subpixel::Unknown,
+                make: "FlowState".into(),
+                model: "Nested".into(),
+                serial_number: "flowstate-nested".into(),
+            },
+        );
+        output.create_global::<DesktopState>(&dh);
+        output
+    });
 
     let compositor_state = CompositorState::new::<DesktopState>(&dh);
     let xdg_shell_state = XdgShellState::new::<DesktopState>(&dh);
@@ -359,6 +375,10 @@ pub(crate) fn bootstrap_compositor_core(
     seat.add_keyboard(Default::default(), 200, 25)?;
 
     let render = RenderState::new();
+    let scale_factor = bootstrap_output
+        .as_ref()
+        .map(|output| output.scale_factor)
+        .unwrap_or(1.0);
     let cursor_manager = CursorManager::new(24, scale_factor as f32);
     let notifications = NotificationManager::new();
     let chrome = Chrome::new(ChromeMetrics::default());
@@ -421,17 +441,26 @@ pub(crate) fn bootstrap_compositor_core(
     };
 
     let mut state = DesktopState::new(init);
-    state.set_output_from_nested(output.clone(), buffer_size, scale_factor);
+    let output_state =
+        if let (Some(output), Some(bootstrap_output)) = (output, bootstrap_output.as_ref()) {
+            state.set_output_from_nested(
+                output,
+                bootstrap_output.buffer_size,
+                bootstrap_output.scale_factor,
+            );
 
-    let desk_output = state
-        .outputs
-        .get(&state.primary_output)
-        .expect("active output missing");
+            let desk_output = state
+                .outputs
+                .get(&state.primary_output)
+                .expect("active output missing");
 
-    let output_state = OutputState::new_single_nested(
-        (desk_output.logical_size.w, desk_output.logical_size.h),
-        desk_output.scale_factor,
-    );
+            OutputState::new_single_nested(
+                (desk_output.logical_size.w, desk_output.logical_size.h),
+                desk_output.scale_factor,
+            )
+        } else {
+            OutputState::new_single_nested((1, 1), 1.0)
+        };
 
     let start = Instant::now();
     let last_now = Instant::now();

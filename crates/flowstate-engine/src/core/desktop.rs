@@ -237,6 +237,10 @@ pub struct DesktopState {
     /// so a simple click still reaches the client (immediate compositor grab blocks forwarding).
     pending_xdg_move: Option<(WindowId, Point<f64, Logical>)>,
 
+    /// Last compositor-managed titlebar click, used for XWayland double-click maximize.
+    last_titlebar_click: Option<(WindowId, Instant, Point<f64, Logical>)>,
+    suppress_next_left_release: bool,
+
     /// Stable [`Id`] for the DRM cursor [`TextureRenderElement`] so [`RenderElementStates`] can be inspected.
     pub drm_cursor_render_id: Id,
     /// When true, pass a separate `Kind::Cursor` element to [`smithay::backend::drm::DrmOutput::render_frame`].
@@ -1135,6 +1139,76 @@ impl DesktopState {
         })
     }
 
+    fn xwayland_titlebar_window_id_at(&self, position: Point<f64, Logical>) -> Option<WindowId> {
+        const TITLEBAR_H: i32 = 36;
+        const RESIZE_EDGE_GUARD: i32 = RESIZE_BORDER_PX + 1;
+
+        if !self.pointer_in_work_recess(position) {
+            return None;
+        }
+
+        let px = position.x.round() as i32;
+        let py = position.y.round() as i32;
+        let ws = self.focused_workspace();
+
+        self.space.elements().rev().find_map(|window| {
+            let managed = self
+                .windows
+                .iter()
+                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
+            if !managed.mapped
+                || managed.fullscreen
+                || managed.minimized
+                || window.x11_surface().is_none()
+            {
+                return None;
+            }
+
+            let bbox = self.global_window_bbox(window)?;
+            let titlebar = Rectangle::<i32, Logical>::from_loc_and_size(
+                (bbox.loc.x, bbox.loc.y + RESIZE_EDGE_GUARD),
+                (bbox.size.w, (TITLEBAR_H - RESIZE_EDGE_GUARD).max(1)),
+            );
+
+            titlebar.contains((px, py)).then_some(managed.id)
+        })
+    }
+
+    fn handle_xwayland_titlebar_press(&mut self, position: Point<f64, Logical>) -> bool {
+        const DOUBLE_CLICK_MAX: Duration = Duration::from_millis(500);
+        const DOUBLE_CLICK_DISTANCE_SQ: f64 = 6.0 * 6.0;
+
+        let Some(id) = self.xwayland_titlebar_window_id_at(position) else {
+            self.last_titlebar_click = None;
+            return false;
+        };
+
+        let now = Instant::now();
+        let is_double_click =
+            self.last_titlebar_click
+                .as_ref()
+                .is_some_and(|(last_id, last_time, last_pos)| {
+                    let d = position - *last_pos;
+                    *last_id == id
+                        && now.saturating_duration_since(*last_time) <= DOUBLE_CLICK_MAX
+                        && d.x * d.x + d.y * d.y <= DOUBLE_CLICK_DISTANCE_SQ
+                });
+
+        self.last_titlebar_click = Some((id, now, position));
+
+        if is_double_click {
+            self.last_titlebar_click = None;
+            self.pending_compositor_move = None;
+            self.pending_xdg_move = None;
+            self.input.pointer_left_down = false;
+            self.suppress_next_left_release = true;
+            self.toggle_maximize(id);
+            return true;
+        }
+
+        false
+    }
+
     fn try_begin_compositor_move(&mut self, id: WindowId) {
         if self.toplevel_pointer.is_some() {
             return;
@@ -1349,6 +1423,8 @@ impl DesktopState {
             host_window_drag_requested: false,
             pending_compositor_move: None,
             pending_xdg_move: None,
+            last_titlebar_click: None,
+            suppress_next_left_release: false,
             running: init.running,
             drm_cursor_render_id: Id::new(),
             drm_submit_hw_cursor: false,
@@ -2266,6 +2342,19 @@ impl DesktopState {
                 }
 
                 if matches!(button, FlowMouseButton::Left)
+                    && matches!(state, FlowKeyState::Released)
+                    && self.suppress_next_left_release
+                {
+                    self.suppress_next_left_release = false;
+                    self.input.pointer_left_down = false;
+                    self.pending_compositor_move = None;
+                    self.pending_xdg_move = None;
+                    self.update_pointer_cursor(position);
+                    self.mark_redraw();
+                    return;
+                }
+
+                if matches!(button, FlowMouseButton::Left)
                     && self.peek_ui_action_at_pointer().is_some()
                 {
                     self.clear_client_pointer_focus(position);
@@ -2341,6 +2430,13 @@ impl DesktopState {
                     {
                         self.host_window_drag_requested = true;
                         self.pending_compositor_move = None;
+                    } else if matches!(button, FlowMouseButton::Left)
+                        && self.handle_xwayland_titlebar_press(position)
+                    {
+                        self.clear_client_pointer_focus(position);
+                        self.update_pointer_cursor(position);
+                        self.mark_redraw();
+                        return;
                     } else {
                         self.focus_window_at(position);
                         if matches!(button, FlowMouseButton::Left)
@@ -2681,8 +2777,12 @@ impl DesktopState {
         R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
         R::TextureId: 'static,
     {
+        use smithay::backend::allocator::Buffer as SmithayBuffer;
+        use smithay::backend::renderer::buffer_type;
         use smithay::backend::renderer::utils::import_surface_tree;
         use smithay::utils::Rectangle;
+        use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+        use smithay::wayland::dmabuf::get_dmabuf;
 
         let output_rect = Rectangle::from_loc_and_size(origin, logical_size);
 
@@ -2697,7 +2797,34 @@ impl DesktopState {
                 continue;
             };
             if let Err(err) = import_surface_tree(renderer, &surface) {
-                flowstate_logging::flog(&format!("frame surface import failed: {err:?}"));
+                let buffer_info = with_states(&surface, |states| {
+                    states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .buffer
+                        .as_ref()
+                        .map(|assignment| match assignment {
+                            BufferAssignment::Removed => "removed".to_string(),
+                            BufferAssignment::NewBuffer(buffer) => {
+                                let kind = format!("{:?}", buffer_type(buffer));
+                                if let Ok(dmabuf) = get_dmabuf(buffer) {
+                                    format!(
+                                        "{kind} format={:?} planes={} y_inverted={}",
+                                        SmithayBuffer::format(dmabuf),
+                                        dmabuf.num_planes(),
+                                        dmabuf.y_inverted()
+                                    )
+                                } else {
+                                    kind
+                                }
+                            }
+                        })
+                        .unwrap_or_else(|| "unchanged".to_string())
+                });
+                flowstate_logging::flog(&format!(
+                    "frame surface import failed: {err:?}; root_buffer={buffer_info}"
+                ));
             }
         }
     }
@@ -2846,16 +2973,213 @@ impl DesktopState {
         }
     }
 
-    pub fn request_maximize(&mut self, id: WindowId) {
-        if let Some(window) = self.window_mut(id) {
-            window.set_maximized(true);
+    pub(crate) fn set_window_maximized(&mut self, id: WindowId, maximized: bool) {
+        let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
+            return;
+        };
+
+        if self.windows[idx].maximized == maximized {
+            return;
         }
+
+        let window = self.windows[idx].window.clone();
+        let output_id = self
+            .output_under_pointer(self.pointer_pos)
+            .or(self.windows[idx].output)
+            .unwrap_or(self.focused_output);
+
+        if maximized {
+            let Some(work) = self.work_recess_for_output(output_id) else {
+                self.windows[idx].set_maximized(true);
+                self.mark_redraw();
+                return;
+            };
+
+            let restore_rect = self
+                .space
+                .element_bbox(&window)
+                .or(self.windows[idx].float_rect)
+                .unwrap_or_else(|| Rectangle::from_loc_and_size(work.loc, window.geometry().size));
+
+            {
+                let managed = &mut self.windows[idx];
+                managed.restore_rect = Some(restore_rect);
+                managed.set_maximized(true);
+            }
+
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Maximized);
+                    state.size = Some(work.size);
+                });
+                toplevel.send_pending_configure();
+            }
+
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.set_maximized(true);
+                let _ = x11.configure(work);
+            }
+
+            self.map_window_bbox_location(window, work.loc, true);
+        } else {
+            let restore_rect = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
+                self.windows[idx].float_rect.unwrap_or_else(|| {
+                    Rectangle::from_loc_and_size((100, 100), window.geometry().size)
+                })
+            });
+
+            self.windows[idx].set_maximized(false);
+            self.windows[idx].float_rect = Some(restore_rect);
+
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                    state.size = Some(restore_rect.size);
+                });
+                toplevel.send_pending_configure();
+            }
+
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.set_maximized(false);
+                let _ = x11.configure(restore_rect);
+            }
+
+            self.map_window_bbox_location(window, restore_rect.loc, true);
+        }
+
+        self.space.refresh();
+        self.mark_redraw();
     }
 
-    pub fn request_fullscreen(&mut self, id: WindowId) {
-        if let Some(window) = self.window_mut(id) {
-            window.set_fullscreen(true);
+    fn toggle_maximize(&mut self, id: WindowId) {
+        let Some(maximized) = self.window(id).map(|window| window.maximized) else {
+            return;
+        };
+        self.set_window_maximized(id, !maximized);
+    }
+
+    pub fn request_maximize(&mut self, id: WindowId) {
+        self.set_window_maximized(id, true);
+    }
+
+    pub(crate) fn set_window_fullscreen(
+        &mut self,
+        id: WindowId,
+        fullscreen: bool,
+        requested_output: Option<wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
+            return;
+        };
+
+        if self.windows[idx].fullscreen == fullscreen {
+            return;
         }
+
+        let window = self.windows[idx].window.clone();
+        let output_id = requested_output
+            .as_ref()
+            .and_then(|requested| {
+                self.outputs
+                    .iter()
+                    .find_map(|(id, output)| output.handle.owns(requested).then_some(*id))
+            })
+            .or_else(|| self.output_under_pointer(self.pointer_pos))
+            .or(self.windows[idx].output)
+            .unwrap_or(self.focused_output);
+
+        if fullscreen {
+            let rect = self
+                .outputs
+                .get(&output_id)
+                .and_then(|output| self.space.output_geometry(&output.handle))
+                .or_else(|| {
+                    self.outputs
+                        .get(&self.primary_output)
+                        .and_then(|output| self.space.output_geometry(&output.handle))
+                });
+
+            let Some(rect) = rect else {
+                self.windows[idx].set_fullscreen(true);
+                self.mark_redraw();
+                return;
+            };
+
+            let restore_rect = self
+                .space
+                .element_bbox(&window)
+                .or(self.windows[idx].float_rect)
+                .unwrap_or_else(|| Rectangle::from_loc_and_size(rect.loc, window.geometry().size));
+
+            {
+                let managed = &mut self.windows[idx];
+                managed.restore_rect = Some(restore_rect);
+                managed.set_fullscreen(true);
+                managed.set_maximized(false);
+                managed.set_output(Some(output_id));
+            }
+
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.set(xdg_toplevel::State::Fullscreen);
+                    state.states.unset(xdg_toplevel::State::Maximized);
+                    state.size = Some(rect.size);
+                    state.fullscreen_output = requested_output;
+                });
+                toplevel.send_pending_configure();
+            }
+
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.set_fullscreen(true);
+                let _ = x11.set_maximized(false);
+                let _ = x11.configure(rect);
+            }
+
+            self.map_window_bbox_location(window, rect.loc, true);
+        } else {
+            let restore_rect = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
+                self.windows[idx].float_rect.unwrap_or_else(|| {
+                    Rectangle::from_loc_and_size((100, 100), window.geometry().size)
+                })
+            });
+
+            {
+                let managed = &mut self.windows[idx];
+                managed.set_fullscreen(false);
+                managed.float_rect = Some(restore_rect);
+            }
+
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.states.unset(xdg_toplevel::State::Fullscreen);
+                    state.size = Some(restore_rect.size);
+                    state.fullscreen_output = None;
+                });
+                toplevel.send_pending_configure();
+            }
+
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.set_fullscreen(false);
+                let _ = x11.configure(restore_rect);
+            }
+
+            self.map_window_bbox_location(window, restore_rect.loc, true);
+        }
+
+        self.space.refresh();
+        self.mark_redraw();
+    }
+
+    pub fn request_fullscreen(
+        &mut self,
+        id: WindowId,
+        requested_output: Option<wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        self.set_window_fullscreen(id, true, requested_output);
+    }
+
+    pub fn request_unfullscreen(&mut self, id: WindowId) {
+        self.set_window_fullscreen(id, false, None);
     }
 
     pub fn prepare_cursor_for_frame(
