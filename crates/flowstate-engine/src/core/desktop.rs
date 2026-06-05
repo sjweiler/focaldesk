@@ -70,7 +70,7 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::id;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -1697,11 +1697,17 @@ impl DesktopState {
                     self.space.elements().any(|e| e == &window)
                 ));
                 dbg_flush(&format!("managed.mapped={}", self.windows[idx].mapped));
-                if window.x11_surface().is_some() {
-                    if !self.space.elements().any(|e| e == &window) {
+                let in_space = self.space.elements().any(|e| e == &window);
+                if in_space && !self.windows[idx].mapped && !self.windows[idx].minimized {
+                    self.windows[idx].mapped = true;
+                    let window_id = self.windows[idx].id;
+                    self.focus_window_id(window_id);
+                    dbg_flush("marked existing space window mapped from commit");
+                } else if window.x11_surface().is_some() {
+                    if !in_space {
                         to_map = Some(idx);
                     }
-                } else if !self.space.elements().any(|e| e == &window) {
+                } else if !in_space {
                     to_map = Some(idx);
                 }
             }
@@ -3265,6 +3271,39 @@ fn chrome_profile_dir() -> PathBuf {
         .join("chrome-profile")
 }
 
+fn clear_stale_chrome_singleton(profile: &Path) {
+    let lock = profile.join("SingletonLock");
+    let Ok(target) = std::fs::read_link(&lock) else {
+        return;
+    };
+
+    let Some(pid) = target
+        .to_string_lossy()
+        .rsplit('-')
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+    else {
+        return;
+    };
+
+    if PathBuf::from(format!("/proc/{pid}")).exists() {
+        return;
+    }
+
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let path = profile.join(name);
+        if let Err(err) = std::fs::remove_file(&path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                flog(&format!(
+                    "failed to remove stale Chrome singleton {}: {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    flog(&format!("removed stale Chrome profile singleton for pid {pid}"));
+}
+
 fn flowstate_files_command() -> String {
     std::env::current_exe()
         .ok()
@@ -3288,6 +3327,7 @@ fn flowstate_settings_command() -> String {
 
 fn configure_chrome_command(command: &mut Command) {
     let profile = chrome_profile_dir();
+    clear_stale_chrome_singleton(&profile);
     command
         .arg("--ozone-platform=wayland")
         .arg(format!("--user-data-dir={}", profile.display()))
