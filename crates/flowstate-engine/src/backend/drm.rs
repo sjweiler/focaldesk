@@ -937,6 +937,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
             for (_crtc, surface) in device.surfaces.iter_mut() {
                 let owns_cursor = data.core.state.output_contains_pointer(surface.output_id);
+                let pending_damage = data.core.state.output_has_pending_damage(surface.output_id);
+                let wants_screenshot = screenshot_output == Some(surface.output_id);
+                let should_skip =
+                    !data.core.state.render.redraw_all
+                        && !data.core.state.screenshot_all_requested
+                        && !pending_damage
+                        && !wants_screenshot
+                        && !owns_cursor;
+
+                if should_skip {
+                    continue;
+                }
+
                 data.core.state.drm_try_pass_cursor_this_frame = owns_cursor
                     && data.core.state.drm_submit_hw_cursor
                     && data.core.state.cursor_manager.visible();
@@ -1000,7 +1013,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 //let should_capture = data.core.state.take_screenshot_request();
 
-                if screenshot_output == Some(surface.output_id) {
+                if wants_screenshot {
                     data.core.state.screenshot_seq += 1;
                     let seq = data.core.state.screenshot_seq;
                     let output_name = format!("output-{}", surface.output_id.0);

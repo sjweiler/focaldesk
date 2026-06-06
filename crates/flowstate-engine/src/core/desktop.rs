@@ -126,6 +126,42 @@ pub struct OutputState {
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum DamageSource {
+    WindowMove,
+    WindowResize,
+    Cursor,
+    Hover,
+    CommitBbox,
+    FullRedrawFallback,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DamageSourceCounts {
+    pub window_move: u64,
+    pub window_resize: u64,
+    pub cursor: u64,
+    pub hover: u64,
+    pub commit_bbox: u64,
+    pub full_redraw_fallback: u64,
+    pub unknown: u64,
+}
+
+impl DamageSourceCounts {
+    fn record(&mut self, source: DamageSource) {
+        match source {
+            DamageSource::WindowMove => self.window_move += 1,
+            DamageSource::WindowResize => self.window_resize += 1,
+            DamageSource::Cursor => self.cursor += 1,
+            DamageSource::Hover => self.hover += 1,
+            DamageSource::CommitBbox => self.commit_bbox += 1,
+            DamageSource::FullRedrawFallback => self.full_redraw_fallback += 1,
+            DamageSource::Unknown => self.unknown += 1,
+        }
+    }
+}
+
 pub struct DesktopInit {
     pub display_handle: DisplayHandle,
     pub xdg_activation_state: XdgActivationState,
@@ -260,6 +296,8 @@ pub struct DesktopState {
     pub fonts: FontSystem,
 
     pub theme: ThemeManager,
+    pub damage_debug_enabled: bool,
+    pub damage_source_counts: DamageSourceCounts,
     //pub popups: Vec<PopupState>,
 }
 
@@ -319,7 +357,7 @@ impl DesktopState {
         }
 
         for rect in damage {
-            self.mark_output_logical_damage(output_id, rect, 10);
+            self.mark_output_logical_damage(output_id, rect, 10, DamageSource::Hover);
         }
 
         true
@@ -570,7 +608,7 @@ impl DesktopState {
         }
 
         for (output_id, rect) in damage {
-            self.mark_output_damage(output_id, rect);
+            self.mark_output_damage_source(output_id, rect, DamageSource::Unknown);
         }
     }
 
@@ -578,11 +616,45 @@ impl DesktopState {
         self.mark_global_logical_damage(rect);
     }
 
+    fn mark_window_bbox_damage_source(
+        &mut self,
+        rect: Rectangle<i32, Logical>,
+        source: DamageSource,
+    ) {
+        const WINDOW_DAMAGE_MARGIN: i32 = 24;
+
+        let rect = Self::expand_logical_rect(rect, WINDOW_DAMAGE_MARGIN);
+        let mut damage = Vec::new();
+
+        for (output_id, output) in &self.outputs {
+            let output_rect =
+                Rectangle::from_loc_and_size(output.logical_origin, output.logical_size);
+            let Some(clipped) = rect.intersection(output_rect) else {
+                continue;
+            };
+
+            let local = Rectangle::<i32, Logical>::from_loc_and_size(
+                (
+                    clipped.loc.x - output.logical_origin.x,
+                    clipped.loc.y - output.logical_origin.y,
+                ),
+                clipped.size,
+            );
+            let physical = local.to_physical_precise_round::<f64, i32>(output.scale);
+            damage.push((*output_id, physical));
+        }
+
+        for (output_id, rect) in damage {
+            self.mark_output_damage_source(output_id, rect, source);
+        }
+    }
+
     fn mark_output_logical_damage(
         &mut self,
         output_id: OutputId,
         rect: Rectangle<i32, Logical>,
         margin: i32,
+        source: DamageSource,
     ) {
         let Some(output) = self.outputs.get(&output_id) else {
             return;
@@ -595,7 +667,7 @@ impl DesktopState {
         };
 
         let physical = clipped.to_physical_precise_round::<f64, i32>(output.scale);
-        self.mark_output_damage(output_id, physical);
+        self.mark_output_damage_source(output_id, physical, source);
     }
 
     fn software_cursor_damage_pending_for_output(&self, output_id: OutputId) -> bool {
@@ -1532,6 +1604,9 @@ impl DesktopState {
             screenshot_all_requested: false,
             screenshot_seq: 0,
             theme: init.theme_manager,
+            damage_debug_enabled: std::env::var("FLOWSTATE_DAMAGE_DEBUG")
+                .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
+            damage_source_counts: DamageSourceCounts::default(),
         }
     }
 
@@ -1784,10 +1859,10 @@ impl DesktopState {
                             false,
                         );
                         if let Some(old_bbox) = old_bbox {
-                            self.mark_window_bbox_damage(old_bbox);
+                            self.mark_window_bbox_damage_source(old_bbox, DamageSource::CommitBbox);
                         }
                         if let Some(new_bbox) = self.global_window_bbox(&window) {
-                            self.mark_window_bbox_damage(new_bbox);
+                            self.mark_window_bbox_damage_source(new_bbox, DamageSource::CommitBbox);
                         }
                         commit_damage_queued = true;
                     }
@@ -1871,20 +1946,29 @@ impl DesktopState {
 
         let resize_damage = handle_resize_surface_commit(&mut self.space, surface);
         if let Some((old_bbox, new_bbox)) = resize_damage {
-            self.mark_window_bbox_damage(old_bbox);
-            self.mark_window_bbox_damage(new_bbox);
+            self.mark_window_bbox_damage_source(old_bbox, DamageSource::WindowResize);
+            self.mark_window_bbox_damage_source(new_bbox, DamageSource::WindowResize);
         }
 
         self.ensure_popup_initial_configure(surface);
 
         if mapped_window {
-            self.render.redraw_all = true;
-            self.mark_redraw();
+            if let Some(window) = committed_window.as_ref() {
+                if let Some(bbox) = self.global_window_bbox(window) {
+                    self.mark_window_bbox_damage_source(bbox, DamageSource::CommitBbox);
+                    commit_damage_queued = true;
+                }
+            }
+
+            if !commit_damage_queued {
+                self.render.redraw_all = true;
+                self.mark_redraw();
+            }
         } else if resize_damage.is_none() {
             if !commit_damage_queued {
                 if let Some(window) = committed_window.as_ref() {
                     if let Some(bbox) = self.global_window_bbox(window) {
-                        self.mark_window_bbox_damage(bbox);
+                        self.mark_window_bbox_damage_source(bbox, DamageSource::CommitBbox);
                         commit_damage_queued = true;
                     }
                 }
@@ -2251,10 +2335,10 @@ impl DesktopState {
                         .window(window_id)
                         .and_then(|w| self.global_window_bbox(&w.window));
                     if let Some(old_bbox) = old_bbox {
-                        self.mark_window_bbox_damage(old_bbox);
+                        self.mark_window_bbox_damage_source(old_bbox, DamageSource::WindowMove);
                     }
                     if let Some(new_bbox) = new_bbox {
-                        self.mark_window_bbox_damage(new_bbox);
+                        self.mark_window_bbox_damage_source(new_bbox, DamageSource::WindowMove);
                     }
                     return old_bbox.is_some() || new_bbox.is_some();
                 }
@@ -2836,11 +2920,19 @@ impl DesktopState {
                 .any(|output| !output.pending_damage.is_empty())
     }
 
+    pub fn output_has_pending_damage(&self, output_id: OutputId) -> bool {
+        self.outputs
+            .get(&output_id)
+            .map(|output| !output.pending_damage.is_empty())
+            .unwrap_or(false)
+    }
+
     pub fn clear_repaint_request(&mut self) {
         self.render.redraw_all = false;
         for output in self.outputs.values_mut() {
             output.pending_damage.clear();
         }
+        self.damage_source_counts = DamageSourceCounts::default();
     }
 
     pub fn mark_redraw(&mut self) {
@@ -2848,6 +2940,15 @@ impl DesktopState {
     }
 
     pub fn mark_output_damage(&mut self, output_id: OutputId, rect: Rectangle<i32, Physical>) {
+        self.mark_output_damage_source(output_id, rect, DamageSource::Unknown);
+    }
+
+    pub fn mark_output_damage_source(
+        &mut self,
+        output_id: OutputId,
+        rect: Rectangle<i32, Physical>,
+        source: DamageSource,
+    ) {
         if rect.size.w <= 0 || rect.size.h <= 0 {
             return;
         }
@@ -2856,8 +2957,52 @@ impl DesktopState {
             let bounds = Rectangle::from_loc_and_size((0, 0), output.physical_size);
             if let Some(clipped) = rect.intersection(bounds) {
                 output.pending_damage.push(clipped);
+                self.damage_source_counts.record(source);
             }
         }
+    }
+
+    pub fn record_damage_source(&mut self, source: DamageSource) {
+        self.damage_source_counts.record(source);
+    }
+
+    pub fn damage_debug_enabled(&self) -> bool {
+        self.damage_debug_enabled
+    }
+
+    pub fn log_damage_frame(
+        &self,
+        output_id: OutputId,
+        pre_rects: usize,
+        post_rects: usize,
+        pre_area_percent: i64,
+        post_area_percent: i64,
+        full_damage: bool,
+        redraw_all: bool,
+    ) {
+        if !self.damage_debug_enabled || self.render.frame_no % 120 != 0 {
+            return;
+        }
+
+        let c = self.damage_source_counts;
+        flog(&format!(
+            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, hover={}, commit={}, full_fallback={}, unknown={})",
+            output_id,
+            self.render.frame_no,
+            pre_rects,
+            post_rects,
+            pre_area_percent,
+            post_area_percent,
+            full_damage,
+            redraw_all,
+            c.window_move,
+            c.window_resize,
+            c.cursor,
+            c.hover,
+            c.commit_bbox,
+            c.full_redraw_fallback,
+            c.unknown
+        ));
     }
 
     fn expand_physical_rect(
@@ -3401,7 +3546,11 @@ impl DesktopState {
                 output.last_sw_cursor_rect = None;
             }
             if let Some(old_rect) = previous_cursor_rect {
-                self.mark_output_damage(output_id, Self::expand_physical_rect(old_rect, 4));
+                self.mark_output_damage_source(
+                    output_id,
+                    Self::expand_physical_rect(old_rect, 4),
+                    DamageSource::Cursor,
+                );
             }
             return Ok(());
         }
@@ -3430,9 +3579,17 @@ impl DesktopState {
 
             if previous_cursor_rect != Some(cursor_rect) {
                 if let Some(old_rect) = previous_cursor_rect {
-                    self.mark_output_damage(output_id, Self::expand_physical_rect(old_rect, 4));
+                    self.mark_output_damage_source(
+                        output_id,
+                        Self::expand_physical_rect(old_rect, 4),
+                        DamageSource::Cursor,
+                    );
                 }
-                self.mark_output_damage(output_id, Self::expand_physical_rect(cursor_rect, 4));
+                self.mark_output_damage_source(
+                    output_id,
+                    Self::expand_physical_rect(cursor_rect, 4),
+                    DamageSource::Cursor,
+                );
             }
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.last_sw_cursor_rect = Some(cursor_rect);
@@ -3443,7 +3600,11 @@ impl DesktopState {
                 output.last_sw_cursor_rect = None;
             }
             if let Some(old_rect) = previous_cursor_rect {
-                self.mark_output_damage(output_id, Self::expand_physical_rect(old_rect, 4));
+                self.mark_output_damage_source(
+                    output_id,
+                    Self::expand_physical_rect(old_rect, 4),
+                    DamageSource::Cursor,
+                );
             }
         }
         Ok(())

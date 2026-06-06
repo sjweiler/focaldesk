@@ -27,6 +27,19 @@ fn rect_area(rect: Rectangle<i32, Physical>) -> i64 {
     i64::from(rect.size.w.max(0)) * i64::from(rect.size.h.max(0))
 }
 
+fn damage_area_percent(
+    damage: &[Rectangle<i32, Physical>],
+    output_size: Size<i32, Physical>,
+) -> i64 {
+    let output_area = i64::from(output_size.w.max(0)) * i64::from(output_size.h.max(0)).max(1);
+    let damage_area: i64 = damage.iter().copied().map(rect_area).sum();
+    (damage_area * 100 / output_area.max(1)).clamp(0, 100)
+}
+
+fn is_full_damage(damage: &[Rectangle<i32, Physical>], output_size: Size<i32, Physical>) -> bool {
+    damage.len() == 1 && damage[0] == Rectangle::from_loc_and_size((0, 0), output_size)
+}
+
 fn rect_bounds(rects: &[Rectangle<i32, Physical>]) -> Option<Rectangle<i32, Physical>> {
     let first = rects.first()?;
     let mut min_x = first.loc.x;
@@ -190,15 +203,42 @@ pub fn prepare_output(
     state.update_ui_hover_for_output(output_id);
 
     let frame_damage = {
-        let desk_output = state
+        let pending_damage = state
             .outputs
             .get(&output_id)
-            .expect("active output missing");
+            .expect("active output missing")
+            .pending_damage
+            .clone();
         let full_damage = Rectangle::from_loc_and_size((0, 0), buffer_size);
-        if state.render.redraw_all || desk_output.pending_damage.is_empty() {
-            vec![full_damage]
+        if state.render.redraw_all || pending_damage.is_empty() {
+            if state.render.redraw_all {
+                state.record_damage_source(crate::core::desktop::DamageSource::FullRedrawFallback);
+            }
+            let frame_damage = vec![full_damage];
+            state.log_damage_frame(
+                output_id,
+                pending_damage.len(),
+                frame_damage.len(),
+                damage_area_percent(&pending_damage, buffer_size),
+                damage_area_percent(&frame_damage, buffer_size),
+                true,
+                state.render.redraw_all,
+            );
+            frame_damage
         } else {
-            compact_damage(&desk_output.pending_damage, buffer_size)
+            let pre_rects = pending_damage.len();
+            let pre_area_percent = damage_area_percent(&pending_damage, buffer_size);
+            let frame_damage = compact_damage(&pending_damage, buffer_size);
+            state.log_damage_frame(
+                output_id,
+                pre_rects,
+                frame_damage.len(),
+                pre_area_percent,
+                damage_area_percent(&frame_damage, buffer_size),
+                is_full_damage(&frame_damage, buffer_size),
+                false,
+            );
+            frame_damage
         }
     };
 
