@@ -11,10 +11,26 @@ use std::rc::Rc;
 #[derive(Debug, Clone)]
 struct FileItem {
     name: String,
-    path: PathBuf,
+    file: gio::File,
+    path: Option<PathBuf>,
+    uri: String,
     is_dir: bool,
     size: u64,
     modified: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SidebarKind {
+    Folder,
+    Trash,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Location {
+    Path(PathBuf),
+    Trash,
+    Uri(String),
+    Separator,
 }
 
 #[derive(Clone)]
@@ -25,10 +41,10 @@ struct FileManager {
     status: gtk::Label,
     hidden_toggle: gtk::ToggleButton,
     places: gtk::StringList,
-    current_dir: Rc<RefCell<PathBuf>>,
+    current_location: Rc<RefCell<Location>>,
     entries: Rc<RefCell<Vec<FileItem>>>,
-    back_stack: Rc<RefCell<Vec<PathBuf>>>,
-    forward_stack: Rc<RefCell<Vec<PathBuf>>>,
+    back_stack: Rc<RefCell<Vec<Location>>>,
+    forward_stack: Rc<RefCell<Vec<Location>>>,
 }
 
 fn main() {
@@ -71,7 +87,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     path_entry.set_hexpand(true);
     path_entry.set_placeholder_text(Some("Path"));
     path_entry.set_primary_icon_name(Some("folder-symbolic"));
-    header.set_title_widget(Some(&path_entry));
+    header.pack_start(&path_entry);
+    header.pack_start(&new_folder_button);
 
     let hidden_toggle = gtk::ToggleButton::new();
     hidden_toggle.set_icon_name("view-hidden-symbolic");
@@ -79,7 +96,6 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     header.pack_end(&hidden_toggle);
     header.pack_end(&refresh_button);
     header.pack_end(&trash_button);
-    header.pack_end(&new_folder_button);
 
     let split = adw::NavigationSplitView::new();
     split.set_min_sidebar_width(180.0);
@@ -133,7 +149,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         status,
         hidden_toggle,
         places,
-        current_dir: Rc::new(RefCell::new(home_dir())),
+        current_location: Rc::new(RefCell::new(Location::Path(home_dir()))),
         entries: Rc::new(RefCell::new(Vec::new())),
         back_stack: Rc::new(RefCell::new(Vec::new())),
         forward_stack: Rc::new(RefCell::new(Vec::new())),
@@ -169,7 +185,12 @@ impl FileManager {
     ) {
         let this = self.clone();
         self.path_entry.connect_activate(move |entry| {
-            this.open_dir(PathBuf::from(entry.text().as_str()), true);
+            this.open_location(location_from_entry(entry.text().as_str()), true);
+        });
+
+        let this = self.clone();
+        self.list.connect_selected_rows_changed(move |_| {
+            this.show_selected_path();
         });
 
         let this = self.clone();
@@ -184,8 +205,8 @@ impl FileManager {
             };
 
             if item.is_dir {
-                this.open_dir(item.path, true);
-            } else if let Err(err) = open_file(&item.path) {
+                this.open_location(item.location(), true);
+            } else if let Err(err) = open_file(&item.file) {
                 this.set_status(&format!("Could not open {}: {err}", item.name));
             }
         });
@@ -197,8 +218,8 @@ impl FileManager {
             };
             this.forward_stack
                 .borrow_mut()
-                .push(this.current_dir.borrow().clone());
-            this.open_dir(previous, false);
+                .push(this.current_location.borrow().clone());
+            this.open_location(previous, false);
         });
 
         let this = self.clone();
@@ -208,20 +229,19 @@ impl FileManager {
             };
             this.back_stack
                 .borrow_mut()
-                .push(this.current_dir.borrow().clone());
-            this.open_dir(next, false);
+                .push(this.current_location.borrow().clone());
+            this.open_location(next, false);
         });
 
         let this = self.clone();
         up_button.connect_clicked(move |_| {
-            let parent = this.current_dir.borrow().parent().map(Path::to_path_buf);
-            if let Some(parent) = parent {
-                this.open_dir(parent, true);
+            if let Some(parent) = this.parent_dir() {
+                this.open_location(Location::Path(parent), true);
             }
         });
 
         let this = self.clone();
-        home_button.connect_clicked(move |_| this.open_dir(home_dir(), true));
+        home_button.connect_clicked(move |_| this.open_location(Location::Path(home_dir()), true));
 
         let this = self.clone();
         refresh_button.connect_clicked(move |_| this.reload());
@@ -237,8 +257,8 @@ impl FileManager {
 
         let this = self.clone();
         places_view.connect_activate(move |_, position| {
-            if let Some(path) = this.place_path(position) {
-                this.open_dir(path, true);
+            if let Some(location) = this.place_location(position) {
+                this.open_location(location, true);
             }
         });
     }
@@ -271,59 +291,80 @@ impl FileManager {
     fn load_places(&self) {
         let mut paths = vec![
             ("Home", home_dir()),
+            ("Trash", PathBuf::from("trash:///")),
+            ("----------", PathBuf::from("-")),
             ("Desktop", home_dir().join("Desktop")),
-            ("Documents", home_dir().join("Documents")),
-            ("Downloads", home_dir().join("Downloads")),
-            ("Pictures", home_dir().join("Pictures")),
             ("Music", home_dir().join("Music")),
+            ("Pictures", home_dir().join("Pictures")),
             ("Videos", home_dir().join("Videos")),
-            ("File System", PathBuf::from("/")),
+            ("Downloads", home_dir().join("Downloads")),
         ];
 
-        paths.retain(|(_, path)| path.exists());
+        paths.retain(|(_, path)| {
+            path == Path::new("trash:///") || path == Path::new("-") || path.exists()
+        });
         for (name, path) in paths {
             self.places
                 .append(&format!("{name}\n{}", path.to_string_lossy()));
         }
     }
 
-    fn place_path(&self, position: u32) -> Option<PathBuf> {
+    fn place_location(&self, position: u32) -> Option<Location> {
         self.places.string(position).and_then(|text| {
-            text.lines()
-                .nth(1)
-                .map(|path| PathBuf::from(path.to_string()))
+            text.lines().nth(1).map(|path| {
+                if path == "trash:///" {
+                    Location::Trash
+                } else if path == "-" {
+                    Location::Separator
+                } else {
+                    Location::Path(PathBuf::from(path))
+                }
+            })
         })
     }
 
-    fn open_dir(&self, path: PathBuf, remember: bool) {
-        let path = normalize_path(&path);
-        if !path.is_dir() {
-            self.set_status(&format!("Not a folder: {}", path.display()));
-            self.path_entry
-                .set_text(&self.current_dir.borrow().to_string_lossy());
+    fn open_location(&self, location: Location, remember: bool) {
+        let location = normalize_location(location);
+        if location == Location::Separator {
             return;
         }
 
-        match read_dir_items(&path, self.hidden_toggle.is_active()) {
+        if let Location::Path(path) = &location {
+            if !path.is_dir() {
+                self.set_status(&format!("Not a folder: {}", path.display()));
+                self.path_entry
+                    .set_text(&self.current_location.borrow().display_text());
+                return;
+            }
+        }
+
+        match read_location_items(&location, self.hidden_toggle.is_active()) {
             Ok(items) => {
-                if remember && *self.current_dir.borrow() != path {
+                if remember && *self.current_location.borrow() != location {
                     self.back_stack
                         .borrow_mut()
-                        .push(self.current_dir.borrow().clone());
+                        .push(self.current_location.borrow().clone());
                     self.forward_stack.borrow_mut().clear();
                 }
 
-                *self.current_dir.borrow_mut() = path.clone();
+                *self.current_location.borrow_mut() = location.clone();
                 *self.entries.borrow_mut() = items;
-                self.path_entry.set_text(&path.to_string_lossy());
+                self.path_entry.set_text(&location.display_text());
                 self.render_entries();
             }
             Err(err) => {
-                self.set_status(&format!("Could not read {}: {err}", path.display()));
+                self.set_status(&format!(
+                    "Could not read {}: {err}",
+                    location.display_text()
+                ));
                 self.path_entry
-                    .set_text(&self.current_dir.borrow().to_string_lossy());
+                    .set_text(&self.current_location.borrow().display_text());
             }
         }
+    }
+
+    fn open_dir(&self, path: PathBuf, remember: bool) {
+        self.open_location(Location::Path(path), remember);
     }
 
     fn open_initial_path(&self, path: PathBuf) {
@@ -340,7 +381,14 @@ impl FileManager {
     }
 
     fn reload(&self) {
-        self.open_dir(self.current_dir.borrow().clone(), false);
+        self.open_location(self.current_location.borrow().clone(), false);
+    }
+
+    fn parent_dir(&self) -> Option<PathBuf> {
+        match &*self.current_location.borrow() {
+            Location::Path(path) => path.parent().map(Path::to_path_buf),
+            Location::Trash | Location::Uri(_) | Location::Separator => None,
+        }
     }
 
     fn render_entries(&self) {
@@ -365,6 +413,14 @@ impl FileManager {
     }
 
     fn show_new_folder_dialog(&self) {
+        let Location::Path(current_dir) = &*self.current_location.borrow() else {
+            self.set_status("New folders cannot be created in Trash.");
+            self.path_entry
+                .set_text(&self.current_location.borrow().display_text());
+            return;
+        };
+        let current_dir = current_dir.clone();
+
         let dialog = gtk::Window::builder()
             .transient_for(&self.window)
             .modal(true)
@@ -405,7 +461,7 @@ impl FileManager {
         create.connect_clicked(move |_| {
             let name = entry.text().trim().to_string();
             if !name.is_empty() && !name.contains('/') {
-                let path = this.current_dir.borrow().join(name);
+                let path = current_dir.join(name);
                 match std::fs::create_dir(&path) {
                     Ok(()) => this.reload(),
                     Err(err) => this.set_status(&format!("Could not create folder: {err}")),
@@ -434,8 +490,12 @@ impl FileManager {
             return;
         };
 
-        let file = gio::File::for_path(&item.path);
-        match file.trash(gio::Cancellable::NONE) {
+        if self.current_location.borrow().is_trash() {
+            self.set_status("Items in Trash are already in the trash bin.");
+            return;
+        }
+
+        match item.file.trash(gio::Cancellable::NONE) {
             Ok(()) => {
                 self.set_status(&format!("Moved {} to trash.", item.name));
                 self.reload();
@@ -447,10 +507,73 @@ impl FileManager {
     fn set_status(&self, text: &str) {
         self.status.set_text(text);
     }
+
+    fn show_selected_path(&self) {
+        let Some(row) = self.list.selected_row() else {
+            self.path_entry
+                .set_text(&self.current_location.borrow().display_text());
+            return;
+        };
+
+        let index = row.index();
+        if index < 0 {
+            return;
+        }
+
+        if let Some(item) = self.entries.borrow().get(index as usize) {
+            self.path_entry.set_text(&item.display_path());
+        }
+    }
 }
 
-fn read_dir_items(path: &Path, show_hidden: bool) -> Result<Vec<FileItem>, glib::Error> {
-    let file = gio::File::for_path(path);
+impl FileItem {
+    fn location(&self) -> Location {
+        self.path
+            .as_ref()
+            .map(|path| Location::Path(path.clone()))
+            .unwrap_or_else(|| Location::Uri(self.uri.clone()))
+    }
+
+    fn display_path(&self) -> String {
+        self.path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.uri.clone())
+    }
+}
+
+impl Location {
+    fn display_text(&self) -> String {
+        match self {
+            Location::Path(path) => path.to_string_lossy().into_owned(),
+            Location::Trash => "trash:///".to_string(),
+            Location::Uri(uri) => uri.clone(),
+            Location::Separator => "-".to_string(),
+        }
+    }
+
+    fn is_trash(&self) -> bool {
+        match self {
+            Location::Trash => true,
+            Location::Uri(uri) => uri.starts_with("trash:"),
+            Location::Path(_) | Location::Separator => false,
+        }
+    }
+}
+
+fn read_location_items(
+    location: &Location,
+    show_hidden: bool,
+) -> Result<Vec<FileItem>, glib::Error> {
+    match location {
+        Location::Path(path) => read_file_items(&gio::File::for_path(path), show_hidden),
+        Location::Trash => read_file_items(&gio::File::for_uri("trash:///"), show_hidden),
+        Location::Uri(uri) => read_file_items(&gio::File::for_uri(uri), show_hidden),
+        Location::Separator => Ok(Vec::new()),
+    }
+}
+
+fn read_file_items(file: &gio::File, show_hidden: bool) -> Result<Vec<FileItem>, glib::Error> {
     let enumerator = file.enumerate_children(
         "standard::name,standard::display-name,standard::type,standard::size,time::modified",
         gio::FileQueryInfoFlags::NONE,
@@ -466,9 +589,12 @@ fn read_dir_items(path: &Path, show_hidden: bool) -> Result<Vec<FileItem>, glib:
         }
 
         let is_dir = info.file_type() == gio::FileType::Directory;
+        let child = enumerator.child(&info);
         items.push(FileItem {
-            path: path.join(&name),
             name,
+            path: child.path(),
+            uri: child.uri().to_string(),
+            file: child,
             is_dir,
             size: info.size().max(0) as u64,
             modified: modified_text(&info),
@@ -590,8 +716,14 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
-fn open_file(path: &Path) -> Result<(), glib::Error> {
-    if path.extension().is_some_and(|ext| ext == "desktop") {
+fn open_file(file: &gio::File) -> Result<(), glib::Error> {
+    let path = file.path();
+
+    if path
+        .as_deref()
+        .is_some_and(|path| path.extension().is_some_and(|ext| ext == "desktop"))
+    {
+        let path = path.as_deref().expect("checked desktop path");
         return launch_desktop_entry(path).map_err(|err| {
             glib::Error::new(
                 gio::IOErrorEnum::Failed,
@@ -600,10 +732,11 @@ fn open_file(path: &Path) -> Result<(), glib::Error> {
         });
     }
 
-    let force_x11 = path
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
-    let uri = gio::File::for_path(path).uri();
+    let force_x11 = path.as_deref().is_some_and(|path| {
+        path.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    });
+    let uri = file.uri();
     if let Some(display) = gtk::gdk::Display::default() {
         let context = display.app_launch_context();
         apply_launch_environment(&context, force_x11);
@@ -612,6 +745,17 @@ fn open_file(path: &Path) -> Result<(), glib::Error> {
         let context = gio::AppLaunchContext::new();
         apply_launch_environment(&context, force_x11);
         gio::AppInfo::launch_default_for_uri(&uri, Some(&context))
+    }
+}
+
+fn location_from_entry(text: &str) -> Location {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("trash:///") || text.eq_ignore_ascii_case("trash://") {
+        Location::Trash
+    } else if text.starts_with("trash:") {
+        Location::Uri(text.to_string())
+    } else {
+        Location::Path(PathBuf::from(text))
     }
 }
 
@@ -720,6 +864,14 @@ fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
+fn normalize_location(location: Location) -> Location {
+    match location {
+        Location::Path(path) => Location::Path(normalize_path(&path)),
+        Location::Uri(uri) if uri == "trash:///" || uri == "trash://" => Location::Trash,
+        other => other,
+    }
+}
+
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -755,3 +907,79 @@ fn plural(count: usize) -> &'static str {
         "s"
     }
 }
+
+fn attach_sidebar_context_menu(row: &gtk::ListBoxRow, kind: SidebarKind) {
+    let menu = gio::Menu::new();
+
+    menu.append(Some("Open"), Some("win.sidebar-open"));
+
+    if matches!(kind, SidebarKind::Folder) {
+        menu.append(Some("Open in New Tab"), Some("win.sidebar-open-tab"));
+        menu.append(Some("Open in New Window"), Some("win.sidebar-open-window"));
+    }
+
+    menu.append_section(None, &{
+        let section = gio::Menu::new();
+
+        if matches!(kind, SidebarKind::Trash) {
+            section.append(Some("Empty Trash..."), Some("win.empty-trash"));
+        }
+
+        section
+    });
+
+    menu.append_section(None, &{
+        let section = gio::Menu::new();
+        section.append(Some("Properties"), Some("win.sidebar-properties"));
+        section
+    });
+
+    let popover = gtk::PopoverMenu::from_model(Some(&menu));
+    popover.set_has_arrow(false);
+    popover.set_parent(row);
+
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+
+    click.connect_pressed(glib::clone!(@weak popover => move |gesture, _, x, y| {
+        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover.set_pointing_to(Some(&rect));
+        popover.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    }));
+
+    row.add_controller(click);
+}
+
+fn install_sidebar_actions(window: &gtk::ApplicationWindow) {
+    let open = gio::SimpleAction::new("sidebar-open", None);
+    open.connect_activate(|_, _| {
+        println!("Open sidebar location");
+    });
+    window.add_action(&open);
+
+    let open_tab = gio::SimpleAction::new("sidebar-open-tab", None);
+    open_tab.connect_activate(|_, _| {
+        println!("Open in new tab");
+    });
+    window.add_action(&open_tab);
+
+    let open_window = gio::SimpleAction::new("sidebar-open-window", None);
+    open_window.connect_activate(|_, _| {
+        println!("Open in new window");
+    });
+    window.add_action(&open_window);
+
+    let empty_trash = gio::SimpleAction::new("empty-trash", None);
+    empty_trash.connect_activate(|_, _| {
+        println!("Empty Trash...");
+    });
+    window.add_action(&empty_trash);
+
+    let properties = gio::SimpleAction::new("sidebar-properties", None);
+    properties.connect_activate(|_, _| {
+        println!("Show properties");
+    });
+    window.add_action(&properties);
+}
+

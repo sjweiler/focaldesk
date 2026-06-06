@@ -36,6 +36,7 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::core::input::FlowKeyState;
@@ -194,7 +195,9 @@ pub struct DesktopState {
     pub output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    pub image_copy_capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
+    pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
@@ -1399,7 +1402,9 @@ impl DesktopState {
             image_capture_source_state: init.image_capture_source_state,
             output_capture_source_state: init.output_capture_source_state,
             image_copy_capture_state: init.image_copy_capture_state,
+            image_copy_capture_sessions: Vec::new(),
             portal_dispatch_ctx: None,
+            portal_frame_cache: HashMap::new(),
             backend_kind: init.backend_kind,
             cursor_manager: init.cursor_manager,
             seat: init.seat,
@@ -3301,7 +3306,9 @@ fn clear_stale_chrome_singleton(profile: &Path) {
             }
         }
     }
-    flog(&format!("removed stale Chrome profile singleton for pid {pid}"));
+    flog(&format!(
+        "removed stale Chrome profile singleton for pid {pid}"
+    ));
 }
 
 fn flowstate_files_command() -> String {

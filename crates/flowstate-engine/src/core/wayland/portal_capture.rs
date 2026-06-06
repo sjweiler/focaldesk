@@ -55,10 +55,13 @@ impl ImageCopyCaptureHandler for DesktopState {
         })
     }
 
-    fn new_session(&mut self, session: Session) {}
+    fn new_session(&mut self, session: Session) {
+        self.image_copy_capture_sessions.push(session);
+    }
 
     fn frame(&mut self, session: &SessionRef, frame: Frame) {
         let Some(output_id) = portal::output_id_for_session(self, session) else {
+            frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
             return;
         };
 

@@ -22,12 +22,11 @@ use crate::core::desktop::DesktopState;
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
 use crate::core::OutputState;
-use flowstate_themes::theme::BuiltInThemeId;
-use flowstate_themes::FlowThemeId;
-use flowstate_themes::ThemeManager;
 use smithay::backend::renderer::Frame as RendererFrame;
 use smithay::wayland::image_capture_source::ImageCaptureSource;
 use smithay::wayland::image_copy_capture::SessionRef;
+
+const PORTAL_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(66);
 
 /// Pointers to objects that must be live for the duration of `dispatch_clients` only.
 #[derive(Clone, Copy)]
@@ -38,6 +37,13 @@ pub struct PortalDispatchCtx {
     pub output_state: NonNull<OutputState>,
     pub now: Instant,
     pub dt: Duration,
+}
+
+pub struct PortalFrameCache {
+    pub size: Size<i32, BufferCoords>,
+    pub rgba: Vec<u8>,
+    pub transform: Transform,
+    pub captured_at: Instant,
 }
 
 impl DesktopState {
@@ -121,6 +127,23 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         return;
     }
 
+    if let Some(cache) = state.portal_frame_cache.get(&output_id) {
+        if cache.size == buffer_size
+            && now.duration_since(cache.captured_at) < PORTAL_CAPTURE_MIN_INTERVAL
+        {
+            if write_rgba_to_shm_buffer(&buffer, buffer_size, &cache.rgba).is_ok() {
+                frame.success(
+                    cache.transform,
+                    None::<Vec<Rectangle<i32, BufferCoords>>>,
+                    Duration::ZERO,
+                );
+            } else {
+                frame.fail(CaptureFailureReason::BufferConstraints);
+            }
+            return;
+        }
+    }
+
     let mut capture_tex = match <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(
         renderer,
         Fourcc::Argb8888,
@@ -146,8 +169,6 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
             let mut target = renderer.bind(&mut capture_tex)?;
             let client_elements = build_output_client_elements(state, renderer, output_id);
             let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
-            let mut theme_manager = ThemeManager::new(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
-            let theme = theme_manager.active_theme();
             draw_output(
                 state,
                 &mut gles_frame,
@@ -158,8 +179,7 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
                 output_state,
             )?;
 
-            let sync = gles_frame.finish()?;
-            renderer.wait(&sync)?;
+            let _ = gles_frame.finish()?;
         }
         Ok(())
     })();
@@ -191,7 +211,43 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         return;
     }
 
-    let write_res = with_buffer_contents_mut(&buffer, |ptr, len, data| -> Result<(), ()> {
+    state.portal_frame_cache.insert(
+        output_id,
+        PortalFrameCache {
+            size: buffer_size,
+            rgba: rgba.clone(),
+            transform,
+            captured_at: now,
+        },
+    );
+
+    let write_res = write_rgba_to_shm_buffer(&buffer, buffer_size, &rgba);
+
+    if write_res.is_err() {
+        frame.fail(CaptureFailureReason::BufferConstraints);
+        return;
+    }
+
+    frame.success(
+        transform,
+        None::<Vec<Rectangle<i32, BufferCoords>>>,
+        std::time::Duration::ZERO,
+    );
+}
+
+fn write_rgba_to_shm_buffer(
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    buffer_size: Size<i32, BufferCoords>,
+    rgba: &[u8],
+) -> Result<(), ()> {
+    let width = buffer_size.w as usize;
+    let height = buffer_size.h as usize;
+
+    if rgba.len() != width.saturating_mul(height).saturating_mul(4) {
+        return Err(());
+    }
+
+    with_buffer_contents_mut(buffer, |ptr, len, data| -> Result<(), ()> {
         if data.height != buffer_size.h || data.width != buffer_size.w {
             return Err(());
         }
@@ -227,18 +283,8 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
             }
             _ => Err(()),
         }
-    });
-
-    if write_res.is_err() {
-        frame.fail(CaptureFailureReason::BufferConstraints);
-        return;
-    }
-
-    frame.success(
-        transform,
-        None::<Vec<Rectangle<i32, BufferCoords>>>,
-        std::time::Duration::ZERO,
-    );
+    })
+    .map_err(|_| ())?
 }
 
 /// Append [`wlr-layer-shell`](https://wayland.app/protocols/wlr-layer-shell-unstable-v1) surfaces

@@ -920,9 +920,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.refresh_space();
         data.core.display.handle().flush_clients()?;
         data.core.state.tick_layout();
-        data.core.last_now = now;
 
         let screenshot_output = data.core.state.take_screenshot_request();
+        let should_render = data.core.state.needs_redraw()
+            || screenshot_output.is_some()
+            || data.core.state.screenshot_all_requested;
+        if !should_render {
+            continue;
+        }
+        data.core.last_now = now;
 
         for (_node, device) in data.backend.devices.iter_mut() {
             let drm_surface_count = device.surfaces.len();

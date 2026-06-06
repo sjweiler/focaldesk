@@ -321,13 +321,34 @@ pub(crate) fn bind_wayland_socket() -> anyhow::Result<(ListeningSocket, String)>
     Ok((socket, name))
 }
 
+fn publish_portal_environment(wayland_display: &str) {
+    std::env::set_var("WAYLAND_DISPLAY", wayland_display);
+    std::env::set_var("XDG_CURRENT_DESKTOP", "wlroots");
+
+    let status = std::process::Command::new("dbus-update-activation-environment")
+        .args(["--systemd", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"])
+        .status();
+
+    match status {
+        Ok(status) if status.success() => flog(&format!(
+            "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=wlroots"
+        )),
+        Ok(status) => flog(&format!(
+            "failed to publish portal environment: dbus-update-activation-environment exited with {status}"
+        )),
+        Err(err) => flog(&format!(
+            "failed to publish portal environment: dbus-update-activation-environment: {err}"
+        )),
+    }
+}
+
 /// Build [`Display`], globals, and [`DesktopState`] for a nested output of the given size and scale.
 pub(crate) fn bootstrap_compositor_core(
     bootstrap_output: Option<BootstrapOutput>,
     backend: BackendKind,
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
-    std::env::set_var("WAYLAND_DISPLAY", &wayland_display);
+    publish_portal_environment(&wayland_display);
     flog(&format!("FlowState client socket is {}", wayland_display));
 
     let mut display = Display::<DesktopState>::new()?;

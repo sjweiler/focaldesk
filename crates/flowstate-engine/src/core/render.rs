@@ -1321,11 +1321,6 @@ impl RenderState {
 
         // notifications
         // this will render notifications here in future - this is a placeholder
-        println!(
-            "dialogs={}, active_dialog={:?}",
-            inputs.dialogs.len(),
-            inputs.active_dialog
-        );
         let program = self.chrome_shaders.tinted_icon.clone();
 
         if let (Some(atlas), Some(program)) = (muts.ui.chrome.atlas.as_ref(), program.as_ref()) {

@@ -59,7 +59,7 @@ impl DesktopState {
         display_handle: &smithay::reexports::wayland_server::DisplayHandle,
     ) {
         let mut seat = self.seat_state.new_wl_seat(display_handle, "seat-0");
-        seat.add_keyboard(Default::default(), 200, 25).unwrap();
+        seat.add_keyboard(Default::default(), 500, 20).unwrap();
         seat.add_pointer();
         //self.seat = seat;
     }
