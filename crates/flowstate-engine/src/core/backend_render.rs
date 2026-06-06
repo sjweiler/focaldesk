@@ -23,6 +23,130 @@ pub struct PreparedOutput {
     pub draw_software_cursor: bool,
 }
 
+fn rect_area(rect: Rectangle<i32, Physical>) -> i64 {
+    i64::from(rect.size.w.max(0)) * i64::from(rect.size.h.max(0))
+}
+
+fn rect_bounds(rects: &[Rectangle<i32, Physical>]) -> Option<Rectangle<i32, Physical>> {
+    let first = rects.first()?;
+    let mut min_x = first.loc.x;
+    let mut min_y = first.loc.y;
+    let mut max_x = first.loc.x + first.size.w;
+    let mut max_y = first.loc.y + first.size.h;
+
+    for rect in &rects[1..] {
+        min_x = min_x.min(rect.loc.x);
+        min_y = min_y.min(rect.loc.y);
+        max_x = max_x.max(rect.loc.x + rect.size.w);
+        max_y = max_y.max(rect.loc.y + rect.size.h);
+    }
+
+    Some(Rectangle::from_loc_and_size(
+        (min_x, min_y),
+        ((max_x - min_x).max(0), (max_y - min_y).max(0)),
+    ))
+}
+
+fn expand_rect(rect: Rectangle<i32, Physical>, margin: i32) -> Rectangle<i32, Physical> {
+    Rectangle::from_loc_and_size(
+        (rect.loc.x - margin, rect.loc.y - margin),
+        (rect.size.w + margin * 2, rect.size.h + margin * 2),
+    )
+}
+
+fn compact_damage(
+    damage: &[Rectangle<i32, Physical>],
+    output_size: Size<i32, Physical>,
+) -> Vec<Rectangle<i32, Physical>> {
+    const MERGE_MARGIN: i32 = 4;
+    const MAX_RECTS: usize = 8;
+    const FULL_DAMAGE_PERCENT: i64 = 45;
+
+    let full = Rectangle::from_loc_and_size((0, 0), output_size);
+    let output_area = rect_area(full).max(1);
+    let mut rects = Vec::with_capacity(damage.len());
+
+    for rect in damage {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            continue;
+        }
+        if let Some(clipped) = rect.intersection(full) {
+            if !clipped.is_empty() {
+                rects.push(clipped);
+            }
+        }
+    }
+
+    if rects.is_empty() {
+        return vec![full];
+    }
+
+    let mut i = 0;
+    while i < rects.len() {
+        let mut j = i + 1;
+        while j < rects.len() {
+            if expand_rect(rects[i], MERGE_MARGIN).overlaps(rects[j]) {
+                let merged = rect_bounds(&[rects[i], rects[j]]).expect("two rects");
+                rects[i] = merged;
+                rects.swap_remove(j);
+            } else {
+                j += 1;
+            }
+        }
+        i += 1;
+    }
+
+    let total_area: i64 = rects.iter().copied().map(rect_area).sum();
+    if total_area * 100 >= output_area * FULL_DAMAGE_PERCENT {
+        return vec![full];
+    }
+
+    if rects.len() > MAX_RECTS {
+        if let Some(bounds) = rect_bounds(&rects) {
+            return vec![bounds];
+        }
+    }
+
+    rects
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_damage_merges_nearby_rects() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let damage = [
+            Rectangle::from_loc_and_size((10, 10), (10, 10)),
+            Rectangle::from_loc_and_size((23, 10), (10, 10)),
+        ];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::from_loc_and_size((10, 10), (23, 10))]
+        );
+    }
+
+    #[test]
+    fn compact_damage_uses_full_output_for_large_area() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let damage = [Rectangle::from_loc_and_size((0, 0), (80, 60))];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::<i32, Physical>::from_loc_and_size(
+                (0, 0),
+                output_size
+            )]
+        );
+    }
+}
+
 pub fn prepare_output(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -64,6 +188,19 @@ pub fn prepare_output(
 
     build_ui_for_output(&mut state.ui, &layout);
     state.update_ui_hover_for_output(output_id);
+
+    let frame_damage = {
+        let desk_output = state
+            .outputs
+            .get(&output_id)
+            .expect("active output missing");
+        let full_damage = Rectangle::from_loc_and_size((0, 0), buffer_size);
+        if state.render.redraw_all || desk_output.pending_damage.is_empty() {
+            vec![full_damage]
+        } else {
+            compact_damage(&desk_output.pending_damage, buffer_size)
+        }
+    };
 
     state.render.ensure_shader_programs(renderer)?;
     // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
@@ -135,10 +272,7 @@ pub fn prepare_output(
         output_size: (buffer_size.w, buffer_size.h),
         output_scale,
         buffer_scale,
-        damage: vec![Rectangle::from_loc_and_size(
-            (0, 0),
-            (buffer_size.w, buffer_size.h),
-        )],
+        damage: frame_damage,
         work: Rectangle::from_loc_and_size((0, 0), (logical_w, logical_h)),
         frame_no: state.render.frame_no,
         now,

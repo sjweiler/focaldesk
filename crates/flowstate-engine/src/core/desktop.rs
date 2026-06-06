@@ -122,6 +122,8 @@ pub struct OutputState {
     pub scale_factor: f64,
     pub scale: Scale<f64>,
     pub active_workspace: WorkspaceId,
+    pub pending_damage: Vec<Rectangle<i32, Physical>>,
+    pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
 }
 
 pub struct DesktopInit {
@@ -277,7 +279,8 @@ impl DesktopState {
             })
             .map(|(id, _)| *id)
     }
-    pub fn update_ui_hover_for_output(&mut self, output_id: OutputId) {
+    pub fn update_ui_hover_for_output(&mut self, output_id: OutputId) -> bool {
+        let old_hovered = self.ui.hovered;
         if !self.output_contains_pointer(output_id) {
             self.ui.hovered = None;
 
@@ -285,20 +288,41 @@ impl DesktopState {
                 el.hovered = false;
             }
 
-            return;
+            return false;
         }
 
         let Some(rel) = self.pointer_relative_to_output_logical(output_id) else {
-            return;
+            return false;
         };
         let x = rel.x.round() as i32;
         let y = rel.y.round() as i32;
 
-        self.ui.hovered = self.ui.hit_test(x, y).map(|e| e.id);
+        let new_hovered = self.ui.hit_test(x, y).map(|e| e.id);
+        self.ui.hovered = new_hovered;
 
         for el in &mut self.ui.elements {
             el.hovered = Some(el.id) == self.ui.hovered;
         }
+
+        if old_hovered == new_hovered {
+            return false;
+        }
+
+        let mut damage = Vec::new();
+        for id in [old_hovered, new_hovered].into_iter().flatten() {
+            if let Some(el) = self.ui.elements.iter().find(|el| el.id == id) {
+                damage.push(Rectangle::<i32, Logical>::from_loc_and_size(
+                    (el.bounds.x, el.bounds.y),
+                    (el.bounds.w, el.bounds.h),
+                ));
+            }
+        }
+
+        for rect in damage {
+            self.mark_output_logical_damage(output_id, rect, 10);
+        }
+
+        true
     }
 
     /// Compositor chrome hit (sidebar/topbar UI), if any, without consuming the event.
@@ -512,6 +536,72 @@ impl DesktopState {
 
     fn global_window_bbox(&self, window: &Window) -> Option<Rectangle<i32, Logical>> {
         self.space.element_bbox(window)
+    }
+
+    fn expand_logical_rect(rect: Rectangle<i32, Logical>, margin: i32) -> Rectangle<i32, Logical> {
+        Rectangle::from_loc_and_size(
+            (rect.loc.x - margin, rect.loc.y - margin),
+            (rect.size.w + margin * 2, rect.size.h + margin * 2),
+        )
+    }
+
+    fn mark_global_logical_damage(&mut self, rect: Rectangle<i32, Logical>) {
+        const WINDOW_DAMAGE_MARGIN: i32 = 24;
+
+        let rect = Self::expand_logical_rect(rect, WINDOW_DAMAGE_MARGIN);
+        let mut damage = Vec::new();
+
+        for (output_id, output) in &self.outputs {
+            let output_rect =
+                Rectangle::from_loc_and_size(output.logical_origin, output.logical_size);
+            let Some(clipped) = rect.intersection(output_rect) else {
+                continue;
+            };
+
+            let local = Rectangle::<i32, Logical>::from_loc_and_size(
+                (
+                    clipped.loc.x - output.logical_origin.x,
+                    clipped.loc.y - output.logical_origin.y,
+                ),
+                clipped.size,
+            );
+            let physical = local.to_physical_precise_round::<f64, i32>(output.scale);
+            damage.push((*output_id, physical));
+        }
+
+        for (output_id, rect) in damage {
+            self.mark_output_damage(output_id, rect);
+        }
+    }
+
+    fn mark_window_bbox_damage(&mut self, rect: Rectangle<i32, Logical>) {
+        self.mark_global_logical_damage(rect);
+    }
+
+    fn mark_output_logical_damage(
+        &mut self,
+        output_id: OutputId,
+        rect: Rectangle<i32, Logical>,
+        margin: i32,
+    ) {
+        let Some(output) = self.outputs.get(&output_id) else {
+            return;
+        };
+
+        let rect = Self::expand_logical_rect(rect, margin);
+        let output_rect = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), output.logical_size);
+        let Some(clipped) = rect.intersection(output_rect) else {
+            return;
+        };
+
+        let physical = clipped.to_physical_precise_round::<f64, i32>(output.scale);
+        self.mark_output_damage(output_id, physical);
+    }
+
+    fn software_cursor_damage_pending_for_output(&self, output_id: OutputId) -> bool {
+        self.output_contains_pointer(output_id)
+            && self.cursor_manager.software_cursor_needed()
+            && !self.drm_try_pass_cursor_this_frame
     }
 
     pub(crate) fn map_window_bbox_location(
@@ -921,6 +1011,8 @@ impl DesktopState {
                 scale_factor,
                 scale: Scale::from((scale_factor, scale_factor)),
                 active_workspace: WorkspaceId(1),
+                pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
+                last_sw_cursor_rect: None,
             }
         });
 
@@ -930,6 +1022,8 @@ impl DesktopState {
         entry.logical_origin = logical_origin;
         entry.scale_factor = scale_factor;
         entry.scale = Scale::from((scale_factor, scale_factor));
+        entry.pending_damage = vec![Rectangle::from_loc_and_size((0, 0), physical_size)];
+        entry.last_sw_cursor_rect = None;
 
         // Optional: choose first registered output as active if needed
         if self.outputs.len() == 1 {
@@ -1656,6 +1750,8 @@ impl DesktopState {
         self.popups.commit(surface);
 
         let mut to_map: Option<usize> = None;
+        let mut committed_window: Option<Window> = None;
+        let mut commit_damage_queued = false;
 
         let mut root = surface.clone();
         while let Some(parent) = get_parent(&root) {
@@ -1663,9 +1759,11 @@ impl DesktopState {
         }
 
         if let Some(window) = self.window_for_wl_surface(&root) {
+            committed_window = Some(window.clone());
             window.on_commit();
 
             if window.x11_surface().is_some() && !is_sync_subsurface(surface) && &root == surface {
+                let old_bbox = self.global_window_bbox(&window);
                 let buffer_offset = with_states(surface, |states| {
                     states
                         .cached_state
@@ -1685,6 +1783,13 @@ impl DesktopState {
                             current_loc - window.geometry().loc + buffer_offset,
                             false,
                         );
+                        if let Some(old_bbox) = old_bbox {
+                            self.mark_window_bbox_damage(old_bbox);
+                        }
+                        if let Some(new_bbox) = self.global_window_bbox(&window) {
+                            self.mark_window_bbox_damage(new_bbox);
+                        }
+                        commit_damage_queued = true;
                     }
                 }
             }
@@ -1726,6 +1831,7 @@ impl DesktopState {
                 });
 
                 if belongs {
+                    committed_window = Some(managed.window.clone());
                     managed.window.on_commit();
                     dbg_flush(&format!(
                         "commit matched window idx={idx} (toplevel or subsurface)"
@@ -1738,6 +1844,7 @@ impl DesktopState {
             }
         }
 
+        let mut mapped_window = false;
         if let Some(idx) = to_map {
             let window = self.windows[idx].window.clone();
 
@@ -1759,14 +1866,35 @@ impl DesktopState {
                 "space count after map={}",
                 self.space.elements().count()
             ));
+            mapped_window = true;
         }
 
-        let _ = handle_resize_surface_commit(&mut self.space, surface);
+        let resize_damage = handle_resize_surface_commit(&mut self.space, surface);
+        if let Some((old_bbox, new_bbox)) = resize_damage {
+            self.mark_window_bbox_damage(old_bbox);
+            self.mark_window_bbox_damage(new_bbox);
+        }
 
         self.ensure_popup_initial_configure(surface);
 
-        self.render.redraw_all = true;
-        self.mark_redraw();
+        if mapped_window {
+            self.render.redraw_all = true;
+            self.mark_redraw();
+        } else if resize_damage.is_none() {
+            if !commit_damage_queued {
+                if let Some(window) = committed_window.as_ref() {
+                    if let Some(bbox) = self.global_window_bbox(window) {
+                        self.mark_window_bbox_damage(bbox);
+                        commit_damage_queued = true;
+                    }
+                }
+            }
+
+            if !commit_damage_queued {
+                self.render.redraw_all = true;
+                self.mark_redraw();
+            }
+        }
     }
 
     pub(crate) fn window_for_wl_surface(&self, surface: &WlSurface) -> Option<Window> {
@@ -2103,21 +2231,32 @@ impl DesktopState {
         }
     }
 
-    fn process_toplevel_pointer_motion(&mut self, pos: Point<f64, Logical>) {
-        match &self.toplevel_pointer {
+    fn process_toplevel_pointer_motion(&mut self, pos: Point<f64, Logical>) -> bool {
+        match self.toplevel_pointer {
             Some(ToplevelPointerInteraction::Move {
                 window_id,
                 pointer_start,
                 initial_location,
             }) => {
-                let delta = pos - *pointer_start;
+                let delta = pos - pointer_start;
                 let new_loc = (initial_location.to_f64() + delta).to_i32_round();
-                if let Some(w) = self.window(*window_id) {
+                if let Some(w) = self.window(window_id) {
+                    let window = w.window.clone();
+                    let old_bbox = self.global_window_bbox(&window);
                     let new_loc =
                         self.clamp_window_location_to_work_recess(&w.window, new_loc, pos);
-                    let window = w.window.clone();
                     self.map_window_bbox_location(window, new_loc, false);
                     self.space.refresh();
+                    let new_bbox = self
+                        .window(window_id)
+                        .and_then(|w| self.global_window_bbox(&w.window));
+                    if let Some(old_bbox) = old_bbox {
+                        self.mark_window_bbox_damage(old_bbox);
+                    }
+                    if let Some(new_bbox) = new_bbox {
+                        self.mark_window_bbox_damage(new_bbox);
+                    }
+                    return old_bbox.is_some() || new_bbox.is_some();
                 }
             }
             Some(ToplevelPointerInteraction::Resize {
@@ -2127,12 +2266,12 @@ impl DesktopState {
                 initial_rect,
                 ..
             }) => {
-                let mut delta = pos - *pointer_start;
+                let mut delta = pos - pointer_start;
 
                 let mut new_window_width = initial_rect.size.w;
                 let mut new_window_height = initial_rect.size.h;
 
-                let e = *edges;
+                let e = edges;
                 if e.intersects(ResizeEdgeMask::LEFT | ResizeEdgeMask::RIGHT) {
                     if e.intersects(ResizeEdgeMask::LEFT) {
                         delta.x = -delta.x;
@@ -2147,11 +2286,11 @@ impl DesktopState {
                     new_window_height = (initial_rect.size.h as f64 + delta.y) as i32;
                 }
 
-                let Some(w) = self.window(*window_id) else {
-                    return;
+                let Some(w) = self.window(window_id) else {
+                    return false;
                 };
                 let Some(tl) = w.window.toplevel() else {
-                    return;
+                    return false;
                 };
 
                 let (min_size, max_size) = compositor::with_states(tl.wl_surface(), |states| {
@@ -2193,9 +2332,11 @@ impl DesktopState {
                         *lw = last_window_size;
                     }
                 }
+                return true;
             }
             None => {}
         }
+        false
     }
 
     fn process_toplevel_pointer_button(&mut self, button: FlowMouseButton, state: FlowKeyState) {
@@ -2317,12 +2458,17 @@ impl DesktopState {
                         self.forward_pointer_to_clients(self.pointer_pos);
                     }
                 }
-                self.process_toplevel_pointer_motion(position);
+                let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
+                let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
                 self.update_pointer_cursor(position);
                 if !self.compositor_pointer_grab_active() {
                     self.forward_pointer_to_clients(position);
                 }
-                self.mark_redraw();
+                let precise_cursor_damage =
+                    self.software_cursor_damage_pending_for_output(self.focused_output);
+                if !precise_toplevel_damage && !precise_hover_damage && !precise_cursor_damage {
+                    self.mark_redraw();
+                }
             }
 
             FlowInputEvent::PointerButton {
@@ -2434,7 +2580,8 @@ impl DesktopState {
                     self.focused_output = id;
                 }
                 self.cursor_manager.move_to(position.x, position.y);
-                self.process_toplevel_pointer_motion(position);
+                let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
+                let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
                 if matches!(state, FlowKeyState::Pressed) {
                     if matches!(button, FlowMouseButton::Left)
                         && self.pointer_on_chrome_host_drag_region(position)
@@ -2487,7 +2634,11 @@ impl DesktopState {
                     self.process_toplevel_pointer_button(button, state);
                 }
                 self.update_pointer_cursor(position);
-                self.mark_redraw();
+                let precise_cursor_damage =
+                    self.software_cursor_damage_pending_for_output(self.focused_output);
+                if !precise_toplevel_damage && !precise_hover_damage && !precise_cursor_damage {
+                    self.mark_redraw();
+                }
             }
 
             FlowInputEvent::PointerScroll {
@@ -2658,6 +2809,8 @@ impl DesktopState {
             output.scale = Scale::from((scale_factor, scale_factor));
             output.physical_size = physical_size;
             output.logical_size = logical_size;
+            output.pending_damage = vec![Rectangle::from_loc_and_size((0, 0), physical_size)];
+            output.last_sw_cursor_rect = None;
 
             output.handle.change_current_state(
                 Some(mode),
@@ -2677,14 +2830,44 @@ impl DesktopState {
 
     pub fn needs_redraw(&self) -> bool {
         self.render.redraw_all
+            || self
+                .outputs
+                .values()
+                .any(|output| !output.pending_damage.is_empty())
     }
 
     pub fn clear_repaint_request(&mut self) {
         self.render.redraw_all = false;
+        for output in self.outputs.values_mut() {
+            output.pending_damage.clear();
+        }
     }
 
     pub fn mark_redraw(&mut self) {
         self.render.redraw_all = true;
+    }
+
+    pub fn mark_output_damage(&mut self, output_id: OutputId, rect: Rectangle<i32, Physical>) {
+        if rect.size.w <= 0 || rect.size.h <= 0 {
+            return;
+        }
+
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            let bounds = Rectangle::from_loc_and_size((0, 0), output.physical_size);
+            if let Some(clipped) = rect.intersection(bounds) {
+                output.pending_damage.push(clipped);
+            }
+        }
+    }
+
+    fn expand_physical_rect(
+        rect: Rectangle<i32, Physical>,
+        margin: i32,
+    ) -> Rectangle<i32, Physical> {
+        Rectangle::from_loc_and_size(
+            (rect.loc.x - margin, rect.loc.y - margin),
+            (rect.size.w + margin * 2, rect.size.h + margin * 2),
+        )
     }
 
     /*
@@ -2759,6 +2942,8 @@ impl DesktopState {
                     scale_factor: scale,
                     scale: Scale::from((scale, scale)),
                     active_workspace: WorkspaceId(1),
+                    pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
+                    last_sw_cursor_rect: None,
                 },
             );
         }
@@ -3201,14 +3386,23 @@ impl DesktopState {
         let Some(desk_output) = self.outputs.get(&output_id) else {
             return Ok(());
         };
+        let output_scale = desk_output.scale;
+        let output_scale_factor = desk_output.scale_factor;
+        let previous_cursor_rect = desk_output.last_sw_cursor_rect;
         self.cursor_manager
-            .set_base_size_and_scale(24, desk_output.scale_factor as f32);
+            .set_base_size_and_scale(24, output_scale_factor as f32);
         self.cursor_manager
             .move_to(self.pointer_pos.x, self.pointer_pos.y);
 
         if !self.cursor_manager.visible() {
             self.render.clear_sw_cursor_texture();
             self.render.sw_cursor_dst_rect = None;
+            if let Some(output) = self.outputs.get_mut(&output_id) {
+                output.last_sw_cursor_rect = None;
+            }
+            if let Some(old_rect) = previous_cursor_rect {
+                self.mark_output_damage(output_id, Self::expand_physical_rect(old_rect, 4));
+            }
             return Ok(());
         }
 
@@ -3222,12 +3416,35 @@ impl DesktopState {
                 .pointer_relative_to_output_logical(output_id)
                 .unwrap_or(self.pointer_pos);
             let phys: Point<i32, Physical> =
-                rel.to_physical_precise_round::<f64, i32>(desk_output.scale);
+                rel.to_physical_precise_round::<f64, i32>(output_scale);
             let (hx, hy) = self.render.sw_cursor_hotspot;
             let (tw, th) = self.render.sw_cursor_tex_size;
-            self.render.sw_cursor_dst_rect = Some((phys.x - hx, phys.y - hy, tw, th));
+            let cursor_rect =
+                Rectangle::<i32, Physical>::from_loc_and_size((phys.x - hx, phys.y - hy), (tw, th));
+            self.render.sw_cursor_dst_rect = Some((
+                cursor_rect.loc.x,
+                cursor_rect.loc.y,
+                cursor_rect.size.w,
+                cursor_rect.size.h,
+            ));
+
+            if previous_cursor_rect != Some(cursor_rect) {
+                if let Some(old_rect) = previous_cursor_rect {
+                    self.mark_output_damage(output_id, Self::expand_physical_rect(old_rect, 4));
+                }
+                self.mark_output_damage(output_id, Self::expand_physical_rect(cursor_rect, 4));
+            }
+            if let Some(output) = self.outputs.get_mut(&output_id) {
+                output.last_sw_cursor_rect = Some(cursor_rect);
+            }
         } else {
             self.render.sw_cursor_dst_rect = None;
+            if let Some(output) = self.outputs.get_mut(&output_id) {
+                output.last_sw_cursor_rect = None;
+            }
+            if let Some(old_rect) = previous_cursor_rect {
+                self.mark_output_damage(output_id, Self::expand_physical_rect(old_rect, 4));
+            }
         }
         Ok(())
     }

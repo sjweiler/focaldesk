@@ -680,8 +680,6 @@ impl RenderState {
         let Some(tex) = self.sw_cursor_texture.as_ref() else {
             return Ok(());
         };
-        let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
-        let damage = std::slice::from_ref(&full);
         let elem = TextureRenderElement::from_static_texture(
             Id::new(),
             frame.context_id(),
@@ -699,7 +697,7 @@ impl RenderState {
             frame,
             ctx.output_scale,
             std::slice::from_ref(&elem),
-            damage,
+            &ctx.damage,
         )?;
         Ok(())
     }

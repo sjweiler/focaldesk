@@ -18,7 +18,7 @@ use smithay::reexports::drm::control::Device as _;
 use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
 use crate::core::backend_render::{build_output_client_elements, prepare_output};
-use smithay::backend::renderer::utils::CommitCounter;
+use smithay::backend::renderer::utils::{CommitCounter, DamageBag};
 use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
@@ -220,6 +220,8 @@ pub struct DrmSurfaceState {
     pub size: Size<i32, Physical>,
     pub output_id: OutputId,
     pub origin: Point<i32, Logical>,
+    pub present_render_id: Id,
+    pub present_damage: DamageBag<i32, Buffer>,
 
     pub drm_output: DrmOutput<
         GbmAllocator<DrmDeviceFd>,
@@ -1025,9 +1027,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .expect("offscreen texture missing")
                     .texture
                     .clone();
+                surface
+                    .present_damage
+                    .add(prepared.frame_ctx.damage.iter().map(|rect| {
+                        Rectangle::<i32, Buffer>::from_loc_and_size(
+                            (rect.loc.x, rect.loc.y),
+                            (rect.size.w, rect.size.h),
+                        )
+                    }));
+                let present_damage = surface.present_damage.snapshot();
 
-                let texture_elem = TextureRenderElement::from_static_texture(
-                    Id::new(),
+                let texture_elem = TextureRenderElement::from_texture_with_damage(
+                    surface.present_render_id.clone(),
                     device.renderer.context_id(),
                     (0.0, 0.0),
                     texture,
@@ -1037,6 +1048,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     None,
                     None,
                     None,
+                    present_damage,
                     Kind::Unspecified,
                 );
 
@@ -1527,6 +1539,8 @@ fn device_added(
                     size: Size::<i32, Physical>::from((w as i32, h as i32)),
                     output_id: output_id,
                     origin,
+                    present_render_id: Id::new(),
+                    present_damage: DamageBag::default(),
                     drm_output,
                     offscreen: None,
                 },

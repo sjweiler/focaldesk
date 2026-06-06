@@ -127,7 +127,7 @@ mod tests {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ToplevelPointerInteraction {
     Move {
         window_id: WindowId,
@@ -222,11 +222,20 @@ impl ResizeSurfaceState {
 }
 
 /// After a client commit during/after resize, adjust space location for top/left drags.
-pub fn handle_resize_surface_commit(space: &mut Space<Window>, surface: &WlSurface) -> Option<()> {
+pub fn handle_resize_surface_commit(
+    space: &mut Space<Window>,
+    surface: &WlSurface,
+) -> Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)> {
     let window = space
         .elements()
         .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
         .cloned()?;
+
+    let old_bbox = ResizeSurfaceState::with(surface, |state| match *state {
+        ResizeSurfaceState::Resizing { initial_rect, .. }
+        | ResizeSurfaceState::WaitingForLastCommit { initial_rect, .. } => Some(initial_rect),
+        ResizeSurfaceState::Idle => None,
+    })?;
 
     let mut window_loc = space.element_location(&window)?;
     let geometry = window.geometry();
@@ -256,8 +265,10 @@ pub fn handle_resize_surface_commit(space: &mut Space<Window>, surface: &WlSurfa
     }
 
     if new_loc.x.is_some() || new_loc.y.is_some() {
-        space.map_element(window, window_loc, false);
+        space.map_element(window.clone(), window_loc, false);
     }
 
-    Some(())
+    let new_bbox = space.element_bbox(&window)?;
+
+    Some((old_bbox, new_bbox))
 }
