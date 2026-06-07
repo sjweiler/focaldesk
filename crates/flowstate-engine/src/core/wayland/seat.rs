@@ -40,7 +40,7 @@ impl SeatHandler for DesktopState {
                 self.cursor_manager.set_icon(CursorIcon::Default);
             }
         }
-        self.mark_redraw();
+        self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::Cursor);
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {

@@ -40,6 +40,7 @@ use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 //use flowstate_ui::atlas::render_atlas_icon_with_alpha;
 use crate::core::desktop::DesktopState;
+use crate::core::desktop::SidebarPulseFrame;
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
@@ -154,6 +155,7 @@ pub struct RenderInputs<'a> {
     pub elements: &'a [FlowRenderElement],
     pub popup_elements: &'a [FlowRenderElement],
     pub sidebar_hover_slot: Option<usize>, // 👈 ADD THIS
+    pub sidebar_pulse: Option<SidebarPulseFrame>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     pub ui_tree: &'a UiTree,
@@ -1263,6 +1265,7 @@ impl RenderState {
             inputs.metrics,
             muts.ui,
             inputs.sidebar_hover_slot,
+            inputs.sidebar_pulse,
             theme.chrome,
         );
 
@@ -1770,6 +1773,47 @@ impl RenderState {
         )
     }
 
+    fn draw_sidebar_pulse(
+        frame: &mut GlesFrame<'_, '_>,
+        program: &GlesPixelProgram,
+        rect_logical: Rectangle<i32, Logical>,
+        click_local: Point<f64, Logical>,
+        elapsed: Duration,
+        scale: Scale<f64>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        let rect_physical = to_physical_rect(rect_logical, scale);
+        let src_rect = Rectangle::from_loc_and_size(
+            (0.0, 0.0),
+            (rect_physical.size.w as f64, rect_physical.size.h as f64),
+        );
+        let size = Size::from((rect_physical.size.w, rect_physical.size.h));
+
+        let click_x = ((click_local.x - f64::from(rect_logical.loc.x)) * scale.x)
+            .clamp(0.0, f64::from(rect_physical.size.w)) as f32;
+        let click_y = ((click_local.y - f64::from(rect_logical.loc.y)) * scale.y)
+            .clamp(0.0, f64::from(rect_physical.size.h)) as f32;
+
+        let uniforms = [
+            Uniform::new("u_click_pos", [click_x, click_y]),
+            Uniform::new("u_time", elapsed.as_secs_f32()),
+            Uniform::new(
+                "u_size",
+                [rect_physical.size.w as f32, rect_physical.size.h as f32],
+            ),
+        ];
+
+        frame.render_pixel_shader_to(
+            program,
+            src_rect,
+            rect_physical,
+            size,
+            Some(damage),
+            1.0,
+            &uniforms,
+        )
+    }
+
     /// Solid fill over `regions` in the same coordinate space as [`Frame::clear`]: `dest` is usually
     /// `Rectangle::from_loc_and_size((0, 0), output_size)` and `regions` are absolute physical rects.
     fn draw_solid_rect(
@@ -1823,10 +1867,8 @@ impl RenderState {
         output: &OutputState,
         bg: BackgroundTheme,
     ) {
-        // 1) Clear whole output
         let full: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), ctx.output_size.into());
         let full_damage = [full];
-
         let c = bg.color;
 
         frame
@@ -2128,11 +2170,9 @@ impl RenderState {
         // 1) Build elements from Space<Window>
         //let elements = build_client_elements(&scene.space, renderer, ctx);
 
-        // 2) Choose damage
         let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        // 3) Draw
         draw_render_elements(frame, ctx.output_scale.x, &elements, damage).unwrap();
     }
 
@@ -2147,6 +2187,7 @@ impl RenderState {
         _metrics: &ChromeMetrics,
         _ui: &mut UiState<GlesTexture>,
         sidebar_hover_slot: Option<usize>,
+        sidebar_pulse: Option<SidebarPulseFrame>,
         theme: flowstate_themes::ChromeTheme,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(&theme);
@@ -2174,6 +2215,8 @@ impl RenderState {
             .top_bar
             .as_ref()
             .expect("top bar shader not compiled");
+
+        let pulse = self.chrome_shaders.pulse.as_ref();
 
         let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
             Point::<i32, Physical>::from((0, 0)),
@@ -2387,6 +2430,20 @@ impl RenderState {
                 damage,
                 &light_style,
             );
+
+            if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, sidebar_pulse) {
+                if pulse_frame.slot == i {
+                    let _ = Self::draw_sidebar_pulse(
+                        frame,
+                        pulse_shader,
+                        outer,
+                        pulse_frame.click_local,
+                        pulse_frame.elapsed,
+                        ctx.output_scale,
+                        damage,
+                    );
+                }
+            }
 
             //let glow_rect = inset_rect(*well, 3);
             //let _ = Self::draw_light_channel(frame, light, glow_rect, damage, &legacy_theme.light);

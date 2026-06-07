@@ -298,7 +298,25 @@ pub struct DesktopState {
     pub theme: ThemeManager,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
+    pub sidebar_pulse: Option<SidebarPulse>,
     //pub popups: Vec<PopupState>,
+}
+
+pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
+
+#[derive(Clone, Copy, Debug)]
+pub struct SidebarPulse {
+    pub output_id: OutputId,
+    pub slot: usize,
+    pub click_local: Point<f64, Logical>,
+    pub started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SidebarPulseFrame {
+    pub slot: usize,
+    pub click_local: Point<f64, Logical>,
+    pub elapsed: Duration,
 }
 
 impl DesktopState {
@@ -436,7 +454,7 @@ impl DesktopState {
             return;
         };
         self.sync_egui(&frame_ctx);
-        self.mark_redraw();
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
     }
 
     fn egui_pointer_button(button: FlowMouseButton) -> Option<EguiPointerButton> {
@@ -649,7 +667,16 @@ impl DesktopState {
         }
     }
 
-    fn mark_output_logical_damage(
+    pub(crate) fn mark_window_id_damage(&mut self, id: WindowId, source: DamageSource) {
+        let Some(window) = self.window(id).map(|managed| managed.window.clone()) else {
+            return;
+        };
+        if let Some(bbox) = self.global_window_bbox(&window) {
+            self.mark_window_bbox_damage_source(bbox, source);
+        }
+    }
+
+    pub(crate) fn mark_output_logical_damage(
         &mut self,
         output_id: OutputId,
         rect: Rectangle<i32, Logical>,
@@ -971,7 +998,7 @@ impl DesktopState {
 
             UiAction::OpenPanel(panel) => {
                 self.render.egui.open_panel(panel);
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
             UiAction::Custom(id) => match id {
@@ -1010,12 +1037,12 @@ impl DesktopState {
 
     pub fn request_screenshot(&mut self) {
         self.screenshot_requested = Some(self.focused_output);
-        self.mark_redraw();
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
         dbg_flush("SCREENSHOT REQUEST SET");
     }
     pub fn request_screenshot_all(&mut self) {
         self.screenshot_all_requested = true;
-        self.mark_redraw();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
         dbg_flush("SCREENSHOT ALL REQUEST SET");
     }
 
@@ -1046,7 +1073,7 @@ impl DesktopState {
             output.active_workspace = workspace;
         }
         self.active_workspace = workspace;
-        self.mark_redraw();
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
     pub fn register_output_entry(
@@ -1293,6 +1320,82 @@ impl DesktopState {
         sidebar_slot_index_at(&layout, px, py)
     }
 
+    pub fn sidebar_pulse_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<SidebarPulseFrame> {
+        let pulse = self.sidebar_pulse?;
+        if pulse.output_id != output_id {
+            return None;
+        }
+
+        let elapsed = now.saturating_duration_since(pulse.started_at);
+        if elapsed >= SIDEBAR_PULSE_DURATION {
+            return None;
+        }
+
+        Some(SidebarPulseFrame {
+            slot: pulse.slot,
+            click_local: pulse.click_local,
+            elapsed,
+        })
+    }
+
+    pub fn output_has_active_sidebar_pulse(&self, output_id: OutputId, now: Instant) -> bool {
+        self.sidebar_pulse_for_output(output_id, now).is_some()
+    }
+
+    pub fn active_sidebar_pulse_damage_rect(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let pulse = self.sidebar_pulse_for_output(output_id, now)?;
+        let output = self.outputs.get(&output_id)?;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        layout.sidebar.slots.get(pulse.slot).map(|slot| slot.outer)
+    }
+
+    fn trigger_sidebar_pulse_at_pointer(&mut self, output_id: OutputId) -> bool {
+        let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+            return false;
+        };
+        let Some(output) = self.outputs.get(&output_id) else {
+            return false;
+        };
+
+        let px = local.x.round() as i32;
+        let py = local.y.round() as i32;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        let Some(slot) = sidebar_slot_index_at(&layout, px, py) else {
+            return false;
+        };
+
+        self.sidebar_pulse = Some(SidebarPulse {
+            output_id,
+            slot,
+            click_local: local,
+            started_at: Instant::now(),
+        });
+
+        if let Some(slot_layout) = layout.sidebar.slots.get(slot) {
+            self.mark_output_logical_damage(output_id, slot_layout.outer, 0, DamageSource::Unknown);
+        }
+
+        true
+    }
+
     fn top_mapped_window_id_at(&self, position: Point<f64, Logical>) -> Option<WindowId> {
         let px = position.x.round() as i32;
         let py = position.y.round() as i32;
@@ -1462,9 +1565,15 @@ impl DesktopState {
             return;
         };
 
+        let old_focus_bbox = self
+            .focused_window
+            .and_then(|id| self.window(id))
+            .and_then(|managed| self.global_window_bbox(&managed.window));
+
         self.focused_window = Some(window_id);
         let window = self.windows[idx].window.clone();
         self.space.raise_element(&window, true);
+        let new_focus_bbox = self.global_window_bbox(&window);
 
         // `raise_element(..., true)` updates xdg `Activated` in pending state only; clients are not
         // notified until configure is sent. Without this, keyboard enter/leave can be ignored for
@@ -1478,6 +1587,13 @@ impl DesktopState {
         if let Some(keyboard) = self.seat.get_keyboard() {
             let serial = SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, Some(KeyboardFocusTarget::Window(window)), serial);
+        }
+
+        if let Some(rect) = old_focus_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::Unknown);
+        }
+        if let Some(rect) = new_focus_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::Unknown);
         }
     }
 
@@ -1526,7 +1642,6 @@ impl DesktopState {
 
         let next = (idx + delta).rem_euclid(len) as usize;
         self.focus_window_id(ids[next]);
-        self.mark_redraw();
     }
 
     pub fn new(init: DesktopInit) -> Self {
@@ -1607,6 +1722,7 @@ impl DesktopState {
             damage_debug_enabled: std::env::var("FLOWSTATE_DAMAGE_DEBUG")
                 .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
             damage_source_counts: DamageSourceCounts::default(),
+            sidebar_pulse: None,
         }
     }
 
@@ -1636,7 +1752,7 @@ impl DesktopState {
         self.windows.push(managed);
         dbg_flush(&format!("after push windows={}", self.windows.len()));
 
-        self.mark_redraw();
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
     #[cfg(feature = "xwayland")]
@@ -1710,6 +1826,7 @@ impl DesktopState {
         };
 
         if surface.wl_surface().is_none() {
+            self.mark_window_id_damage(id, DamageSource::CommitBbox);
             let window = self.windows[idx].window.clone();
             self.space.unmap_elem(&window);
             self.windows[idx].mapped = false;
@@ -1717,7 +1834,6 @@ impl DesktopState {
                 "XWayland map deferred id={:?}: no associated wl_surface yet",
                 id
             ));
-            self.mark_redraw();
             return;
         }
 
@@ -1726,7 +1842,6 @@ impl DesktopState {
         let output_id = self
             .output_under_pointer(self.input.pointer_pos)
             .unwrap_or(self.primary_output);
-        let fallback_output = self.outputs.get(&output_id);
 
         let bbox_location = if surface.is_override_redirect() {
             requested_geometry.loc
@@ -1760,7 +1875,7 @@ impl DesktopState {
         }
 
         self.space.refresh();
-        self.mark_redraw();
+        self.mark_window_id_damage(id, DamageSource::CommitBbox);
     }
 
     pub fn open_dialog(&mut self, dialog: Dialog) {
@@ -1773,7 +1888,7 @@ impl DesktopState {
             self.active_dialog
         );
 
-        self.mark_redraw();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
     pub fn close_dialog(&mut self, id: DialogId) {
@@ -1783,7 +1898,7 @@ impl DesktopState {
             self.active_dialog = None;
         }
 
-        self.mark_redraw();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
@@ -1961,8 +2076,7 @@ impl DesktopState {
             }
 
             if !commit_damage_queued {
-                self.render.redraw_all = true;
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
         } else if resize_damage.is_none() {
             if !commit_damage_queued {
@@ -1975,8 +2089,7 @@ impl DesktopState {
             }
 
             if !commit_damage_queued {
-                self.render.redraw_all = true;
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
         }
     }
@@ -2058,7 +2171,7 @@ impl DesktopState {
 
             KeyAction::ToggleLauncher => {
                 self.render.egui.open_panel(PanelKind::AppLauncher);
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
             KeyAction::ActivateSlot(n) => {
@@ -2102,13 +2215,20 @@ impl DesktopState {
             return;
         };
 
-        let Some(managed) = self.window(focused_id) else {
+        let Some(window) = self
+            .window(focused_id)
+            .map(|managed| managed.window.clone())
+        else {
             self.focused_window = None;
             return;
         };
 
-        managed.request_close();
-        self.mark_redraw();
+        if let Some(managed) = self.window(focused_id) {
+            managed.request_close();
+        }
+        if let Some(bbox) = self.global_window_bbox(&window) {
+            self.mark_window_bbox_damage_source(bbox, DamageSource::Unknown);
+        }
     }
 
     pub fn activate_slot(&mut self, slot: usize) {
@@ -2470,7 +2590,7 @@ impl DesktopState {
             }
         }
         self.forward_pointer_to_clients(self.pointer_pos);
-        self.mark_redraw();
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
     pub fn handle_input(&mut self, event: FlowInputEvent) {
@@ -2479,17 +2599,17 @@ impl DesktopState {
                 if matches!(state, FlowKeyState::Pressed) && keycode == 1 {
                     if self.render.egui.has_open_panels() {
                         self.render.egui.close_all_panels();
-                        self.mark_redraw();
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
                         return;
                     }
                 }
                 if self.handle_egui_input(&event) {
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
                 // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
                 self.handle_key_event(keycode, state);
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
             FlowInputEvent::PointerMoved { position } => {
@@ -2502,17 +2622,17 @@ impl DesktopState {
                     let _ = self.handle_egui_input(&event);
                     if self.render.egui.wants_pointer_input() {
                         self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_redraw();
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
                         return;
                     }
                 } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
                 if self.handle_dialog_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
                 self.cursor_manager.move_to(position.x, position.y);
@@ -2551,7 +2671,7 @@ impl DesktopState {
                 let precise_cursor_damage =
                     self.software_cursor_damage_pending_for_output(self.focused_output);
                 if !precise_toplevel_damage && !precise_hover_damage && !precise_cursor_damage {
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                 }
             }
 
@@ -2572,13 +2692,13 @@ impl DesktopState {
                     let _ = self.handle_egui_input(&event);
                 } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
 
                 if self.handle_dialog_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
 
@@ -2591,7 +2711,7 @@ impl DesktopState {
                     self.pending_compositor_move = None;
                     self.pending_xdg_move = None;
                     self.update_pointer_cursor(position);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
 
@@ -2599,6 +2719,7 @@ impl DesktopState {
                     && self.peek_ui_action_at_pointer().is_some()
                 {
                     self.clear_client_pointer_focus(position);
+                    let mut damaged_precisely = false;
                     match state {
                         FlowKeyState::Pressed => {
                             self.input.pointer_left_down = true;
@@ -2609,6 +2730,8 @@ impl DesktopState {
                                         .hit_test(local.x.round() as i32, local.y.round() as i32)
                                         .map(|el| el.id)
                                 });
+                            damaged_precisely =
+                                self.trigger_sidebar_pulse_at_pointer(self.focused_output);
                             let _ = self.click_ui_at_pointer();
                         }
                         FlowKeyState::Released => {
@@ -2617,7 +2740,9 @@ impl DesktopState {
                             self.pending_compositor_move = None;
                         }
                     }
-                    self.mark_redraw();
+                    if !damaged_precisely {
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    }
                     return;
                 }
 
@@ -2629,7 +2754,7 @@ impl DesktopState {
                     self.ui.pressed = None;
                     self.pending_compositor_move = None;
                     self.clear_client_pointer_focus(position);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
 
@@ -2642,7 +2767,7 @@ impl DesktopState {
                         && self.render.egui.wants_pointer_input()
                     {
                         self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_redraw();
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
                         return;
                     }
                 }
@@ -2677,7 +2802,7 @@ impl DesktopState {
                     {
                         self.clear_client_pointer_focus(position);
                         self.update_pointer_cursor(position);
-                        self.mark_redraw();
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
                         return;
                     } else {
                         self.focus_window_at(position);
@@ -2721,7 +2846,7 @@ impl DesktopState {
                 let precise_cursor_damage =
                     self.software_cursor_damage_pending_for_output(self.focused_output);
                 if !precise_toplevel_damage && !precise_hover_damage && !precise_cursor_damage {
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                 }
             }
 
@@ -2737,17 +2862,17 @@ impl DesktopState {
                     let _ = self.handle_egui_input(&event);
                     if self.render.egui.wants_pointer_input() {
                         self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_redraw();
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
                         return;
                     }
                 } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
                 if self.handle_dialog_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_redraw();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
                 self.cursor_manager.move_to(position.x, position.y);
@@ -2755,12 +2880,12 @@ impl DesktopState {
                     self.forward_pointer_to_clients(position);
                     self.forward_pointer_scroll(delta);
                 }
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
             FlowInputEvent::PointerEntered => {
                 self.cursor_manager.set_visible(true);
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Cursor);
             }
 
             FlowInputEvent::PointerLeft => {
@@ -2770,7 +2895,7 @@ impl DesktopState {
                 self.pending_compositor_move = None;
                 self.pending_xdg_move = None;
                 self.cursor_manager.set_visible(false);
-                self.mark_redraw();
+                self.mark_focused_output_full_damage(DamageSource::Cursor);
             }
 
             FlowInputEvent::Resized {
@@ -2791,7 +2916,6 @@ impl DesktopState {
                 //     let logical_h = (size.h as f64 / scale_factor).round() as i32;
                 //     output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
                 // }
-                self.mark_redraw();
             }
 
             FlowInputEvent::CloseRequested => {
@@ -2908,23 +3032,27 @@ impl DesktopState {
             output.handle.set_preferred(mode);
             self.space.map_output(&output.handle, output.logical_origin);
         }
-
-        self.mark_redraw();
     }
 
     pub fn needs_redraw(&self) -> bool {
+        let now = Instant::now();
         self.render.redraw_all
             || self
                 .outputs
                 .values()
                 .any(|output| !output.pending_damage.is_empty())
+            || self.sidebar_pulse.is_some_and(|pulse| {
+                now.saturating_duration_since(pulse.started_at) < SIDEBAR_PULSE_DURATION
+            })
     }
 
     pub fn output_has_pending_damage(&self, output_id: OutputId) -> bool {
+        let now = Instant::now();
         self.outputs
             .get(&output_id)
             .map(|output| !output.pending_damage.is_empty())
             .unwrap_or(false)
+            || self.output_has_active_sidebar_pulse(output_id, now)
     }
 
     pub fn clear_repaint_request(&mut self) {
@@ -2937,6 +3065,28 @@ impl DesktopState {
 
     pub fn mark_redraw(&mut self) {
         self.render.redraw_all = true;
+    }
+
+    pub fn mark_output_full_damage(&mut self, output_id: OutputId, source: DamageSource) {
+        let Some(output) = self.outputs.get(&output_id) else {
+            return;
+        };
+        self.mark_output_damage_source(
+            output_id,
+            Rectangle::from_loc_and_size((0, 0), output.physical_size),
+            source,
+        );
+    }
+
+    pub fn mark_focused_output_full_damage(&mut self, source: DamageSource) {
+        self.mark_output_full_damage(self.focused_output, source);
+    }
+
+    pub fn mark_all_outputs_full_damage(&mut self, source: DamageSource) {
+        let output_ids: Vec<OutputId> = self.outputs.keys().copied().collect();
+        for output_id in output_ids {
+            self.mark_output_full_damage(output_id, source);
+        }
     }
 
     pub fn mark_output_damage(&mut self, output_id: OutputId, rect: Rectangle<i32, Physical>) {
@@ -3032,9 +3182,8 @@ impl DesktopState {
                     //output.scale = Scale::from((scale_factor, scale_factor));
                 }
 
-            // For now: just mark redraw
-            // Later: update layout/output metrics properly
-            self.render.redraw_all = true;
+            // For now: queue output damage.
+            // Later: update layout/output metrics properly.
         }
     */
     /// Wire the nested compositor's single `wl_output` ([`Output`] with [`Output::create_global`])
@@ -3328,11 +3477,14 @@ impl DesktopState {
             .output_under_pointer(self.pointer_pos)
             .or(self.windows[idx].output)
             .unwrap_or(self.focused_output);
+        let old_bbox = self.global_window_bbox(&window);
 
         if maximized {
             let Some(work) = self.work_recess_for_output(output_id) else {
                 self.windows[idx].set_maximized(true);
-                self.mark_redraw();
+                if let Some(rect) = old_bbox {
+                    self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+                }
                 return;
             };
 
@@ -3361,7 +3513,7 @@ impl DesktopState {
                 let _ = x11.configure(work);
             }
 
-            self.map_window_bbox_location(window, work.loc, true);
+            self.map_window_bbox_location(window.clone(), work.loc, true);
         } else {
             let restore_rect = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
                 self.windows[idx].float_rect.unwrap_or_else(|| {
@@ -3385,11 +3537,16 @@ impl DesktopState {
                 let _ = x11.configure(restore_rect);
             }
 
-            self.map_window_bbox_location(window, restore_rect.loc, true);
+            self.map_window_bbox_location(window.clone(), restore_rect.loc, true);
         }
 
         self.space.refresh();
-        self.mark_redraw();
+        if let Some(rect) = old_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
+        if let Some(rect) = self.global_window_bbox(&window) {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
     }
 
     fn toggle_maximize(&mut self, id: WindowId) {
@@ -3418,6 +3575,7 @@ impl DesktopState {
         }
 
         let window = self.windows[idx].window.clone();
+        let old_bbox = self.global_window_bbox(&window);
         let output_id = requested_output
             .as_ref()
             .and_then(|requested| {
@@ -3442,7 +3600,9 @@ impl DesktopState {
 
             let Some(rect) = rect else {
                 self.windows[idx].set_fullscreen(true);
-                self.mark_redraw();
+                if let Some(rect) = old_bbox {
+                    self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+                }
                 return;
             };
 
@@ -3476,7 +3636,7 @@ impl DesktopState {
                 let _ = x11.configure(rect);
             }
 
-            self.map_window_bbox_location(window, rect.loc, true);
+            self.map_window_bbox_location(window.clone(), rect.loc, true);
         } else {
             let restore_rect = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
                 self.windows[idx].float_rect.unwrap_or_else(|| {
@@ -3504,11 +3664,16 @@ impl DesktopState {
                 let _ = x11.configure(restore_rect);
             }
 
-            self.map_window_bbox_location(window, restore_rect.loc, true);
+            self.map_window_bbox_location(window.clone(), restore_rect.loc, true);
         }
 
         self.space.refresh();
-        self.mark_redraw();
+        if let Some(rect) = old_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
+        if let Some(rect) = self.global_window_bbox(&window) {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
     }
 
     pub fn request_fullscreen(

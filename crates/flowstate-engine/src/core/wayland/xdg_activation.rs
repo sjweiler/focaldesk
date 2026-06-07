@@ -19,7 +19,6 @@ impl XdgActivationHandler for DesktopState {
     ) {
         if let Some(id) = self.window_id_for_wl_surface(&surface) {
             self.focus_window_id(id);
-            self.mark_redraw();
         }
 
         let _ = self.xdg_activation_state.remove_token(&token);

@@ -939,12 +939,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let owns_cursor = data.core.state.output_contains_pointer(surface.output_id);
                 let pending_damage = data.core.state.output_has_pending_damage(surface.output_id);
                 let wants_screenshot = screenshot_output == Some(surface.output_id);
-                let should_skip =
-                    !data.core.state.render.redraw_all
-                        && !data.core.state.screenshot_all_requested
-                        && !pending_damage
-                        && !wants_screenshot
-                        && !owns_cursor;
+                let should_skip = !data.core.state.render.redraw_all
+                    && !data.core.state.screenshot_all_requested
+                    && !pending_damage
+                    && !wants_screenshot
+                    && !owns_cursor;
 
                 if should_skip {
                     continue;

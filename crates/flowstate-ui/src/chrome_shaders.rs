@@ -18,6 +18,7 @@ pub struct ChromeShaders {
     pub font_text: Option<GlesTexProgram>,
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
+    pub pulse: Option<GlesPixelProgram>,
 }
 
 impl ChromeShaders {
@@ -33,6 +34,7 @@ impl ChromeShaders {
             font_text: None,
             rounded_rect: None,
             wallpaper_tint: None,
+            pulse: None,
         }
     }
 
@@ -167,6 +169,17 @@ impl ChromeShaders {
                     UniformName::new("u_face_color", UniformType::_4f),
                     UniformName::new("u_edge_color", UniformType::_4f),
                     UniformName::new("u_trim_color", UniformType::_4f),
+                ],
+            )?);
+        }
+
+        if self.pulse.is_none() {
+            self.pulse = Some(renderer.compile_custom_pixel_shader(
+                PULSE_FRAG,
+                &[
+                    UniformName::new("u_click_pos", UniformType::_2f),
+                    UniformName::new("u_time", UniformType::_1f),
+                    UniformName::new("u_size", UniformType::_2f),
                 ],
             )?);
         }
@@ -841,5 +854,31 @@ void main() {
     vec3 rgb = mix(src.rgb, u_tint.rgb, u_tint.a);
 
     gl_FragColor = vec4(rgb, src.a);
+}
+"#;
+
+const PULSE_FRAG: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform vec2 u_click_pos;
+uniform float u_time;
+uniform vec2 u_size;
+
+varying vec2 v_coords;
+
+void main() {
+    float current_radius = u_time * 200.0;
+
+    vec2 frag_pos = v_coords * u_size;
+    vec2 d = abs(frag_pos - u_click_pos) - vec2(current_radius);
+    float sdf_rect = length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+
+    float blur_width = 50.0;
+    float alpha = 1.0 - smoothstep(-blur_width, blur_width, sdf_rect);
+    alpha *= max(1.0 - (u_time / 2.0), 0.0);
+
+    gl_FragColor = vec4(0.0, 0.5, 1.0, max(alpha, 0.0));
 }
 "#;

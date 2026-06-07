@@ -31,7 +31,7 @@ impl XWaylandShellHandler for DesktopState {
             self.map_xwayland_window(surface);
             return;
         }
-        self.mark_redraw();
+        self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::Unknown);
     }
 }
 
@@ -51,7 +51,7 @@ impl XwmHandler for DesktopState {
     }
 
     fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
-        if let Some(managed) = self
+        let damaged_id = self
             .windows
             .iter()
             .find(|managed| {
@@ -60,11 +60,13 @@ impl XwmHandler for DesktopState {
                     .x11_surface()
                     .is_some_and(|x11| x11 == &window)
             })
-            .map(|managed| managed.window.clone())
-        {
-            managed.on_commit();
+            .map(|managed| managed.id);
+        if let Some(id) = damaged_id {
+            self.mark_window_id_damage(id, crate::core::desktop::DamageSource::CommitBbox);
+            if let Some(managed) = self.window(id).map(|managed| managed.window.clone()) {
+                managed.on_commit();
+            }
         }
-        self.mark_redraw();
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -75,6 +77,7 @@ impl XwmHandler for DesktopState {
         let Some(id) = self.window_id_for_x11_surface(&window) else {
             return;
         };
+        self.mark_window_id_damage(id, crate::core::desktop::DamageSource::CommitBbox);
         if let Some(idx) = self.windows.iter().position(|managed| managed.id == id) {
             let managed = self.windows.remove(idx);
             self.space.unmap_elem(&managed.window);
@@ -85,13 +88,13 @@ impl XwmHandler for DesktopState {
         if self.focused_window == Some(id) {
             self.focused_window = None;
         }
-        self.mark_redraw();
     }
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
         let Some(id) = self.window_id_for_x11_surface(&window) else {
             return;
         };
+        self.mark_window_id_damage(id, crate::core::desktop::DamageSource::CommitBbox);
         if let Some(idx) = self.windows.iter().position(|managed| managed.id == id) {
             let managed = self.windows.remove(idx);
             self.space.unmap_elem(&managed.window);
@@ -99,7 +102,6 @@ impl XwmHandler for DesktopState {
         if self.focused_window == Some(id) {
             self.focused_window = None;
         }
-        self.mark_redraw();
     }
 
     fn configure_request(
@@ -145,6 +147,7 @@ impl XwmHandler for DesktopState {
         let Some(managed) = self.window(id).map(|managed| managed.window.clone()) else {
             return;
         };
+        self.mark_window_id_damage(id, crate::core::desktop::DamageSource::WindowResize);
         if window.is_override_redirect() {
             if let Some(state) = self.window_mut(id) {
                 state.float_rect = Some(geometry);
@@ -167,12 +170,14 @@ impl XwmHandler for DesktopState {
             self.map_window_bbox_location(managed, current_loc, false);
         }
         self.space.refresh();
-        self.mark_redraw();
+        self.mark_window_id_damage(id, crate::core::desktop::DamageSource::WindowResize);
     }
 
     fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, _property: WmWindowProperty) {
         self.sync_xwayland_window_meta(&window);
-        self.mark_redraw();
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.mark_window_id_damage(id, crate::core::desktop::DamageSource::Unknown);
+        }
     }
 
     fn maximize_request(&mut self, _xwm: XwmId, window: X11Surface) {
