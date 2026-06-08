@@ -185,7 +185,7 @@ pub fn prepare_output(
 
     state.prepare_cursor_for_frame(renderer, output_id)?;
 
-    let pointer_on_this_output = state.output_contains_pointer(output_id);
+    let pointer_on_this_output = state.output_owns_cursor(output_id);
 
     let draw_software_cursor = pointer_on_this_output
         && state.cursor_manager.software_cursor_needed()
@@ -200,7 +200,7 @@ pub fn prepare_output(
     );
 
     build_ui_for_output(&mut state.ui, &layout);
-    state.update_ui_hover_for_output(output_id);
+    state.refresh_ui_hover_for_output(output_id);
 
     if let Some(rect) = state.active_sidebar_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(
@@ -261,27 +261,28 @@ pub fn prepare_output(
         .builtin_id()
         .unwrap_or(BuiltInThemeId::Classic);
 
-    let preload_fonts = match active_theme_id {
-        BuiltInThemeId::Classic => [
+    let preload_fonts: &[FontId] = match active_theme_id {
+        BuiltInThemeId::Classic => &[
             FontId::IbmPlexSansRegular,
             FontId::IbmPlexSansMedium,
             FontId::IbmPlexSansSemiBold,
         ],
 
-        BuiltInThemeId::Moonbase => [
+        BuiltInThemeId::Moonbase => &[
             FontId::RajdhaniRegular,
             FontId::RajdhaniMedium,
             FontId::RajdhaniSemiBold,
         ],
 
-        BuiltInThemeId::Eagle => [
+        BuiltInThemeId::Eagle => &[
+            FontId::IbmPlexSansMedium,
             FontId::OrbitronRegular,
             FontId::OrbitronMedium,
             FontId::OrbitronSemiBold,
         ],
     };
 
-    for font in preload_fonts {
+    for &font in preload_fonts {
         for size_px in [10, 12, 14, 16, 18, 20, 24] {
             let style = TextStyle { font, size_px };
 
@@ -374,11 +375,38 @@ pub fn build_output_client_elements(
     )
 }
 
+pub fn build_output_popup_elements(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+) -> Vec<FlowRenderElement> {
+    let output_handle = state
+        .outputs
+        .get(&output_id)
+        .map(|o| o.handle.clone())
+        .expect("output missing");
+
+    let active_workspace = state
+        .outputs
+        .get(&output_id)
+        .map(|o| o.active_workspace)
+        .unwrap_or_else(|| state.focused_workspace());
+
+    state.render.build_popup_elements_for_output(
+        &state.space,
+        &state.windows,
+        active_workspace,
+        &output_handle,
+        renderer,
+    )
+}
+
 pub fn draw_output(
     state: &mut DesktopState,
     frame: &mut GlesFrame<'_, '_>,
     prepared: &PreparedOutput,
     elements: &[FlowRenderElement],
+    popup_elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
@@ -397,6 +425,12 @@ pub fn draw_output(
         state.sync_egui(&egui_frame_ctx);
     }
 
+    let active_workspace = state
+        .outputs
+        .get(&prepared.frame_ctx.rendering_output)
+        .map(|o| o.active_workspace)
+        .unwrap_or(state.active_workspace);
+
     let inputs = RenderInputs {
         ctx: &prepared.frame_ctx,
         layout: &prepared.layout,
@@ -404,17 +438,13 @@ pub fn draw_output(
         output: output_state,
         metrics: &state.chrome.metrics,
         elements: &elements,
-        popup_elements: &[],
+        popup_elements,
         sidebar_hover_slot: state.sidebar_hover_for_output(prepared.frame_ctx.active_output),
         sidebar_pulse: state
             .sidebar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
         ui_tree: &state.ui,
-        current_workspace: state
-            .outputs
-            .get(&prepared.frame_ctx.rendering_output)
-            .map(|o| o.active_workspace)
-            .unwrap_or(state.active_workspace),
+        current_workspace: active_workspace,
         // 👇 ADD THESE
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,

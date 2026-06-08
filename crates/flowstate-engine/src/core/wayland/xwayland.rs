@@ -18,6 +18,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
+use flowstate_logging::flog;
 
 impl XWaylandShellHandler for DesktopState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
@@ -70,10 +71,23 @@ impl XwmHandler for DesktopState {
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        flog(&format!(
+            "xwayland override-redirect mapped title={:?} class={:?} geometry={:?}",
+            window.title(),
+            window.class(),
+            window.geometry()
+        ));
         self.map_xwayland_window(window);
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
+        flog(&format!(
+            "xwayland window unmapped override_redirect={} title={:?} class={:?} geometry={:?}",
+            window.is_override_redirect(),
+            window.title(),
+            window.class(),
+            window.geometry()
+        ));
         let Some(id) = self.window_id_for_x11_surface(&window) else {
             return;
         };

@@ -23,7 +23,7 @@ members = [
     "apps/flowstate-settings",
 
     # services
-    "services/flowstate-server", "crates/flowstate-types", "crates/flowstate-power", "crates/flowstate-audio", "crates/flowstate-bluetooth", "crates/flowstate-notifications", "crates/flowstate-resources", "crates/flowstate-cursor", "crates/flowstate-spawn", "crates/flowstate-config", "crates/flowstate-permissions", "apps/flowstate-portal", "apps/flowstate-settings", "crates/flowstate-themes", 
+    "services/flowstate-server", "crates/flowstate-types", "crates/flowstate-power", "crates/flowstate-audio", "crates/flowstate-bluetooth", "crates/flowstate-notifications", "crates/flowstate-resources", "crates/flowstate-cursor", "crates/flowstate-spawn", "crates/flowstate-config", "crates/flowstate-permissions", "apps/flowstate-portal", "apps/flowstate-settings", "crates/flowstate-themes", "crates/flowstate-sounds", 
 ]
 resolver = "2"
 

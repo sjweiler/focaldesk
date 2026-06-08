@@ -26,18 +26,21 @@ pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
             _ => continue,
         };
 
-        let action = match i {
-            0 => UiAction::OpenPanel(PanelKind::AppLauncher),
-            1 => UiAction::Custom(SIDEBAR_BASE + i as u32), //OpenPanel(PanelKind::Settings),
-            2 => UiAction::Custom(SIDEBAR_BASE + i as u32),
-            3 => UiAction::Custom(SIDEBAR_BASE + i as u32),
-            4 => UiAction::Custom(SIDEBAR_BASE + 4),
-            5 => UiAction::Custom(SIDEBAR_BASE + 5),
-            6 => UiAction::Custom(SIDEBAR_BASE + 6),
+        let (tooltip, action) = match i {
+            0 => ("Launcher", UiAction::OpenPanel(PanelKind::AppLauncher)),
+            1 => ("Settings", UiAction::Custom(SIDEBAR_BASE + i as u32)), //OpenPanel(PanelKind::Settings),
+            2 => ("Workspace 1", UiAction::Custom(SIDEBAR_BASE + i as u32)),
+            3 => (
+                "Add new workspace",
+                UiAction::Custom(SIDEBAR_BASE + i as u32),
+            ),
+            4 => ("Browser", UiAction::Custom(SIDEBAR_BASE + 4)),
+            5 => ("Terminal", UiAction::Custom(SIDEBAR_BASE + 5)),
+            6 => ("Files", UiAction::Custom(SIDEBAR_BASE + 6)),
             _ => continue,
         };
 
-        let mut el = UiElement::sidebar_button(id, icon, "some tooltip", action);
+        let mut el = UiElement::sidebar_button(id, icon, tooltip, action);
         el.hover_scale = 1.10;
         el.press_scale = 0.96;
         el.bounds = UiRect {

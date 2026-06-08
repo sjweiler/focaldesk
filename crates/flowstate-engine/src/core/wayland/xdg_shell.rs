@@ -34,9 +34,25 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        use wayland_server::Resource;
+
         self.unconstrain_popup(&surface);
-        if let Err(e) = self.popups.track_popup(PopupKind::from(surface)) {
+        flog(&format!(
+            "xdg popup new surface={:?}",
+            surface.wl_surface().id()
+        ));
+        if let Err(e) = self.popups.track_popup(PopupKind::from(surface.clone())) {
             flog(&format!("Failed to track xdg popup: {e:?}"));
+        }
+        if !surface.is_initial_configure_sent() {
+            if let Err(e) = surface.send_configure() {
+                flog(&format!("Failed to configure xdg popup: {e:?}"));
+            } else {
+                flog(&format!(
+                    "xdg popup initial configure sent surface={:?}",
+                    surface.wl_surface().id()
+                ));
+            }
         }
     }
 
@@ -50,18 +66,33 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        use wayland_server::Resource;
+
+        let surface_id = surface.wl_surface().id();
         let Some(seat) = Seat::<DesktopState>::from_resource(&seat) else {
+            flog(&format!(
+                "xdg popup grab ignored surface={surface_id:?}: unknown seat"
+            ));
             return;
         };
         let kind = PopupKind::from(surface);
         let Some(root) = find_popup_root_surface(&kind).ok() else {
+            flog(&format!(
+                "xdg popup grab ignored surface={surface_id:?}: no root"
+            ));
             return;
         };
         let Some(window) = self.window_for_wl_surface(&root) else {
+            flog(&format!(
+                "xdg popup grab ignored surface={surface_id:?}: root window not mapped"
+            ));
             return;
         };
         let root_focus = KeyboardFocusTarget::Window(window.clone());
         let Ok(mut grab) = self.popups.grab_popup(root_focus, kind, &seat, serial) else {
+            flog(&format!(
+                "xdg popup grab ignored surface={surface_id:?}: grab_popup failed"
+            ));
             return;
         };
 
@@ -71,6 +102,9 @@ impl XdgShellHandler for DesktopState {
                     || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
             {
                 grab.ungrab(PopupUngrabStrategy::All);
+                flog(&format!(
+                    "xdg popup grab rejected surface={surface_id:?}: keyboard serial mismatch"
+                ));
                 return;
             }
             keyboard.set_focus(self, grab.current_grab(), serial);
@@ -82,10 +116,19 @@ impl XdgShellHandler for DesktopState {
                     || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
             {
                 grab.ungrab(PopupUngrabStrategy::All);
+                flog(&format!(
+                    "xdg popup grab rejected surface={surface_id:?}: pointer serial mismatch"
+                ));
                 return;
             }
             pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
         }
+        if self.input.pointer_left_down {
+            self.suppress_next_left_release();
+        }
+        flog(&format!(
+            "xdg popup grab active surface={surface_id:?} serial={serial:?}"
+        ));
     }
 
     fn resize_request(
@@ -140,6 +183,16 @@ impl XdgShellHandler for DesktopState {
         });
         self.unconstrain_popup(&surface);
         surface.send_repositioned(token);
+    }
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        use wayland_server::Resource;
+
+        flog(&format!(
+            "xdg popup destroyed surface={:?}",
+            surface.wl_surface().id()
+        ));
+        self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::CommitBbox);
     }
 }
 

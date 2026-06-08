@@ -155,6 +155,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         forward_stack: Rc::new(RefCell::new(Vec::new())),
     };
 
+    ensure_standard_user_dirs();
     manager.install_css();
     manager.load_places();
     manager.connect_actions(
@@ -876,6 +877,15 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
+fn ensure_standard_user_dirs() {
+    for name in ["Desktop", "Downloads", "Music", "Pictures", "Videos"] {
+        let path = home_dir().join(name);
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            log_launch(&format!("could not create {}: {err}", path.display()));
+        }
+    }
+}
+
 fn modified_text(info: &gio::FileInfo) -> String {
     info.modification_date_time()
         .and_then(|date| date.format("%Y-%m-%d %H:%M").ok())
@@ -982,4 +992,3 @@ fn install_sidebar_actions(window: &gtk::ApplicationWindow) {
     });
     window.add_action(&properties);
 }
-

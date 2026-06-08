@@ -17,7 +17,9 @@ use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Size, T
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
-use crate::core::backend_render::{build_output_client_elements, draw_output, prepare_output};
+use crate::core::backend_render::{
+    build_output_client_elements, build_output_popup_elements, draw_output, prepare_output,
+};
 use crate::core::desktop::DesktopState;
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
@@ -168,12 +170,14 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         {
             let mut target = renderer.bind(&mut capture_tex)?;
             let client_elements = build_output_client_elements(state, renderer, output_id);
+            let popup_elements = build_output_popup_elements(state, renderer, output_id);
             let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
             draw_output(
                 state,
                 &mut gles_frame,
                 &prepared,
                 &client_elements,
+                &popup_elements,
                 ui_state,
                 scene,
                 output_state,

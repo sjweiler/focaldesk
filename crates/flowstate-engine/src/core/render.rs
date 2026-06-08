@@ -7,6 +7,7 @@ use flowstate_ui::types::UiElementKind;
 use flowstate_ui::uitree::UiTree;
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::gles::GlesFrame;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -15,8 +16,8 @@ use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::ImportMem;
 use smithay::backend::renderer::Texture;
-use smithay::desktop::Space;
 use smithay::desktop::Window;
+use smithay::desktop::{PopupManager, Space};
 use smithay::output::Output;
 use smithay::utils::Buffer;
 use smithay::utils::Transform;
@@ -65,6 +66,7 @@ use flowstate_ui::{UiVisualState, UiVisualStyle};
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
 use smithay::backend::renderer::gles::Uniform;
+use smithay::wayland::seat::WaylandFocus;
 #[cfg(feature = "xwayland")]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -244,6 +246,24 @@ fn selected_sidebar_style(theme: &FlowTheme, hovered: bool) -> BevelStyle {
         shadow_color: [0.0, 0.0, 0.0, 0.45],
         glow_color,
     }
+}
+
+fn tooltip_rect_for_element(
+    el_bounds: flowstate_ui::element::UiRect,
+    text_w: i32,
+    output_size: Size<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    let pad_x = 10;
+    let width = (text_w + pad_x * 2).clamp(64, 260);
+    let height = 30;
+    let gap = 10;
+
+    let max_x = (output_size.w - width - 6).max(0);
+    let max_y = (output_size.h - height - 6).max(0);
+    let x = (el_bounds.x + el_bounds.w + gap).clamp(6, max_x);
+    let y = (el_bounds.y + (el_bounds.h - height) / 2).clamp(6, max_y);
+
+    Rectangle::from_loc_and_size((x, y), (width, height))
 }
 
 fn title_glyph_style(token: &str, in_meta: bool, is_active_output: bool) -> UiVisualStyle {
@@ -602,6 +622,56 @@ impl RenderState {
         }
 
         Ok(())
+    }
+
+    fn draw_hover_tooltip(
+        &mut self,
+        frame: &mut GlesFrame<'_, '_>,
+        fonts: &FontSystem,
+        ui_tree: &UiTree,
+        output_size: Size<i32, Logical>,
+        theme: &FlowTheme,
+        scale: Scale<f64>,
+    ) -> Result<(), GlesError> {
+        if self.font_atlas_texture.is_none() || self.chrome_shaders.font_text.is_none() {
+            return Ok(());
+        }
+
+        let Some(el) = ui_tree.elements.iter().find(|el| {
+            el.hovered
+                && matches!(
+                    el.kind,
+                    UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot
+                )
+        }) else {
+            return Ok(());
+        };
+
+        let Some(text) = el.tooltip.as_deref().filter(|text| !text.is_empty()) else {
+            return Ok(());
+        };
+
+        let style = style_for(
+            FontRole::Label,
+            14,
+            theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle),
+        );
+        let text_w = fonts.advance_width(text, style);
+        let rect = tooltip_rect_for_element(el.bounds, text_w, output_size);
+
+        self.draw_rounded_rect(frame, rect, scale, 6.0, [0.035, 0.050, 0.075, 0.92])?;
+
+        let baseline_y = rect.loc.y + 20;
+        self.draw_text_cached(
+            frame,
+            fonts,
+            text,
+            rect.loc.x + 10,
+            baseline_y,
+            style,
+            theme.text.normal,
+            scale,
+        )
     }
 
     pub fn upload_font_atlas(
@@ -1992,11 +2062,17 @@ impl RenderState {
                 continue;
             }
 
-            let bbox = space.element_bbox(window).unwrap_or_else(|| {
+            let popup_bbox = space.element_location(window).map(|element_loc| {
                 let mut bbox = window.bbox_with_popups();
-                bbox.loc -= window.geometry().loc;
+                bbox.loc += element_loc - window.geometry().loc;
                 bbox
             });
+            let bbox = match (space.element_bbox(window), popup_bbox) {
+                (Some(space_bbox), Some(popup_bbox)) => space_bbox.merge(popup_bbox),
+                (Some(space_bbox), None) => space_bbox,
+                (None, Some(popup_bbox)) => popup_bbox,
+                (None, None) => continue,
+            };
             if !region.overlaps(bbox) {
                 continue;
             }
@@ -2053,6 +2129,68 @@ impl RenderState {
                 Scale::from(scale),
                 &mut out,
             );
+        }
+
+        out
+    }
+
+    /// Build xdg popup elements for a top overlay pass.
+    ///
+    /// `Window::render_elements` includes popups in the client layer, but FlowState draws shell
+    /// chrome after that layer. Menus need a second top pass so browser/app popups are not covered
+    /// by compositor trim and icons.
+    pub fn build_popup_elements_for_output(
+        &mut self,
+        space: &Space<Window>,
+        windows: &[ManagedWindow],
+        active_workspace: WorkspaceId,
+        output: &Output,
+        renderer: &mut GlesRenderer,
+    ) -> Vec<FlowRenderElement> {
+        let Some(region) = space.output_geometry(output) else {
+            return Vec::new();
+        };
+
+        let scale = output.current_scale().fractional_scale();
+        let mut out = Vec::new();
+
+        let on_workspace: std::collections::HashSet<_> = windows
+            .iter()
+            .filter(|mw| mw.mapped && mw.workspace == active_workspace)
+            .map(|mw| &mw.window)
+            .collect();
+
+        for window in space.elements().rev() {
+            if !on_workspace.contains(window) {
+                continue;
+            }
+
+            let Some(window_loc) = space.element_location(window) else {
+                continue;
+            };
+            let Some(surface) = window.wl_surface() else {
+                continue;
+            };
+
+            for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+                let mut popup_bbox = popup.geometry();
+                popup_bbox.loc += window_loc + popup_offset - popup.geometry().loc;
+                if !region.overlaps(popup_bbox) {
+                    continue;
+                }
+
+                let popup_loc = window_loc + popup_offset - popup.geometry().loc;
+                let output_loc = popup_loc - region.loc;
+                let render_pos = output_loc.to_physical_precise_round(scale);
+                out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
+                    renderer,
+                    popup.wl_surface(),
+                    render_pos,
+                    Scale::from(scale),
+                    1.0,
+                    Kind::Unspecified,
+                ));
+            }
         }
 
         out
@@ -2735,6 +2873,20 @@ impl RenderState {
                     _ => {}
                 }
             }
+
+            let output_logical_size = Size::<i32, Logical>::from((
+                (ctx.output_size.0 as f64 / ctx.output_scale.x).round() as i32,
+                (ctx.output_size.1 as f64 / ctx.output_scale.y).round() as i32,
+            ));
+
+            let _ = self.draw_hover_tooltip(
+                frame,
+                fonts,
+                ui_tree,
+                output_logical_size,
+                active_theme,
+                ctx.output_scale,
+            );
 
             /*
             let sidebar_icons = [

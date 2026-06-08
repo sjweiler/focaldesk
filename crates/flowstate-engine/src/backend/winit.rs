@@ -25,7 +25,9 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 use crate::core::input::FlowInputEvent;
 
 use crate::core::backend_render::draw_output;
-use crate::core::backend_render::{build_output_client_elements, prepare_output};
+use crate::core::backend_render::{
+    build_output_client_elements, build_output_popup_elements, prepare_output,
+};
 use crate::core::desktop::DesktopState;
 use flowstate_logging::flog;
 use flowstate_themes::theme::BuiltInThemeId;
@@ -191,6 +193,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
                 let client_elements =
                     build_output_client_elements(&mut nested.state, renderer, OutputId(1));
+                let popup_elements =
+                    build_output_popup_elements(&mut nested.state, renderer, OutputId(1));
 
                 let mut frame =
                     renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
@@ -200,6 +204,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &mut frame,
                     &prepared,
                     &client_elements,
+                    &popup_elements,
                     &mut nested.ui_state,
                     &nested.scene,
                     &nested.output_state,

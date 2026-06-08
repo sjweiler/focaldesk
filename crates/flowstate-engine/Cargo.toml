@@ -26,6 +26,7 @@ flowstate-settings-core = { path = "../flowstate-settings-core" }
 flowstate-ipc = { path = "../flowstate-ipc" }
 flowstate-themes = { path = "../flowstate-themes" }
 flowstate-config = { path = "../flowstate-config" }
+flowstate-sounds = { path = "../flowstate-sounds" }
 
 serde_json = "1"
 zbus = "3"

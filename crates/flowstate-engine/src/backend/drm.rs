@@ -17,7 +17,9 @@ use smithay::reexports::drm::control::Device as _;
 
 use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
-use crate::core::backend_render::{build_output_client_elements, prepare_output};
+use crate::core::backend_render::{
+    build_output_client_elements, build_output_popup_elements, prepare_output,
+};
 use smithay::backend::renderer::utils::{CommitCounter, DamageBag};
 use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -923,7 +925,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.display.handle().flush_clients()?;
         data.core.state.tick_layout();
 
-        let screenshot_output = data.core.state.take_screenshot_request();
+        let screenshot_output = data.core.state.screenshot_request();
         let should_render = data.core.state.needs_redraw()
             || screenshot_output.is_some()
             || data.core.state.screenshot_all_requested;
@@ -936,7 +938,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let drm_surface_count = device.surfaces.len();
 
             for (_crtc, surface) in device.surfaces.iter_mut() {
-                let owns_cursor = data.core.state.output_contains_pointer(surface.output_id);
+                let owns_cursor = data.core.state.output_owns_cursor(surface.output_id);
                 let pending_damage = data.core.state.output_has_pending_damage(surface.output_id);
                 let wants_screenshot = screenshot_output == Some(surface.output_id);
                 let should_skip = !data.core.state.render.redraw_all
@@ -987,6 +989,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &mut device.renderer,
                         surface.output_id,
                     );
+                    let popup_elements = build_output_popup_elements(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        surface.output_id,
+                    );
 
                     let mut frame = device
                         .renderer
@@ -998,6 +1005,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &mut frame,
                         &prepared,
                         &client_elements,
+                        &popup_elements,
                         &mut data.core.ui_state,
                         &data.core.scene,
                         &data.core.output_state,
@@ -1010,8 +1018,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         ));
                     }
                 }
-                //let should_capture = data.core.state.take_screenshot_request();
-
                 if wants_screenshot {
                     data.core.state.screenshot_seq += 1;
                     let seq = data.core.state.screenshot_seq;
@@ -1030,6 +1036,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             flog(&format!("Screenshot failed: {err}"));
                         }
                     }
+                    data.core
+                        .state
+                        .clear_screenshot_request(surface.output_id);
                 }
 
                 // now borrow immutably after the mutable borrow is gone
@@ -1139,10 +1148,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     )),
                     Err(err) => flog(&format!("All-outputs screenshot failed: {err}")),
                 }
-
-                data.core.state.screenshot_all_requested = false;
             }
         }
+
+        data.core.state.screenshot_all_requested = false;
 
         data.core.state.clear_repaint_request();
         data.core.state.render.frame_no += 1;
@@ -1264,7 +1273,9 @@ fn device_added(
         EGLDevice::device_for_display(&egl_display).context("Failed to query EGLDevice")?;
 
     if egl_device.is_software() {
-        flog("EGL reports a software rasterizer (e.g. llvmpipe). Check drivers if you expected GPU acceleration.");
+        flog(
+            "EGL reports a software rasterizer (e.g. llvmpipe). Check drivers if you expected GPU acceleration.",
+        );
     }
 
     // Prefer the render node from the EGL driver so scan-out import matches where GL allocates.
@@ -1460,15 +1471,7 @@ fn device_added(
 
             flog(&format!(
                 "Wayland output advertised: name={} px={}x{} mm={}x{} refresh_mhz={} make={:?} model={:?} serial={:?}",
-                output_name,
-                w,
-                h,
-                mm_w,
-                mm_h,
-                wl_mode.refresh,
-                make,
-                model,
-                serial_number,
+                output_name, w, h, mm_w, mm_h, wl_mode.refresh, make, model, serial_number,
             ));
 
             let crtc = info.encoders().iter().find_map(|enc| {

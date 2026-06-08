@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+flowstate-sounds = { path = "../flowstate-sounds" }
 image = "0.25"
 
 tiny-skia.workspace = true

@@ -31,7 +31,9 @@ pub enum SystemCommand {
 pub enum UiAction {
     LaunchApp(&'static str),
     ToggleSetting(SettingKey),
+    SetSetting(SettingKey, bool),
     OpenPanel(PanelKind),
+    SetVolume(f32),
     SystemCommand(SystemCommand),
     Custom(ElementId),
 }

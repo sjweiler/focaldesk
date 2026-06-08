@@ -1464,6 +1464,7 @@ dependencies = [
  "flowstate-notifications",
  "flowstate-resources",
  "flowstate-settings-core",
+ "flowstate-sounds",
  "flowstate-themes",
  "flowstate-types",
  "flowstate-ui",
@@ -1564,6 +1565,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "cosmic-text",
+ "flowstate-sounds",
  "fontdb 0.16.2",
  "image",
  "resvg 0.41.0",
@@ -1609,6 +1611,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "flowstate-sounds"
+version = "0.1.0"
 
 [[package]]
 name = "flowstate-spawn"
