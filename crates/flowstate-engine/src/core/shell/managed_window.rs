@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use flowstate_types::types::{OutputId, WindowId, WorkspaceId};
 use smithay::desktop::{PopupManager, Space};
 use smithay::wayland::compositor::CompositorState;

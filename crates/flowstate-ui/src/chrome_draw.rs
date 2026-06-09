@@ -6,7 +6,7 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::atlas::{IconAtlas, IconId, IconState};
+use crate::atlas::{IconAtlas, IconId};
 use crate::chrome::ChromeMetrics;
 use crate::chrome_layout::ChromeLayoutLogical;
 use crate::chrome_shaders::ChromeShaders;

@@ -35,6 +35,17 @@ pub fn sidebar_slot_index_at(layout: &ChromeLayout, lx: i32, ly: i32) -> Option<
         .map(|(i, _)| i)
 }
 
+/// Index of the topbar status well under output-local **logical** `(lx, ly)`.
+pub fn topbar_status_well_index_at(layout: &ChromeLayout, lx: i32, ly: i32) -> Option<usize> {
+    layout
+        .topbar
+        .status_wells
+        .iter()
+        .enumerate()
+        .find(|(_, well)| well.contains((lx, ly)))
+        .map(|(i, _)| i)
+}
+
 /// Scale every chrome rectangle from logical layout space into framebuffer (physical) space.
 /// Used by the GPU path only; hit testing and UI element bounds stay in logical space.
 pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Physical> {

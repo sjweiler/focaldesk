@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 # Primary API namespace (recommended)
 flowstate-engine = { path = "../../crates/flowstate-engine", default-features = false  }
+flowstate-logging = { path = "../../crates/flowstate-logging" }
 flowstate-ui = { path = "../../crates/flowstate-ui" }
 
 # Logging and error handling

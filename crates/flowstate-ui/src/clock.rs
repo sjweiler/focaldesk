@@ -4,14 +4,10 @@ use crate::uicomponent::RenderCtx;
 use crate::uicomponent::UiComponent;
 use crate::uicomponent::UiHit;
 use crate::uicomponent::UiHitTarget;
-use flowstate_themes::FlowTheme;
 use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
-use smithay::backend::renderer::gles::GlesFrame;
 use smithay::utils::Logical;
-use smithay::utils::Physical;
 use smithay::utils::Point;
-use smithay::utils::Rectangle;
 
 #[derive(Debug, Clone)]
 pub enum ClockHourFormat {
@@ -76,7 +72,7 @@ impl ClockComponent {
 }
 
 impl UiComponent for ClockComponent {
-    fn layout(&mut self, ctx: &LayoutCtx) {
+    fn layout(&mut self, _ctx: &LayoutCtx) {
         // clock layout
     }
 

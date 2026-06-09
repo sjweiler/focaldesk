@@ -1,10 +1,6 @@
 // crates/flowstate-ui/src/dialog_layout.rs
 
 use crate::dialog::Dialog;
-use crate::uicomponent::RenderCtx;
-use flowstate_themes::FlowTheme;
-use smithay::backend::renderer::gles::GlesFrame;
-use smithay::utils::Physical;
 use smithay::utils::{Logical, Rectangle};
 
 pub struct DialogLayout {

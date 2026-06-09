@@ -1,13 +1,11 @@
 use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::DialogId;
-use crate::element::UiElement;
 use flowstate_themes::FlowTheme;
 use flowstate_types::OutputId;
 use flowstate_types::WidgetId;
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesFrame;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::Logical;
 use smithay::utils::Physical;
 use smithay::utils::Rectangle;

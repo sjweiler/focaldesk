@@ -3,9 +3,8 @@ use flowstate_logging::flog;
 
 use smithay::backend::renderer::gles::GlesTexProgram;
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
+    GlesError, GlesPixelProgram, GlesRenderer, UniformName, UniformType,
 };
-use smithay::utils::{Physical, Rectangle, Size};
 
 pub struct ChromeShaders {
     pub beveled_panel: Option<GlesPixelProgram>,

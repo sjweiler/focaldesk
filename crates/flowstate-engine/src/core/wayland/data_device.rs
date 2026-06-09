@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use smithay::{delegate_data_device, delegate_primary_selection};
 use std::os::fd::OwnedFd;
 

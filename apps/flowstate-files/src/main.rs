@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use flowstate_logging::flog_info;
 use gtk::gio;
 use gtk::glib;
 use std::cell::RefCell;
@@ -964,31 +965,31 @@ fn attach_sidebar_context_menu(row: &gtk::ListBoxRow, kind: SidebarKind) {
 fn install_sidebar_actions(window: &gtk::ApplicationWindow) {
     let open = gio::SimpleAction::new("sidebar-open", None);
     open.connect_activate(|_, _| {
-        println!("Open sidebar location");
+        flog_info!("Open sidebar location");
     });
     window.add_action(&open);
 
     let open_tab = gio::SimpleAction::new("sidebar-open-tab", None);
     open_tab.connect_activate(|_, _| {
-        println!("Open in new tab");
+        flog_info!("Open in new tab");
     });
     window.add_action(&open_tab);
 
     let open_window = gio::SimpleAction::new("sidebar-open-window", None);
     open_window.connect_activate(|_, _| {
-        println!("Open in new window");
+        flog_info!("Open in new window");
     });
     window.add_action(&open_window);
 
     let empty_trash = gio::SimpleAction::new("empty-trash", None);
     empty_trash.connect_activate(|_, _| {
-        println!("Empty Trash...");
+        flog_info!("Empty Trash...");
     });
     window.add_action(&empty_trash);
 
     let properties = gio::SimpleAction::new("sidebar-properties", None);
     properties.connect_activate(|_, _| {
-        println!("Show properties");
+        flog_info!("Show properties");
     });
     window.add_action(&properties);
 }

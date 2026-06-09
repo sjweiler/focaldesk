@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use crate::core::desktop::DesktopState;
 use crate::core::render::RenderState;
 use std::process::Command;

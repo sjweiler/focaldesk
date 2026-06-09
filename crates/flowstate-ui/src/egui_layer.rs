@@ -8,6 +8,7 @@ use egui::{
     epaint::Primitive,
 };
 use egui_glow::Painter;
+use flowstate_logging::{flog_error, flog_info};
 use flowstate_themes::FlowTheme;
 use glow;
 use smithay::backend::egl::get_proc_address;
@@ -538,7 +539,7 @@ impl EguiLayer {
         if egui_debug_uv_enabled() {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
-                eprintln!(
+                flog_info!(
                     "egui: FLOWSTATE_EGUI_DEBUG_UV is ignored when using the egui_glow painter"
                 );
             });
@@ -554,7 +555,7 @@ impl EguiLayer {
 
         frame.with_context(|_gl| {
             if let Err(err) = self.paint_with_glow(frame_ctx, screen_size_px, pixels_per_point) {
-                eprintln!("egui glow paint failed: {err}");
+                flog_error!("egui glow paint failed: {err}");
             }
         })
     }
@@ -568,7 +569,7 @@ impl EguiLayer {
 
             if !self.logged_texture_delta {
                 let stats = image_alpha_stats(&delta.image);
-                eprintln!(
+                flog_info!(
                     "egui texture delta: id={id:?} kind={} pos={:?} size={}x{} alpha_nonzero={} alpha_min={} alpha_max={}",
                     image_kind(&delta.image),
                     delta.pos,
@@ -586,9 +587,9 @@ impl EguiLayer {
                 if let Err(err) =
                     dump_egui_atlas_png("/tmp/flowstate-egui-font-atlas.png", &rgba, [w, h])
                 {
-                    eprintln!("egui texture warning: failed to dump font atlas: {err}");
+                    flog_error!("egui texture warning: failed to dump font atlas: {err}");
                 } else {
-                    eprintln!("egui texture dump: /tmp/flowstate-egui-font-atlas.png");
+                    flog_info!("egui texture dump: /tmp/flowstate-egui-font-atlas.png");
                 }
                 self.dumped_font_atlas = true;
             }
@@ -612,7 +613,7 @@ impl EguiLayer {
                         .find(|(tid, _)| *tid == TextureId::default())
                         .map(|(_, d)| d.image.size())
                         .unwrap_or([0, 0]);
-                    eprintln!(
+                    flog_info!(
                         "egui text mesh sample: texture={:?} texture_size={:?} vertices={} indices={} uv_min={:?} uv_max={:?}",
                         mesh.texture_id,
                         atlas_size,
@@ -651,8 +652,8 @@ impl EguiLayer {
                 &mesh.vertices,
                 &mesh.indices,
             ) {
-                Ok(()) => eprintln!("egui mesh dump: /tmp/flowstate-egui-font-mesh.png"),
-                Err(err) => eprintln!("egui mesh warning: failed to dump font mesh: {err}"),
+                Ok(()) => flog_info!("egui mesh dump: /tmp/flowstate-egui-font-mesh.png"),
+                Err(err) => flog_error!("egui mesh warning: failed to dump font mesh: {err}"),
             }
             self.dumped_font_mesh = true;
         }
@@ -669,7 +670,7 @@ impl EguiLayer {
                 glow::Context::from_loader_function(|symbol| get_proc_address(symbol) as *const _)
             });
             let painter = Painter::new(gl, "", None, false)?;
-            eprintln!("egui: using egui_glow painter");
+            flog_info!("egui: using egui_glow painter");
             self.glow_painter = Some(painter);
         }
 

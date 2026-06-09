@@ -1,3 +1,5 @@
+use flowstate_logging::flog_info;
+
 fn main() {
-    println!("Hello, world!");
+    flog_info!("Hello, world!");
 }

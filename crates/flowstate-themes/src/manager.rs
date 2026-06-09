@@ -1,6 +1,5 @@
 use crate::builtins::builtin_theme;
 use crate::{FlowTheme, FlowThemeId};
-use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 
 pub fn load_custom_theme(path: &Path) -> anyhow::Result<FlowTheme> {

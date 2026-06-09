@@ -1,9 +1,7 @@
 // all my keybind stuff goes here
 use crate::actions::KeyAction;
 use bitflags::bitflags;
-use smithay::backend::input::KeyState;
 use smithay::input::keyboard::keysyms;
-use smithay::input::keyboard::{Keysym, KeysymHandle, ModifiersState};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 //! Interactive XDG toplevel move/resize (winit input path; not Smithay pointer grabs).
 use std::cell::RefCell;
 

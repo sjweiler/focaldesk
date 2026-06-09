@@ -7,10 +7,10 @@ use flowstate_engine::backend;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    println!("FlowState server starting...");
+    flog_info!("FlowState server starting...");
 
     let agent = Agent::new("ipc server".to_string());
-    println!("Initialized agent: {}", agent.name);
+    flog_info!("Initialized agent: {}", agent.name);
 
     // later:
     // start IPC server

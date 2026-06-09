@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use crate::core::app::App;
 use crate::core::layout::LayoutSnapshot;
 use crate::core::output::OutputState; // if still needed (ideally not)
@@ -8,7 +10,6 @@ use flowstate_ui::uitree::UiTree;
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::element::AsRenderElements;
 use smithay::backend::renderer::gles::GlesFrame;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::gles::GlesTexture;
@@ -30,7 +31,7 @@ use smithay::backend::renderer::gles::GlesTexProgram;
 use crate::core::scene::SceneState;
 //use crate::core::output::OutputId;
 use flowstate_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
-use flowstate_logging::flog;
+use flowstate_logging::{flog, flog_error, flog_info};
 use flowstate_types::OutputId;
 use flowstate_ui::atlas::IconId;
 use flowstate_ui::atlas::IconState;
@@ -41,7 +42,7 @@ use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 //use flowstate_ui::atlas::render_atlas_icon_with_alpha;
 use crate::core::desktop::DesktopState;
-use crate::core::desktop::SidebarPulseFrame;
+use crate::core::desktop::{ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame};
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
@@ -158,6 +159,8 @@ pub struct RenderInputs<'a> {
     pub popup_elements: &'a [FlowRenderElement],
     pub sidebar_hover_slot: Option<usize>, // 👈 ADD THIS
     pub sidebar_pulse: Option<SidebarPulseFrame>,
+    pub topbar_pulse: Option<TopbarPulseFrame>,
+    pub clock_pulse: Option<ClockPulseFrame>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     pub ui_tree: &'a UiTree,
@@ -614,7 +617,7 @@ impl RenderState {
                 Some(program),
                 &[Uniform::new("u_tint", color)],
             ) {
-                eprintln!("tinted icon render failed: {:?}", e);
+                flog_error!("tinted icon render failed: {:?}", e);
             }
 
             // ✅ MUST be inside loop
@@ -807,7 +810,7 @@ impl RenderState {
                 Some(program),
                 &[Uniform::new("u_tint", style.tint)], //&[Uniform::new("u_tint", tint)],
             ) {
-                eprintln!("tinted icon render failed for {:?}: {:?}", icon, e);
+                flog_error!("tinted icon render failed for {:?}: {:?}", icon, e);
             }
         }
     }
@@ -987,7 +990,7 @@ impl RenderState {
           //          rect.size.h,
           //          alpha,
            //     ) {
-          //          eprintln!("render_atlas_icon failed for {:?}: {:?}", icon, e);
+          //          flog_error!("render_atlas_icon failed for {:?}: {:?}", icon, e);
            //     }
             //}
         }
@@ -997,7 +1000,7 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         atlas: &flowstate_ui::atlas::IconAtlas,
         icon: IconId,
-        state: IconState,
+        _state: IconState,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
         style: UiVisualStyle,
@@ -1103,7 +1106,7 @@ impl RenderState {
         if self.wallpaper_texture.is_some() {
             return;
         }
-        eprintln!("ensure_wallpaper_loaded: attempting load…");
+        flog_info!("ensure_wallpaper_loaded: attempting load...");
 
         let tex = Self::load_wallpaper(
             renderer,
@@ -1117,7 +1120,7 @@ impl RenderState {
         //"/home/steve/flowstate/assets/wallpaper/ChatGPT Image Mar 26, 2026, 08_07_23 AM.png",
         //"/home/steve/flowstate/assets/wallpaper/ChatGPT Image Mar 29, 2026, 07_11_29 PM.png",
         //"/home/steve/flowstate/assets/wallpaper/WALLPAPER.png",
-        eprintln!(
+        flog_info!(
             "ensure_wallpaper_loaded: load result is_some={}",
             tex.is_some()
         );
@@ -1126,18 +1129,18 @@ impl RenderState {
     }
 
     pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<GlesTexture> {
-        eprintln!("load_wallpaper: opening {path}");
+        flog_info!("load_wallpaper: opening {path}");
 
         let img = match image::open(path) {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("load_wallpaper: image::open failed: {e:?}");
+                flog_error!("load_wallpaper: image::open failed: {e:?}");
                 return None;
             }
         };
 
         let (w, h) = img.dimensions();
-        eprintln!("load_wallpaper: decoded {w}x{h}");
+        flog_info!("load_wallpaper: decoded {w}x{h}");
 
         //let rgba = img.to_rgba8();
         let mut rgba = img.to_rgba8();
@@ -1147,19 +1150,19 @@ impl RenderState {
         }
 
         //let fourcc = Fourcc::Rgba8888;
-        eprintln!("load_wallpaper: rgba bytes={}", rgba.len());
+        flog_info!("load_wallpaper: rgba bytes={}", rgba.len());
 
         // IMPORTANT: your buffer is RGBA; ABGR is often wrong here.
         let fourcc = Fourcc::Argb8888; // try this first
-        eprintln!("load_wallpaper: importing to GPU as {fourcc:?}");
+        flog_info!("load_wallpaper: importing to GPU as {fourcc:?}");
 
         match renderer.import_memory(&rgba, fourcc, (w as i32, h as i32).into(), false) {
             Ok(tex) => {
-                eprintln!("load_wallpaper: import_memory OK");
+                flog_info!("load_wallpaper: import_memory OK");
                 Some(tex)
             }
             Err(e) => {
-                eprintln!("load_wallpaper: import_memory FAILED: {e:?}");
+                flog_error!("load_wallpaper: import_memory FAILED: {e:?}");
                 None
             }
         }
@@ -1227,7 +1230,7 @@ impl RenderState {
 
         let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
 
-        frame.render_pixel_shader_to(
+        let _ = frame.render_pixel_shader_to(
             button,
             src_rect,
             rect_physical,
@@ -1255,9 +1258,9 @@ impl RenderState {
         r: Rectangle<i32, Physical>,
         output_size: (i32, i32),
     ) -> Rectangle<i32, Physical> {
-        let (W, H) = output_size;
+        let (w, h) = output_size;
         Rectangle::new(
-            ((W - (r.loc.x + r.size.w)), (H - (r.loc.y + r.size.h))).into(),
+            ((w - (r.loc.x + r.size.w)), (h - (r.loc.y + r.size.h))).into(),
             r.size,
         )
     }
@@ -1336,6 +1339,8 @@ impl RenderState {
             muts.ui,
             inputs.sidebar_hover_slot,
             inputs.sidebar_pulse,
+            inputs.topbar_pulse,
+            inputs.clock_pulse,
             theme.chrome,
         );
 
@@ -1498,8 +1503,8 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         dialog: &Dialog,
         layout: &DialogLayout,
-        atlas: &flowstate_ui::atlas::IconAtlas,
-        program: &GlesTexProgram,
+        _atlas: &flowstate_ui::atlas::IconAtlas,
+        _program: &GlesTexProgram,
         fonts: &FontSystem,
         output_pixels: Size<i32, Physical>,
         scale: Scale<f64>,
@@ -1919,8 +1924,8 @@ impl RenderState {
     pub fn draw_debug_rect(
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
-        ctx: &FrameCtx,
-        output: &OutputState,
+        _ctx: &FrameCtx,
+        _output: &OutputState,
     ) {
         // Debug marker where window should start
         let marker: Rectangle<i32, Physical> = Rectangle::new((64, 36).into(), (20, 20).into());
@@ -1934,7 +1939,7 @@ impl RenderState {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        output: &OutputState,
+        _output: &OutputState,
         bg: BackgroundTheme,
     ) {
         let full: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), ctx.output_size.into());
@@ -1950,7 +1955,7 @@ impl RenderState {
     pub fn draw_wallpaper_in_rect(
         &self,
         frame: &mut GlesFrame<'_, '_>,
-        ctx: &FrameCtx,
+        _ctx: &FrameCtx,
         target_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
         theme: WallpaperTheme,
@@ -2301,8 +2306,8 @@ impl RenderState {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        scene: &SceneState,
-        output: &OutputState,
+        _scene: &SceneState,
+        _output: &OutputState,
         elements: &[FlowRenderElement],
     ) {
         // 1) Build elements from Space<Window>
@@ -2326,6 +2331,8 @@ impl RenderState {
         _ui: &mut UiState<GlesTexture>,
         sidebar_hover_slot: Option<usize>,
         sidebar_pulse: Option<SidebarPulseFrame>,
+        topbar_pulse: Option<TopbarPulseFrame>,
+        clock_pulse: Option<ClockPulseFrame>,
         theme: flowstate_themes::ChromeTheme,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(&theme);
@@ -2375,7 +2382,7 @@ impl RenderState {
             &legacy_theme.top_bar,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.topbar.outer,
@@ -2384,7 +2391,7 @@ impl RenderState {
             &legacy_theme.frame_outer,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.topbar.inner,
@@ -2393,7 +2400,7 @@ impl RenderState {
             &legacy_theme.frame_inner,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.sidebar.outer,
@@ -2402,7 +2409,7 @@ impl RenderState {
             &legacy_theme.sidebar,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.sidebar.inner,
@@ -2411,7 +2418,7 @@ impl RenderState {
             &legacy_theme.panel_inner,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.work_area.outer,
@@ -2420,7 +2427,7 @@ impl RenderState {
             &legacy_theme.frame_outer,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.work_area.inner_frame,
@@ -2429,7 +2436,7 @@ impl RenderState {
             &legacy_theme.frame_inner,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.work_area.recess,
@@ -2442,7 +2449,7 @@ impl RenderState {
         // 2. TOP BAR DETAILS
         //
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.topbar.title,
@@ -2451,7 +2458,7 @@ impl RenderState {
             &legacy_theme.panel_inner,
         );
 
-        Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
             layout.topbar.trim,
@@ -2461,7 +2468,7 @@ impl RenderState {
         );
 
         if let Some(rect) = layout.topbar.light {
-            Self::draw_light_channel(
+            let _ = Self::draw_light_channel(
                 frame,
                 light,
                 rect,
@@ -2471,7 +2478,7 @@ impl RenderState {
             );
         }
 
-        for rect in &layout.topbar.status_wells {
+        for (i, rect) in layout.topbar.status_wells.iter().enumerate() {
             Self::draw_recessed_button(
                 frame,
                 button,
@@ -2481,7 +2488,7 @@ impl RenderState {
                 &legacy_theme.button,
             );
 
-            Self::draw_light_channel(
+            let _ = Self::draw_light_channel(
                 frame,
                 light,
                 inset_rect(*rect, 3),
@@ -2489,6 +2496,20 @@ impl RenderState {
                 damage,
                 &legacy_theme.light,
             );
+
+            if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
+                if pulse_frame.indicator == i {
+                    let _ = Self::draw_sidebar_pulse(
+                        frame,
+                        pulse_shader,
+                        *rect,
+                        pulse_frame.click_local,
+                        pulse_frame.elapsed,
+                        ctx.output_scale,
+                        damage,
+                    );
+                }
+            }
         }
 
         Self::draw_recessed_button(
@@ -2500,7 +2521,7 @@ impl RenderState {
             &legacy_theme.button,
         );
 
-        Self::draw_light_channel(
+        let _ = Self::draw_light_channel(
             frame,
             light,
             inset_rect(layout.topbar.clock_well, 3),
@@ -2508,6 +2529,18 @@ impl RenderState {
             damage,
             &legacy_theme.light,
         );
+
+        if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, clock_pulse) {
+            let _ = Self::draw_sidebar_pulse(
+                frame,
+                pulse_shader,
+                layout.topbar.clock_well,
+                pulse_frame.click_local,
+                pulse_frame.elapsed,
+                ctx.output_scale,
+                damage,
+            );
+        }
 
         //
         // 3. SIDEBAR MODULESFtopbar
@@ -2589,7 +2622,7 @@ impl RenderState {
         }
 
         if let Some(rect) = layout.sidebar.light {
-            Self::draw_light_channel(
+            let _ = Self::draw_light_channel(
                 frame,
                 light,
                 rect,
@@ -2600,7 +2633,7 @@ impl RenderState {
         }
 
         for rect in &layout.sidebar.caps {
-            Self::draw_beveled_panel(
+            let _ = Self::draw_beveled_panel(
                 frame,
                 &beveled,
                 *rect,
@@ -2615,7 +2648,7 @@ impl RenderState {
         //
 
         for rect in &layout.decoration.corner_caps {
-            Self::draw_beveled_panel(
+            let _ = Self::draw_beveled_panel(
                 frame,
                 &beveled,
                 *rect,
@@ -2626,7 +2659,7 @@ impl RenderState {
         }
 
         for rect in &layout.decoration.corner_joint_caps {
-            Self::draw_beveled_panel(
+            let _ = Self::draw_beveled_panel(
                 frame,
                 &beveled,
                 *rect,
@@ -2643,7 +2676,7 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         layout: &ChromeLayoutLogical,
-        output: &OutputState,
+        _output: &OutputState,
         metrics: &ChromeMetrics,
         //ui: &mut UiState<GlesTexture>,
         ui_state: &mut UiState<GlesTexture>,
@@ -2667,7 +2700,7 @@ impl RenderState {
         let damage = &[fullscreen_rect];
 
         if let Some(rect) = layout.work_area.trim {
-            Self::draw_beveled_panel(
+            let _ = Self::draw_beveled_panel(
                 frame,
                 &beveled,
                 rect,
@@ -2682,14 +2715,14 @@ impl RenderState {
         if let Some(atlas) = ui_state.chrome.atlas.as_ref() {
             let icon_px = metrics.icon_base_px as i32;
 
-            let text = format!(
+            let _text = format!(
                 "FLOWSTATE · OUT {} · WS {}",
                 ctx.rendering_output.0, current_workspace.0
             );
 
             let _label_rect_logical = title_label_rect(layout.topbar.title);
 
-            let is_active = ctx.rendering_output == ctx.active_output; // or output.output_id
+            let _is_active = ctx.rendering_output == ctx.active_output; // or output.output_id
 
             //let _ = RenderState::draw_title_text(frame, atlas, _label_rect_logical, &text, is_active, ctx.output_scale, tinted_icon);
 
@@ -2859,7 +2892,7 @@ impl RenderState {
                                 .unwrap_or(BuiltInThemeId::Eagle),
                         );
 
-                        self.draw_clock_font_text(
+                        let _ = self.draw_clock_font_text(
                             frame,
                             fonts,
                             &time_str,

@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use std::time::{Duration, Instant};
 
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
@@ -203,6 +205,24 @@ pub fn prepare_output(
     state.refresh_ui_hover_for_output(output_id);
 
     if let Some(rect) = state.active_sidebar_pulse_damage_rect(output_id, now) {
+        state.mark_output_logical_damage(
+            output_id,
+            rect,
+            0,
+            crate::core::desktop::DamageSource::Unknown,
+        );
+    }
+
+    if let Some(rect) = state.active_topbar_pulse_damage_rect(output_id, now) {
+        state.mark_output_logical_damage(
+            output_id,
+            rect,
+            0,
+            crate::core::desktop::DamageSource::Unknown,
+        );
+    }
+
+    if let Some(rect) = state.active_clock_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(
             output_id,
             rect,
@@ -442,6 +462,10 @@ pub fn draw_output(
         sidebar_hover_slot: state.sidebar_hover_for_output(prepared.frame_ctx.active_output),
         sidebar_pulse: state
             .sidebar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
+        topbar_pulse: state
+            .topbar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
+        clock_pulse: state
+            .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
         ui_tree: &state.ui,
         current_workspace: active_workspace,

@@ -309,7 +309,7 @@ let src = Rectangle::<f64, Buffer>::from_loc_and_size(
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
    
 
-eprintln!(
+flog_info!(
         "render_atlas_icon: src=({}, {}) {}x{}, dst=({}, {}) {}x{}",
         entry.x, entry.y, entry.w, entry.h, x, y, w, h
     );

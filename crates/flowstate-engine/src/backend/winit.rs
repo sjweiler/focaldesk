@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 // winit backend
 
 use crate::backend::common::{bootstrap_compositor_core, translate_backend_input, BootstrapOutput};
@@ -29,7 +31,7 @@ use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
 use crate::core::desktop::DesktopState;
-use flowstate_logging::flog;
+use flowstate_logging::{flog, flog_info};
 use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
@@ -139,7 +141,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         // accept clients
         if let Some(stream) = nested.listener.accept()? {
-            println!("accepting client");
+            flog_info!("accepting client");
             let client = nested
                 .display
                 .handle()
@@ -151,7 +153,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let dt = now.saturating_duration_since(nested.last_now);
 
         {
-            let (renderer, mut framebuffer) = backend.bind()?;
+            let (renderer, framebuffer) = backend.bind()?;
             nested.state.begin_portal_dispatch(
                 renderer,
                 &mut nested.ui_state,
@@ -210,7 +212,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     &nested.output_state,
                 )?;
 
-                frame.finish()?;
+                let _ = frame.finish()?;
             }
 
             backend.submit(None)?;

@@ -1,7 +1,8 @@
 use tracing_subscriber::EnvFilter;
 
-use flowstate_engine::core::app::CoreInit;
 use flowstate_engine::backend;
+use flowstate_engine::core::app::CoreInit;
+use flowstate_logging::flog_info;
 
 fn main() -> Result<(), Box<dyn std::error::Error>>  {
 
@@ -9,7 +10,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
         .with_env_filter(EnvFilter::from_default_env())
         .try_init()
     {
-        eprintln!("tracing already initialized: {e}");
+        flog_info!("tracing already initialized: {e}");
     }
     
     let CoreInit { display, app } = CoreInit::new()?;
@@ -20,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>>  {
 	"winit" => flowstate_engine::minimal_core::winit::run(display, app)?,
 	"drm"   => flowstate_engine::minimal_core::drm::run(display, app)?,
         other   => {
-            eprintln!("unknown backend: {other} (use: winit | drm)");
+            flog_info!("unknown backend: {other} (use: winit | drm)");
             std::process::exit(2);
         }
     }

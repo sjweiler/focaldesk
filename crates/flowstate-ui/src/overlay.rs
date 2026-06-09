@@ -5,8 +5,7 @@ use crate::desktop_frame::DesktopFrameCtx;
 use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
 use crate::uicomponent::UiComponent;
-use crate::uicomponent::{UiHit, UiHitTarget};
-use flowstate_types::WidgetId;
+use crate::uicomponent::UiHit;
 use smithay::backend::renderer::gles::GlesError;
 
 #[derive(Default)]

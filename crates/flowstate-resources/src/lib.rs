@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 pub mod atlas;
 pub mod render_resources;
 pub mod svg;

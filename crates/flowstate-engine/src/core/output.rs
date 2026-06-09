@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use flowstate_types::OutputId;
 use indexmap::IndexMap;
 use smithay::utils::{Physical, Rectangle, Scale}; // your custom OutputId
@@ -43,7 +45,6 @@ impl OutputState {
         let id = OutputId(1);
         let s = Scale::from(scale);
         let buffer_scale = scale.round().max(1.0) as i32;
-        let physical_size = size;
         let logical_size = (
             (size.0 as f64 / scale).round() as i32,
             (size.1 as f64 / scale).round() as i32,

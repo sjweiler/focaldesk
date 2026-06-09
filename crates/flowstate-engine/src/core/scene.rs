@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 use crate::core::consts::MRU_CAP;
 use crate::core::layout::LayoutSnapshot;
 use flowstate_types::{OutputId, WindowId};

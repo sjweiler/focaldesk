@@ -1,6 +1,5 @@
 use flowstate_themes::FlowTheme;
 use smithay::backend::renderer::Color32F;
-use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesPixelProgram, Uniform};
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size};
 

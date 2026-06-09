@@ -1,6 +1,7 @@
 mod config;
 
 use adw::prelude::*;
+use flowstate_logging::flog_info;
 use gtk::prelude::*;
 
 use config::{load_config, save_config, FlowStateConfig};
@@ -446,7 +447,7 @@ fn appearance_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage 
         reset_button.connect_clicked(move |_| {
             *config.borrow_mut() = FlowStateConfig::default();
             let _ = save_config(&config.borrow());
-            println!("Reset config");
+            flog_info!("Reset config");
         });
     }
 

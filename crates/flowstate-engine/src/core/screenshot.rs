@@ -1,6 +1,7 @@
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Size, Physical};
 use smithay::backend::renderer::Bind;
+use flowstate_logging::flog_info;
 
 use image::{ImageBuffer, Rgba};
 use std::path::PathBuf;
@@ -39,7 +40,7 @@ pub fn capture_screenshot(
 
     img.save(&path)?;
 
-    println!("Saved screenshot: {:?}", path);
+    flog_info!("Saved screenshot: {:?}", path);
 
     Ok(())
 }

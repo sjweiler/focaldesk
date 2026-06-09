@@ -64,7 +64,7 @@ pub struct FontSystem {
 }
 
 impl FontSystem {
-    pub fn new(theme_id: BuiltInThemeId) -> anyhow::Result<Self> {
+    pub fn new(_theme_id: BuiltInThemeId) -> anyhow::Result<Self> {
         let mut system = Self::empty();
 
         // system.load_fallback_fonts()?;

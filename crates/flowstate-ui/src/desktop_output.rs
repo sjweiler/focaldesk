@@ -6,7 +6,7 @@ use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::Texture;
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
-use smithay::utils::{Logical, Physical, Rectangle, Scale, Size};
+use smithay::utils::{Logical, Physical, Rectangle, Size};
 
 use crate::atlas::IconAtlas;
 use crate::chrome::ChromeMetrics;
@@ -154,7 +154,7 @@ impl DesktopOutput {
     fn render_background(
         &self,
         frame: &mut GlesFrame<'_, '_>,
-        frame_ctx: &DesktopFrameCtx,
+        _frame_ctx: &DesktopFrameCtx,
         theme: &FlowTheme,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
@@ -178,7 +178,6 @@ impl DesktopOutput {
         if sz.w == 0 || sz.h == 0 {
             return Ok(());
         }
-        use smithay::backend::renderer::gles::GlesTexProgram;
         use smithay::utils::Transform;
         let src =
             smithay::utils::Rectangle::from_loc_and_size((0.0, 0.0), (sz.w as f64, sz.h as f64));

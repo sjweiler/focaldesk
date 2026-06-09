@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 // crates/flowstate-engine/src/core/ui.rs
 //use flowstate_ui::widgets::ClockCache;
 use std::collections::HashMap;
@@ -57,7 +59,7 @@ impl<Tex: 'static> UiState<Tex> {
         chrome: Chrome,
         text: TextSystem,
         clock: ClockCache,
-        chrome_cache: ChromeCacheState,
+        _chrome_cache: ChromeCacheState,
     ) -> Self {
         Self {
             chrome,

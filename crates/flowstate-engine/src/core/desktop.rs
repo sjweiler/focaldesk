@@ -1,13 +1,15 @@
+#![allow(unused_imports)]
+
 use flowstate_types::types::{OutputId, WindowId, WorkspaceId};
 use flowstate_ui::uitree::UiTree;
 use smithay::backend::renderer::utils::import_surface_tree;
 use smithay::desktop::{
-    PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
+    find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
 };
-use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::compositor::get_parent;
 use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -25,8 +27,8 @@ use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::keysyms;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
-use crate::core::shell::WaylandWindowMeta;
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
+use crate::core::shell::WaylandWindowMeta;
 use flowstate_cursor::CursorManager;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
@@ -39,7 +41,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::core::RenderState;
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
 use crate::core::input::FlowMouseButton;
@@ -47,25 +48,25 @@ use crate::core::input::FlowScrollDelta;
 use crate::core::input::FlowScrollSource;
 use crate::core::input::{FlowInputEvent, InputState};
 use crate::core::shell::ManagedWindow;
-use flowstate_flow::Keybinds;
-use flowstate_flow::ModMask;
+use crate::core::RenderState;
 use flowstate_flow::actions::KeyAction;
 use flowstate_flow::keybinds::BackendKind;
-use flowstate_logging::flog;
+use flowstate_flow::Keybinds;
+use flowstate_flow::ModMask;
+use flowstate_logging::{flog, flog_error, flog_info, flog_warn};
 use flowstate_notifications::NotificationManager;
 use flowstate_settings_core::AppSettings;
 use flowstate_sounds::{UiSound, UiSoundPlayer};
 use flowstate_ui::chrome::Chrome;
 use flowstate_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
-use smithay::backend::input::AbsolutePositionEvent;
 use smithay::delegate_output;
-use smithay::input::Seat;
 use smithay::input::keyboard::FilterResult;
+use smithay::input::Seat;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
+use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
@@ -73,8 +74,8 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::process::id;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
@@ -92,17 +93,17 @@ use std::io::{self, Write};
 use wayland_server::DisplayHandle;
 
 use crate::core::chrome_layout::{
-    build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at,
+    build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at, topbar_status_well_index_at,
 };
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
-    RESIZE_BORDER_PX, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
-    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at,
+    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
+    ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
+use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
-use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_ui::dialog::DialogAction;
 use flowstate_ui::dialog::{Dialog, DialogId};
 use flowstate_ui::dialog_layout::layout_dialog;
@@ -301,12 +302,16 @@ pub struct DesktopState {
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
     pub sidebar_pulse: Option<SidebarPulse>,
+    pub topbar_pulse: Option<TopbarPulse>,
+    pub clock_pulse: Option<ClockPulse>,
     pub ui_sound_player: UiSoundPlayer,
     last_sidebar_hover_sound_target: Option<(OutputId, ElementId)>,
     //pub popups: Vec<PopupState>,
 }
 
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
+pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
+pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SidebarPulse {
@@ -319,6 +324,34 @@ pub struct SidebarPulse {
 #[derive(Clone, Copy, Debug)]
 pub struct SidebarPulseFrame {
     pub slot: usize,
+    pub click_local: Point<f64, Logical>,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TopbarPulse {
+    pub output_id: OutputId,
+    pub indicator: usize,
+    pub click_local: Point<f64, Logical>,
+    pub started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TopbarPulseFrame {
+    pub indicator: usize,
+    pub click_local: Point<f64, Logical>,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClockPulse {
+    pub output_id: OutputId,
+    pub click_local: Point<f64, Logical>,
+    pub started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClockPulseFrame {
     pub click_local: Point<f64, Logical>,
     pub elapsed: Duration,
 }
@@ -1011,7 +1044,7 @@ impl DesktopState {
 
     fn forward_pointer_button(
         &mut self,
-        pos: Point<f64, Logical>,
+        _pos: Point<f64, Logical>,
         button: FlowMouseButton,
         state: FlowKeyState,
     ) {
@@ -1147,7 +1180,7 @@ impl DesktopState {
                 1004 => self.launch_app(self.apps.browser.clone()),
                 1005 => self.launch_app(self.apps.terminal.clone()),
                 1006 => self.launch_app(flowstate_files_command()),
-                _ => eprintln!("unhandled custom ui action: {id}"),
+                _ => flog_warn!("unhandled custom ui action: {id}"),
             },
 
             UiAction::SystemCommand(cmd) => {
@@ -1155,7 +1188,7 @@ impl DesktopState {
             }
 
             UiAction::ToggleSetting(setting) => {
-                eprintln!("TODO toggle setting: {:?}", setting);
+                flog_info!("TODO toggle setting: {:?}", setting);
             }
         }
     }
@@ -1165,17 +1198,17 @@ impl DesktopState {
             flowstate_ui::types::SettingKey::Wifi => {
                 let state = if enabled { "on" } else { "off" };
                 if let Err(err) = Command::new("nmcli").args(["radio", "wifi", state]).spawn() {
-                    flog(&format!("failed to set wifi radio {state}: {err}"));
+                    flog_error!("failed to set wifi radio {state}: {err}");
                 }
             }
             flowstate_ui::types::SettingKey::Bluetooth => {
                 let state = if enabled { "on" } else { "off" };
                 if let Err(err) = Command::new("bluetoothctl").args(["power", state]).spawn() {
-                    flog(&format!("failed to set bluetooth power {state}: {err}"));
+                    flog_error!("failed to set bluetooth power {state}: {err}");
                 }
             }
             flowstate_ui::types::SettingKey::DoNotDisturb => {
-                flog("do-not-disturb setting is not implemented");
+                flog_warn!("do-not-disturb setting is not implemented");
             }
         }
     }
@@ -1190,7 +1223,7 @@ impl DesktopState {
             ])
             .spawn()
         {
-            flog(&format!("failed to set default audio volume: {err}"));
+            flog_error!("failed to set default audio volume: {err}");
         }
     }
 
@@ -1198,7 +1231,7 @@ impl DesktopState {
         match cmd {
             flowstate_ui::types::SystemCommand::Lock => {
                 if let Err(err) = Command::new("loginctl").arg("lock-session").spawn() {
-                    flog(&format!("failed to lock session: {err}"));
+                    flog_error!("failed to lock session: {err}");
                 }
             }
             flowstate_ui::types::SystemCommand::Logout => {
@@ -1206,12 +1239,12 @@ impl DesktopState {
             }
             flowstate_ui::types::SystemCommand::Restart => {
                 if let Err(err) = Command::new("systemctl").arg("reboot").spawn() {
-                    flog(&format!("failed to start reboot: {err}"));
+                    flog_error!("failed to start reboot: {err}");
                 }
             }
             flowstate_ui::types::SystemCommand::Shutdown => {
                 if let Err(err) = Command::new("systemctl").arg("poweroff").spawn() {
-                    flog(&format!("failed to start poweroff: {err}"));
+                    flog_error!("failed to start poweroff: {err}");
                 }
             }
         }
@@ -1565,6 +1598,57 @@ impl DesktopState {
         self.sidebar_pulse_for_output(output_id, now).is_some()
     }
 
+    pub fn topbar_pulse_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<TopbarPulseFrame> {
+        let pulse = self.topbar_pulse?;
+        if pulse.output_id != output_id {
+            return None;
+        }
+
+        let elapsed = now.saturating_duration_since(pulse.started_at);
+        if elapsed >= TOPBAR_PULSE_DURATION {
+            return None;
+        }
+
+        Some(TopbarPulseFrame {
+            indicator: pulse.indicator,
+            click_local: pulse.click_local,
+            elapsed,
+        })
+    }
+
+    pub fn output_has_active_topbar_pulse(&self, output_id: OutputId, now: Instant) -> bool {
+        self.topbar_pulse_for_output(output_id, now).is_some()
+    }
+
+    pub fn clock_pulse_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<ClockPulseFrame> {
+        let pulse = self.clock_pulse?;
+        if pulse.output_id != output_id {
+            return None;
+        }
+
+        let elapsed = now.saturating_duration_since(pulse.started_at);
+        if elapsed >= CLOCK_PULSE_DURATION {
+            return None;
+        }
+
+        Some(ClockPulseFrame {
+            click_local: pulse.click_local,
+            elapsed,
+        })
+    }
+
+    pub fn output_has_active_clock_pulse(&self, output_id: OutputId, now: Instant) -> bool {
+        self.clock_pulse_for_output(output_id, now).is_some()
+    }
+
     pub fn active_sidebar_pulse_damage_rect(
         &self,
         output_id: OutputId,
@@ -1579,6 +1663,38 @@ impl DesktopState {
             self.chrome.metrics.sidebar_w,
         );
         layout.sidebar.slots.get(pulse.slot).map(|slot| slot.outer)
+    }
+
+    pub fn active_topbar_pulse_damage_rect(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let pulse = self.topbar_pulse_for_output(output_id, now)?;
+        let output = self.outputs.get(&output_id)?;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        layout.topbar.status_wells.get(pulse.indicator).copied()
+    }
+
+    pub fn active_clock_pulse_damage_rect(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<Rectangle<i32, Logical>> {
+        self.clock_pulse_for_output(output_id, now)?;
+        let output = self.outputs.get(&output_id)?;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        Some(layout.topbar.clock_well)
     }
 
     fn trigger_sidebar_pulse_at_pointer(&mut self, output_id: OutputId) -> bool {
@@ -1611,6 +1727,76 @@ impl DesktopState {
         if let Some(slot_layout) = layout.sidebar.slots.get(slot) {
             self.mark_output_logical_damage(output_id, slot_layout.outer, 0, DamageSource::Unknown);
         }
+
+        true
+    }
+
+    fn trigger_topbar_pulse_at_pointer(&mut self, output_id: OutputId) -> bool {
+        let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+            return false;
+        };
+        let Some(output) = self.outputs.get(&output_id) else {
+            return false;
+        };
+
+        let px = local.x.round() as i32;
+        let py = local.y.round() as i32;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        let Some(indicator) = topbar_status_well_index_at(&layout, px, py) else {
+            return false;
+        };
+
+        self.topbar_pulse = Some(TopbarPulse {
+            output_id,
+            indicator,
+            click_local: local,
+            started_at: Instant::now(),
+        });
+
+        if let Some(rect) = layout.topbar.status_wells.get(indicator) {
+            self.mark_output_logical_damage(output_id, *rect, 0, DamageSource::Unknown);
+        }
+
+        true
+    }
+
+    fn trigger_clock_pulse_at_pointer(&mut self, output_id: OutputId) -> bool {
+        let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+            return false;
+        };
+        let Some(output) = self.outputs.get(&output_id) else {
+            return false;
+        };
+
+        let px = local.x.round() as i32;
+        let py = local.y.round() as i32;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        if !layout.topbar.clock_well.contains((px, py)) {
+            return false;
+        }
+
+        self.clock_pulse = Some(ClockPulse {
+            output_id,
+            click_local: local,
+            started_at: Instant::now(),
+        });
+
+        self.mark_output_logical_damage(
+            output_id,
+            layout.topbar.clock_well,
+            0,
+            DamageSource::Unknown,
+        );
 
         true
     }
@@ -1943,6 +2129,8 @@ impl DesktopState {
                 .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,
+            topbar_pulse: None,
+            clock_pulse: None,
             ui_sound_player: UiSoundPlayer::new(),
             last_sidebar_hover_sound_target: None,
         }
@@ -2052,10 +2240,10 @@ impl DesktopState {
             let window = self.windows[idx].window.clone();
             self.space.unmap_elem(&window);
             self.windows[idx].mapped = false;
-            flog(&format!(
+            flog_info!(
                 "XWayland map deferred id={:?}: no associated wl_surface yet",
                 id
-            ));
+            );
             return;
         }
 
@@ -2088,10 +2276,12 @@ impl DesktopState {
                 .unwrap_or_else(|| {
                     Rectangle::from_loc_and_size(bbox_location, requested_geometry.size)
                 });
-            flog(&format!(
+            flog_info!(
                 "XWayland map configure id={:?} requested={:?} configure={:?}",
-                id, requested_geometry, configure_rect
-            ));
+                id,
+                requested_geometry,
+                configure_rect
+            );
             let _ = surface.configure(Some(configure_rect));
             self.focus_window_id(id);
         }
@@ -2104,7 +2294,7 @@ impl DesktopState {
         self.active_dialog = Some(dialog.id);
         self.dialogs.push(dialog);
 
-        println!(
+        flog_info!(
             "after open_dialog: dialogs={}, active_dialog={:?}",
             self.dialogs.len(),
             self.active_dialog
@@ -2126,18 +2316,18 @@ impl DesktopState {
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
         match action {
             DialogAction::Confirm => {
-                println!("Dialog {} confirmed", id);
+                flog_info!("Dialog {} confirmed", id);
 
                 // Example: allow screenshot
                 // self.allow_screenshot = true;
             }
 
             DialogAction::Cancel => {
-                println!("Dialog {} canceled", id);
+                flog_info!("Dialog {} canceled", id);
             }
 
             DialogAction::Custom(v) => {
-                println!("Dialog {} custom action {}", id, v);
+                flog_info!("Dialog {} custom action {}", id, v);
             }
         }
 
@@ -2186,10 +2376,11 @@ impl DesktopState {
                 });
                 if let Some(buffer_offset) = buffer_offset {
                     if let Some(current_loc) = self.space.element_location(&window) {
-                        flog(&format!(
+                        flog_info!(
                             "XWayland buffer_delta {:?} for window at {:?}",
-                            buffer_offset, current_loc
-                        ));
+                            buffer_offset,
+                            current_loc
+                        );
                         self.map_window_bbox_location(
                             window.clone(),
                             current_loc - window.geometry().loc + buffer_offset,
@@ -2371,7 +2562,7 @@ impl DesktopState {
     pub fn handle_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::QuitCompositor => {
-                println!("Quit");
+                flog_info!("Quit");
                 self.running = false;
             }
 
@@ -2397,15 +2588,15 @@ impl DesktopState {
             }
 
             KeyAction::ActivateSlot(n) => {
-                println!("Activate slot {} (not implemented yet)", n);
+                flog_warn!("Activate slot {} (not implemented yet)", n);
             }
 
             KeyAction::AssignSlot(n) => {
-                println!("Assign slot {} (not implemented yet)", n);
+                flog_warn!("Assign slot {} (not implemented yet)", n);
             }
 
             KeyAction::OverflowView => {
-                println!("Overflow view (not implemented yet)");
+                flog_warn!("Overflow view (not implemented yet)");
             }
 
             KeyAction::TakeScreenshot => {
@@ -2454,11 +2645,11 @@ impl DesktopState {
     }
 
     pub fn activate_slot(&mut self, slot: usize) {
-        println!("Activate slot {} (not implemented yet)", slot);
+        flog_warn!("Activate slot {} (not implemented yet)", slot);
     }
 
     pub fn assign_slot(&mut self, slot: usize) {
-        println!("Assign slot {} (not implemented yet)", slot);
+        flog_warn!("Assign slot {} (not implemented yet)", slot);
     }
 
     fn update_focus(&mut self) {}
@@ -2547,7 +2738,6 @@ impl DesktopState {
 
         if let Some((candidate, err)) = last_error {
             flog(&format!("failed to launch {candidate}: {err}"));
-            eprintln!("failed to launch {candidate}: {err}");
         }
     }
 
@@ -2564,7 +2754,7 @@ impl DesktopState {
         let time = 0;
 
         let Some(keyboard) = self.seat.get_keyboard() else {
-            //eprintln!("no keyboard on seat");
+            flog_info!("no keyboard on seat");
             return;
         };
 
@@ -2963,8 +3153,18 @@ impl DesktopState {
                             {
                                 self.play_ui_sound(UiSound::Select);
                             }
-                            damaged_precisely =
-                                self.trigger_sidebar_pulse_at_pointer(self.focused_output);
+                            damaged_precisely = match pressed_element {
+                                Some((_, UiElementKind::SidebarButton)) => {
+                                    self.trigger_sidebar_pulse_at_pointer(self.focused_output)
+                                }
+                                Some((_, UiElementKind::TopbarIndicator)) => {
+                                    self.trigger_topbar_pulse_at_pointer(self.focused_output)
+                                }
+                                Some((_, UiElementKind::Clock)) => {
+                                    self.trigger_clock_pulse_at_pointer(self.focused_output)
+                                }
+                                _ => false,
+                            };
                             let _ = self.click_ui_at_pointer();
                         }
                         FlowKeyState::Released => {
@@ -3287,6 +3487,12 @@ impl DesktopState {
             || self.sidebar_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < SIDEBAR_PULSE_DURATION
             })
+            || self.topbar_pulse.is_some_and(|pulse| {
+                now.saturating_duration_since(pulse.started_at) < TOPBAR_PULSE_DURATION
+            })
+            || self.clock_pulse.is_some_and(|pulse| {
+                now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
+            })
     }
 
     pub fn output_has_pending_damage(&self, output_id: OutputId) -> bool {
@@ -3296,6 +3502,8 @@ impl DesktopState {
             .map(|output| !output.pending_damage.is_empty())
             .unwrap_or(false)
             || self.output_has_active_sidebar_pulse(output_id, now)
+            || self.output_has_active_topbar_pulse(output_id, now)
+            || self.output_has_active_clock_pulse(output_id, now)
     }
 
     pub fn clear_repaint_request(&mut self) {
@@ -3489,7 +3697,13 @@ impl DesktopState {
             .set_base_size_and_scale(24, scale as f32);
     }
 
-    pub fn insert_nested_output(&mut self, output: Output, size: Size<i32, Physical>, scale: f64) {}
+    pub fn insert_nested_output(
+        &mut self,
+        _output: Output,
+        _size: Size<i32, Physical>,
+        _scale: f64,
+    ) {
+    }
 
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();

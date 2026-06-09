@@ -8,8 +8,6 @@ use smithay::backend::renderer::{ImportMem, Renderer, RendererSuper};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 
 use crate::svg::rasterize_svg;
-use smithay::backend::renderer::Texture;
-use smithay::backend::renderer::gles::GlesFrame;
 
 #[derive(Clone, Copy, Debug)]
 pub struct AtlasRect {
@@ -152,9 +150,6 @@ pub fn render_atlas_icon(
     w: i32,
     h: i32,
 ) -> Result<(), GlesError> {
-    let size = atlas.size();
-    let atlas_w = size.w as f64;
-    let atlas_h = size.h as f64;
     let src = Rectangle::<f64, Buffer>::from_loc_and_size(
         (entry.x as f64, entry.y as f64),
         (entry.w as f64, entry.h as f64),
@@ -189,7 +184,7 @@ let src = Rectangle::<f64, Buffer>::from_loc_and_size(
     let dst = Rectangle::<i32, Physical>::from_loc_and_size((x, y), (w, h));
 
 
-eprintln!(
+flog_info!(
         "render_atlas_icon: src=({}, {}) {}x{}, dst=({}, {}) {}x{}",
         entry.x, entry.y, entry.w, entry.h, x, y, w, h
     );
@@ -422,7 +417,7 @@ where
         px.swap(0, 2); // swap R and B
     }
 
-    let mut atlas_upload = atlas_rgba.clone();
+    let atlas_upload = atlas_rgba.clone();
 
     let tex = renderer
         .import_memory(

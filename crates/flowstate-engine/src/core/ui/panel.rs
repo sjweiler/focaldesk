@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 // crates/flowstate-engine/src/core/ui/panel.rs
 
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};

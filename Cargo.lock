@@ -1385,6 +1385,7 @@ name = "flow-automation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "flowstate-logging",
  "mlua",
  "serde",
  "serde_json",
@@ -1442,6 +1443,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "flowstate-engine",
+ "flowstate-logging",
  "flowstate-ui",
  "tracing",
  "tracing-subscriber",
@@ -1492,6 +1494,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "flowstate-logging",
  "gtk4",
  "libadwaita",
  "serde",
@@ -1512,6 +1515,7 @@ dependencies = [
 name = "flowstate-ipc"
 version = "0.1.0"
 dependencies = [
+ "flowstate-logging",
  "flowstate-settings-core",
  "serde",
  "serde_json",
@@ -1596,6 +1600,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "flowstate-logging",
  "gtk4",
  "libadwaita",
  "serde",

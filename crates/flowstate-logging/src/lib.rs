@@ -1,23 +1,10 @@
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+pub mod logging;
 
-static LOG_LOCK: Mutex<()> = Mutex::new(());
+pub use logging::{
+    current_log_level, enabled, init_default_logging, init_logging, init_logging_from_env,
+    set_log_level, BuildMode, FLogLevel,
+};
 
-pub fn flog(msg: &str) {
-    let _guard = LOG_LOCK.lock().ok();
-
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/flowstate.log")
-    {
-        let _ = writeln!(f, "[{ts}] {msg}");
-    }
+pub fn flog(msg: impl AsRef<str>) {
+    logging::flog(FLogLevel::Info, msg);
 }

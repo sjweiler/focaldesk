@@ -1,6 +1,6 @@
 use flowstate_themes::FlowTheme;
 use smithay::backend::renderer::gles::GlesFrame;
-use smithay::utils::{Logical, Physical, Point, Rectangle};
+use smithay::utils::{Logical, Point, Rectangle};
 
 use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;

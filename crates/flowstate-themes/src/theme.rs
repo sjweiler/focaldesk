@@ -1,4 +1,4 @@
-use crate::builtins::{builtin_theme, classic_theme, eagle_theme, moonbase_theme};
+use crate::builtins::builtin_theme;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

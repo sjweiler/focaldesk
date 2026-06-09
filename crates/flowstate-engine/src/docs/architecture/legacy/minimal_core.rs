@@ -16,6 +16,7 @@ use smithay::backend::renderer::element::AsRenderElements;
 use crate::text::rasterize_text_to_texture;
 use std::time::Instant;
 use chrono::Local;
+use flowstate_logging::flog_info;
 
 // Image decoding
 use std::fs::File;
@@ -245,11 +246,11 @@ pub fn bind_wayland_socket() -> (ListeningSocket, String) {
                     .to_string_lossy()
                     .into_owned();
 
-                eprintln!("FlowOS listening on WAYLAND_DISPLAY={name} (forced)");
+                flog_info!("FlowOS listening on WAYLAND_DISPLAY={name} (forced)");
                 return (sock, name);
             }
             Err(err) => {
-                eprintln!(
+                flog_info!(
                     "FLOW_WAYLAND_DISPLAY={requested} was set but bind failed ({err}); falling back to auto."
                 );
             }
@@ -267,7 +268,7 @@ pub fn bind_wayland_socket() -> (ListeningSocket, String) {
         .to_string_lossy()
         .into_owned();
 
-    eprintln!("FlowOS listening on WAYLAND_DISPLAY={name}");
+    flog_info!("FlowOS listening on WAYLAND_DISPLAY={name}");
     (sock, name)
 }
 
@@ -1002,8 +1003,8 @@ fn render_clients(
     ctx: &FrameCtx,
     elements: &[FlowRenderElement],
 ) {
-    //eprintln!("render_clients: elements.len={}", elements.len());
-    //eprintln!(
+    //flog_info!("render_clients: elements.len={}", elements.len());
+    //flog_info!(
  // "tl_window={} tl_surface={} space_elems={}",
  // self.tl_window.len(),
 //  self.tl_surface.len(),
@@ -1044,13 +1045,13 @@ let damage = std::slice::from_ref(&full);
 
 
     // Debug while you stabilize:
-    // eprintln!("chrome: top={:?} side={:?} full={:?}", top_bar, side_bar, full);
+    // flog_info!("chrome: top={:?} side={:?} full={:?}", top_bar, side_bar, full);
 }
    
 fn ensure_wallpaper_loaded(&mut self, renderer: &mut GlesRenderer)
 {
     if self.wallpaper_texture.is_none() {
-        //eprintln!("wallpaper loaded");
+        //flog_info!("wallpaper loaded");
         self.wallpaper_texture = load_wallpaper(
             renderer,
             "/home/steve/flowos/assets/wallpaper/flowos_wallpaper_5k.png",
@@ -1075,7 +1076,7 @@ fn render_background(&mut self, frame: &mut GlesFrame, ctx: &FrameCtx) {
         .unwrap();
 
     let Some(tex) = self.wallpaper_texture.as_ref() else {
-        //eprintln!("no display wallpaper");
+        //flog_info!("no display wallpaper");
         return;
     };
 
@@ -1187,11 +1188,11 @@ let full_damage = [dst];
     fn update_layout_from_output(&mut self) {
         // physical -> logical
         let phys = self.output_size;
-        println!("{:?}", self.output_size);
+        flog_info!("{:?}", self.output_size);
         
         let sf = self.scale_factor.max(0.1);
 
-        println!("scale factor {:?}",sf);
+        flog_info!("scale factor {:?}",sf);
 
         let out_w = ((phys.w as f64) / sf).round() as i32;
         let out_h = ((phys.h as f64) / sf).round() as i32;
@@ -1205,7 +1206,7 @@ let full_damage = [dst];
         let work_w = sz.w.max(1);
         let work_h = sz.h.max(1);
 
-        //eprintln!("cfg max to work area (logical): {}x{}", work_w, work_h);
+        //flog_info!("cfg max to work area (logical): {}x{}", work_w, work_h);
 
         for tl in self.tl_surface.values() {
             tl.with_pending_state(|st| {
@@ -1324,11 +1325,11 @@ let full_damage = [dst];
     }
     
     fn close_toplevel(&mut self, wid: WindowId) {
-        eprintln!("close request wid={wid}");
-        eprintln!("known wids={:?}", self.wid_to_surface.keys());
+        flog_info!("close request wid={wid}");
+        flog_info!("known wids={:?}", self.wid_to_surface.keys());
 
         let Some(key) = self.wid_to_surface.get(&wid).cloned() else {
-            eprintln!("close_toplevel: unknown wid={wid}");
+            flog_info!("close_toplevel: unknown wid={wid}");
         return;
         };
         
@@ -1344,7 +1345,7 @@ let full_damage = [dst];
         let work_w = sz.w.max(1);
         let work_h = sz.h.max(1);
 
-        eprintln!("cfg client_size (logical) {}x{} sf={}", work_w, work_h, self.scale_factor);
+        flog_info!("cfg client_size (logical) {}x{} sf={}", work_w, work_h, self.scale_factor);
 
         tl.with_pending_state(|st| {
             st.states.set(xdg_toplevel::State::Maximized);
@@ -1517,11 +1518,11 @@ pub struct ClientState {
 }
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {
-        println!("initialized");
+        flog_info!("initialized");
     }
 
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
-        println!("disconnected");
+        flog_info!("disconnected");
     }
 }
 

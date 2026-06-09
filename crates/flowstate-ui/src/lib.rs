@@ -1,3 +1,5 @@
+#![allow(dead_code, deprecated)]
+
 pub mod atlas;
 pub mod chrome;
 pub mod element;

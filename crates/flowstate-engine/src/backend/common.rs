@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 //! Shared setup for nested compositor backends (winit, future DRM/KMS, etc.).
 
 #[cfg(feature = "xwayland")]
@@ -8,7 +10,7 @@ use std::time::Instant;
 
 use flowstate_cursor::CursorManager;
 use flowstate_flow::Keybinds;
-use flowstate_logging::flog;
+use flowstate_logging::{flog, flog_info};
 use flowstate_notifications::NotificationManager;
 use flowstate_resources::RenderResources;
 use flowstate_types::OutputId;
@@ -351,7 +353,7 @@ pub(crate) fn bootstrap_compositor_core(
     publish_portal_environment(&wayland_display);
     flog(&format!("FlowState client socket is {}", wayland_display));
 
-    let mut display = Display::<DesktopState>::new()?;
+    let display = Display::<DesktopState>::new()?;
     let dh = display.handle();
 
     let output = bootstrap_output.as_ref().map(|bootstrap_output| {
@@ -414,7 +416,7 @@ pub(crate) fn bootstrap_compositor_core(
         config.appearance.theme.clone()
     };
 
-    eprintln!("FLOWSTATE selected theme_id = {:?}", theme_id);
+    flog_info!("FLOWSTATE selected theme_id = {:?}", theme_id);
 
     let theme_id = match config.appearance.theme.as_str() {
         "Eagle" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
@@ -425,7 +427,7 @@ pub(crate) fn bootstrap_compositor_core(
 
     let theme_manager = ThemeManager::new(theme_id);
 
-    eprintln!(
+    flog_info!(
         "FLOWSTATE active theme after manager init = {:?}",
         theme_manager.active_theme().id
     );

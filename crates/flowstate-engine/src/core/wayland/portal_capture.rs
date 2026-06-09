@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 //! Desktop portal support: `ext-image-copy-capture-v1`, `ext-image-capture-source-v1`, and
 //! `wlr-layer-shell-unstable-v1` (used by [`xdg-desktop-portal-wlr`](https://github.com/emersion/xdg-desktop-portal-wlr)).
 

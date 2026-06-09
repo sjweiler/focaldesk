@@ -15,6 +15,7 @@ use wayland_server::protocol::{wl_output, wl_seat, wl_surface};
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
 use flowstate_logging::flog;
+#[allow(unused_imports)]
 use flowstate_types::WindowId;
 
 impl XdgShellHandler for DesktopState {

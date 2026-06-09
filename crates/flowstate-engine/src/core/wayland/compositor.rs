@@ -1,11 +1,15 @@
 use crate::core::wayland::client::ClientState;
 use flowstate_logging::flog;
+#[allow(unused_imports)]
 use smithay::backend::renderer::buffer_type;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_compositor;
+#[allow(unused_imports)]
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+#[allow(unused_imports)]
 use smithay::reexports::wayland_server::Resource;
+#[allow(unused_imports)]
 use smithay::wayland::compositor::{
     add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorClientState,
     SurfaceAttributes,
@@ -14,14 +18,18 @@ use smithay::wayland::compositor::{CompositorHandler, CompositorState as Smithay
 use smithay::wayland::dmabuf::get_dmabuf;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::XWaylandClientData;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+#[allow(unused_imports)]
+use std::sync::atomic::Ordering;
 
 use smithay::desktop::layer_map_for_output;
 
 use crate::core::desktop::DesktopState;
 use smithay::reexports::wayland_server::Client;
 
+#[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static XWAYLAND_BUFFER_LOGS: AtomicUsize = AtomicUsize::new(0);
+#[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static DMABUF_BLOCKER_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 impl CompositorHandler for DesktopState {
@@ -41,6 +49,8 @@ impl CompositorHandler for DesktopState {
 
     fn new_surface(&mut self, surface: &WlSurface) {
         add_pre_commit_hook::<DesktopState, _>(surface, |state, _dh, surface| {
+            #[cfg(not(feature = "xwayland"))]
+            let _ = state;
             let maybe_dmabuf = with_states(surface, |states| {
                 states
                     .cached_state
@@ -55,6 +65,8 @@ impl CompositorHandler for DesktopState {
             });
 
             if let Some(dmabuf) = maybe_dmabuf {
+                #[cfg(not(feature = "xwayland"))]
+                let _ = &dmabuf;
                 #[cfg(feature = "xwayland")]
                 if let Some(client) = surface.client() {
                     if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
