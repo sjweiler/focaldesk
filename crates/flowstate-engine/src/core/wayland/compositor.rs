@@ -1,4 +1,5 @@
 use crate::core::wayland::client::ClientState;
+#[cfg(feature = "xwayland")]
 use flowstate_logging::flog;
 #[allow(unused_imports)]
 use smithay::backend::renderer::buffer_type;

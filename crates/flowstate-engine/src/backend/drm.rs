@@ -3,11 +3,10 @@
 
 use crate::backend::common::{
     bootstrap_compositor_core, finish_xwayland_startup, physical_size_mm_from_pixels,
-    start_xwayland, NestedDesktop,
+    start_xwayland,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, Mode};
-use smithay::backend::allocator::gbm::GbmBuffer;
 use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, KeyState};
 use smithay::backend::renderer::gles::GlesError;
@@ -20,14 +19,13 @@ use smithay::backend::input::KeyboardKeyEvent;
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
-use smithay::backend::renderer::utils::{CommitCounter, DamageBag};
+use smithay::backend::renderer::utils::DamageBag;
 use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
     render_elements, texture::TextureRenderElement, Id, Kind,
 };
 
-use crate::core::backend_render::PreparedOutput;
 use flowstate_flow::keybinds::BackendKind;
 
 // DRM/KMS backend for FlowState.
@@ -55,67 +53,49 @@ use std::{
 
 use crate::backend::common::translate_backend_input;
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
-use flowstate_flow::Keybinds;
 use flowstate_logging::flog;
-use flowstate_notifications::NotificationManager;
 use flowstate_resources::RenderResources;
 use flowstate_types::OutputId;
-use flowstate_ui::chrome::{Chrome, ChromeMetrics};
 use smithay::backend::allocator::format::FormatSet;
 use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
 
 use smithay::{
     backend::{
-        allocator::{dmabuf::Dmabuf, gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc},
-        drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface},
+        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc},
+        drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
         egl::{self, context::ContextPriority, EGLContext},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            damage::Error as OutputDamageTrackerError,
-            element::memory::MemoryRenderBuffer,
             element::solid::SolidColorRenderElement,
-            gles::{Capability, GlesRenderer, GlesTarget, GlesTexture},
-            Color32F, ExportMem, ImportDma, ImportEgl, ImportMemWl,
+            gles::{GlesRenderer, GlesTarget, GlesTexture},
+            Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{
-            libseat::{self, LibSeatSession},
-            Event as SessionEvent, Session,
-        },
-        udev::{primary_gpu, UdevBackend, UdevEvent},
+        session::{libseat::LibSeatSession, Session},
+        udev::{primary_gpu, UdevBackend},
     },
     desktop::utils::OutputPresentationFeedback,
-    input::{keyboard::LedState, SeatState},
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
     reexports::{
         calloop,
         gbm::Device as GbmDevice,
-        input::{event::EventTrait, Libinput},
-        wayland_server::{Client, Display, DisplayHandle, ListeningSocket},
+        input::Libinput,
+        wayland_server::{Client, Display, ListeningSocket},
     },
     utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
-    wayland::{
-        compositor::CompositorState, dmabuf::DmabufFeedbackBuilder, output::OutputManagerState,
-        selection::data_device::DataDeviceState, shell::xdg::XdgShellState, shm::ShmState,
-    },
+    wayland::dmabuf::DmabufFeedbackBuilder,
 };
 
 use smithay::backend::drm::{
-    compositor::{FrameError, FrameFlags},
-    exporter::gbm::{GbmFramebufferExporter, NodeFilter},
+    compositor::FrameFlags,
+    exporter::gbm::GbmFramebufferExporter,
     output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
 };
 
-use crate::backend::common::bind_wayland_socket;
-use crate::core::{
-    desktop::{DesktopInit, DesktopState},
-    render::{FlowRenderElement, RenderState},
-    ui_state::UiState,
-    OutputState, SceneState,
-};
+use crate::core::chrome_layout::build_chrome_layout;
+use crate::core::{desktop::DesktopState, ui_state::UiState, OutputState, SceneState};
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 
-use nix::fcntl::OFlag;
 use smithay::reexports::drm;
 
 use smithay::reexports::rustix::fs::OFlags;
@@ -257,24 +237,88 @@ pub struct DrmBackend {
 }
 
 /// Loop data for the DRM backend.
-pub struct DrmLoopData {
+pub(crate) struct DrmLoopData {
     pub core: CompositorCore,
     pub backend: DrmBackend,
     pub libinput: Libinput,
     pub should_stop: bool,
 }
 
-fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
+fn display_config_path() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
         });
 
-    let dir = base.join("flowstate");
-    std::fs::create_dir_all(&dir)?;
+    base.join("flowstate").join("displays.json")
+}
 
-    let path = dir.join("displays.json");
+fn load_display_config() -> Vec<DisplayConfig> {
+    let path = display_config_path();
+
+    match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(displays) => displays,
+            Err(err) => {
+                flog(&format!(
+                    "Failed to parse display config {}; using defaults: {}",
+                    path.display(),
+                    err
+                ));
+                Vec::new()
+            }
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            flog(&format!(
+                "Failed to read display config {}; using defaults: {}",
+                path.display(),
+                err
+            ));
+            Vec::new()
+        }
+    }
+}
+
+fn configured_display_scale(displays: &[DisplayConfig], name: &str) -> f64 {
+    const MIN_SCALE: f64 = 1.0;
+    const MAX_SCALE: f64 = 4.0;
+
+    let Some(scale) = displays
+        .iter()
+        .find(|display| display.name == name)
+        .map(|display| display.scale)
+    else {
+        return MIN_SCALE;
+    };
+
+    if !scale.is_finite() || scale < MIN_SCALE {
+        flog(&format!(
+            "Ignoring invalid display scale for {}: {}; using {}",
+            name, scale, MIN_SCALE
+        ));
+        return MIN_SCALE;
+    }
+
+    if scale > MAX_SCALE {
+        flog(&format!(
+            "Clamping display scale for {} from {} to {}",
+            name, scale, MAX_SCALE
+        ));
+        return MAX_SCALE;
+    }
+
+    scale
+}
+
+fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
+    let path = display_config_path();
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("display config path has no parent: {}", path.display()))?;
+
+    std::fs::create_dir_all(&dir)?;
 
     let json = serde_json::to_string_pretty(displays)?;
     std::fs::write(&path, json)?;
@@ -577,7 +621,7 @@ fn ensure_offscreen_texture(
     Ok(())
 }
 
-pub fn collect_display_configs(
+pub(crate) fn collect_display_configs(
     device: &DrmDeviceState,
     core: &CompositorCore,
 ) -> Vec<DisplayConfig> {
@@ -742,13 +786,31 @@ fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
         _ => state.logical_pointer_clamp_rect(),
     };
 
-    if let Some(event) = translate_backend_input(
+    if let Some(mut event) = translate_backend_input(
         input,
         state.input.pointer_pos,
         clamp_rect,
         scale,
         state.input.modifiers,
     ) {
+        if matches!(input, InputEvent::PointerMotion { .. }) {
+            if let crate::core::input::FlowInputEvent::PointerMoved { position } = &mut event {
+                let scale = scale.max(1.0);
+                let old_pos = state.input.pointer_pos;
+                let scaled = Point::<f64, Logical>::from((
+                    old_pos.x + (position.x - old_pos.x) / scale,
+                    old_pos.y + (position.y - old_pos.y) / scale,
+                ));
+                let min_x = clamp_rect.loc.x as f64;
+                let min_y = clamp_rect.loc.y as f64;
+                let max_x = (clamp_rect.loc.x + clamp_rect.size.w) as f64 - f64::EPSILON;
+                let max_y = (clamp_rect.loc.y + clamp_rect.size.h) as f64 - f64::EPSILON;
+                *position = Point::from((
+                    scaled.x.clamp(min_x, max_x.max(min_x)),
+                    scaled.y.clamp(min_y, max_y.max(min_y)),
+                ));
+            }
+        }
         state.handle_input(event);
     }
 }
@@ -761,7 +823,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     // Session / seat ownership
     //
-    let (mut session, notifier) =
+    let (session, _notifier) =
         LibSeatSession::new().map_err(|e| anyhow!("Could not initialize libseat session: {e}"))?;
 
     //
@@ -935,8 +997,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.last_now = now;
 
         for (_node, device) in data.backend.devices.iter_mut() {
-            let drm_surface_count = device.surfaces.len();
-
             for (_crtc, surface) in device.surfaces.iter_mut() {
                 let owns_cursor = data.core.state.output_owns_cursor(surface.output_id);
                 let pending_damage = data.core.state.output_has_pending_damage(surface.output_id);
@@ -1036,9 +1096,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             flog(&format!("Screenshot failed: {err}"));
                         }
                     }
-                    data.core
-                        .state
-                        .clear_screenshot_request(surface.output_id);
+                    data.core.state.clear_screenshot_request(surface.output_id);
                 }
 
                 // now borrow immutably after the mutable borrow is gone
@@ -1048,6 +1106,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .expect("offscreen texture missing")
                     .texture
                     .clone();
+                let output_scale = data
+                    .core
+                    .state
+                    .outputs
+                    .get(&surface.output_id)
+                    .map(|o| o.scale_factor)
+                    .unwrap_or(1.0)
+                    .max(1.0);
+                let present_logical_size = Size::<i32, Logical>::from((
+                    (surface.size.w as f64 / output_scale).round() as i32,
+                    (surface.size.h as f64 / output_scale).round() as i32,
+                ));
+                let present_src = Rectangle::<f64, Logical>::from_loc_and_size(
+                    (0.0, 0.0),
+                    (surface.size.w as f64, surface.size.h as f64),
+                );
                 surface
                     .present_damage
                     .add(prepared.frame_ctx.damage.iter().map(|rect| {
@@ -1066,8 +1140,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     1,
                     Transform::Normal,
                     Some(1.0),
-                    None,
-                    None,
+                    Some(present_src),
+                    Some(present_logical_size),
                     None,
                     present_damage,
                     Kind::Unspecified,
@@ -1097,6 +1171,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         let phys: Point<i32, Physical> =
                             rel.to_physical_precise_round::<f64, i32>(scale);
                         let (hx, hy) = data.core.state.render.sw_cursor_hotspot;
+                        let (tw, th) = data.core.state.render.sw_cursor_tex_size;
+                        let cursor_logical_size = Size::<i32, Logical>::from((
+                            (tw as f64 / output_scale).round().max(1.0) as i32,
+                            (th as f64 / output_scale).round().max(1.0) as i32,
+                        ));
+                        let cursor_src = Rectangle::<f64, Logical>::from_loc_and_size(
+                            (0.0, 0.0),
+                            (tw as f64, th as f64),
+                        );
                         let cursor_elem = TextureRenderElement::from_static_texture(
                             data.core.state.drm_cursor_render_id.clone(),
                             device.renderer.context_id(),
@@ -1108,8 +1191,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             1,
                             Transform::Normal,
                             Some(1.0),
-                            None,
-                            None,
+                            Some(cursor_src),
+                            Some(cursor_logical_size),
                             None,
                             Kind::Cursor,
                         );
@@ -1177,7 +1260,7 @@ pub fn make_drm_gpu(
     let render_node = {
         let display = unsafe { EGLDisplay::new(gbm.clone())? };
         let egl_device = EGLDevice::device_for_display(&display)?;
-        let context = EGLContext::new(&display)?;
+        let _context = EGLContext::new(&display)?;
         if egl_device.is_software() {
             None
         } else {
@@ -1359,6 +1442,7 @@ fn device_added(
     let mut id: u64 = 1;
 
     let mut next_x = 0;
+    let configured_displays = load_display_config();
 
     for conn in res.connectors() {
         let info = drm_output_manager
@@ -1453,6 +1537,17 @@ fn device_added(
             // wl_output + xdg_output advertise this to clients; leaving (0,0) stacks every head at the origin
             // (e.g. OBS projector shows all DRM outputs on top of each other).
             let origin = Point::<i32, Logical>::from((next_x, 0));
+            let output_scale = configured_display_scale(&configured_displays, &output_name);
+            let output_scale_int = output_scale.round().max(1.0) as i32;
+            let logical_size = Size::<i32, Logical>::from((
+                (w as f64 / output_scale).round() as i32,
+                (h as f64 / output_scale).round() as i32,
+            ));
+            let chrome_layout = build_chrome_layout(
+                logical_size,
+                data.core.state.chrome.metrics.topbar_h,
+                data.core.state.chrome.metrics.sidebar_w,
+            );
 
             let refresh_mhz = ((mode.vrefresh() as i32).max(60)) * 1000;
             let wl_mode = WlMode {
@@ -1463,15 +1558,36 @@ fn device_added(
             output.change_current_state(
                 Some(wl_mode),
                 Some(Transform::Normal),
-                Some(smithay::output::Scale::Fractional(1.0)),
+                Some(smithay::output::Scale::Custom {
+                    advertised_integer: output_scale_int,
+                    fractional: output_scale,
+                }),
                 Some(origin),
             );
             output.set_preferred(wl_mode);
             output.create_global::<DesktopState>(&data.core.display.handle());
 
             flog(&format!(
-                "Wayland output advertised: name={} px={}x{} mm={}x{} refresh_mhz={} make={:?} model={:?} serial={:?}",
-                output_name, w, h, mm_w, mm_h, wl_mode.refresh, make, model, serial_number,
+                "Wayland output advertised: name={} px={}x{} logical={}x{} scale={} mm={}x{} refresh_mhz={} make={:?} model={:?} serial={:?}",
+                output_name,
+                w,
+                h,
+                logical_size.w,
+                logical_size.h,
+                output_scale,
+                mm_w,
+                mm_h,
+                wl_mode.refresh,
+                make,
+                model,
+                serial_number,
+            ));
+            flog(&format!(
+                "DRM chrome layout: name={} topbar={:?} status_wells={:?} clock={:?}",
+                output_name,
+                chrome_layout.topbar.outer,
+                chrome_layout.topbar.status_wells,
+                chrome_layout.topbar.clock_well,
             ));
 
             let crtc = info.encoders().iter().find_map(|enc| {
@@ -1501,7 +1617,7 @@ fn device_added(
 
             let tex_phys_size: Size<i32, Physical> = Size::from((i32::from(w), i32::from(h)));
 
-            let gbm_buffer = allocator.create_buffer(
+            let _gbm_buffer = allocator.create_buffer(
                 tex_phys_size.w as u32,
                 tex_phys_size.h as u32,
                 Fourcc::Argb8888,
@@ -1529,9 +1645,9 @@ fn device_added(
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
                 out.handle = output.clone();
                 out.physical_size = Size::<i32, Physical>::from((w as i32, h as i32));
-                out.logical_size = Size::<i32, Logical>::from((w as i32, h as i32));
-                out.scale_factor = 1.0;
-                out.scale = smithay::utils::Scale::from((1.0, 1.0));
+                out.logical_size = logical_size;
+                out.scale_factor = output_scale;
+                out.scale = smithay::utils::Scale::from((output_scale, output_scale));
             }
 
             data.core.state.register_output_entry(
@@ -1539,7 +1655,7 @@ fn device_added(
                 output.clone(),
                 origin,
                 Size::<i32, Physical>::from((w as i32, h as i32)),
-                1.0, // or real scale later
+                output_scale,
             );
 
             if !initialized_one {
@@ -1561,7 +1677,7 @@ fn device_added(
                 },
             );
             id += 1;
-            next_x += w as i32;
+            next_x += logical_size.w;
             flog("Output initialized (Wayland + DRM)");
             data.core.state.drm_submit_hw_cursor = true;
             initialized_one = true;

@@ -101,6 +101,7 @@ use crate::core::toplevel_interaction::{
     cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
     ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
+use crate::core::ui_builder::build_ui_for_output;
 use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
@@ -386,6 +387,7 @@ impl DesktopState {
         play_hover_sound: bool,
     ) -> bool {
         let old_hovered = self.ui.hovered;
+        self.rebuild_ui_tree_for_output(output_id);
         if !self.output_contains_pointer(output_id) {
             self.ui.hovered = None;
 
@@ -463,6 +465,18 @@ impl DesktopState {
         let x = local.x.round() as i32;
         let y = local.y.round() as i32;
         self.ui.hit_test(x, y)
+    }
+
+    fn rebuild_ui_tree_for_output(&mut self, output_id: OutputId) {
+        let Some(output) = self.outputs.get(&output_id) else {
+            return;
+        };
+        let layout = build_chrome_layout(
+            output.logical_size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        build_ui_for_output(&mut self.ui, &layout);
     }
 
     fn play_ui_sound(&self, sound: UiSound) {

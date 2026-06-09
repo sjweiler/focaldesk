@@ -275,7 +275,7 @@ pub fn build_chrome_layout(
 
     // Right-side cluster inside topbar_inner
     let (status_cluster, status_wells, clock_well) =
-        build_status_cluster(topbar_inner, 10, 6, 8, 10);
+        build_status_cluster(topbar_inner, 10, 6, 8, 4);
 
     // Title gets the remaining space to the left of the cluster
     let title_left = topbar_inner.loc.x + 6;
