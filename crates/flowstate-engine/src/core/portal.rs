@@ -7,7 +7,10 @@
 use std::ptr::NonNull;
 use std::time::{Duration, Instant};
 
+use flowstate_logging::flog;
 use flowstate_types::OutputId;
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::Buffer as AllocatorBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
 use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
@@ -25,6 +28,7 @@ use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
 use crate::core::OutputState;
 use smithay::backend::renderer::Frame as RendererFrame;
+use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::image_capture_source::ImageCaptureSource;
 use smithay::wayland::image_copy_capture::SessionRef;
 
@@ -105,11 +109,9 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
     let dt = ctx.dt;
 
     let buffer = frame.buffer();
-    let buffer_size = match with_buffer_contents(&buffer, |_, _, data| {
-        Size::<i32, BufferCoords>::from((data.width, data.height))
-    }) {
-        Ok(s) => s,
-        Err(_) => {
+    let buffer_size = match capture_buffer_size(&buffer) {
+        Some(size) => size,
+        None => {
             frame.fail(CaptureFailureReason::BufferConstraints);
             return;
         }
@@ -146,6 +148,40 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         }
     }
 
+    let transform = match state.backend_kind {
+        flowstate_flow::keybinds::BackendKind::Winit => Transform::Flipped180,
+        _ => Transform::Normal,
+    };
+
+    if let Ok(mut dmabuf) = get_dmabuf(&buffer).cloned() {
+        let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
+        let render_res = render_portal_output_to_dmabuf(
+            state,
+            renderer,
+            output_id,
+            render_size,
+            ui_state,
+            scene,
+            output_state,
+            now,
+            dt,
+            transform,
+            &mut dmabuf,
+        );
+        if let Err(err) = render_res {
+            flog(&format!("portal dmabuf capture render failed: {err:?}"));
+            frame.fail(CaptureFailureReason::Unknown);
+            return;
+        }
+
+        frame.success(
+            transform,
+            None::<Vec<Rectangle<i32, BufferCoords>>>,
+            std::time::Duration::ZERO,
+        );
+        return;
+    }
+
     let mut capture_tex = match <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(
         renderer,
         Fourcc::Argb8888,
@@ -158,37 +194,23 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         }
     };
 
-    let transform = match state.backend_kind {
-        flowstate_flow::keybinds::BackendKind::Winit => Transform::Flipped180,
-        _ => Transform::Normal,
-    };
+    let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
+    let render_res = render_portal_output_to_texture(
+        state,
+        renderer,
+        output_id,
+        render_size,
+        ui_state,
+        scene,
+        output_state,
+        now,
+        dt,
+        transform,
+        &mut capture_tex,
+    );
 
-    let render_res = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
-        let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt)?;
-
-        {
-            let mut target = renderer.bind(&mut capture_tex)?;
-            let client_elements = build_output_client_elements(state, renderer, output_id);
-            let popup_elements = build_output_popup_elements(state, renderer, output_id);
-            let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
-            draw_output(
-                state,
-                &mut gles_frame,
-                &prepared,
-                &client_elements,
-                &popup_elements,
-                ui_state,
-                scene,
-                output_state,
-            )?;
-
-            let _ = gles_frame.finish()?;
-        }
-        Ok(())
-    })();
-
-    if render_res.is_err() {
+    if let Err(err) = render_res {
+        flog(&format!("portal shm capture render failed: {err:?}"));
         frame.fail(CaptureFailureReason::Unknown);
         return;
     }
@@ -237,6 +259,80 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         None::<Vec<Rectangle<i32, BufferCoords>>>,
         std::time::Duration::ZERO,
     );
+}
+
+fn capture_buffer_size(
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+) -> Option<Size<i32, BufferCoords>> {
+    with_buffer_contents(buffer, |_, _, data| {
+        Size::<i32, BufferCoords>::from((data.width, data.height))
+    })
+    .ok()
+    .or_else(|| get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.size()))
+}
+
+fn render_portal_output_to_texture(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+    render_size: Size<i32, Physical>,
+    ui_state: &mut UiState<smithay::backend::renderer::gles::GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    now: Instant,
+    dt: Duration,
+    transform: Transform,
+    target_texture: &mut GlesTexture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt)?;
+    let mut target = renderer.bind(target_texture)?;
+    let client_elements = build_output_client_elements(state, renderer, output_id);
+    let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
+    draw_output(
+        state,
+        &mut gles_frame,
+        &prepared,
+        &client_elements,
+        &popup_elements,
+        ui_state,
+        scene,
+        output_state,
+    )?;
+    let _ = gles_frame.finish()?;
+    Ok(())
+}
+
+fn render_portal_output_to_dmabuf(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+    render_size: Size<i32, Physical>,
+    ui_state: &mut UiState<smithay::backend::renderer::gles::GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    now: Instant,
+    dt: Duration,
+    transform: Transform,
+    target_dmabuf: &mut Dmabuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt)?;
+    let mut target = renderer.bind(target_dmabuf)?;
+    let client_elements = build_output_client_elements(state, renderer, output_id);
+    let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
+    draw_output(
+        state,
+        &mut gles_frame,
+        &prepared,
+        &client_elements,
+        &popup_elements,
+        ui_state,
+        scene,
+        output_state,
+    )?;
+    let _ = gles_frame.finish()?;
+    Ok(())
 }
 
 fn write_rgba_to_shm_buffer(

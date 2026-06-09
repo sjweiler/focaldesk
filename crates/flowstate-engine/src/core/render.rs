@@ -96,6 +96,7 @@ pub struct FrameCtx {
     pub dt: std::time::Duration,
     pub active_output: OutputId,
     pub rendering_output: OutputId,
+    pub focus_pulse: f32,
     //pub time: f32,
 }
 
@@ -111,6 +112,7 @@ impl FrameCtx {
         dt: std::time::Duration,
         active_output: OutputId,
         rendering_output: OutputId,
+        focus_pulse: f32,
     ) -> Self {
         Self {
             output_size,
@@ -123,6 +125,7 @@ impl FrameCtx {
             dt,
             active_output,
             rendering_output,
+            focus_pulse,
         }
     }
 }
@@ -1421,7 +1424,9 @@ impl RenderState {
             )?;
         }
 
-        self.draw_active_output_glow(frame, inputs.ctx, theme)?;
+        if let Err(err) = self.draw_active_output_glow(frame, inputs.ctx, theme) {
+            flog_error!("active output accent render failed: {:?}", err);
+        }
 
         let egui_frame_ctx = DesktopFrameCtx {
             output_size: inputs.ctx.output_size,
@@ -1472,7 +1477,7 @@ impl RenderState {
         let damage = std::slice::from_ref(&dst);
 
         let mut accent = theme.chrome.accent_color;
-        accent[3] = (accent[3] * 0.70).min(0.42);
+        accent[3] = 1.0;
         let elapsed = ctx.now.duration_since(self.start_time).as_secs_f32();
 
         let buffer_size = Size::<i32, Buffer>::from((output_size.w, output_size.h));
@@ -1486,13 +1491,10 @@ impl RenderState {
             1.0,
             &[
                 Uniform::new("u_resolution", [output_size.w as f32, output_size.h as f32]),
-                Uniform::new(
-                    "u_rect",
-                    [0.0f32, 0.0f32, output_size.w as f32, output_size.h as f32],
-                ),
+                Uniform::new("u_rect", [0.0f32, 0.0f32, output_size.w as f32, 44.0f32]),
                 Uniform::new("u_accent", accent),
                 Uniform::new("u_time", elapsed),
-                Uniform::new("u_pulse", 0.0f32),
+                Uniform::new("u_pulse", ctx.focus_pulse),
                 Uniform::new("u_active", 1.0f32),
             ],
         )

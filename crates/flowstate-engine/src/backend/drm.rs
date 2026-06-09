@@ -61,7 +61,7 @@ use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
 
 use smithay::{
     backend::{
-        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc},
+        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
         egl::{self, context::ContextPriority, EGLContext},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
@@ -1071,12 +1071,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &data.core.output_state,
                     )?;
 
-                    let sync = frame.finish()?;
-                    if let Err(e) = device.renderer.wait(&sync) {
-                        flog(&format!(
-                            "screenshot: GPU sync wait failed (readback may be wrong): {e}"
-                        ));
-                    }
+                    // Do not block on the GL fence here. The DRM compositor imports this texture
+                    // on the same render path, and waiting in the modeset/present loop can wedge
+                    // some drivers. Screenshot readback does its own explicit finish.
+                    let _ = frame.finish()?;
                 }
                 if wants_screenshot {
                     data.core.state.screenshot_seq += 1;
@@ -1250,6 +1248,20 @@ fn connector_name(info: &drm::control::connector::Info) -> String {
     format!("{}-{}", info.interface().as_str(), info.interface_id())
 }
 
+fn dmabuf_capture_formats(format_set: &FormatSet) -> Vec<(Fourcc, Vec<Modifier>)> {
+    let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
+    for format in format_set.iter() {
+        if let Some((_, modifiers)) = formats.iter_mut().find(|(code, _)| *code == format.code) {
+            if !modifiers.contains(&format.modifier) {
+                modifiers.push(format.modifier);
+            }
+        } else {
+            formats.push((format.code, vec![format.modifier]));
+        }
+    }
+    formats
+}
+
 pub fn make_drm_gpu(
     node: DrmNode,
     fd: DrmDeviceFd,
@@ -1407,12 +1419,9 @@ fn device_added(
         ));
     }
 
-    let render_formats = renderer
-        .egl_context()
-        .dmabuf_render_formats()
-        .iter()
-        .copied()
-        .collect::<Vec<_>>();
+    let render_format_set = renderer.egl_context().dmabuf_render_formats().clone();
+    data.core.state.portal_dmabuf_formats = dmabuf_capture_formats(&render_format_set);
+    let render_formats = render_format_set.iter().copied().collect::<Vec<_>>();
 
     let allocator = GbmAllocator::new(
         gbm.clone(),

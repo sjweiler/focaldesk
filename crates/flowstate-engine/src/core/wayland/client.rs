@@ -1,5 +1,5 @@
-use smithay::wayland::compositor::CompositorClientState;
 use flowstate_logging::flog_info;
+use smithay::wayland::compositor::CompositorClientState;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 
 #[derive(Default)]

@@ -922,30 +922,24 @@ uniform float u_active;      // 0.0 or 1.0
 
 varying vec2 v_coords;
 
-float sdBox(vec2 p, vec2 b) {
-    vec2 d = abs(p) - b;
-    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
-}
-
 void main() {
     vec2 pos = v_coords * u_resolution;
 
-    vec2 center = u_rect.xy + u_rect.zw * 0.5;
-    vec2 halfSize = u_rect.zw * 0.5;
+    float inside_x = step(u_rect.x, pos.x) * step(pos.x, u_rect.x + u_rect.z);
+    float y = pos.y - u_rect.y;
+    float inside_y = step(0.0, y) * step(y, u_rect.w);
+    float mask = inside_x * inside_y;
 
-    float dist = sdBox(pos - center, halfSize);
-
-    float core = 1.0 - smoothstep(0.0, 3.0, abs(dist));
-    float glow = 1.0 - smoothstep(0.0, 24.0, abs(dist));
-
-    float pulse = 1.0 - u_pulse;
-    float pulseRing = 1.0 - smoothstep(0.0, 18.0, abs(dist - pulse * 24.0));
+    float strip = 1.0 - smoothstep(1.8, 2.8, y);
+    float glow = 1.0 - smoothstep(0.0, u_rect.w, y);
+    float pulse = clamp(u_pulse, 0.0, 1.0);
+    float pulse_band = (1.0 - smoothstep(0.0, 16.0, y)) * pulse;
 
     float alpha =
-        u_active * (
-            core * 0.18 +
-            glow * 0.10 +
-            pulseRing * 0.18 * pulse
+        mask * u_active * (
+            strip * (0.34 + 0.22 * pulse) +
+            glow * 0.08 +
+            pulse_band * 0.14
         );
 
     float out_alpha = alpha * u_accent.a;

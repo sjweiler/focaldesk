@@ -342,6 +342,45 @@ fn publish_portal_environment(wayland_display: &str) {
             "failed to publish portal environment: dbus-update-activation-environment: {err}"
         )),
     }
+
+    if std::env::var_os("FLOWSTATE_RESTART_PORTALS").is_some() {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "reset-failed", "xdg-desktop-portal-wlr.service"])
+            .status();
+
+        match status {
+            Ok(status) if status.success() => {
+                flog("reset failed state for xdg-desktop-portal-wlr.service")
+            }
+            Ok(status) => flog(&format!(
+                "failed to reset xdg-desktop-portal-wlr.service state: systemctl exited with {status}"
+            )),
+            Err(err) => flog(&format!(
+                "failed to reset xdg-desktop-portal-wlr.service state: systemctl: {err}"
+            )),
+        }
+
+        let status = std::process::Command::new("systemctl")
+            .args([
+                "--user",
+                "restart",
+                "xdg-desktop-portal.service",
+                "xdg-desktop-portal-wlr.service",
+            ])
+            .status();
+
+        match status {
+            Ok(status) if status.success() => {
+                flog("restarted xdg-desktop-portal and xdg-desktop-portal-wlr")
+            }
+            Ok(status) => flog(&format!(
+                "failed to restart xdg-desktop-portal services: systemctl exited with {status}"
+            )),
+            Err(err) => flog(&format!(
+                "failed to restart xdg-desktop-portal services: systemctl: {err}"
+            )),
+        }
+    }
 }
 
 /// Build [`Display`], globals, and [`DesktopState`] for a nested output of the given size and scale.

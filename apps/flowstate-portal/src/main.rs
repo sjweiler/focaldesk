@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 const DEFAULT_OUTPUT: &str = "flowstate-nested";
@@ -9,6 +11,8 @@ const MENU_COMMANDS: &[MenuCommand<'_>] = &[
         program: "zenity",
         args: &[
             "--list",
+            "--width=520",
+            "--height=320",
             "--title=Select a source to share",
             "--text=Select a source to share",
             "--column=Source",
@@ -88,7 +92,7 @@ fn screencast_choices() -> Vec<String> {
         }
     }
 
-    let wayland_outputs = query_wayland_outputs();
+    let wayland_outputs = configured_outputs().unwrap_or_else(query_wayland_outputs);
     if !wayland_outputs.is_empty() {
         return wayland_outputs
             .into_iter()
@@ -131,6 +135,33 @@ fn query_wayland_outputs() -> Vec<String> {
     parse_wayland_output_names(&text)
 }
 
+fn configured_outputs() -> Option<Vec<String>> {
+    let path = displays_config_path();
+    let text = std::fs::read_to_string(path).ok()?;
+    let displays: Vec<DisplayConfig> = serde_json::from_str(&text).ok()?;
+    let outputs = displays
+        .into_iter()
+        .filter(|display| display.enabled)
+        .map(|display| display.name)
+        .collect::<Vec<_>>();
+    if outputs.is_empty() {
+        None
+    } else {
+        Some(outputs)
+    }
+}
+
+fn displays_config_path() -> PathBuf {
+    let base = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = env::var("HOME").unwrap_or_else(|_| ".".into());
+            PathBuf::from(home).join(".config")
+        });
+
+    base.join("flowstate").join("displays.json")
+}
+
 fn parse_wayland_output_names(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
@@ -157,6 +188,12 @@ fn trim_quotes(value: &str) -> &str {
         .unwrap_or(value)
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct DisplayConfig {
+    name: String,
+    enabled: bool,
+}
+
 fn monitor_choice(output: &str) -> String {
     format!("Monitor: {output}")
 }
@@ -181,7 +218,10 @@ fn select_choice(choices: &[String]) -> Result<Option<String>> {
 
     for menu in MENU_COMMANDS {
         if command_exists(menu.program) {
-            return run_menu_command(*menu, choices);
+            match run_menu_command(*menu, choices)? {
+                Some(selected) => return Ok(Some(selected)),
+                None => continue,
+            }
         }
     }
 
@@ -240,7 +280,7 @@ fn print_xdpw_config() -> Result<()> {
     let exe = exe.to_string_lossy();
 
     println!("[screencast]");
-    println!("chooser_type=dmenu");
+    println!("chooser_type=simple");
     println!("chooser_cmd={}", shell_quote(&exe));
 
     Ok(())

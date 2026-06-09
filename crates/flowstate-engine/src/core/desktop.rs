@@ -2,6 +2,7 @@
 
 use flowstate_types::types::{OutputId, WindowId, WorkspaceId};
 use flowstate_ui::uitree::UiTree;
+use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::utils::import_surface_tree;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
@@ -215,6 +216,7 @@ pub struct DesktopState {
     pub next_window_id: WindowId,
     pub primary_output: OutputId,
     pub focused_output: OutputId, //keyboard shit
+    pub focus_changed_at: Instant,
     pub input: InputState,
     // pub keybinds: Keybinds,
     pub running: bool,
@@ -224,6 +226,7 @@ pub struct DesktopState {
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
     pub dmabuf_node: Option<smithay::backend::drm::DrmNode>,
+    pub portal_dmabuf_formats: Vec<(Fourcc, Vec<Modifier>)>,
     pub shm_state: smithay::wayland::shm::ShmState,
     pub seat_state: smithay::input::SeatState<Self>,
     pub output_manager_state: smithay::wayland::output::OutputManagerState,
@@ -1319,6 +1322,18 @@ impl DesktopState {
         self.outputs.get(&self.focused_output)
     }
 
+    fn set_focused_output(&mut self, output_id: OutputId) {
+        if self.focused_output == output_id {
+            return;
+        }
+
+        let previous = self.focused_output;
+        self.focused_output = output_id;
+        self.focus_changed_at = Instant::now();
+        self.mark_output_full_damage(previous, DamageSource::Unknown);
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+    }
+
     pub fn focused_workspace(&self) -> WorkspaceId {
         self.outputs
             .get(&self.focused_output)
@@ -2086,6 +2101,7 @@ impl DesktopState {
             next_window_id: WindowId(1),
             primary_output: init.primary_output,
             focused_output: init.primary_output,
+            focus_changed_at: Instant::now(),
             input: InputState::default(),
             compositor_state: init.compositor_state,
             render: init.render,
@@ -2093,6 +2109,7 @@ impl DesktopState {
             dmabuf_state: init.dmabuf_state,
             dmabuf_global: None,
             dmabuf_node: None,
+            portal_dmabuf_formats: Vec::new(),
             shm_state: init.shm_state,
             seat_state: init.seat_state,
             output_manager_state: init.output_manager_state,
@@ -3042,7 +3059,7 @@ impl DesktopState {
                 self.input.pointer_pos = position;
                 self.pointer_pos = position;
                 if let Some(id) = self.output_under_pointer(position) {
-                    self.focused_output = id;
+                    self.set_focused_output(id);
                 }
                 let cursor_owner_damage = self.update_cursor_owner_damage();
                 let stale_cursor_damage = self.clear_stale_software_cursor_damage();
@@ -3118,7 +3135,7 @@ impl DesktopState {
                 self.pointer_pos = position;
 
                 if let Some(id) = self.output_under_pointer(position) {
-                    self.focused_output = id;
+                    self.set_focused_output(id);
                 }
                 let cursor_owner_damage = self.update_cursor_owner_damage();
                 let stale_cursor_damage = self.clear_stale_software_cursor_damage();
@@ -3233,7 +3250,7 @@ impl DesktopState {
                 }
 
                 if let Some(id) = self.output_under_pointer(position) {
-                    self.focused_output = id;
+                    self.set_focused_output(id);
                 }
                 self.cursor_manager.move_to(position.x, position.y);
                 let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
@@ -3308,7 +3325,7 @@ impl DesktopState {
                 self.input.pointer_pos = position;
                 self.pointer_pos = position;
                 if let Some(id) = self.output_under_pointer(position) {
-                    self.focused_output = id;
+                    self.set_focused_output(id);
                 }
                 self.update_cursor_owner_damage();
                 self.clear_stale_software_cursor_damage();

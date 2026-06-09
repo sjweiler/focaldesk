@@ -229,6 +229,7 @@ impl OutputState {
             dt,
             active_output: self.active_output,
             rendering_output: out_id,
+            focus_pulse: 0.0,
         }
     }
 }

@@ -53,6 +53,8 @@ impl ImageCopyCaptureHandler for DesktopState {
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
             ],
+            // OBS/xdg-desktop-portal-wlr may reconnect during DRM startup. Keep capture on
+            // SHM until the dmabuf render path is proven not to wedge KMS/GL drivers.
             dma: None,
         })
     }

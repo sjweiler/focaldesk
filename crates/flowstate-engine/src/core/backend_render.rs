@@ -349,6 +349,7 @@ pub fn prepare_output(
         dt,
         active_output: state.focused_output,
         rendering_output: output_id,
+        focus_pulse: focus_pulse_value(now.saturating_duration_since(state.focus_changed_at)),
     };
 
     ui_state
@@ -360,6 +361,15 @@ pub fn prepare_output(
         layout,
         draw_software_cursor,
     })
+}
+
+fn focus_pulse_value(elapsed: Duration) -> f32 {
+    let seconds = elapsed.as_secs_f32();
+    if seconds >= 0.45 {
+        0.0
+    } else {
+        1.0 - (seconds / 0.45)
+    }
 }
 
 /// Import and build client surfaces for an output. Call after `GlesRenderer::bind` and before
