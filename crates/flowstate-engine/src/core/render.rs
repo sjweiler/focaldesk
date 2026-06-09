@@ -1421,6 +1421,8 @@ impl RenderState {
             )?;
         }
 
+        self.draw_active_output_glow(frame, inputs.ctx, theme)?;
+
         let egui_frame_ctx = DesktopFrameCtx {
             output_size: inputs.ctx.output_size,
             output_scale: inputs.ctx.output_scale,
@@ -1446,6 +1448,54 @@ impl RenderState {
         }
 
         Ok(())
+    }
+
+    fn draw_active_output_glow(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        theme: &FlowTheme,
+    ) -> Result<(), GlesError> {
+        if ctx.active_output != ctx.rendering_output {
+            return Ok(());
+        }
+
+        let Some(program) = self.chrome_shaders.accent.as_ref() else {
+            return Ok(());
+        };
+
+        let output_size = Size::<i32, Physical>::from(ctx.output_size);
+        let dst = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_size);
+        let src = Rectangle::<f64, Buffer>::from_size(
+            (f64::from(output_size.w), f64::from(output_size.h)).into(),
+        );
+        let damage = std::slice::from_ref(&dst);
+
+        let mut accent = theme.chrome.accent_color;
+        accent[3] = (accent[3] * 0.70).min(0.42);
+        let elapsed = ctx.now.duration_since(self.start_time).as_secs_f32();
+
+        let buffer_size = Size::<i32, Buffer>::from((output_size.w, output_size.h));
+
+        frame.render_pixel_shader_to(
+            program,
+            src,
+            dst,
+            buffer_size,
+            Some(damage),
+            1.0,
+            &[
+                Uniform::new("u_resolution", [output_size.w as f32, output_size.h as f32]),
+                Uniform::new(
+                    "u_rect",
+                    [0.0f32, 0.0f32, output_size.w as f32, output_size.h as f32],
+                ),
+                Uniform::new("u_accent", accent),
+                Uniform::new("u_time", elapsed),
+                Uniform::new("u_pulse", 0.0f32),
+                Uniform::new("u_active", 1.0f32),
+            ],
+        )
     }
 
     pub fn render_output(

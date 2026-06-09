@@ -18,6 +18,7 @@ pub struct ChromeShaders {
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
+    pub accent: Option<GlesPixelProgram>,
 }
 
 impl ChromeShaders {
@@ -34,6 +35,7 @@ impl ChromeShaders {
             rounded_rect: None,
             wallpaper_tint: None,
             pulse: None,
+            accent: None,
         }
     }
 
@@ -181,6 +183,30 @@ impl ChromeShaders {
                     UniformName::new("u_size", UniformType::_2f),
                 ],
             )?);
+        }
+
+        if self.accent.is_none() {
+            match renderer.compile_custom_pixel_shader(
+                ACCENT_FRAG,
+                &[
+                    UniformName::new("u_resolution", UniformType::_2f),
+                    UniformName::new("u_rect", UniformType::_4f),
+                    UniformName::new("u_accent", UniformType::_4f),
+                    UniformName::new("u_time", UniformType::_1f),
+                    UniformName::new("u_pulse", UniformType::_1f),
+                    UniformName::new("u_active", UniformType::_1f),
+                ],
+            ) {
+                Ok(program) => {
+                    self.accent = Some(program);
+                }
+                Err(err) => {
+                    flog(&format!(
+                        "accent shader compile failed; disabling active-output glow: {:?}",
+                        err
+                    ));
+                }
+            }
         }
 
         Ok(())
@@ -879,5 +905,50 @@ void main() {
     alpha *= max(1.0 - (u_time / 2.0), 0.0);
 
     gl_FragColor = vec4(0.0, 0.5, 1.0, max(alpha, 0.0));
+}
+"#;
+
+const ACCENT_FRAG: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform vec2  u_resolution;
+uniform vec4  u_rect;        // x, y, w, h
+uniform vec4  u_accent;      // rgba theme color
+uniform float u_time;
+uniform float u_pulse;       // 0.0 -> 1.0
+uniform float u_active;      // 0.0 or 1.0
+
+varying vec2 v_coords;
+
+float sdBox(vec2 p, vec2 b) {
+    vec2 d = abs(p) - b;
+    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+}
+
+void main() {
+    vec2 pos = v_coords * u_resolution;
+
+    vec2 center = u_rect.xy + u_rect.zw * 0.5;
+    vec2 halfSize = u_rect.zw * 0.5;
+
+    float dist = sdBox(pos - center, halfSize);
+
+    float core = 1.0 - smoothstep(0.0, 3.0, abs(dist));
+    float glow = 1.0 - smoothstep(0.0, 24.0, abs(dist));
+
+    float pulse = 1.0 - u_pulse;
+    float pulseRing = 1.0 - smoothstep(0.0, 18.0, abs(dist - pulse * 24.0));
+
+    float alpha =
+        u_active * (
+            core * 0.18 +
+            glow * 0.10 +
+            pulseRing * 0.18 * pulse
+        );
+
+    float out_alpha = alpha * u_accent.a;
+    gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
 }
 "#;
