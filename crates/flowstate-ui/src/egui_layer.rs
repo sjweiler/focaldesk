@@ -409,12 +409,12 @@ impl EguiLayer {
         shaders: &ChromeShaders,
         theme: &FlowTheme,
     ) -> Result<(), GlesError> {
-        if frame_ctx.rendering_output != frame_ctx.active_output {
+        if !self.has_open_panels() {
+            self.clear_paint();
             return Ok(());
         }
 
-        if !self.has_open_panels() {
-            self.clear_paint();
+        if frame_ctx.rendering_output != frame_ctx.active_output && !frame_ctx.portal_capture {
             return Ok(());
         }
 

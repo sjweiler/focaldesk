@@ -1557,6 +1557,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "wayland-client",
 ]
 
 [[package]]

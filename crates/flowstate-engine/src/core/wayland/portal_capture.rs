@@ -11,7 +11,8 @@ use smithay::wayland::image_capture_source::{
     OutputCaptureSourceHandler, OutputCaptureSourceState,
 };
 use smithay::wayland::image_copy_capture::{
-    BufferConstraints, Frame, ImageCopyCaptureHandler, ImageCopyCaptureState, Session, SessionRef,
+    BufferConstraints, DmabufConstraints, Frame, ImageCopyCaptureHandler, ImageCopyCaptureState,
+    Session, SessionRef,
 };
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
@@ -47,15 +48,30 @@ impl ImageCopyCaptureHandler for DesktopState {
         let output = weak_output.upgrade()?;
         let mode = output.current_mode()?;
 
-        Some(BufferConstraints {
-            size: mode.size.to_logical(1).to_buffer(1, Transform::Normal),
-            shm: vec![
+        let dma = self.dmabuf_node.filter(|_| !self.portal_dmabuf_formats.is_empty()).map(
+            |node| DmabufConstraints {
+                node,
+                formats: self.portal_dmabuf_formats.clone(),
+            },
+        );
+
+        // On DRM, prefer zero-copy dmabuf capture for OBS / xdg-desktop-portal-wlr. SHM would
+        // require a GPU readback (`copy_texture`) on every frame.
+        let shm = if dma.is_some()
+            && self.backend_kind == flowstate_flow::keybinds::BackendKind::Drm
+        {
+            vec![]
+        } else {
+            vec![
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
                 smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
-            ],
-            // OBS/xdg-desktop-portal-wlr may reconnect during DRM startup. Keep capture on
-            // SHM until the dmabuf render path is proven not to wedge KMS/GL drivers.
-            dma: None,
+            ]
+        };
+
+        Some(BufferConstraints {
+            size: mode.size.to_logical(1).to_buffer(1, Transform::Normal),
+            shm,
+            dma,
         })
     }
 

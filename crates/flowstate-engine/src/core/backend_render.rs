@@ -8,7 +8,7 @@ use smithay::utils::{Logical, Physical, Rectangle, Size};
 
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
-use crate::core::fonts::{FontId, TextStyle};
+use crate::core::fonts::{FontId, FontRole, TextStyle, style_for};
 use crate::core::render::{FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
 use crate::core::ui_builder::build_ui_for_output;
 use crate::core::ui_state::UiState;
@@ -170,6 +170,7 @@ pub fn prepare_output(
     ui_state: &mut UiState<GlesTexture>,
     now: Instant,
     dt: Duration,
+    force_full_damage: bool,
 ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
     let (logical_w, logical_h, scale_factor, output_scale, buffer_scale) = {
         let desk_output = state
@@ -239,7 +240,7 @@ pub fn prepare_output(
             .pending_damage
             .clone();
         let full_damage = Rectangle::from_loc_and_size((0, 0), buffer_size);
-        if state.render.redraw_all || pending_damage.is_empty() {
+        if force_full_damage || state.render.redraw_all || pending_damage.is_empty() {
             if state.render.redraw_all {
                 state.record_damage_source(crate::core::desktop::DamageSource::FullRedrawFallback);
             }
@@ -275,8 +276,50 @@ pub fn prepare_output(
     // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
     state.render.ensure_wallpaper_loaded(renderer);
 
-    let active_theme = state.theme.active_theme();
-    let active_theme_id = active_theme
+    if !state.render.fonts_prewarm_done {
+        prewarm_font_glyphs(state)?;
+        state.render.fonts_prewarm_done = true;
+    }
+
+    if force_full_damage {
+        prepare_portal_chrome_glyphs(state, scale_factor)?;
+    }
+
+    if state.fonts.atlas_dirty || state.render.font_atlas_texture.is_none() {
+        state.render.upload_font_atlas(renderer, &state.fonts)?;
+        state.fonts.atlas_dirty = false;
+    }
+
+    let frame_ctx = FrameCtx {
+        output_size: (buffer_size.w, buffer_size.h),
+        output_scale,
+        buffer_scale,
+        damage: frame_damage,
+        work: Rectangle::from_loc_and_size((0, 0), (logical_w, logical_h)),
+        frame_no: state.render.frame_no,
+        now,
+        dt,
+        active_output: state.focused_output,
+        rendering_output: output_id,
+        focus_pulse: focus_pulse_value(now.saturating_duration_since(state.focus_changed_at)),
+        portal_capture: force_full_damage,
+    };
+
+    ui_state
+        .chrome
+        .ensure_gpu_resources(renderer, scale_factor)?;
+
+    Ok(PreparedOutput {
+        frame_ctx,
+        layout,
+        draw_software_cursor,
+    })
+}
+
+fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::error::Error>> {
+    let active_theme_id = state
+        .theme
+        .active_theme()
         .id
         .builtin_id()
         .unwrap_or(BuiltInThemeId::Classic);
@@ -287,13 +330,11 @@ pub fn prepare_output(
             FontId::IbmPlexSansMedium,
             FontId::IbmPlexSansSemiBold,
         ],
-
         BuiltInThemeId::Moonbase => &[
             FontId::RajdhaniRegular,
             FontId::RajdhaniMedium,
             FontId::RajdhaniSemiBold,
         ],
-
         BuiltInThemeId::Eagle => &[
             FontId::IbmPlexSansMedium,
             FontId::OrbitronRegular,
@@ -318,49 +359,35 @@ pub fn prepare_output(
         }
     }
 
-    // Dialog text uses 16px in draw_dialog; glyph keys include size, so we must
-    // rasterize at 16px or draw_text_cached finds no glyphs.
-    // let dialog_text_style = TextStyle {
-    //     font: FontId::Debug,
-    //     size_px: 16,
-    // };
-    //let dialog_text_style =
-    // for d in &state.dialogs {
-    //    state.fonts.prepare_text(&d.title, dialog_text_style)?;
-    //    state.fonts.prepare_text(&d.message, dialog_text_style)?;
-    //    for b in &d.buttons {
-    //       state.fonts.prepare_text(&b.label, dialog_text_style)?;
-    //   }
-    //}
+    Ok(())
+}
 
-    if state.fonts.atlas_dirty {
-        state.render.upload_font_atlas(renderer, &state.fonts)?;
-        state.fonts.atlas_dirty = false;
-    }
+fn prepare_portal_chrome_glyphs(
+    state: &mut DesktopState,
+    scale_factor: f64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use chrono::Local;
 
-    let frame_ctx = FrameCtx {
-        output_size: (buffer_size.w, buffer_size.h),
-        output_scale,
-        buffer_scale,
-        damage: frame_damage,
-        work: Rectangle::from_loc_and_size((0, 0), (logical_w, logical_h)),
-        frame_no: state.render.frame_no,
-        now,
-        dt,
-        active_output: state.focused_output,
-        rendering_output: output_id,
-        focus_pulse: focus_pulse_value(now.saturating_duration_since(state.focus_changed_at)),
-    };
+    let active_theme = state.theme.active_theme();
+    let builtin_id = active_theme
+        .id
+        .builtin_id()
+        .unwrap_or(BuiltInThemeId::Eagle);
 
-    ui_state
-        .chrome
-        .ensure_gpu_resources(renderer, scale_factor)?;
+    let clock_style = style_for(FontRole::Clock, 24, builtin_id);
+    let time_str = Local::now().format("%-I:%M %p").to_string();
+    state.fonts.prepare_text(&time_str, clock_style)?;
 
-    Ok(PreparedOutput {
-        frame_ctx,
-        layout,
-        draw_software_cursor,
-    })
+    let title_style = style_for(FontRole::Title, 24, builtin_id);
+    state.fonts.prepare_text("FLOWSTATE", title_style)?;
+
+    let meta_style = style_for(FontRole::Meta, 14, builtin_id);
+    let output_number = state.focused_output.0;
+    let meta = format!("OUT {output_number} · WS 1");
+    state.fonts.prepare_text(&meta, meta_style)?;
+
+    let _ = scale_factor;
+    Ok(())
 }
 
 fn focus_pulse_value(elapsed: Duration) -> f32 {
@@ -450,8 +477,12 @@ pub fn draw_output(
         now: prepared.frame_ctx.now,
         start_time: state.render.start_time,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
+        portal_capture: prepared.frame_ctx.portal_capture,
     };
-    if prepared.frame_ctx.rendering_output == prepared.frame_ctx.active_output {
+    if (prepared.frame_ctx.rendering_output == prepared.frame_ctx.active_output
+        || prepared.frame_ctx.portal_capture)
+        && state.render.egui.has_open_panels()
+    {
         state.sync_egui(&egui_frame_ctx);
     }
 

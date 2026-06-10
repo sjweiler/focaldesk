@@ -239,7 +239,12 @@ pub struct DesktopState {
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
     pub image_copy_capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
+    pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
+    /// Latest DRM offscreen texture per output for portal/OBS capture.
+    pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
+    /// Set after the first successful DRM present; portal capture waits for this.
+    pub compositor_ready: bool,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
@@ -526,6 +531,7 @@ impl DesktopState {
             now,
             start_time: self.render.start_time,
             flip_egui_y: self.backend_kind == BackendKind::Drm,
+            portal_capture: false,
         })
     }
 
@@ -2121,7 +2127,10 @@ impl DesktopState {
             image_copy_capture_state: init.image_copy_capture_state,
             image_copy_capture_sessions: Vec::new(),
             portal_dispatch_ctx: None,
+            pending_portal_captures: Vec::new(),
             portal_frame_cache: HashMap::new(),
+            portal_capture_source: HashMap::new(),
+            compositor_ready: false,
             backend_kind: init.backend_kind,
             cursor_manager: init.cursor_manager,
             seat: init.seat,

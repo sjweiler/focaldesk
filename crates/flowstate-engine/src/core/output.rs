@@ -230,6 +230,7 @@ impl OutputState {
             active_output: self.active_output,
             rendering_output: out_id,
             focus_pulse: 0.0,
+            portal_capture: false,
         }
     }
 }

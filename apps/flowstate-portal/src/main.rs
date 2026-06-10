@@ -5,6 +5,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+mod wayland_outputs;
+
 const DEFAULT_OUTPUT: &str = "flowstate-nested";
 const MENU_COMMANDS: &[MenuCommand<'_>] = &[
     MenuCommand {
@@ -80,9 +82,10 @@ fn run_chooser() -> Result<()> {
 }
 
 fn screencast_choices() -> Vec<String> {
-    let stdin_choices = read_stdin_choices();
-    if !stdin_choices.is_empty() {
-        return stdin_choices;
+    // xdpw `dmenu` chooser pipes "Monitor: …" lines on stdin; `simple` sends nothing.
+    let dmenu_choices = read_dmenu_choices_from_stdin();
+    if !dmenu_choices.is_empty() {
+        return dmenu_choices;
     }
 
     if let Ok(output) = env::var("FLOWSTATE_SCREENCAST_OUTPUT") {
@@ -92,9 +95,16 @@ fn screencast_choices() -> Vec<String> {
         }
     }
 
-    let wayland_outputs = configured_outputs().unwrap_or_else(query_wayland_outputs);
-    if !wayland_outputs.is_empty() {
-        return wayland_outputs
+    let mut outputs = wayland_outputs::query_wayland_outputs();
+    if let Some(configured) = configured_outputs() {
+        for name in configured {
+            if !outputs.iter().any(|existing| existing == &name) {
+                outputs.push(name);
+            }
+        }
+    }
+    if !outputs.is_empty() {
+        return outputs
             .into_iter()
             .map(|output| monitor_choice(&output))
             .collect();
@@ -103,7 +113,8 @@ fn screencast_choices() -> Vec<String> {
     vec![monitor_choice(DEFAULT_OUTPUT)]
 }
 
-fn read_stdin_choices() -> Vec<String> {
+/// Read xdpw `dmenu`-style chooser input. Ignore empty stdin (`simple` chooser type).
+fn read_dmenu_choices_from_stdin() -> Vec<String> {
     let mut stdin = io::stdin();
     if stdin.is_terminal() {
         return Vec::new();
@@ -118,21 +129,9 @@ fn read_stdin_choices() -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|line| line.starts_with("Monitor: ") || line.starts_with("Window: "))
         .map(ToOwned::to_owned)
         .collect()
-}
-
-fn query_wayland_outputs() -> Vec<String> {
-    let output = match Command::new("wayland-info").output() {
-        Ok(output) if output.status.success() => output.stdout,
-        _ => return Vec::new(),
-    };
-
-    let Ok(text) = String::from_utf8(output) else {
-        return Vec::new();
-    };
-
-    parse_wayland_output_names(&text)
 }
 
 fn configured_outputs() -> Option<Vec<String>> {
@@ -160,32 +159,6 @@ fn displays_config_path() -> PathBuf {
         });
 
     base.join("flowstate").join("displays.json")
-}
-
-fn parse_wayland_output_names(text: &str) -> Vec<String> {
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            trimmed
-                .strip_prefix("name: ")
-                .map(str::trim)
-                .map(trim_quotes)
-                .filter(|name| !name.is_empty())
-                .map(ToOwned::to_owned)
-        })
-        .collect()
-}
-
-fn trim_quotes(value: &str) -> &str {
-    value
-        .strip_prefix('\'')
-        .and_then(|value| value.strip_suffix('\''))
-        .or_else(|| {
-            value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-        })
-        .unwrap_or(value)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -320,19 +293,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_quoted_wayland_info_output_names() {
-        let text = r#"
-interface: 'wl_output', version: 4, name: 42
-	name: 'HDMI-A-1'
-	description: 'FlowState display'
-interface: 'wl_output', version: 4, name: 43
-	name: 'DP-1'
-"#;
-
-        assert_eq!(
-            parse_wayland_output_names(text),
-            vec!["HDMI-A-1".to_string(), "DP-1".to_string()]
-        );
+    fn loads_enabled_outputs_from_displays_json() {
+        let json = r#"[
+          {"name":"DP-3","enabled":true},
+          {"name":"DP-4","enabled":false}
+        ]"#;
+        let displays: Vec<DisplayConfig> = serde_json::from_str(json).unwrap();
+        let outputs = displays
+            .into_iter()
+            .filter(|display| display.enabled)
+            .map(|display| display.name)
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, vec!["DP-3".to_string()]);
     }
 
     #[test]

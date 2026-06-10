@@ -13,10 +13,10 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer as AllocatorBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
-use smithay::backend::renderer::{Bind, ExportMem, Offscreen, Renderer};
+use smithay::backend::renderer::{Bind, ExportMem, ImportMem, Offscreen, Renderer};
 use smithay::desktop::layer_map_for_output;
 use smithay::reexports::wayland_server::protocol::wl_shm;
-use smithay::utils::{Buffer as BufferCoords, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
@@ -46,9 +46,23 @@ pub struct PortalDispatchCtx {
 }
 
 pub struct PortalFrameCache {
-    pub size: Size<i32, BufferCoords>,
+    pub size: Size<i32, Buffer>,
     pub rgba: Vec<u8>,
     pub transform: Transform,
+    pub captured_at: Instant,
+}
+
+/// Portal frame received during `dispatch_clients`; completed after the DRM offscreen draw.
+pub struct PendingPortalCapture {
+    pub output_id: OutputId,
+    pub frame: Frame,
+}
+
+/// Last DRM offscreen frame per output — portal blits this instead of re-rendering so OBS
+/// matches what the monitor shows (sidebar/topbar chrome included).
+pub struct PortalCaptureSource {
+    pub texture: GlesTexture,
+    pub size: Size<i32, Physical>,
     pub captured_at: Instant,
 }
 
@@ -93,8 +107,25 @@ pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Opti
     })
 }
 
-/// Renders the active output into the portal client's SHM buffer, if dispatch context is set.
+/// Renders the active output into the portal client's buffer, if dispatch context is set.
+///
+/// On DRM the frame is queued and completed in [`complete_pending_portal_captures`] after the
+/// offscreen draw so OBS receives the same pixels as the monitor.
 pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id: OutputId) {
+    if state.portal_dispatch_ctx.is_none() {
+        frame.fail(CaptureFailureReason::Unknown);
+        return;
+    }
+
+    if state.backend_kind == flowstate_flow::keybinds::BackendKind::Drm {
+        state.pending_portal_captures.push(PendingPortalCapture { output_id, frame });
+        return;
+    }
+
+    render_portal_frame_now(state, frame, output_id);
+}
+
+fn render_portal_frame_now(state: &mut DesktopState, frame: Frame, output_id: OutputId) {
     let Some(ctx) = state.portal_dispatch_ctx.as_mut() else {
         frame.fail(CaptureFailureReason::Unknown);
         return;
@@ -108,6 +139,96 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
     let now = ctx.now;
     let dt = ctx.dt;
 
+    complete_portal_frame(
+        state,
+        renderer,
+        ui_state,
+        scene,
+        output_state,
+        output_id,
+        frame,
+        now,
+        dt,
+    );
+}
+
+/// Finish portal frames queued during `dispatch_clients` using the latest DRM offscreen texture.
+pub fn complete_pending_portal_captures(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    ui_state: &mut UiState<smithay::backend::renderer::gles::GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    now: Instant,
+    dt: Duration,
+) {
+    if state.pending_portal_captures.is_empty() {
+        return;
+    }
+
+    let pending = std::mem::take(&mut state.pending_portal_captures);
+    for cap in pending {
+        complete_portal_frame(
+            state,
+            renderer,
+            ui_state,
+            scene,
+            output_state,
+            cap.output_id,
+            cap.frame,
+            now,
+            dt,
+        );
+    }
+}
+
+/// Finish portal frames for one output immediately after its offscreen draw (same pixels as monitor).
+pub fn complete_pending_portal_captures_for_output(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    ui_state: &mut UiState<smithay::backend::renderer::gles::GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    output_id: OutputId,
+    now: Instant,
+    dt: Duration,
+) {
+    if state.pending_portal_captures.is_empty() {
+        return;
+    }
+
+    let (for_output, rest): (Vec<_>, Vec<_>) = state
+        .pending_portal_captures
+        .drain(..)
+        .partition(|cap| cap.output_id == output_id);
+    state.pending_portal_captures = rest;
+
+    for cap in for_output {
+        complete_portal_frame(
+            state,
+            renderer,
+            ui_state,
+            scene,
+            output_state,
+            cap.output_id,
+            cap.frame,
+            now,
+            dt,
+        );
+    }
+}
+
+fn complete_portal_frame(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    ui_state: &mut UiState<smithay::backend::renderer::gles::GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    output_id: OutputId,
+    frame: Frame,
+    now: Instant,
+    dt: Duration,
+) {
     let buffer = frame.buffer();
     let buffer_size = match capture_buffer_size(&buffer) {
         Some(size) => size,
@@ -131,20 +252,28 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         return;
     }
 
-    if let Some(cache) = state.portal_frame_cache.get(&output_id) {
-        if cache.size == buffer_size
-            && now.duration_since(cache.captured_at) < PORTAL_CAPTURE_MIN_INTERVAL
-        {
-            if write_rgba_to_shm_buffer(&buffer, buffer_size, &cache.rgba).is_ok() {
-                frame.success(
-                    cache.transform,
-                    None::<Vec<Rectangle<i32, BufferCoords>>>,
-                    Duration::ZERO,
-                );
-            } else {
-                frame.fail(CaptureFailureReason::BufferConstraints);
+    if !state.compositor_ready {
+        frame.fail(CaptureFailureReason::Unknown);
+        return;
+    }
+
+    // Frame cache only applies to SHM readback; dmabuf clients must receive a fresh GPU render.
+    if get_dmabuf(&buffer).is_err() {
+        if let Some(cache) = state.portal_frame_cache.get(&output_id) {
+            if cache.size == buffer_size
+                && now.duration_since(cache.captured_at) < PORTAL_CAPTURE_MIN_INTERVAL
+            {
+                if write_rgba_to_shm_buffer(&buffer, buffer_size, &cache.rgba).is_ok() {
+                    frame.success(
+                        cache.transform,
+                        None::<Vec<Rectangle<i32, Buffer>>>,
+                        Duration::ZERO,
+                    );
+                } else {
+                    frame.fail(CaptureFailureReason::BufferConstraints);
+                }
+                return;
             }
-            return;
         }
     }
 
@@ -154,8 +283,91 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
     };
 
     if let Ok(mut dmabuf) = get_dmabuf(&buffer).cloned() {
+        if let Some(node) = state.dmabuf_node {
+            dmabuf.set_node(node);
+        }
         let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
-        let render_res = render_portal_output_to_dmabuf(
+        let render_res = if let Some(source) = state.portal_capture_source.get(&output_id) {
+            if source.size == render_size {
+                blit_offscreen_source_to_dmabuf(
+                    renderer,
+                    source.texture.clone(),
+                    render_size,
+                    transform,
+                    &mut dmabuf,
+                )
+            } else {
+                render_portal_output_to_dmabuf(
+                    state,
+                    renderer,
+                    output_id,
+                    render_size,
+                    ui_state,
+                    scene,
+                    output_state,
+                    now,
+                    dt,
+                    transform,
+                    &mut dmabuf,
+                )
+            }
+        } else {
+            render_portal_output_to_dmabuf(
+                state,
+                renderer,
+                output_id,
+                render_size,
+                ui_state,
+                scene,
+                output_state,
+                now,
+                dt,
+                transform,
+                &mut dmabuf,
+            )
+        };
+        if let Err(err) = render_res {
+            flog(&format!("portal dmabuf capture render failed: {err:?}"));
+            frame.fail(CaptureFailureReason::Unknown);
+            return;
+        }
+
+        frame.success(
+            transform,
+            None::<Vec<Rectangle<i32, Buffer>>>,
+            std::time::Duration::ZERO,
+        );
+        return;
+    }
+
+    let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
+    let rgba = if let Some(source) = state.portal_capture_source.get(&output_id) {
+        if source.size != render_size {
+            frame.fail(CaptureFailureReason::Unknown);
+            return;
+        }
+        let mut tex = source.texture.clone();
+        match read_bound_offscreen_rgba(renderer, &mut tex, render_size) {
+            Ok(pixels) => pixels,
+            Err(err) => {
+                flog(&format!("portal shm readback failed: {err}"));
+                frame.fail(CaptureFailureReason::Unknown);
+                return;
+            }
+        }
+    } else {
+        let mut capture_tex = match renderer.create_buffer(
+            Fourcc::Abgr8888,
+            Size::<i32, Buffer>::from((buffer_size.w, buffer_size.h)),
+        ) {
+            Ok(t) => t,
+            Err(_) => {
+                frame.fail(CaptureFailureReason::Unknown);
+                return;
+            }
+        };
+
+        let render_res = render_portal_output_to_texture(
             state,
             renderer,
             output_id,
@@ -166,76 +378,29 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
             now,
             dt,
             transform,
-            &mut dmabuf,
+            &mut capture_tex,
         );
+
         if let Err(err) = render_res {
-            flog(&format!("portal dmabuf capture render failed: {err:?}"));
+            flog(&format!("portal shm capture render failed: {err:?}"));
             frame.fail(CaptureFailureReason::Unknown);
             return;
         }
 
-        frame.success(
-            transform,
-            None::<Vec<Rectangle<i32, BufferCoords>>>,
-            std::time::Duration::ZERO,
-        );
-        return;
-    }
-
-    let mut capture_tex = match <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(
-        renderer,
-        Fourcc::Argb8888,
-        buffer_size,
-    ) {
-        Ok(t) => t,
-        Err(_) => {
-            frame.fail(CaptureFailureReason::Unknown);
-            return;
+        let region =
+            Rectangle::<i32, Buffer>::from_loc_and_size(Point::from((0, 0)), buffer_size);
+        match (|| -> Result<Vec<u8>, smithay::backend::renderer::gles::GlesError> {
+            let mapping = renderer.copy_texture(&capture_tex, region, Fourcc::Abgr8888)?;
+            let src = renderer.map_texture(&mapping)?;
+            Ok(src.to_vec())
+        })() {
+            Ok(pixels) => pixels,
+            Err(_) => {
+                frame.fail(CaptureFailureReason::Unknown);
+                return;
+            }
         }
     };
-
-    let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
-    let render_res = render_portal_output_to_texture(
-        state,
-        renderer,
-        output_id,
-        render_size,
-        ui_state,
-        scene,
-        output_state,
-        now,
-        dt,
-        transform,
-        &mut capture_tex,
-    );
-
-    if let Err(err) = render_res {
-        flog(&format!("portal shm capture render failed: {err:?}"));
-        frame.fail(CaptureFailureReason::Unknown);
-        return;
-    }
-
-    let width = buffer_size.w as usize;
-    let height = buffer_size.h as usize;
-    let mut rgba = vec![0u8; width * height * 4];
-    let region =
-        Rectangle::<i32, BufferCoords>::from_loc_and_size(Point::from((0, 0)), buffer_size);
-    let read_res = (|| -> Result<(), smithay::backend::renderer::gles::GlesError> {
-        // Match `create_buffer(Fourcc::Argb8888)` (`GL_BGRA8_EXT`): read as BGRA then swizzle to RGBA
-        // for the SHM conversion loop below (it expects `rgba[..]` in R,G,B,A order per pixel).
-        let mapping = renderer.copy_texture(&capture_tex, region, Fourcc::Argb8888)?;
-        let src = renderer.map_texture(&mapping)?;
-        rgba.copy_from_slice(src);
-        for px in rgba.chunks_exact_mut(4) {
-            px.swap(0, 2);
-        }
-        Ok(())
-    })();
-
-    if read_res.is_err() {
-        frame.fail(CaptureFailureReason::Unknown);
-        return;
-    }
 
     state.portal_frame_cache.insert(
         output_id,
@@ -256,16 +421,16 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
 
     frame.success(
         transform,
-        None::<Vec<Rectangle<i32, BufferCoords>>>,
+        None::<Vec<Rectangle<i32, Buffer>>>,
         std::time::Duration::ZERO,
     );
 }
 
 fn capture_buffer_size(
     buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
-) -> Option<Size<i32, BufferCoords>> {
+) -> Option<Size<i32, Buffer>> {
     with_buffer_contents(buffer, |_, _, data| {
-        Size::<i32, BufferCoords>::from((data.width, data.height))
+        Size::<i32, Buffer>::from((data.width, data.height))
     })
     .ok()
     .or_else(|| get_dmabuf(buffer).ok().map(|dmabuf| dmabuf.size()))
@@ -284,8 +449,8 @@ fn render_portal_output_to_texture(
     transform: Transform,
     target_texture: &mut GlesTexture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt)?;
     let mut target = renderer.bind(target_texture)?;
+    let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt, true)?;
     let client_elements = build_output_client_elements(state, renderer, output_id);
     let popup_elements = build_output_popup_elements(state, renderer, output_id);
     let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
@@ -299,7 +464,8 @@ fn render_portal_output_to_texture(
         scene,
         output_state,
     )?;
-    let _ = gles_frame.finish()?;
+    let sync = gles_frame.finish()?;
+    renderer.wait(&sync)?;
     Ok(())
 }
 
@@ -316,28 +482,127 @@ fn render_portal_output_to_dmabuf(
     transform: Transform,
     target_dmabuf: &mut Dmabuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt)?;
-    let mut target = renderer.bind(target_dmabuf)?;
-    let client_elements = build_output_client_elements(state, renderer, output_id);
-    let popup_elements = build_output_popup_elements(state, renderer, output_id);
-    let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
-    draw_output(
+    // Render to an intermediate texture (same path as the DRM monitor), then blit into the
+    // portal dmabuf. Direct draws into client-imported dmabufs miss chrome on some drivers.
+    let mut capture_tex = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, Buffer>::from((render_size.w, render_size.h)),
+    )?;
+    render_portal_output_to_texture(
         state,
-        &mut gles_frame,
-        &prepared,
-        &client_elements,
-        &popup_elements,
+        renderer,
+        output_id,
+        render_size,
         ui_state,
         scene,
         output_state,
+        now,
+        dt,
+        transform,
+        &mut capture_tex,
     )?;
-    let _ = gles_frame.finish()?;
+    blit_texture_to_dmabuf(
+        renderer,
+        capture_tex,
+        render_size,
+        transform,
+        target_dmabuf,
+    )
+}
+
+/// Copy the DRM offscreen texture into a portal dmabuf using the same FBO readback path as
+/// internal screenshots. `render_texture_from_to` from the texture handle alone drops chrome on
+/// some GLES stacks; bound-FBO readback matches what you see on the monitor.
+fn blit_offscreen_source_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    render_size: Size<i32, Physical>,
+    transform: Transform,
+    target_dmabuf: &mut Dmabuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bound = texture;
+    let rgba = read_bound_offscreen_rgba(renderer, &mut bound, render_size)?;
+    let imported = renderer.import_memory(
+        &rgba,
+        Fourcc::Abgr8888,
+        Size::from((render_size.w, render_size.h)),
+        false,
+    )?;
+    blit_texture_to_dmabuf(
+        renderer,
+        imported,
+        render_size,
+        transform,
+        target_dmabuf,
+    )
+}
+
+fn read_bound_offscreen_rgba(
+    renderer: &mut GlesRenderer,
+    texture: &mut GlesTexture,
+    render_size: Size<i32, Physical>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use smithay::backend::renderer::gles::ffi;
+
+    let target = renderer.bind(texture)?;
+    let region = Rectangle::<i32, Buffer>::from_loc_and_size(
+        Point::from((0, 0)),
+        Size::from((render_size.w, render_size.h)),
+    );
+
+    renderer
+        .with_context(|gl| unsafe {
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+        })
+        .map_err(|e| format!("portal readback GL state: {e}"))?;
+
+    let mapping = renderer
+        .copy_framebuffer(&target, region, Fourcc::Abgr8888)
+        .map_err(|e| format!("portal copy_framebuffer: {e}"))?;
+    renderer
+        .with_context(|gl| unsafe {
+            gl.Finish();
+        })
+        .map_err(|e| format!("portal readback Finish: {e}"))?;
+    Ok(renderer
+        .map_texture(&mapping)
+        .map_err(|e| format!("portal map_texture: {e}"))?
+        .to_vec())
+}
+
+fn blit_texture_to_dmabuf(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    render_size: Size<i32, Physical>,
+    transform: Transform,
+    target_dmabuf: &mut Dmabuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut target = renderer.bind(target_dmabuf)?;
+    let mut frame = renderer.render(&mut target, render_size, transform)?;
+    let dest = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), render_size);
+    let src = Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (render_size.w as f64, render_size.h as f64),
+    );
+    frame.render_texture_from_to(
+        &texture,
+        src,
+        dest,
+        std::slice::from_ref(&dest),
+        &[],
+        transform,
+        1.0,
+        None,
+        &[],
+    )?;
+    let sync = frame.finish()?;
+    renderer.wait(&sync)?;
     Ok(())
 }
 
 fn write_rgba_to_shm_buffer(
     buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
-    buffer_size: Size<i32, BufferCoords>,
+    buffer_size: Size<i32, Buffer>,
     rgba: &[u8],
 ) -> Result<(), ()> {
     let width = buffer_size.w as usize;

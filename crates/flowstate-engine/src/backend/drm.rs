@@ -3,7 +3,7 @@
 
 use crate::backend::common::{
     bootstrap_compositor_core, finish_xwayland_startup, physical_size_mm_from_pixels,
-    start_xwayland,
+    refresh_portal_services, start_xwayland,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, Mode};
@@ -988,10 +988,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.tick_layout();
 
         let screenshot_output = data.core.state.screenshot_request();
+        let portal_active = !data.core.state.image_copy_capture_sessions.is_empty();
         let should_render = data.core.state.needs_redraw()
             || screenshot_output.is_some()
-            || data.core.state.screenshot_all_requested;
+            || data.core.state.screenshot_all_requested
+            || portal_active;
         if !should_render {
+            if portal_active {
+                if let Some(device) = data.backend.devices.values_mut().next() {
+                    crate::core::portal::complete_pending_portal_captures(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        &mut data.core.ui_state,
+                        &data.core.scene,
+                        &data.core.output_state,
+                        now,
+                        dt,
+                    );
+                }
+            }
             continue;
         }
         data.core.last_now = now;
@@ -1003,6 +1018,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 let wants_screenshot = screenshot_output == Some(surface.output_id);
                 let should_skip = !data.core.state.render.redraw_all
                     && !data.core.state.screenshot_all_requested
+                    && !portal_active
                     && !pending_damage
                     && !wants_screenshot
                     && !owns_cursor;
@@ -1025,6 +1041,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     &mut data.core.ui_state,
                     now,
                     dt,
+                    portal_active,
                 )?;
 
                 ensure_offscreen_texture(
@@ -1071,11 +1088,36 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &data.core.output_state,
                     )?;
 
-                    // Do not block on the GL fence here. The DRM compositor imports this texture
-                    // on the same render path, and waiting in the modeset/present loop can wedge
-                    // some drivers. Screenshot readback does its own explicit finish.
-                    let _ = frame.finish()?;
+                    let sync = frame.finish()?;
+                    if portal_active {
+                        device.renderer.wait(&sync)?;
+                    }
                 }
+
+                if let Some(offscreen) = surface.offscreen.as_ref() {
+                    data.core.state.portal_capture_source.insert(
+                        surface.output_id,
+                        crate::core::portal::PortalCaptureSource {
+                            texture: offscreen.texture.clone(),
+                            size: surface.size,
+                            captured_at: now,
+                        },
+                    );
+                }
+
+                if portal_active {
+                    crate::core::portal::complete_pending_portal_captures_for_output(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        &mut data.core.ui_state,
+                        &data.core.scene,
+                        &data.core.output_state,
+                        surface.output_id,
+                        now,
+                        dt,
+                    );
+                }
+
                 if wants_screenshot {
                     data.core.state.screenshot_seq += 1;
                     let seq = data.core.state.screenshot_seq;
@@ -1214,6 +1256,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                 if !frame_result.is_empty {
                     surface.drm_output.queue_frame(None)?;
+                    data.core.state.compositor_ready = true;
                 }
             }
 
@@ -1229,6 +1272,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     )),
                     Err(err) => flog(&format!("All-outputs screenshot failed: {err}")),
                 }
+            }
+        }
+
+        if portal_active {
+            if let Some(device) = data.backend.devices.values_mut().next() {
+                crate::core::portal::complete_pending_portal_captures(
+                    &mut data.core.state,
+                    &mut device.renderer,
+                    &mut data.core.ui_state,
+                    &data.core.scene,
+                    &data.core.output_state,
+                    now,
+                    dt,
+                );
             }
         }
 
@@ -1735,6 +1792,10 @@ fn device_added(
 
     if let Err(err) = write_display_config(&displays) {
         flog(&format!("Failed to write display config: {err}"));
+    }
+
+    if !displays.is_empty() {
+        refresh_portal_services(&data.core.state.client_wayland_display);
     }
 
     data.backend.devices.insert(node, temp_device);

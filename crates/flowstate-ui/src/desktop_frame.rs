@@ -15,6 +15,8 @@ pub struct DesktopFrameCtx {
     pub start_time: Instant,
     /// Flip egui geometry vertically for raw egui_glow painting on DRM framebuffers.
     pub flip_egui_y: bool,
+    /// True while rendering a frame destined for portal/OBS capture on this output.
+    pub portal_capture: bool,
 }
 
 impl DesktopFrameCtx {

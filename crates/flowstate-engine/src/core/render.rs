@@ -97,6 +97,8 @@ pub struct FrameCtx {
     pub active_output: OutputId,
     pub rendering_output: OutputId,
     pub focus_pulse: f32,
+    /// Full-frame portal/OBS capture — keep egui and chrome on the captured output.
+    pub portal_capture: bool,
     //pub time: f32,
 }
 
@@ -113,6 +115,7 @@ impl FrameCtx {
         active_output: OutputId,
         rendering_output: OutputId,
         focus_pulse: f32,
+        portal_capture: bool,
     ) -> Self {
         Self {
             output_size,
@@ -126,6 +129,7 @@ impl FrameCtx {
             active_output,
             rendering_output,
             focus_pulse,
+            portal_capture,
         }
     }
 }
@@ -150,6 +154,8 @@ pub struct RenderState {
     pub start_time: Instant,
     //pub chrome_svg: ChromeSvgCache,
     pub font_atlas_texture: Option<GlesTexture>,
+    pub fonts_prewarm_done: bool,
+    pub portal_capture_blit_id: Id,
 }
 
 pub struct RenderInputs<'a> {
@@ -201,6 +207,11 @@ fn to_physical_rect(
     scale: Scale<f64>,
 ) -> Rectangle<i32, Physical> {
     rect_logical.to_physical_precise_round(scale)
+}
+
+/// Smithay pixel/texture draws expect damage in dest-local coordinates.
+fn dest_local_damage(size: Size<i32, Physical>) -> [Rectangle<i32, Physical>; 1] {
+    [Rectangle::from_loc_and_size((0, 0), (size.w, size.h))]
 }
 
 fn themed_icon_style(theme: &FlowTheme, state: UiVisualState) -> UiVisualStyle {
@@ -442,6 +453,8 @@ impl RenderState {
             start_time: Instant::now(),
 
             font_atlas_texture: None,
+            fonts_prewarm_done: false,
+            portal_capture_blit_id: Id::new(),
         }
     }
 
@@ -1176,7 +1189,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         style: &TopBarStyle,
     ) -> Result<(), GlesError> {
         use smithay::backend::renderer::gles::Uniform;
@@ -1189,13 +1202,14 @@ impl RenderState {
         );
 
         let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
+        let damage_local = dest_local_damage(rect_physical.size);
 
         frame.render_pixel_shader_to(
             program,
             src_rect,
             rect_physical,
             buffer_size,
-            Some(damage),
+            Some(&damage_local),
             1.0,
             &[
                 Uniform::new(
@@ -1221,7 +1235,7 @@ impl RenderState {
         button: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         style: &ButtonStyle,
     ) {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -1232,13 +1246,14 @@ impl RenderState {
         );
 
         let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
+        let damage_local = dest_local_damage(rect_physical.size);
 
         let _ = frame.render_pixel_shader_to(
             button,
             src_rect,
             rect_physical,
             buffer_size,
-            Some(damage),
+            Some(&damage_local),
             1.0,
             &[
                 Uniform::new(
@@ -1437,11 +1452,21 @@ impl RenderState {
             now: inputs.ctx.now,
             start_time: self.start_time,
             flip_egui_y: inputs.flip_egui_y,
+            portal_capture: inputs.ctx.portal_capture,
+        };
+        let full_output_damage = [Rectangle::<i32, Physical>::from_loc_and_size(
+            (0, 0),
+            Size::<i32, Physical>::from(inputs.ctx.output_size),
+        )];
+        let egui_damage = if self.egui.has_open_panels() || inputs.ctx.portal_capture {
+            &full_output_damage[..]
+        } else {
+            &inputs.ctx.damage[..]
         };
         self.egui.render(
             frame,
             &egui_frame_ctx,
-            &inputs.ctx.damage,
+            egui_damage,
             &self.chrome_shaders,
             theme,
         )?;
@@ -1785,7 +1810,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         style: &GlassStyle,
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -1795,6 +1820,7 @@ impl RenderState {
         );
         let dst_rect_physical = rect_physical;
         let size = Size::from((rect_physical.size.w, rect_physical.size.h));
+        let damage_local = dest_local_damage(rect_physical.size);
 
         let t = ctx.now.duration_since(self.start_time).as_secs_f32();
 
@@ -1817,7 +1843,7 @@ impl RenderState {
             src_rect,          // Rectangle<f64, Buffer>
             dst_rect_physical, // Rectangle<i32, Physical>
             size,              // Size<i32, Buffer>
-            Some(damage),      // Option<&[Rectangle<i32, Physical>]>
+            Some(&damage_local),
             1.0,               // alpha
             &uniforms,
         )
@@ -1828,7 +1854,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         style: &BevelStyle,
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -1838,6 +1864,7 @@ impl RenderState {
         );
         let dst_rect_physical = rect_physical;
         let size = Size::from((rect_physical.size.w, rect_physical.size.h));
+        let damage_local = dest_local_damage(rect_physical.size);
 
         let uniforms = [
             Uniform::new("u_bevel", style.bevel),
@@ -1856,7 +1883,7 @@ impl RenderState {
             src_rect,          // Rectangle<f64, Buffer>
             dst_rect_physical, // Rectangle<i32, Physical>
             size,              // Size<i32, Buffer>
-            Some(damage),      // Option<&[Rectangle<i32, Physical>]>
+            Some(&damage_local),
             1.0,               // alpha
             &uniforms,
         )
@@ -1867,7 +1894,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
         style: &LightChannelStyle,
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -1878,6 +1905,7 @@ impl RenderState {
             (rect_physical.size.w as f64, rect_physical.size.h as f64),
         );
         let size = Size::from((rect_physical.size.w, rect_physical.size.h));
+        let damage_local = dest_local_damage(rect_physical.size);
 
         let uniforms = [
             Uniform::new("u_slot_inset", style.slot_inset),
@@ -1894,7 +1922,7 @@ impl RenderState {
             src_rect,          // Rectangle<f64, Buffer>
             dst_rect_physical, // Rectangle<i32, Physical>
             size,              // Size<i32, Buffer>
-            Some(damage),      // Option<&[Rectangle<i32, Physical>]>
+            Some(&damage_local),
             1.0,               // alpha
             &uniforms,
         )
@@ -1994,14 +2022,11 @@ impl RenderState {
         _output: &OutputState,
         bg: BackgroundTheme,
     ) {
-        let full: Rectangle<i32, Physical> = Rectangle::new((0, 0).into(), ctx.output_size.into());
-        let full_damage = [full];
         let c = bg.color;
-
-        frame
-            .clear(Color32F::new(c[0], c[1], c[2], c[3]), &full_damage)
-            //.clear(Color32F::new(0.07, 0.08, 0.10, 1.0), &full_damage)
-            .unwrap();
+        let color = Color32F::new(c[0], c[1], c[2], c[3]);
+        for rect in &ctx.damage {
+            frame.clear(color, std::slice::from_ref(rect)).unwrap();
+        }
     }
 
     pub fn draw_wallpaper_in_rect(
@@ -2329,7 +2354,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        damage: &[Rectangle<i32, Physical>],
+        _damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
         let src_rect = Rectangle::<f64, Buffer>::from_loc_and_size(
@@ -2338,13 +2363,14 @@ impl RenderState {
         );
 
         let size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
+        let damage_local = dest_local_damage(rect_physical.size);
 
         frame.render_pixel_shader_to(
             program,
             src_rect,
             rect_physical,
             size,
-            Some(damage),
+            Some(&damage_local),
             1.0,
             &[
                 //Uniform::new("u_color", [1.0, 0.58, 0.12, 1.0]),
@@ -2848,7 +2874,8 @@ impl RenderState {
                 let state = el.visual_state();
                 let mut style = themed_icon_style(active_theme, state);
 
-                let is_active_output = ctx.rendering_output == ctx.active_output;
+                let is_active_output =
+                    ctx.rendering_output == ctx.active_output || ctx.portal_capture;
                 let output_factor = if is_active_output { 1.0 } else { 0.75 };
 
                 // Dim only the icon color/alpha on inactive outputs.

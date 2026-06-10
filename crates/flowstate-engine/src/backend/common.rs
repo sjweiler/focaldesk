@@ -342,45 +342,56 @@ fn publish_portal_environment(wayland_display: &str) {
             "failed to publish portal environment: dbus-update-activation-environment: {err}"
         )),
     }
+}
 
-    if std::env::var_os("FLOWSTATE_RESTART_PORTALS").is_some() {
-        let status = std::process::Command::new("systemctl")
-            .args(["--user", "reset-failed", "xdg-desktop-portal-wlr.service"])
-            .status();
+/// Restart portal services so xdg-desktop-portal-wlr reconnects and discovers current `wl_output`s.
+/// xdpw only roundtrips the registry once at service start; outputs added later are invisible until restart.
+fn restart_portal_services() {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "reset-failed", "xdg-desktop-portal-wlr.service"])
+        .status();
 
-        match status {
-            Ok(status) if status.success() => {
-                flog("reset failed state for xdg-desktop-portal-wlr.service")
-            }
-            Ok(status) => flog(&format!(
-                "failed to reset xdg-desktop-portal-wlr.service state: systemctl exited with {status}"
-            )),
-            Err(err) => flog(&format!(
-                "failed to reset xdg-desktop-portal-wlr.service state: systemctl: {err}"
-            )),
-        }
-
-        let status = std::process::Command::new("systemctl")
-            .args([
-                "--user",
-                "restart",
-                "xdg-desktop-portal.service",
-                "xdg-desktop-portal-wlr.service",
-            ])
-            .status();
-
-        match status {
-            Ok(status) if status.success() => {
-                flog("restarted xdg-desktop-portal and xdg-desktop-portal-wlr")
-            }
-            Ok(status) => flog(&format!(
-                "failed to restart xdg-desktop-portal services: systemctl exited with {status}"
-            )),
-            Err(err) => flog(&format!(
-                "failed to restart xdg-desktop-portal services: systemctl: {err}"
-            )),
-        }
+    match status {
+        Ok(status) if status.success() => flog("reset failed state for xdg-desktop-portal-wlr.service"),
+        Ok(status) => flog(&format!(
+            "failed to reset xdg-desktop-portal-wlr.service state: systemctl exited with {status}"
+        )),
+        Err(err) => flog(&format!(
+            "failed to reset xdg-desktop-portal-wlr.service state: systemctl: {err}"
+        )),
     }
+
+    let status = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "restart",
+            "--no-block",
+            "xdg-desktop-portal.service",
+            "xdg-desktop-portal-wlr.service",
+        ])
+        .status();
+
+    match status {
+        Ok(status) if status.success() => {
+            flog("requested async restart of xdg-desktop-portal and xdg-desktop-portal-wlr")
+        }
+        Ok(status) => flog(&format!(
+            "failed to restart xdg-desktop-portal services: systemctl exited with {status}"
+        )),
+        Err(err) => flog(&format!(
+            "failed to restart xdg-desktop-portal services: systemctl: {err}"
+        )),
+    }
+}
+
+/// Publish FlowState's client socket to portal services and restart them (best-effort).
+pub(crate) fn refresh_portal_services(wayland_display: &str) {
+    publish_portal_environment(wayland_display);
+    if std::env::var_os("FLOWSTATE_SKIP_PORTAL_RESTART").is_some() {
+        flog("skipping portal service restart (FLOWSTATE_SKIP_PORTAL_RESTART is set)");
+        return;
+    }
+    restart_portal_services();
 }
 
 /// Build [`Display`], globals, and [`DesktopState`] for a nested output of the given size and scale.
