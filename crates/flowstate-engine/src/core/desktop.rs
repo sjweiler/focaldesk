@@ -553,7 +553,11 @@ impl DesktopState {
         if !self.render.egui.has_open_panels() {
             return;
         }
-        let output_id = self.focused_output;
+        let output_id = self
+            .render
+            .egui
+            .owner_output()
+            .unwrap_or(self.focused_output);
         let Some(frame_ctx) = self.egui_frame_ctx_for_output(output_id, Instant::now()) else {
             return;
         };
@@ -599,11 +603,18 @@ impl DesktopState {
             return false;
         }
 
+        let Some(owner_output) = self.render.egui.owner_output() else {
+            return false;
+        };
+
         let egui_event = match *event {
             FlowInputEvent::PointerMoved { position } => {
                 let Some(output_id) = self.output_under_pointer(position) else {
                     return false;
                 };
+                if output_id != owner_output {
+                    return false;
+                }
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
@@ -621,6 +632,9 @@ impl DesktopState {
                 let Some(output_id) = self.output_under_pointer(position) else {
                     return false;
                 };
+                if output_id != owner_output {
+                    return false;
+                }
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
@@ -637,6 +651,9 @@ impl DesktopState {
                 let Some(output_id) = self.output_under_pointer(position) else {
                     return false;
                 };
+                if output_id != owner_output {
+                    return false;
+                }
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
@@ -663,12 +680,17 @@ impl DesktopState {
                 state,
                 repeat,
                 modifiers,
-            } => EguiInputEvent::Key {
-                key: Self::egui_key(keycode),
-                pressed: matches!(state, FlowKeyState::Pressed),
-                repeat,
-                modifiers: Self::egui_modifiers(modifiers),
-            },
+            } => {
+                if self.focused_output != owner_output {
+                    return false;
+                }
+                EguiInputEvent::Key {
+                    key: Self::egui_key(keycode),
+                    pressed: matches!(state, FlowKeyState::Pressed),
+                    repeat,
+                    modifiers: Self::egui_modifiers(modifiers),
+                }
+            }
             _ => return false,
         };
 
@@ -1186,7 +1208,7 @@ impl DesktopState {
             }
 
             UiAction::OpenPanel(panel) => {
-                self.render.egui.open_panel(panel);
+                self.render.egui.open_panel(panel, self.focused_output);
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
@@ -2623,7 +2645,9 @@ impl DesktopState {
             }
 
             KeyAction::ToggleLauncher => {
-                self.render.egui.open_panel(PanelKind::AppLauncher);
+                self.render
+                    .egui
+                    .open_panel(PanelKind::AppLauncher, self.focused_output);
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 

@@ -479,9 +479,10 @@ pub fn draw_output(
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         portal_capture: prepared.frame_ctx.portal_capture,
     };
-    if (prepared.frame_ctx.rendering_output == prepared.frame_ctx.active_output
-        || prepared.frame_ctx.portal_capture)
-        && state.render.egui.has_open_panels()
+    if state
+        .render
+        .egui
+        .is_open_on_output(prepared.frame_ctx.rendering_output)
     {
         state.sync_egui(&egui_frame_ctx);
     }

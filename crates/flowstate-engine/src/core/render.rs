@@ -1458,7 +1458,9 @@ impl RenderState {
             (0, 0),
             Size::<i32, Physical>::from(inputs.ctx.output_size),
         )];
-        let egui_damage = if self.egui.has_open_panels() || inputs.ctx.portal_capture {
+        let egui_damage = if self.egui.is_open_on_output(inputs.ctx.rendering_output)
+            || inputs.ctx.portal_capture
+        {
             &full_output_damage[..]
         } else {
             &inputs.ctx.damage[..]

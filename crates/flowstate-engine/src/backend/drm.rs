@@ -1033,6 +1033,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                 let buffer_size = Size::from((surface.size.w, surface.size.h));
 
+                if portal_active {
+                    data.core.state.render.redraw_all = true;
+                }
                 let prepared = prepare_output(
                     &mut data.core.state,
                     &mut device.renderer,
@@ -1095,6 +1098,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 if let Some(offscreen) = surface.offscreen.as_ref() {
+                    flog(&format!(
+                        "DRM stores portal source output={:?} tex_size={}x{} surface_size={}x{}",
+                        surface.output_id,
+                        offscreen.size.w,
+                        offscreen.size.h,
+                        surface.size.w,
+                        surface.size.h,
+                    ));
+
                     data.core.state.portal_capture_source.insert(
                         surface.output_id,
                         crate::core::portal::PortalCaptureSource {

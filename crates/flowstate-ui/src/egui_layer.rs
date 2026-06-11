@@ -11,6 +11,7 @@ use egui_glow::Painter;
 use flowstate_logging::{flog_error, flog_info};
 use flowstate_themes::FlowTheme;
 use glow;
+use flowstate_types::OutputId;
 use smithay::backend::egl::get_proc_address;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesPixelProgram, Uniform};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Size};
@@ -47,6 +48,7 @@ pub struct EguiLayer {
     dumped_font_mesh: bool,
     last_font_atlas_rgba: Option<Vec<u8>>,
     last_pointer_pos: Option<Pos2>,
+    owner_output: Option<OutputId>,
     pub screen_height_pts: f32,
     pub last_frame_ctx: Option<DesktopFrameCtx>,
 }
@@ -153,6 +155,7 @@ impl Default for EguiLayer {
             dumped_font_mesh: false,
             last_font_atlas_rgba: None,
             last_pointer_pos: None,
+            owner_output: None,
             screen_height_pts: 1.0,
             last_frame_ctx: None,
             settings: SettingsPanel::default(),
@@ -274,16 +277,52 @@ impl EguiLayer {
             || self.debug.open
     }
 
-    pub fn open_panel(&mut self, panel: PanelKind) {
+    pub fn owner_output(&self) -> Option<OutputId> {
+        self.owner_output
+    }
+
+    pub fn is_open_on_output(&self, output: OutputId) -> bool {
+        self.has_open_panels() && self.owner_output == Some(output)
+    }
+
+    pub fn open_panel(&mut self, panel: PanelKind, owner_output: OutputId) {
+        let mut opened = false;
         match panel {
-            PanelKind::Settings => self.settings.open = !self.settings.open,
-            PanelKind::AppLauncher => self.launcher.open = !self.launcher.open,
-            PanelKind::Network => self.network.open = !self.network.open,
-            PanelKind::Bluetooth => self.bluetooth.open = !self.bluetooth.open,
-            PanelKind::Audio => self.audio.open = !self.audio.open,
-            PanelKind::Power => self.power.open = !self.power.open,
-            PanelKind::Calendar => self.calendar.open = !self.calendar.open,
+            PanelKind::Settings => {
+                self.settings.open = !self.settings.open;
+                opened = self.settings.open;
+            }
+            PanelKind::AppLauncher => {
+                self.launcher.open = !self.launcher.open;
+                opened = self.launcher.open;
+            }
+            PanelKind::Network => {
+                self.network.open = !self.network.open;
+                opened = self.network.open;
+            }
+            PanelKind::Bluetooth => {
+                self.bluetooth.open = !self.bluetooth.open;
+                opened = self.bluetooth.open;
+            }
+            PanelKind::Audio => {
+                self.audio.open = !self.audio.open;
+                opened = self.audio.open;
+            }
+            PanelKind::Power => {
+                self.power.open = !self.power.open;
+                opened = self.power.open;
+            }
+            PanelKind::Calendar => {
+                self.calendar.open = !self.calendar.open;
+                opened = self.calendar.open;
+            }
             _ => {}
+        }
+
+        if opened {
+            self.owner_output = Some(owner_output);
+        } else if !self.has_open_panels() {
+            self.owner_output = None;
         }
     }
 
@@ -381,6 +420,7 @@ impl EguiLayer {
         self.power.open = false;
         self.calendar.open = false;
         self.debug.open = false;
+        self.owner_output = None;
     }
 
     pub fn wants_pointer_input(&self) -> bool {
@@ -414,7 +454,7 @@ impl EguiLayer {
             return Ok(());
         }
 
-        if frame_ctx.rendering_output != frame_ctx.active_output && !frame_ctx.portal_capture {
+        if self.owner_output != Some(frame_ctx.rendering_output) {
             return Ok(());
         }
 

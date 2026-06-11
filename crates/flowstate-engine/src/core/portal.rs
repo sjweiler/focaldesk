@@ -118,7 +118,9 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
     }
 
     if state.backend_kind == flowstate_flow::keybinds::BackendKind::Drm {
-        state.pending_portal_captures.push(PendingPortalCapture { output_id, frame });
+        state
+            .pending_portal_captures
+            .push(PendingPortalCapture { output_id, frame });
         return;
     }
 
@@ -218,6 +220,33 @@ pub fn complete_pending_portal_captures_for_output(
     }
 }
 
+fn blit_offscreen_source_to_dmabuf_scaled(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    source_size: Size<i32, Physical>,
+    target_size: Size<i32, Physical>,
+    transform: Transform,
+    target_dmabuf: &mut Dmabuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut bound = texture;
+    let rgba = read_bound_offscreen_rgba(renderer, &mut bound, source_size)?;
+    let imported = renderer.import_memory(
+        &rgba,
+        Fourcc::Abgr8888,
+        Size::from((source_size.w, source_size.h)),
+        false,
+    )?;
+
+    blit_texture_to_dmabuf_scaled(
+        renderer,
+        imported,
+        source_size,
+        target_size,
+        transform,
+        target_dmabuf,
+    )
+}
+
 fn complete_portal_frame(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -246,8 +275,10 @@ fn complete_portal_frame(
         }
     };
 
-    if buffer_size.w != desk_output.physical_size.w || buffer_size.h != desk_output.physical_size.h
-    {
+    let output_size = desk_output.physical_size; // real monitor size, e.g. 2560x1440
+    let stream_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h)); // OBS, e.g. 2048x1152
+
+    if buffer_size.w <= 0 || buffer_size.h <= 0 {
         frame.fail(CaptureFailureReason::BufferConstraints);
         return;
     }
@@ -286,13 +317,15 @@ fn complete_portal_frame(
         if let Some(node) = state.dmabuf_node {
             dmabuf.set_node(node);
         }
-        let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
+        let render_size = output_size;
+        let target_size = stream_size;
         let render_res = if let Some(source) = state.portal_capture_source.get(&output_id) {
             if source.size == render_size {
-                blit_offscreen_source_to_dmabuf(
+                blit_offscreen_source_to_dmabuf_scaled(
                     renderer,
                     source.texture.clone(),
-                    render_size,
+                    render_size, // 2560x1440 source
+                    target_size, // 2048x1152 OBS buffer
                     transform,
                     &mut dmabuf,
                 )
@@ -387,8 +420,7 @@ fn complete_portal_frame(
             return;
         }
 
-        let region =
-            Rectangle::<i32, Buffer>::from_loc_and_size(Point::from((0, 0)), buffer_size);
+        let region = Rectangle::<i32, Buffer>::from_loc_and_size(Point::from((0, 0)), buffer_size);
         match (|| -> Result<Vec<u8>, smithay::backend::renderer::gles::GlesError> {
             let mapping = renderer.copy_texture(&capture_tex, region, Fourcc::Abgr8888)?;
             let src = renderer.map_texture(&mapping)?;
@@ -450,7 +482,16 @@ fn render_portal_output_to_texture(
     target_texture: &mut GlesTexture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut target = renderer.bind(target_texture)?;
-    let prepared = prepare_output(state, renderer, output_id, render_size, ui_state, now, dt, true)?;
+    let prepared = prepare_output(
+        state,
+        renderer,
+        output_id,
+        render_size,
+        ui_state,
+        now,
+        dt,
+        true,
+    )?;
     let client_elements = build_output_client_elements(state, renderer, output_id);
     let popup_elements = build_output_popup_elements(state, renderer, output_id);
     let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
@@ -501,13 +542,7 @@ fn render_portal_output_to_dmabuf(
         transform,
         &mut capture_tex,
     )?;
-    blit_texture_to_dmabuf(
-        renderer,
-        capture_tex,
-        render_size,
-        transform,
-        target_dmabuf,
-    )
+    blit_texture_to_dmabuf(renderer, capture_tex, render_size, transform, target_dmabuf)
 }
 
 /// Copy the DRM offscreen texture into a portal dmabuf using the same FBO readback path as
@@ -528,13 +563,7 @@ fn blit_offscreen_source_to_dmabuf(
         Size::from((render_size.w, render_size.h)),
         false,
     )?;
-    blit_texture_to_dmabuf(
-        renderer,
-        imported,
-        render_size,
-        transform,
-        target_dmabuf,
-    )
+    blit_texture_to_dmabuf(renderer, imported, render_size, transform, target_dmabuf)
 }
 
 fn read_bound_offscreen_rgba(
@@ -583,6 +612,37 @@ fn blit_texture_to_dmabuf(
     let src = Rectangle::<f64, Buffer>::from_loc_and_size(
         (0.0, 0.0),
         (render_size.w as f64, render_size.h as f64),
+    );
+    frame.render_texture_from_to(
+        &texture,
+        src,
+        dest,
+        std::slice::from_ref(&dest),
+        &[],
+        transform,
+        1.0,
+        None,
+        &[],
+    )?;
+    let sync = frame.finish()?;
+    renderer.wait(&sync)?;
+    Ok(())
+}
+
+fn blit_texture_to_dmabuf_scaled(
+    renderer: &mut GlesRenderer,
+    texture: GlesTexture,
+    source_size: Size<i32, Physical>,
+    target_size: Size<i32, Physical>,
+    transform: Transform,
+    target_dmabuf: &mut Dmabuf,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut target = renderer.bind(target_dmabuf)?;
+    let mut frame = renderer.render(&mut target, target_size, transform)?;
+    let dest = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), target_size);
+    let src = Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (source_size.w as f64, source_size.h as f64),
     );
     frame.render_texture_from_to(
         &texture,

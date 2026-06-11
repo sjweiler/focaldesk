@@ -5,7 +5,7 @@
 
 use smithay::output::Output;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
-use smithay::utils::Transform;
+use smithay::utils::{Buffer, Size};
 use smithay::wayland::image_capture_source::{
     ImageCaptureSource, ImageCaptureSourceHandler, ImageCaptureSourceState,
     OutputCaptureSourceHandler, OutputCaptureSourceState,
@@ -46,30 +46,43 @@ impl ImageCopyCaptureHandler for DesktopState {
         use smithay::output::WeakOutput;
         let weak_output = source.user_data().get::<WeakOutput>()?;
         let output = weak_output.upgrade()?;
-        let mode = output.current_mode()?;
+        let capture_size = self
+            .outputs
+            .values()
+            .find(|desk_output| desk_output.handle == output)
+            .map(|desk_output| {
+                Size::<i32, Buffer>::from((
+                    desk_output.physical_size.w,
+                    desk_output.physical_size.h,
+                ))
+            })
+            .or_else(|| {
+                let mode = output.current_mode()?;
+                Some(Size::<i32, Buffer>::from((mode.size.w, mode.size.h)))
+            })?;
 
-        let dma = self.dmabuf_node.filter(|_| !self.portal_dmabuf_formats.is_empty()).map(
-            |node| DmabufConstraints {
+        let dma = self
+            .dmabuf_node
+            .filter(|_| !self.portal_dmabuf_formats.is_empty())
+            .map(|node| DmabufConstraints {
                 node,
                 formats: self.portal_dmabuf_formats.clone(),
-            },
-        );
+            });
 
         // On DRM, prefer zero-copy dmabuf capture for OBS / xdg-desktop-portal-wlr. SHM would
         // require a GPU readback (`copy_texture`) on every frame.
-        let shm = if dma.is_some()
-            && self.backend_kind == flowstate_flow::keybinds::BackendKind::Drm
-        {
-            vec![]
-        } else {
-            vec![
-                smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
-                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
-            ]
-        };
+        let shm =
+            if dma.is_some() && self.backend_kind == flowstate_flow::keybinds::BackendKind::Drm {
+                vec![]
+            } else {
+                vec![
+                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
+                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
+                ]
+            };
 
         Some(BufferConstraints {
-            size: mode.size.to_logical(1).to_buffer(1, Transform::Normal),
+            size: capture_size,
             shm,
             dma,
         })
