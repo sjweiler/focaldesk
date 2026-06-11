@@ -2,7 +2,7 @@
 name = "flowstate-memory"
 version = "0.1.0"
 edition = "2021"
-description = "Core primitives, traits, and shared types for FlowState"
+description = "Core primitives, traits, and shared types for FocusShell"
 license = "MIT"
 authors = ["Steve"]
 

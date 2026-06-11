@@ -2,7 +2,7 @@
 name = "flowstate-server"
 version = "0.1.0"
 edition = "2021"
-description = "FlowState background server and IPC daemon"
+description = "FocusShell background server and IPC daemon"
 license = "MIT"
 
 [[bin]]
@@ -14,6 +14,7 @@ flowstate-ai = { path = "../../crates/flowstate-ai" }
 flowstate-memory = { path = "../../crates/flowstate-memory" }
 
 flowstate-engine = { path = "../../crates/flowstate-engine" }
+flowstate-logging = { path = "../../crates/flowstate-logging" }
 
 # Async runtime (server usually async)
 tokio = { version = "1", features = ["full"] }

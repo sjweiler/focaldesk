@@ -1,5 +1,5 @@
-//! FlowState compositor configuration (TOML on disk).
+//! FocusShell compositor configuration (TOML on disk).
 
 mod config;
 
-pub use config::{load_config, save_config, FlowStateConfig};
+pub use config::{load_config, save_config, FocusShellConfig};

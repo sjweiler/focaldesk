@@ -1,12 +1,12 @@
 # Security Policy
 
-FlowState is alpha compositor and desktop environment software. Security-sensitive
+FocusShell is alpha compositor and desktop environment software. Security-sensitive
 behavior may include process launching, IPC, permissions, portals, input handling,
 display output, file access, and automation features.
 
 ## Supported Versions
 
-Security fixes are handled on the current default branch. FlowState does not
+Security fixes are handled on the current default branch. FocusShell does not
 currently maintain separate supported release branches.
 
 ## Reporting a Vulnerability
@@ -31,7 +31,7 @@ Include as much of the following as you can safely share:
 ## Response Expectations
 
 Maintainers will acknowledge valid reports when possible, investigate the issue,
-and coordinate a fix before public disclosure. Because FlowState is early alpha,
+and coordinate a fix before public disclosure. Because FocusShell is early alpha,
 response times and release processes may vary.
 
 ## Disclosure

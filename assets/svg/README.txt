@@ -1,4 +1,4 @@
-FlowState display glyph set v1
+FocusShell display glyph set v1
 
 Included:
 - A-Z

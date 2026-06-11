@@ -28,7 +28,7 @@ use smithay::backend::renderer::element::{
 
 use flowstate_flow::keybinds::BackendKind;
 
-// DRM/KMS backend for FlowState.
+// DRM/KMS backend for FocusShell.
 //
 // This is the real hardware backend counterpart to the winit backend.
 // It keeps compositor state shared, but owns its own session/device/input/output plumbing.
@@ -37,7 +37,7 @@ use flowstate_flow::keybinds::BackendKind;
 // - struct layout is real
 // - event loop wiring is real
 // - device/output attach points are real
-// - many internals are still TODO so you can connect them to your existing FlowState code
+// - many internals are still TODO so you can connect them to your existing FocusShell code
 
 use crate::core::backend_render::draw_output;
 use anyhow::{anyhow, Context, Result};
@@ -816,7 +816,7 @@ fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    flog("FLOWSTATE: entered DRM backend");
+    flog("FOCUSSHELL: entered DRM backend");
     let mut event_loop: EventLoop<DrmLoopData> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
@@ -1584,7 +1584,7 @@ fn device_added(
             let make = edid_identity
                 .as_ref()
                 .map(|identity| identity.make.clone())
-                .unwrap_or_else(|| "FlowState".to_string());
+                .unwrap_or_else(|| "FocusShell".to_string());
             let model = edid_identity
                 .as_ref()
                 .map(|identity| identity.model.clone())

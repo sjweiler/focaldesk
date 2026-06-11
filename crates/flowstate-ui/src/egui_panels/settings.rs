@@ -1,6 +1,6 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
-use flowstate_config::{FlowStateConfig, save_config};
+use flowstate_config::{FocusShellConfig, save_config};
 
 fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fill = if selected {
@@ -27,7 +27,7 @@ fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Respon
 pub struct SettingsPanel {
     pub open: bool,
     tab: SettingsPage,
-    config: FlowStateConfig,
+    config: FocusShellConfig,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -46,7 +46,7 @@ impl Default for SettingsPanel {
     fn default() -> Self {
         Self {
             tab: SettingsPage::Appearance,
-            config: FlowStateConfig::default(),
+            config: FocusShellConfig::default(),
             open: false,
         }
     }
@@ -160,7 +160,7 @@ impl SettingsPanel {
 
         let mut open = self.open;
         let mut close_requested = false;
-        let response = egui::Window::new("FlowState Settings")
+        let response = egui::Window::new("FocusShell Settings")
             .default_pos(egui::pos2(
                 frame_ctx.work.loc.x as f32 + 24.0,
                 frame_ctx.work.loc.y as f32 + 24.0,

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FlowStateConfig {
+pub struct FocusShellConfig {
     pub appearance: AppearanceConfig,
     pub displays: DisplaysConfig,
 }
@@ -17,7 +17,7 @@ pub struct AppearanceConfig {
     pub shader_chrome: bool,
 }
 
-impl FlowStateConfig {
+impl FocusShellConfig {
     pub fn load() -> anyhow::Result<Self> {
         Ok(load_config())
     }
@@ -27,7 +27,7 @@ impl FlowStateConfig {
     }
 }
 
-impl Default for FlowStateConfig {
+impl Default for FocusShellConfig {
     fn default() -> Self {
         Self {
             appearance: AppearanceConfig {
@@ -49,16 +49,16 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
-pub fn load_config() -> FlowStateConfig {
+pub fn load_config() -> FocusShellConfig {
     let path = config_path();
 
     match fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => FlowStateConfig::default(),
+        Err(_) => FocusShellConfig::default(),
     }
 }
 
-pub fn save_config(config: &FlowStateConfig) -> Result<()> {
+pub fn save_config(config: &FocusShellConfig) -> Result<()> {
     let path = config_path();
 
     if let Some(parent) = path.parent() {

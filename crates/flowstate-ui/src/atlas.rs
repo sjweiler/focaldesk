@@ -56,7 +56,7 @@ pub enum IconId {
     MicrophoneOff,
     Speaker,
     SpeakerOff,
-    FlowStateLabel,
+    FocusShellLabel,
     Power,
     HDR,
     DiagonalResize,
@@ -460,7 +460,7 @@ where
             IconId::MicrophoneOff,
             include_bytes!("../../../assets/svg/microphone-off.svg"),
         ),
-        //(IconId::FlowStateLabel, include_bytes!("../../../assets/svg/flowstate-logo.svg")),
+        //(IconId::FocusShellLabel, include_bytes!("../../../assets/svg/flowstate-logo.svg")),
         (
             IconId::HDR,
             include_bytes!("../../../assets/svg/hdr-enabled.svg"),

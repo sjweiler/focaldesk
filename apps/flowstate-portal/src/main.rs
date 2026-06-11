@@ -88,7 +88,7 @@ fn screencast_choices() -> Vec<String> {
         return dmenu_choices;
     }
 
-    if let Ok(output) = env::var("FLOWSTATE_SCREENCAST_OUTPUT") {
+    if let Ok(output) = env::var("FOCUSSHELL_SCREENCAST_OUTPUT") {
         let output = output.trim();
         if !output.is_empty() {
             return vec![monitor_choice(output)];
@@ -176,7 +176,7 @@ fn select_choice(choices: &[String]) -> Result<Option<String>> {
         return Ok(Some(choices[0].clone()));
     }
 
-    if let Some(command) = env::var("FLOWSTATE_SCREENCAST_CHOOSER")
+    if let Some(command) = env::var("FOCUSSHELL_SCREENCAST_CHOOSER")
         .ok()
         .filter(|command| !command.trim().is_empty())
     {
@@ -283,9 +283,9 @@ fn print_help() {
     println!();
     println!("Environment:");
     println!(
-        "  FLOWSTATE_SCREENCAST_OUTPUT   Output name to use when no chooser input is provided"
+        "  FOCUSSHELL_SCREENCAST_OUTPUT   Output name to use when no chooser input is provided"
     );
-    println!("  FLOWSTATE_SCREENCAST_CHOOSER  Menu command to use before built-in menu discovery");
+    println!("  FOCUSSHELL_SCREENCAST_CHOOSER  Menu command to use before built-in menu discovery");
 }
 
 #[cfg(test)]

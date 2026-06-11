@@ -2,7 +2,7 @@
 
 
 use super::events::{FlowEvent, Intent, PrivacyDevice};
-use super::state::{ActiveContext, FlowState, OutputId, OutputState, TaskId};
+use super::state::{ActiveContext, FocusShell, OutputId, OutputState, TaskId};
 
 
 /// Actions are *intentional side effects* the Smithay adapter executes:
@@ -46,7 +46,7 @@ impl ReduceResult {
 
 /// Reduce one event into state changes + actions.
 /// Deterministic: no IO, no Smithay types, no time sources.
-pub fn reduce(state: &mut FlowState, ev: FlowEvent) -> ReduceResult {
+pub fn reduce(state: &mut FocusShell, ev: FlowEvent) -> ReduceResult {
     state.tick = state.tick.saturating_add(1);
     let now = state.tick;
 
@@ -339,7 +339,7 @@ fn mru_touch(out: &mut OutputState, task: TaskId) {
     out.mru.push_front(task);
 }
 
-fn touch_meta(state: &mut FlowState, task: TaskId, now: u64) {
+fn touch_meta(state: &mut FocusShell, task: TaskId, now: u64) {
     state
         .task_meta
         .entry(task)
@@ -412,7 +412,7 @@ fn next_pinned_slot(out: &OutputState, reverse: bool) -> Option<u8> {
     }
 }
 
-fn choose_focus_after_close(state: &mut FlowState, rr: &mut ReduceResult, output: OutputId) {
+fn choose_focus_after_close(state: &mut FocusShell, rr: &mut ReduceResult, output: OutputId) {
     let out = state.output_mut(output);
 
     // Rule: if overflow still has tasks -> focus MRU-first overflow
@@ -442,7 +442,7 @@ fn choose_focus_after_close(state: &mut FlowState, rr: &mut ReduceResult, output
 }
 
 fn migrate_task(
-    state: &mut FlowState,
+    state: &mut FocusShell,
     rr: &mut ReduceResult,
     task: TaskId,
     from: OutputId,

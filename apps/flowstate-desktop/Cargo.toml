@@ -2,7 +2,7 @@
 name = "flowstate-desktop"
 version = "0.1.0"
 edition = "2021"
-description = "FlowState desktop compositor executable"
+description = "FocusShell desktop compositor executable"
 license = "MIT"
 
 [[bin]]

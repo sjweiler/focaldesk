@@ -1,12 +1,12 @@
-# FlowState
+# FocusShell
 
-FlowState is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.
+FocusShell is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.
 
 The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop with structured workspaces, clear system feedback, and permissioned automation. See [docs/vision.md](docs/vision.md) for the broader project direction.
 
 ## Status
 
-FlowState is alpha software.
+FocusShell is alpha software.
 
 It is stable enough for daily use by the project owner, but it is still early in
 development. Expect incomplete features, breaking changes, rough edges, and
@@ -21,13 +21,13 @@ to debug Linux desktop, Wayland, graphics, and input issues.
 - `apps/flowstate-settings`: settings app prototype
 - `apps/flowstate-portal`: portal-related app code
 - `services/flowstate-server`: background server and IPC daemon
-- `crates/`: shared FlowState libraries
+- `crates/`: shared FocusShell libraries
 - `assets/`: bundled visual assets
 - `docs/`: design notes and architecture material
 
 ## Requirements
 
-FlowState is currently developed as a Rust workspace for Linux.
+FocusShell is currently developed as a Rust workspace for Linux.
 
 Install Rust from <https://rustup.rs/>.
 
@@ -75,12 +75,12 @@ The main compositor binary is:
 cargo run -p flowstate-desktop
 ```
 
-Because FlowState is alpha compositor/system software, run it from a safe
+Because FocusShell is alpha compositor/system software, run it from a safe
 development session first. Avoid switching important work over to it until you
 know the current state of your local build.
 
 ## License
 
-FlowState is licensed under the MIT License. See [LICENSE](LICENSE).
+FocusShell is licensed under the MIT License. See [LICENSE](LICENSE).
 
 Bundled third-party assets retain their own licenses, including the icon and font license files under `assets/`.

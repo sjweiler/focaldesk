@@ -41,7 +41,7 @@ use crate::core::render::RenderState;
 use crate::core::ui_state::UiState;
 use crate::core::OutputState;
 use crate::core::SceneState;
-use flowstate_config::FlowStateConfig;
+use flowstate_config::FocusShellConfig;
 use flowstate_flow::keybinds::BackendKind;
 use flowstate_settings_core::load_settings;
 use flowstate_themes::theme::BuiltInThemeId;
@@ -386,11 +386,11 @@ fn restart_portal_services() {
     }
 }
 
-/// Publish FlowState's client socket to portal services and restart them (best-effort).
+/// Publish FocusShell's client socket to portal services and restart them (best-effort).
 pub(crate) fn refresh_portal_services(wayland_display: &str) {
     publish_portal_environment(wayland_display);
-    if std::env::var_os("FLOWSTATE_SKIP_PORTAL_RESTART").is_some() {
-        flog("skipping portal service restart (FLOWSTATE_SKIP_PORTAL_RESTART is set)");
+    if std::env::var_os("FOCUSSHELL_SKIP_PORTAL_RESTART").is_some() {
+        flog("skipping portal service restart (FOCUSSHELL_SKIP_PORTAL_RESTART is set)");
         return;
     }
     restart_portal_services();
@@ -403,7 +403,7 @@ pub(crate) fn bootstrap_compositor_core(
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
     publish_portal_environment(&wayland_display);
-    flog(&format!("FlowState client socket is {}", wayland_display));
+    flog(&format!("FocusShell client socket is {}", wayland_display));
 
     let display = Display::<DesktopState>::new()?;
     let dh = display.handle();
@@ -414,7 +414,7 @@ pub(crate) fn bootstrap_compositor_core(
             PhysicalProperties {
                 size: physical_size_mm_from_pixels(bootstrap_output.buffer_size).into(),
                 subpixel: Subpixel::Unknown,
-                make: "FlowState".into(),
+                make: "FocusShell".into(),
                 model: "Nested".into(),
                 serial_number: "flowstate-nested".into(),
             },
@@ -459,7 +459,7 @@ pub(crate) fn bootstrap_compositor_core(
     let chrome = Chrome::new(ChromeMetrics::default());
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
 
-    let config = FlowStateConfig::load().unwrap_or_default();
+    let config = FocusShellConfig::load().unwrap_or_default();
     let settings = load_settings();
 
     let theme_id = if config.appearance.theme.is_empty() {
@@ -468,7 +468,7 @@ pub(crate) fn bootstrap_compositor_core(
         config.appearance.theme.clone()
     };
 
-    flog_info!("FLOWSTATE selected theme_id = {:?}", theme_id);
+    flog_info!("FOCUSSHELL selected theme_id = {:?}", theme_id);
 
     let theme_id = match config.appearance.theme.as_str() {
         "Eagle" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
@@ -480,7 +480,7 @@ pub(crate) fn bootstrap_compositor_core(
     let theme_manager = ThemeManager::new(theme_id);
 
     flog_info!(
-        "FLOWSTATE active theme after manager init = {:?}",
+        "FOCUSSHELL active theme after manager init = {:?}",
         theme_manager.active_theme().id
     );
 

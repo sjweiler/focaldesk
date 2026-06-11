@@ -31,7 +31,7 @@ use smithay::backend::renderer::element::{
 
 use flowstate_flow::keybinds::BackendKind;
 
-// DRM/KMS backend for FlowState.
+// DRM/KMS backend for FocusShell.
 //
 // This is the real hardware backend counterpart to the winit backend.
 // It keeps compositor state shared, but owns its own session/device/input/output plumbing.
@@ -40,7 +40,7 @@ use flowstate_flow::keybinds::BackendKind;
 // - struct layout is real
 // - event loop wiring is real
 // - device/output attach points are real
-// - many internals are still TODO so you can connect them to your existing FlowState code
+// - many internals are still TODO so you can connect them to your existing FocusShell code
 
 use anyhow::{anyhow, Context, Result};
 use smithay::utils::DeviceFd;
@@ -593,7 +593,7 @@ fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
-    flog("FLOWSTATE: entered DRM backend");
+    flog("FOCUSSHELL: entered DRM backend");
     let mut event_loop: EventLoop<DrmLoopData> = EventLoop::try_new()?;
     let loop_handle = event_loop.handle();
 
@@ -1131,7 +1131,7 @@ for (i, m) in info.modes().iter().enumerate() {
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
-                make: "FlowState".into(),
+                make: "FocusShell".into(),
                 model: "DRM".into(),
                 serial_number: "drm-output".into(),
             },

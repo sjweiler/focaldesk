@@ -105,7 +105,7 @@ impl Default for BluetoothPanel {
             .default_width(520.0)
             .open(&mut self.open)
             .show(ctx, |ui| {
-                ui.heading("FlowState Settings");
+                ui.heading("FocusShell Settings");
                 ui.label(format!("Output: {:?}", frame_ctx.rendering_output));
             });
     }

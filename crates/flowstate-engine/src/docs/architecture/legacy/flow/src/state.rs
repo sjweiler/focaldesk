@@ -25,7 +25,7 @@ impl Default for OutputPins {
     }
 }
 
-pub struct FlowState {
+pub struct FocusShell {
     windows: Vec<WindowId>,
     known: HashSet<WindowId>,
     pub focused: Option<WindowId>,
@@ -35,7 +35,7 @@ pub struct FlowState {
     pub pins_by_output: HashMap<OutputId, OutputPins>, // slots + selected glow
 }
 
-impl Default for FlowState {
+impl Default for FocusShell {
     fn default() -> Self {
         Self {
             next_window_id: 1,
@@ -49,7 +49,7 @@ impl Default for FlowState {
     }
 }
 
-impl FlowState {
+impl FocusShell {
     pub fn new() -> Self {
         Self::default()
     }

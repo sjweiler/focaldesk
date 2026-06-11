@@ -55,7 +55,7 @@ impl OutputState {
             PhysicalProperties {
                 size: (0, 0).into(),
                 subpixel: Subpixel::Unknown,
-                make: "FlowState".into(),
+                make: "FocusShell".into(),
                 model: "Winit".into(),
                 serial_number: "nested-0".into(),
             },

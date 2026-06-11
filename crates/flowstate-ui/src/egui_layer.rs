@@ -174,13 +174,13 @@ fn flowstate_egui_fonts() -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
 
     fonts.font_data.insert(
-        "FlowStateSans".to_owned(),
+        "FocusShellSans".to_owned(),
         Arc::new(FontData::from_static(include_bytes!(
             "../../../assets/fonts/IBMPlexSans-Regular.ttf"
         ))),
     );
     fonts.font_data.insert(
-        "FlowStateMono".to_owned(),
+        "FocusShellMono".to_owned(),
         Arc::new(FontData::from_static(include_bytes!(
             "../../../assets/fonts/IBMPlexMono-Regular.ttf"
         ))),
@@ -190,17 +190,17 @@ fn flowstate_egui_fonts() -> FontDefinitions {
         .families
         .entry(FontFamily::Proportional)
         .or_default()
-        .insert(0, "FlowStateSans".to_owned());
+        .insert(0, "FocusShellSans".to_owned());
     fonts
         .families
         .entry(FontFamily::Monospace)
         .or_default()
-        .insert(0, "FlowStateMono".to_owned());
+        .insert(0, "FocusShellMono".to_owned());
 
     fonts
 }
 
-/// Gives egui overlay code access to FlowState's compiled shader set and current GLES frame.
+/// Gives egui overlay code access to FocusShell's compiled shader set and current GLES frame.
 ///
 /// This is intentionally thin: egui can own interaction/layout, while compositor-native effects
 /// still render through the same `ChromeShaders` programs used by the shell.
@@ -524,7 +524,7 @@ impl EguiLayer {
                 .fixed_pos(work.min + egui::vec2(16.0, 16.0))
                 .show(ctx, |ui| {
                     ui.set_min_width(220.0);
-                    ui.heading("FlowState");
+                    ui.heading("FocusShell");
                     ui.separator();
                     if ui.button("Open settings panel").clicked() {
                         actions.push(UiAction::OpenPanel(PanelKind::Settings));
@@ -580,7 +580,7 @@ impl EguiLayer {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 flog_info!(
-                    "egui: FLOWSTATE_EGUI_DEBUG_UV is ignored when using the egui_glow painter"
+                    "egui: FOCUSSHELL_EGUI_DEBUG_UV is ignored when using the egui_glow painter"
                 );
             });
         }
@@ -854,7 +854,7 @@ fn mesh_has_atlas_uvs((min, max): ([f32; 2], [f32; 2])) -> bool {
 }
 
 fn egui_debug_uv_enabled() -> bool {
-    std::env::var_os("FLOWSTATE_EGUI_DEBUG_UV").is_some()
+    std::env::var_os("FOCUSSHELL_EGUI_DEBUG_UV").is_some()
 }
 
 fn flip_clipped_primitives_y(

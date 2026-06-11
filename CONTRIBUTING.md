@@ -1,12 +1,12 @@
 # Contributing
 
-FlowState is currently a solo-developed alpha project. Contributions, bug
+FocusShell is currently a solo-developed alpha project. Contributions, bug
 reports, and design feedback may be welcome, but there is no formal maintainer
 team, release process, or guaranteed review timeline yet.
 
 ## Project Status
 
-FlowState is experimental compositor and desktop environment software. Expect
+FocusShell is experimental compositor and desktop environment software. Expect
 breaking changes, incomplete features, and architectural churn.
 
 Before contributing, read the [README](README.md) for the current project shape

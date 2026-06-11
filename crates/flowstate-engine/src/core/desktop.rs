@@ -2187,7 +2187,7 @@ impl DesktopState {
             screenshot_all_requested: false,
             screenshot_seq: 0,
             theme: init.theme_manager,
-            damage_debug_enabled: std::env::var("FLOWSTATE_DAMAGE_DEBUG")
+            damage_debug_enabled: std::env::var("FOCUSSHELL_DAMAGE_DEBUG")
                 .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,

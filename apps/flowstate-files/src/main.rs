@@ -74,7 +74,7 @@ fn main() {
 
 fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let window = adw::ApplicationWindow::new(app);
-    window.set_title(Some("FlowState Files"));
+    window.set_title(Some("FocusShell Files"));
     window.set_default_size(1040, 680);
 
     let toolbar = adw::ToolbarView::new();

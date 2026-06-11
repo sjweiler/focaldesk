@@ -1,13 +1,13 @@
 use anyhow::Result;
 
 use flowstate_ai::Agent;
-use flowstate_engine::backend;
+use flowstate_logging::flog_info;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
-    flog_info!("FlowState server starting...");
+    flog_info!("FocusShell server starting...");
 
     let agent = Agent::new("ipc server".to_string());
     flog_info!("Initialized agent: {}", agent.name);

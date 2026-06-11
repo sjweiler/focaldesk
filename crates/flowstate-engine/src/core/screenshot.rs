@@ -66,7 +66,7 @@ fn next_screenshot_path() -> PathBuf {
 
     let dir = dirs::picture_dir()
         .unwrap_or_else(|| std::env::current_dir().unwrap())
-        .join("FlowState");
+        .join("FocusShell");
 
     std::fs::create_dir_all(&dir).ok();
 

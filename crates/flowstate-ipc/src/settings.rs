@@ -11,7 +11,7 @@ pub fn start_settings_ipc(settings: Arc<Mutex<Settings>>) {
     let _ = std::fs::remove_file(SOCKET_PATH);
 
     let listener = UnixListener::bind(SOCKET_PATH)
-        .expect("failed to bind FlowState settings IPC socket");
+        .expect("failed to bind FocusShell settings IPC socket");
 
     thread::spawn(move || {
         for stream in listener.incoming() {

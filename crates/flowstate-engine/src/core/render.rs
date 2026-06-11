@@ -945,7 +945,7 @@ impl RenderState {
                 //(IconState::Inactive, meta_intensity)
                 (IconState::Inactive, meta_intensity)
             } else {
-                // FLOWSTATE title stays bright.
+                // FOCUSSHELL title stays bright.
                 (IconState::Active, title_intensity)
             };
 
@@ -2212,7 +2212,7 @@ impl RenderState {
 
     /// Build xdg popup elements for a top overlay pass.
     ///
-    /// `Window::render_elements` includes popups in the client layer, but FlowState draws shell
+    /// `Window::render_elements` includes popups in the client layer, but FocusShell draws shell
     /// chrome after that layer. Menus need a second top pass so browser/app popups are not covered
     /// by compositor trim and icons.
     pub fn build_popup_elements_for_output(
@@ -2788,7 +2788,7 @@ impl RenderState {
             let icon_px = metrics.icon_base_px as i32;
 
             let _text = format!(
-                "FLOWSTATE · OUT {} · WS {}",
+                "FOCUSSHELL · OUT {} · WS {}",
                 ctx.rendering_output.0, current_workspace.0
             );
 
@@ -2806,7 +2806,7 @@ impl RenderState {
                 frame,
                 fonts,
                 layout,
-                "FLOWSTATE",
+                "FOCUSSHELL",
                 &active_theme,
                 ctx.output_scale,
             );
@@ -2815,7 +2815,7 @@ impl RenderState {
                 frame,
                 fonts,
                 layout,
-                "FLOWSTATE",
+                "FOCUSSHELL",
                 output_number,
                 workspace_number,
                 &active_theme,
@@ -3020,7 +3020,7 @@ impl RenderState {
             }
 
             let label_rect = title_label_rect(layout.title_rect);
-            self.draw_title_text(frame, atlas, label_rect, "FLOWSTATE");
+            self.draw_title_text(frame, atlas, label_rect, "FOCUSSHELL");
 
             let status_icons = [IconId::Wifi, IconId::Bluetooth, IconId::Speaker, IconId::Power];
             for (well, icon_id) in layout.status_wells.iter().zip(status_icons.iter()) {

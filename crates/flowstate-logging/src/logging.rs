@@ -56,7 +56,7 @@ pub fn init_logging(mode: BuildMode) {
 pub fn init_logging_from_env(default_mode: BuildMode) {
     init_logging(default_mode);
 
-    let Ok(level) = std::env::var("FLOWSTATE_LOG") else {
+    let Ok(level) = std::env::var("FOCUSSHELL_LOG") else {
         return;
     };
 

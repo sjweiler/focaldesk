@@ -85,7 +85,7 @@ fn dispatch_backend_events(
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    flog("FLOWSTATE: entered WINIT backend");
+    flog("FOCUSSHELL: entered WINIT backend");
     // Create Smithay winit backend + renderer
     //let mut theme_manager =
     // ThemeManager::new(

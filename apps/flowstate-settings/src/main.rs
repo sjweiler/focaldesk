@@ -4,7 +4,7 @@ use adw::prelude::*;
 use flowstate_logging::flog_info;
 use gtk::prelude::*;
 
-use config::{load_config, save_config, FlowStateConfig};
+use config::{load_config, save_config, FocusShellConfig};
 use gtk::cairo;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -213,7 +213,7 @@ fn build_ui(app: &adw::Application) {
     let config = Rc::new(RefCell::new(load_config()));
 
     let window = adw::ApplicationWindow::new(app);
-    window.set_title(Some("FlowState Settings"));
+    window.set_title(Some("FocusShell Settings"));
     window.set_default_size(1000, 700);
 
     let toolbar = adw::ToolbarView::new();
@@ -316,7 +316,7 @@ fn build_ui(app: &adw::Application) {
     window.present();
 }
 
-fn appearance_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn appearance_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Appearance");
 
@@ -326,7 +326,7 @@ fn appearance_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage 
     // Shader chrome
     let shader_row = adw::ActionRow::new();
     shader_row.set_title("Use shader chrome");
-    shader_row.set_subtitle("Enable FlowState beveled/glass shader styling");
+    shader_row.set_subtitle("Enable FocusShell beveled/glass shader styling");
 
     let shader_switch = gtk::Switch::new();
     shader_switch.set_active(config.borrow().appearance.shader_chrome);
@@ -445,7 +445,7 @@ fn appearance_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage 
     {
         let config = config.clone();
         reset_button.connect_clicked(move |_| {
-            *config.borrow_mut() = FlowStateConfig::default();
+            *config.borrow_mut() = FocusShellConfig::default();
             let _ = save_config(&config.borrow());
             flog_info!("Reset config");
         });
@@ -459,7 +459,7 @@ fn appearance_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage 
     adw::NavigationPage::new(&page, "Appearance")
 }
 
-fn displays_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn displays_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Displays");
 
@@ -549,7 +549,7 @@ fn displays_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
 
     let remember_row = adw::ActionRow::new();
     remember_row.set_title("Remember focused display");
-    remember_row.set_subtitle("Restore the last active display when FlowState starts");
+    remember_row.set_subtitle("Restore the last active display when FocusShell starts");
 
     let remember_switch = gtk::Switch::new();
     remember_switch.set_active(config.borrow().displays.remember_focused_output);
@@ -573,42 +573,42 @@ fn displays_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Displays")
 }
 
-fn workspaces_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn workspaces_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Workspaces");
 
     adw::NavigationPage::new(&page, "Workspaces")
 }
 
-fn keyboard_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn keyboard_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Keyboard");
 
     adw::NavigationPage::new(&page, "Keyboard")
 }
 
-fn privacy_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn privacy_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Privacy");
 
     adw::NavigationPage::new(&page, "Privacy")
 }
 
-fn power_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn power_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Power");
 
     adw::NavigationPage::new(&page, "Power")
 }
 
-fn debug_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn debug_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Debug");
 
     adw::NavigationPage::new(&page, "Debug")
 }
 
-fn about_page(config: Rc<RefCell<FlowStateConfig>>) -> adw::NavigationPage {
+fn about_page(config: Rc<RefCell<FocusShellConfig>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("About");
 

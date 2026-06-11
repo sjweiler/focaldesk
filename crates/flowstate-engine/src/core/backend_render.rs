@@ -347,8 +347,8 @@ fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::erro
         for size_px in [10, 12, 14, 16, 18, 20, 24] {
             let style = TextStyle { font, size_px };
 
-            state.fonts.prepare_text("FlowState", style)?;
-            state.fonts.prepare_text("FlowState Debug", style)?;
+            state.fonts.prepare_text("FocusShell", style)?;
+            state.fonts.prepare_text("FocusShell Debug", style)?;
             state.fonts.prepare_text("OK", style)?;
             state.fonts.prepare_text("Cancel", style)?;
             const BASIC_ASCII: &str =
@@ -379,7 +379,7 @@ fn prepare_portal_chrome_glyphs(
     state.fonts.prepare_text(&time_str, clock_style)?;
 
     let title_style = style_for(FontRole::Title, 24, builtin_id);
-    state.fonts.prepare_text("FLOWSTATE", title_style)?;
+    state.fonts.prepare_text("FOCUSSHELL", title_style)?;
 
     let meta_style = style_for(FontRole::Meta, 14, builtin_id);
     let output_number = state.focused_output.0;

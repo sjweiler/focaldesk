@@ -35,9 +35,9 @@ pub struct TopBar {
 impl Default for TopBar {
     fn default() -> Self {
         Self {
-            title: "FLOWSTATE".into(),
+            title: "FOCUSSHELL".into(),
             meta: TopBarMeta {
-                title: "FLOWSTATE".into(),
+                title: "FOCUSSHELL".into(),
                 application_name: None,
                 show_output_label: true,
                 output_id: 0,

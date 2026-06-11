@@ -1589,6 +1589,7 @@ dependencies = [
  "anyhow",
  "flowstate-ai",
  "flowstate-engine",
+ "flowstate-logging",
  "flowstate-memory",
  "serde",
  "serde_json",

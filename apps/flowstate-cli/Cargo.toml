@@ -2,7 +2,7 @@
 name = "flowstate-cli"
 version = "0.1.0"
 edition = "2024"
-description = "Command-line interface for FlowState"
+description = "Command-line interface for FocusShell"
 license="MIT"
 
 [[bin]]

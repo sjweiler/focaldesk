@@ -4,7 +4,7 @@ use std::collections::HashMap;
 /// Logical state of FlowOS.
 /// Owns window ordering, focus, slot assignments, and outputs.
 #[derive(Debug)]
-pub struct FlowState {
+pub struct FocusShell {
     /// Slot assignments (slot index -> window)
     slots: [Option<WindowId>; 9],
 
@@ -17,7 +17,7 @@ struct OutputInfo {
     pub active: bool,
 }
 
-impl FlowState {
+impl FocusShell {
     pub fn new() -> Self {
         Self {
             slots: [None; 9],
@@ -40,7 +40,7 @@ impl FlowState {
     }
 }
 
-impl Default for FlowState {
+impl Default for FocusShell {
     fn default() -> Self {
         Self::new()
     }

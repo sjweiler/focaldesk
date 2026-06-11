@@ -60,7 +60,7 @@ pub enum FlowScrollSource {
     WheelTilt,
 }
 
-/// Core FlowState input event
+/// Core FocusShell input event
 #[derive(Debug, Clone, PartialEq)]
 pub enum FlowInputEvent {
     Key {

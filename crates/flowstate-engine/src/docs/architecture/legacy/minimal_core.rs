@@ -42,7 +42,7 @@ use std::path::Path;
 use bitflags::bitflags;
 use std::rc::Rc;
 use std::cell::Cell;
-use flow::{FlowState, FlowEvent, FlowAction, WindowId};
+use flow::{FocusShell, FlowEvent, FlowAction, WindowId};
 use smithay::reexports::wayland_server::backend::ObjectId;
 use std::collections::HashMap;
 use smithay::backend::input::KeyState;
@@ -473,7 +473,7 @@ impl App {
             space: Space::<Window>::default(),
             surface_to_wid: HashMap::new(),
             wid_to_surface: HashMap::new(),
-            flow: FlowState::new(),
+            flow: FocusShell::new(),
             output_size: (0, 0).into(),
             keybinds: HashMap::new(),
             launcher_open: false,
@@ -530,7 +530,7 @@ impl App {
             space: Space::<Window>::default(),
             surface_to_wid: HashMap::new(),
             wid_to_surface: HashMap::new(),
-            flow: FlowState::new(),
+            flow: FocusShell::new(),
             output_size: (0, 0).into(),
             keybinds: HashMap::new(),
             launcher_open: false,
@@ -654,7 +654,7 @@ fn on_toplevel_destroyed(&mut self, key: ObjectId) {
     self.wid_to_surface.remove(&wid);
     self.tl_surface.remove(&key);
 
-    // 3) Update FlowState policy
+    // 3) Update FocusShell policy
     self.flow.remove_window(wid);
 
     // 4) Restore keyboard focus to a remaining window (fallback)
@@ -1458,7 +1458,7 @@ pub struct App {
     surface_to_wid: HashMap<ObjectId, WindowId>,
     wid_to_surface: HashMap<WindowId, ObjectId>,
     pub seat: Seat<Self>,
-    flow: FlowState,
+    flow: FocusShell,
     
     
     
