@@ -92,6 +92,12 @@ impl ImageCopyCaptureHandler for DesktopState {
         self.image_copy_capture_sessions.push(session);
     }
 
+    fn session_destroyed(&mut self, session: SessionRef) {
+        self.image_copy_capture_sessions
+            .retain(|stored| *stored != session);
+        flowstate_logging::flog("portal capture session destroyed");
+    }
+
     fn frame(&mut self, session: &SessionRef, frame: Frame) {
         let Some(output_id) = portal::output_id_for_session(self, session) else {
             frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);

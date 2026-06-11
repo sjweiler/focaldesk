@@ -81,7 +81,7 @@ use smithay::{
         input::Libinput,
         wayland_server::{Client, Display, ListeningSocket},
     },
-    utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::dmabuf::DmabufFeedbackBuilder,
 };
 
@@ -988,7 +988,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.tick_layout();
 
         let screenshot_output = data.core.state.screenshot_request();
-        let portal_active = !data.core.state.image_copy_capture_sessions.is_empty();
+        data.core
+            .state
+            .image_copy_capture_sessions
+            .retain(|session| session.alive());
+        let portal_active = !data.core.state.image_copy_capture_sessions.is_empty()
+            && !data.core.state.pending_portal_captures.is_empty();
         let should_render = data.core.state.needs_redraw()
             || screenshot_output.is_some()
             || data.core.state.screenshot_all_requested
@@ -1098,15 +1103,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 if let Some(offscreen) = surface.offscreen.as_ref() {
-                    flog(&format!(
-                        "DRM stores portal source output={:?} tex_size={}x{} surface_size={}x{}",
-                        surface.output_id,
-                        offscreen.size.w,
-                        offscreen.size.h,
-                        surface.size.w,
-                        surface.size.h,
-                    ));
-
                     data.core.state.portal_capture_source.insert(
                         surface.output_id,
                         crate::core::portal::PortalCaptureSource {
