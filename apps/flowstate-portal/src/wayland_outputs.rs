@@ -1,4 +1,4 @@
-use wayland_client::globals::{registry_queue_init, GlobalListContents};
+use wayland_client::globals::{GlobalListContents, registry_queue_init};
 use wayland_client::protocol::{wl_output, wl_registry};
 use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
 
@@ -43,9 +43,7 @@ pub fn query_wayland_outputs() -> Vec<String> {
         return Vec::new();
     };
 
-    let mut state = State {
-        names: Vec::new(),
-    };
+    let mut state = State { names: Vec::new() };
     let qh = event_queue.handle();
     let registry = globals.registry();
 

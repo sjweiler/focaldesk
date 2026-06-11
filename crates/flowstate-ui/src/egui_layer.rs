@@ -10,8 +10,8 @@ use egui::{
 use egui_glow::Painter;
 use flowstate_logging::{flog_error, flog_info};
 use flowstate_themes::FlowTheme;
-use glow;
 use flowstate_types::OutputId;
+use glow;
 use smithay::backend::egl::get_proc_address;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesPixelProgram, Uniform};
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Size};

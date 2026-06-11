@@ -34,14 +34,25 @@ enum Location {
     Separator,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Details,
+    List,
+    Grid,
+}
+
 #[derive(Clone)]
 struct FileManager {
     window: adw::ApplicationWindow,
     path_entry: gtk::Entry,
     list: gtk::ListBox,
+    grid: gtk::FlowBox,
+    scroller: gtk::ScrolledWindow,
+    column_header: gtk::Grid,
     status: gtk::Label,
     hidden_toggle: gtk::ToggleButton,
     places: gtk::StringList,
+    view_mode: Rc<RefCell<ViewMode>>,
     current_location: Rc<RefCell<Location>>,
     entries: Rc<RefCell<Vec<FileItem>>>,
     back_stack: Rc<RefCell<Vec<Location>>>,
@@ -78,6 +89,12 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let refresh_button = icon_button("view-refresh-symbolic", "Refresh");
     let new_folder_button = icon_button("folder-new-symbolic", "New Folder");
     let trash_button = icon_button("user-trash-symbolic", "Move to Trash");
+    let details_view_button = toggle_icon_button("view-list-symbolic", "Details View");
+    let list_view_button = toggle_icon_button("view-paged-symbolic", "List View");
+    let grid_view_button = toggle_icon_button("view-grid-symbolic", "Grid View");
+    list_view_button.set_group(Some(&details_view_button));
+    grid_view_button.set_group(Some(&details_view_button));
+    details_view_button.set_active(true);
 
     header.pack_start(&back_button);
     header.pack_start(&forward_button);
@@ -95,6 +112,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     hidden_toggle.set_icon_name("view-hidden-symbolic");
     hidden_toggle.set_tooltip_text(Some("Show Hidden Files"));
     header.pack_end(&hidden_toggle);
+    header.pack_end(&grid_view_button);
+    header.pack_end(&list_view_button);
+    header.pack_end(&details_view_button);
     header.pack_end(&refresh_button);
     header.pack_end(&trash_button);
 
@@ -120,6 +140,16 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     list.add_css_class("boxed-list");
     list.set_vexpand(true);
 
+    let grid = gtk::FlowBox::new();
+    grid.set_selection_mode(gtk::SelectionMode::Single);
+    grid.set_valign(gtk::Align::Start);
+    grid.set_max_children_per_line(8);
+    grid.set_min_children_per_line(2);
+    grid.set_row_spacing(8);
+    grid.set_column_spacing(8);
+    grid.add_css_class("file-grid");
+    grid.set_vexpand(true);
+
     let scroller = gtk::ScrolledWindow::new();
     scroller.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
     scroller.set_vexpand(true);
@@ -135,7 +165,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     content.set_margin_bottom(12);
     content.set_margin_start(12);
     content.set_margin_end(12);
-    content.append(&column_header());
+    let column_header = column_header();
+    content.append(&column_header);
     content.append(&scroller);
     content.append(&status);
     split.set_content(Some(&adw::NavigationPage::new(&content, "Files")));
@@ -147,9 +178,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         window,
         path_entry,
         list,
+        grid,
+        scroller,
+        column_header,
         status,
         hidden_toggle,
         places,
+        view_mode: Rc::new(RefCell::new(ViewMode::Details)),
         current_location: Rc::new(RefCell::new(Location::Path(home_dir()))),
         entries: Rc::new(RefCell::new(Vec::new())),
         back_stack: Rc::new(RefCell::new(Vec::new())),
@@ -167,6 +202,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         refresh_button,
         new_folder_button,
         trash_button,
+        details_view_button,
+        list_view_button,
+        grid_view_button,
         places_view,
     );
     manager.open_initial_path(initial_path.unwrap_or_else(home_dir));
@@ -183,6 +221,9 @@ impl FileManager {
         refresh_button: gtk::Button,
         new_folder_button: gtk::Button,
         trash_button: gtk::Button,
+        details_view_button: gtk::ToggleButton,
+        list_view_button: gtk::ToggleButton,
+        grid_view_button: gtk::ToggleButton,
         places_view: gtk::ListView,
     ) {
         let this = self.clone();
@@ -196,21 +237,21 @@ impl FileManager {
         });
 
         let this = self.clone();
+        self.grid.connect_selected_children_changed(move |_| {
+            this.show_selected_path();
+        });
+
+        self.install_drop_target(&self.list);
+        self.install_drop_target(&self.grid);
+
+        let this = self.clone();
         self.list.connect_row_activated(move |_, row| {
-            let index = row.index();
-            if index < 0 {
-                return;
-            }
+            this.activate_item(row.index());
+        });
 
-            let Some(item) = this.entries.borrow().get(index as usize).cloned() else {
-                return;
-            };
-
-            if item.is_dir {
-                this.open_location(item.location(), true);
-            } else if let Err(err) = open_file(&item.file) {
-                this.set_status(&format!("Could not open {}: {err}", item.name));
-            }
+        let this = self.clone();
+        self.grid.connect_child_activated(move |_, child| {
+            this.activate_item(child.index());
         });
 
         let this = self.clone();
@@ -258,6 +299,27 @@ impl FileManager {
         trash_button.connect_clicked(move |_| this.trash_selected());
 
         let this = self.clone();
+        details_view_button.connect_toggled(move |button| {
+            if button.is_active() {
+                this.set_view_mode(ViewMode::Details);
+            }
+        });
+
+        let this = self.clone();
+        list_view_button.connect_toggled(move |button| {
+            if button.is_active() {
+                this.set_view_mode(ViewMode::List);
+            }
+        });
+
+        let this = self.clone();
+        grid_view_button.connect_toggled(move |button| {
+            if button.is_active() {
+                this.set_view_mode(ViewMode::Grid);
+            }
+        });
+
+        let this = self.clone();
         places_view.connect_activate(move |_, position| {
             if let Some(location) = this.place_location(position) {
                 this.open_location(location, true);
@@ -271,6 +333,22 @@ impl FileManager {
             "
             .file-row {
                 padding: 8px 10px;
+            }
+            .file-list-row {
+                padding: 10px;
+            }
+            .file-grid {
+                padding: 4px;
+            }
+            .file-grid-child {
+                border-radius: 8px;
+                padding: 8px;
+            }
+            .file-grid-tile {
+                min-width: 112px;
+            }
+            .file-grid-name {
+                font-weight: 500;
             }
             .file-name {
                 font-weight: 500;
@@ -397,9 +475,19 @@ impl FileManager {
         while let Some(row) = self.list.first_child() {
             self.list.remove(&row);
         }
+        while let Some(child) = self.grid.first_child() {
+            self.grid.remove(&child);
+        }
 
+        let view_mode = *self.view_mode.borrow();
         for item in self.entries.borrow().iter() {
-            self.list.append(&file_row(item));
+            let row = file_row(item, view_mode);
+            attach_file_drag_source(&row, item.clone());
+            self.list.append(&row);
+
+            let child = grid_file_child(item);
+            attach_file_drag_source(&child, item.clone());
+            self.grid.append(&child);
         }
 
         let entries = self.entries.borrow();
@@ -478,15 +566,10 @@ impl FileManager {
     }
 
     fn trash_selected(&self) {
-        let Some(row) = self.list.selected_row() else {
+        let Some(index) = self.selected_index() else {
             self.set_status("Select an item to move to trash.");
             return;
         };
-
-        let index = row.index();
-        if index < 0 {
-            return;
-        }
 
         let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
             return;
@@ -511,19 +594,127 @@ impl FileManager {
     }
 
     fn show_selected_path(&self) {
-        let Some(row) = self.list.selected_row() else {
+        let Some(index) = self.selected_index() else {
             self.path_entry
                 .set_text(&self.current_location.borrow().display_text());
             return;
         };
 
-        let index = row.index();
+        if let Some(item) = self.entries.borrow().get(index as usize) {
+            self.path_entry.set_text(&item.display_path());
+        }
+    }
+
+    fn activate_item(&self, index: i32) {
         if index < 0 {
             return;
         }
 
-        if let Some(item) = self.entries.borrow().get(index as usize) {
-            self.path_entry.set_text(&item.display_path());
+        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
+            return;
+        };
+
+        if item.is_dir {
+            self.open_location(item.location(), true);
+        } else if let Err(err) = open_file(&item.file) {
+            self.set_status(&format!("Could not open {}: {err}", item.name));
+        }
+    }
+
+    fn selected_index(&self) -> Option<i32> {
+        match *self.view_mode.borrow() {
+            ViewMode::Grid => self
+                .grid
+                .selected_children()
+                .first()
+                .map(gtk::FlowBoxChild::index)
+                .filter(|index| *index >= 0),
+            ViewMode::Details | ViewMode::List => self
+                .list
+                .selected_row()
+                .map(|row| row.index())
+                .filter(|index| *index >= 0),
+        }
+    }
+
+    fn set_view_mode(&self, view_mode: ViewMode) {
+        if *self.view_mode.borrow() == view_mode {
+            return;
+        }
+
+        *self.view_mode.borrow_mut() = view_mode;
+        self.column_header
+            .set_visible(matches!(view_mode, ViewMode::Details));
+
+        match view_mode {
+            ViewMode::Details | ViewMode::List => self.scroller.set_child(Some(&self.list)),
+            ViewMode::Grid => self.scroller.set_child(Some(&self.grid)),
+        }
+
+        self.render_entries();
+        self.path_entry
+            .set_text(&self.current_location.borrow().display_text());
+    }
+
+    fn install_drop_target(&self, widget: &impl IsA<gtk::Widget>) {
+        let target = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
+
+        let this = self.clone();
+        target.connect_drop(move |_, value, _, _| {
+            let Ok(file_list) = value.get::<gtk::gdk::FileList>() else {
+                this.set_status("Drop did not contain files.");
+                return false;
+            };
+
+            this.copy_dropped_files(file_list.files())
+        });
+
+        widget.add_controller(target);
+    }
+
+    fn copy_dropped_files(&self, files: Vec<gio::File>) -> bool {
+        let Location::Path(target_dir) = &*self.current_location.borrow() else {
+            self.set_status("Files can only be dropped into local folders.");
+            return false;
+        };
+
+        if files.is_empty() {
+            self.set_status("Drop did not contain files.");
+            return false;
+        }
+
+        let target_dir = target_dir.clone();
+        let mut copied = 0usize;
+        let mut last_error = None;
+
+        for file in files {
+            match copy_dropped_file(&file, &target_dir) {
+                Ok(()) => copied += 1,
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        self.reload();
+
+        match (copied, last_error) {
+            (0, Some(err)) => {
+                self.set_status(&format!("Could not copy dropped files: {err}"));
+                false
+            }
+            (count, Some(err)) => {
+                self.set_status(&format!(
+                    "Copied {count} item{}; some items failed: {err}",
+                    plural(count)
+                ));
+                true
+            }
+            (count, None) => {
+                self.set_status(&format!("Copied {count} dropped item{}.", plural(count)));
+                true
+            }
         }
     }
 }
@@ -612,7 +803,14 @@ fn read_file_items(file: &gio::File, show_hidden: bool) -> Result<Vec<FileItem>,
     Ok(items)
 }
 
-fn file_row(item: &FileItem) -> gtk::ListBoxRow {
+fn file_row(item: &FileItem, view_mode: ViewMode) -> gtk::ListBoxRow {
+    match view_mode {
+        ViewMode::Details => detail_file_row(item),
+        ViewMode::List | ViewMode::Grid => list_file_row(item),
+    }
+}
+
+fn detail_file_row(item: &FileItem) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     row.add_css_class("file-row");
 
@@ -620,11 +818,7 @@ fn file_row(item: &FileItem) -> gtk::ListBoxRow {
     grid.set_column_spacing(12);
     grid.set_hexpand(true);
 
-    let icon = gtk::Image::from_icon_name(if item.is_dir {
-        "folder-symbolic"
-    } else {
-        "text-x-generic-symbolic"
-    });
+    let icon = gtk::Image::from_icon_name(file_icon_name(item));
     icon.set_pixel_size(22);
     grid.attach(&icon, 0, 0, 1, 1);
 
@@ -656,6 +850,109 @@ fn file_row(item: &FileItem) -> gtk::ListBoxRow {
 
     row.set_child(Some(&grid));
     row
+}
+
+fn list_file_row(item: &FileItem) -> gtk::ListBoxRow {
+    let row = gtk::ListBoxRow::new();
+    row.add_css_class("file-list-row");
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    content.set_hexpand(true);
+
+    let icon = gtk::Image::from_icon_name(file_icon_name(item));
+    icon.set_pixel_size(28);
+    content.append(&icon);
+
+    let text = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    text.set_hexpand(true);
+
+    let name = gtk::Label::new(Some(&item.name));
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.add_css_class("file-name");
+    text.append(&name);
+
+    let meta_text = if item.is_dir {
+        "Folder".to_string()
+    } else {
+        format!("{} - {}", format_size(item.size), item.modified)
+    };
+    let meta = gtk::Label::new(Some(&meta_text));
+    meta.set_xalign(0.0);
+    meta.add_css_class("dim-label");
+    text.append(&meta);
+
+    content.append(&text);
+    row.set_child(Some(&content));
+    row
+}
+
+fn grid_file_child(item: &FileItem) -> gtk::FlowBoxChild {
+    let child = gtk::FlowBoxChild::new();
+    child.add_css_class("file-grid-child");
+
+    let tile = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    tile.add_css_class("file-grid-tile");
+    tile.set_halign(gtk::Align::Center);
+
+    let icon = gtk::Image::from_icon_name(file_icon_name(item));
+    icon.set_pixel_size(48);
+    tile.append(&icon);
+
+    let name = gtk::Label::new(Some(&item.name));
+    name.set_xalign(0.5);
+    name.set_justify(gtk::Justification::Center);
+    name.set_wrap(true);
+    name.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    name.set_lines(2);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.add_css_class("file-grid-name");
+    tile.append(&name);
+
+    child.set_child(Some(&tile));
+    child
+}
+
+fn file_icon_name(item: &FileItem) -> &'static str {
+    if item.is_dir {
+        "folder-symbolic"
+    } else {
+        "text-x-generic-symbolic"
+    }
+}
+
+fn attach_file_drag_source(widget: &impl IsA<gtk::Widget>, item: FileItem) {
+    let source = gtk::DragSource::new();
+    source.set_actions(gtk::gdk::DragAction::COPY);
+
+    source.connect_prepare(move |_, _, _| {
+        let files = [item.file.clone()];
+        let file_list = gtk::gdk::FileList::from_array(&files);
+        let file_provider = gtk::gdk::ContentProvider::for_value(&file_list.to_value());
+
+        let uri_list = format!("{}\r\n", item.uri);
+        let uri_provider = gtk::gdk::ContentProvider::for_bytes(
+            "text/uri-list",
+            &glib::Bytes::from_owned(uri_list.into_bytes()),
+        );
+
+        let display_path = item
+            .path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| item.uri.clone());
+        let drag_text = format!("{}\n{}", item.name, display_path);
+        let text_provider = gtk::gdk::ContentProvider::for_value(&drag_text.to_value());
+
+        Some(gtk::gdk::ContentProvider::new_union(&[
+            file_provider,
+            uri_provider,
+            text_provider,
+        ]))
+    });
+
+    widget.add_controller(source);
 }
 
 fn column_header() -> gtk::Grid {
@@ -718,6 +1015,13 @@ fn icon_button(icon: &str, tooltip: &str) -> gtk::Button {
     button
 }
 
+fn toggle_icon_button(icon: &str, tooltip: &str) -> gtk::ToggleButton {
+    let button = gtk::ToggleButton::new();
+    button.set_icon_name(icon);
+    button.set_tooltip_text(Some(tooltip));
+    button
+}
+
 fn open_file(file: &gio::File) -> Result<(), glib::Error> {
     let path = file.path();
 
@@ -748,6 +1052,80 @@ fn open_file(file: &gio::File) -> Result<(), glib::Error> {
         apply_launch_environment(&context, force_x11);
         gio::AppInfo::launch_default_for_uri(&uri, Some(&context))
     }
+}
+
+fn copy_dropped_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
+    let name = file.basename().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "dropped file has no basename")
+    })?;
+    let destination = available_destination(target_dir, Path::new(&name));
+
+    if let Some(source) = file.path() {
+        if source.is_dir() && is_path_inside(target_dir, &source) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot copy a folder into itself",
+            ));
+        }
+        copy_path_recursively(&source, &destination)
+    } else {
+        let destination_file = gio::File::for_path(&destination);
+        file.copy(
+            &destination_file,
+            gio::FileCopyFlags::NONE,
+            gio::Cancellable::NONE,
+            None,
+        )
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+    }
+}
+
+fn is_path_inside(path: &Path, parent: &Path) -> bool {
+    match (path.canonicalize(), parent.canonicalize()) {
+        (Ok(path), Ok(parent)) => path.starts_with(parent),
+        _ => false,
+    }
+}
+
+fn copy_path_recursively(source: &Path, destination: &Path) -> io::Result<()> {
+    if source.is_dir() {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            copy_path_recursively(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        std::fs::copy(source, destination).map(|_| ())
+    }
+}
+
+fn available_destination(target_dir: &Path, basename: &Path) -> PathBuf {
+    let mut destination = target_dir.join(basename);
+    if !destination.exists() {
+        return destination;
+    }
+
+    let stem = basename
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Untitled");
+    let extension = basename
+        .extension()
+        .and_then(|extension| extension.to_str());
+
+    for index in 1.. {
+        let file_name = match extension {
+            Some(extension) if !extension.is_empty() => format!("{stem} copy {index}.{extension}"),
+            _ => format!("{stem} copy {index}"),
+        };
+        destination = target_dir.join(file_name);
+        if !destination.exists() {
+            return destination;
+        }
+    }
+
+    unreachable!("unbounded destination search should always return")
 }
 
 fn location_from_entry(text: &str) -> Location {
@@ -912,11 +1290,7 @@ fn format_size(size: u64) -> String {
 }
 
 fn plural(count: usize) -> &'static str {
-    if count == 1 {
-        ""
-    } else {
-        "s"
-    }
+    if count == 1 { "" } else { "s" }
 }
 
 fn attach_sidebar_context_menu(row: &gtk::ListBoxRow, kind: SidebarKind) {

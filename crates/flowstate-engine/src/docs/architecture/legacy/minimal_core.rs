@@ -1054,7 +1054,7 @@ fn ensure_wallpaper_loaded(&mut self, renderer: &mut GlesRenderer)
         //flog_info!("wallpaper loaded");
         self.wallpaper_texture = load_wallpaper(
             renderer,
-            "/home/steve/flowos/assets/wallpaper/flowos_wallpaper_5k.png",
+            "/home/steve/flowstate/assets/wallpaper/flowstate wallpaper.png",
             
     );
 }

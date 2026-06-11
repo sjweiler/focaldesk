@@ -5,12 +5,12 @@ use flowstate_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::utils::import_surface_tree;
 use smithay::desktop::{
-    find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
+    PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
 };
+use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::compositor::get_parent;
 use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -28,8 +28,8 @@ use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::keysyms;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
-use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
+use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use flowstate_cursor::CursorManager;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
@@ -42,6 +42,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::core::RenderState;
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
 use crate::core::input::FlowMouseButton;
@@ -49,11 +50,10 @@ use crate::core::input::FlowScrollDelta;
 use crate::core::input::FlowScrollSource;
 use crate::core::input::{FlowInputEvent, InputState};
 use crate::core::shell::ManagedWindow;
-use crate::core::RenderState;
-use flowstate_flow::actions::KeyAction;
-use flowstate_flow::keybinds::BackendKind;
 use flowstate_flow::Keybinds;
 use flowstate_flow::ModMask;
+use flowstate_flow::actions::KeyAction;
+use flowstate_flow::keybinds::BackendKind;
 use flowstate_logging::{flog, flog_error, flog_info, flog_warn};
 use flowstate_notifications::NotificationManager;
 use flowstate_settings_core::AppSettings;
@@ -62,12 +62,12 @@ use flowstate_ui::chrome::Chrome;
 use flowstate_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
 use smithay::delegate_output;
-use smithay::input::keyboard::FilterResult;
 use smithay::input::Seat;
+use smithay::input::keyboard::FilterResult;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::utils::Serial;
 use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::Serial;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
@@ -75,8 +75,8 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::path::{Path, PathBuf};
-use std::process::id;
 use std::process::Command;
+use std::process::id;
 use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
@@ -99,13 +99,13 @@ use crate::core::chrome_layout::{
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
-    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
-    ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
+    RESIZE_BORDER_PX, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
+    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at,
 };
 use crate::core::ui_builder::build_ui_for_output;
-use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_themes::FlowThemeId;
 use flowstate_themes::ThemeManager;
+use flowstate_themes::theme::BuiltInThemeId;
 use flowstate_ui::dialog::DialogAction;
 use flowstate_ui::dialog::{Dialog, DialogId};
 use flowstate_ui::dialog_layout::layout_dialog;
@@ -3311,18 +3311,6 @@ impl DesktopState {
                                 if let Ok(edge) = ResizeEdge::try_from(edges) {
                                     self.try_begin_compositor_resize(id, edge);
                                 }
-                            } else {
-                                self.pending_compositor_move = self
-                                    .top_mapped_window_id_at(position)
-                                    .filter(|&id| {
-                                        self.window(id).is_some_and(|w| {
-                                            w.mapped
-                                                && !w.maximized
-                                                && !w.fullscreen
-                                                && !w.minimized
-                                        })
-                                    })
-                                    .map(|id| (id, position));
                             }
                         }
                     }

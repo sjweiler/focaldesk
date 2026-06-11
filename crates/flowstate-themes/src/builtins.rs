@@ -18,7 +18,7 @@ pub fn eagle_theme() -> FlowTheme {
         },
 
         wallpaper: WallpaperTheme {
-            path: Some("themes/eagle/wallpaper.png".to_string()),
+            path: Some("themes/eagle/flowstate wallpaper.png".to_string()),
             tint_color: [0.05, 0.15, 0.30, 0.25],
             dim: 0.35,
         },
@@ -80,7 +80,7 @@ pub fn moonbase_theme() -> FlowTheme {
         },
 
         wallpaper: WallpaperTheme {
-            path: Some("themes/moonbase/wallpaper.png".to_string()),
+            path: Some("themes/moonbase/flowstate wallpaper.png".to_string()),
             tint_color: [0.85, 0.90, 1.00, 0.15],
             dim: 0.20,
         },
@@ -142,7 +142,7 @@ pub fn classic_theme() -> FlowTheme {
         },
 
         wallpaper: WallpaperTheme {
-            path: Some("themes/classic/wallpaper.png".to_string()),
+            path: Some("themes/classic/flowstate wallpaper.png".to_string()),
             tint_color: [1.0, 0.5, 0.1, 0.25],
             dim: 0.45,
         },

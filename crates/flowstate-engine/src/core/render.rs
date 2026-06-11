@@ -1126,16 +1126,8 @@ impl RenderState {
 
         let tex = Self::load_wallpaper(
             renderer,
-            //"/home/steve/flowstate/assets/wallpaper/doctor.png",
-            //"/home/steve/flowstate/assets/wallpaper/WALLPAPER.png",
-            "/home/steve/flowstate/assets/wallpaper/ChatGPT Image Mar 29, 2026, 07_11_29 PM.png",
+            "/home/steve/flowstate/assets/wallpaper/flowstate wallpaper.png",
         );
-        //"/home/steve/flowstate/assets/icons/sidebar/launcher_56.png",
-        //"/tmp/atlas-debug.png",
-        //"/home/steve/flowstate/assets/wallpaper/flowstate_wallpaper_tagline_5k.png",
-        //"/home/steve/flowstate/assets/wallpaper/ChatGPT Image Mar 26, 2026, 08_07_23 AM.png",
-        //"/home/steve/flowstate/assets/wallpaper/ChatGPT Image Mar 29, 2026, 07_11_29 PM.png",
-        //"/home/steve/flowstate/assets/wallpaper/WALLPAPER.png",
         flog_info!(
             "ensure_wallpaper_loaded: load result is_some={}",
             tex.is_some()
@@ -1846,7 +1838,7 @@ impl RenderState {
             dst_rect_physical, // Rectangle<i32, Physical>
             size,              // Size<i32, Buffer>
             Some(&damage_local),
-            1.0,               // alpha
+            1.0, // alpha
             &uniforms,
         )
     }
@@ -1886,7 +1878,7 @@ impl RenderState {
             dst_rect_physical, // Rectangle<i32, Physical>
             size,              // Size<i32, Buffer>
             Some(&damage_local),
-            1.0,               // alpha
+            1.0, // alpha
             &uniforms,
         )
     }
@@ -1925,7 +1917,7 @@ impl RenderState {
             dst_rect_physical, // Rectangle<i32, Physical>
             size,              // Size<i32, Buffer>
             Some(&damage_local),
-            1.0,               // alpha
+            1.0, // alpha
             &uniforms,
         )
     }

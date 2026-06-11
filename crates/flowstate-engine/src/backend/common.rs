@@ -352,7 +352,9 @@ fn restart_portal_services() {
         .status();
 
     match status {
-        Ok(status) if status.success() => flog("reset failed state for xdg-desktop-portal-wlr.service"),
+        Ok(status) if status.success() => {
+            flog("reset failed state for xdg-desktop-portal-wlr.service")
+        }
         Ok(status) => flog(&format!(
             "failed to reset xdg-desktop-portal-wlr.service state: systemctl exited with {status}"
         )),
