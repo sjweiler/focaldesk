@@ -6,13 +6,13 @@
 [36m@@ -0,0 +1,81 @@[m
 [32m+[m[32m# Contributing[m
 [32m+[m
-[32m+[m[32mFocusShell is currently a solo-developed alpha project. Contributions, bug[m
+[32m+[m[32mFocalDesk is currently a solo-developed alpha project. Contributions, bug[m
 [32m+[m[32mreports, and design feedback may be welcome, but there is no formal maintainer[m
 [32m+[m[32mteam, release process, or guaranteed review timeline yet.[m
 [32m+[m
 [32m+[m[32m## Project Status[m
 [32m+[m
-[32m+[m[32mFocusShell is experimental compositor and desktop environment software. Expect[m
+[32m+[m[32mFocalDesk is experimental compositor and desktop environment software. Expect[m
 [32m+[m[32mbreaking changes, incomplete features, and architectural churn.[m
 [32m+[m
 [32m+[m[32mBefore contributing, read the [README](README.md) for the current project shape[m
@@ -319,15 +319,15 @@
 [1m--- /dev/null[m
 [1m+++ b/README.md[m
 [36m@@ -0,0 +1,86 @@[m
-[32m+[m[32m# FocusShell[m
+[32m+[m[32m# FocalDesk[m
 [32m+[m
-[32m+[m[32mFocusShell is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.[m
+[32m+[m[32mFocalDesk is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.[m
 [32m+[m
 [32m+[m[32mThe long-term direction is a fast, keyboard-friendly, retro-futuristic desktop with structured workspaces, clear system feedback, and permissioned automation. See [docs/vision.md](docs/vision.md) for the broader project direction.[m
 [32m+[m
 [32m+[m[32m## Status[m
 [32m+[m
-[32m+[m[32mFocusShell is alpha software.[m
+[32m+[m[32mFocalDesk is alpha software.[m
 [32m+[m
 [32m+[m[32mIt is stable enough for daily use by the project owner, but it is still early in[m
 [32m+[m[32mdevelopment. Expect incomplete features, breaking changes, rough edges, and[m
@@ -336,19 +336,19 @@
 [32m+[m
 [32m+[m[32m## Repository Layout[m
 [32m+[m
-[32m+[m[32m- `apps/flowstate-desktop`: compositor executable[m
-[32m+[m[32m- `apps/flowstate-cli`: command-line interface[m
-[32m+[m[32m- `apps/flowstate-files`: file app prototype[m
-[32m+[m[32m- `apps/flowstate-settings`: settings app prototype[m
-[32m+[m[32m- `apps/flowstate-portal`: portal-related app code[m
-[32m+[m[32m- `services/flowstate-server`: background server and IPC daemon[m
-[32m+[m[32m- `crates/`: shared FocusShell libraries[m
+[32m+[m[32m- `apps/focaldesk-desktop`: compositor executable[m
+[32m+[m[32m- `apps/focaldesk-cli`: command-line interface[m
+[32m+[m[32m- `apps/focaldesk-files`: file app prototype[m
+[32m+[m[32m- `apps/focaldesk-settings`: settings app prototype[m
+[32m+[m[32m- `apps/focaldesk-portal`: portal-related app code[m
+[32m+[m[32m- `services/focaldesk-server`: background server and IPC daemon[m
+[32m+[m[32m- `crates/`: shared FocalDesk libraries[m
 [32m+[m[32m- `assets/`: bundled visual assets[m
 [32m+[m[32m- `docs/`: design notes and architecture material[m
 [32m+[m
 [32m+[m[32m## Requirements[m
 [32m+[m
-[32m+[m[32mFocusShell is currently developed as a Rust workspace for Linux.[m
+[32m+[m[32mFocalDesk is currently developed as a Rust workspace for Linux.[m
 [32m+[m
 [32m+[m[32mInstall Rust from <https://rustup.rs/>.[m
 [32m+[m
@@ -393,16 +393,16 @@
 [32m+[m[32mThe main compositor binary is:[m
 [32m+[m
 [32m+[m[32m```sh[m
-[32m+[m[32mcargo run -p flowstate-desktop[m
+[32m+[m[32mcargo run -p focaldesk-desktop[m
 [32m+[m[32m```[m
 [32m+[m
-[32m+[m[32mBecause FocusShell is alpha compositor/system software, run it from a safe[m
+[32m+[m[32mBecause FocalDesk is alpha compositor/system software, run it from a safe[m
 [32m+[m[32mdevelopment session first. Avoid switching important work over to it until you[m
 [32m+[m[32mknow the current state of your local build.[m
 [32m+[m
 [32m+[m[32m## License[m
 [32m+[m
-[32m+[m[32mFocusShell is licensed under the MIT License. See [LICENSE](LICENSE).[m
+[32m+[m[32mFocalDesk is licensed under the MIT License. See [LICENSE](LICENSE).[m
 [32m+[m
 [32m+[m[32mBundled third-party assets retain their own licenses, including the icon and font license files under `assets/`.[m
 [1mdiff --git a/SECURITY.md b/SECURITY.md[m
@@ -413,13 +413,13 @@
 [36m@@ -0,0 +1,42 @@[m
 [32m+[m[32m# Security Policy[m
 [32m+[m
-[32m+[m[32mFocusShell is alpha compositor and desktop environment software. Security-sensitive[m
+[32m+[m[32mFocalDesk is alpha compositor and desktop environment software. Security-sensitive[m
 [32m+[m[32mbehavior may include process launching, IPC, permissions, portals, input handling,[m
 [32m+[m[32mdisplay output, file access, and automation features.[m
 [32m+[m
 [32m+[m[32m## Supported Versions[m
 [32m+[m
-[32m+[m[32mSecurity fixes are handled on the current default branch. FocusShell does not[m
+[32m+[m[32mSecurity fixes are handled on the current default branch. FocalDesk does not[m
 [32m+[m[32mcurrently maintain separate supported release branches.[m
 [32m+[m
 [32m+[m[32m## Reporting a Vulnerability[m
@@ -444,7 +444,7 @@
 [32m+[m[32m## Response Expectations[m
 [32m+[m
 [32m+[m[32mMaintainers will acknowledge valid reports when possible, investigate the issue,[m
-[32m+[m[32mand coordinate a fix before public disclosure. Because FocusShell is early alpha,[m
+[32m+[m[32mand coordinate a fix before public disclosure. Because FocalDesk is early alpha,[m
 [32m+[m[32mresponse times and release processes may vary.[m
 [32m+[m
 [32m+[m[32m## Disclosure[m

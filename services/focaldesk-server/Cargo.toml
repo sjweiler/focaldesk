@@ -1,0 +1,29 @@
+[package]
+name = "focaldesk-server"
+version = "0.1.0"
+edition = "2021"
+description = "FocalDesk background server and IPC daemon"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-server"
+path = "src/main.rs"
+
+[dependencies]
+focaldesk-ai = { path = "../../crates/focaldesk-ai" }
+focaldesk-memory = { path = "../../crates/focaldesk-memory" }
+
+focaldesk-engine = { path = "../../crates/focaldesk-engine" }
+focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+
+# Async runtime (server usually async)
+tokio = { version = "1", features = ["full"] }
+
+# Error handling and logging
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization for IPC
+serde = { workspace = true }
+serde_json = "1"

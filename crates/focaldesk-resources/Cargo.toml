@@ -1,0 +1,19 @@
+[package]
+name = "focaldesk-resources"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+focaldesk-sounds = { path = "../focaldesk-sounds" }
+image = "0.25"
+
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+swash.workspace = true
+fontdb.workspace = true
+usvg.workspace = true
+resvg.workspace = true
+chrono.workspace = true
+ab_glyph.workspace = true
+anyhow.workspace = true
+smithay = { workspace = true, features = ["renderer_gl"] }

@@ -1,4 +1,4 @@
-FocusShell display glyph set v1
+FocalDesk display glyph set v1
 
 Included:
 - A-Z

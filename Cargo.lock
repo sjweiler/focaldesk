@@ -1381,11 +1381,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
-name = "flow-automation"
+name = "focaldesk-ai"
+version = "0.1.0"
+
+[[package]]
+name = "focaldesk-audio"
+version = "0.1.0"
+
+[[package]]
+name = "focaldesk-automation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "flowstate-logging",
+ "focaldesk-logging",
  "mlua",
  "serde",
  "serde_json",
@@ -1394,40 +1402,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-ai"
+name = "focaldesk-bluetooth"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-audio"
-version = "0.1.0"
-
-[[package]]
-name = "flowstate-bluetooth"
-version = "0.1.0"
-
-[[package]]
-name = "flowstate-cli"
+name = "focaldesk-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "flowstate-ai",
+ "focaldesk-ai",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "flowstate-config"
+name = "focaldesk-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
- "flowstate-themes",
+ "focaldesk-themes",
  "serde",
  "toml",
 ]
 
 [[package]]
-name = "flowstate-cursor"
+name = "focaldesk-cursor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1438,19 +1438,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-desktop"
+name = "focaldesk-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "flowstate-engine",
- "flowstate-logging",
- "flowstate-ui",
+ "focaldesk-engine",
+ "focaldesk-logging",
+ "focaldesk-ui",
  "tracing",
  "tracing-subscriber",
 ]
 
 [[package]]
-name = "flowstate-engine"
+name = "focaldesk-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1458,18 +1458,18 @@ dependencies = [
  "calloop 0.12.4",
  "chrono",
  "egui",
- "flowstate-config",
- "flowstate-cursor",
- "flowstate-flow",
- "flowstate-ipc",
- "flowstate-logging",
- "flowstate-notifications",
- "flowstate-resources",
- "flowstate-settings-core",
- "flowstate-sounds",
- "flowstate-themes",
- "flowstate-types",
- "flowstate-ui",
+ "focaldesk-config",
+ "focaldesk-cursor",
+ "focaldesk-flow",
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "focaldesk-notifications",
+ "focaldesk-resources",
+ "focaldesk-settings-core",
+ "focaldesk-sounds",
+ "focaldesk-themes",
+ "focaldesk-types",
+ "focaldesk-ui",
  "fontdue",
  "gl",
  "glow",
@@ -1489,12 +1489,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-files"
+name = "focaldesk-files"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
- "flowstate-logging",
+ "focaldesk-logging",
  "gtk4",
  "libadwaita",
  "serde",
@@ -1503,34 +1503,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-flow"
+name = "focaldesk-flow"
 version = "0.1.0"
 dependencies = [
  "bitflags 2.11.0",
- "flowstate-types",
+ "focaldesk-types",
  "smithay",
 ]
 
 [[package]]
-name = "flowstate-ipc"
+name = "focaldesk-ipc"
 version = "0.1.0"
 dependencies = [
- "flowstate-logging",
- "flowstate-settings-core",
+ "focaldesk-logging",
+ "focaldesk-settings-core",
  "serde",
  "serde_json",
 ]
 
 [[package]]
-name = "flowstate-logging"
+name = "focaldesk-logging"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-memory"
+name = "focaldesk-memory"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-network"
+name = "focaldesk-network"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1543,15 +1543,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-notifications"
+name = "focaldesk-notifications"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-permissions"
+name = "focaldesk-permissions"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-portal"
+name = "focaldesk-portal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1561,18 +1561,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-power"
+name = "focaldesk-power"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-resources"
+name = "focaldesk-resources"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
  "chrono",
  "cosmic-text",
- "flowstate-sounds",
+ "focaldesk-sounds",
  "fontdb 0.16.2",
  "image",
  "resvg 0.41.0",
@@ -1583,14 +1583,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-server"
+name = "focaldesk-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "flowstate-ai",
- "flowstate-engine",
- "flowstate-logging",
- "flowstate-memory",
+ "focaldesk-ai",
+ "focaldesk-engine",
+ "focaldesk-logging",
+ "focaldesk-memory",
  "serde",
  "serde_json",
  "tokio",
@@ -1599,12 +1599,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-settings"
+name = "focaldesk-settings"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
- "flowstate-logging",
+ "focaldesk-logging",
  "gtk4",
  "libadwaita",
  "serde",
@@ -1613,7 +1613,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-settings-core"
+name = "focaldesk-settings-core"
 version = "0.1.0"
 dependencies = [
  "dirs 6.0.0",
@@ -1622,15 +1622,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-sounds"
+name = "focaldesk-sounds"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-spawn"
+name = "focaldesk-spawn"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-themes"
+name = "focaldesk-themes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -1639,11 +1639,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-types"
+name = "focaldesk-types"
 version = "0.1.0"
 
 [[package]]
-name = "flowstate-ui"
+name = "focaldesk-ui"
 version = "0.1.0"
 dependencies = [
  "ab_glyph",
@@ -1652,11 +1652,11 @@ dependencies = [
  "cosmic-text",
  "egui",
  "egui_glow",
- "flowstate-config",
- "flowstate-logging",
- "flowstate-permissions",
- "flowstate-themes",
- "flowstate-types",
+ "focaldesk-config",
+ "focaldesk-logging",
+ "focaldesk-permissions",
+ "focaldesk-themes",
+ "focaldesk-types",
  "fontdb 0.16.2",
  "glow",
  "image",
@@ -1668,7 +1668,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "flowstate-voice"
+name = "focaldesk-voice"
 version = "0.1.0"
 
 [[package]]

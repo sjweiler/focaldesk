@@ -2,28 +2,28 @@
 members = [
 
     # library crates
-    "crates/flowstate-types",
-    "crates/flowstate-engine",
-    "crates/flowstate-flow",
-    "crates/flowstate-ai",
-    "crates/flowstate-memory",
-    "crates/flowstate-ipc",
-    "crates/flowstate-settings-core",
-    "crates/flowstate-automation",
-    "crates/flowstate-ui",
-    "crates/flowstate-network",
-    "crates/flowstate-logging",
-    "crates/flowstate-voice",
+    "crates/focaldesk-types",
+    "crates/focaldesk-engine",
+    "crates/focaldesk-flow",
+    "crates/focaldesk-ai",
+    "crates/focaldesk-memory",
+    "crates/focaldesk-ipc",
+    "crates/focaldesk-settings-core",
+    "crates/focaldesk-automation",
+    "crates/focaldesk-ui",
+    "crates/focaldesk-network",
+    "crates/focaldesk-logging",
+    "crates/focaldesk-voice",
     
 
     # apps
-    "apps/flowstate-cli",
-    "apps/flowstate-desktop",
-    "apps/flowstate-files",
-    "apps/flowstate-settings",
+    "apps/focaldesk-cli",
+    "apps/focaldesk-desktop",
+    "apps/focaldesk-files",
+    "apps/focaldesk-settings",
 
     # services
-    "services/flowstate-server", "crates/flowstate-types", "crates/flowstate-power", "crates/flowstate-audio", "crates/flowstate-bluetooth", "crates/flowstate-notifications", "crates/flowstate-resources", "crates/flowstate-cursor", "crates/flowstate-spawn", "crates/flowstate-config", "crates/flowstate-permissions", "apps/flowstate-portal", "apps/flowstate-settings", "crates/flowstate-themes", "crates/flowstate-sounds", 
+    "services/focaldesk-server", "crates/focaldesk-types", "crates/focaldesk-power", "crates/focaldesk-audio", "crates/focaldesk-bluetooth", "crates/focaldesk-notifications", "crates/focaldesk-resources", "crates/focaldesk-cursor", "crates/focaldesk-spawn", "crates/focaldesk-config", "crates/focaldesk-permissions", "apps/focaldesk-portal", "apps/focaldesk-settings", "crates/focaldesk-themes", "crates/focaldesk-sounds", 
 ]
 resolver = "2"
 

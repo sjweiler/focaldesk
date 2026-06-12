@@ -1,0 +1,50 @@
+[package]
+name = "focaldesk-engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+indexmap = "2"
+bitflags = "2"
+smithay.workspace = true
+nix = { version = "0.27", features = ["fs"] }
+calloop = "0.12"
+wayland-server = "0.31"
+wayland-protocols.workspace = true
+serde = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+focaldesk-ui = { path = "../focaldesk-ui" }
+focaldesk-flow = { path = "../focaldesk-flow" }
+focaldesk-types = { path = "../focaldesk-types" }
+focaldesk-logging = { path = "../focaldesk-logging" }
+focaldesk-resources = { path = "../focaldesk-resources" }
+focaldesk-cursor = { path = "../focaldesk-cursor" }
+focaldesk-notifications = { path = "../focaldesk-notifications" }
+focaldesk-settings-core = { path = "../focaldesk-settings-core" }
+focaldesk-ipc = { path = "../focaldesk-ipc" }
+focaldesk-themes = { path = "../focaldesk-themes" }
+focaldesk-config = { path = "../focaldesk-config" }
+focaldesk-sounds = { path = "../focaldesk-sounds" }
+
+serde_json = "1"
+zbus = "3"
+pipewire = "0.8"
+egui = "0.31"
+# Optional backend deps you control (examples)
+winit = { version = "0.30", optional = true }
+gl = "0.14.0"
+fontdue = "0.9"
+chrono.workspace = true
+image.workspace = true
+glow.workspace = true
+#winit
+
+
+
+[features]
+default = ["winit"]
+winit = ["dep:winit"]
+xwayland = ["smithay/xwayland"]
+drm = []

@@ -1,0 +1,26 @@
+[package]
+name = "focaldesk-ui"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+focaldesk-types = { path = "../focaldesk-types" }
+focaldesk-themes = { path = "../focaldesk-themes" }
+focaldesk-logging = { path = "../focaldesk-logging" }
+focaldesk-config = { path = "../focaldesk-config" }
+focaldesk-permissions = { path = "../focaldesk-permissions" }
+image = "0.25"
+egui = "0.31"
+egui_glow = "0.31"
+glow.workspace = true
+
+tiny-skia.workspace = true
+cosmic-text.workspace = true
+swash.workspace = true
+fontdb.workspace = true
+usvg.workspace = true
+resvg.workspace = true
+chrono.workspace = true
+ab_glyph.workspace = true
+anyhow.workspace = true
+smithay = { workspace = true, features = ["renderer_gl"] }
