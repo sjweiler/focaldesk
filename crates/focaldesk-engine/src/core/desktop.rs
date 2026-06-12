@@ -5,12 +5,12 @@ use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::utils::import_surface_tree;
 use smithay::desktop::{
-    PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
+    find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
 };
-use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::compositor::get_parent;
 use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::compositor::with_states;
+use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -28,8 +28,8 @@ use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::keysyms;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
-use crate::core::shell::WaylandWindowMeta;
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
+use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::CursorManager;
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
@@ -42,7 +42,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::core::RenderState;
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
 use crate::core::input::FlowMouseButton;
@@ -50,10 +49,11 @@ use crate::core::input::FlowScrollDelta;
 use crate::core::input::FlowScrollSource;
 use crate::core::input::{FlowInputEvent, InputState};
 use crate::core::shell::ManagedWindow;
-use focaldesk_flow::Keybinds;
-use focaldesk_flow::ModMask;
+use crate::core::RenderState;
 use focaldesk_flow::actions::KeyAction;
 use focaldesk_flow::keybinds::BackendKind;
+use focaldesk_flow::Keybinds;
+use focaldesk_flow::ModMask;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn};
 use focaldesk_notifications::NotificationManager;
 use focaldesk_settings_core::AppSettings;
@@ -62,12 +62,12 @@ use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
 use smithay::delegate_output;
-use smithay::input::Seat;
 use smithay::input::keyboard::FilterResult;
+use smithay::input::Seat;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
+use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
@@ -75,8 +75,8 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::process::id;
+use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
@@ -99,13 +99,13 @@ use crate::core::chrome_layout::{
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
-    RESIZE_BORDER_PX, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
-    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at,
+    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
+    ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
 use crate::core::ui_builder::build_ui_for_output;
+use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
-use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogId};
 use focaldesk_ui::dialog_layout::layout_dialog;
@@ -2779,6 +2779,9 @@ impl DesktopState {
             if chrome_like {
                 configure_chrome_command(&mut command);
             }
+            if is_obs_like(&candidate) {
+                configure_obs_recording_dir();
+            }
 
             match command.spawn() {
                 Ok(child) => {
@@ -4399,6 +4402,110 @@ fn is_chrome_like(app_name: &str) -> bool {
             | "chromium"
             | "chromium-browser"
     )
+}
+
+fn is_obs_like(app_name: &str) -> bool {
+    let executable = app_name.rsplit('/').next().unwrap_or(app_name);
+    matches!(executable, "obs" | "obs-studio" | "com.obsproject.Studio")
+}
+
+fn home_videos_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("Videos"))
+}
+
+fn obs_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("obs-studio")
+}
+
+fn configure_obs_recording_dir() {
+    let Some(videos_dir) = home_videos_dir() else {
+        return;
+    };
+    if let Err(err) = std::fs::create_dir_all(&videos_dir) {
+        flog(&format!(
+            "failed to create OBS recording directory {}: {err}",
+            videos_dir.display()
+        ));
+        return;
+    }
+
+    let profile_root = obs_config_dir().join("basic").join("profiles");
+    let Ok(entries) = std::fs::read_dir(&profile_root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path().join("basic.ini");
+        if path.is_file() {
+            configure_obs_profile_recording_dir(&path, &videos_dir);
+        }
+    }
+}
+
+fn configure_obs_profile_recording_dir(path: &Path, videos_dir: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+
+    let desired = format!("RecFilePath={}", videos_dir.display());
+    let mut changed = false;
+    let mut in_recording_section = false;
+    let mut saw_rec_file_path = false;
+    let mut lines = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_recording_section && !saw_rec_file_path {
+                lines.push(desired.clone());
+                changed = true;
+            }
+            in_recording_section = matches!(trimmed, "[SimpleOutput]" | "[AdvOut]");
+            saw_rec_file_path = false;
+            lines.push(line.to_string());
+            continue;
+        }
+
+        if trimmed.starts_with("RecFilePath=") {
+            saw_rec_file_path = true;
+            if trimmed == desired {
+                lines.push(line.to_string());
+            } else {
+                lines.push(desired.clone());
+                changed = true;
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if in_recording_section && !saw_rec_file_path {
+        lines.push(desired);
+        changed = true;
+    }
+
+    if !changed {
+        return;
+    }
+
+    let mut output = lines.join("\n");
+    output.push('\n');
+    if let Err(err) = std::fs::write(path, output) {
+        flog(&format!(
+            "failed to update OBS recording directory in {}: {err}",
+            path.display()
+        ));
+    }
 }
 
 impl BufferHandler for DesktopState {

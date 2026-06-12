@@ -1126,7 +1126,7 @@ impl RenderState {
 
         let tex = Self::load_wallpaper(
             renderer,
-            "/home/steve/focusshell/assets/wallpaper/focaldesk_wallpaper.png",
+            "/home/steve/focaldesk/assets/wallpaper/focaldesk_wallpaper.png",
         );
         flog_info!(
             "ensure_wallpaper_loaded: load result is_some={}",
