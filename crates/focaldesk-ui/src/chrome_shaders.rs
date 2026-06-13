@@ -181,6 +181,7 @@ impl ChromeShaders {
                     UniformName::new("u_click_pos", UniformType::_2f),
                     UniformName::new("u_time", UniformType::_1f),
                     UniformName::new("u_size", UniformType::_2f),
+                    UniformName::new("u_color", UniformType::_4f),
                 ],
             )?);
         }
@@ -890,6 +891,7 @@ precision mediump float;
 uniform vec2 u_click_pos;
 uniform float u_time;
 uniform vec2 u_size;
+uniform vec4 u_color;
 
 varying vec2 v_coords;
 
@@ -904,7 +906,8 @@ void main() {
     float alpha = 1.0 - smoothstep(-blur_width, blur_width, sdf_rect);
     alpha *= max(1.0 - (u_time / 2.0), 0.0);
 
-    gl_FragColor = vec4(0.0, 0.5, 1.0, max(alpha, 0.0));
+    float out_alpha = max(alpha, 0.0) * u_color.a;
+    gl_FragColor = vec4(u_color.rgb * out_alpha, out_alpha);
 }
 "#;
 

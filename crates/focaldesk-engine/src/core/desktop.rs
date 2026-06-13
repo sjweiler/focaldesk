@@ -25,7 +25,7 @@ use focaldesk_ui::element::UiElement;
 use focaldesk_ui::types::{ElementId, PanelKind, UiAction, UiElementKind};
 use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState};
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
-use smithay::input::keyboard::keysyms;
+use smithay::input::keyboard::{keysyms, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
@@ -48,12 +48,17 @@ use crate::core::input::FlowMouseButton;
 use crate::core::input::FlowScrollDelta;
 use crate::core::input::FlowScrollSource;
 use crate::core::input::{FlowInputEvent, InputState};
+use crate::core::lock::{
+    authenticate_current_user, LockPulseKind, LockScreenState, LOCK_PULSE_DURATION,
+};
 use crate::core::shell::ManagedWindow;
 use crate::core::RenderState;
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_flow::actions::KeyAction;
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
+use focaldesk_ipc::{IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn};
 use focaldesk_notifications::NotificationManager;
 use focaldesk_settings_core::AppSettings;
@@ -90,7 +95,10 @@ use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::X11Wm;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc;
+use std::thread;
 use wayland_server::DisplayHandle;
 
 use crate::core::chrome_layout::{
@@ -102,18 +110,119 @@ use crate::core::toplevel_interaction::{
     cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
     ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
-use crate::core::ui_builder::build_ui_for_output;
+use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
 use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogId};
 use focaldesk_ui::dialog_layout::layout_dialog;
+use focaldesk_ui::ui_builder::{
+    SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID,
+    SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_1_ID, SIDEBAR_WORKSPACE_2_ID,
+    SIDEBAR_WORKSPACE_3_ID,
+};
 
 pub(crate) fn dbg_flush(msg: &str) {
     let mut stderr = io::stderr();
     let _ = writeln!(stderr, "{msg}");
     let _ = stderr.flush();
+}
+
+fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let _ = std::fs::remove_file(DESKTOP_SOCKET_PATH);
+        let listener = match UnixListener::bind(DESKTOP_SOCKET_PATH) {
+            Ok(listener) => listener,
+            Err(err) => {
+                flog_warn!("failed to bind desktop settings IPC socket: {err}");
+                return;
+            }
+        };
+
+        flog_info!("desktop settings IPC listening on {DESKTOP_SOCKET_PATH}");
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => handle_desktop_settings_ipc_stream(&mut stream, &tx),
+                Err(err) => flog_warn!("desktop settings IPC accept failed: {err}"),
+            }
+        }
+    });
+
+    rx
+}
+
+fn handle_desktop_settings_ipc_stream(
+    stream: &mut UnixStream,
+    tx: &mpsc::Sender<DesktopIpcMessage>,
+) {
+    let mut payload = String::new();
+    if let Err(err) = stream.read_to_string(&mut payload) {
+        write_ipc_response(
+            stream,
+            IpcResponse::Error {
+                message: err.to_string(),
+            },
+        );
+        return;
+    }
+
+    let request = match serde_json::from_str::<IpcRequest>(&payload) {
+        Ok(request) => request,
+        Err(err) => {
+            write_ipc_response(
+                stream,
+                IpcResponse::Error {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    let (response_tx, response_rx) = mpsc::channel();
+    if tx
+        .send(DesktopIpcMessage {
+            request,
+            response: response_tx,
+        })
+        .is_err()
+    {
+        write_ipc_response(
+            stream,
+            IpcResponse::Error {
+                message: "desktop settings IPC handler is unavailable".to_string(),
+            },
+        );
+        return;
+    }
+
+    match response_rx.recv() {
+        Ok(response) => write_ipc_response(stream, response),
+        Err(err) => write_ipc_response(
+            stream,
+            IpcResponse::Error {
+                message: err.to_string(),
+            },
+        ),
+    }
+}
+
+fn write_ipc_response(stream: &mut UnixStream, response: IpcResponse) {
+    if let Ok(json) = serde_json::to_vec(&response) {
+        let _ = stream.write_all(&json);
+    }
+}
+
+fn theme_id_from_config(config: &FocalDeskConfig) -> FlowThemeId {
+    match config.appearance.theme.as_str() {
+        "Eagle" | "" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
+        "Moonbase" => FlowThemeId::BuiltIn(BuiltInThemeId::Moonbase),
+        "Classic" => FlowThemeId::BuiltIn(BuiltInThemeId::Classic),
+        other => FlowThemeId::Custom(other.to_string()),
+    }
 }
 
 pub struct OutputState {
@@ -123,6 +232,8 @@ pub struct OutputState {
     pub logical_origin: Point<i32, Logical>,
     pub scale_factor: f64,
     pub scale: Scale<f64>,
+    pub hdr_supported: bool,
+    pub hdr_enabled: bool,
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
@@ -196,6 +307,11 @@ pub struct DesktopInit {
     pub apps: AppSettings,
 }
 
+struct DesktopIpcMessage {
+    request: IpcRequest,
+    response: mpsc::Sender<IpcResponse>,
+}
+
 pub struct DesktopState {
     // smithay protocol state
     pub display_handle: DisplayHandle,
@@ -213,6 +329,7 @@ pub struct DesktopState {
     pub winit_scale_factor: f64,
     pub ui: UiTree,
     pub active_workspace: WorkspaceId,
+    pub workspace_names: Vec<String>,
     pub next_window_id: WindowId,
     pub primary_output: OutputId,
     pub focused_output: OutputId, //keyboard shit
@@ -268,6 +385,7 @@ pub struct DesktopState {
     //pub topbar: TopBarModel,
     //pub sidebar: SidebarModel,
     pub notifications: NotificationManager,
+    pub lock_screen: LockScreenState,
 
     // xwayland and special surfaces
     pub unmapped_windows: Vec<ManagedWindow>,
@@ -276,6 +394,7 @@ pub struct DesktopState {
 
     pub client_wayland_display: String,
     pub apps: AppSettings,
+    settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
 
     /// Undecorated winit window: set on left-press over chrome top bar; backend calls platform window drag.
     host_window_drag_requested: bool,
@@ -315,6 +434,7 @@ pub struct DesktopState {
     pub clock_pulse: Option<ClockPulse>,
     pub ui_sound_player: UiSoundPlayer,
     last_sidebar_hover_sound_target: Option<(OutputId, ElementId)>,
+    last_clock_text: String,
     //pub popups: Vec<PopupState>,
 }
 
@@ -366,6 +486,112 @@ pub struct ClockPulseFrame {
 }
 
 impl DesktopState {
+    pub fn process_settings_ipc_requests(&mut self) {
+        while let Ok(message) = self.settings_ipc_rx.try_recv() {
+            let response = self.handle_settings_ipc_request(message.request);
+            let _ = message.response.send(response);
+        }
+    }
+
+    pub fn process_chrome_timers(&mut self) {
+        let clock_text = chrono::Local::now().format("%-I:%M %p").to_string();
+        if self.last_clock_text == clock_text {
+            return;
+        }
+
+        self.last_clock_text = clock_text;
+        self.mark_all_outputs_clock_damage(DamageSource::Unknown);
+    }
+
+    pub fn process_notification_timers(&mut self) {
+        let now = Instant::now();
+        let had_visible = self.notifications.has_visible(now);
+        let expired = self.notifications.expire(now);
+
+        if had_visible || expired {
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+    }
+
+    pub fn process_lock_timers(&mut self) {
+        if !self.lock_screen.active {
+            return;
+        }
+
+        let now = Instant::now();
+        if let Some(pulse) = self.lock_screen.pulse {
+            let elapsed = now.saturating_duration_since(pulse.started_at);
+            if pulse.kind == LockPulseKind::Accepted && elapsed >= LOCK_PULSE_DURATION {
+                self.lock_screen.unlock();
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                return;
+            }
+
+            if elapsed < LOCK_PULSE_DURATION {
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+        }
+    }
+
+    fn handle_settings_ipc_request(&mut self, request: IpcRequest) -> IpcResponse {
+        match request {
+            IpcRequest::GetConfig => IpcResponse::Config {
+                config: load_config(),
+            },
+            IpcRequest::SetConfig { config } => match save_config(&config) {
+                Ok(()) => {
+                    self.apply_config(config);
+                    IpcResponse::Ok
+                }
+                Err(err) => IpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            IpcRequest::ReloadConfig | IpcRequest::Reload => {
+                self.apply_config(load_config());
+                IpcResponse::Ok
+            }
+            IpcRequest::IdentifyDisplays => {
+                self.topbar_pulse = Some(TopbarPulse {
+                    output_id: self.focused_output,
+                    indicator: 0,
+                    click_local: (0.0, 0.0).into(),
+                    started_at: Instant::now(),
+                });
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                IpcResponse::Ok
+            }
+            IpcRequest::Notify {
+                title,
+                body,
+                timeout_ms,
+            } => {
+                let timeout = timeout_ms.map(Duration::from_millis);
+                let id = if timeout == Some(Duration::ZERO) {
+                    self.notifications.push_persistent(title, body)
+                } else if let Some(timeout) = timeout {
+                    self.notifications
+                        .push_with_timeout(title, body, Some(timeout))
+                } else {
+                    self.notifications.push(title, body)
+                };
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+                IpcResponse::Notification { id }
+            }
+            IpcRequest::GetAll | IpcRequest::SetValue { .. } | IpcRequest::SetDisplays { .. } => {
+                IpcResponse::Error {
+                    message: "legacy settings.json IPC is not handled by focaldesk-desktop"
+                        .to_string(),
+                }
+            }
+        }
+    }
+
+    fn apply_config(&mut self, config: FocalDeskConfig) {
+        self.theme.set_builtin(theme_id_from_config(&config));
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
     /// Clears and returns whether the host (nested) window should begin a platform move drag.
     pub fn output_at_logical_point(&self, p: Point<f64, Logical>) -> Option<OutputId> {
         self.outputs
@@ -465,6 +691,7 @@ impl DesktopState {
     /// Compositor chrome hit (sidebar/topbar UI), if any, without consuming the event.
     pub(crate) fn peek_ui_action_at_pointer(&self) -> Option<focaldesk_ui::types::UiAction> {
         self.ui_element_at_pointer_for_output(self.focused_output)
+            .filter(|el| el.enabled)
             .and_then(|el| el.action.clone())
     }
 
@@ -484,7 +711,16 @@ impl DesktopState {
             self.chrome.metrics.topbar_h,
             self.chrome.metrics.sidebar_w,
         );
-        build_ui_for_output(&mut self.ui, &layout);
+        build_ui_for_output_with_options(
+            &mut self.ui,
+            &layout,
+            UiBuildOptions {
+                hdr_supported: output.hdr_supported,
+                hdr_enabled: output.hdr_enabled,
+                workspace_count: self.workspace_names.len(),
+                active_workspace: output.active_workspace.0,
+            },
+        );
     }
 
     fn play_ui_sound(&self, sound: UiSound) {
@@ -577,9 +813,8 @@ impl DesktopState {
     }
 
     fn egui_key(keycode: u32) -> Option<egui::Key> {
-        // Smithay `KeyboardKeyEvent::key_code()` is evdev-style, while
-        // `smithay::input::keyboard::keysyms` are XKB keysyms.
-        match keycode {
+        let evdev_keycode = keycode.saturating_sub(8);
+        match evdev_keycode {
             1 => Some(egui::Key::Escape),
             15 => Some(egui::Key::Tab),
             14 => Some(egui::Key::Backspace),
@@ -596,6 +831,350 @@ impl DesktopState {
             111 => Some(egui::Key::Delete),
             _ => None,
         }
+    }
+
+    fn egui_text_for_keycode(keycode: u32, modifiers: FlowModifiers) -> Option<String> {
+        if modifiers.ctrl || modifiers.alt || modifiers.super_key {
+            return None;
+        }
+
+        let shifted = modifiers.shift;
+        let evdev_keycode = keycode.saturating_sub(8);
+        let ch = match evdev_keycode {
+            2 => {
+                if shifted {
+                    '!'
+                } else {
+                    '1'
+                }
+            }
+            3 => {
+                if shifted {
+                    '@'
+                } else {
+                    '2'
+                }
+            }
+            4 => {
+                if shifted {
+                    '#'
+                } else {
+                    '3'
+                }
+            }
+            5 => {
+                if shifted {
+                    '$'
+                } else {
+                    '4'
+                }
+            }
+            6 => {
+                if shifted {
+                    '%'
+                } else {
+                    '5'
+                }
+            }
+            7 => {
+                if shifted {
+                    '^'
+                } else {
+                    '6'
+                }
+            }
+            8 => {
+                if shifted {
+                    '&'
+                } else {
+                    '7'
+                }
+            }
+            9 => {
+                if shifted {
+                    '*'
+                } else {
+                    '8'
+                }
+            }
+            10 => {
+                if shifted {
+                    '('
+                } else {
+                    '9'
+                }
+            }
+            11 => {
+                if shifted {
+                    ')'
+                } else {
+                    '0'
+                }
+            }
+            12 => {
+                if shifted {
+                    '_'
+                } else {
+                    '-'
+                }
+            }
+            13 => {
+                if shifted {
+                    '+'
+                } else {
+                    '='
+                }
+            }
+            16 => {
+                if shifted {
+                    'Q'
+                } else {
+                    'q'
+                }
+            }
+            17 => {
+                if shifted {
+                    'W'
+                } else {
+                    'w'
+                }
+            }
+            18 => {
+                if shifted {
+                    'E'
+                } else {
+                    'e'
+                }
+            }
+            19 => {
+                if shifted {
+                    'R'
+                } else {
+                    'r'
+                }
+            }
+            20 => {
+                if shifted {
+                    'T'
+                } else {
+                    't'
+                }
+            }
+            21 => {
+                if shifted {
+                    'Y'
+                } else {
+                    'y'
+                }
+            }
+            22 => {
+                if shifted {
+                    'U'
+                } else {
+                    'u'
+                }
+            }
+            23 => {
+                if shifted {
+                    'I'
+                } else {
+                    'i'
+                }
+            }
+            24 => {
+                if shifted {
+                    'O'
+                } else {
+                    'o'
+                }
+            }
+            25 => {
+                if shifted {
+                    'P'
+                } else {
+                    'p'
+                }
+            }
+            26 => {
+                if shifted {
+                    '{'
+                } else {
+                    '['
+                }
+            }
+            27 => {
+                if shifted {
+                    '}'
+                } else {
+                    ']'
+                }
+            }
+            30 => {
+                if shifted {
+                    'A'
+                } else {
+                    'a'
+                }
+            }
+            31 => {
+                if shifted {
+                    'S'
+                } else {
+                    's'
+                }
+            }
+            32 => {
+                if shifted {
+                    'D'
+                } else {
+                    'd'
+                }
+            }
+            33 => {
+                if shifted {
+                    'F'
+                } else {
+                    'f'
+                }
+            }
+            34 => {
+                if shifted {
+                    'G'
+                } else {
+                    'g'
+                }
+            }
+            35 => {
+                if shifted {
+                    'H'
+                } else {
+                    'h'
+                }
+            }
+            36 => {
+                if shifted {
+                    'J'
+                } else {
+                    'j'
+                }
+            }
+            37 => {
+                if shifted {
+                    'K'
+                } else {
+                    'k'
+                }
+            }
+            38 => {
+                if shifted {
+                    'L'
+                } else {
+                    'l'
+                }
+            }
+            39 => {
+                if shifted {
+                    ':'
+                } else {
+                    ';'
+                }
+            }
+            40 => {
+                if shifted {
+                    '"'
+                } else {
+                    '\''
+                }
+            }
+            41 => {
+                if shifted {
+                    '~'
+                } else {
+                    '`'
+                }
+            }
+            43 => {
+                if shifted {
+                    '|'
+                } else {
+                    '\\'
+                }
+            }
+            44 => {
+                if shifted {
+                    'Z'
+                } else {
+                    'z'
+                }
+            }
+            45 => {
+                if shifted {
+                    'X'
+                } else {
+                    'x'
+                }
+            }
+            46 => {
+                if shifted {
+                    'C'
+                } else {
+                    'c'
+                }
+            }
+            47 => {
+                if shifted {
+                    'V'
+                } else {
+                    'v'
+                }
+            }
+            48 => {
+                if shifted {
+                    'B'
+                } else {
+                    'b'
+                }
+            }
+            49 => {
+                if shifted {
+                    'N'
+                } else {
+                    'n'
+                }
+            }
+            50 => {
+                if shifted {
+                    'M'
+                } else {
+                    'm'
+                }
+            }
+            51 => {
+                if shifted {
+                    '<'
+                } else {
+                    ','
+                }
+            }
+            52 => {
+                if shifted {
+                    '>'
+                } else {
+                    '.'
+                }
+            }
+            53 => {
+                if shifted {
+                    '?'
+                } else {
+                    '/'
+                }
+            }
+            57 => ' ',
+            _ => return None,
+        };
+
+        Some(ch.to_string())
     }
 
     fn handle_egui_input(&mut self, event: &FlowInputEvent) -> bool {
@@ -686,6 +1265,7 @@ impl DesktopState {
                 }
                 EguiInputEvent::Key {
                     key: Self::egui_key(keycode),
+                    text: Self::egui_text_for_keycode(keycode, modifiers),
                     pressed: matches!(state, FlowKeyState::Pressed),
                     repeat,
                     modifiers: Self::egui_modifiers(modifiers),
@@ -1212,6 +1792,14 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
+            UiAction::CreateWorkspace(name) => {
+                self.create_workspace_from_dialog(name);
+            }
+
+            UiAction::DeleteWorkspace => {
+                self.delete_focused_workspace();
+            }
+
             UiAction::SetSetting(setting, enabled) => {
                 self.set_system_setting(setting, enabled);
             }
@@ -1221,10 +1809,36 @@ impl DesktopState {
             }
 
             UiAction::Custom(id) => match id {
-                1001 => self.launch_app(focaldesk_settings_command()),
-                1004 => self.launch_app(self.apps.browser.clone()),
-                1005 => self.launch_app(self.apps.terminal.clone()),
-                1006 => self.launch_app(focaldesk_files_command()),
+                SIDEBAR_SETTINGS_ID => self.launch_app(focaldesk_settings_command()),
+                SIDEBAR_WORKSPACE_1_ID => self.set_focused_workspace(WorkspaceId(1)),
+                SIDEBAR_WORKSPACE_2_ID => {
+                    if self.workspace_names.len() > 1 {
+                        self.set_focused_workspace(WorkspaceId(2));
+                    }
+                }
+                SIDEBAR_WORKSPACE_3_ID => {
+                    if self.workspace_names.len() > 2 {
+                        self.set_focused_workspace(WorkspaceId(3));
+                    }
+                }
+                SIDEBAR_ADD_WORKSPACE_ID => {
+                    let name = format!("Workspace {}", self.workspace_names.len() + 1);
+                    self.render
+                        .egui
+                        .open_add_workspace_dialog(self.focused_output, name);
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
+                SIDEBAR_DELETE_WORKSPACE_ID => {
+                    if self.workspace_names.len() > 1 {
+                        self.render
+                            .egui
+                            .open_delete_workspace_dialog(self.focused_output);
+                        self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    }
+                }
+                SIDEBAR_BROWSER_ID => self.launch_app(self.apps.browser.clone()),
+                SIDEBAR_TERMINAL_ID => self.launch_app(self.apps.terminal.clone()),
+                SIDEBAR_FILES_ID => self.launch_app(focaldesk_files_command()),
                 _ => flog_warn!("unhandled custom ui action: {id}"),
             },
 
@@ -1275,9 +1889,7 @@ impl DesktopState {
     fn dispatch_system_command(&mut self, cmd: focaldesk_ui::types::SystemCommand) {
         match cmd {
             focaldesk_ui::types::SystemCommand::Lock => {
-                if let Err(err) = Command::new("loginctl").arg("lock-session").spawn() {
-                    flog_error!("failed to lock session: {err}");
-                }
+                self.lock_session();
             }
             focaldesk_ui::types::SystemCommand::Logout => {
                 self.running = false;
@@ -1292,6 +1904,86 @@ impl DesktopState {
                     flog_error!("failed to start poweroff: {err}");
                 }
             }
+        }
+    }
+
+    fn lock_session(&mut self) {
+        self.render.egui.close_all_panels();
+        self.active_dialog = None;
+        self.clear_client_pointer_focus(self.pointer_pos);
+        self.lock_screen.lock();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    fn submit_lock_password(&mut self) {
+        if !self.lock_screen.active || self.lock_screen.authenticating {
+            return;
+        }
+
+        if self.lock_screen.password.is_empty() {
+            self.lock_screen.message = "Enter password".to_string();
+            self.lock_screen.pulse(LockPulseKind::Rejected);
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            return;
+        }
+
+        self.lock_screen.authenticating = true;
+        self.lock_screen.message = "Authenticating".to_string();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+
+        let password = self.lock_screen.password.clone();
+        let authenticated = match authenticate_current_user(&password) {
+            Ok(authenticated) => authenticated,
+            Err(err) => {
+                flog_error!("PAM authentication failed: {err}");
+                false
+            }
+        };
+
+        self.lock_screen.authenticating = false;
+        self.lock_screen.clear_password();
+
+        if authenticated {
+            self.lock_screen.message = "Unlocked".to_string();
+            self.lock_screen.pulse(LockPulseKind::Accepted);
+        } else {
+            self.lock_screen.message = "Wrong password".to_string();
+            self.lock_screen.pulse(LockPulseKind::Rejected);
+        }
+
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    fn toggle_lock_password_visibility_at(&mut self, position: Point<f64, Logical>) -> bool {
+        let Some((output_id, local)) = self.output_local_point(position) else {
+            return false;
+        };
+        let Some(output) = self.outputs.get(&output_id) else {
+            return false;
+        };
+
+        let logical_size = output.logical_size;
+        let panel_w = logical_size.w.min(460).max(320);
+        let panel_h = 190;
+        let panel_x = (logical_size.w - panel_w) / 2;
+        let panel_y = (logical_size.h - panel_h) / 2;
+        let field = Rectangle::<i32, Logical>::from_loc_and_size(
+            (panel_x + 28, panel_y + 72),
+            (panel_w - 56, 48),
+        );
+        let reveal_button = Rectangle::<i32, Logical>::from_loc_and_size(
+            (field.loc.x + field.size.w - 82, field.loc.y + 8),
+            (68, 32),
+        );
+
+        let px = local.x.round() as i32;
+        let py = local.y.round() as i32;
+        if reveal_button.contains((px, py)) {
+            self.lock_screen.toggle_password_visibility();
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            true
+        } else {
+            false
         }
     }
     //}
@@ -1370,11 +2062,42 @@ impl DesktopState {
     }
 
     pub fn set_focused_workspace(&mut self, workspace: WorkspaceId) {
+        if workspace.0 == 0 || workspace.0 as usize > self.workspace_names.len() {
+            return;
+        }
         if let Some(output) = self.outputs.get_mut(&self.focused_output) {
             output.active_workspace = workspace;
         }
         self.active_workspace = workspace;
+        self.rebuild_ui_tree_for_output(self.focused_output);
         self.mark_focused_output_full_damage(DamageSource::Unknown);
+    }
+
+    fn create_workspace_from_dialog(&mut self, name: String) {
+        let next_number = self.workspace_names.len() + 1;
+        let name = if name.trim().is_empty() {
+            format!("Workspace {next_number}")
+        } else {
+            name.trim().to_string()
+        };
+
+        self.workspace_names.push(name);
+        self.set_focused_workspace(WorkspaceId(next_number as u32));
+        self.mark_all_outputs_chrome_controls_damage(DamageSource::Unknown);
+    }
+
+    fn delete_focused_workspace(&mut self) {
+        if self.workspace_names.len() <= 1 {
+            return;
+        }
+
+        let current = self.focused_workspace().0.max(1) as usize;
+        let delete_index = current.min(self.workspace_names.len()) - 1;
+        self.workspace_names.remove(delete_index);
+
+        let next_workspace = delete_index.min(self.workspace_names.len().saturating_sub(1)) + 1;
+        self.set_focused_workspace(WorkspaceId(next_workspace as u32));
+        self.mark_all_outputs_chrome_controls_damage(DamageSource::Unknown);
     }
 
     pub fn register_output_entry(
@@ -1410,6 +2133,8 @@ impl DesktopState {
                 logical_origin,
                 scale_factor,
                 scale: Scale::from((scale_factor, scale_factor)),
+                hdr_supported: false,
+                hdr_enabled: false,
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
                 last_sw_cursor_rect: None,
@@ -2126,6 +2851,7 @@ impl DesktopState {
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
             active_workspace: WorkspaceId(1),
+            workspace_names: vec!["Workspace 1".to_string()],
             next_window_id: WindowId(1),
             primary_output: init.primary_output,
             focused_output: init.primary_output,
@@ -2169,10 +2895,12 @@ impl DesktopState {
             toplevel_pointer: None,
 
             notifications: init.notifications,
+            lock_screen: LockScreenState::new(),
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
+            settings_ipc_rx: start_desktop_settings_ipc(),
             host_window_drag_requested: false,
             pending_compositor_move: None,
             pending_xdg_move: None,
@@ -2195,6 +2923,7 @@ impl DesktopState {
             clock_pulse: None,
             ui_sound_player: UiSoundPlayer::new(),
             last_sidebar_hover_sound_target: None,
+            last_clock_text: String::new(),
         }
     }
 
@@ -2914,6 +3643,83 @@ impl DesktopState {
         }
     }
 
+    fn handle_lock_key_event(&mut self, keycode: u32, state: FlowKeyState) {
+        use smithay::backend::input::KeyState as SmithayKeyState;
+        use smithay::input::keyboard::ModifiersState;
+
+        let smithay_state = match state {
+            FlowKeyState::Pressed => SmithayKeyState::Pressed,
+            FlowKeyState::Released => SmithayKeyState::Released,
+        };
+        let serial = SERIAL_COUNTER.next_serial();
+        let time = 0;
+
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+
+        keyboard.input(
+            self,
+            keycode.into(),
+            smithay_state,
+            serial,
+            time,
+            |ds, mods: &ModifiersState, handle| {
+                ds.input.modifiers = FlowModifiers {
+                    shift: mods.shift,
+                    ctrl: mods.ctrl,
+                    alt: mods.alt,
+                    super_key: mods.logo,
+                };
+
+                if !matches!(smithay_state, SmithayKeyState::Pressed) {
+                    return FilterResult::<()>::Intercept(());
+                }
+
+                if ds.lock_screen.authenticating {
+                    return FilterResult::<()>::Intercept(());
+                }
+
+                let sym = handle.modified_sym().raw();
+                match sym {
+                    keysyms::KEY_Return | keysyms::KEY_KP_Enter => {
+                        ds.submit_lock_password();
+                    }
+                    keysyms::KEY_BackSpace => {
+                        ds.lock_screen.backspace();
+                        ds.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    }
+                    keysyms::KEY_Escape => {
+                        ds.lock_screen.clear_password();
+                        ds.lock_screen.message = "Enter password".to_string();
+                        ds.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    }
+                    _ => {
+                        let text = if ds.input.modifiers.ctrl
+                            || ds.input.modifiers.alt
+                            || ds.input.modifiers.super_key
+                        {
+                            String::new()
+                        } else {
+                            xkb::keysym_to_utf8(handle.modified_sym())
+                        };
+
+                        if !text.is_empty() {
+                            for ch in text.chars() {
+                                if !ch.is_control() {
+                                    ds.lock_screen.push_char(ch);
+                                }
+                            }
+                            ds.mark_all_outputs_full_damage(DamageSource::Unknown);
+                        }
+                    }
+                }
+
+                FilterResult::<()>::Intercept(())
+            },
+        );
+    }
+
     fn process_toplevel_pointer_motion(&mut self, pos: Point<f64, Logical>) -> bool {
         match self.toplevel_pointer {
             Some(ToplevelPointerInteraction::Move {
@@ -3073,6 +3879,67 @@ impl DesktopState {
     }
 
     pub fn handle_input(&mut self, event: FlowInputEvent) {
+        if self.lock_screen.active {
+            match event {
+                FlowInputEvent::Key { keycode, state, .. } => {
+                    self.handle_lock_key_event(keycode, state);
+                }
+                FlowInputEvent::PointerMoved { position } => {
+                    self.input.pointer_pos = position;
+                    self.pointer_pos = position;
+                    self.cursor_manager.move_to(position.x, position.y);
+                    self.clear_client_pointer_focus(position);
+                }
+                FlowInputEvent::PointerButton {
+                    button,
+                    state,
+                    position,
+                } => {
+                    self.input.pointer_pos = position;
+                    self.pointer_pos = position;
+                    self.cursor_manager.move_to(position.x, position.y);
+                    self.clear_client_pointer_focus(position);
+                    if matches!(
+                        (button, state),
+                        (FlowMouseButton::Left, FlowKeyState::Pressed)
+                    ) {
+                        self.toggle_lock_password_visibility_at(position);
+                    }
+                }
+                FlowInputEvent::PointerScroll { position, .. } => {
+                    self.input.pointer_pos = position;
+                    self.pointer_pos = position;
+                    self.cursor_manager.move_to(position.x, position.y);
+                    self.clear_client_pointer_focus(position);
+                }
+                FlowInputEvent::PointerEntered => {
+                    self.cursor_manager.set_visible(true);
+                }
+                FlowInputEvent::PointerLeft => {
+                    self.cursor_manager.set_visible(false);
+                }
+                FlowInputEvent::Resized {
+                    output_id,
+                    width,
+                    height,
+                    scale_factor,
+                } => {
+                    let size = Size::<i32, Physical>::from((width as i32, height as i32));
+                    self.update_output_size(output_id, size, scale_factor);
+                }
+                FlowInputEvent::CloseRequested => {
+                    self.running = false;
+                }
+            }
+
+            self.pending_compositor_move = None;
+            self.pending_xdg_move = None;
+            self.toplevel_pointer = None;
+            self.input.pointer_left_down = false;
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            return;
+        }
+
         match event {
             FlowInputEvent::Key { keycode, state, .. } => {
                 if matches!(state, FlowKeyState::Pressed) && keycode == 1 {
@@ -3548,6 +4415,7 @@ impl DesktopState {
             || self.clock_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
             })
+            || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
 
     pub fn output_has_pending_damage(&self, output_id: OutputId) -> bool {
@@ -3559,6 +4427,7 @@ impl DesktopState {
             || self.output_has_active_sidebar_pulse(output_id, now)
             || self.output_has_active_topbar_pulse(output_id, now)
             || self.output_has_active_clock_pulse(output_id, now)
+            || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
 
     pub fn clear_repaint_request(&mut self) {
@@ -3592,6 +4461,47 @@ impl DesktopState {
         let output_ids: Vec<OutputId> = self.outputs.keys().copied().collect();
         for output_id in output_ids {
             self.mark_output_full_damage(output_id, source);
+        }
+    }
+
+    fn mark_all_outputs_clock_damage(&mut self, source: DamageSource) {
+        let damage: Vec<(OutputId, Rectangle<i32, Logical>)> = self
+            .outputs
+            .iter()
+            .map(|(output_id, output)| {
+                let layout = build_chrome_layout(
+                    output.logical_size,
+                    self.chrome.metrics.topbar_h,
+                    self.chrome.metrics.sidebar_w,
+                );
+                (*output_id, layout.topbar.clock_well)
+            })
+            .collect();
+
+        for (output_id, rect) in damage {
+            self.mark_output_logical_damage(output_id, rect, 2, source);
+        }
+    }
+
+    fn mark_all_outputs_chrome_controls_damage(&mut self, source: DamageSource) {
+        let damage: Vec<(OutputId, Rectangle<i32, Logical>)> = self
+            .outputs
+            .iter()
+            .flat_map(|(output_id, output)| {
+                let layout = build_chrome_layout(
+                    output.logical_size,
+                    self.chrome.metrics.topbar_h,
+                    self.chrome.metrics.sidebar_w,
+                );
+                [
+                    (*output_id, layout.sidebar.outer),
+                    (*output_id, layout.topbar.inner),
+                ]
+            })
+            .collect();
+
+        for (output_id, rect) in damage {
+            self.mark_output_logical_damage(output_id, rect, 2, source);
         }
     }
 
@@ -3741,6 +4651,8 @@ impl DesktopState {
                     logical_origin: Point::<i32, Logical>::from((0, 0)),
                     scale_factor: scale,
                     scale: Scale::from((scale, scale)),
+                    hdr_supported: false,
+                    hdr_enabled: false,
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
                     last_sw_cursor_rect: None,

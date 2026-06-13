@@ -1,14 +1,38 @@
-mod config;
-
 use adw::prelude::*;
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use focaldesk_ipc::send_desktop_config;
 use focaldesk_logging::flog_info;
-use gtk::prelude::*;
 
-use config::{load_config, save_config, FocalDeskConfig};
 use gtk::cairo;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+
+const SCALE_OPTIONS: &[(&str, f64)] = &[
+    ("100 %", 1.0),
+    ("125 %", 1.25),
+    ("133 %", 1.3333334),
+    ("150 %", 1.5),
+    ("166 %", 1.6666667),
+    ("200 %", 2.0),
+    ("250 %", 2.5),
+    ("266 %", 2.6666667),
+];
+
+const THEME_OPTIONS: &[&str] = &["Eagle", "Moonbase", "Classic"];
+const ORIENTATION_OPTIONS: &[&str] = &[
+    "Landscape",
+    "Portrait Right",
+    "Landscape Flipped",
+    "Portrait Left",
+];
+const OUTPUT_DEVICE_OPTIONS: &[&str] = &[
+    "Default Output",
+    "S/PDIF Output - USB Audio",
+    "HDMI / DisplayPort",
+];
+const OUTPUT_CONFIGURATION_OPTIONS: &[&str] = &["HiFi 2.0 channels", "Stereo", "Mono"];
+const ALERT_SOUND_OPTIONS: &[&str] = &["Default", "Click", "Chime", "None"];
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayConfig {
@@ -49,8 +73,13 @@ fn display_preview_rect(
     offset_x: f64,
     offset_y: f64,
 ) -> (f64, f64, f64, f64) {
-    let logical_w = d.mode_width as f64 / d.scale.max(1.0);
-    let logical_h = d.mode_height as f64 / d.scale.max(1.0);
+    let (width, height) = if matches!(d.transform.as_str(), "Rotate90" | "Rotate270") {
+        (d.mode_height, d.mode_width)
+    } else {
+        (d.mode_width, d.mode_height)
+    };
+    let logical_w = width as f64 / d.scale.max(1.0);
+    let logical_h = height as f64 / d.scale.max(1.0);
 
     (
         d.logical_x as f64 * zoom + offset_x,
@@ -203,6 +232,265 @@ fn load_displays() -> Vec<DisplayConfig> {
     }
 }
 
+fn display_summary(d: &DisplayConfig) -> String {
+    format!(
+        "{}x{} @ {} Hz  |  {}  |  Scale {:.2}{}{}",
+        d.mode_width,
+        d.mode_height,
+        d.refresh_mhz / 1000,
+        transform_label(&d.transform),
+        d.scale,
+        if d.primary { "  |  Primary" } else { "" },
+        if d.enabled { "" } else { "  |  Disabled" }
+    )
+}
+
+fn transform_label(transform: &str) -> &'static str {
+    match transform {
+        "Rotate90" => "Portrait Right",
+        "Rotate180" => "Landscape Flipped",
+        "Rotate270" => "Portrait Left",
+        _ => "Landscape",
+    }
+}
+
+fn transform_index(transform: &str) -> u32 {
+    match transform {
+        "Rotate90" => 1,
+        "Rotate180" => 2,
+        "Rotate270" => 3,
+        _ => 0,
+    }
+}
+
+fn transform_from_index(index: u32) -> &'static str {
+    match index {
+        1 => "Rotate90",
+        2 => "Rotate180",
+        3 => "Rotate270",
+        _ => "Normal",
+    }
+}
+
+fn resolution_options(current_width: i32, current_height: i32) -> Vec<(i32, i32)> {
+    let mut options = vec![
+        (1280, 720),
+        (1366, 768),
+        (1600, 900),
+        (1920, 1080),
+        (2560, 1440),
+        (3440, 1440),
+        (3840, 2160),
+    ];
+
+    if !options.contains(&(current_width, current_height)) {
+        options.push((current_width, current_height));
+    }
+
+    options.sort_unstable();
+    options.dedup();
+    options
+}
+
+fn dropdown_from_strings(labels: &[&str], selected: u32) -> gtk::DropDown {
+    let dropdown = gtk::DropDown::from_strings(labels);
+    dropdown.set_selected(selected);
+    dropdown
+}
+
+fn dim_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.add_css_class("dim-label");
+    label
+}
+
+fn suffix_chevron() -> gtk::Image {
+    gtk::Image::from_icon_name("go-next-symbolic")
+}
+
+fn save_display_change(
+    displays: &Rc<RefCell<Vec<DisplayConfig>>>,
+    area: &gtk::DrawingArea,
+    row: &adw::ExpanderRow,
+    index: usize,
+) {
+    let displays_ref = displays.borrow();
+    save_displays(&displays_ref);
+    area.queue_draw();
+
+    if let Some(display) = displays_ref.get(index) {
+        row.set_subtitle(&display_summary(display));
+    }
+}
+
+fn connected_display_row(
+    index: usize,
+    displays: Rc<RefCell<Vec<DisplayConfig>>>,
+    area: gtk::DrawingArea,
+) -> adw::ExpanderRow {
+    let display = displays.borrow()[index].clone();
+    let row = adw::ExpanderRow::new();
+    row.set_title(&display.name);
+    row.set_subtitle(&display_summary(&display));
+    row.set_enable_expansion(true);
+
+    let info = gtk::Image::from_icon_name("dialog-information-symbolic");
+    info.set_tooltip_text(Some("Display details"));
+    row.add_suffix(&info);
+
+    let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+    chevron.set_tooltip_text(Some("Expand display settings"));
+    row.add_suffix(&chevron);
+
+    let resolution_row = adw::ActionRow::new();
+    resolution_row.set_title("Resolution");
+    let resolutions = resolution_options(display.mode_width, display.mode_height);
+    let resolution_labels = resolutions
+        .iter()
+        .map(|(width, height)| format!("{width} x {height}"))
+        .collect::<Vec<_>>();
+    let resolution_label_refs = resolution_labels
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let resolution_dropdown = dropdown_from_strings(
+        &resolution_label_refs,
+        resolutions
+            .iter()
+            .position(|resolution| *resolution == (display.mode_width, display.mode_height))
+            .unwrap_or(0) as u32,
+    );
+    resolution_row.add_suffix(&resolution_dropdown);
+    row.add_row(&resolution_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        resolution_dropdown.connect_selected_notify(move |dropdown| {
+            let Some((width, height)) = resolutions.get(dropdown.selected() as usize).copied()
+            else {
+                return;
+            };
+
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.mode_width = width;
+                display.mode_height = height;
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let orientation_row = adw::ActionRow::new();
+    orientation_row.set_title("Orientation");
+    let orientation_dropdown =
+        dropdown_from_strings(ORIENTATION_OPTIONS, transform_index(&display.transform));
+    orientation_row.add_suffix(&orientation_dropdown);
+    row.add_row(&orientation_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        orientation_dropdown.connect_selected_notify(move |dropdown| {
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.transform = transform_from_index(dropdown.selected()).to_string();
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let scale_row = adw::ActionRow::new();
+    scale_row.set_title("Scale");
+    let scale_dropdown = gtk::DropDown::from_strings(
+        &SCALE_OPTIONS
+            .iter()
+            .map(|(label, _)| *label)
+            .collect::<Vec<_>>(),
+    );
+    scale_dropdown.set_selected(
+        SCALE_OPTIONS
+            .iter()
+            .position(|(_, value)| (*value - display.scale).abs() < 0.01)
+            .unwrap_or(0) as u32,
+    );
+    scale_row.add_suffix(&scale_dropdown);
+    row.add_row(&scale_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        scale_dropdown.connect_selected_notify(move |dropdown| {
+            let selected = dropdown.selected() as usize;
+            if let (Some(display), Some((_, scale))) = (
+                displays.borrow_mut().get_mut(index),
+                SCALE_OPTIONS.get(selected),
+            ) {
+                display.scale = *scale;
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let primary_row = adw::ActionRow::new();
+    primary_row.set_title("Primary Display");
+    let primary = gtk::Switch::new();
+    primary.set_active(display.primary);
+    primary_row.add_suffix(&primary);
+    primary_row.set_activatable_widget(Some(&primary));
+    row.add_row(&primary_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        primary.connect_active_notify(move |switch| {
+            let active = switch.is_active();
+            let mut displays_ref = displays.borrow_mut();
+            if active {
+                for display in displays_ref.iter_mut() {
+                    display.primary = false;
+                }
+            }
+            if let Some(display) = displays_ref.get_mut(index) {
+                display.primary = active;
+            }
+            drop(displays_ref);
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let enabled_row = adw::ActionRow::new();
+    enabled_row.set_title("Enabled");
+    let enabled = gtk::Switch::new();
+    enabled.set_active(display.enabled);
+    enabled_row.add_suffix(&enabled);
+    enabled_row.set_activatable_widget(Some(&enabled));
+    row.add_row(&enabled_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        enabled.connect_active_notify(move |switch| {
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.enabled = switch.is_active();
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    row
+}
+
+fn persist_config(config: &FocalDeskConfig) {
+    if let Err(err) = send_desktop_config(config.clone()) {
+        flog_info!("settings IPC unavailable; saving config directly: {err}");
+        let _ = save_config(config);
+    }
+}
+
 fn main() {
     let app = adw::Application::new(Some("com.focaldesk.Settings"), Default::default());
     app.connect_activate(build_ui);
@@ -235,6 +523,7 @@ fn build_ui(app: &adw::Application) {
     for name in [
         "Appearance",
         "Displays",
+        "Sound",
         "Workspaces",
         "Keyboard",
         "Privacy",
@@ -263,6 +552,7 @@ fn build_ui(app: &adw::Application) {
 
     pages.insert("Appearance".to_string(), appearance_page(config.clone()));
     pages.insert("Displays".to_string(), displays_page(config.clone()));
+    pages.insert("Sound".to_string(), sound_page());
 
     for name in [
         "Workspaces",
@@ -338,7 +628,7 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
         let config = config.clone();
         shader_switch.connect_active_notify(move |s| {
             config.borrow_mut().appearance.shader_chrome = s.is_active();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -359,7 +649,7 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
         let config = config.clone();
         focus_switch.connect_active_notify(move |s| {
             config.borrow_mut().appearance.output_focus_glow = s.is_active();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -381,35 +671,32 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     let theme_row = adw::ActionRow::new();
     theme_row.set_title("Theme");
 
-    let combo = gtk::ComboBoxText::new();
-    combo.append_text("Eagle");
-    combo.append_text("Moonbase");
-    combo.append_text("Classic");
-
-    combo.set_active(Some(match config.borrow().appearance.theme.as_str() {
-        "Moonbase" => 1,
-        "Classic" => 2,
-        _ => 0,
-    }));
+    let theme_dropdown = dropdown_from_strings(
+        THEME_OPTIONS,
+        THEME_OPTIONS
+            .iter()
+            .position(|theme| *theme == config.borrow().appearance.theme.as_str())
+            .unwrap_or(0) as u32,
+    );
 
     {
         let config = config.clone();
-        combo.connect_changed(move |c| {
-            if let Some(text) = c.active_text() {
-                config.borrow_mut().appearance.theme = text.to_string();
-                let _ = save_config(&config.borrow());
+        theme_dropdown.connect_selected_notify(move |dropdown| {
+            if let Some(theme) = THEME_OPTIONS.get(dropdown.selected() as usize) {
+                config.borrow_mut().appearance.theme = (*theme).to_string();
+                persist_config(&config.borrow());
             }
         });
     }
 
-    theme_row.add_suffix(&combo);
+    theme_row.add_suffix(&theme_dropdown);
     visual_group.add(&theme_row);
 
     {
         let config = config.clone();
         glow_scale.connect_value_changed(move |scale| {
             config.borrow_mut().appearance.glow_strength = scale.value();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -429,7 +716,7 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
         let config = config.clone();
         font_scale.connect_value_changed(move |scale| {
             config.borrow_mut().appearance.font_scale = scale.value();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -446,7 +733,7 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
         let config = config.clone();
         reset_button.connect_clicked(move |_| {
             *config.borrow_mut() = FocalDeskConfig::default();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
             flog_info!("Reset config");
         });
     }
@@ -457,6 +744,85 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     page.add(&reset_group);
 
     adw::NavigationPage::new(&page, "Appearance")
+}
+
+fn sound_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Sound");
+
+    let output_group = adw::PreferencesGroup::new();
+    output_group.set_title("Output");
+
+    let output_device_row = adw::ActionRow::new();
+    output_device_row.set_title("Output Device");
+    let speaker_icon = gtk::Image::from_icon_name("audio-speakers-symbolic");
+    output_device_row.add_prefix(&speaker_icon);
+    output_device_row.add_suffix(&dropdown_from_strings(OUTPUT_DEVICE_OPTIONS, 1));
+    output_group.add(&output_device_row);
+
+    let output_config_row = adw::ActionRow::new();
+    output_config_row.set_title("Configuration");
+    output_config_row.add_suffix(&dropdown_from_strings(OUTPUT_CONFIGURATION_OPTIONS, 0));
+    output_group.add(&output_config_row);
+
+    let output_volume_row = adw::ActionRow::new();
+    output_volume_row.set_title("Output Volume");
+    let output_volume_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    output_volume_box.set_hexpand(true);
+    let output_volume_icon = gtk::Image::from_icon_name("audio-volume-high-symbolic");
+    let output_volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+    output_volume.set_hexpand(true);
+    output_volume.set_draw_value(false);
+    output_volume.set_value(75.0);
+    output_volume_box.append(&output_volume_icon);
+    output_volume_box.append(&output_volume);
+    output_volume_row.add_suffix(&output_volume_box);
+    output_group.add(&output_volume_row);
+
+    let balance_row = adw::ActionRow::new();
+    balance_row.set_title("Balance");
+    let balance = gtk::Scale::with_range(gtk::Orientation::Horizontal, -1.0, 1.0, 0.05);
+    balance.set_hexpand(true);
+    balance.set_draw_value(false);
+    balance.set_value(0.0);
+    balance_row.add_suffix(&balance);
+    output_group.add(&balance_row);
+
+    let test_row = adw::ActionRow::new();
+    test_row.set_title("Test Speakers");
+    let test_button = gtk::Button::with_label("Test...");
+    test_button.add_css_class("pill");
+    test_row.add_suffix(&test_button);
+    output_group.add(&test_row);
+
+    page.add(&output_group);
+
+    let input_group = adw::PreferencesGroup::new();
+    input_group.set_title("Input");
+
+    let input_device_row = adw::ActionRow::new();
+    input_device_row.set_title("Input Device");
+    input_device_row.add_suffix(&dim_label("No Input Devices"));
+    input_group.add(&input_device_row);
+
+    page.add(&input_group);
+
+    let sounds_group = adw::PreferencesGroup::new();
+    sounds_group.set_title("Sounds");
+
+    let volume_levels_row = adw::ActionRow::new();
+    volume_levels_row.set_title("Volume Levels");
+    volume_levels_row.add_suffix(&suffix_chevron());
+    sounds_group.add(&volume_levels_row);
+
+    let alert_sound_row = adw::ActionRow::new();
+    alert_sound_row.set_title("Alert Sound");
+    alert_sound_row.add_suffix(&dropdown_from_strings(ALERT_SOUND_OPTIONS, 0));
+    sounds_group.add(&alert_sound_row);
+
+    page.add(&sounds_group);
+
+    adw::NavigationPage::new(&page, "Sound")
 }
 
 fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
@@ -475,27 +841,20 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
 
     page.add(&arrangement_group);
 
-    let displays = load_displays();
     let outputs_group = adw::PreferencesGroup::new();
     outputs_group.set_title("Connected Displays");
 
-    for d in displays {
+    let display_count = detected_displays.borrow().len();
+    if display_count == 0 {
         let row = adw::ActionRow::new();
-
-        row.set_title(&d.name);
-
-        row.set_subtitle(&format!(
-            "{}×{} @ {} Hz  •  Scale {:.2}  •  Pos {}, {}{}",
-            d.mode_width,
-            d.mode_height,
-            d.refresh_mhz,
-            d.scale,
-            d.logical_x,
-            d.logical_y,
-            if d.primary { "  •  Primary" } else { "" }
-        ));
-
+        row.set_title("No connected displays found");
+        row.set_subtitle("Display information will appear here after the compositor writes it.");
         outputs_group.add(&row);
+    } else {
+        for index in 0..display_count {
+            let row = connected_display_row(index, detected_displays.clone(), area.clone());
+            outputs_group.add(&row);
+        }
     }
     page.add(&outputs_group);
 
@@ -517,7 +876,7 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         let config = config.clone();
         topbar_switch.connect_active_notify(move |s| {
             config.borrow_mut().displays.topbar_on_all_outputs = s.is_active();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -537,7 +896,7 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         let config = config.clone();
         sidebar_switch.connect_active_notify(move |s| {
             config.borrow_mut().displays.sidebar_on_all_outputs = s.is_active();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -561,7 +920,7 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         let config = config.clone();
         remember_switch.connect_active_notify(move |s| {
             config.borrow_mut().displays.remember_focused_output = s.is_active();
-            let _ = save_config(&config.borrow());
+            persist_config(&config.borrow());
         });
     }
 
@@ -571,46 +930,4 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
     page.add(&focus_group);
 
     adw::NavigationPage::new(&page, "Displays")
-}
-
-fn workspaces_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title("Workspaces");
-
-    adw::NavigationPage::new(&page, "Workspaces")
-}
-
-fn keyboard_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title("Keyboard");
-
-    adw::NavigationPage::new(&page, "Keyboard")
-}
-
-fn privacy_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title("Privacy");
-
-    adw::NavigationPage::new(&page, "Privacy")
-}
-
-fn power_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title("Power");
-
-    adw::NavigationPage::new(&page, "Power")
-}
-
-fn debug_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title("Debug");
-
-    adw::NavigationPage::new(&page, "Debug")
-}
-
-fn about_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
-    let page = adw::PreferencesPage::new();
-    page.set_title("About");
-
-    adw::NavigationPage::new(&page, "About")
 }

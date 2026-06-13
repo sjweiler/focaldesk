@@ -20,7 +20,7 @@ use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_panels::{
     AudioPanel, BluetoothPanel, CalendarPanel, DebugPanel, EguiPanelView, LauncherPanel,
-    NetworkPanel, PowerPanel, SettingsPanel,
+    NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog,
 };
 use crate::types::{PanelKind, UiAction};
 
@@ -36,6 +36,7 @@ pub struct EguiLayer {
     power: PowerPanel,
     calendar: CalendarPanel,
     debug: DebugPanel,
+    workspace_dialog: WorkspaceDialog,
 
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
@@ -53,7 +54,7 @@ pub struct EguiLayer {
     pub last_frame_ctx: Option<DesktopFrameCtx>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EguiInputEvent {
     PointerMoved {
         position: Point<f64, Logical>,
@@ -72,6 +73,7 @@ pub enum EguiInputEvent {
     PointerGone,
     Key {
         key: Option<egui::Key>,
+        text: Option<String>,
         pressed: bool,
         repeat: bool,
         modifiers: EguiModifiers,
@@ -166,6 +168,7 @@ impl Default for EguiLayer {
             power: PowerPanel::default(),
             calendar: CalendarPanel::default(),
             debug: DebugPanel::default(),
+            workspace_dialog: WorkspaceDialog::default(),
         }
     }
 }
@@ -275,6 +278,7 @@ impl EguiLayer {
             || self.power.open
             || self.calendar.open
             || self.debug.open
+            || self.workspace_dialog.open
     }
 
     pub fn owner_output(&self) -> Option<OutputId> {
@@ -340,6 +344,8 @@ impl EguiLayer {
             self.power.show(ctx, frame_ctx, &mut self.actions);
             self.calendar.show(ctx, frame_ctx, &mut self.actions);
             self.debug.show(ctx, frame_ctx, &mut self.actions);
+            self.workspace_dialog
+                .show(ctx, frame_ctx, &mut self.actions);
         });
 
         self.textures_delta.append(output.textures_delta);
@@ -392,6 +398,7 @@ impl EguiLayer {
             }
             EguiInputEvent::Key {
                 key,
+                text,
                 pressed,
                 repeat,
                 modifiers,
@@ -404,6 +411,13 @@ impl EguiLayer {
                         repeat,
                         modifiers: modifiers.into(),
                     });
+                }
+                if pressed {
+                    if let Some(text) = text {
+                        if !modifiers.ctrl && !modifiers.command {
+                            self.raw_input.events.push(Event::Text(text));
+                        }
+                    }
                 }
             }
         }
@@ -420,7 +434,20 @@ impl EguiLayer {
         self.power.open = false;
         self.calendar.open = false;
         self.debug.open = false;
+        self.workspace_dialog.open = false;
         self.owner_output = None;
+    }
+
+    pub fn open_add_workspace_dialog(&mut self, owner_output: OutputId, name: impl Into<String>) {
+        self.close_all_panels();
+        self.workspace_dialog.open_add(name);
+        self.owner_output = Some(owner_output);
+    }
+
+    pub fn open_delete_workspace_dialog(&mut self, owner_output: OutputId) {
+        self.close_all_panels();
+        self.workspace_dialog.open_delete();
+        self.owner_output = Some(owner_output);
     }
 
     pub fn wants_pointer_input(&self) -> bool {

@@ -32,6 +32,7 @@ use crate::core::scene::SceneState;
 //use crate::core::output::OutputId;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use focaldesk_logging::{flog, flog_error, flog_info};
+use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::atlas::IconState;
@@ -47,6 +48,7 @@ use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
 use crate::core::fonts::{FontId, FontSystem, TextStyle};
+use crate::core::lock::{LockPulseKind, LockScreenSnapshot, LOCK_PULSE_DURATION};
 use crate::core::shell::ManagedWindow;
 use focaldesk_resources::RenderResources;
 use focaldesk_themes::theme::BuiltInThemeId;
@@ -179,6 +181,8 @@ pub struct RenderInputs<'a> {
     pub active_dialog: Option<DialogId>,
     pub fonts: &'a FontSystem,
     pub theme: &'a FlowTheme,
+    pub notifications: &'a [NotificationSnapshot],
+    pub lock_screen: &'a LockScreenSnapshot,
     pub flip_egui_y: bool,
 }
 
@@ -212,6 +216,19 @@ fn to_physical_rect(
 /// Smithay pixel/texture draws expect damage in dest-local coordinates.
 fn dest_local_damage(size: Size<i32, Physical>) -> [Rectangle<i32, Physical>; 1] {
     [Rectangle::from_loc_and_size((0, 0), (size.w, size.h))]
+}
+
+fn ellipsize_for_width(text: &str, max_width: i32, size_px: u32) -> String {
+    let max_chars = ((max_width.max(0) as usize) / ((size_px as usize).max(1) / 2).max(1)).max(3);
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+
+    let keep = max_chars.saturating_sub(3);
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str("...");
+    out
 }
 
 fn themed_icon_style(theme: &FlowTheme, state: UiVisualState) -> UiVisualStyle {
@@ -267,6 +284,7 @@ fn selected_sidebar_style(theme: &FlowTheme, hovered: bool) -> BevelStyle {
 
 fn tooltip_rect_for_element(
     el_bounds: focaldesk_ui::element::UiRect,
+    el_kind: UiElementKind,
     text_w: i32,
     output_size: Size<i32, Logical>,
 ) -> Rectangle<i32, Logical> {
@@ -277,8 +295,16 @@ fn tooltip_rect_for_element(
 
     let max_x = (output_size.w - width - 6).max(0);
     let max_y = (output_size.h - height - 6).max(0);
-    let x = (el_bounds.x + el_bounds.w + gap).clamp(6, max_x);
-    let y = (el_bounds.y + (el_bounds.h - height) / 2).clamp(6, max_y);
+    let (x, y) = match el_kind {
+        UiElementKind::TopbarIndicator | UiElementKind::TopbarButton => (
+            (el_bounds.x + (el_bounds.w - width) / 2).clamp(6, max_x),
+            (el_bounds.y + el_bounds.h + gap).clamp(6, max_y),
+        ),
+        _ => (
+            (el_bounds.x + el_bounds.w + gap).clamp(6, max_x),
+            (el_bounds.y + (el_bounds.h - height) / 2).clamp(6, max_y),
+        ),
+    };
 
     Rectangle::from_loc_and_size((x, y), (width, height))
 }
@@ -660,7 +686,10 @@ impl RenderState {
             el.hovered
                 && matches!(
                     el.kind,
-                    UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot
+                    UiElementKind::SidebarButton
+                        | UiElementKind::WorkspaceSlot
+                        | UiElementKind::TopbarIndicator
+                        | UiElementKind::TopbarButton
                 )
         }) else {
             return Ok(());
@@ -676,7 +705,7 @@ impl RenderState {
             theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle),
         );
         let text_w = fonts.advance_width(text, style);
-        let rect = tooltip_rect_for_element(el.bounds, text_w, output_size);
+        let rect = tooltip_rect_for_element(el.bounds, el.kind, text_w, output_size);
 
         self.draw_rounded_rect(frame, rect, scale, 6.0, [0.035, 0.050, 0.075, 0.92])?;
 
@@ -1405,8 +1434,10 @@ impl RenderState {
         // xdg popups are included in [`Window::render_elements`] when [`PopupManager::commit`] runs.
         self.draw_popup_elements(frame, inputs.ctx, inputs.popup_elements)?;
 
-        // notifications
-        // this will render notifications here in future - this is a placeholder
+        if inputs.ctx.active_output == inputs.ctx.rendering_output {
+            self.draw_notifications(frame, inputs.ctx, inputs.notifications, inputs.fonts, theme)?;
+        }
+
         let program = self.chrome_shaders.tinted_icon.clone();
 
         if let (Some(atlas), Some(program)) = (muts.ui.chrome.atlas.as_ref(), program.as_ref()) {
@@ -1465,11 +1496,268 @@ impl RenderState {
             theme,
         )?;
 
+        self.draw_lock_screen(frame, inputs.ctx, inputs.lock_screen, inputs.fonts, theme)?;
+
         //self.draw_text_test(frame, inputs.fonts)?;
 
         if inputs.draw_software_cursor {
             self.draw_software_cursor_overlay(frame, inputs.ctx)?;
         }
+
+        Ok(())
+    }
+
+    fn draw_notifications(
+        &mut self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        notifications: &[NotificationSnapshot],
+        fonts: &FontSystem,
+        theme: &FlowTheme,
+    ) -> Result<(), GlesError> {
+        if notifications.is_empty() {
+            return Ok(());
+        }
+        if self.font_atlas_texture.is_none() || self.chrome_shaders.font_text.is_none() {
+            return Ok(());
+        }
+
+        let toast_w = ctx.work.size.w.min(360).max(240);
+        let toast_h = 86;
+        let margin = 18;
+        let gap = 10;
+        let x = ctx.work.loc.x + ctx.work.size.w - toast_w - margin;
+        let mut y = ctx.work.loc.y + margin;
+        let theme_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+
+        for notification in notifications {
+            let mut alpha = 0.94;
+            if let Some(timeout) = notification.timeout {
+                let remaining = timeout.saturating_sub(notification.age);
+                if remaining < Duration::from_millis(300) {
+                    alpha *= remaining.as_secs_f32() / 0.3;
+                }
+            }
+
+            let rect = Rectangle::<i32, Logical>::from_loc_and_size((x, y), (toast_w, toast_h));
+            let mut bg = theme.chrome.panel_color;
+            bg[3] = alpha;
+            self.draw_rounded_rect(frame, rect, ctx.output_scale, 8.0, bg)?;
+
+            let accent_rect = Rectangle::<i32, Logical>::from_loc_and_size((x, y), (4, toast_h));
+            let mut accent = theme.chrome.accent_color;
+            accent[3] = alpha.min(0.85);
+            self.draw_rounded_rect(frame, accent_rect, ctx.output_scale, 2.0, accent)?;
+
+            let text_x = x + 18;
+            let title = ellipsize_for_width(&notification.title, toast_w - 36, 16);
+            let body = ellipsize_for_width(&notification.body, toast_w - 36, 15);
+
+            self.draw_text_cached(
+                frame,
+                fonts,
+                &title,
+                text_x,
+                y + 28,
+                style_for(FontRole::Title, 16, theme_id),
+                [1.0, 0.97, 0.90, alpha],
+                ctx.output_scale,
+            )?;
+            self.draw_text_cached(
+                frame,
+                fonts,
+                &body,
+                text_x,
+                y + 58,
+                style_for(FontRole::Body, 15, theme_id),
+                [0.78, 0.86, 1.0, alpha * 0.92],
+                ctx.output_scale,
+            )?;
+
+            y += toast_h + gap;
+        }
+
+        Ok(())
+    }
+
+    fn draw_lock_screen(
+        &mut self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        lock: &LockScreenSnapshot,
+        fonts: &FontSystem,
+        theme: &FlowTheme,
+    ) -> Result<(), GlesError> {
+        if !lock.active {
+            return Ok(());
+        }
+
+        let output_physical = Size::<i32, Physical>::from(ctx.output_size);
+        let full_physical = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), output_physical);
+        RenderState::draw_solid_rect(
+            frame,
+            full_physical,
+            &[full_physical],
+            [0.005, 0.008, 0.014, 0.72],
+        )?;
+
+        let logical_w = (f64::from(ctx.output_size.0) / ctx.output_scale.x).round() as i32;
+        let logical_h = (f64::from(ctx.output_size.1) / ctx.output_scale.y).round() as i32;
+        let screen = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (logical_w, logical_h));
+        let haze = Rectangle::<i32, Logical>::from_loc_and_size(
+            (screen.loc.x + 24, screen.loc.y + 24),
+            ((screen.size.w - 48).max(1), (screen.size.h - 48).max(1)),
+        );
+        self.draw_rounded_rect(
+            frame,
+            haze,
+            ctx.output_scale,
+            18.0,
+            [0.12, 0.16, 0.20, 0.12],
+        )?;
+
+        let panel_w = screen.size.w.min(460).max(320);
+        let panel_h = 190;
+        let panel_x = screen.loc.x + (screen.size.w - panel_w) / 2;
+        let panel_y = screen.loc.y + (screen.size.h - panel_h) / 2;
+        let panel =
+            Rectangle::<i32, Logical>::from_loc_and_size((panel_x, panel_y), (panel_w, panel_h));
+
+        let mut panel_color = theme.chrome.panel_color;
+        panel_color[3] = 0.74;
+        self.draw_rounded_rect(frame, panel, ctx.output_scale, 12.0, panel_color)?;
+
+        let mut trim = theme.chrome.accent_color;
+        trim[3] = 0.36;
+        let trim_rect = Rectangle::<i32, Logical>::from_loc_and_size(
+            (panel_x + 14, panel_y + 12),
+            (panel_w - 28, 3),
+        );
+        self.draw_rounded_rect(frame, trim_rect, ctx.output_scale, 2.0, trim)?;
+
+        if let (Some(program), Some(pulse)) = (self.chrome_shaders.pulse.as_ref(), lock.pulse) {
+            let color = match pulse.kind {
+                LockPulseKind::Rejected => [0.78, 0.02, 0.02, 0.92],
+                LockPulseKind::Accepted => [0.35, 1.0, 0.28, 0.86],
+            };
+            let panel_physical = to_physical_rect(panel, ctx.output_scale);
+            let pulse_damage = dest_local_damage(panel_physical.size);
+            let center = Point::<f64, Logical>::from((
+                f64::from(panel.loc.x + panel.size.w / 2),
+                f64::from(panel.loc.y + panel.size.h / 2),
+            ));
+            Self::draw_pulse(
+                frame,
+                program,
+                panel,
+                center,
+                pulse.elapsed,
+                ctx.output_scale,
+                &pulse_damage,
+                color,
+            )?;
+
+            let fade = 1.0
+                - (pulse.elapsed.as_secs_f32() / LOCK_PULSE_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+            let wash_color = match pulse.kind {
+                LockPulseKind::Rejected => [0.55, 0.0, 0.0, 0.24 * fade],
+                LockPulseKind::Accepted => [1.0, 0.62, 0.12, 0.18 * fade],
+            };
+            self.draw_rounded_rect(frame, panel, ctx.output_scale, 12.0, wash_color)?;
+        }
+
+        if self.font_atlas_texture.is_none() || self.chrome_shaders.font_text.is_none() {
+            return Ok(());
+        }
+
+        let theme_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+        self.draw_text_cached(
+            frame,
+            fonts,
+            "FOCALDESK LOCKED",
+            panel_x + 28,
+            panel_y + 48,
+            style_for(FontRole::Title, 18, theme_id),
+            [1.0, 0.95, 0.82, 0.96],
+            ctx.output_scale,
+        )?;
+
+        let field = Rectangle::<i32, Logical>::from_loc_and_size(
+            (panel_x + 28, panel_y + 72),
+            (panel_w - 56, 48),
+        );
+        self.draw_rounded_rect(
+            frame,
+            field,
+            ctx.output_scale,
+            8.0,
+            [0.02, 0.03, 0.05, 0.78],
+        )?;
+
+        let reveal_button = Rectangle::<i32, Logical>::from_loc_and_size(
+            (field.loc.x + field.size.w - 82, field.loc.y + 8),
+            (68, 32),
+        );
+        self.draw_rounded_rect(
+            frame,
+            reveal_button,
+            ctx.output_scale,
+            6.0,
+            [0.08, 0.11, 0.16, 0.88],
+        )?;
+
+        let password_display = if lock.password_visible {
+            lock.password_text.clone()
+        } else if lock.password_len == 0 {
+            String::new()
+        } else {
+            "*".repeat(lock.password_len.min(48))
+        };
+        self.draw_text_cached(
+            frame,
+            fonts,
+            &password_display,
+            field.loc.x + 18,
+            field.loc.y + 31,
+            style_for(FontRole::Body, 22, theme_id),
+            [0.82, 0.90, 1.0, 0.94],
+            ctx.output_scale,
+        )?;
+        self.draw_text_cached(
+            frame,
+            fonts,
+            if lock.password_visible {
+                "Hide"
+            } else {
+                "Show"
+            },
+            reveal_button.loc.x + 15,
+            reveal_button.loc.y + 22,
+            style_for(FontRole::Label, 14, theme_id),
+            [0.86, 0.92, 1.0, 0.92],
+            ctx.output_scale,
+        )?;
+
+        let message = if lock.authenticating {
+            "Authenticating"
+        } else {
+            lock.message.as_str()
+        };
+        let message_color = match lock.pulse.map(|pulse| pulse.kind) {
+            Some(LockPulseKind::Rejected) => [1.0, 0.22, 0.18, 0.95],
+            Some(LockPulseKind::Accepted) => [0.68, 1.0, 0.48, 0.95],
+            None => [0.70, 0.78, 0.92, 0.86],
+        };
+        self.draw_text_cached(
+            frame,
+            fonts,
+            message,
+            panel_x + 28,
+            panel_y + 150,
+            style_for(FontRole::Label, 15, theme_id),
+            message_color,
+            ctx.output_scale,
+        )?;
 
         Ok(())
     }
@@ -1931,6 +2219,28 @@ impl RenderState {
         scale: Scale<f64>,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
+        Self::draw_pulse(
+            frame,
+            program,
+            rect_logical,
+            click_local,
+            elapsed,
+            scale,
+            damage,
+            [0.0, 0.5, 1.0, 1.0],
+        )
+    }
+
+    fn draw_pulse(
+        frame: &mut GlesFrame<'_, '_>,
+        program: &GlesPixelProgram,
+        rect_logical: Rectangle<i32, Logical>,
+        click_local: Point<f64, Logical>,
+        elapsed: Duration,
+        scale: Scale<f64>,
+        damage: &[Rectangle<i32, Physical>],
+        color: [f32; 4],
+    ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
         let src_rect = Rectangle::from_loc_and_size(
             (0.0, 0.0),
@@ -1950,6 +2260,7 @@ impl RenderState {
                 "u_size",
                 [rect_physical.size.w as f32, rect_physical.size.h as f32],
             ),
+            Uniform::new("u_color", color),
         ];
 
         frame.render_pixel_shader_to(

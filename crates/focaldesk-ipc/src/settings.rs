@@ -73,6 +73,14 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             IpcResponse::Ok
         }
 
+        Ok(IpcRequest::ReloadConfig) => IpcResponse::Ok,
+
+        Ok(IpcRequest::GetConfig | IpcRequest::SetConfig { .. } | IpcRequest::Notify { .. }) => {
+            IpcResponse::Error {
+                message: "request is handled by focaldesk-desktop".to_string(),
+            }
+        }
+
         Err(e) => IpcResponse::Error {
             message: e.to_string(),
         },

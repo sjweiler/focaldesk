@@ -12,14 +12,14 @@ impl UiTree {
         self.elements
             .iter()
             .rev()
-            .find(|e| e.visible && e.enabled && e.bounds.contains(x, y))
+            .find(|e| e.visible && e.bounds.contains(x, y))
     }
 
     pub fn hit_test_mut(&mut self, x: i32, y: i32) -> Option<&mut UiElement> {
         self.elements
             .iter_mut()
             .rev()
-            .find(|e| e.visible && e.enabled && e.bounds.contains(x, y))
+            .find(|e| e.visible && e.bounds.contains(x, y))
     }
 }
 

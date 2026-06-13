@@ -6,6 +6,7 @@ use smithay::utils::Size;
 /// Defaults aligned with `focaldesk_ui::chrome::ChromeMetrics::default` for nested (winit) mode.
 pub const NESTED_DEFAULT_TOPBAR_H: i32 = 64;
 pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
+pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 11;
 
 /// True when `(lx, ly)` (output-local **logical** coords) is in the top bar host-drag strip
 /// but not on status/clock wells.
@@ -275,7 +276,7 @@ pub fn build_chrome_layout(
 
     // Right-side cluster inside topbar_inner
     let (status_cluster, status_wells, clock_well) =
-        build_status_cluster(topbar_inner, 10, 6, 8, 4);
+        build_status_cluster(topbar_inner, 10, 6, 8, 5);
 
     // Title gets the remaining space to the left of the cluster
     let title_left = topbar_inner.loc.x + 6;
@@ -310,7 +311,11 @@ pub fn build_chrome_layout(
     let module_w = (left_w - module_margin_x * 2).max(16);
     let mut y = top_h + module_margin_top;
 
-    while y + module_h <= h - module_margin_bottom {
+    let available_h = (h - top_h - module_margin_top - module_margin_bottom).max(0);
+    let max_slots_that_fit = ((available_h + module_gap) / (module_h + module_gap)).max(0) as usize;
+    let slot_count = DEFAULT_SIDEBAR_SLOT_COUNT.min(max_slots_that_fit);
+
+    for _ in 0..slot_count {
         let outer = Rectangle::from_loc_and_size((module_margin_x, y), (module_w, module_h));
         let inner = inset_rect(outer, 2);
         let well = inset_rect(inner, 3);

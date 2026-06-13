@@ -3,6 +3,7 @@ pub mod consts;
 pub mod desktop;
 pub mod input;
 pub mod layout;
+pub mod lock;
 pub mod output;
 pub mod output_store;
 pub mod render;

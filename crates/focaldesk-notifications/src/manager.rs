@@ -1,5 +1,8 @@
-use crate::notification::Notification;
+use crate::notification::{
+    DEFAULT_TIMEOUT, MAX_VISIBLE_NOTIFICATIONS, Notification, NotificationSnapshot,
+};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 pub struct NotificationManager {
     queue: VecDeque<Notification>,
@@ -14,23 +17,72 @@ impl NotificationManager {
         }
     }
 
-    pub fn push(&mut self, title: impl Into<String>, body: impl Into<String>) {
+    pub fn push(&mut self, title: impl Into<String>, body: impl Into<String>) -> u64 {
+        self.push_with_timeout(title, body, Some(DEFAULT_TIMEOUT))
+    }
+
+    pub fn push_persistent(&mut self, title: impl Into<String>, body: impl Into<String>) -> u64 {
+        self.push_with_timeout(title, body, None)
+    }
+
+    pub fn push_with_timeout(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        timeout: Option<Duration>,
+    ) -> u64 {
+        let id = self.next_id;
         let notif = Notification {
-            id: self.next_id,
+            id,
             title: title.into(),
             body: body.into(),
-            timeout_ms: Some(5000),
+            created_at: Instant::now(),
+            timeout,
         };
 
         self.next_id += 1;
         self.queue.push_back(notif);
+        id
     }
 
-    pub fn pop(&mut self) -> Option<Notification> {
-        self.queue.pop_front()
+    pub fn dismiss(&mut self, id: u64) -> bool {
+        let Some(index) = self
+            .queue
+            .iter()
+            .position(|notification| notification.id == id)
+        else {
+            return false;
+        };
+
+        self.queue.remove(index).is_some()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &Notification> {
-        self.queue.iter()
+    pub fn expire(&mut self, now: Instant) -> bool {
+        let before = self.queue.len();
+        self.queue
+            .retain(|notification| !notification.is_expired(now));
+        self.queue.len() != before
+    }
+
+    pub fn has_visible(&self, now: Instant) -> bool {
+        self.queue
+            .iter()
+            .any(|notification| !notification.is_expired(now))
+    }
+
+    pub fn visible_snapshots(&self, now: Instant) -> Vec<NotificationSnapshot> {
+        self.queue
+            .iter()
+            .filter(|notification| !notification.is_expired(now))
+            .rev()
+            .take(MAX_VISIBLE_NOTIFICATIONS)
+            .map(|notification| notification.snapshot(now))
+            .collect()
+    }
+}
+
+impl Default for NotificationManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
