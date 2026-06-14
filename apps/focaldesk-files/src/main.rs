@@ -1072,14 +1072,15 @@ fn attach_file_context_menu(
 
     click.connect_pressed(move |gesture, _, x, y| {
         select_item();
-        let parent = gesture.widget();
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_has_arrow(false);
-        popover.set_parent(&parent);
-        popover.connect_closed(|popover| popover.unparent());
-        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-        popover.set_pointing_to(Some(&rect));
-        popover.popup();
+        if let Some(parent) = gesture.widget() {
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_has_arrow(false);
+            popover.set_parent(&parent);
+            popover.connect_closed(|popover| popover.unparent());
+            let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popover.set_pointing_to(Some(&rect));
+            popover.popup();
+        }
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
 
@@ -1513,14 +1514,15 @@ fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind
     click.set_button(3);
 
     click.connect_pressed(move |gesture, _, x, y| {
-        let parent = gesture.widget();
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_has_arrow(false);
-        popover.set_parent(&parent);
-        popover.connect_closed(|popover| popover.unparent());
-        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
-        popover.set_pointing_to(Some(&rect));
-        popover.popup();
+        if let Some(parent) = gesture.widget() {
+            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            popover.set_has_arrow(false);
+            popover.set_parent(&parent);
+            popover.connect_closed(|popover| popover.unparent());
+            let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+            popover.set_pointing_to(Some(&rect));
+            popover.popup();
+        }
         gesture.set_state(gtk::EventSequenceState::Claimed);
     });
 
