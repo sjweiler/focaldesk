@@ -1054,7 +1054,7 @@ fn ensure_wallpaper_loaded(&mut self, renderer: &mut GlesRenderer)
         //flog_info!("wallpaper loaded");
         self.wallpaper_texture = load_wallpaper(
             renderer,
-            "/home/steve/focusshell/assets/wallpaper/focaldesk_wallpaper.png",
+            "/home/steve/focaldesk/assets/wallpaper/focaldesk_wallpaper.png",
             
     );
 }

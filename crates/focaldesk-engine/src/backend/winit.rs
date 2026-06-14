@@ -134,6 +134,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "xwayland")]
         xwayland_event_loop.dispatch(Some(Duration::ZERO), &mut nested.state)?;
 
+        nested.state.process_settings_ipc_requests();
+        nested.state.process_chrome_timers();
+        nested.state.process_notification_timers();
+        nested.state.process_lock_timers();
+
         // dispatch events
         if !dispatch_backend_events(&mut nested.state, &mut event_loop)? {
             break;

@@ -2,6 +2,7 @@
 
 //! Shared setup for nested compositor backends (winit, future DRM/KMS, etc.).
 
+use std::path::PathBuf;
 #[cfg(feature = "xwayland")]
 use std::process::Stdio;
 #[cfg(feature = "xwayland")]
@@ -324,6 +325,8 @@ pub(crate) fn bind_wayland_socket() -> anyhow::Result<(ListeningSocket, String)>
 }
 
 fn publish_portal_environment(wayland_display: &str) {
+    ensure_standard_user_dirs();
+
     std::env::set_var("WAYLAND_DISPLAY", wayland_display);
     std::env::set_var("XDG_CURRENT_DESKTOP", "wlroots");
 
@@ -341,6 +344,86 @@ fn publish_portal_environment(wayland_display: &str) {
         Err(err) => flog(&format!(
             "failed to publish portal environment: dbus-update-activation-environment: {err}"
         )),
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn xdg_config_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn ensure_standard_user_dirs() {
+    let Some(home) = home_dir() else {
+        return;
+    };
+
+    for name in ["Desktop", "Downloads", "Music", "Pictures", "Videos"] {
+        let path = home.join(name);
+        if let Err(err) = std::fs::create_dir_all(&path) {
+            flog(&format!(
+                "failed to create user directory {}: {err}",
+                path.display()
+            ));
+        }
+    }
+
+    ensure_xdg_videos_dir();
+}
+
+fn ensure_xdg_videos_dir() {
+    let user_dirs_path = xdg_config_dir().join("user-dirs.dirs");
+    if let Some(parent) = user_dirs_path.parent() {
+        if let Err(err) = std::fs::create_dir_all(parent) {
+            flog(&format!(
+                "failed to create XDG user dirs config directory {}: {err}",
+                parent.display()
+            ));
+            return;
+        }
+    }
+
+    let videos_line = r#"XDG_VIDEOS_DIR="$HOME/Videos""#;
+    let text = std::fs::read_to_string(&user_dirs_path).unwrap_or_default();
+    let mut found = false;
+    let mut changed = false;
+    let mut lines = Vec::new();
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("XDG_VIDEOS_DIR=") {
+            found = true;
+            if line.trim() == videos_line {
+                lines.push(line.to_string());
+            } else {
+                lines.push(videos_line.to_string());
+                changed = true;
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    if !found {
+        lines.push(videos_line.to_string());
+        changed = true;
+    }
+
+    if !changed {
+        return;
+    }
+
+    let mut output = lines.join("\n");
+    output.push('\n');
+    if let Err(err) = std::fs::write(&user_dirs_path, output) {
+        flog(&format!(
+            "failed to write XDG videos directory to {}: {err}",
+            user_dirs_path.display()
+        ));
     }
 }
 

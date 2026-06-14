@@ -123,6 +123,41 @@ pub struct DisplayConfig {
 
     pub primary: bool,
     pub transform: DisplayTransform,
+
+    #[serde(default)]
+    pub hdr_supported: bool,
+    #[serde(default)]
+    pub hdr_enabled: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct HdrSupport {
+    pub has_hdr_metadata_property: bool,
+    pub has_bt2020_colorspace: bool,
+    pub colorspaces: Vec<String>,
+    pub current_colorspace: Option<String>,
+    pub max_bpc: Option<HdrBpcRange>,
+    pub current_max_bpc: Option<u64>,
+    pub hdr_metadata_blob: Option<u64>,
+    pub edid_hdr_static_metadata: bool,
+    pub edid_pq: bool,
+    pub edid_hlg: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct HdrBpcRange {
+    pub min: u64,
+    pub max: u64,
+}
+
+impl HdrSupport {
+    fn is_detected(&self) -> bool {
+        self.has_hdr_metadata_property
+            || self.has_bt2020_colorspace
+            || self.edid_hdr_static_metadata
+            || self.edid_pq
+            || self.edid_hlg
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -204,6 +239,7 @@ pub struct DrmSurfaceState {
     pub origin: Point<i32, Logical>,
     pub present_render_id: Id,
     pub present_damage: DamageBag<i32, Buffer>,
+    pub hdr_support: HdrSupport,
 
     pub drm_output: DrmOutput<
         GbmAllocator<DrmDeviceFd>,
@@ -310,6 +346,14 @@ fn configured_display_scale(displays: &[DisplayConfig], name: &str) -> f64 {
     }
 
     scale
+}
+
+fn configured_display_hdr_enabled(displays: &[DisplayConfig], name: &str) -> bool {
+    displays
+        .iter()
+        .find(|display| display.name == name)
+        .map(|display| display.hdr_enabled)
+        .unwrap_or(false)
 }
 
 fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
@@ -645,6 +689,10 @@ pub(crate) fn collect_display_configs(
 
         let w = surface.mode.size.w;
         let h = surface.mode.size.h;
+        let hdr_supported = surface.hdr_support.is_detected();
+        let hdr_enabled = core_output
+            .map(|output| output.hdr_enabled && hdr_supported)
+            .unwrap_or(false);
 
         displays.push(DisplayConfig {
             name: surface.output.name(),
@@ -665,6 +713,9 @@ pub(crate) fn collect_display_configs(
             primary,
 
             transform: DisplayTransform::Normal,
+
+            hdr_supported,
+            hdr_enabled,
         });
     }
 
@@ -702,6 +753,141 @@ fn connector_edid(
         }
     }
     None
+}
+
+fn connector_hdr_support(
+    device: &impl drm::control::Device,
+    connector: connector::Handle,
+    edid: Option<&[u8]>,
+) -> HdrSupport {
+    let mut support = edid
+        .map(parse_edid_hdr_support)
+        .unwrap_or_else(HdrSupport::default);
+
+    let Ok(props) = device.get_properties(connector) else {
+        return support;
+    };
+
+    for (prop, raw_value) in props.iter() {
+        let Ok(info) = device.get_property(*prop) else {
+            continue;
+        };
+        let name = info.name().to_string_lossy();
+
+        match name.as_ref() {
+            "HDR_OUTPUT_METADATA" => {
+                support.has_hdr_metadata_property = true;
+                support.hdr_metadata_blob = (*raw_value != 0).then_some(*raw_value);
+            }
+            "Colorspace" => {
+                if let drm::control::property::ValueType::Enum(values) = info.value_type() {
+                    let (_, enums) = values.values();
+                    support.colorspaces = enums
+                        .iter()
+                        .map(|value| value.name().to_string_lossy().into_owned())
+                        .collect();
+                    support.has_bt2020_colorspace = support
+                        .colorspaces
+                        .iter()
+                        .any(|colorspace| colorspace.contains("BT2020"));
+                    support.current_colorspace = values
+                        .get_value_from_raw_value(*raw_value)
+                        .map(|value| value.name().to_string_lossy().into_owned());
+                }
+            }
+            "max bpc" => {
+                if let drm::control::property::ValueType::UnsignedRange(min, max) =
+                    info.value_type()
+                {
+                    support.max_bpc = Some(HdrBpcRange { min, max });
+                    support.current_max_bpc = Some(*raw_value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    support
+}
+
+fn parse_edid_hdr_support(edid: &[u8]) -> HdrSupport {
+    let mut support = HdrSupport::default();
+    if edid.len() < 128
+        || edid.get(0..8) != Some([0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0].as_slice())
+    {
+        return support;
+    }
+
+    let extension_count = edid[126] as usize;
+    for ext_index in 0..extension_count {
+        let start = 128 * (ext_index + 1);
+        let Some(extension) = edid.get(start..start + 128) else {
+            break;
+        };
+        if extension[0] != 0x02 {
+            continue;
+        }
+
+        let dtd_offset = match extension[2] {
+            0 => 127,
+            offset @ 4..=127 => offset as usize,
+            _ => continue,
+        };
+        let mut index = 4;
+        while index < dtd_offset {
+            let header = extension[index];
+            index += 1;
+
+            let tag = header >> 5;
+            let len = (header & 0x1f) as usize;
+            if len == 0 || index + len > dtd_offset {
+                index += len;
+                continue;
+            }
+
+            let block = &extension[index..index + len];
+            index += len;
+
+            if tag != 0x07 || block.first() != Some(&0x06) || block.len() < 3 {
+                continue;
+            }
+
+            let eotf_flags = block[1];
+            support.edid_hdr_static_metadata = true;
+            support.edid_pq = eotf_flags & (1 << 2) != 0;
+            support.edid_hlg = eotf_flags & (1 << 3) != 0;
+        }
+    }
+
+    support
+}
+
+fn log_hdr_support(output_name: &str, support: &HdrSupport) {
+    let max_bpc = support
+        .max_bpc
+        .as_ref()
+        .map(|range| format!("{}..{}", range.min, range.max))
+        .unwrap_or_else(|| "none".to_string());
+    let current_bpc = support
+        .current_max_bpc
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let current_colorspace = support.current_colorspace.as_deref().unwrap_or("unknown");
+
+    flog(&format!(
+        "HDR support: output={} metadata_property={} metadata_blob={:?} bt2020_colorspace={} colorspaces={:?} current_colorspace={} max_bpc={} current_max_bpc={} edid_hdr_static_metadata={} edid_pq={} edid_hlg={}",
+        output_name,
+        support.has_hdr_metadata_property,
+        support.hdr_metadata_blob,
+        support.has_bt2020_colorspace,
+        support.colorspaces,
+        current_colorspace,
+        max_bpc,
+        current_bpc,
+        support.edid_hdr_static_metadata,
+        support.edid_pq,
+        support.edid_hlg,
+    ));
 }
 
 fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
@@ -951,6 +1137,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .xwayland_event_loop
             .dispatch(Some(Duration::ZERO), &mut data.core.state)?;
 
+        data.core.state.process_settings_ipc_requests();
+        data.core.state.process_chrome_timers();
+        data.core.state.process_notification_timers();
+        data.core.state.process_lock_timers();
+
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
 
         if let Some(stream) = data.core.listener.accept()? {
@@ -1040,6 +1231,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                 if portal_active {
                     data.core.state.render.redraw_all = true;
+                }
+                if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                    out.hdr_supported = surface.hdr_support.is_detected();
                 }
                 let prepared = prepare_output(
                     &mut data.core.state,
@@ -1579,8 +1773,12 @@ fn device_added(
                 .map(|(mm_w, mm_h)| (mm_w as i32, mm_h as i32))
                 .unwrap_or(fallback_mm);
 
-            let edid_identity = connector_edid(drm_output_manager.device(), *conn)
-                .and_then(|edid| parse_edid_identity(&edid));
+            let edid = connector_edid(drm_output_manager.device(), *conn);
+            let hdr_support =
+                connector_hdr_support(drm_output_manager.device(), *conn, edid.as_deref());
+            log_hdr_support(&output_name, &hdr_support);
+
+            let edid_identity = edid.as_deref().and_then(parse_edid_identity);
             let make = edid_identity
                 .as_ref()
                 .map(|identity| identity.make.clone())
@@ -1612,6 +1810,7 @@ fn device_added(
             // (e.g. OBS projector shows all DRM outputs on top of each other).
             let origin = Point::<i32, Logical>::from((next_x, 0));
             let output_scale = configured_display_scale(&configured_displays, &output_name);
+            let hdr_enabled = configured_display_hdr_enabled(&configured_displays, &output_name);
             let output_scale_int = output_scale.round().max(1.0) as i32;
             let logical_size = Size::<i32, Logical>::from((
                 (w as f64 / output_scale).round() as i32,
@@ -1731,6 +1930,10 @@ fn device_added(
                 Size::<i32, Physical>::from((w as i32, h as i32)),
                 output_scale,
             );
+            if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
+                out.hdr_supported = hdr_support.is_detected();
+                out.hdr_enabled = hdr_support.is_detected() && hdr_enabled;
+            }
 
             if !initialized_one {
                 data.core.state.primary_output = output_id;
@@ -1746,6 +1949,7 @@ fn device_added(
                     origin,
                     present_render_id: Id::new(),
                     present_damage: DamageBag::default(),
+                    hdr_support,
                     drm_output,
                     offscreen: None,
                 },

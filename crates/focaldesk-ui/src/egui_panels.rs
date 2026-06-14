@@ -56,12 +56,107 @@ pub struct CalendarPanel {
     pub open: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceDialogMode {
+    Add,
+    Delete,
+}
+
+pub struct WorkspaceDialog {
+    pub open: bool,
+    pub mode: WorkspaceDialogMode,
+    pub name: String,
+}
+
+impl Default for WorkspaceDialog {
+    fn default() -> Self {
+        Self {
+            open: false,
+            mode: WorkspaceDialogMode::Add,
+            name: String::new(),
+        }
+    }
+}
+
 impl Default for AudioPanel {
     fn default() -> Self {
         Self {
             open: false,
             volume: 0.5,
         }
+    }
+}
+
+impl WorkspaceDialog {
+    pub fn open_add(&mut self, name: impl Into<String>) {
+        self.open = true;
+        self.mode = WorkspaceDialogMode::Add;
+        self.name = name.into();
+    }
+
+    pub fn open_delete(&mut self) {
+        self.open = true;
+        self.mode = WorkspaceDialogMode::Delete;
+    }
+
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            return;
+        }
+
+        let mut open = self.open;
+        let mut close_requested = false;
+        let title = match self.mode {
+            WorkspaceDialogMode::Add => "Add Workspace",
+            WorkspaceDialogMode::Delete => "Delete Workspace",
+        };
+
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(320.0)
+            .default_pos(egui::pos2(
+                frame_ctx.work.loc.x as f32 + 32.0,
+                frame_ctx.work.loc.y as f32 + 32.0,
+            ))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                match self.mode {
+                    WorkspaceDialogMode::Add => {
+                        ui.label("Workspace name");
+                        ui.text_edit_singleline(&mut self.name);
+                    }
+                    WorkspaceDialogMode::Delete => {
+                        ui.label("Delete the current workspace?");
+                    }
+                }
+
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("No").clicked() {
+                        close_requested = true;
+                    }
+                    if ui.button("Yes").clicked() {
+                        match self.mode {
+                            WorkspaceDialogMode::Add => {
+                                actions
+                                    .push(UiAction::CreateWorkspace(self.name.trim().to_string()));
+                            }
+                            WorkspaceDialogMode::Delete => {
+                                actions.push(UiAction::DeleteWorkspace);
+                            }
+                        }
+                        close_requested = true;
+                    }
+                });
+            });
+
+        self.open = open && !close_requested;
     }
 }
 

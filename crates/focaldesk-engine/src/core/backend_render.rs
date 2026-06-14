@@ -10,7 +10,7 @@ use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
 use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
 use crate::core::render::{FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
-use crate::core::ui_builder::build_ui_for_output;
+use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_flow::keybinds::BackendKind;
@@ -172,7 +172,15 @@ pub fn prepare_output(
     dt: Duration,
     force_full_damage: bool,
 ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
-    let (logical_w, logical_h, scale_factor, output_scale, buffer_scale) = {
+    let (
+        logical_w,
+        logical_h,
+        scale_factor,
+        output_scale,
+        buffer_scale,
+        hdr_supported,
+        hdr_enabled,
+    ) = {
         let desk_output = state
             .outputs
             .get(&output_id)
@@ -183,6 +191,8 @@ pub fn prepare_output(
             desk_output.scale_factor,
             desk_output.scale,
             desk_output.scale_factor.round().max(1.0) as i32,
+            desk_output.hdr_supported,
+            desk_output.hdr_enabled,
         )
     };
 
@@ -202,7 +212,19 @@ pub fn prepare_output(
         state.chrome.metrics.sidebar_w,
     );
 
-    build_ui_for_output(&mut state.ui, &layout);
+    let workspace_count = state.workspace_names.len();
+    let active_workspace = state.focused_workspace().0;
+
+    build_ui_for_output_with_options(
+        &mut state.ui,
+        &layout,
+        UiBuildOptions {
+            hdr_supported,
+            hdr_enabled,
+            workspace_count,
+            active_workspace,
+        },
+    );
     state.refresh_ui_hover_for_output(output_id);
 
     if let Some(rect) = state.active_sidebar_pulse_damage_rect(output_id, now) {
@@ -285,6 +307,8 @@ pub fn prepare_output(
         prepare_portal_chrome_glyphs(state, scale_factor)?;
     }
 
+    prepare_lock_screen_glyphs(state)?;
+
     if state.fonts.atlas_dirty || state.render.font_atlas_texture.is_none() {
         state.render.upload_font_atlas(renderer, &state.fonts)?;
         state.fonts.atlas_dirty = false;
@@ -358,6 +382,45 @@ fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::erro
             state.fonts.prepare_text(BASIC_ASCII, style)?;
         }
     }
+
+    Ok(())
+}
+
+fn prepare_lock_screen_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::error::Error>> {
+    if !state.lock_screen.active {
+        return Ok(());
+    }
+
+    let theme_id = state
+        .theme
+        .active_theme()
+        .id
+        .builtin_id()
+        .unwrap_or(BuiltInThemeId::Classic);
+
+    state
+        .fonts
+        .prepare_text("FOCALDESK LOCKED", style_for(FontRole::Title, 18, theme_id))?;
+    state
+        .fonts
+        .prepare_text("ShowHide", style_for(FontRole::Label, 14, theme_id))?;
+    state.fonts.prepare_text(
+        "Enter passwordAuthenticatingUnlockedWrong password",
+        style_for(FontRole::Label, 15, theme_id),
+    )?;
+    state.fonts.prepare_text(
+        &state.lock_screen.message,
+        style_for(FontRole::Label, 15, theme_id),
+    )?;
+
+    let password_display = if state.lock_screen.password_visible {
+        state.lock_screen.password.as_str().to_string()
+    } else {
+        "*".repeat(state.lock_screen.password.chars().count().min(48))
+    };
+    state
+        .fonts
+        .prepare_text(&password_display, style_for(FontRole::Body, 22, theme_id))?;
 
     Ok(())
 }
@@ -492,6 +555,10 @@ pub fn draw_output(
         .get(&prepared.frame_ctx.rendering_output)
         .map(|o| o.active_workspace)
         .unwrap_or(state.active_workspace);
+    let notifications = state
+        .notifications
+        .visible_snapshots(prepared.frame_ctx.now);
+    let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
 
     let inputs = RenderInputs {
         ctx: &prepared.frame_ctx,
@@ -516,6 +583,8 @@ pub fn draw_output(
         active_dialog: state.active_dialog,
         fonts: &state.fonts,
         theme: &state.theme.active_theme(),
+        notifications: &notifications,
+        lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
     };
 

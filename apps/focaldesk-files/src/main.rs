@@ -24,6 +24,13 @@ struct FileItem {
 enum SidebarKind {
     Folder,
     Trash,
+    Separator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileContextTarget {
+    Folder,
+    File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +87,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_show_title(false);
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
     toolbar.add_top_bar(&header);
 
     let back_button = icon_button("go-previous-symbolic", "Back");
@@ -92,6 +101,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let details_view_button = toggle_icon_button("view-list-symbolic", "Details View");
     let list_view_button = toggle_icon_button("view-paged-symbolic", "List View");
     let grid_view_button = toggle_icon_button("view-grid-symbolic", "Grid View");
+    let close_button = icon_button("window-close-symbolic", "Close");
     list_view_button.set_group(Some(&details_view_button));
     grid_view_button.set_group(Some(&details_view_button));
     details_view_button.set_active(true);
@@ -111,6 +121,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let hidden_toggle = gtk::ToggleButton::new();
     hidden_toggle.set_icon_name("view-hidden-symbolic");
     hidden_toggle.set_tooltip_text(Some("Show Hidden Files"));
+    let window_for_close = window.clone();
+    close_button.connect_clicked(move |_| window_for_close.close());
+    header.pack_end(&close_button);
     header.pack_end(&hidden_toggle);
     header.pack_end(&grid_view_button);
     header.pack_end(&list_view_button);
@@ -194,6 +207,8 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     ensure_standard_user_dirs();
     manager.install_css();
     manager.load_places();
+    install_sidebar_actions(manager.window.upcast_ref());
+    manager.install_file_context_actions();
     manager.connect_actions(
         back_button,
         forward_button,
@@ -212,6 +227,76 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 }
 
 impl FileManager {
+    fn install_file_context_actions(&self) {
+        let open = gio::SimpleAction::new("file-open", None);
+        let this = self.clone();
+        open.connect_activate(move |_, _| {
+            let this = this.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(index) = this.selected_index() {
+                    this.activate_item(index);
+                }
+            });
+        });
+        self.window.add_action(&open);
+
+        let cut = gio::SimpleAction::new("file-cut", None);
+        cut.connect_activate(|_, _| {
+            flog_info!("Cut file item");
+        });
+        self.window.add_action(&cut);
+
+        let copy = gio::SimpleAction::new("file-copy", None);
+        copy.connect_activate(|_, _| {
+            flog_info!("Copy file item");
+        });
+        self.window.add_action(&copy);
+
+        let move_to = gio::SimpleAction::new("file-move-to", None);
+        move_to.connect_activate(|_, _| {
+            flog_info!("Move file item to...");
+        });
+        self.window.add_action(&move_to);
+
+        let copy_to = gio::SimpleAction::new("file-copy-to", None);
+        copy_to.connect_activate(|_, _| {
+            flog_info!("Copy file item to...");
+        });
+        self.window.add_action(&copy_to);
+
+        let rename = gio::SimpleAction::new("file-rename", None);
+        rename.connect_activate(|_, _| {
+            flog_info!("Rename file item");
+        });
+        self.window.add_action(&rename);
+
+        let paste_into = gio::SimpleAction::new("file-paste-into-folder", None);
+        paste_into.connect_activate(|_, _| {
+            flog_info!("Paste into folder");
+        });
+        self.window.add_action(&paste_into);
+
+        let compress = gio::SimpleAction::new("file-compress", None);
+        compress.connect_activate(|_, _| {
+            flog_info!("Compress file item");
+        });
+        self.window.add_action(&compress);
+
+        let move_to_trash = gio::SimpleAction::new("file-move-to-trash", None);
+        let this = self.clone();
+        move_to_trash.connect_activate(move |_, _| {
+            let this = this.clone();
+            glib::idle_add_local_once(move || this.trash_selected());
+        });
+        self.window.add_action(&move_to_trash);
+
+        let properties = gio::SimpleAction::new("file-properties", None);
+        properties.connect_activate(|_, _| {
+            flog_info!("Show file properties");
+        });
+        self.window.add_action(&properties);
+    }
+
     fn connect_actions(
         &self,
         back_button: gtk::Button,
@@ -461,7 +546,8 @@ impl FileManager {
     }
 
     fn reload(&self) {
-        self.open_location(self.current_location.borrow().clone(), false);
+        let location = self.current_location.borrow().clone();
+        self.open_location(location, false);
     }
 
     fn parent_dir(&self) -> Option<PathBuf> {
@@ -483,10 +569,20 @@ impl FileManager {
         for item in self.entries.borrow().iter() {
             let row = file_row(item, view_mode);
             attach_file_drag_source(&row, item.clone());
+            let list = self.list.clone();
+            let row_for_context = row.clone();
+            attach_file_context_menu(&row, file_context_target(item), move || {
+                list.select_row(Some(&row_for_context));
+            });
             self.list.append(&row);
 
             let child = grid_file_child(item);
             attach_file_drag_source(&child, item.clone());
+            let grid = self.grid.clone();
+            let child_for_context = child.clone();
+            attach_file_context_menu(&child, file_context_target(item), move || {
+                grid.select_child(&child_for_context);
+            });
             self.grid.append(&child);
         }
 
@@ -922,6 +1018,74 @@ fn file_icon_name(item: &FileItem) -> &'static str {
     }
 }
 
+fn file_context_target(item: &FileItem) -> FileContextTarget {
+    if item.is_dir {
+        FileContextTarget::Folder
+    } else {
+        FileContextTarget::File
+    }
+}
+
+fn attach_file_context_menu(
+    widget: &impl IsA<gtk::Widget>,
+    target: FileContextTarget,
+    select_item: impl Fn() + 'static,
+) {
+    let menu = gio::Menu::new();
+
+    menu.append(Some("Open"), Some("win.file-open"));
+
+    menu.append_section(None, &{
+        let section = gio::Menu::new();
+        section.append(Some("Cut\tCtrl+X"), Some("win.file-cut"));
+        section.append(Some("Copy\tCtrl+C"), Some("win.file-copy"));
+        section.append(Some("Move to..."), Some("win.file-move-to"));
+        section.append(Some("Copy to..."), Some("win.file-copy-to"));
+        section
+    });
+
+    menu.append_section(None, &{
+        let section = gio::Menu::new();
+        section.append(Some("Rename...\tF2"), Some("win.file-rename"));
+        if matches!(target, FileContextTarget::Folder) {
+            section.append(
+                Some("Paste Into Folder"),
+                Some("win.file-paste-into-folder"),
+            );
+        }
+        section.append(Some("Compress..."), Some("win.file-compress"));
+        section.append(
+            Some("Move to Trash\tDelete"),
+            Some("win.file-move-to-trash"),
+        );
+        section
+    });
+
+    menu.append_section(None, &{
+        let section = gio::Menu::new();
+        section.append(Some("Properties\tAlt+Return"), Some("win.file-properties"));
+        section
+    });
+
+    let click = gtk::GestureClick::new();
+    click.set_button(3);
+
+    click.connect_pressed(move |gesture, _, x, y| {
+        select_item();
+        let parent = gesture.widget();
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_has_arrow(false);
+        popover.set_parent(&parent);
+        popover.connect_closed(|popover| popover.unparent());
+        let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        popover.set_pointing_to(Some(&rect));
+        popover.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+
+    widget.add_controller(click);
+}
+
 fn attach_file_drag_source(widget: &impl IsA<gtk::Widget>, item: FileItem) {
     let source = gtk::DragSource::new();
     source.set_actions(gtk::gdk::DragAction::COPY);
@@ -981,20 +1145,27 @@ fn column_header() -> gtk::Grid {
 fn place_factory() -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.set_hexpand(true);
+        row.set_margin_top(8);
+        row.set_margin_bottom(8);
+        row.set_margin_start(10);
+        row.set_margin_end(10);
+
         let label = gtk::Label::new(None);
         label.set_xalign(0.0);
-        label.set_margin_top(8);
-        label.set_margin_bottom(8);
-        label.set_margin_start(10);
-        label.set_margin_end(10);
+        label.set_hexpand(true);
+        row.append(&label);
+
         item.downcast_ref::<gtk::ListItem>()
             .expect("ListItem")
-            .set_child(Some(&label));
+            .set_child(Some(&row));
     });
     factory.connect_bind(|_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("ListItem");
-        let label = item
-            .child()
+        let row = item.child().and_downcast::<gtk::Box>().expect("Box child");
+        let label = row
+            .first_child()
             .and_downcast::<gtk::Label>()
             .expect("Label child");
         let Some(place) = item.item().and_downcast::<gtk::StringObject>() else {
@@ -1002,8 +1173,11 @@ fn place_factory() -> gtk::SignalListItemFactory {
         };
 
         let name = place.string();
-        label.set_text(name.lines().next().unwrap_or_default());
-        label.set_tooltip_text(name.lines().nth(1));
+        let title = name.lines().next().unwrap_or_default();
+        let path = name.lines().nth(1).unwrap_or_default();
+        label.set_text(title);
+        label.set_tooltip_text(Some(path));
+        attach_sidebar_context_menu(&row, sidebar_kind_for_place(path));
     });
     factory
 }
@@ -1290,10 +1464,26 @@ fn format_size(size: u64) -> String {
 }
 
 fn plural(count: usize) -> &'static str {
-    if count == 1 { "" } else { "s" }
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
-fn attach_sidebar_context_menu(row: &gtk::ListBoxRow, kind: SidebarKind) {
+fn sidebar_kind_for_place(path: &str) -> SidebarKind {
+    match path {
+        "trash:///" => SidebarKind::Trash,
+        "-" => SidebarKind::Separator,
+        _ => SidebarKind::Folder,
+    }
+}
+
+fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind) {
+    if matches!(kind, SidebarKind::Separator) {
+        return;
+    }
+
     let menu = gio::Menu::new();
 
     menu.append(Some("Open"), Some("win.sidebar-open"));
@@ -1319,21 +1509,22 @@ fn attach_sidebar_context_menu(row: &gtk::ListBoxRow, kind: SidebarKind) {
         section
     });
 
-    let popover = gtk::PopoverMenu::from_model(Some(&menu));
-    popover.set_has_arrow(false);
-    popover.set_parent(row);
-
     let click = gtk::GestureClick::new();
     click.set_button(3);
 
-    click.connect_pressed(glib::clone!(@weak popover => move |gesture, _, x, y| {
+    click.connect_pressed(move |gesture, _, x, y| {
+        let parent = gesture.widget();
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_has_arrow(false);
+        popover.set_parent(&parent);
+        popover.connect_closed(|popover| popover.unparent());
         let rect = gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
         popover.set_pointing_to(Some(&rect));
         popover.popup();
         gesture.set_state(gtk::EventSequenceState::Claimed);
-    }));
+    });
 
-    row.add_controller(click);
+    widget.add_controller(click);
 }
 
 fn install_sidebar_actions(window: &gtk::ApplicationWindow) {
