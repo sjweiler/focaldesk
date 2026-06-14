@@ -26,6 +26,7 @@ jobs:
             libxkbcommon-dev \
             libudev-dev \
             libinput-dev \
+            libseat-dev \
             libegl1-mesa-dev \
             libgles2-mesa-dev \
             libgbm-dev \
@@ -37,4 +38,3 @@ jobs:
 
       - name: Cargo check
         run: cargo check --workspace
-

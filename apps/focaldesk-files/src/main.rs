@@ -7,6 +7,7 @@ use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -48,6 +49,18 @@ enum ViewMode {
     Grid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClipboardOp {
+    Copy,
+    Cut,
+}
+
+#[derive(Debug, Clone)]
+struct FileClipboard {
+    files: Vec<gio::File>,
+    op: ClipboardOp,
+}
+
 #[derive(Clone)]
 struct FileManager {
     window: adw::ApplicationWindow,
@@ -62,6 +75,7 @@ struct FileManager {
     view_mode: Rc<RefCell<ViewMode>>,
     current_location: Rc<RefCell<Location>>,
     entries: Rc<RefCell<Vec<FileItem>>>,
+    file_clipboard: Rc<RefCell<Option<FileClipboard>>>,
     back_stack: Rc<RefCell<Vec<Location>>>,
     forward_stack: Rc<RefCell<Vec<Location>>>,
 }
@@ -76,6 +90,10 @@ fn main() {
         let initial_path = files.first().and_then(|file| file.path());
         build_ui(app, initial_path);
     });
+    app.set_accels_for_action("win.file-cut", &["<Control>x"]);
+    app.set_accels_for_action("win.file-copy", &["<Control>c"]);
+    app.set_accels_for_action("win.file-paste", &["<Control>v"]);
+    app.set_accels_for_action("win.file-move-to-trash", &["Delete"]);
     app.run();
 }
 
@@ -200,6 +218,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         view_mode: Rc::new(RefCell::new(ViewMode::Details)),
         current_location: Rc::new(RefCell::new(Location::Path(home_dir()))),
         entries: Rc::new(RefCell::new(Vec::new())),
+        file_clipboard: Rc::new(RefCell::new(None)),
         back_stack: Rc::new(RefCell::new(Vec::new())),
         forward_stack: Rc::new(RefCell::new(Vec::new())),
     };
@@ -207,7 +226,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     ensure_standard_user_dirs();
     manager.install_css();
     manager.load_places();
-    install_sidebar_actions(manager.window.upcast_ref());
+    manager.install_sidebar_actions();
     manager.install_file_context_actions();
     manager.connect_actions(
         back_button,
@@ -227,6 +246,52 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 }
 
 impl FileManager {
+    fn install_sidebar_actions(&self) {
+        let open = gio::SimpleAction::new("sidebar-open", Some(&String::static_variant_type()));
+        let this = self.clone();
+        open.connect_activate(move |_, parameter| {
+            if let Some(location) = sidebar_location_from_parameter(parameter) {
+                this.open_location(location, true);
+            }
+        });
+        self.window.add_action(&open);
+
+        let open_tab =
+            gio::SimpleAction::new("sidebar-open-tab", Some(&String::static_variant_type()));
+        open_tab.connect_activate(|_, _| {
+            flog_info!("Open in new tab");
+        });
+        self.window.add_action(&open_tab);
+
+        let open_window =
+            gio::SimpleAction::new("sidebar-open-window", Some(&String::static_variant_type()));
+        let this = self.clone();
+        open_window.connect_activate(move |_, parameter| {
+            let Some(location) = sidebar_location_from_parameter(parameter) else {
+                return;
+            };
+
+            match open_sidebar_location_in_new_window(&location) {
+                Ok(()) => {}
+                Err(err) => this.set_status(&format!("Could not open new window: {err}")),
+            }
+        });
+        self.window.add_action(&open_window);
+
+        let empty_trash = gio::SimpleAction::new("empty-trash", None);
+        empty_trash.connect_activate(|_, _| {
+            flog_info!("Empty Trash...");
+        });
+        self.window.add_action(&empty_trash);
+
+        let properties =
+            gio::SimpleAction::new("sidebar-properties", Some(&String::static_variant_type()));
+        properties.connect_activate(|_, _| {
+            flog_info!("Show properties");
+        });
+        self.window.add_action(&properties);
+    }
+
     fn install_file_context_actions(&self) {
         let open = gio::SimpleAction::new("file-open", None);
         let this = self.clone();
@@ -241,16 +306,25 @@ impl FileManager {
         self.window.add_action(&open);
 
         let cut = gio::SimpleAction::new("file-cut", None);
-        cut.connect_activate(|_, _| {
-            flog_info!("Cut file item");
+        let this = self.clone();
+        cut.connect_activate(move |_, _| {
+            this.copy_selected_to_clipboard(ClipboardOp::Cut);
         });
         self.window.add_action(&cut);
 
         let copy = gio::SimpleAction::new("file-copy", None);
-        copy.connect_activate(|_, _| {
-            flog_info!("Copy file item");
+        let this = self.clone();
+        copy.connect_activate(move |_, _| {
+            this.copy_selected_to_clipboard(ClipboardOp::Copy);
         });
         self.window.add_action(&copy);
+
+        let paste = gio::SimpleAction::new("file-paste", None);
+        let this = self.clone();
+        paste.connect_activate(move |_, _| {
+            this.paste_files_to_current_folder();
+        });
+        self.window.add_action(&paste);
 
         let move_to = gio::SimpleAction::new("file-move-to", None);
         move_to.connect_activate(|_, _| {
@@ -271,8 +345,9 @@ impl FileManager {
         self.window.add_action(&rename);
 
         let paste_into = gio::SimpleAction::new("file-paste-into-folder", None);
-        paste_into.connect_activate(|_, _| {
-            flog_info!("Paste into folder");
+        let this = self.clone();
+        paste_into.connect_activate(move |_, _| {
+            this.paste_files_into_selected_folder();
         });
         self.window.add_action(&paste_into);
 
@@ -328,6 +403,7 @@ impl FileManager {
 
         self.install_drop_target(&self.list);
         self.install_drop_target(&self.grid);
+        self.watch_file_clipboard_owner();
 
         let this = self.clone();
         self.list.connect_row_activated(move |_, row| {
@@ -683,6 +759,187 @@ impl FileManager {
             }
             Err(err) => self.set_status(&format!("Could not move {} to trash: {err}", item.name)),
         }
+    }
+
+    fn copy_selected_to_clipboard(&self, op: ClipboardOp) {
+        let Some(index) = self.selected_index() else {
+            self.set_status("Select an item to copy.");
+            return;
+        };
+
+        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
+            return;
+        };
+
+        let files = vec![item.file.clone()];
+        let provider = file_clipboard_provider(&files, op);
+
+        let Some(display) = gtk::gdk::Display::default() else {
+            self.set_status("No display clipboard is available.");
+            return;
+        };
+
+        match display.clipboard().set_content(Some(&provider)) {
+            Ok(()) => {
+                *self.file_clipboard.borrow_mut() = Some(FileClipboard { files, op });
+                let action = match op {
+                    ClipboardOp::Copy => "Copied",
+                    ClipboardOp::Cut => "Cut",
+                };
+                self.set_status(&format!("{action} {} to clipboard.", item.name));
+            }
+            Err(err) => self.set_status(&format!("Could not copy {}: {err}", item.name)),
+        }
+    }
+
+    fn paste_files_to_current_folder(&self) {
+        let Location::Path(target_dir) = &*self.current_location.borrow() else {
+            self.set_status("Files can only be pasted into local folders.");
+            return;
+        };
+
+        self.paste_files_into_folder(target_dir.clone());
+    }
+
+    fn paste_files_into_selected_folder(&self) {
+        let Some(index) = self.selected_index() else {
+            self.set_status("Select a folder to paste into.");
+            return;
+        };
+
+        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
+            return;
+        };
+
+        let Some(target_dir) = item.path.filter(|_| item.is_dir) else {
+            self.set_status("Select a local folder to paste into.");
+            return;
+        };
+
+        self.paste_files_into_folder(target_dir);
+    }
+
+    fn paste_files_into_folder(&self, target_dir: PathBuf) {
+        let Some(display) = gtk::gdk::Display::default() else {
+            self.set_status("No display clipboard is available.");
+            return;
+        };
+
+        if display.clipboard().is_local() {
+            if let Some(clipboard) = self.file_clipboard.borrow().clone() {
+                self.copy_or_move_clipboard_files(clipboard.files, clipboard.op, &target_dir);
+                return;
+            }
+        } else {
+            self.file_clipboard.borrow_mut().take();
+        }
+
+        let this = self.clone();
+        display.clipboard().read_value_async(
+            gtk::gdk::FileList::static_type(),
+            glib::Priority::default(),
+            gio::Cancellable::NONE,
+            move |result| match result
+                .ok()
+                .and_then(|value| value.get::<gtk::gdk::FileList>().ok())
+            {
+                Some(file_list) => {
+                    this.copy_or_move_clipboard_files(
+                        file_list.files(),
+                        ClipboardOp::Copy,
+                        &target_dir,
+                    );
+                }
+                None => this.paste_text_uris_into_folder(target_dir),
+            },
+        );
+    }
+
+    fn paste_text_uris_into_folder(&self, target_dir: PathBuf) {
+        let Some(display) = gtk::gdk::Display::default() else {
+            self.set_status("No display clipboard is available.");
+            return;
+        };
+
+        let this = self.clone();
+        display
+            .clipboard()
+            .read_text_async(gio::Cancellable::NONE, move |result| match result {
+                Ok(Some(text)) => {
+                    let files = files_from_uri_text(text.as_str());
+                    if files.is_empty() {
+                        this.set_status("Clipboard does not contain files.");
+                    } else {
+                        this.copy_or_move_clipboard_files(files, ClipboardOp::Copy, &target_dir);
+                    }
+                }
+                Ok(None) => this.set_status("Clipboard does not contain files."),
+                Err(err) => this.set_status(&format!("Could not read clipboard: {err}")),
+            });
+    }
+
+    fn copy_or_move_clipboard_files(
+        &self,
+        files: Vec<gio::File>,
+        op: ClipboardOp,
+        target_dir: &Path,
+    ) {
+        if files.is_empty() {
+            self.set_status("Clipboard does not contain files.");
+            return;
+        }
+
+        let mut completed = 0usize;
+        let mut last_error = None;
+
+        for file in files {
+            let result = match op {
+                ClipboardOp::Copy => copy_dropped_file(&file, target_dir),
+                ClipboardOp::Cut => move_clipboard_file(&file, target_dir),
+            };
+
+            match result {
+                Ok(()) => completed += 1,
+                Err(err) => last_error = Some(err),
+            }
+        }
+
+        self.reload();
+
+        if matches!(op, ClipboardOp::Cut) && last_error.is_none() {
+            self.file_clipboard.borrow_mut().take();
+        }
+
+        let verb = match op {
+            ClipboardOp::Copy => "Copied",
+            ClipboardOp::Cut => "Moved",
+        };
+
+        match (completed, last_error) {
+            (0, Some(err)) => self.set_status(&format!("Could not paste files: {err}")),
+            (count, Some(err)) => self.set_status(&format!(
+                "{verb} {count} item{}; some items failed: {err}",
+                plural(count)
+            )),
+            (count, None) => {
+                self.set_status(&format!("{verb} {count} pasted item{}.", plural(count)))
+            }
+        }
+    }
+
+    fn watch_file_clipboard_owner(&self) {
+        let Some(display) = gtk::gdk::Display::default() else {
+            return;
+        };
+
+        let file_clipboard = self.file_clipboard.clone();
+        display
+            .clipboard()
+            .connect_formats_notify(move |clipboard| {
+                if !clipboard.is_local() {
+                    file_clipboard.borrow_mut().take();
+                }
+            });
     }
 
     fn set_status(&self, text: &str) {
@@ -1092,32 +1349,65 @@ fn attach_file_drag_source(widget: &impl IsA<gtk::Widget>, item: FileItem) {
     source.set_actions(gtk::gdk::DragAction::COPY);
 
     source.connect_prepare(move |_, _, _| {
-        let files = [item.file.clone()];
-        let file_list = gtk::gdk::FileList::from_array(&files);
-        let file_provider = gtk::gdk::ContentProvider::for_value(&file_list.to_value());
-
-        let uri_list = format!("{}\r\n", item.uri);
-        let uri_provider = gtk::gdk::ContentProvider::for_bytes(
-            "text/uri-list",
-            &glib::Bytes::from_owned(uri_list.into_bytes()),
-        );
-
-        let display_path = item
-            .path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| item.uri.clone());
-        let drag_text = format!("{}\n{}", item.name, display_path);
-        let text_provider = gtk::gdk::ContentProvider::for_value(&drag_text.to_value());
-
-        Some(gtk::gdk::ContentProvider::new_union(&[
-            file_provider,
-            uri_provider,
-            text_provider,
-        ]))
+        let files = vec![item.file.clone()];
+        Some(file_clipboard_provider(&files, ClipboardOp::Copy))
     });
 
     widget.add_controller(source);
+}
+
+fn file_clipboard_provider(files: &[gio::File], op: ClipboardOp) -> gtk::gdk::ContentProvider {
+    let file_list = gtk::gdk::FileList::from_array(files);
+    let file_provider = gtk::gdk::ContentProvider::for_value(&file_list.to_value());
+
+    let uri_list = uri_list_text(files);
+    let uri_provider = gtk::gdk::ContentProvider::for_bytes(
+        "text/uri-list",
+        &glib::Bytes::from_owned(uri_list.clone().into_bytes()),
+    );
+
+    let gnome_files = gnome_copied_files_text(files, op);
+    let gnome_provider = gtk::gdk::ContentProvider::for_bytes(
+        "x-special/gnome-copied-files",
+        &glib::Bytes::from_owned(gnome_files.into_bytes()),
+    );
+
+    let text_provider = gtk::gdk::ContentProvider::for_value(&uri_list.to_value());
+
+    gtk::gdk::ContentProvider::new_union(&[
+        file_provider,
+        uri_provider,
+        gnome_provider,
+        text_provider,
+    ])
+}
+
+fn uri_list_text(files: &[gio::File]) -> String {
+    files
+        .iter()
+        .map(|file| file.uri().to_string())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+fn gnome_copied_files_text(files: &[gio::File], op: ClipboardOp) -> String {
+    let action = match op {
+        ClipboardOp::Copy => "copy",
+        ClipboardOp::Cut => "cut",
+    };
+    format!("{action}\n{}", uri_list_text(files).replace("\r\n", "\n"))
+}
+
+fn files_from_uri_text(text: &str) -> Vec<gio::File> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| *line != "copy" && *line != "cut")
+        .filter(|line| line.contains(':'))
+        .map(gio::File::for_uri)
+        .collect()
 }
 
 fn column_header() -> gtk::Grid {
@@ -1178,7 +1468,7 @@ fn place_factory() -> gtk::SignalListItemFactory {
         let path = name.lines().nth(1).unwrap_or_default();
         label.set_text(title);
         label.set_tooltip_text(Some(path));
-        attach_sidebar_context_menu(&row, sidebar_kind_for_place(path));
+        attach_sidebar_context_menu(&row, sidebar_kind_for_place(path), path);
     });
     factory
 }
@@ -1255,6 +1545,41 @@ fn copy_dropped_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
     }
 }
 
+fn move_clipboard_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
+    let name = file.basename().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "clipboard file has no basename",
+        )
+    })?;
+    let destination = available_destination(target_dir, Path::new(&name));
+
+    if let Some(source) = file.path() {
+        if source == destination {
+            return Ok(());
+        }
+        if source.is_dir() && is_path_inside(target_dir, &source) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot move a folder into itself",
+            ));
+        }
+        std::fs::rename(&source, &destination).or_else(|_| {
+            copy_path_recursively(&source, &destination)?;
+            remove_path_recursively(&source)
+        })
+    } else {
+        let destination_file = gio::File::for_path(&destination);
+        file.move_(
+            &destination_file,
+            gio::FileCopyFlags::NONE,
+            gio::Cancellable::NONE,
+            None,
+        )
+        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+    }
+}
+
 fn is_path_inside(path: &Path, parent: &Path) -> bool {
     match (path.canonicalize(), parent.canonicalize()) {
         (Ok(path), Ok(parent)) => path.starts_with(parent),
@@ -1272,6 +1597,14 @@ fn copy_path_recursively(source: &Path, destination: &Path) -> io::Result<()> {
         Ok(())
     } else {
         std::fs::copy(source, destination).map(|_| ())
+    }
+}
+
+fn remove_path_recursively(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
     }
 }
 
@@ -1427,6 +1760,30 @@ fn normalize_location(location: Location) -> Location {
     }
 }
 
+fn sidebar_location_from_parameter(parameter: Option<&glib::Variant>) -> Option<Location> {
+    parameter
+        .and_then(|parameter| parameter.get::<String>())
+        .map(|path| {
+            if path == "trash:///" {
+                Location::Trash
+            } else {
+                Location::Path(PathBuf::from(path))
+            }
+        })
+}
+
+fn open_sidebar_location_in_new_window(location: &Location) -> io::Result<()> {
+    let Location::Path(path) = location else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only local folders can be opened in a new window",
+        ));
+    };
+
+    Command::new(std::env::current_exe()?).arg(path).spawn()?;
+    Ok(())
+}
+
 fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
@@ -1480,18 +1837,27 @@ fn sidebar_kind_for_place(path: &str) -> SidebarKind {
     }
 }
 
-fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind) {
+fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind, path: &str) {
     if matches!(kind, SidebarKind::Separator) {
         return;
     }
 
     let menu = gio::Menu::new();
+    let target = path.to_variant();
 
-    menu.append(Some("Open"), Some("win.sidebar-open"));
+    menu.append_item(&sidebar_menu_item("Open", "win.sidebar-open", &target));
 
     if matches!(kind, SidebarKind::Folder) {
-        menu.append(Some("Open in New Tab"), Some("win.sidebar-open-tab"));
-        menu.append(Some("Open in New Window"), Some("win.sidebar-open-window"));
+        menu.append_item(&sidebar_menu_item(
+            "Open in New Tab",
+            "win.sidebar-open-tab",
+            &target,
+        ));
+        menu.append_item(&sidebar_menu_item(
+            "Open in New Window",
+            "win.sidebar-open-window",
+            &target,
+        ));
     }
 
     menu.append_section(None, &{
@@ -1506,7 +1872,11 @@ fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind
 
     menu.append_section(None, &{
         let section = gio::Menu::new();
-        section.append(Some("Properties"), Some("win.sidebar-properties"));
+        section.append_item(&sidebar_menu_item(
+            "Properties",
+            "win.sidebar-properties",
+            &target,
+        ));
         section
     });
 
@@ -1529,34 +1899,8 @@ fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind
     widget.add_controller(click);
 }
 
-fn install_sidebar_actions(window: &gtk::ApplicationWindow) {
-    let open = gio::SimpleAction::new("sidebar-open", None);
-    open.connect_activate(|_, _| {
-        flog_info!("Open sidebar location");
-    });
-    window.add_action(&open);
-
-    let open_tab = gio::SimpleAction::new("sidebar-open-tab", None);
-    open_tab.connect_activate(|_, _| {
-        flog_info!("Open in new tab");
-    });
-    window.add_action(&open_tab);
-
-    let open_window = gio::SimpleAction::new("sidebar-open-window", None);
-    open_window.connect_activate(|_, _| {
-        flog_info!("Open in new window");
-    });
-    window.add_action(&open_window);
-
-    let empty_trash = gio::SimpleAction::new("empty-trash", None);
-    empty_trash.connect_activate(|_, _| {
-        flog_info!("Empty Trash...");
-    });
-    window.add_action(&empty_trash);
-
-    let properties = gio::SimpleAction::new("sidebar-properties", None);
-    properties.connect_activate(|_, _| {
-        flog_info!("Show properties");
-    });
-    window.add_action(&properties);
+fn sidebar_menu_item(label: &str, action: &str, target: &glib::Variant) -> gio::MenuItem {
+    let item = gio::MenuItem::new(Some(label), None);
+    item.set_action_and_target_value(Some(action), Some(target));
+    item
 }
