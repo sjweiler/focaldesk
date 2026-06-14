@@ -2799,7 +2799,7 @@ impl RenderState {
             //let _ = RenderState::draw_title_text(frame, atlas, _label_rect_logical, &text, is_active, ctx.output_scale, tinted_icon);
 
             let output_number = ctx.rendering_output.0;
-            let workspace_number = 1;
+            let workspace_number = current_workspace.0 as usize;
             let active_theme = theme;
 
             let _ = self.draw_topbar_title(
