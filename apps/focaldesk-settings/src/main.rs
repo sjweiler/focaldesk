@@ -1,8 +1,8 @@
 use adw::prelude::*;
-use focaldesk_config::{FocalDeskConfig, load_config, save_config};
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
-    IpcRequest, IpcResponse, send_desktop_config, send_desktop_request, send_desktop_set,
-    watch_desktop_keys,
+    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
+    IpcResponse,
 };
 use focaldesk_logging::flog_info;
 use focaldesk_settings_core::OutputConfig;

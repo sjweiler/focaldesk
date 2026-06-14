@@ -699,12 +699,9 @@ impl DesktopState {
                 Ok(()) => IpcResponse::Ok,
                 Err(message) => IpcResponse::Error { message },
             },
-            IpcRequest::GetAll | IpcRequest::SetValue { .. } => {
-                IpcResponse::Error {
-                    message: "legacy settings.json IPC is not handled by focaldesk-desktop"
-                        .to_string(),
-                }
-            }
+            IpcRequest::GetAll | IpcRequest::SetValue { .. } => IpcResponse::Error {
+                message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
+            },
         }
     }
 
