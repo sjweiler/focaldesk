@@ -1,12 +1,21 @@
 use adw::prelude::*;
-use focaldesk_config::{load_config, save_config, FocalDeskConfig};
-use focaldesk_ipc::send_desktop_config;
+use focaldesk_config::{FocalDeskConfig, load_config, save_config};
+use focaldesk_ipc::{
+    IpcRequest, IpcResponse, send_desktop_config, send_desktop_request, send_desktop_set,
+    watch_desktop_keys,
+};
 use focaldesk_logging::flog_info;
+use focaldesk_settings_core::OutputConfig;
 
 use gtk::cairo;
+use gtk::glib;
+use serde_json::json;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("100 %", 1.0),
@@ -34,6 +43,12 @@ const OUTPUT_DEVICE_OPTIONS: &[&str] = &[
 const OUTPUT_CONFIGURATION_OPTIONS: &[&str] = &["HiFi 2.0 channels", "Stereo", "Mono"];
 const ALERT_SOUND_OPTIONS: &[&str] = &["Default", "Click", "Chime", "None"];
 
+#[derive(Debug)]
+struct ConfigEvent {
+    key: String,
+    value: serde_json::Value,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayConfig {
     name: String,
@@ -53,6 +68,11 @@ struct DisplayConfig {
 
     primary: bool,
     transform: String,
+
+    #[serde(default)]
+    hdr_supported: bool,
+    #[serde(default)]
+    hdr_enabled: bool,
 }
 
 fn save_displays(displays: &[DisplayConfig]) {
@@ -64,6 +84,34 @@ fn save_displays(displays: &[DisplayConfig]) {
 
     if let Ok(text) = serde_json::to_string_pretty(displays) {
         let _ = std::fs::write(path, text);
+    }
+
+    let outputs = displays
+        .iter()
+        .map(|display| OutputConfig {
+            connector: display.name.clone(),
+            enabled: display.enabled,
+            x: display.logical_x,
+            y: display.logical_y,
+            width: display.mode_width,
+            height: display.mode_height,
+            refresh_mhz: display.refresh_mhz,
+            scale: display.scale as f32,
+            primary: display.primary,
+        })
+        .collect();
+
+    match send_desktop_request(&IpcRequest::SetDisplays { outputs }) {
+        Ok(IpcResponse::Ok) => {}
+        Ok(IpcResponse::Error { message }) => {
+            flog_info!("display IPC update rejected: {message}");
+        }
+        Ok(other) => {
+            flog_info!("unexpected display IPC response: {other:?}");
+        }
+        Err(err) => {
+            flog_info!("display IPC unavailable; saved display config directly: {err}");
+        }
     }
 }
 
@@ -481,6 +529,29 @@ fn connected_display_row(
         });
     }
 
+    if display.hdr_supported {
+        let hdr_row = adw::ActionRow::new();
+        hdr_row.set_title("Enable HDR");
+        hdr_row.set_subtitle("Use HDR output when this display and backend support it");
+        let hdr = gtk::Switch::new();
+        hdr.set_active(display.hdr_enabled);
+        hdr_row.add_suffix(&hdr);
+        hdr_row.set_activatable_widget(Some(&hdr));
+        row.add_row(&hdr_row);
+
+        {
+            let displays = displays.clone();
+            let area = area.clone();
+            let row = row.clone();
+            hdr.connect_active_notify(move |switch| {
+                if let Some(display) = displays.borrow_mut().get_mut(index) {
+                    display.hdr_enabled = display.hdr_supported && switch.is_active();
+                }
+                save_display_change(&displays, &area, &row, index);
+            });
+        }
+    }
+
     row
 }
 
@@ -488,6 +559,46 @@ fn persist_config(config: &FocalDeskConfig) {
     if let Err(err) = send_desktop_config(config.clone()) {
         flog_info!("settings IPC unavailable; saving config directly: {err}");
         let _ = save_config(config);
+    }
+}
+
+fn persist_config_key(config: &FocalDeskConfig, key: &str, value: serde_json::Value) {
+    if let Err(err) = send_desktop_set(key, value) {
+        flog_info!("settings IPC set failed for {key}; saving config directly: {err}");
+        let _ = save_config(config);
+    }
+}
+
+fn start_config_watch(keys: &[&str]) -> mpsc::Receiver<ConfigEvent> {
+    let (tx, rx) = mpsc::channel();
+    let keys = keys.iter().map(|key| (*key).to_string()).collect();
+
+    thread::spawn(move || {
+        if let Err(err) = watch_desktop_keys(keys, move |response| match response {
+            IpcResponse::Event { key, value } => {
+                let _ = tx.send(ConfigEvent { key, value });
+            }
+            IpcResponse::Error { message } => {
+                flog_info!("settings IPC watch error: {message}");
+            }
+            _ => {}
+        }) {
+            flog_info!("settings IPC watch unavailable: {err}");
+        }
+    });
+
+    rx
+}
+
+fn set_switch_if_changed(switch: &gtk::Switch, active: bool) {
+    if switch.is_active() != active {
+        switch.set_active(active);
+    }
+}
+
+fn set_scale_if_changed(scale: &gtk::Scale, value: f64) {
+    if (scale.value() - value).abs() > f64::EPSILON {
+        scale.set_value(value);
     }
 }
 
@@ -627,8 +738,9 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     {
         let config = config.clone();
         shader_switch.connect_active_notify(move |s| {
-            config.borrow_mut().appearance.shader_chrome = s.is_active();
-            persist_config(&config.borrow());
+            let active = s.is_active();
+            config.borrow_mut().appearance.shader_chrome = active;
+            persist_config_key(&config.borrow(), "appearance.shader_chrome", json!(active));
         });
     }
 
@@ -648,8 +760,13 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     {
         let config = config.clone();
         focus_switch.connect_active_notify(move |s| {
-            config.borrow_mut().appearance.output_focus_glow = s.is_active();
-            persist_config(&config.borrow());
+            let active = s.is_active();
+            config.borrow_mut().appearance.output_focus_glow = active;
+            persist_config_key(
+                &config.borrow(),
+                "appearance.output_focus_glow",
+                json!(active),
+            );
         });
     }
 
@@ -683,8 +800,9 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
         let config = config.clone();
         theme_dropdown.connect_selected_notify(move |dropdown| {
             if let Some(theme) = THEME_OPTIONS.get(dropdown.selected() as usize) {
-                config.borrow_mut().appearance.theme = (*theme).to_string();
-                persist_config(&config.borrow());
+                let theme = (*theme).to_string();
+                config.borrow_mut().appearance.theme = theme.clone();
+                persist_config_key(&config.borrow(), "appearance.theme", json!(theme));
             }
         });
     }
@@ -695,8 +813,9 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     {
         let config = config.clone();
         glow_scale.connect_value_changed(move |scale| {
-            config.borrow_mut().appearance.glow_strength = scale.value();
-            persist_config(&config.borrow());
+            let value = scale.value();
+            config.borrow_mut().appearance.glow_strength = value;
+            persist_config_key(&config.borrow(), "appearance.glow_strength", json!(value));
         });
     }
 
@@ -715,8 +834,9 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     {
         let config = config.clone();
         font_scale.connect_value_changed(move |scale| {
-            config.borrow_mut().appearance.font_scale = scale.value();
-            persist_config(&config.borrow());
+            let value = scale.value();
+            config.borrow_mut().appearance.font_scale = value;
+            persist_config_key(&config.borrow(), "appearance.font_scale", json!(value));
         });
     }
 
@@ -742,6 +862,66 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     reset_group.add(&reset_button);
     reset_group.set_description(Some("Restore all appearance settings to their defaults"));
     page.add(&reset_group);
+
+    {
+        let rx = start_config_watch(&[
+            "appearance.shader_chrome",
+            "appearance.output_focus_glow",
+            "appearance.theme",
+            "appearance.glow_strength",
+            "appearance.font_scale",
+        ]);
+        let config = config.clone();
+        let shader_switch = shader_switch.clone();
+        let focus_switch = focus_switch.clone();
+        let theme_dropdown = theme_dropdown.clone();
+        let glow_scale = glow_scale.clone();
+        let font_scale = font_scale.clone();
+
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            while let Ok(event) = rx.try_recv() {
+                match event.key.as_str() {
+                    "appearance.shader_chrome" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().appearance.shader_chrome = active;
+                            set_switch_if_changed(&shader_switch, active);
+                        }
+                    }
+                    "appearance.output_focus_glow" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().appearance.output_focus_glow = active;
+                            set_switch_if_changed(&focus_switch, active);
+                        }
+                    }
+                    "appearance.theme" => {
+                        if let Some(theme) = event.value.as_str() {
+                            config.borrow_mut().appearance.theme = theme.to_string();
+                            if let Some(index) =
+                                THEME_OPTIONS.iter().position(|option| *option == theme)
+                            {
+                                theme_dropdown.set_selected(index as u32);
+                            }
+                        }
+                    }
+                    "appearance.glow_strength" => {
+                        if let Some(value) = event.value.as_f64() {
+                            config.borrow_mut().appearance.glow_strength = value;
+                            set_scale_if_changed(&glow_scale, value);
+                        }
+                    }
+                    "appearance.font_scale" => {
+                        if let Some(value) = event.value.as_f64() {
+                            config.borrow_mut().appearance.font_scale = value;
+                            set_scale_if_changed(&font_scale, value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
 
     adw::NavigationPage::new(&page, "Appearance")
 }
@@ -875,8 +1055,13 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
     {
         let config = config.clone();
         topbar_switch.connect_active_notify(move |s| {
-            config.borrow_mut().displays.topbar_on_all_outputs = s.is_active();
-            persist_config(&config.borrow());
+            let active = s.is_active();
+            config.borrow_mut().displays.topbar_on_all_outputs = active;
+            persist_config_key(
+                &config.borrow(),
+                "displays.topbar_on_all_outputs",
+                json!(active),
+            );
         });
     }
 
@@ -895,8 +1080,13 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
     {
         let config = config.clone();
         sidebar_switch.connect_active_notify(move |s| {
-            config.borrow_mut().displays.sidebar_on_all_outputs = s.is_active();
-            persist_config(&config.borrow());
+            let active = s.is_active();
+            config.borrow_mut().displays.sidebar_on_all_outputs = active;
+            persist_config_key(
+                &config.borrow(),
+                "displays.sidebar_on_all_outputs",
+                json!(active),
+            );
         });
     }
 
@@ -919,8 +1109,13 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
     {
         let config = config.clone();
         remember_switch.connect_active_notify(move |s| {
-            config.borrow_mut().displays.remember_focused_output = s.is_active();
-            persist_config(&config.borrow());
+            let active = s.is_active();
+            config.borrow_mut().displays.remember_focused_output = active;
+            persist_config_key(
+                &config.borrow(),
+                "displays.remember_focused_output",
+                json!(active),
+            );
         });
     }
 
@@ -928,6 +1123,46 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
 
     page.add(&layout_group);
     page.add(&focus_group);
+
+    {
+        let rx = start_config_watch(&[
+            "displays.topbar_on_all_outputs",
+            "displays.sidebar_on_all_outputs",
+            "displays.remember_focused_output",
+        ]);
+        let config = config.clone();
+        let topbar_switch = topbar_switch.clone();
+        let sidebar_switch = sidebar_switch.clone();
+        let remember_switch = remember_switch.clone();
+
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            while let Ok(event) = rx.try_recv() {
+                match event.key.as_str() {
+                    "displays.topbar_on_all_outputs" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().displays.topbar_on_all_outputs = active;
+                            set_switch_if_changed(&topbar_switch, active);
+                        }
+                    }
+                    "displays.sidebar_on_all_outputs" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().displays.sidebar_on_all_outputs = active;
+                            set_switch_if_changed(&sidebar_switch, active);
+                        }
+                    }
+                    "displays.remember_focused_output" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().displays.remember_focused_output = active;
+                            set_switch_if_changed(&remember_switch, active);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
 
     adw::NavigationPage::new(&page, "Displays")
 }

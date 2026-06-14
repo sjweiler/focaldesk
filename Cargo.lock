@@ -1609,6 +1609,7 @@ dependencies = [
  "focaldesk-config",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-settings-core",
  "gtk4",
  "libadwaita",
  "serde",

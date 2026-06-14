@@ -123,6 +123,11 @@ pub struct DisplayConfig {
 
     pub primary: bool,
     pub transform: DisplayTransform,
+
+    #[serde(default)]
+    pub hdr_supported: bool,
+    #[serde(default)]
+    pub hdr_enabled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -341,6 +346,14 @@ fn configured_display_scale(displays: &[DisplayConfig], name: &str) -> f64 {
     }
 
     scale
+}
+
+fn configured_display_hdr_enabled(displays: &[DisplayConfig], name: &str) -> bool {
+    displays
+        .iter()
+        .find(|display| display.name == name)
+        .map(|display| display.hdr_enabled)
+        .unwrap_or(false)
 }
 
 fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
@@ -676,6 +689,10 @@ pub(crate) fn collect_display_configs(
 
         let w = surface.mode.size.w;
         let h = surface.mode.size.h;
+        let hdr_supported = surface.hdr_support.is_detected();
+        let hdr_enabled = core_output
+            .map(|output| output.hdr_enabled && hdr_supported)
+            .unwrap_or(false);
 
         displays.push(DisplayConfig {
             name: surface.output.name(),
@@ -696,6 +713,9 @@ pub(crate) fn collect_display_configs(
             primary,
 
             transform: DisplayTransform::Normal,
+
+            hdr_supported,
+            hdr_enabled,
         });
     }
 
@@ -1790,6 +1810,7 @@ fn device_added(
             // (e.g. OBS projector shows all DRM outputs on top of each other).
             let origin = Point::<i32, Logical>::from((next_x, 0));
             let output_scale = configured_display_scale(&configured_displays, &output_name);
+            let hdr_enabled = configured_display_hdr_enabled(&configured_displays, &output_name);
             let output_scale_int = output_scale.round().max(1.0) as i32;
             let logical_size = Size::<i32, Logical>::from((
                 (w as f64 / output_scale).round() as i32,
@@ -1911,7 +1932,7 @@ fn device_added(
             );
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
                 out.hdr_supported = hdr_support.is_detected();
-                out.hdr_enabled = false;
+                out.hdr_enabled = hdr_support.is_detected() && hdr_enabled;
             }
 
             if !initialized_one {

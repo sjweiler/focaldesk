@@ -1,5 +1,5 @@
 use focaldesk_ipc::{IpcRequest, IpcResponse, SOCKET_PATH};
-use focaldesk_settings_core::{load_settings, save_settings, Settings};
+use focaldesk_settings_core::{Settings, load_settings, save_settings};
 use std::{
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -10,8 +10,8 @@ use std::{
 pub fn start_settings_ipc(settings: Arc<Mutex<Settings>>) {
     let _ = std::fs::remove_file(SOCKET_PATH);
 
-    let listener = UnixListener::bind(SOCKET_PATH)
-        .expect("failed to bind FocalDesk settings IPC socket");
+    let listener =
+        UnixListener::bind(SOCKET_PATH).expect("failed to bind FocalDesk settings IPC socket");
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -75,11 +75,16 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
 
         Ok(IpcRequest::ReloadConfig) => IpcResponse::Ok,
 
-        Ok(IpcRequest::GetConfig | IpcRequest::SetConfig { .. } | IpcRequest::Notify { .. }) => {
-            IpcResponse::Error {
-                message: "request is handled by focaldesk-desktop".to_string(),
-            }
-        }
+        Ok(
+            IpcRequest::Get { .. }
+            | IpcRequest::Set { .. }
+            | IpcRequest::Watch { .. }
+            | IpcRequest::GetConfig
+            | IpcRequest::SetConfig { .. }
+            | IpcRequest::Notify { .. },
+        ) => IpcResponse::Error {
+            message: "request is handled by focaldesk-desktop".to_string(),
+        },
 
         Err(e) => IpcResponse::Error {
             message: e.to_string(),
@@ -97,60 +102,43 @@ fn apply_setting_value(
 ) -> Result<(), String> {
     match path {
         "appearance.theme" => {
-            settings.appearance.theme = value
-                .as_str()
-                .ok_or("theme must be string")?
-                .to_string();
+            settings.appearance.theme = value.as_str().ok_or("theme must be string")?.to_string();
         }
 
         "appearance.sidebar_width" => {
-            settings.appearance.sidebar_width = value
-                .as_i64()
-                .ok_or("sidebar_width must be integer")? as i32;
+            settings.appearance.sidebar_width =
+                value.as_i64().ok_or("sidebar_width must be integer")? as i32;
         }
 
         "appearance.topbar_height" => {
-            settings.appearance.topbar_height = value
-                .as_i64()
-                .ok_or("topbar_height must be integer")? as i32;
+            settings.appearance.topbar_height =
+                value.as_i64().ok_or("topbar_height must be integer")? as i32;
         }
 
         "appearance.icon_size" => {
-            settings.appearance.icon_size = value
-                .as_i64()
-                .ok_or("icon_size must be integer")? as i32;
+            settings.appearance.icon_size =
+                value.as_i64().ok_or("icon_size must be integer")? as i32;
         }
 
         "appearance.animations" => {
-            settings.appearance.animations = value
-                .as_bool()
-                .ok_or("animations must be bool")?;
+            settings.appearance.animations = value.as_bool().ok_or("animations must be bool")?;
         }
 
         "input.pointer_speed" => {
-            settings.input.pointer_speed = value
-                .as_f64()
-                .ok_or("pointer_speed must be number")? as f32;
+            settings.input.pointer_speed =
+                value.as_f64().ok_or("pointer_speed must be number")? as f32;
         }
 
         "input.natural_scroll" => {
-            settings.input.natural_scroll = value
-                .as_bool()
-                .ok_or("natural_scroll must be bool")?;
+            settings.input.natural_scroll = value.as_bool().ok_or("natural_scroll must be bool")?;
         }
 
         "apps.terminal" => {
-            settings.apps.terminal = value
-                .as_str()
-                .ok_or("terminal must be string")?
-                .to_string();
+            settings.apps.terminal = value.as_str().ok_or("terminal must be string")?.to_string();
         }
 
         "apps.browser" => {
-            settings.apps.browser = value
-                .as_str()
-                .ok_or("browser must be string")?
-                .to_string();
+            settings.apps.browser = value.as_str().ok_or("browser must be string")?.to_string();
         }
 
         "apps.file_manager" => {

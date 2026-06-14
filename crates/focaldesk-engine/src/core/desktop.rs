@@ -61,7 +61,7 @@ use focaldesk_flow::ModMask;
 use focaldesk_ipc::{IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn};
 use focaldesk_notifications::NotificationManager;
-use focaldesk_settings_core::AppSettings;
+use focaldesk_settings_core::{AppSettings, OutputConfig};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
@@ -145,7 +145,10 @@ fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
         flog_info!("desktop settings IPC listening on {DESKTOP_SOCKET_PATH}");
         for stream in listener.incoming() {
             match stream {
-                Ok(mut stream) => handle_desktop_settings_ipc_stream(&mut stream, &tx),
+                Ok(mut stream) => {
+                    let tx = tx.clone();
+                    thread::spawn(move || handle_desktop_settings_ipc_stream(&mut stream, &tx));
+                }
                 Err(err) => flog_warn!("desktop settings IPC accept failed: {err}"),
             }
         }
@@ -183,8 +186,9 @@ fn handle_desktop_settings_ipc_stream(
     };
 
     let (response_tx, response_rx) = mpsc::channel();
+    let is_watch = matches!(request, IpcRequest::Watch { .. });
     if tx
-        .send(DesktopIpcMessage {
+        .send(DesktopIpcMessage::Request {
             request,
             response: response_tx,
         })
@@ -196,6 +200,13 @@ fn handle_desktop_settings_ipc_stream(
                 message: "desktop settings IPC handler is unavailable".to_string(),
             },
         );
+        return;
+    }
+
+    if is_watch {
+        for response in response_rx {
+            write_ipc_response(stream, response);
+        }
         return;
     }
 
@@ -213,6 +224,7 @@ fn handle_desktop_settings_ipc_stream(
 fn write_ipc_response(stream: &mut UnixStream, response: IpcResponse) {
     if let Ok(json) = serde_json::to_vec(&response) {
         let _ = stream.write_all(&json);
+        let _ = stream.write_all(b"\n");
     }
 }
 
@@ -223,6 +235,55 @@ fn theme_id_from_config(config: &FocalDeskConfig) -> FlowThemeId {
         "Classic" => FlowThemeId::BuiltIn(BuiltInThemeId::Classic),
         other => FlowThemeId::Custom(other.to_string()),
     }
+}
+
+fn get_config_key(config: &FocalDeskConfig, key: &str) -> Option<serde_json::Value> {
+    let value = serde_json::to_value(config).ok()?;
+    get_json_key(&value, key).cloned()
+}
+
+fn get_json_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let mut current = value;
+    for part in key.split('.') {
+        if part.is_empty() {
+            return None;
+        }
+        current = current.as_object()?.get(part)?;
+    }
+    Some(current)
+}
+
+fn set_json_key(
+    value: &mut serde_json::Value,
+    key: &str,
+    new_value: serde_json::Value,
+) -> Result<(), String> {
+    let mut parts = key.split('.').peekable();
+    let mut current = value;
+
+    while let Some(part) = parts.next() {
+        if part.is_empty() {
+            return Err("config key contains an empty segment".to_string());
+        }
+
+        if parts.peek().is_none() {
+            let object = current
+                .as_object_mut()
+                .ok_or_else(|| format!("config key is not an object path: {key}"))?;
+            if !object.contains_key(part) {
+                return Err(format!("unknown config key: {key}"));
+            }
+            object.insert(part.to_string(), new_value);
+            return Ok(());
+        }
+
+        current = current
+            .as_object_mut()
+            .and_then(|object| object.get_mut(part))
+            .ok_or_else(|| format!("unknown config key: {key}"))?;
+    }
+
+    Err("config key is empty".to_string())
 }
 
 pub struct OutputState {
@@ -307,8 +368,15 @@ pub struct DesktopInit {
     pub apps: AppSettings,
 }
 
-struct DesktopIpcMessage {
-    request: IpcRequest,
+enum DesktopIpcMessage {
+    Request {
+        request: IpcRequest,
+        response: mpsc::Sender<IpcResponse>,
+    },
+}
+
+struct DesktopIpcWatcher {
+    keys: Vec<String>,
     response: mpsc::Sender<IpcResponse>,
 }
 
@@ -395,6 +463,8 @@ pub struct DesktopState {
     pub client_wayland_display: String,
     pub apps: AppSettings,
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
+    settings_ipc_watchers: Vec<DesktopIpcWatcher>,
+    settings_ipc_config: FocalDeskConfig,
 
     /// Undecorated winit window: set on left-press over chrome top bar; backend calls platform window drag.
     host_window_drag_requested: bool,
@@ -488,8 +558,13 @@ pub struct ClockPulseFrame {
 impl DesktopState {
     pub fn process_settings_ipc_requests(&mut self) {
         while let Ok(message) = self.settings_ipc_rx.try_recv() {
-            let response = self.handle_settings_ipc_request(message.request);
-            let _ = message.response.send(response);
+            match message {
+                DesktopIpcMessage::Request { request, response } => {
+                    let response_value =
+                        self.handle_settings_ipc_request(request, response.clone());
+                    let _ = response.send(response_value);
+                }
+            }
         }
     }
 
@@ -533,22 +608,64 @@ impl DesktopState {
         }
     }
 
-    fn handle_settings_ipc_request(&mut self, request: IpcRequest) -> IpcResponse {
+    fn handle_settings_ipc_request(
+        &mut self,
+        request: IpcRequest,
+        response: mpsc::Sender<IpcResponse>,
+    ) -> IpcResponse {
         match request {
+            IpcRequest::Get { key } => match get_config_key(&load_config(), &key) {
+                Some(value) => IpcResponse::Value { key, value },
+                None => IpcResponse::Error {
+                    message: format!("unknown config key: {key}"),
+                },
+            },
+            IpcRequest::Set { key, value } => self.set_config_key_and_notify(key, value),
+            IpcRequest::Watch { keys } => {
+                if keys.is_empty() {
+                    return IpcResponse::Error {
+                        message: "watch requires at least one key".to_string(),
+                    };
+                }
+
+                let config = load_config();
+                if let Some(key) = keys
+                    .iter()
+                    .find(|key| get_config_key(&config, key).is_none())
+                    .cloned()
+                {
+                    return IpcResponse::Error {
+                        message: format!("unknown config key: {key}"),
+                    };
+                }
+
+                self.settings_ipc_watchers
+                    .push(DesktopIpcWatcher { keys, response });
+                IpcResponse::Ok
+            }
             IpcRequest::GetConfig => IpcResponse::Config {
                 config: load_config(),
             },
-            IpcRequest::SetConfig { config } => match save_config(&config) {
-                Ok(()) => {
-                    self.apply_config(config);
-                    IpcResponse::Ok
+            IpcRequest::SetConfig { config } => {
+                let old_config = self.settings_ipc_config.clone();
+                match save_config(&config) {
+                    Ok(()) => {
+                        self.notify_config_changes(&old_config, &config);
+                        self.settings_ipc_config = config.clone();
+                        self.apply_config(config);
+                        IpcResponse::Ok
+                    }
+                    Err(err) => IpcResponse::Error {
+                        message: err.to_string(),
+                    },
                 }
-                Err(err) => IpcResponse::Error {
-                    message: err.to_string(),
-                },
-            },
+            }
             IpcRequest::ReloadConfig | IpcRequest::Reload => {
-                self.apply_config(load_config());
+                let old_config = self.settings_ipc_config.clone();
+                let config = load_config();
+                self.notify_config_changes(&old_config, &config);
+                self.settings_ipc_config = config.clone();
+                self.apply_config(config);
                 IpcResponse::Ok
             }
             IpcRequest::IdentifyDisplays => {
@@ -578,13 +695,182 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
                 IpcResponse::Notification { id }
             }
-            IpcRequest::GetAll | IpcRequest::SetValue { .. } | IpcRequest::SetDisplays { .. } => {
+            IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
+                Ok(()) => IpcResponse::Ok,
+                Err(message) => IpcResponse::Error { message },
+            },
+            IpcRequest::GetAll | IpcRequest::SetValue { .. } => {
                 IpcResponse::Error {
                     message: "legacy settings.json IPC is not handled by focaldesk-desktop"
                         .to_string(),
                 }
             }
         }
+    }
+
+    fn apply_display_configs(&mut self, outputs: Vec<OutputConfig>) -> Result<(), String> {
+        let single_output_id = (self.outputs.len() == 1 && outputs.len() == 1)
+            .then(|| self.outputs.keys().copied().next())
+            .flatten();
+        let mut changed = false;
+        let mut unmatched = Vec::new();
+
+        for config in outputs {
+            let output_id = self
+                .outputs
+                .iter()
+                .find_map(|(id, output)| (output.handle.name() == config.connector).then_some(*id))
+                .or(single_output_id);
+
+            let Some(output_id) = output_id else {
+                unmatched.push(config.connector);
+                continue;
+            };
+
+            let scale_factor = f64::from(config.scale);
+            if !scale_factor.is_finite() || scale_factor < 1.0 {
+                return Err(format!(
+                    "invalid scale for {}: {}",
+                    config.connector, config.scale
+                ));
+            }
+
+            let physical_size = Size::<i32, Physical>::from((config.width, config.height));
+            let logical_origin = Point::<i32, Logical>::from((config.x, config.y));
+
+            if physical_size.w <= 0 || physical_size.h <= 0 {
+                return Err(format!(
+                    "invalid mode for {}: {}x{}",
+                    config.connector, config.width, config.height
+                ));
+            }
+
+            if let Some(output) = self.outputs.get_mut(&output_id) {
+                output.logical_origin = logical_origin;
+            }
+            self.update_output_size(output_id, physical_size, scale_factor);
+
+            if config.primary {
+                self.primary_output = output_id;
+            }
+
+            changed = true;
+            flog_info!(
+                "applied display IPC update name={} output={:?} size={}x{} scale={} origin={},{} primary={}",
+                config.connector,
+                output_id,
+                config.width,
+                config.height,
+                scale_factor,
+                config.x,
+                config.y,
+                config.primary
+            );
+        }
+
+        if changed {
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            self.cursor_manager.set_base_size_and_scale(
+                24,
+                self.outputs
+                    .get(&self.focused_output)
+                    .or_else(|| self.outputs.get(&self.primary_output))
+                    .map(|output| output.scale_factor as f32)
+                    .unwrap_or(1.0),
+            );
+        }
+
+        if !unmatched.is_empty() {
+            flog_warn!(
+                "display IPC update ignored unmatched outputs: {}",
+                unmatched.join(", ")
+            );
+        }
+
+        Ok(())
+    }
+
+    fn set_config_key_and_notify(&mut self, key: String, value: serde_json::Value) -> IpcResponse {
+        let old_config = self.settings_ipc_config.clone();
+        let mut config_value = match serde_json::to_value(&old_config) {
+            Ok(value) => value,
+            Err(err) => {
+                return IpcResponse::Error {
+                    message: err.to_string(),
+                };
+            }
+        };
+
+        if let Err(message) = set_json_key(&mut config_value, &key, value) {
+            return IpcResponse::Error { message };
+        }
+
+        let new_config = match serde_json::from_value::<FocalDeskConfig>(config_value) {
+            Ok(config) => config,
+            Err(err) => {
+                return IpcResponse::Error {
+                    message: err.to_string(),
+                };
+            }
+        };
+
+        match save_config(&new_config) {
+            Ok(()) => {
+                self.notify_config_changes(&old_config, &new_config);
+                self.settings_ipc_config = new_config.clone();
+                self.apply_config(new_config);
+                IpcResponse::Ok
+            }
+            Err(err) => IpcResponse::Error {
+                message: err.to_string(),
+            },
+        }
+    }
+
+    fn notify_config_changes(
+        &mut self,
+        old_config: &FocalDeskConfig,
+        new_config: &FocalDeskConfig,
+    ) {
+        let mut changed = Vec::new();
+
+        for watcher in &self.settings_ipc_watchers {
+            for key in &watcher.keys {
+                if changed.iter().any(|(changed_key, _)| changed_key == key) {
+                    continue;
+                }
+
+                let old_value = get_config_key(old_config, key);
+                let new_value = get_config_key(new_config, key);
+                if old_value != new_value {
+                    if let Some(value) = new_value {
+                        changed.push((key.clone(), value));
+                    }
+                }
+            }
+        }
+
+        if changed.is_empty() {
+            return;
+        }
+
+        self.settings_ipc_watchers.retain(|watcher| {
+            for (key, value) in &changed {
+                if watcher.keys.iter().any(|watched| watched == key)
+                    && watcher
+                        .response
+                        .send(IpcResponse::Event {
+                            key: key.clone(),
+                            value: value.clone(),
+                        })
+                        .is_err()
+                {
+                    return false;
+                }
+            }
+
+            true
+        });
     }
 
     fn apply_config(&mut self, config: FocalDeskConfig) {
@@ -2901,6 +3187,8 @@ impl DesktopState {
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
             settings_ipc_rx: start_desktop_settings_ipc(),
+            settings_ipc_watchers: Vec::new(),
+            settings_ipc_config: load_config(),
             host_window_drag_requested: false,
             pending_compositor_move: None,
             pending_xdg_move: None,

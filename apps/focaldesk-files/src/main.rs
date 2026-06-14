@@ -101,6 +101,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let details_view_button = toggle_icon_button("view-list-symbolic", "Details View");
     let list_view_button = toggle_icon_button("view-paged-symbolic", "List View");
     let grid_view_button = toggle_icon_button("view-grid-symbolic", "Grid View");
+    let close_button = icon_button("window-close-symbolic", "Close");
     list_view_button.set_group(Some(&details_view_button));
     grid_view_button.set_group(Some(&details_view_button));
     details_view_button.set_active(true);
@@ -120,6 +121,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     let hidden_toggle = gtk::ToggleButton::new();
     hidden_toggle.set_icon_name("view-hidden-symbolic");
     hidden_toggle.set_tooltip_text(Some("Show Hidden Files"));
+    let window_for_close = window.clone();
+    close_button.connect_clicked(move |_| window_for_close.close());
+    header.pack_end(&close_button);
     header.pack_end(&hidden_toggle);
     header.pack_end(&grid_view_button);
     header.pack_end(&list_view_button);
@@ -542,7 +546,8 @@ impl FileManager {
     }
 
     fn reload(&self) {
-        self.open_location(self.current_location.borrow().clone(), false);
+        let location = self.current_location.borrow().clone();
+        self.open_location(location, false);
     }
 
     fn parent_dir(&self) -> Option<PathBuf> {
