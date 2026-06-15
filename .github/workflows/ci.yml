@@ -27,6 +27,7 @@ jobs:
             libudev-dev \
             libinput-dev \
             libseat-dev \
+            libpipewire-0.3-dev \
             libegl1-mesa-dev \
             libgles2-mesa-dev \
             libgbm-dev \
