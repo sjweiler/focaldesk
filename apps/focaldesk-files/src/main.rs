@@ -61,6 +61,8 @@ struct FileClipboard {
     op: ClipboardOp,
 }
 
+const FILE_TRANSFER_MIME_TYPES: &[&str] = &["x-special/gnome-copied-files", "text/uri-list"];
+
 #[derive(Clone)]
 struct FileManager {
     window: adw::ApplicationWindow,
@@ -835,47 +837,54 @@ impl FileManager {
         }
 
         let this = self.clone();
-        display.clipboard().read_value_async(
+        let clipboard = display.clipboard();
+        let clipboard_for_fallback = clipboard.clone();
+        clipboard.read_value_async(
             gtk::gdk::FileList::static_type(),
             glib::Priority::default(),
             gio::Cancellable::NONE,
-            move |result| match result
-                .ok()
-                .and_then(|value| value.get::<gtk::gdk::FileList>().ok())
-            {
-                Some(file_list) => {
+            move |result| {
+                if let Ok(file_list) = result.and_then(|value| {
+                    value
+                        .get::<gtk::gdk::FileList>()
+                        .map_err(|_| glib::Error::new(gio::IOErrorEnum::InvalidData, "not files"))
+                }) {
                     this.copy_or_move_clipboard_files(
                         file_list.files(),
                         ClipboardOp::Copy,
                         &target_dir,
                     );
+                    return;
                 }
-                None => this.paste_text_uris_into_folder(target_dir),
+
+                this.paste_mime_files_into_folder(clipboard_for_fallback, target_dir);
             },
         );
     }
 
-    fn paste_text_uris_into_folder(&self, target_dir: PathBuf) {
-        let Some(display) = gtk::gdk::Display::default() else {
-            self.set_status("No display clipboard is available.");
-            return;
-        };
-
+    fn paste_mime_files_into_folder(&self, clipboard: gtk::gdk::Clipboard, target_dir: PathBuf) {
         let this = self.clone();
-        display
-            .clipboard()
-            .read_text_async(gio::Cancellable::NONE, move |result| match result {
-                Ok(Some(text)) => {
-                    let files = files_from_uri_text(text.as_str());
-                    if files.is_empty() {
-                        this.set_status("Clipboard does not contain files.");
-                    } else {
-                        this.copy_or_move_clipboard_files(files, ClipboardOp::Copy, &target_dir);
-                    }
+        clipboard.read_async(
+            FILE_TRANSFER_MIME_TYPES,
+            glib::Priority::default(),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Ok((stream, mime_type)) => {
+                    let this = this.clone();
+                    read_transfer_text(stream, move |text| {
+                        match file_clipboard_from_text(mime_type.as_str(), &text) {
+                            Some(clipboard) => this.copy_or_move_clipboard_files(
+                                clipboard.files,
+                                clipboard.op,
+                                &target_dir,
+                            ),
+                            None => this.set_status("Clipboard does not contain files."),
+                        }
+                    });
                 }
-                Ok(None) => this.set_status("Clipboard does not contain files."),
                 Err(err) => this.set_status(&format!("Could not read clipboard: {err}")),
-            });
+            },
+        );
     }
 
     fn copy_or_move_clipboard_files(
@@ -1010,22 +1019,79 @@ impl FileManager {
     }
 
     fn install_drop_target(&self, widget: &impl IsA<gtk::Widget>) {
-        let target = gtk::DropTarget::new(
-            gtk::gdk::FileList::static_type(),
-            gtk::gdk::DragAction::COPY,
-        );
+        let target = gtk::DropTargetAsync::new(None, gtk::gdk::DragAction::COPY);
+
+        target.connect_accept(|_, drop| {
+            let formats = drop.formats();
+            formats.contains_type(gtk::gdk::FileList::static_type())
+                || FILE_TRANSFER_MIME_TYPES
+                    .iter()
+                    .any(|mime_type| formats.contain_mime_type(mime_type))
+        });
 
         let this = self.clone();
-        target.connect_drop(move |_, value, _, _| {
-            let Ok(file_list) = value.get::<gtk::gdk::FileList>() else {
-                this.set_status("Drop did not contain files.");
-                return false;
-            };
+        target.connect_drop(move |_, drop, _, _| {
+            let this = this.clone();
+            let drop_for_fallback = drop.clone();
+            drop.read_value_async(
+                gtk::gdk::FileList::static_type(),
+                glib::Priority::default(),
+                gio::Cancellable::NONE,
+                move |result| {
+                    if let Ok(file_list) = result.and_then(|value| {
+                        value.get::<gtk::gdk::FileList>().map_err(|_| {
+                            glib::Error::new(gio::IOErrorEnum::InvalidData, "not files")
+                        })
+                    }) {
+                        let success = this.copy_dropped_files(file_list.files());
+                        drop_for_fallback.finish(if success {
+                            gtk::gdk::DragAction::COPY
+                        } else {
+                            gtk::gdk::DragAction::empty()
+                        });
+                        return;
+                    }
 
-            this.copy_dropped_files(file_list.files())
+                    this.read_dropped_mime_files(drop_for_fallback);
+                },
+            );
+            true
         });
 
         widget.add_controller(target);
+    }
+
+    fn read_dropped_mime_files(&self, drop: gtk::gdk::Drop) {
+        let this = self.clone();
+        let drop_for_read = drop.clone();
+        drop_for_read.read_async(
+            FILE_TRANSFER_MIME_TYPES,
+            glib::Priority::default(),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Ok((stream, mime_type)) => {
+                    let drop = drop.clone();
+                    let this = this.clone();
+                    read_transfer_text(stream, move |text| {
+                        let success = file_clipboard_from_text(mime_type.as_str(), &text)
+                            .map(|clipboard| this.copy_dropped_files(clipboard.files))
+                            .unwrap_or_else(|| {
+                                this.set_status("Drop did not contain files.");
+                                false
+                            });
+                        drop.finish(if success {
+                            gtk::gdk::DragAction::COPY
+                        } else {
+                            gtk::gdk::DragAction::empty()
+                        });
+                    });
+                }
+                Err(err) => {
+                    this.set_status(&format!("Could not read dropped files: {err}"));
+                    drop.finish(gtk::gdk::DragAction::empty());
+                }
+            },
+        );
     }
 
     fn copy_dropped_files(&self, files: Vec<gio::File>) -> bool {
@@ -1408,6 +1474,44 @@ fn files_from_uri_text(text: &str) -> Vec<gio::File> {
         .filter(|line| line.contains(':'))
         .map(gio::File::for_uri)
         .collect()
+}
+
+fn file_clipboard_from_text(mime_type: &str, text: &str) -> Option<FileClipboard> {
+    if mime_type == "x-special/gnome-copied-files" {
+        let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+        let op = match lines.next() {
+            Some("cut") => ClipboardOp::Cut,
+            Some("copy") => ClipboardOp::Copy,
+            _ => ClipboardOp::Copy,
+        };
+        let files = lines
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| line.contains(':'))
+            .map(gio::File::for_uri)
+            .collect::<Vec<_>>();
+        return (!files.is_empty()).then_some(FileClipboard { files, op });
+    }
+
+    let files = files_from_uri_text(text);
+    (!files.is_empty()).then_some(FileClipboard {
+        files,
+        op: ClipboardOp::Copy,
+    })
+}
+
+fn read_transfer_text(stream: gio::InputStream, callback: impl FnOnce(String) + 'static) {
+    stream.read_bytes_async(
+        1024 * 1024,
+        glib::Priority::default(),
+        gio::Cancellable::NONE,
+        move |result| {
+            let text = result
+                .ok()
+                .and_then(|bytes| String::from_utf8(bytes.as_ref().to_vec()).ok())
+                .unwrap_or_default();
+            callback(text);
+        },
+    );
 }
 
 fn column_header() -> gtk::Grid {
