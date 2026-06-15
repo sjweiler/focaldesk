@@ -10,6 +10,7 @@ name = "focaldesk-cli"
 path = "src/main.rs"
 
 [dependencies]
+focaldesk-ai = { path = "../../crates/focaldesk-ai" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 
 anyhow = { workspace = true }

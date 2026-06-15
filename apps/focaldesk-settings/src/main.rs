@@ -12,6 +12,7 @@ use gtk::glib;
 use serde_json::json;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -42,6 +43,60 @@ const OUTPUT_DEVICE_OPTIONS: &[&str] = &[
 ];
 const OUTPUT_CONFIGURATION_OPTIONS: &[&str] = &["HiFi 2.0 channels", "Stereo", "Mono"];
 const ALERT_SOUND_OPTIONS: &[&str] = &["Default", "Click", "Chime", "None"];
+const KEYBOARD_LAYOUT_OPTIONS: &[&str] = &["English (US)", "English (UK)", "German", "French"];
+const MODIFIER_BEHAVIOR_OPTIONS: &[&str] = &["Default", "Caps Lock as Ctrl", "Swap Ctrl and Alt"];
+const LOG_LEVEL_OPTIONS: &[&str] = &["Error", "Warn", "Info", "Debug", "Trace"];
+const POWER_TIMEOUT_OPTIONS: &[&str] =
+    &["Never", "1 minute", "5 minutes", "10 minutes", "30 minutes"];
+const SUSPEND_TIMEOUT_OPTIONS: &[&str] = &["Never", "15 minutes", "30 minutes", "1 hour"];
+const POWER_BUTTON_OPTIONS: &[&str] = &["Show power menu", "Suspend", "Power off", "Do nothing"];
+const LID_CLOSE_OPTIONS: &[&str] = &["Suspend", "Blank screen", "Lock screen", "Do nothing"];
+const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "Power off"];
+const PERFORMANCE_MODE_OPTIONS: &[&str] = &["Balanced", "Performance", "Power saver"];
+
+#[derive(Debug, Clone)]
+struct WifiNetwork {
+    active: bool,
+    ssid: String,
+    security: String,
+    signal: u8,
+}
+
+#[derive(Debug, Clone)]
+struct WifiSnapshot {
+    enabled: bool,
+    networks: Vec<WifiNetwork>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EthernetDevice {
+    device: String,
+    state: String,
+    connection: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct EthernetSnapshot {
+    devices: Vec<EthernetDevice>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BluetoothDevice {
+    address: String,
+    name: String,
+    paired: bool,
+    connected: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BluetoothSnapshot {
+    powered: bool,
+    scanning: bool,
+    devices: Vec<BluetoothDevice>,
+    error: Option<String>,
+}
 
 #[derive(Debug)]
 struct ConfigEvent {
@@ -352,8 +407,425 @@ fn dim_label(text: &str) -> gtk::Label {
     label
 }
 
+fn parse_pactl_short_sources(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            fields.next()?;
+            let name = fields.next()?.trim();
+
+            if name.is_empty() || name.ends_with(".monitor") {
+                return None;
+            }
+
+            let label = name
+                .strip_prefix("alsa_input.")
+                .unwrap_or(name)
+                .replace(['_', '.'], " ");
+            Some(label)
+        })
+        .collect()
+}
+
+fn parse_wpctl_sources(output: &str) -> Vec<String> {
+    let mut in_sources = false;
+    let mut sources = Vec::new();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.contains("Sources:") {
+            in_sources = true;
+            continue;
+        }
+
+        if !in_sources {
+            continue;
+        }
+
+        if trimmed.ends_with(':') {
+            break;
+        }
+
+        let Some((_, label)) = trimmed.split_once(". ") else {
+            continue;
+        };
+        let label = label
+            .split(" [")
+            .next()
+            .unwrap_or(label)
+            .trim()
+            .trim_start_matches('*')
+            .trim();
+
+        if label.is_empty() || label.to_ascii_lowercase().contains("monitor") {
+            continue;
+        }
+
+        sources.push(label.to_string());
+    }
+
+    sources
+}
+
+fn load_input_sources() -> Result<Vec<String>, String> {
+    match run_control_command("pactl", &["list", "short", "sources"]) {
+        Ok(output) => Ok(parse_pactl_short_sources(&output)),
+        Err(pactl_err) => match run_control_command("wpctl", &["status"]) {
+            Ok(output) => Ok(parse_wpctl_sources(&output)),
+            Err(wpctl_err) => Err(format!("{pactl_err}; {wpctl_err}")),
+        },
+    }
+}
+
+fn add_switch_row(
+    group: &adw::PreferencesGroup,
+    title: &str,
+    subtitle: Option<&str>,
+    active: bool,
+) -> gtk::Switch {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    if let Some(subtitle) = subtitle {
+        row.set_subtitle(subtitle);
+    }
+
+    let switch = gtk::Switch::new();
+    switch.set_active(active);
+    row.add_suffix(&switch);
+    row.set_activatable_widget(Some(&switch));
+    group.add(&row);
+
+    switch
+}
+
+fn add_dropdown_row(
+    group: &adw::PreferencesGroup,
+    title: &str,
+    subtitle: Option<&str>,
+    labels: &[&str],
+    selected: u32,
+) -> gtk::DropDown {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    if let Some(subtitle) = subtitle {
+        row.set_subtitle(subtitle);
+    }
+
+    let dropdown = dropdown_from_strings(labels, selected);
+    row.add_suffix(&dropdown);
+    group.add(&row);
+
+    dropdown
+}
+
+fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: Option<&str>, value: &str) {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    if let Some(subtitle) = subtitle {
+        row.set_subtitle(subtitle);
+    }
+    row.add_suffix(&dim_label(value));
+    group.add(&row);
+}
+
+fn add_button_row(
+    group: &adw::PreferencesGroup,
+    title: &str,
+    subtitle: Option<&str>,
+    label: &str,
+) -> gtk::Button {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    if let Some(subtitle) = subtitle {
+        row.set_subtitle(subtitle);
+    }
+
+    let button = gtk::Button::with_label(label);
+    button.add_css_class("pill");
+    row.add_suffix(&button);
+    group.add(&row);
+
+    button
+}
+
+fn add_scale_row(
+    group: &adw::PreferencesGroup,
+    title: &str,
+    min: f64,
+    max: f64,
+    step: f64,
+    value: f64,
+) -> gtk::Scale {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
+    scale.set_hexpand(true);
+    scale.set_draw_value(true);
+    scale.set_value(value);
+    row.add_suffix(&scale);
+    group.add(&row);
+
+    scale
+}
+
 fn suffix_chevron() -> gtk::Image {
     gtk::Image::from_icon_name("go-next-symbolic")
+}
+
+fn run_control_command(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("{program}: {err}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        Err(format!("{program}: {message}"))
+    }
+}
+
+fn split_nmcli_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escape = false;
+
+    for ch in line.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+        } else if ch == '\\' {
+            escape = true;
+        } else if ch == ':' {
+            fields.push(current);
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    fields.push(current);
+    fields
+}
+
+fn load_wifi_snapshot() -> WifiSnapshot {
+    let enabled = match run_control_command("nmcli", &["-t", "-f", "WIFI", "radio"]) {
+        Ok(output) => output.lines().next().unwrap_or_default().trim() == "enabled",
+        Err(err) => {
+            return WifiSnapshot {
+                enabled: false,
+                networks: vec![],
+                error: Some(err),
+            };
+        }
+    };
+
+    let list = match run_control_command(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "IN-USE,SSID,SECURITY,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            return WifiSnapshot {
+                enabled,
+                networks: vec![],
+                error: Some(err),
+            };
+        }
+    };
+
+    let mut networks = Vec::new();
+
+    for line in list.lines() {
+        let fields = split_nmcli_line(line);
+        let ssid = fields.get(1).map(String::as_str).unwrap_or_default().trim();
+        if ssid.is_empty() {
+            continue;
+        }
+
+        let security = fields
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let signal = fields
+            .get(3)
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(0);
+
+        networks.push(WifiNetwork {
+            active: fields.first().map(String::as_str).unwrap_or_default() == "*",
+            ssid: ssid.to_string(),
+            security,
+            signal,
+        });
+    }
+
+    networks.sort_by(|a, b| b.active.cmp(&a.active).then(b.signal.cmp(&a.signal)));
+    networks.dedup_by(|a, b| a.ssid == b.ssid);
+
+    WifiSnapshot {
+        enabled,
+        networks,
+        error: None,
+    }
+}
+
+fn load_ethernet_snapshot() -> EthernetSnapshot {
+    let output = match run_control_command(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "DEVICE,TYPE,STATE,CONNECTION",
+            "device",
+            "status",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            return EthernetSnapshot {
+                devices: vec![],
+                error: Some(err),
+            };
+        }
+    };
+
+    let mut devices = Vec::new();
+
+    for line in output.lines() {
+        let fields = split_nmcli_line(line);
+        if fields.get(1).map(String::as_str) != Some("ethernet") {
+            continue;
+        }
+
+        let device = fields.first().cloned().unwrap_or_default();
+        if device.is_empty() {
+            continue;
+        }
+
+        let connection = fields
+            .get(3)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != "--")
+            .map(str::to_string);
+
+        devices.push(EthernetDevice {
+            device,
+            state: fields
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            connection,
+        });
+    }
+
+    devices.sort_by(|a, b| {
+        ethernet_connected(b)
+            .cmp(&ethernet_connected(a))
+            .then(a.device.cmp(&b.device))
+    });
+
+    EthernetSnapshot {
+        devices,
+        error: None,
+    }
+}
+
+fn parse_bluetooth_devices(output: &str, paired: bool) -> Vec<BluetoothDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            if parts.next()? != "Device" {
+                return None;
+            }
+
+            let address = parts.next()?.to_string();
+            let name = parts.next().unwrap_or("Unknown Device").to_string();
+
+            Some(BluetoothDevice {
+                address,
+                name,
+                paired,
+                connected: false,
+            })
+        })
+        .collect()
+}
+
+fn bluetooth_info_value(info: &str, key: &str) -> bool {
+    info.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix(key)
+            .and_then(|value| value.trim().strip_prefix(':'))
+            .map(|value| value.trim() == "yes")
+            .unwrap_or(false)
+    })
+}
+
+fn load_bluetooth_snapshot(scanning: bool) -> BluetoothSnapshot {
+    let show = match run_control_command("bluetoothctl", &["show"]) {
+        Ok(output) => output,
+        Err(err) => {
+            return BluetoothSnapshot {
+                powered: false,
+                scanning,
+                devices: vec![],
+                error: Some(err),
+            };
+        }
+    };
+
+    let powered = bluetooth_info_value(&show, "Powered");
+    let paired_output =
+        run_control_command("bluetoothctl", &["paired-devices"]).unwrap_or_default();
+    let all_output = run_control_command("bluetoothctl", &["devices"]).unwrap_or_default();
+
+    let mut devices = parse_bluetooth_devices(&paired_output, true);
+
+    for device in parse_bluetooth_devices(&all_output, false) {
+        if !devices.iter().any(|known| known.address == device.address) {
+            devices.push(device);
+        }
+    }
+
+    for device in &mut devices {
+        if let Ok(info) = run_control_command("bluetoothctl", &["info", &device.address]) {
+            device.connected = bluetooth_info_value(&info, "Connected");
+            device.paired = device.paired || bluetooth_info_value(&info, "Paired");
+        }
+    }
+
+    devices.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then(b.paired.cmp(&a.paired))
+            .then(a.name.cmp(&b.name))
+    });
+
+    BluetoothSnapshot {
+        powered,
+        scanning,
+        devices,
+        error: None,
+    }
 }
 
 fn save_display_change(
@@ -633,6 +1105,8 @@ fn build_ui(app: &adw::Application) {
 
     for name in [
         "Appearance",
+        "Network",
+        "Bluetooth",
         "Displays",
         "Sound",
         "Workspaces",
@@ -662,40 +1136,20 @@ fn build_ui(app: &adw::Application) {
     let mut pages: HashMap<String, adw::NavigationPage> = HashMap::new();
 
     pages.insert("Appearance".to_string(), appearance_page(config.clone()));
+    pages.insert("Network".to_string(), network_page());
+    pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Displays".to_string(), displays_page(config.clone()));
     pages.insert("Sound".to_string(), sound_page());
-
-    for name in [
-        "Workspaces",
-        "Keyboard",
-        "Privacy",
-        "Power",
-        "Debug",
-        "About",
-    ] {
-        let box_ = gtk::Box::new(gtk::Orientation::Vertical, 12);
-        box_.set_margin_top(24);
-        box_.set_margin_bottom(24);
-        box_.set_margin_start(24);
-        box_.set_margin_end(24);
-
-        let title = gtk::Label::new(Some(name));
-        title.add_css_class("title-1");
-        title.set_xalign(0.0);
-
-        let subtitle = gtk::Label::new(Some(&format!("{name} settings")));
-        subtitle.set_xalign(0.0);
-
-        box_.append(&title);
-        box_.append(&subtitle);
-
-        let page = adw::NavigationPage::new(&box_, name);
-        pages.insert(name.to_string(), page);
-    }
+    pages.insert("Workspaces".to_string(), workspaces_page());
+    pages.insert("Keyboard".to_string(), keyboard_page());
+    pages.insert("Privacy".to_string(), privacy_page());
+    pages.insert("Power".to_string(), power_page());
+    pages.insert("Debug".to_string(), debug_page());
+    pages.insert("About".to_string(), about_page());
 
     split.set_sidebar(Some(&sidebar_page));
     split.set_content(Some(pages.get("Appearance").unwrap()));
-    split.set_content(Some(pages.get("Displays").unwrap()));
+    list.select_row(list.row_at_index(0).as_ref());
 
     let split_clone = split.clone();
     let pages_clone = pages.clone();
@@ -926,6 +1380,511 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     adw::NavigationPage::new(&page, "Appearance")
 }
 
+fn clear_preferences_group(group: &adw::PreferencesGroup) {
+    //  while let Some(child) = group.first_child() {
+    //      group.remove(&child);
+    //  }
+}
+
+fn wifi_security_label(security: &str) -> &str {
+    if security.trim().is_empty() || security == "--" {
+        "Open network"
+    } else {
+        "Secured network"
+    }
+}
+
+fn ethernet_connected(device: &EthernetDevice) -> bool {
+    matches!(
+        device.state.as_str(),
+        "connected" | "connecting (getting IP configuration)"
+    )
+}
+
+fn ethernet_state_label(device: &EthernetDevice) -> String {
+    let connection = device
+        .connection
+        .as_deref()
+        .filter(|connection| !connection.is_empty())
+        .unwrap_or("No active connection");
+
+    format!("{} | {connection}", device.state)
+}
+
+fn populate_ethernet_list(
+    group: &adw::PreferencesGroup,
+    snapshot: &EthernetSnapshot,
+    status: &gtk::Label,
+) {
+    //clear_preferences_group(group);
+
+    if let Some(err) = &snapshot.error {
+        status.set_text(err);
+    } else if snapshot.devices.is_empty() {
+        status.set_text("No Ethernet devices found");
+    } else {
+        status.set_text("Ethernet devices are managed by NetworkManager");
+    }
+
+    if snapshot.devices.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title("No Ethernet devices found");
+        row.set_subtitle("Plug in a wired adapter or enable one in NetworkManager");
+        group.add(&row);
+        return;
+    }
+
+    for device in &snapshot.devices {
+        let row = adw::ActionRow::new();
+        row.set_title(&device.device);
+        row.set_subtitle(&ethernet_state_label(device));
+        row.add_prefix(&gtk::Image::from_icon_name("network-wired-symbolic"));
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+        if ethernet_connected(device) {
+            row.add_suffix(&dim_label("Connected"));
+
+            let disconnect = gtk::Button::with_label("Disconnect");
+            disconnect.add_css_class("pill");
+            {
+                let name = device.device.clone();
+                let status = status.clone();
+                disconnect.connect_clicked(move |_| {
+                    match run_control_command("nmcli", &["device", "disconnect", &name]) {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("Disconnected {name}"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+            controls.append(&disconnect);
+        } else {
+            let connect = gtk::Button::with_label("Connect");
+            connect.add_css_class("pill");
+            {
+                let name = device.device.clone();
+                let status = status.clone();
+                connect.connect_clicked(move |_| {
+                    match run_control_command("nmcli", &["device", "connect", &name]) {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("Connected {name}"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+            controls.append(&connect);
+        }
+
+        row.add_suffix(&controls);
+        group.add(&row);
+    }
+}
+
+fn populate_wifi_list(group: &adw::PreferencesGroup, snapshot: &WifiSnapshot, status: &gtk::Label) {
+    //clear_preferences_group(group);
+
+    if let Some(err) = &snapshot.error {
+        status.set_text(err);
+    } else if snapshot.enabled {
+        status.set_text("Wi-Fi is enabled");
+    } else {
+        status.set_text("Wi-Fi is disabled");
+    }
+
+    if snapshot.networks.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title(if snapshot.enabled {
+            "No Wi-Fi networks found"
+        } else {
+            "Turn on Wi-Fi to scan for networks"
+        });
+        group.add(&row);
+        return;
+    }
+
+    for network in &snapshot.networks {
+        let row = adw::ActionRow::new();
+        row.set_title(&network.ssid);
+        row.set_subtitle(&format!(
+            "{} | Signal {}%",
+            wifi_security_label(&network.security),
+            network.signal
+        ));
+
+        let icon = gtk::Image::from_icon_name(if network.active {
+            "network-wireless-acquiring-symbolic"
+        } else {
+            "network-wireless-symbolic"
+        });
+        row.add_prefix(&icon);
+
+        if network.active {
+            row.add_suffix(&dim_label("Connected"));
+        } else {
+            let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            let password = gtk::PasswordEntry::new();
+            password.set_placeholder_text(Some("Password"));
+            password.set_width_chars(18);
+            password.set_visible(!network.security.trim().is_empty() && network.security != "--");
+
+            let button = gtk::Button::with_label("Connect");
+            button.add_css_class("pill");
+
+            {
+                let ssid = network.ssid.clone();
+                let password = password.clone();
+                let status = status.clone();
+                button.connect_clicked(move |_| {
+                    let password_text = password.text().to_string();
+                    let result = if password.is_visible() && !password_text.is_empty() {
+                        run_control_command(
+                            "nmcli",
+                            &[
+                                "device",
+                                "wifi",
+                                "connect",
+                                &ssid,
+                                "password",
+                                &password_text,
+                            ],
+                        )
+                    } else {
+                        run_control_command("nmcli", &["device", "wifi", "connect", &ssid])
+                    };
+
+                    match result {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("Connected to {ssid}"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+
+            controls.append(&password);
+            controls.append(&button);
+            row.add_suffix(&controls);
+        }
+
+        group.add(&row);
+    }
+}
+
+fn network_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Network");
+
+    let ethernet_status = dim_label("Loading Ethernet state");
+
+    let ethernet_group = adw::PreferencesGroup::new();
+    ethernet_group.set_title("Ethernet");
+
+    let ethernet_refresh_row = adw::ActionRow::new();
+    ethernet_refresh_row.set_title("Refresh Wired Devices");
+    ethernet_refresh_row.set_subtitle("Update adapter state and active wired connections");
+    let ethernet_refresh_button = gtk::Button::with_label("Refresh");
+    ethernet_refresh_button.add_css_class("pill");
+    ethernet_refresh_row.add_suffix(&ethernet_refresh_button);
+    ethernet_group.add(&ethernet_refresh_row);
+    ethernet_group.add(&ethernet_status);
+    page.add(&ethernet_group);
+
+    let ethernet_devices_group = adw::PreferencesGroup::new();
+    ethernet_devices_group.set_title("Wired Devices");
+    page.add(&ethernet_devices_group);
+
+    let wifi_status = dim_label("Loading Wi-Fi state");
+
+    let controls_group = adw::PreferencesGroup::new();
+    controls_group.set_title("Wi-Fi");
+
+    let wifi_row = adw::ActionRow::new();
+    wifi_row.set_title("Wi-Fi");
+    wifi_row.set_subtitle("Use NetworkManager to scan and connect to wireless networks");
+    let wifi_switch = gtk::Switch::new();
+    wifi_row.add_suffix(&wifi_switch);
+    wifi_row.set_activatable_widget(Some(&wifi_switch));
+    controls_group.add(&wifi_row);
+
+    let refresh_row = adw::ActionRow::new();
+    refresh_row.set_title("Refresh Networks");
+    refresh_row.set_subtitle("Rescan nearby access points");
+    let refresh_button = gtk::Button::with_label("Refresh");
+    refresh_button.add_css_class("pill");
+    refresh_row.add_suffix(&refresh_button);
+    controls_group.add(&refresh_row);
+    controls_group.add(&wifi_status);
+    page.add(&controls_group);
+
+    let networks_group = adw::PreferencesGroup::new();
+    networks_group.set_title("Available Wi-Fi Networks");
+    page.add(&networks_group);
+
+    let ethernet_snapshot = load_ethernet_snapshot();
+    populate_ethernet_list(
+        &ethernet_devices_group,
+        &ethernet_snapshot,
+        &ethernet_status,
+    );
+
+    let wifi_snapshot = load_wifi_snapshot();
+    wifi_switch.set_active(wifi_snapshot.enabled);
+    populate_wifi_list(&networks_group, &wifi_snapshot, &wifi_status);
+
+    {
+        let ethernet_devices_group = ethernet_devices_group.clone();
+        let ethernet_status = ethernet_status.clone();
+        ethernet_refresh_button.connect_clicked(move |_| {
+            let snapshot = load_ethernet_snapshot();
+            populate_ethernet_list(&ethernet_devices_group, &snapshot, &ethernet_status);
+        });
+    }
+
+    {
+        let wifi_status = wifi_status.clone();
+        wifi_switch.connect_active_notify(move |switch| {
+            let state = if switch.is_active() { "on" } else { "off" };
+            match run_control_command("nmcli", &["radio", "wifi", state]) {
+                Ok(_) => wifi_status.set_text(if switch.is_active() {
+                    "Wi-Fi enabled"
+                } else {
+                    "Wi-Fi disabled"
+                }),
+                Err(err) => wifi_status.set_text(&err),
+            }
+        });
+    }
+
+    {
+        let networks_group = networks_group.clone();
+        let wifi_status = wifi_status.clone();
+        let wifi_switch = wifi_switch.clone();
+        refresh_button.connect_clicked(move |_| {
+            let snapshot = load_wifi_snapshot();
+            wifi_switch.set_active(snapshot.enabled);
+            populate_wifi_list(&networks_group, &snapshot, &wifi_status);
+        });
+    }
+
+    adw::NavigationPage::new(&page, "Network")
+}
+
+fn populate_bluetooth_list(
+    group: &adw::PreferencesGroup,
+    snapshot: &BluetoothSnapshot,
+    status: &gtk::Label,
+) {
+    //clear_preferences_group(group);
+
+    if let Some(err) = &snapshot.error {
+        status.set_text(err);
+    } else if snapshot.powered {
+        status.set_text(if snapshot.scanning {
+            "Bluetooth is scanning"
+        } else {
+            "Bluetooth is powered on"
+        });
+    } else {
+        status.set_text("Bluetooth is powered off");
+    }
+
+    if snapshot.devices.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title(if snapshot.powered {
+            "No Bluetooth devices found"
+        } else {
+            "Turn on Bluetooth to manage devices"
+        });
+        group.add(&row);
+        return;
+    }
+
+    for device in &snapshot.devices {
+        let row = adw::ActionRow::new();
+        row.set_title(&device.name);
+        row.set_subtitle(&format!(
+            "{}{} | {}",
+            if device.connected {
+                "Connected"
+            } else {
+                "Disconnected"
+            },
+            if device.paired { " | Paired" } else { "" },
+            device.address
+        ));
+        row.add_prefix(&gtk::Image::from_icon_name("bluetooth-symbolic"));
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+        if !device.paired {
+            let pair = gtk::Button::with_label("Pair");
+            pair.add_css_class("pill");
+            {
+                let address = device.address.clone();
+                let status = status.clone();
+                pair.connect_clicked(move |_| {
+                    match run_control_command("bluetoothctl", &["pair", &address]) {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("Paired {address}"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+            controls.append(&pair);
+        }
+
+        let connect = gtk::Button::with_label(if device.connected {
+            "Disconnect"
+        } else {
+            "Connect"
+        });
+        connect.add_css_class("pill");
+        {
+            let address = device.address.clone();
+            let command = if device.connected {
+                "disconnect"
+            } else {
+                "connect"
+            };
+            let status = status.clone();
+            connect.connect_clicked(move |_| {
+                match run_control_command("bluetoothctl", &[command, &address]) {
+                    Ok(output) if output.is_empty() => {
+                        status.set_text(&format!("{command} sent to {address}"));
+                    }
+                    Ok(output) => status.set_text(&output),
+                    Err(err) => status.set_text(&err),
+                }
+            });
+        }
+        controls.append(&connect);
+
+        if device.paired {
+            let trust = gtk::Button::with_label("Trust");
+            trust.add_css_class("pill");
+            {
+                let address = device.address.clone();
+                let status = status.clone();
+                trust.connect_clicked(move |_| {
+                    match run_control_command("bluetoothctl", &["trust", &address]) {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("Trusted {address}"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+            controls.append(&trust);
+        }
+
+        row.add_suffix(&controls);
+        group.add(&row);
+    }
+}
+
+fn bluetooth_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Bluetooth");
+
+    let scanning = Rc::new(RefCell::new(false));
+    let status = dim_label("Loading Bluetooth state");
+
+    let controls_group = adw::PreferencesGroup::new();
+    controls_group.set_title("Bluetooth");
+
+    let power_row = adw::ActionRow::new();
+    power_row.set_title("Bluetooth");
+    power_row.set_subtitle("Use BlueZ to pair and connect devices");
+    let power_switch = gtk::Switch::new();
+    power_row.add_suffix(&power_switch);
+    power_row.set_activatable_widget(Some(&power_switch));
+    controls_group.add(&power_row);
+
+    let scan_row = adw::ActionRow::new();
+    scan_row.set_title("Scan for Devices");
+    let scan_switch = gtk::Switch::new();
+    scan_row.add_suffix(&scan_switch);
+    scan_row.set_activatable_widget(Some(&scan_switch));
+    controls_group.add(&scan_row);
+
+    let refresh_row = adw::ActionRow::new();
+    refresh_row.set_title("Refresh Devices");
+    let refresh_button = gtk::Button::with_label("Refresh");
+    refresh_button.add_css_class("pill");
+    refresh_row.add_suffix(&refresh_button);
+    controls_group.add(&refresh_row);
+    controls_group.add(&status);
+    page.add(&controls_group);
+
+    let devices_group = adw::PreferencesGroup::new();
+    devices_group.set_title("Devices");
+    page.add(&devices_group);
+
+    let snapshot = load_bluetooth_snapshot(false);
+    power_switch.set_active(snapshot.powered);
+    scan_switch.set_active(snapshot.scanning);
+    populate_bluetooth_list(&devices_group, &snapshot, &status);
+
+    {
+        let status = status.clone();
+        power_switch.connect_active_notify(move |switch| {
+            let state = if switch.is_active() { "on" } else { "off" };
+            match run_control_command("bluetoothctl", &["power", state]) {
+                Ok(_) => status.set_text(if switch.is_active() {
+                    "Bluetooth powered on"
+                } else {
+                    "Bluetooth powered off"
+                }),
+                Err(err) => status.set_text(&err),
+            }
+        });
+    }
+
+    {
+        let scanning = scanning.clone();
+        let status = status.clone();
+        scan_switch.connect_active_notify(move |switch| {
+            let state = if switch.is_active() { "on" } else { "off" };
+            match run_control_command("bluetoothctl", &["scan", state]) {
+                Ok(_) => {
+                    *scanning.borrow_mut() = switch.is_active();
+                    status.set_text(if switch.is_active() {
+                        "Bluetooth scan enabled"
+                    } else {
+                        "Bluetooth scan disabled"
+                    });
+                }
+                Err(err) => status.set_text(&err),
+            }
+        });
+    }
+
+    {
+        let devices_group = devices_group.clone();
+        let status = status.clone();
+        let scanning = scanning.clone();
+        let power_switch = power_switch.clone();
+        let scan_switch = scan_switch.clone();
+        refresh_button.connect_clicked(move |_| {
+            let snapshot = load_bluetooth_snapshot(*scanning.borrow());
+            power_switch.set_active(snapshot.powered);
+            scan_switch.set_active(snapshot.scanning);
+            populate_bluetooth_list(&devices_group, &snapshot, &status);
+        });
+    }
+
+    adw::NavigationPage::new(&page, "Bluetooth")
+}
+
 fn sound_page() -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Sound");
@@ -982,7 +1941,19 @@ fn sound_page() -> adw::NavigationPage {
 
     let input_device_row = adw::ActionRow::new();
     input_device_row.set_title("Input Device");
-    input_device_row.add_suffix(&dim_label("No Input Devices"));
+    match load_input_sources() {
+        Ok(devices) if devices.is_empty() => {
+            input_device_row.add_suffix(&dim_label("No Input Devices"));
+        }
+        Ok(devices) => {
+            let labels: Vec<&str> = devices.iter().map(String::as_str).collect();
+            input_device_row.add_suffix(&dropdown_from_strings(&labels, 0));
+        }
+        Err(err) => {
+            input_device_row.add_suffix(&dim_label("Input Detection Unavailable"));
+            input_device_row.set_subtitle(&err);
+        }
+    }
     input_group.add(&input_device_row);
 
     page.add(&input_group);
@@ -1003,6 +1974,358 @@ fn sound_page() -> adw::NavigationPage {
     page.add(&sounds_group);
 
     adw::NavigationPage::new(&page, "Sound")
+}
+
+fn workspaces_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Workspaces");
+
+    let behavior_group = adw::PreferencesGroup::new();
+    behavior_group.set_title("Desktop Behavior");
+    behavior_group.set_description(Some(
+        "Controls for how workspaces appear, switch, and restore applications.",
+    ));
+
+    let count_row = adw::ActionRow::new();
+    count_row.set_title("Number of workspaces");
+    count_row.set_subtitle("Static workspace slots shown by the desktop shell");
+    let count = gtk::SpinButton::with_range(1.0, 9.0, 1.0);
+    count.set_value(4.0);
+    count.set_numeric(true);
+    count_row.add_suffix(&count);
+    behavior_group.add(&count_row);
+
+    add_switch_row(
+        &behavior_group,
+        "Show workspace indicator on top bar",
+        Some("Show the active workspace where it is always visible"),
+        true,
+    );
+    add_switch_row(
+        &behavior_group,
+        "Per-monitor workspaces",
+        Some("Keep each display on its own active workspace"),
+        false,
+    );
+    add_switch_row(
+        &behavior_group,
+        "Remember apps on workspace",
+        Some("Restore apps to their previous workspace after restart"),
+        true,
+    );
+    add_switch_row(
+        &behavior_group,
+        "Wrap around when switching",
+        Some("Continue from the last workspace back to the first"),
+        true,
+    );
+    page.add(&behavior_group);
+
+    let keybind_group = adw::PreferencesGroup::new();
+    keybind_group.set_title("Keybind Hints");
+    add_info_row(&keybind_group, "Switch to workspace 1", None, "Super+1");
+    add_info_row(&keybind_group, "Switch to workspace 2", None, "Super+2");
+    add_info_row(
+        &keybind_group,
+        "Move between workspaces",
+        None,
+        "Super+Arrow",
+    );
+    page.add(&keybind_group);
+
+    adw::NavigationPage::new(&page, "Workspaces")
+}
+
+fn keyboard_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Keyboard");
+
+    let input_group = adw::PreferencesGroup::new();
+    input_group.set_title("Typing");
+    add_dropdown_row(
+        &input_group,
+        "Layout",
+        Some("Keyboard layout used for new sessions"),
+        KEYBOARD_LAYOUT_OPTIONS,
+        0,
+    );
+    add_scale_row(&input_group, "Repeat delay", 150.0, 1000.0, 25.0, 350.0);
+    add_scale_row(&input_group, "Repeat speed", 10.0, 60.0, 1.0, 30.0);
+    add_dropdown_row(
+        &input_group,
+        "Modifier behavior",
+        Some("Common modifier remaps"),
+        MODIFIER_BEHAVIOR_OPTIONS,
+        0,
+    );
+    page.add(&input_group);
+
+    let shortcuts_group = adw::PreferencesGroup::new();
+    shortcuts_group.set_title("Shortcuts");
+    add_info_row(&shortcuts_group, "Open launcher", None, "Super");
+    add_info_row(&shortcuts_group, "Open terminal", None, "Super+Enter");
+    add_info_row(&shortcuts_group, "Close focused window", None, "Super+Q");
+    add_info_row(&shortcuts_group, "Screenshot shortcut", None, "Print");
+    add_info_row(&shortcuts_group, "Lock screen shortcut", None, "Super+L");
+    add_button_row(
+        &shortcuts_group,
+        "Reset shortcuts",
+        Some("Restore the default keyboard shortcuts"),
+        "Reset",
+    );
+    page.add(&shortcuts_group);
+
+    adw::NavigationPage::new(&page, "Keyboard")
+}
+
+fn privacy_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Privacy");
+
+    let permissions_group = adw::PreferencesGroup::new();
+    permissions_group.set_title("Permissions");
+    add_info_row(
+        &permissions_group,
+        "Screen capture permission status",
+        Some("PipeWire portal screen sharing"),
+        "No active grant",
+    );
+    add_info_row(
+        &permissions_group,
+        "Microphone portal permission",
+        Some("Per-app microphone permissions will appear here"),
+        "Placeholder",
+    );
+    add_info_row(
+        &permissions_group,
+        "Camera portal permission",
+        Some("Per-app camera permissions will appear here"),
+        "Placeholder",
+    );
+    add_info_row(
+        &permissions_group,
+        "Location services",
+        Some("Location access is not connected yet"),
+        "Placeholder",
+    );
+    page.add(&permissions_group);
+
+    let history_group = adw::PreferencesGroup::new();
+    history_group.set_title("History");
+    add_switch_row(
+        &history_group,
+        "Recent files",
+        Some("Allow apps to show recently opened files"),
+        true,
+    );
+    let history_status = dim_label("Recent history is local to this user");
+    let clear_history = add_button_row(
+        &history_group,
+        "Clear recent history",
+        Some("Remove saved recent file entries"),
+        "Clear",
+    );
+    clear_history.connect_clicked({
+        let history_status = history_status.clone();
+        move |_| history_status.set_text("Recent history cleared")
+    });
+    history_group.add(&history_status);
+    page.add(&history_group);
+
+    let lock_group = adw::PreferencesGroup::new();
+    lock_group.set_title("Lock Screen");
+    add_switch_row(
+        &lock_group,
+        "Hide notifications on lock screen",
+        Some("Keep notification content private while locked"),
+        true,
+    );
+    page.add(&lock_group);
+
+    adw::NavigationPage::new(&page, "Privacy")
+}
+
+fn power_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Power");
+
+    let timing_group = adw::PreferencesGroup::new();
+    timing_group.set_title("Idle");
+    add_dropdown_row(
+        &timing_group,
+        "Blank screen after",
+        Some("Turn off display output after inactivity"),
+        POWER_TIMEOUT_OPTIONS,
+        3,
+    );
+    add_dropdown_row(
+        &timing_group,
+        "Suspend after",
+        Some("Suspend the session after longer inactivity"),
+        SUSPEND_TIMEOUT_OPTIONS,
+        1,
+    );
+    page.add(&timing_group);
+
+    let actions_group = adw::PreferencesGroup::new();
+    actions_group.set_title("Actions");
+    add_dropdown_row(
+        &actions_group,
+        "Power button action",
+        None,
+        POWER_BUTTON_OPTIONS,
+        0,
+    );
+    add_dropdown_row(
+        &actions_group,
+        "Lid close action",
+        Some("Shown when laptop lid detection is available"),
+        LID_CLOSE_OPTIONS,
+        0,
+    );
+    add_dropdown_row(
+        &actions_group,
+        "Low battery action",
+        Some("Battery policy placeholder"),
+        LOW_BATTERY_OPTIONS,
+        0,
+    );
+    add_dropdown_row(
+        &actions_group,
+        "Performance mode",
+        Some("Hardware performance profile placeholder"),
+        PERFORMANCE_MODE_OPTIONS,
+        0,
+    );
+    page.add(&actions_group);
+
+    adw::NavigationPage::new(&page, "Power")
+}
+
+fn debug_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Debug");
+
+    let logging_group = adw::PreferencesGroup::new();
+    logging_group.set_title("Diagnostics");
+    add_dropdown_row(
+        &logging_group,
+        "Log level",
+        Some("Runtime logging detail for the desktop session"),
+        LOG_LEVEL_OPTIONS,
+        2,
+    );
+    add_switch_row(
+        &logging_group,
+        "Show FPS / frame timing",
+        Some("Overlay frame pacing information"),
+        false,
+    );
+    add_switch_row(
+        &logging_group,
+        "Show damage regions",
+        Some("Highlight areas redrawn by the compositor"),
+        false,
+    );
+    add_switch_row(
+        &logging_group,
+        "Show input events",
+        Some("Display pointer and keyboard event traces"),
+        false,
+    );
+    add_switch_row(
+        &logging_group,
+        "Enable verbose Wayland/XWayland logs",
+        Some("More protocol detail for compositor development"),
+        false,
+    );
+    page.add(&logging_group);
+
+    let files_group = adw::PreferencesGroup::new();
+    files_group.set_title("Files");
+    let debug_status = dim_label("Diagnostics are generated locally");
+    let open_log = add_button_row(
+        &files_group,
+        "Open log file",
+        Some("Open the current FocalDesk session log"),
+        "Open",
+    );
+    open_log.connect_clicked({
+        let debug_status = debug_status.clone();
+        move |_| debug_status.set_text("Log file opening is not wired yet")
+    });
+    let copy_diagnostics = add_button_row(
+        &files_group,
+        "Copy diagnostics",
+        Some("Copy version and session details for bug reports"),
+        "Copy",
+    );
+    copy_diagnostics.connect_clicked({
+        let debug_status = debug_status.clone();
+        move |_| debug_status.set_text("Diagnostics copied to clipboard placeholder")
+    });
+    files_group.add(&debug_status);
+    page.add(&files_group);
+
+    adw::NavigationPage::new(&page, "Debug")
+}
+
+fn about_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("About");
+
+    let identity_group = adw::PreferencesGroup::new();
+    identity_group.set_title("FocalDesk");
+    identity_group.set_description(Some("Early alpha desktop shell and settings app"));
+
+    let brand_row = adw::ActionRow::new();
+    brand_row.set_title("FocalDesk");
+    brand_row.set_subtitle("A Rust desktop environment built on Smithay and GTK4");
+    brand_row.add_prefix(&gtk::Image::from_icon_name("preferences-desktop-symbolic"));
+    identity_group.add(&brand_row);
+    add_info_row(
+        &identity_group,
+        "Version",
+        Some("Application package version"),
+        env!("CARGO_PKG_VERSION"),
+    );
+    add_info_row(
+        &identity_group,
+        "Build hash",
+        Some("Git commit captured by the build, when available"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("development"),
+    );
+    add_info_row(&identity_group, "Status", None, "Early alpha");
+    page.add(&identity_group);
+
+    let session_group = adw::PreferencesGroup::new();
+    session_group.set_title("Session");
+    add_info_row(&session_group, "Session type", None, "DRM");
+    add_info_row(&session_group, "Display manager", None, "GDM compatible");
+    add_info_row(&session_group, "XWayland", None, "Enabled");
+    page.add(&session_group);
+
+    let project_group = adw::PreferencesGroup::new();
+    project_group.set_title("Project");
+    add_info_row(&project_group, "License", None, "See LICENSE");
+
+    let github_row = adw::ActionRow::new();
+    github_row.set_title("GitHub");
+    github_row.set_subtitle("Source code and issue tracking");
+    let github = gtk::LinkButton::with_label("https://github.com/sjweiler/focaldesk", "Open");
+    github.add_css_class("pill");
+    github_row.add_suffix(&github);
+    project_group.add(&github_row);
+
+    add_info_row(
+        &project_group,
+        "Credits",
+        Some("Core projects and technologies"),
+        "Smithay, GTK4, PipeWire, Rust",
+    );
+    page.add(&project_group);
+
+    adw::NavigationPage::new(&page, "About")
 }
 
 fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
