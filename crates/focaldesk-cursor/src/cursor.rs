@@ -10,6 +10,8 @@ pub enum CursorIcon {
     Wait,
     Help,
     NotAllowed,
+    FileDrag,
+    FileDragCopy,
     EwResize,
     NsResize,
     NwseResize,

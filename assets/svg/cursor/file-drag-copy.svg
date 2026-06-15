@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+<defs>
+  <linearGradient id="tealGrad" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0%" stop-color="#A6C4C8"/><stop offset="55%" stop-color="#6E9198"/><stop offset="100%" stop-color="#355961"/>
+  </linearGradient>
+  <linearGradient id="creamGrad" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#FFF8EA"/><stop offset="100%" stop-color="#D6C8A8"/>
+  </linearGradient>
+  <linearGradient id="greenGrad" x1="0" y1="0" x2="0" y2="1">
+    <stop offset="0%" stop-color="#88F0A4"/><stop offset="100%" stop-color="#1E9D55"/>
+  </linearGradient>
+  <filter id="softGlow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="1.7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  <style>
+    .outline { stroke:#EFE6CF; stroke-width:4; stroke-linejoin:round; stroke-linecap:round; }
+    .ink { stroke:#203746; stroke-width:2.2; stroke-linejoin:round; stroke-linecap:round; }
+    .thin { stroke:#EFE6CF; stroke-width:1.2; stroke-linejoin:round; stroke-linecap:round; opacity:.95; }
+    .panel { fill:url(#tealGrad); }
+    .paper { fill:url(#creamGrad); }
+    .plus { fill:url(#greenGrad); }
+  </style>
+</defs>
+
+<path d="M14 8 L14 52 L27 39.5 L33 54 L39.5 51 L33.2 36.8 L49 36.8 Z" class="outline" fill="none" filter="url(#softGlow)"/>
+<path d="M14 8 L14 52 L27 39.5 L33 54 L39.5 51 L33.2 36.8 L49 36.8 Z" class="ink panel"/>
+<path d="M17 11 L17 46 L26 37.5" class="thin" fill="none"/>
+<path d="M36 14 H50 L56 20 V42 H36 Z" class="outline paper" filter="url(#softGlow)"/>
+<path d="M36 14 H50 L56 20 V42 H36 Z" class="ink paper"/>
+<path d="M50 14 V20 H56" fill="none" class="ink"/>
+<path d="M41 27 H51 M41 33 H51" fill="none" class="ink"/>
+<circle cx="49" cy="49" r="9" class="outline plus"/>
+<circle cx="49" cy="49" r="9" class="ink plus"/>
+<path d="M49 44 V54 M44 49 H54" fill="none" class="outline"/>
+<path d="M49 44 V54 M44 49 H54" fill="none" class="ink"/>
+
+</svg>

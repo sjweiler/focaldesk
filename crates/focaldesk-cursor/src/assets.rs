@@ -66,6 +66,8 @@ impl CursorAssets {
 const BD_DOUBLE_ARROW: &[u8] = include_bytes!("../../../assets/svg/cursor/bd_double_arrow.svg");
 const CROSSHAIR: &[u8] = include_bytes!("../../../assets/svg/cursor/crosshair.svg");
 const FD_DOUBLE_ARROW: &[u8] = include_bytes!("../../../assets/svg/cursor/fd_double_arrow.svg");
+const FILE_DRAG: &[u8] = include_bytes!("../../../assets/svg/cursor/file-drag.svg");
+const FILE_DRAG_COPY: &[u8] = include_bytes!("../../../assets/svg/cursor/file-drag-copy.svg");
 const GRABBING: &[u8] = include_bytes!("../../../assets/svg/cursor/grabbing.svg");
 const HAND1: &[u8] = include_bytes!("../../../assets/svg/cursor/hand1.svg");
 const LEFT_PTR: &[u8] = include_bytes!("../../../assets/svg/cursor/left_ptr.svg");
@@ -89,6 +91,8 @@ fn svg_bytes_for(icon: CursorIcon) -> &'static [u8] {
         CursorIcon::Wait => WATCH,
         CursorIcon::Help => LEFT_PTR,
         CursorIcon::NotAllowed => NOT_ALLOWED,
+        CursorIcon::FileDrag => FILE_DRAG,
+        CursorIcon::FileDragCopy => FILE_DRAG_COPY,
         CursorIcon::EwResize => SB_H_DOUBLE_ARROW,
         CursorIcon::NsResize => SB_V_DOUBLE_ARROW,
         CursorIcon::NwseResize => BD_DOUBLE_ARROW,
@@ -98,7 +102,10 @@ fn svg_bytes_for(icon: CursorIcon) -> &'static [u8] {
 
 fn hotspot_for(icon: CursorIcon, size: u32) -> (u32, u32) {
     match icon {
-        CursorIcon::Default | CursorIcon::Pointer => (2, 1),
+        CursorIcon::Default
+        | CursorIcon::Pointer
+        | CursorIcon::FileDrag
+        | CursorIcon::FileDragCopy => (2, 1),
         CursorIcon::Text => (size / 2, size / 2),
         CursorIcon::Wait => (size / 2, size / 2),
         _ => (2, 1),

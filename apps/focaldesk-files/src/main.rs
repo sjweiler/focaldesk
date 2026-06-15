@@ -1423,9 +1423,6 @@ fn attach_file_drag_source(widget: &impl IsA<gtk::Widget>, item: FileItem) {
 }
 
 fn file_clipboard_provider(files: &[gio::File], op: ClipboardOp) -> gtk::gdk::ContentProvider {
-    let file_list = gtk::gdk::FileList::from_array(files);
-    let file_provider = gtk::gdk::ContentProvider::for_value(&file_list.to_value());
-
     let uri_list = uri_list_text(files);
     let uri_provider = gtk::gdk::ContentProvider::for_bytes(
         "text/uri-list",
@@ -1438,12 +1435,15 @@ fn file_clipboard_provider(files: &[gio::File], op: ClipboardOp) -> gtk::gdk::Co
         &glib::Bytes::from_owned(gnome_files.into_bytes()),
     );
 
+    let file_list = gtk::gdk::FileList::from_array(files);
+    let file_provider = gtk::gdk::ContentProvider::for_value(&file_list.to_value());
+
     let text_provider = gtk::gdk::ContentProvider::for_value(&uri_list.to_value());
 
     gtk::gdk::ContentProvider::new_union(&[
-        file_provider,
         uri_provider,
         gnome_provider,
+        file_provider,
         text_provider,
     ])
 }

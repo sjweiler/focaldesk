@@ -30,7 +30,7 @@ use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
-use focaldesk_cursor::CursorManager;
+use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -40,7 +40,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
@@ -122,6 +123,11 @@ use focaldesk_ui::ui_builder::{
     SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_1_ID, SIDEBAR_WORKSPACE_2_ID,
     SIDEBAR_WORKSPACE_3_ID,
 };
+
+pub(crate) const DND_CURSOR_ENDED: u8 = 0;
+pub(crate) const DND_CURSOR_FILE: u8 = 1;
+pub(crate) const DND_CURSOR_VALID: u8 = 2;
+pub(crate) const DND_CURSOR_INVALID: u8 = 3;
 
 pub(crate) fn dbg_flush(msg: &str) {
     let mut stderr = io::stderr();
@@ -448,6 +454,7 @@ pub struct DesktopState {
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
+    pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
 
     // shell/chrome
     //pub topbar: TopBarModel,
@@ -3008,6 +3015,19 @@ impl DesktopState {
     }
 
     fn update_pointer_cursor(&mut self, position: Point<f64, Logical>) {
+        if self
+            .dnd_cursor_phase
+            .as_ref()
+            .is_some_and(|phase| phase.load(Ordering::Relaxed) == DND_CURSOR_ENDED)
+        {
+            self.dnd_cursor_phase = None;
+        }
+
+        if let Some(icon) = self.dnd_cursor_icon(position) {
+            self.set_flow_cursor_icon(icon);
+            return;
+        }
+
         if let Some(interaction) = &self.toplevel_pointer {
             let icon = match interaction {
                 ToplevelPointerInteraction::Resize { edges, .. } => cursor_for_resize_edges(*edges),
@@ -3028,6 +3048,42 @@ impl DesktopState {
         } else {
             self.cursor_manager.set_icon(CursorIcon::Default);
         }
+    }
+
+    pub(crate) fn begin_dnd_cursor(&mut self, phase: Arc<AtomicU8>) {
+        phase.store(DND_CURSOR_FILE, Ordering::Relaxed);
+        self.dnd_cursor_phase = Some(phase);
+        self.set_flow_cursor_icon(FlowCursorIcon::FileDrag);
+    }
+
+    pub(crate) fn end_dnd_cursor(&mut self) {
+        self.dnd_cursor_phase = None;
+        self.set_flow_cursor_icon(FlowCursorIcon::Default);
+    }
+
+    fn dnd_cursor_icon(&self, position: Point<f64, Logical>) -> Option<FlowCursorIcon> {
+        let phase_cell = self.dnd_cursor_phase.as_ref()?;
+        if phase_cell.load(Ordering::Relaxed) == DND_CURSOR_FILE
+            && self.pointer_surface_under(position).is_none()
+        {
+            phase_cell.store(DND_CURSOR_INVALID, Ordering::Relaxed);
+        }
+
+        let phase = phase_cell.load(Ordering::Relaxed);
+        match phase {
+            DND_CURSOR_VALID => Some(FlowCursorIcon::FileDragCopy),
+            DND_CURSOR_INVALID => Some(FlowCursorIcon::NotAllowed),
+            _ => Some(FlowCursorIcon::FileDrag),
+        }
+    }
+
+    pub(crate) fn set_flow_cursor_icon(&mut self, icon: FlowCursorIcon) {
+        if self.cursor_manager.current_flow_icon() == icon {
+            return;
+        }
+        self.cursor_manager.set_flow_icon(icon);
+        self.drm_submit_hw_cursor = true;
+        self.mark_focused_output_full_damage(DamageSource::Cursor);
     }
 
     pub(crate) fn focus_window_id(&mut self, window_id: WindowId) {
@@ -3176,6 +3232,7 @@ impl DesktopState {
             focused_window: None,
             pointer_pos: (0.0, 0.0).into(),
             toplevel_pointer: None,
+            dnd_cursor_phase: None,
 
             notifications: init.notifications,
             lock_screen: LockScreenState::new(),
