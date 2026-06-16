@@ -1,8 +1,8 @@
 use adw::prelude::*;
-use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use focaldesk_config::{FocalDeskConfig, load_config, save_config};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
-    IpcResponse,
+    IpcRequest, IpcResponse, send_desktop_config, send_desktop_request, send_desktop_set,
+    watch_desktop_keys,
 };
 use focaldesk_logging::flog_info;
 use focaldesk_settings_core::OutputConfig;
@@ -10,13 +10,13 @@ use focaldesk_settings_core::OutputConfig;
 use gtk::cairo;
 use gtk::glib;
 use serde_json::json;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("100 %", 1.0),
@@ -98,11 +98,38 @@ struct BluetoothSnapshot {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct Printer {
+    name: String,
+    enabled: bool,
+    accepting_jobs: bool,
+    is_default: bool,
+    state: String,
+    device_uri: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InstallablePrinter {
+    kind: String,
+    uri: String,
+    suggested_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct PrinterSnapshot {
+    scheduler_running: bool,
+    printers: Vec<Printer>,
+    installable_printers: Vec<InstallablePrinter>,
+    error: Option<String>,
+}
+
 #[derive(Debug)]
 struct ConfigEvent {
     key: String,
     value: serde_json::Value,
 }
+
+type DynamicRows = Rc<RefCell<Vec<gtk::Widget>>>;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayConfig {
@@ -550,6 +577,19 @@ fn add_button_row(
     button
 }
 
+fn add_entry_row(group: &adw::PreferencesGroup, title: &str, placeholder: &str) -> gtk::Entry {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+
+    let entry = gtk::Entry::new();
+    entry.set_placeholder_text(Some(placeholder));
+    entry.set_hexpand(true);
+    row.add_suffix(&entry);
+    group.add(&row);
+
+    entry
+}
+
 fn add_scale_row(
     group: &adw::PreferencesGroup,
     title: &str,
@@ -576,9 +616,40 @@ fn suffix_chevron() -> gtk::Image {
 }
 
 fn run_control_command(program: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
+    run_control_command_with_timeout(program, args, Duration::from_secs(2))
+}
+
+fn run_control_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut child = Command::new(program)
         .args(args)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("{program}: {err}"))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{program}: command timed out after {}s",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(err) => return Err(format!("{program}: {err}")),
+        }
+    }
+
+    let output = child
+        .wait_with_output()
         .map_err(|err| format!("{program}: {err}"))?;
 
     if output.status.success() {
@@ -626,7 +697,7 @@ fn load_wifi_snapshot() -> WifiSnapshot {
         }
     };
 
-    let list = match run_control_command(
+    let list = match run_control_command_with_timeout(
         "nmcli",
         &[
             "-t",
@@ -638,7 +709,24 @@ fn load_wifi_snapshot() -> WifiSnapshot {
             "--rescan",
             "yes",
         ],
-    ) {
+        Duration::from_secs(15),
+    )
+    .or_else(|_| {
+        run_control_command_with_timeout(
+            "nmcli",
+            &[
+                "-t",
+                "-f",
+                "IN-USE,SSID,SECURITY,SIGNAL",
+                "device",
+                "wifi",
+                "list",
+                "--rescan",
+                "no",
+            ],
+            Duration::from_secs(5),
+        )
+    }) {
         Ok(output) => output,
         Err(err) => {
             return WifiSnapshot {
@@ -824,6 +912,265 @@ fn load_bluetooth_snapshot(scanning: bool) -> BluetoothSnapshot {
         powered,
         scanning,
         devices,
+        error: None,
+    }
+}
+
+fn parse_default_printer(output: &str) -> Option<String> {
+    output
+        .strip_prefix("system default destination:")
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_printer_devices(output: &str) -> HashMap<String, String> {
+    let mut devices = HashMap::new();
+
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("device for ") {
+            if let Some((name, uri)) = rest.split_once(':') {
+                devices.insert(name.trim().to_string(), uri.trim().to_string());
+            }
+        }
+    }
+
+    devices
+}
+
+fn sanitize_printer_name(name: &str) -> String {
+    let mut sanitized = String::new();
+    let mut last_was_separator = false;
+
+    for ch in name.chars() {
+        let ch = if ch.is_ascii_alphanumeric() {
+            ch
+        } else if matches!(ch, '_' | '-' | '.') {
+            ch
+        } else if ch.is_whitespace() || matches!(ch, ':' | '/' | '%' | '?' | '&' | '=') {
+            '_'
+        } else {
+            continue;
+        };
+
+        let is_separator = matches!(ch, '_' | '-' | '.');
+        if is_separator && last_was_separator {
+            continue;
+        }
+
+        sanitized.push(ch);
+        last_was_separator = is_separator;
+    }
+
+    let sanitized = sanitized.trim_matches(['_', '-', '.']).to_string();
+    if sanitized.is_empty() {
+        "Printer".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn suggested_printer_name(uri: &str) -> String {
+    let decoded = uri.replace("%20", " ");
+    let without_query = decoded.split('?').next().unwrap_or(decoded.as_str());
+    let candidate = without_query
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .filter(|tail| !tail.is_empty())
+        .or_else(|| {
+            without_query
+                .split_once("://")
+                .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        })
+        .unwrap_or("Printer");
+
+    sanitize_printer_name(candidate)
+}
+
+fn parse_installable_printers(
+    output: &str,
+    configured_devices: &HashMap<String, String>,
+) -> Vec<InstallablePrinter> {
+    let configured_uris: Vec<&str> = configured_devices.values().map(String::as_str).collect();
+    let mut installable = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        let Some((kind, uri)) = line.split_once(' ') else {
+            continue;
+        };
+        let kind = kind.trim();
+        let uri = uri.trim();
+
+        if kind.is_empty()
+            || uri.is_empty()
+            || configured_uris.iter().any(|configured| *configured == uri)
+        {
+            continue;
+        }
+
+        installable.push(InstallablePrinter {
+            kind: kind.to_string(),
+            uri: uri.to_string(),
+            suggested_name: suggested_printer_name(uri),
+        });
+    }
+
+    installable.sort_by(|a, b| {
+        a.kind
+            .cmp(&b.kind)
+            .then(a.suggested_name.cmp(&b.suggested_name))
+            .then(a.uri.cmp(&b.uri))
+    });
+    installable.dedup_by(|a, b| a.uri == b.uri);
+    installable
+}
+
+fn parse_printer_states(output: &str, devices: &HashMap<String, String>) -> Vec<Printer> {
+    let mut printers = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        if !line.starts_with("printer ") {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let _printer_word = parts.next();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+
+        let enabled = !line.contains(" disabled ");
+        let state = line
+            .split_once(" is ")
+            .map(|(_, rest)| rest.split('.').next().unwrap_or(rest).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        printers.push(Printer {
+            name: name.to_string(),
+            enabled,
+            accepting_jobs: true,
+            is_default: false,
+            state,
+            device_uri: devices.get(name).cloned(),
+        });
+    }
+
+    printers
+}
+
+fn apply_accepting_jobs(printers: &mut [Printer], output: &str) {
+    for line in output.lines() {
+        let line = line.trim();
+        if !line.starts_with("printer ") {
+            continue;
+        }
+
+        let mut parts = line.split_whitespace();
+        let _printer_word = parts.next();
+        let Some(name) = parts.next() else {
+            continue;
+        };
+
+        if let Some(printer) = printers.iter_mut().find(|printer| printer.name == name) {
+            printer.accepting_jobs = line.contains(" accepting requests ");
+        }
+    }
+}
+
+fn valid_printer_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+}
+
+fn install_printer(name: &str, uri: &str, model: &str) -> Result<String, String> {
+    let name = name.trim();
+    let uri = uri.trim();
+    let model = model.trim();
+    let model = if model.is_empty() {
+        "everywhere"
+    } else {
+        model
+    };
+
+    if !valid_printer_name(name) {
+        return Err(
+            "Printer name can only contain letters, numbers, dots, hyphens, and underscores"
+                .to_string(),
+        );
+    }
+
+    if uri.is_empty() {
+        return Err("Device URI is required".to_string());
+    }
+
+    run_control_command_with_timeout(
+        "lpadmin",
+        &["-p", name, "-E", "-v", uri, "-m", model],
+        Duration::from_secs(10),
+    )
+}
+
+fn load_printer_snapshot() -> PrinterSnapshot {
+    let scheduler_running = match run_control_command("lpstat", &["-r"]) {
+        Ok(output) => output.contains("scheduler is running"),
+        Err(err) => {
+            return PrinterSnapshot {
+                scheduler_running: false,
+                printers: vec![],
+                installable_printers: vec![],
+                error: Some(err),
+            };
+        }
+    };
+
+    let devices_output = run_control_command("lpstat", &["-v"]).unwrap_or_default();
+    let devices = parse_printer_devices(&devices_output);
+    let installable_printers =
+        run_control_command_with_timeout("lpinfo", &["-v"], Duration::from_secs(8))
+            .map(|output| parse_installable_printers(&output, &devices))
+            .unwrap_or_default();
+
+    let printers_output = match run_control_command("lpstat", &["-p"]) {
+        Ok(output) => output,
+        Err(err) => {
+            return PrinterSnapshot {
+                scheduler_running,
+                printers: vec![],
+                installable_printers,
+                error: Some(err),
+            };
+        }
+    };
+
+    let mut printers = parse_printer_states(&printers_output, &devices);
+
+    if let Ok(accepting_output) = run_control_command("lpstat", &["-a"]) {
+        apply_accepting_jobs(&mut printers, &accepting_output);
+    }
+
+    if let Ok(default_output) = run_control_command("lpstat", &["-d"]) {
+        if let Some(default_name) = parse_default_printer(&default_output) {
+            for printer in &mut printers {
+                printer.is_default = printer.name == default_name;
+            }
+        }
+    }
+
+    printers.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then(b.enabled.cmp(&a.enabled))
+            .then(a.name.cmp(&b.name))
+    });
+
+    PrinterSnapshot {
+        scheduler_running,
+        printers,
+        installable_printers,
         error: None,
     }
 }
@@ -1075,7 +1422,10 @@ fn set_scale_if_changed(scale: &gtk::Scale, value: f64) {
 }
 
 fn main() {
-    let app = adw::Application::new(Some("com.focaldesk.Settings"), Default::default());
+    let app = adw::Application::new(
+        Some("com.focaldesk.Settings"),
+        gtk::gio::ApplicationFlags::NON_UNIQUE,
+    );
     app.connect_activate(build_ui);
     app.run();
 }
@@ -1107,6 +1457,7 @@ fn build_ui(app: &adw::Application) {
         "Appearance",
         "Network",
         "Bluetooth",
+        "Printers",
         "Displays",
         "Sound",
         "Workspaces",
@@ -1138,6 +1489,7 @@ fn build_ui(app: &adw::Application) {
     pages.insert("Appearance".to_string(), appearance_page(config.clone()));
     pages.insert("Network".to_string(), network_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
+    pages.insert("Printers".to_string(), printers_page());
     pages.insert("Displays".to_string(), displays_page(config.clone()));
     pages.insert("Sound".to_string(), sound_page());
     pages.insert("Workspaces".to_string(), workspaces_page());
@@ -1380,10 +1732,19 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
     adw::NavigationPage::new(&page, "Appearance")
 }
 
-fn clear_preferences_group(group: &adw::PreferencesGroup) {
-    //  while let Some(child) = group.first_child() {
-    //      group.remove(&child);
-    //  }
+fn clear_dynamic_rows(group: &adw::PreferencesGroup, rows: &DynamicRows) {
+    for row in rows.borrow_mut().drain(..) {
+        group.remove(&row);
+    }
+}
+
+fn add_dynamic_row<W: IsA<gtk::Widget> + Clone + 'static>(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    row: &W,
+) {
+    group.add(row);
+    rows.borrow_mut().push(row.clone().upcast());
 }
 
 fn wifi_security_label(security: &str) -> &str {
@@ -1413,10 +1774,11 @@ fn ethernet_state_label(device: &EthernetDevice) -> String {
 
 fn populate_ethernet_list(
     group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
     snapshot: &EthernetSnapshot,
     status: &gtk::Label,
 ) {
-    //clear_preferences_group(group);
+    clear_dynamic_rows(group, rows);
 
     if let Some(err) = &snapshot.error {
         status.set_text(err);
@@ -1430,7 +1792,7 @@ fn populate_ethernet_list(
         let row = adw::ActionRow::new();
         row.set_title("No Ethernet devices found");
         row.set_subtitle("Plug in a wired adapter or enable one in NetworkManager");
-        group.add(&row);
+        add_dynamic_row(group, rows, &row);
         return;
     }
 
@@ -1481,12 +1843,53 @@ fn populate_ethernet_list(
         }
 
         row.add_suffix(&controls);
-        group.add(&row);
+        add_dynamic_row(group, rows, &row);
     }
 }
 
-fn populate_wifi_list(group: &adw::PreferencesGroup, snapshot: &WifiSnapshot, status: &gtk::Label) {
-    //clear_preferences_group(group);
+fn refresh_ethernet_list_async(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &gtk::Label,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading Ethernet state");
+
+    let row = adw::ActionRow::new();
+    row.set_title("Loading wired devices");
+    row.set_subtitle("Querying NetworkManager");
+    row.add_prefix(&gtk::Image::from_icon_name("network-wired-symbolic"));
+    add_dynamic_row(group, rows, &row);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(load_ethernet_snapshot());
+    });
+
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(snapshot) => {
+            populate_ethernet_list(&group, &rows, &snapshot, &status);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            status.set_text("Unable to load Ethernet state");
+            clear_dynamic_rows(&group, &rows);
+            glib::ControlFlow::Break
+        }
+    });
+}
+
+fn populate_wifi_list(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    snapshot: &WifiSnapshot,
+    status: &gtk::Label,
+) {
+    clear_dynamic_rows(group, rows);
 
     if let Some(err) = &snapshot.error {
         status.set_text(err);
@@ -1503,7 +1906,7 @@ fn populate_wifi_list(group: &adw::PreferencesGroup, snapshot: &WifiSnapshot, st
         } else {
             "Turn on Wi-Fi to scan for networks"
         });
-        group.add(&row);
+        add_dynamic_row(group, rows, &row);
         return;
     }
 
@@ -1572,8 +1975,51 @@ fn populate_wifi_list(group: &adw::PreferencesGroup, snapshot: &WifiSnapshot, st
             row.add_suffix(&controls);
         }
 
-        group.add(&row);
+        add_dynamic_row(group, rows, &row);
     }
+}
+
+fn refresh_wifi_list_async(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &gtk::Label,
+    wifi_switch: &gtk::Switch,
+    updating_switch: &Rc<Cell<bool>>,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading Wi-Fi state");
+
+    let row = adw::ActionRow::new();
+    row.set_title("Loading Wi-Fi networks");
+    row.set_subtitle("Querying NetworkManager");
+    row.add_prefix(&gtk::Image::from_icon_name("network-wireless-symbolic"));
+    add_dynamic_row(group, rows, &row);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(load_wifi_snapshot());
+    });
+
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    let wifi_switch = wifi_switch.clone();
+    let updating_switch = updating_switch.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(snapshot) => {
+            updating_switch.set(true);
+            wifi_switch.set_active(snapshot.enabled);
+            updating_switch.set(false);
+            populate_wifi_list(&group, &rows, &snapshot, &status);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            status.set_text("Unable to load Wi-Fi state");
+            clear_dynamic_rows(&group, &rows);
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 fn network_page() -> adw::NavigationPage {
@@ -1598,6 +2044,7 @@ fn network_page() -> adw::NavigationPage {
     let ethernet_devices_group = adw::PreferencesGroup::new();
     ethernet_devices_group.set_title("Wired Devices");
     page.add(&ethernet_devices_group);
+    let ethernet_device_rows = Rc::new(RefCell::new(Vec::new()));
 
     let wifi_status = dim_label("Loading Wi-Fi state");
 
@@ -1625,30 +2072,43 @@ fn network_page() -> adw::NavigationPage {
     let networks_group = adw::PreferencesGroup::new();
     networks_group.set_title("Available Wi-Fi Networks");
     page.add(&networks_group);
+    let network_rows = Rc::new(RefCell::new(Vec::new()));
 
-    let ethernet_snapshot = load_ethernet_snapshot();
-    populate_ethernet_list(
+    let updating_wifi_switch = Rc::new(Cell::new(false));
+    refresh_ethernet_list_async(
         &ethernet_devices_group,
-        &ethernet_snapshot,
+        &ethernet_device_rows,
         &ethernet_status,
     );
-
-    let wifi_snapshot = load_wifi_snapshot();
-    wifi_switch.set_active(wifi_snapshot.enabled);
-    populate_wifi_list(&networks_group, &wifi_snapshot, &wifi_status);
+    refresh_wifi_list_async(
+        &networks_group,
+        &network_rows,
+        &wifi_status,
+        &wifi_switch,
+        &updating_wifi_switch,
+    );
 
     {
         let ethernet_devices_group = ethernet_devices_group.clone();
+        let ethernet_device_rows = ethernet_device_rows.clone();
         let ethernet_status = ethernet_status.clone();
         ethernet_refresh_button.connect_clicked(move |_| {
-            let snapshot = load_ethernet_snapshot();
-            populate_ethernet_list(&ethernet_devices_group, &snapshot, &ethernet_status);
+            refresh_ethernet_list_async(
+                &ethernet_devices_group,
+                &ethernet_device_rows,
+                &ethernet_status,
+            );
         });
     }
 
     {
         let wifi_status = wifi_status.clone();
+        let updating_wifi_switch = updating_wifi_switch.clone();
         wifi_switch.connect_active_notify(move |switch| {
+            if updating_wifi_switch.get() {
+                return;
+            }
+
             let state = if switch.is_active() { "on" } else { "off" };
             match run_control_command("nmcli", &["radio", "wifi", state]) {
                 Ok(_) => wifi_status.set_text(if switch.is_active() {
@@ -1663,12 +2123,18 @@ fn network_page() -> adw::NavigationPage {
 
     {
         let networks_group = networks_group.clone();
+        let network_rows = network_rows.clone();
         let wifi_status = wifi_status.clone();
         let wifi_switch = wifi_switch.clone();
+        let updating_wifi_switch = updating_wifi_switch.clone();
         refresh_button.connect_clicked(move |_| {
-            let snapshot = load_wifi_snapshot();
-            wifi_switch.set_active(snapshot.enabled);
-            populate_wifi_list(&networks_group, &snapshot, &wifi_status);
+            refresh_wifi_list_async(
+                &networks_group,
+                &network_rows,
+                &wifi_status,
+                &wifi_switch,
+                &updating_wifi_switch,
+            );
         });
     }
 
@@ -1677,10 +2143,11 @@ fn network_page() -> adw::NavigationPage {
 
 fn populate_bluetooth_list(
     group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
     snapshot: &BluetoothSnapshot,
     status: &gtk::Label,
 ) {
-    //clear_preferences_group(group);
+    clear_dynamic_rows(group, rows);
 
     if let Some(err) = &snapshot.error {
         status.set_text(err);
@@ -1701,7 +2168,7 @@ fn populate_bluetooth_list(
         } else {
             "Turn on Bluetooth to manage devices"
         });
-        group.add(&row);
+        add_dynamic_row(group, rows, &row);
         return;
     }
 
@@ -1787,8 +2254,58 @@ fn populate_bluetooth_list(
         }
 
         row.add_suffix(&controls);
-        group.add(&row);
+        add_dynamic_row(group, rows, &row);
     }
+}
+
+fn refresh_bluetooth_list_async(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &gtk::Label,
+    scanning: &Rc<RefCell<bool>>,
+    power_switch: &gtk::Switch,
+    scan_switch: &gtk::Switch,
+    updating_switches: &Rc<Cell<bool>>,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading Bluetooth state");
+
+    let row = adw::ActionRow::new();
+    row.set_title("Loading Bluetooth devices");
+    row.set_subtitle("Querying BlueZ");
+    row.add_prefix(&gtk::Image::from_icon_name("bluetooth-symbolic"));
+    add_dynamic_row(group, rows, &row);
+
+    let scanning_value = *scanning.borrow();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(load_bluetooth_snapshot(scanning_value));
+    });
+
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    let scanning = scanning.clone();
+    let power_switch = power_switch.clone();
+    let scan_switch = scan_switch.clone();
+    let updating_switches = updating_switches.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(snapshot) => {
+            updating_switches.set(true);
+            power_switch.set_active(snapshot.powered);
+            scan_switch.set_active(snapshot.scanning);
+            updating_switches.set(false);
+            *scanning.borrow_mut() = snapshot.scanning;
+            populate_bluetooth_list(&group, &rows, &snapshot, &status);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            status.set_text("Unable to load Bluetooth state");
+            clear_dynamic_rows(&group, &rows);
+            glib::ControlFlow::Break
+        }
+    });
 }
 
 fn bluetooth_page() -> adw::NavigationPage {
@@ -1828,15 +2345,27 @@ fn bluetooth_page() -> adw::NavigationPage {
     let devices_group = adw::PreferencesGroup::new();
     devices_group.set_title("Devices");
     page.add(&devices_group);
+    let device_rows = Rc::new(RefCell::new(Vec::new()));
 
-    let snapshot = load_bluetooth_snapshot(false);
-    power_switch.set_active(snapshot.powered);
-    scan_switch.set_active(snapshot.scanning);
-    populate_bluetooth_list(&devices_group, &snapshot, &status);
+    let updating_switches = Rc::new(Cell::new(false));
+    refresh_bluetooth_list_async(
+        &devices_group,
+        &device_rows,
+        &status,
+        &scanning,
+        &power_switch,
+        &scan_switch,
+        &updating_switches,
+    );
 
     {
         let status = status.clone();
+        let updating_switches = updating_switches.clone();
         power_switch.connect_active_notify(move |switch| {
+            if updating_switches.get() {
+                return;
+            }
+
             let state = if switch.is_active() { "on" } else { "off" };
             match run_control_command("bluetoothctl", &["power", state]) {
                 Ok(_) => status.set_text(if switch.is_active() {
@@ -1852,7 +2381,12 @@ fn bluetooth_page() -> adw::NavigationPage {
     {
         let scanning = scanning.clone();
         let status = status.clone();
+        let updating_switches = updating_switches.clone();
         scan_switch.connect_active_notify(move |switch| {
+            if updating_switches.get() {
+                return;
+            }
+
             let state = if switch.is_active() { "on" } else { "off" };
             match run_control_command("bluetoothctl", &["scan", state]) {
                 Ok(_) => {
@@ -1870,19 +2404,382 @@ fn bluetooth_page() -> adw::NavigationPage {
 
     {
         let devices_group = devices_group.clone();
+        let device_rows = device_rows.clone();
         let status = status.clone();
         let scanning = scanning.clone();
         let power_switch = power_switch.clone();
         let scan_switch = scan_switch.clone();
+        let updating_switches = updating_switches.clone();
         refresh_button.connect_clicked(move |_| {
-            let snapshot = load_bluetooth_snapshot(*scanning.borrow());
-            power_switch.set_active(snapshot.powered);
-            scan_switch.set_active(snapshot.scanning);
-            populate_bluetooth_list(&devices_group, &snapshot, &status);
+            refresh_bluetooth_list_async(
+                &devices_group,
+                &device_rows,
+                &status,
+                &scanning,
+                &power_switch,
+                &scan_switch,
+                &updating_switches,
+            );
         });
     }
 
     adw::NavigationPage::new(&page, "Bluetooth")
+}
+
+fn printer_status_text(printer: &Printer) -> String {
+    let enabled = if printer.enabled {
+        "Enabled"
+    } else {
+        "Disabled"
+    };
+    let accepting = if printer.accepting_jobs {
+        "Accepting jobs"
+    } else {
+        "Rejecting jobs"
+    };
+    let default = if printer.is_default { " | Default" } else { "" };
+
+    match printer.device_uri.as_deref() {
+        Some(uri) if !uri.is_empty() => {
+            format!(
+                "{enabled} | {accepting} | {} | {uri}{default}",
+                printer.state
+            )
+        }
+        _ => format!("{enabled} | {accepting} | {}{default}", printer.state),
+    }
+}
+
+fn refresh_printer_list(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    snapshot: &PrinterSnapshot,
+    status: &gtk::Label,
+) {
+    clear_dynamic_rows(group, rows);
+
+    if let Some(err) = &snapshot.error {
+        status.set_text(err);
+    } else if !snapshot.scheduler_running {
+        status.set_text("CUPS scheduler is not running");
+    } else if snapshot.printers.is_empty() {
+        status.set_text("CUPS is running, but no printers are configured");
+    } else {
+        status.set_text("Printers are managed by CUPS");
+    }
+
+    if snapshot.printers.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title("No Printers Found");
+        row.set_subtitle("No CUPS printer queues are configured");
+        row.add_prefix(&gtk::Image::from_icon_name("printer-symbolic"));
+        add_dynamic_row(group, rows, &row);
+    }
+
+    for printer in &snapshot.printers {
+        let row = adw::ActionRow::new();
+        row.set_title(&printer.name);
+        row.set_subtitle(&printer_status_text(printer));
+        row.add_prefix(&gtk::Image::from_icon_name("printer-symbolic"));
+
+        let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+
+        if printer.is_default {
+            row.add_suffix(&dim_label("Default"));
+        } else {
+            let set_default = gtk::Button::with_label("Set Default");
+            set_default.add_css_class("pill");
+            {
+                let name = printer.name.clone();
+                let status = status.clone();
+                set_default.connect_clicked(move |_| {
+                    match run_control_command("lpadmin", &["-d", &name]) {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("{name} set as default printer"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+            controls.append(&set_default);
+        }
+
+        let toggle = gtk::Button::with_label(if printer.enabled { "Disable" } else { "Enable" });
+        toggle.add_css_class("pill");
+        {
+            let name = printer.name.clone();
+            let command = if printer.enabled {
+                "cupsdisable"
+            } else {
+                "cupsenable"
+            };
+            let status = status.clone();
+            toggle.connect_clicked(move |_| match run_control_command(command, &[&name]) {
+                Ok(output) if output.is_empty() => {
+                    status.set_text(&format!("{command} sent to {name}"));
+                }
+                Ok(output) => status.set_text(&output),
+                Err(err) => status.set_text(&err),
+            });
+        }
+        controls.append(&toggle);
+
+        let queue = gtk::Button::with_label(if printer.accepting_jobs {
+            "Reject Jobs"
+        } else {
+            "Accept Jobs"
+        });
+        queue.add_css_class("pill");
+        {
+            let name = printer.name.clone();
+            let command = if printer.accepting_jobs {
+                "cupsreject"
+            } else {
+                "cupsaccept"
+            };
+            let status = status.clone();
+            queue.connect_clicked(move |_| match run_control_command(command, &[&name]) {
+                Ok(output) if output.is_empty() => {
+                    status.set_text(&format!("{command} sent to {name}"));
+                }
+                Ok(output) => status.set_text(&output),
+                Err(err) => status.set_text(&err),
+            });
+        }
+        controls.append(&queue);
+
+        row.add_suffix(&controls);
+        add_dynamic_row(group, rows, &row);
+    }
+}
+
+fn refresh_installable_printer_list(
+    installable_group: &adw::PreferencesGroup,
+    installable_rows: &DynamicRows,
+    snapshot: &PrinterSnapshot,
+    status: &gtk::Label,
+    printers_group: &adw::PreferencesGroup,
+    printer_rows: &DynamicRows,
+) {
+    clear_dynamic_rows(installable_group, installable_rows);
+
+    if snapshot.installable_printers.is_empty() {
+        let row = adw::ActionRow::new();
+        row.set_title("No Installable Printers Found");
+        row.set_subtitle("CUPS did not report any available printer devices");
+        row.add_prefix(&gtk::Image::from_icon_name("printer-symbolic"));
+        add_dynamic_row(installable_group, installable_rows, &row);
+        return;
+    }
+
+    for printer in &snapshot.installable_printers {
+        let row = adw::ActionRow::new();
+        row.set_title(&printer.suggested_name);
+        row.set_subtitle(&format!("{} | {}", printer.kind, printer.uri));
+        row.add_prefix(&gtk::Image::from_icon_name("printer-symbolic"));
+
+        let install_button = gtk::Button::with_label("Install");
+        install_button.add_css_class("pill");
+        {
+            let name = printer.suggested_name.clone();
+            let uri = printer.uri.clone();
+            let status = status.clone();
+            let printers_group = printers_group.clone();
+            let printer_rows = printer_rows.clone();
+            let installable_group = installable_group.clone();
+            let installable_rows = installable_rows.clone();
+            install_button.connect_clicked(move |_| {
+                match install_printer(&name, &uri, "everywhere") {
+                    Ok(output) => {
+                        if output.is_empty() {
+                            status.set_text(&format!("{name} installed with IPP Everywhere"));
+                        } else {
+                            status.set_text(&output);
+                        }
+                        refresh_printer_list_async(
+                            &printers_group,
+                            &printer_rows,
+                            &installable_group,
+                            &installable_rows,
+                            &status,
+                        );
+                    }
+                    Err(err) => status.set_text(&err),
+                }
+            });
+        }
+        row.add_suffix(&install_button);
+        add_dynamic_row(installable_group, installable_rows, &row);
+    }
+}
+
+fn refresh_printer_list_async(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    installable_group: &adw::PreferencesGroup,
+    installable_rows: &DynamicRows,
+    status: &gtk::Label,
+) {
+    clear_dynamic_rows(group, rows);
+    clear_dynamic_rows(installable_group, installable_rows);
+    status.set_text("Loading CUPS state");
+
+    let row = adw::ActionRow::new();
+    row.set_title("Loading printers");
+    row.set_subtitle("Querying CUPS");
+    row.add_prefix(&gtk::Image::from_icon_name("printer-symbolic"));
+    add_dynamic_row(group, rows, &row);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(load_printer_snapshot());
+    });
+
+    let group = group.clone();
+    let rows = rows.clone();
+    let installable_group = installable_group.clone();
+    let installable_rows = installable_rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(snapshot) => {
+            refresh_printer_list(&group, &rows, &snapshot, &status);
+            refresh_installable_printer_list(
+                &installable_group,
+                &installable_rows,
+                &snapshot,
+                &status,
+                &group,
+                &rows,
+            );
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            status.set_text("Unable to load printer state");
+            clear_dynamic_rows(&group, &rows);
+            clear_dynamic_rows(&installable_group, &installable_rows);
+            glib::ControlFlow::Break
+        }
+    });
+}
+
+fn printers_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Printers");
+
+    let status = dim_label("Loading CUPS state");
+
+    let controls_group = adw::PreferencesGroup::new();
+    controls_group.set_title("CUPS");
+
+    let service_row = adw::ActionRow::new();
+    service_row.set_title("Print Service");
+    service_row.set_subtitle("Use CUPS to manage local and network printers");
+    service_row.add_prefix(&gtk::Image::from_icon_name("printer-symbolic"));
+    controls_group.add(&service_row);
+
+    let install_group = adw::PreferencesGroup::new();
+    install_group.set_title("Install Printer");
+
+    let name_entry = add_entry_row(&install_group, "Name", "Office_Printer");
+    let uri_entry = add_entry_row(
+        &install_group,
+        "Device URI",
+        "ipp://printer.local/ipp/print",
+    );
+    let model_entry = add_entry_row(&install_group, "Driver / Model", "everywhere");
+
+    let install_row = adw::ActionRow::new();
+    install_row.set_title("Add Printer");
+    install_row.set_subtitle("Install the printer with CUPS using IPP Everywhere by default");
+    let install_button = gtk::Button::with_label("Install");
+    install_button.add_css_class("pill");
+    install_row.add_suffix(&install_button);
+    install_group.add(&install_row);
+
+    let refresh_row = adw::ActionRow::new();
+    refresh_row.set_title("Refresh Printers");
+    refresh_row.set_subtitle("Update printer state, queues, and default destination");
+    let refresh_button = gtk::Button::with_label("Refresh");
+    refresh_button.add_css_class("pill");
+    refresh_row.add_suffix(&refresh_button);
+    controls_group.add(&refresh_row);
+    controls_group.add(&status);
+    page.add(&controls_group);
+    page.add(&install_group);
+
+    let printers_group = adw::PreferencesGroup::new();
+    printers_group.set_title("Printers");
+    page.add(&printers_group);
+    let printer_rows = Rc::new(RefCell::new(Vec::new()));
+
+    let installable_group = adw::PreferencesGroup::new();
+    installable_group.set_title("Installable Printers");
+    page.add(&installable_group);
+    let installable_rows = Rc::new(RefCell::new(Vec::new()));
+
+    refresh_printer_list_async(
+        &printers_group,
+        &printer_rows,
+        &installable_group,
+        &installable_rows,
+        &status,
+    );
+
+    {
+        let name_entry = name_entry.clone();
+        let uri_entry = uri_entry.clone();
+        let model_entry = model_entry.clone();
+        let status = status.clone();
+        let printers_group = printers_group.clone();
+        let printer_rows = printer_rows.clone();
+        let installable_group = installable_group.clone();
+        let installable_rows = installable_rows.clone();
+        install_button.connect_clicked(move |_| {
+            let name = name_entry.text().to_string();
+            let uri = uri_entry.text().to_string();
+            let model = model_entry.text().to_string();
+
+            match install_printer(&name, &uri, &model) {
+                Ok(output) => {
+                    let name = name.trim();
+                    if output.is_empty() {
+                        status.set_text(&format!("{name} installed"));
+                    } else {
+                        status.set_text(&output);
+                    }
+                    refresh_printer_list_async(
+                        &printers_group,
+                        &printer_rows,
+                        &installable_group,
+                        &installable_rows,
+                        &status,
+                    );
+                }
+                Err(err) => status.set_text(&err),
+            }
+        });
+    }
+
+    {
+        let printers_group = printers_group.clone();
+        let printer_rows = printer_rows.clone();
+        let installable_group = installable_group.clone();
+        let installable_rows = installable_rows.clone();
+        let status = status.clone();
+        refresh_button.connect_clicked(move |_| {
+            refresh_printer_list_async(
+                &printers_group,
+                &printer_rows,
+                &installable_group,
+                &installable_rows,
+                &status,
+            );
+        });
+    }
+
+    adw::NavigationPage::new(&page, "Printers")
 }
 
 fn sound_page() -> adw::NavigationPage {
