@@ -62,7 +62,7 @@ use focaldesk_flow::ModMask;
 use focaldesk_ipc::{IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn};
 use focaldesk_notifications::NotificationManager;
-use focaldesk_settings_core::{AppSettings, OutputConfig};
+use focaldesk_settings_core::{load_settings, AppSettings, OutputConfig, PrivacySettings};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
@@ -372,6 +372,7 @@ pub struct DesktopInit {
     pub client_wayland_display: String,
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
+    pub privacy: PrivacySettings,
 }
 
 enum DesktopIpcMessage {
@@ -469,6 +470,7 @@ pub struct DesktopState {
 
     pub client_wayland_display: String,
     pub apps: AppSettings,
+    pub privacy: PrivacySettings,
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
     settings_ipc_watchers: Vec<DesktopIpcWatcher>,
     settings_ipc_config: FocalDeskConfig,
@@ -667,12 +669,25 @@ impl DesktopState {
                     },
                 }
             }
-            IpcRequest::ReloadConfig | IpcRequest::Reload => {
+            IpcRequest::ReloadConfig => {
                 let old_config = self.settings_ipc_config.clone();
                 let config = load_config();
                 self.notify_config_changes(&old_config, &config);
                 self.settings_ipc_config = config.clone();
                 self.apply_config(config);
+                IpcResponse::Ok
+            }
+            IpcRequest::Reload => {
+                let old_config = self.settings_ipc_config.clone();
+                let config = load_config();
+                self.notify_config_changes(&old_config, &config);
+                self.settings_ipc_config = config.clone();
+                self.apply_config(config);
+
+                let settings = load_settings();
+                self.apps = settings.apps;
+                self.privacy = settings.privacy;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 IpcResponse::Ok
             }
             IpcRequest::IdentifyDisplays => {
@@ -751,6 +766,7 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
+                output.hdr_enabled = output.hdr_supported && config.hdr_enabled;
             }
             self.update_output_size(output_id, physical_size, scale_factor);
 
@@ -878,7 +894,22 @@ impl DesktopState {
     }
 
     fn apply_config(&mut self, config: FocalDeskConfig) {
-        self.theme.set_builtin(theme_id_from_config(&config));
+        let old_theme_id = self.theme.active_theme().id.clone();
+        let new_theme_id = theme_id_from_config(&config);
+
+        self.theme.set_builtin(new_theme_id.clone());
+
+        if old_theme_id != new_theme_id {
+            if let Some(theme_id) = new_theme_id.builtin_id() {
+                if let Err(err) = self.fonts.reload_for_theme(theme_id) {
+                    flog_error!("failed to reload fonts for theme {:?}: {err}", theme_id);
+                }
+            }
+
+            self.render.fonts_prewarm_done = false;
+            self.render.font_atlas_texture = None;
+        }
+
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
@@ -2185,12 +2216,12 @@ impl DesktopState {
                 self.running = false;
             }
             focaldesk_ui::types::SystemCommand::Restart => {
-                if let Err(err) = Command::new("systemctl").arg("reboot").spawn() {
+                if let Err(err) = focaldesk_power::PowerManager::new().reboot() {
                     flog_error!("failed to start reboot: {err}");
                 }
             }
             focaldesk_ui::types::SystemCommand::Shutdown => {
-                if let Err(err) = Command::new("systemctl").arg("poweroff").spawn() {
+                if let Err(err) = focaldesk_power::PowerManager::new().power_off() {
                     flog_error!("failed to start poweroff: {err}");
                 }
             }
@@ -3240,6 +3271,7 @@ impl DesktopState {
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
+            privacy: init.privacy,
             settings_ipc_rx: start_desktop_settings_ipc(),
             settings_ipc_watchers: Vec::new(),
             settings_ipc_config: load_config(),

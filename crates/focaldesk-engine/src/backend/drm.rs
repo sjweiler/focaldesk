@@ -2,15 +2,14 @@
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
 use crate::backend::common::{
-    bootstrap_compositor_core, finish_xwayland_startup, physical_size_mm_from_pixels,
-    refresh_portal_services, start_xwayland,
+    bootstrap_compositor_core, physical_size_mm_from_pixels, refresh_portal_services,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
-use drm::control::{connector, crtc, Mode};
+use drm::control::{atomic::AtomicModeReq, connector, crtc, property};
 use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, KeyState};
-use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::Offscreen;
+use smithay::backend::renderer::gles::GlesError;
 use smithay::reexports::drm::control::Device as _;
 // `DrmOutput::render_frame` / `initialize_output` drive an internal [`smithay::backend::drm::compositor::DrmCompositor`].
 
@@ -19,11 +18,11 @@ use smithay::backend::input::KeyboardKeyEvent;
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
-use smithay::backend::renderer::utils::DamageBag;
 use smithay::backend::renderer::Frame;
+use smithay::backend::renderer::utils::DamageBag;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
-    render_elements, texture::TextureRenderElement, Id, Kind,
+    Id, Kind, render_elements, texture::TextureRenderElement,
 };
 
 use focaldesk_flow::keybinds::BackendKind;
@@ -40,7 +39,7 @@ use focaldesk_flow::keybinds::BackendKind;
 // - many internals are still TODO so you can connect them to your existing FocalDesk code
 
 use crate::core::backend_render::draw_output;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use smithay::backend::renderer::Bind;
 use smithay::utils::DeviceFd;
 
@@ -61,17 +60,17 @@ use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
 
 use smithay::{
     backend::{
-        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
+        allocator::{Fourcc, Modifier, gbm::GbmAllocator, gbm::GbmBufferFlags},
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
-        egl::{self, context::ContextPriority, EGLContext},
+        egl::{self, EGLContext, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
+            Color32F, ExportMem, ImportDma, ImportEgl,
             element::solid::SolidColorRenderElement,
             gles::{GlesRenderer, GlesTarget, GlesTexture},
-            Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{libseat::LibSeatSession, Session},
-        udev::{primary_gpu, UdevBackend},
+        session::{Session, libseat::LibSeatSession},
+        udev::{UdevBackend, primary_gpu},
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
@@ -92,7 +91,7 @@ use smithay::backend::drm::{
 };
 
 use crate::core::chrome_layout::build_chrome_layout;
-use crate::core::{desktop::DesktopState, ui_state::UiState, OutputState, SceneState};
+use crate::core::{OutputState, SceneState, desktop::DesktopState, ui_state::UiState};
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 
@@ -103,6 +102,10 @@ use smithay::reexports::rustix::fs::OFlags;
 use chrono::Local;
 use image::{ImageBuffer, Rgba};
 use std::fs;
+
+#[cfg(feature = "xwayland")]
+use crate::backend::common::{finish_xwayland_startup, start_xwayland};
+use drm::control::Mode;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DisplayConfig {
@@ -232,6 +235,7 @@ pub(crate) struct CompositorCore {
 
 /// Per-CRTC/output state.
 pub struct DrmSurfaceState {
+    pub connector: connector::Handle,
     pub output: Output,
     pub mode: WlMode,
     pub size: Size<i32, Physical>,
@@ -240,6 +244,7 @@ pub struct DrmSurfaceState {
     pub present_render_id: Id,
     pub present_damage: DamageBag<i32, Buffer>,
     pub hdr_support: HdrSupport,
+    pub hdr_enabled_applied: bool,
 
     pub drm_output: DrmOutput<
         GbmAllocator<DrmDeviceFd>,
@@ -647,18 +652,16 @@ fn ensure_offscreen_texture(
     renderer: &mut GlesRenderer,
     offscreen: &mut Option<OffscreenOutput>,
     size: Size<i32, Physical>,
+    format: Fourcc,
 ) -> Result<(), GlesError> {
     let recreate = match offscreen {
-        Some(existing) => {
-            existing.size != size || existing.texture.format() != Some(Fourcc::Abgr8888)
-        }
+        Some(existing) => existing.size != size || existing.texture.format() != Some(format),
         None => true,
     };
 
     if recreate {
         let tex_size = Size::<i32, Buffer>::from((size.w, size.h));
-        // RGBA8 + RGBA readback is widely supported; BGRA_EXT offscreen reads have regressed to zeros on some GLES.
-        let texture = renderer.create_buffer(Fourcc::Abgr8888, tex_size)?;
+        let texture = renderer.create_buffer(format, tex_size)?;
         *offscreen = Some(OffscreenOutput { size, texture });
     }
 
@@ -888,6 +891,106 @@ fn log_hdr_support(output_name: &str, support: &HdrSupport) {
         support.edid_pq,
         support.edid_hlg,
     ));
+}
+
+fn select_colorspace_value(
+    info: &property::Info,
+    support: &HdrSupport,
+    hdr_enabled: bool,
+) -> Option<u64> {
+    let property::ValueType::Enum(values) = info.value_type() else {
+        return None;
+    };
+
+    let (_, enums) = values.values();
+    let selected = if hdr_enabled {
+        enums
+            .iter()
+            .find(|value| value.name().to_string_lossy().contains("BT2020_RGB"))
+            .or_else(|| {
+                enums
+                    .iter()
+                    .find(|value| value.name().to_string_lossy().contains("BT2020"))
+            })
+    } else if let Some(current_name) = support.current_colorspace.as_deref() {
+        enums
+            .iter()
+            .find(|value| value.name().to_string_lossy() == current_name)
+    } else {
+        enums.first()
+    };
+
+    selected.map(|value| value.value())
+}
+
+fn apply_connector_hdr_state(
+    device: &impl drm::control::Device,
+    connector: connector::Handle,
+    support: &HdrSupport,
+    hdr_enabled: bool,
+) -> Result<(), anyhow::Error> {
+    if !support.is_detected() {
+        return Ok(());
+    }
+
+    let props = device
+        .get_properties(connector)
+        .map_err(|err| anyhow!("failed to read connector properties for HDR: {err}"))?;
+
+    let mut req = AtomicModeReq::new();
+    let mut changed = false;
+
+    for (prop, raw_value) in props.iter() {
+        let info = match device.get_property(*prop) {
+            Ok(info) => info,
+            Err(_) => continue,
+        };
+        let name = info.name().to_string_lossy();
+
+        match name.as_ref() {
+            "Colorspace" => {
+                if let Some(value) = select_colorspace_value(&info, support, hdr_enabled) {
+                    req.add_raw_property(connector.into(), *prop, value);
+                    changed = true;
+                }
+            }
+            "max bpc" => {
+                if let property::ValueType::UnsignedRange(min, max) = info.value_type() {
+                    let target = if hdr_enabled {
+                        Some(max)
+                    } else {
+                        support.current_max_bpc.filter(|value| *value >= min && *value <= max)
+                    };
+                    if let Some(target) = target {
+                        req.add_property(connector, *prop, property::Value::UnsignedRange(target));
+                        changed = true;
+                    }
+                }
+            }
+            "HDR_OUTPUT_METADATA" => {
+                if let property::ValueType::Blob = info.value_type() {
+                    let target = if hdr_enabled {
+                        support.hdr_metadata_blob.unwrap_or(*raw_value)
+                    } else {
+                        0
+                    };
+                    req.add_property(connector, *prop, property::Value::Blob(target));
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !changed {
+        return Ok(());
+    }
+
+    device
+        .atomic_commit(drm::control::AtomicCommitFlags::ALLOW_MODESET, req)
+        .map_err(|err| anyhow!("failed to apply HDR connector state: {err}"))?;
+
+    Ok(())
 }
 
 fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
@@ -1234,6 +1337,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
                     out.hdr_supported = surface.hdr_support.is_detected();
+                    if out.hdr_enabled != surface.hdr_enabled_applied {
+                        if let Err(err) = apply_connector_hdr_state(
+                            device.drm_output_manager.device(),
+                            surface.connector,
+                            &surface.hdr_support,
+                            out.hdr_enabled,
+                        ) {
+                            flog(&format!(
+                                "Failed to update HDR connector state for {:?}: {err}",
+                                surface.output_id
+                            ));
+                        } else {
+                            surface.hdr_enabled_applied = out.hdr_enabled;
+                        }
+                    }
                 }
                 let prepared = prepare_output(
                     &mut data.core.state,
@@ -1250,6 +1368,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     &mut device.renderer,
                     &mut surface.offscreen,
                     surface.size,
+                    Fourcc::Abgr8888,
                 )?;
 
                 {
@@ -1909,6 +2028,18 @@ fn device_added(
                     &DrmOutputRenderElements::default(),
                 )?;
 
+            if let Err(err) = apply_connector_hdr_state(
+                drm_output_manager.device(),
+                *conn,
+                &hdr_support,
+                hdr_enabled,
+            ) {
+                flog(&format!(
+                    "Failed to apply HDR connector state for {}: {err}",
+                    output_name
+                ));
+            }
+
             //let offscreen = OffscreenOutput {
             //    size: tex_phys_size,
             //    texture: None,
@@ -1942,6 +2073,7 @@ fn device_added(
             surfaces.insert(
                 crtc,
                 DrmSurfaceState {
+                    connector: *conn,
                     output,
                     mode: wl_mode,
                     size: Size::<i32, Physical>::from((w as i32, h as i32)),
@@ -1950,6 +2082,7 @@ fn device_added(
                     present_render_id: Id::new(),
                     present_damage: DamageBag::default(),
                     hdr_support,
+                    hdr_enabled_applied: hdr_enabled,
                     drm_output,
                     offscreen: None,
                 },

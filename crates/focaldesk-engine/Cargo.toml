@@ -27,6 +27,7 @@ focaldesk-ipc = { path = "../focaldesk-ipc" }
 focaldesk-themes = { path = "../focaldesk-themes" }
 focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-sounds = { path = "../focaldesk-sounds" }
+focaldesk-power = { path = "../focaldesk-power" }
 
 serde_json = "1"
 zbus = "3"

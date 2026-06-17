@@ -1,17 +1,22 @@
 use adw::prelude::*;
-use focaldesk_config::{FocalDeskConfig, load_config, save_config};
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
-    IpcRequest, IpcResponse, send_desktop_config, send_desktop_request, send_desktop_set,
-    watch_desktop_keys,
+    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
+    IpcResponse,
 };
 use focaldesk_logging::flog_info;
-use focaldesk_settings_core::OutputConfig;
+use focaldesk_power::{PowerCommand, PowerManager};
+use focaldesk_settings_core::{
+    load_settings, save_settings, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
+    PowerButtonAction, Settings,
+};
 
 use gtk::cairo;
 use gtk::glib;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -48,7 +53,9 @@ const MODIFIER_BEHAVIOR_OPTIONS: &[&str] = &["Default", "Caps Lock as Ctrl", "Sw
 const LOG_LEVEL_OPTIONS: &[&str] = &["Error", "Warn", "Info", "Debug", "Trace"];
 const POWER_TIMEOUT_OPTIONS: &[&str] =
     &["Never", "1 minute", "5 minutes", "10 minutes", "30 minutes"];
+const POWER_TIMEOUT_VALUES: &[Option<u32>] = &[None, Some(1), Some(5), Some(10), Some(30)];
 const SUSPEND_TIMEOUT_OPTIONS: &[&str] = &["Never", "15 minutes", "30 minutes", "1 hour"];
+const SUSPEND_TIMEOUT_VALUES: &[Option<u32>] = &[None, Some(15), Some(30), Some(60)];
 const POWER_BUTTON_OPTIONS: &[&str] = &["Show power menu", "Suspend", "Power off", "Do nothing"];
 const LID_CLOSE_OPTIONS: &[&str] = &["Suspend", "Blank screen", "Lock screen", "Do nothing"];
 const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "Power off"];
@@ -180,6 +187,7 @@ fn save_displays(displays: &[DisplayConfig]) {
             refresh_mhz: display.refresh_mhz,
             scale: display.scale as f32,
             primary: display.primary,
+            hdr_enabled: display.hdr_enabled,
         })
         .collect();
 
@@ -1388,6 +1396,122 @@ fn persist_config_key(config: &FocalDeskConfig, key: &str, value: serde_json::Va
     }
 }
 
+fn persist_settings(settings: &Settings) {
+    if let Err(err) = save_settings(settings) {
+        flog_info!("failed to save settings: {err}");
+        return;
+    }
+
+    if let Err(err) = send_desktop_request(&IpcRequest::Reload) {
+        flog_info!("settings IPC reload unavailable after settings save: {err}");
+    }
+}
+
+fn focaldesk_config_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
+}
+
+fn focaldesk_config_path() -> PathBuf {
+    focaldesk_config_dir().join("config.toml")
+}
+
+fn focaldesk_log_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(path) = std::env::var("FOCALDESK_LOG_FILE") {
+        paths.push(PathBuf::from(path));
+    }
+
+    if let Some(state_dir) = dirs::state_dir() {
+        paths.push(state_dir.join("focaldesk").join("focaldesk.log"));
+    }
+
+    if let Some(cache_dir) = dirs::cache_dir() {
+        paths.push(cache_dir.join("focaldesk").join("focaldesk.log"));
+    }
+
+    paths.push(PathBuf::from("/tmp/focaldesk.log"));
+    paths
+}
+
+fn existing_focaldesk_log_path() -> Option<PathBuf> {
+    focaldesk_log_candidates()
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn open_path(path: &PathBuf) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("xdg-open failed: {err}"))
+}
+
+fn session_type_label() -> String {
+    std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("WAYLAND_DISPLAY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| "wayland".to_string())
+        })
+        .or_else(|| {
+            std::env::var("DISPLAY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| "x11".to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn diagnostics_text() -> String {
+    let settings_path = focaldesk_settings_core::settings_path();
+    let log_path = existing_focaldesk_log_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not found".to_string());
+    let current_exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "FocalDesk diagnostics\n\
+         Version: {}\n\
+         Build hash: {}\n\
+         Build profile: {}\n\
+         OS/arch: {}/{}\n\
+         Session type: {}\n\
+         Current executable: {}\n\
+         Config path: {}\n\
+         Settings path: {}\n\
+         Log path: {}\n\
+         WAYLAND_DISPLAY: {}\n\
+         DISPLAY: {}\n\
+         XDG_CURRENT_DESKTOP: {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("development"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        session_type_label(),
+        current_exe,
+        focaldesk_config_path().display(),
+        settings_path.display(),
+        log_path,
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("DISPLAY").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()),
+    )
+}
+
 fn start_config_watch(keys: &[&str]) -> mpsc::Receiver<ConfigEvent> {
     let (tx, rx) = mpsc::channel();
     let keys = keys.iter().map(|key| (*key).to_string()).collect();
@@ -1432,6 +1556,7 @@ fn main() {
 
 fn build_ui(app: &adw::Application) {
     let config = Rc::new(RefCell::new(load_config()));
+    let settings = Rc::new(RefCell::new(load_settings()));
 
     let window = adw::ApplicationWindow::new(app);
     window.set_title(Some("FocalDesk Settings"));
@@ -1460,6 +1585,7 @@ fn build_ui(app: &adw::Application) {
         "Printers",
         "Displays",
         "Sound",
+        "Applications",
         "Workspaces",
         "Keyboard",
         "Privacy",
@@ -1484,6 +1610,10 @@ fn build_ui(app: &adw::Application) {
     let sidebar_page = adw::NavigationPage::new(&sidebar_box, "Settings");
 
     // ----- content pages -----
+    let content_stack = gtk::Stack::new();
+    content_stack.set_hexpand(true);
+    content_stack.set_vexpand(true);
+    let content_page = adw::NavigationPage::new(&content_stack, "Content");
     let mut pages: HashMap<String, adw::NavigationPage> = HashMap::new();
 
     pages.insert("Appearance".to_string(), appearance_page(config.clone()));
@@ -1492,28 +1622,33 @@ fn build_ui(app: &adw::Application) {
     pages.insert("Printers".to_string(), printers_page());
     pages.insert("Displays".to_string(), displays_page(config.clone()));
     pages.insert("Sound".to_string(), sound_page());
+    pages.insert(
+        "Applications".to_string(),
+        applications_page(settings.clone()),
+    );
     pages.insert("Workspaces".to_string(), workspaces_page());
     pages.insert("Keyboard".to_string(), keyboard_page());
-    pages.insert("Privacy".to_string(), privacy_page());
-    pages.insert("Power".to_string(), power_page());
+    pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
+    pages.insert("Power".to_string(), power_page(settings.clone()));
     pages.insert("Debug".to_string(), debug_page());
     pages.insert("About".to_string(), about_page());
 
+    for (name, page) in &pages {
+        content_stack.add_named(page, Some(name.as_str()));
+    }
+
     split.set_sidebar(Some(&sidebar_page));
-    split.set_content(Some(pages.get("Appearance").unwrap()));
+    split.set_content(Some(&content_page));
+    content_stack.set_visible_child_name("Appearance");
     list.select_row(list.row_at_index(0).as_ref());
 
-    let split_clone = split.clone();
-    let pages_clone = pages.clone();
+    let content_stack_clone = content_stack.clone();
 
     list.connect_row_selected(move |_, row| {
         if let Some(row) = row {
             if let Some(label) = row.child().and_then(|w| w.downcast::<gtk::Label>().ok()) {
                 let text = label.text().to_string();
-
-                if let Some(page) = pages_clone.get(&text) {
-                    split_clone.set_content(Some(page));
-                }
+                content_stack_clone.set_visible_child_name(&text);
             }
         }
     });
@@ -2873,6 +3008,75 @@ fn sound_page() -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Sound")
 }
 
+fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Applications");
+
+    let defaults_group = adw::PreferencesGroup::new();
+    defaults_group.set_title("Default Applications");
+    defaults_group.set_description(Some(
+        "Commands used by FocalDesk when opening common application targets.",
+    ));
+
+    let terminal = add_entry_row(&defaults_group, "Terminal", "alacritty");
+    terminal.set_text(&settings.borrow().apps.terminal);
+    {
+        let settings = settings.clone();
+        terminal.connect_changed(move |entry| {
+            settings.borrow_mut().apps.terminal = entry.text().to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let browser = add_entry_row(&defaults_group, "Web browser", "google-chrome");
+    browser.set_text(&settings.borrow().apps.browser);
+    {
+        let settings = settings.clone();
+        browser.connect_changed(move |entry| {
+            settings.borrow_mut().apps.browser = entry.text().to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let file_manager = add_entry_row(&defaults_group, "File manager", "focaldesk-files");
+    file_manager.set_text(&settings.borrow().apps.file_manager);
+    {
+        let settings = settings.clone();
+        file_manager.connect_changed(move |entry| {
+            settings.borrow_mut().apps.file_manager = entry.text().to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    page.add(&defaults_group);
+
+    let actions_group = adw::PreferencesGroup::new();
+    actions_group.set_title("Actions");
+    let reset = add_button_row(
+        &actions_group,
+        "Reset application defaults",
+        Some("Restore the built-in FocalDesk application commands"),
+        "Reset",
+    );
+    reset.connect_clicked({
+        let settings = settings.clone();
+        let terminal = terminal.clone();
+        let browser = browser.clone();
+        let file_manager = file_manager.clone();
+        move |_| {
+            settings.borrow_mut().apps = focaldesk_settings_core::default_settings().apps;
+            let apps = settings.borrow().apps.clone();
+            terminal.set_text(&apps.terminal);
+            browser.set_text(&apps.browser);
+            file_manager.set_text(&apps.file_manager);
+            persist_settings(&settings.borrow());
+        }
+    });
+    page.add(&actions_group);
+
+    adw::NavigationPage::new(&page, "Applications")
+}
+
 fn workspaces_page() -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Workspaces");
@@ -2975,7 +3179,7 @@ fn keyboard_page() -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Keyboard")
 }
 
-fn privacy_page() -> adw::NavigationPage {
+fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Privacy");
 
@@ -2999,22 +3203,36 @@ fn privacy_page() -> adw::NavigationPage {
         Some("Per-app camera permissions will appear here"),
         "Placeholder",
     );
-    add_info_row(
+    let location_services = add_switch_row(
         &permissions_group,
         "Location services",
-        Some("Location access is not connected yet"),
-        "Placeholder",
+        Some("Allow location-aware apps to request location access"),
+        settings.borrow().privacy.location_services,
     );
+    {
+        let settings = settings.clone();
+        location_services.connect_active_notify(move |switch| {
+            settings.borrow_mut().privacy.location_services = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&permissions_group);
 
     let history_group = adw::PreferencesGroup::new();
     history_group.set_title("History");
-    add_switch_row(
+    let recent_files = add_switch_row(
         &history_group,
         "Recent files",
         Some("Allow apps to show recently opened files"),
-        true,
+        settings.borrow().privacy.recent_files,
     );
+    {
+        let settings = settings.clone();
+        recent_files.connect_active_notify(move |switch| {
+            settings.borrow_mut().privacy.recent_files = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     let history_status = dim_label("Recent history is local to this user");
     let clear_history = add_button_row(
         &history_group,
@@ -3031,70 +3249,316 @@ fn privacy_page() -> adw::NavigationPage {
 
     let lock_group = adw::PreferencesGroup::new();
     lock_group.set_title("Lock Screen");
-    add_switch_row(
+    let hide_lock_screen_notifications = add_switch_row(
         &lock_group,
         "Hide notifications on lock screen",
         Some("Keep notification content private while locked"),
-        true,
+        settings.borrow().privacy.hide_lock_screen_notifications,
     );
+    {
+        let settings = settings.clone();
+        hide_lock_screen_notifications.connect_active_notify(move |switch| {
+            settings.borrow_mut().privacy.hide_lock_screen_notifications = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&lock_group);
 
     adw::NavigationPage::new(&page, "Privacy")
 }
 
-fn power_page() -> adw::NavigationPage {
+fn option_index(values: &[Option<u32>], value: Option<u32>) -> u32 {
+    values
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(0) as u32
+}
+
+fn power_button_action_index(action: PowerButtonAction) -> u32 {
+    match action {
+        PowerButtonAction::ShowPowerMenu => 0,
+        PowerButtonAction::Suspend => 1,
+        PowerButtonAction::PowerOff => 2,
+        PowerButtonAction::DoNothing => 3,
+    }
+}
+
+fn lid_close_action_index(action: LidCloseAction) -> u32 {
+    match action {
+        LidCloseAction::Suspend => 0,
+        LidCloseAction::BlankScreen => 1,
+        LidCloseAction::LockScreen => 2,
+        LidCloseAction::DoNothing => 3,
+    }
+}
+
+fn low_battery_action_index(action: LowBatteryAction) -> u32 {
+    match action {
+        LowBatteryAction::NotifyOnly => 0,
+        LowBatteryAction::Suspend => 1,
+        LowBatteryAction::Hibernate => 2,
+        LowBatteryAction::PowerOff => 3,
+    }
+}
+
+fn performance_mode_index(mode: PerformanceMode) -> u32 {
+    match mode {
+        PerformanceMode::Balanced => 0,
+        PerformanceMode::Performance => 1,
+        PerformanceMode::PowerSaver => 2,
+    }
+}
+
+fn selected_power_button_action(index: u32) -> PowerButtonAction {
+    match index {
+        1 => PowerButtonAction::Suspend,
+        2 => PowerButtonAction::PowerOff,
+        3 => PowerButtonAction::DoNothing,
+        _ => PowerButtonAction::ShowPowerMenu,
+    }
+}
+
+fn selected_lid_close_action(index: u32) -> LidCloseAction {
+    match index {
+        1 => LidCloseAction::BlankScreen,
+        2 => LidCloseAction::LockScreen,
+        3 => LidCloseAction::DoNothing,
+        _ => LidCloseAction::Suspend,
+    }
+}
+
+fn selected_low_battery_action(index: u32) -> LowBatteryAction {
+    match index {
+        1 => LowBatteryAction::Suspend,
+        2 => LowBatteryAction::Hibernate,
+        3 => LowBatteryAction::PowerOff,
+        _ => LowBatteryAction::NotifyOnly,
+    }
+}
+
+fn selected_performance_mode(index: u32) -> PerformanceMode {
+    match index {
+        1 => PerformanceMode::Performance,
+        2 => PerformanceMode::PowerSaver,
+        _ => PerformanceMode::Balanced,
+    }
+}
+
+fn performance_profile_name(mode: PerformanceMode) -> &'static str {
+    match mode {
+        PerformanceMode::Balanced => "balanced",
+        PerformanceMode::Performance => "performance",
+        PerformanceMode::PowerSaver => "power-saver",
+    }
+}
+
+fn power_status_text(manager: &PowerManager) -> String {
+    let snapshot = manager.snapshot();
+    let battery = snapshot
+        .batteries
+        .first()
+        .map(|battery| {
+            let percent = battery
+                .percentage
+                .map(|value| format!("{value}%"))
+                .unwrap_or_else(|| "unknown charge".to_string());
+            let state = battery.state.as_deref().unwrap_or("unknown");
+            format!("{percent}, {state}")
+        })
+        .unwrap_or_else(|| "No battery detected".to_string());
+    let line_power = match snapshot.line_power_online {
+        Some(true) => "plugged in",
+        Some(false) => "on battery",
+        None => "line power unknown",
+    };
+    let profile = snapshot
+        .performance_profile
+        .as_deref()
+        .filter(|profile| !profile.is_empty())
+        .unwrap_or("profile unknown");
+
+    format!("{battery}; {line_power}; {profile}")
+}
+
+fn run_power_action(manager: &PowerManager, command: PowerCommand, status: &gtk::Label) {
+    match manager.execute(command) {
+        Ok(()) => status.set_text("Power action started"),
+        Err(err) => {
+            flog_info!("power action failed: {err}");
+            status.set_text("Power action failed");
+        }
+    }
+}
+
+fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Power");
+    let manager = PowerManager::new();
+
+    let status_group = adw::PreferencesGroup::new();
+    status_group.set_title("Status");
+    let status_label = dim_label(&power_status_text(&manager));
+    status_group.add(&status_label);
+    page.add(&status_group);
 
     let timing_group = adw::PreferencesGroup::new();
     timing_group.set_title("Idle");
-    add_dropdown_row(
+    let blank_screen_dropdown = add_dropdown_row(
         &timing_group,
         "Blank screen after",
         Some("Turn off display output after inactivity"),
         POWER_TIMEOUT_OPTIONS,
-        3,
+        option_index(
+            POWER_TIMEOUT_VALUES,
+            settings.borrow().power.blank_screen_minutes,
+        ),
     );
-    add_dropdown_row(
+    {
+        let settings = settings.clone();
+        blank_screen_dropdown.connect_selected_notify(move |dropdown| {
+            let value = POWER_TIMEOUT_VALUES
+                .get(dropdown.selected() as usize)
+                .copied()
+                .unwrap_or(None);
+            settings.borrow_mut().power.blank_screen_minutes = value;
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let suspend_dropdown = add_dropdown_row(
         &timing_group,
         "Suspend after",
         Some("Suspend the session after longer inactivity"),
         SUSPEND_TIMEOUT_OPTIONS,
-        1,
+        option_index(
+            SUSPEND_TIMEOUT_VALUES,
+            settings.borrow().power.suspend_minutes,
+        ),
     );
+    {
+        let settings = settings.clone();
+        suspend_dropdown.connect_selected_notify(move |dropdown| {
+            let value = SUSPEND_TIMEOUT_VALUES
+                .get(dropdown.selected() as usize)
+                .copied()
+                .unwrap_or(None);
+            settings.borrow_mut().power.suspend_minutes = value;
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&timing_group);
 
     let actions_group = adw::PreferencesGroup::new();
     actions_group.set_title("Actions");
-    add_dropdown_row(
+    let power_button_dropdown = add_dropdown_row(
         &actions_group,
         "Power button action",
         None,
         POWER_BUTTON_OPTIONS,
-        0,
+        power_button_action_index(settings.borrow().power.power_button_action),
     );
-    add_dropdown_row(
+    {
+        let settings = settings.clone();
+        power_button_dropdown.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().power.power_button_action =
+                selected_power_button_action(dropdown.selected());
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let lid_dropdown = add_dropdown_row(
         &actions_group,
         "Lid close action",
         Some("Shown when laptop lid detection is available"),
         LID_CLOSE_OPTIONS,
-        0,
+        lid_close_action_index(settings.borrow().power.lid_close_action),
     );
-    add_dropdown_row(
+    {
+        let settings = settings.clone();
+        lid_dropdown.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().power.lid_close_action =
+                selected_lid_close_action(dropdown.selected());
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let low_battery_dropdown = add_dropdown_row(
         &actions_group,
         "Low battery action",
-        Some("Battery policy placeholder"),
+        Some("Action for critically low battery"),
         LOW_BATTERY_OPTIONS,
-        0,
+        low_battery_action_index(settings.borrow().power.low_battery_action),
     );
-    add_dropdown_row(
+    {
+        let settings = settings.clone();
+        low_battery_dropdown.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().power.low_battery_action =
+                selected_low_battery_action(dropdown.selected());
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let performance_dropdown = add_dropdown_row(
         &actions_group,
         "Performance mode",
-        Some("Hardware performance profile placeholder"),
+        Some("Uses power-profiles-daemon when available"),
         PERFORMANCE_MODE_OPTIONS,
-        0,
+        performance_mode_index(settings.borrow().power.performance_mode),
     );
+    {
+        let settings = settings.clone();
+        let manager = manager.clone();
+        let status_label = status_label.clone();
+        performance_dropdown.connect_selected_notify(move |dropdown| {
+            let mode = selected_performance_mode(dropdown.selected());
+            settings.borrow_mut().power.performance_mode = mode;
+            persist_settings(&settings.borrow());
+
+            if let Err(err) = manager.set_performance_profile(performance_profile_name(mode)) {
+                flog_info!("failed to set performance profile: {err}");
+                status_label.set_text("Performance profile change failed");
+            } else {
+                status_label.set_text(&power_status_text(&manager));
+            }
+        });
+    }
     page.add(&actions_group);
+
+    let system_group = adw::PreferencesGroup::new();
+    system_group.set_title("System");
+    let suspend_button = add_button_row(&system_group, "Suspend now", None, "Suspend");
+    {
+        let manager = manager.clone();
+        let status_label = status_label.clone();
+        suspend_button.connect_clicked(move |_| {
+            run_power_action(&manager, PowerCommand::Suspend, &status_label);
+        });
+    }
+    let hibernate_button = add_button_row(&system_group, "Hibernate now", None, "Hibernate");
+    {
+        let manager = manager.clone();
+        let status_label = status_label.clone();
+        hibernate_button.connect_clicked(move |_| {
+            run_power_action(&manager, PowerCommand::Hibernate, &status_label);
+        });
+    }
+    let restart_button = add_button_row(&system_group, "Restart", None, "Restart");
+    {
+        let manager = manager.clone();
+        let status_label = status_label.clone();
+        restart_button.connect_clicked(move |_| {
+            run_power_action(&manager, PowerCommand::Reboot, &status_label);
+        });
+    }
+    let poweroff_button = add_button_row(&system_group, "Power off", None, "Power off");
+    {
+        let manager = manager.clone();
+        let status_label = status_label.clone();
+        poweroff_button.connect_clicked(move |_| {
+            run_power_action(&manager, PowerCommand::PowerOff, &status_label);
+        });
+    }
+    page.add(&system_group);
 
     adw::NavigationPage::new(&page, "Power")
 }
@@ -3149,7 +3613,19 @@ fn debug_page() -> adw::NavigationPage {
     );
     open_log.connect_clicked({
         let debug_status = debug_status.clone();
-        move |_| debug_status.set_text("Log file opening is not wired yet")
+        move |_| {
+            if let Some(path) = existing_focaldesk_log_path() {
+                match open_path(&path) {
+                    Ok(()) => debug_status.set_text("Opened log file"),
+                    Err(err) => {
+                        flog_info!("failed to open log file: {err}");
+                        debug_status.set_text("Unable to open log file");
+                    }
+                }
+            } else {
+                debug_status.set_text("No FocalDesk log file was found");
+            }
+        }
     });
     let copy_diagnostics = add_button_row(
         &files_group,
@@ -3159,7 +3635,14 @@ fn debug_page() -> adw::NavigationPage {
     );
     copy_diagnostics.connect_clicked({
         let debug_status = debug_status.clone();
-        move |_| debug_status.set_text("Diagnostics copied to clipboard placeholder")
+        move |_| {
+            if let Some(display) = gtk::gdk::Display::default() {
+                display.clipboard().set_text(&diagnostics_text());
+                debug_status.set_text("Diagnostics copied to clipboard");
+            } else {
+                debug_status.set_text("Clipboard is unavailable");
+            }
+        }
     });
     files_group.add(&debug_status);
     page.add(&files_group);
@@ -3197,9 +3680,22 @@ fn about_page() -> adw::NavigationPage {
 
     let session_group = adw::PreferencesGroup::new();
     session_group.set_title("Session");
-    add_info_row(&session_group, "Session type", None, "DRM");
-    add_info_row(&session_group, "Display manager", None, "GDM compatible");
-    add_info_row(&session_group, "XWayland", None, "Enabled");
+    let session_type = session_type_label();
+    let current_exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    add_info_row(&session_group, "Session type", None, &session_type);
+    add_info_row(
+        &session_group,
+        "Build profile",
+        None,
+        if cfg!(debug_assertions) {
+            "Debug"
+        } else {
+            "Release"
+        },
+    );
+    add_info_row(&session_group, "Executable", None, &current_exe);
     page.add(&session_group);
 
     let project_group = adw::PreferencesGroup::new();

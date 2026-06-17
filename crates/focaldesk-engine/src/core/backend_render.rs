@@ -303,9 +303,7 @@ pub fn prepare_output(
         state.render.fonts_prewarm_done = true;
     }
 
-    if force_full_damage {
-        prepare_portal_chrome_glyphs(state, scale_factor)?;
-    }
+    prepare_portal_chrome_glyphs(state, scale_factor)?;
 
     prepare_lock_screen_glyphs(state)?;
 
@@ -444,7 +442,7 @@ fn prepare_portal_chrome_glyphs(
     let title_style = style_for(FontRole::Title, 24, builtin_id);
     state.fonts.prepare_text("FOCALDESK", title_style)?;
 
-    let meta_style = style_for(FontRole::Meta, 14, builtin_id);
+    let meta_style = style_for(FontRole::Meta, 18, builtin_id);
     let output_number = state.focused_output.0;
     let meta = format!("OUT {output_number} · WS 1");
     state.fonts.prepare_text(&meta, meta_style)?;
@@ -555,9 +553,14 @@ pub fn draw_output(
         .get(&prepared.frame_ctx.rendering_output)
         .map(|o| o.active_workspace)
         .unwrap_or(state.active_workspace);
-    let notifications = state
-        .notifications
-        .visible_snapshots(prepared.frame_ctx.now);
+    let notifications = if state.lock_screen.active && state.privacy.hide_lock_screen_notifications
+    {
+        Vec::new()
+    } else {
+        state
+            .notifications
+            .visible_snapshots(prepared.frame_ctx.now)
+    };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
 
     let inputs = RenderInputs {

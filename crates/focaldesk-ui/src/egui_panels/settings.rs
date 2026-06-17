@@ -2,6 +2,7 @@ use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
 use focaldesk_config::{FocalDeskConfig, save_config};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
@@ -63,6 +64,125 @@ fn run_control_command(program: &str, args: &[&str]) -> Result<String, String> {
         let message = if stderr.is_empty() { stdout } else { stderr };
         Err(format!("{program}: {message}"))
     }
+}
+
+fn focaldesk_config_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
+        .join("config.toml")
+}
+
+fn focaldesk_log_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(path) = std::env::var("FOCALDESK_LOG_FILE") {
+        paths.push(PathBuf::from(path));
+    }
+
+    if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })
+    {
+        paths.push(state_dir.join("focaldesk").join("focaldesk.log"));
+    }
+
+    if let Some(cache_dir) = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+    {
+        paths.push(cache_dir.join("focaldesk").join("focaldesk.log"));
+    }
+
+    paths.push(PathBuf::from("/tmp/focaldesk.log"));
+    paths
+}
+
+fn existing_focaldesk_log_path() -> Option<PathBuf> {
+    focaldesk_log_candidates()
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn open_path(path: &PathBuf) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("xdg-open failed: {err}"))
+}
+
+fn session_type_label() -> String {
+    std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("WAYLAND_DISPLAY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| "wayland".to_string())
+        })
+        .or_else(|| {
+            std::env::var("DISPLAY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| "x11".to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn diagnostics_text() -> String {
+    let log_path = existing_focaldesk_log_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not found".to_string());
+    let current_exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "FocalDesk diagnostics\n\
+         Version: {}\n\
+         Build hash: {}\n\
+         Build profile: {}\n\
+         OS/arch: {}/{}\n\
+         Session type: {}\n\
+         Current executable: {}\n\
+         Config path: {}\n\
+         Log path: {}\n\
+         WAYLAND_DISPLAY: {}\n\
+         DISPLAY: {}\n\
+         XDG_CURRENT_DESKTOP: {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("development"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        session_type_label(),
+        current_exe,
+        focaldesk_config_path().display(),
+        log_path,
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("DISPLAY").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()),
+    )
 }
 
 fn split_nmcli_line(line: &str) -> Vec<String> {
@@ -284,6 +404,7 @@ pub struct SettingsPanel {
     network_status: String,
     bluetooth_status: String,
     bluetooth_scanning: bool,
+    debug_status: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -309,6 +430,7 @@ impl Default for SettingsPanel {
             network_status: String::new(),
             bluetooth_status: String::new(),
             bluetooth_scanning: false,
+            debug_status: "Diagnostics are generated locally".to_string(),
             open: false,
         }
     }
@@ -668,6 +790,100 @@ impl SettingsPanel {
         }
     }
 
+    fn debug_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Debug");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.heading("Diagnostics");
+            ui.label(format!("Session type: {}", session_type_label()));
+            ui.label(format!(
+                "Build profile: {}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            ));
+            ui.label(format!(
+                "Log file: {}",
+                existing_focaldesk_log_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".to_string())
+            ));
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open log file").clicked() {
+                    if let Some(path) = existing_focaldesk_log_path() {
+                        self.debug_status = match open_path(&path) {
+                            Ok(()) => "Opened log file".to_string(),
+                            Err(err) => err,
+                        };
+                    } else {
+                        self.debug_status = "No FocalDesk log file was found".to_string();
+                    }
+                }
+
+                if ui.button("Copy diagnostics").clicked() {
+                    ui.ctx().copy_text(diagnostics_text());
+                    self.debug_status = "Diagnostics copied to clipboard".to_string();
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.label(&self.debug_status);
+        });
+    }
+
+    fn about_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("About");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.heading("FocalDesk");
+            ui.label("A Rust desktop environment built on Smithay and GTK4");
+            ui.separator();
+            ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+            ui.label(format!(
+                "Build hash: {}",
+                option_env!("VERGEN_GIT_SHA").unwrap_or("development")
+            ));
+            ui.label("Status: Early alpha");
+        });
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Session");
+            ui.label(format!("Session type: {}", session_type_label()));
+            ui.label(format!(
+                "Build profile: {}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            ));
+            ui.label(format!(
+                "Config path: {}",
+                focaldesk_config_path().display()
+            ));
+        });
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Project");
+            ui.label("License: See LICENSE");
+            ui.hyperlink_to(
+                "Source code and issue tracking",
+                "https://github.com/sjweiler/focaldesk",
+            );
+            ui.label("Credits: Smithay, GTK4, PipeWire, Rust");
+        });
+    }
+
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -723,8 +939,8 @@ impl SettingsPanel {
                                 SettingsPage::Keyboard => self.show_placeholder(ui, "Keyboard"),
                                 SettingsPage::Privacy => self.show_placeholder(ui, "Privacy"),
                                 SettingsPage::Power => self.show_placeholder(ui, "Power"),
-                                SettingsPage::Debug => self.show_placeholder(ui, "Debug"),
-                                SettingsPage::About => self.show_placeholder(ui, "About"),
+                                SettingsPage::Debug => self.debug_page(ui),
+                                SettingsPage::About => self.about_page(ui),
                             }
                         });
                 });

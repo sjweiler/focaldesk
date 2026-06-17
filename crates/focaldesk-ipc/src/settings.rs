@@ -1,5 +1,8 @@
 use focaldesk_ipc::{IpcRequest, IpcResponse, SOCKET_PATH};
-use focaldesk_settings_core::{Settings, load_settings, save_settings};
+use focaldesk_settings_core::{
+    LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, Settings, load_settings,
+    save_settings,
+};
 use std::{
     io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
@@ -148,8 +151,85 @@ fn apply_setting_value(
                 .to_string();
         }
 
+        "privacy.recent_files" => {
+            settings.privacy.recent_files = value.as_bool().ok_or("recent_files must be bool")?;
+        }
+
+        "privacy.location_services" => {
+            settings.privacy.location_services =
+                value.as_bool().ok_or("location_services must be bool")?;
+        }
+
+        "privacy.hide_lock_screen_notifications" => {
+            settings.privacy.hide_lock_screen_notifications = value
+                .as_bool()
+                .ok_or("hide_lock_screen_notifications must be bool")?;
+        }
+
+        "power.blank_screen_minutes" => {
+            settings.power.blank_screen_minutes = optional_minutes(value)?;
+        }
+
+        "power.suspend_minutes" => {
+            settings.power.suspend_minutes = optional_minutes(value)?;
+        }
+
+        "power.power_button_action" => {
+            settings.power.power_button_action =
+                match value.as_str().ok_or("power_button_action must be string")? {
+                    "show_power_menu" => PowerButtonAction::ShowPowerMenu,
+                    "suspend" => PowerButtonAction::Suspend,
+                    "power_off" => PowerButtonAction::PowerOff,
+                    "do_nothing" => PowerButtonAction::DoNothing,
+                    other => return Err(format!("unknown power button action: {other}")),
+                };
+        }
+
+        "power.lid_close_action" => {
+            settings.power.lid_close_action =
+                match value.as_str().ok_or("lid_close_action must be string")? {
+                    "suspend" => LidCloseAction::Suspend,
+                    "blank_screen" => LidCloseAction::BlankScreen,
+                    "lock_screen" => LidCloseAction::LockScreen,
+                    "do_nothing" => LidCloseAction::DoNothing,
+                    other => return Err(format!("unknown lid close action: {other}")),
+                };
+        }
+
+        "power.low_battery_action" => {
+            settings.power.low_battery_action =
+                match value.as_str().ok_or("low_battery_action must be string")? {
+                    "notify_only" => LowBatteryAction::NotifyOnly,
+                    "suspend" => LowBatteryAction::Suspend,
+                    "hibernate" => LowBatteryAction::Hibernate,
+                    "power_off" => LowBatteryAction::PowerOff,
+                    other => return Err(format!("unknown low battery action: {other}")),
+                };
+        }
+
+        "power.performance_mode" => {
+            settings.power.performance_mode =
+                match value.as_str().ok_or("performance_mode must be string")? {
+                    "balanced" => PerformanceMode::Balanced,
+                    "performance" => PerformanceMode::Performance,
+                    "power_saver" => PerformanceMode::PowerSaver,
+                    other => return Err(format!("unknown performance mode: {other}")),
+                };
+        }
+
         _ => return Err(format!("unknown setting path: {path}")),
     }
 
     Ok(())
+}
+
+fn optional_minutes(value: serde_json::Value) -> Result<Option<u32>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+
+    let minutes = value.as_u64().ok_or("timeout must be integer or null")?;
+    u32::try_from(minutes)
+        .map(Some)
+        .map_err(|_| "timeout is too large".to_string())
 }

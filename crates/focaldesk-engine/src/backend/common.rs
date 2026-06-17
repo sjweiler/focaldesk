@@ -596,6 +596,7 @@ pub(crate) fn bootstrap_compositor_core(
         client_wayland_display: wayland_display.clone(),
         theme_manager,
         apps: settings.apps,
+        privacy: settings.privacy,
     };
 
     let mut state = DesktopState::new(init);
