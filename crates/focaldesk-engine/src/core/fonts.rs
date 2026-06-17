@@ -218,6 +218,16 @@ impl FontSystem {
 
             BuiltInThemeId::Eagle => {
                 self.load_font(
+                    FontId::IbmPlexSansRegular,
+                    include_bytes!("../../../../assets/fonts/IBMPlexSans-Regular.ttf"),
+                    "IBM Plex Sans Regular",
+                )?;
+                self.load_font(
+                    FontId::IbmPlexSansMedium,
+                    include_bytes!("../../../../assets/fonts/IBMPlexSans-Medium.ttf"),
+                    "IBM Plex Sans Medium",
+                )?;
+                self.load_font(
                     FontId::OrbitronRegular,
                     include_bytes!("../../../../assets/fonts/Orbitron-Regular.ttf"),
                     "Orbitron Regular",
@@ -399,4 +409,37 @@ pub fn style_for(role: FontRole, size_px: u32, theme: BuiltInThemeId) -> TextSty
     };
 
     TextStyle { font, size_px }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_reload_loads_fonts_for_all_roles() {
+        let mut fonts = FontSystem::new(BuiltInThemeId::Eagle).unwrap();
+        let themes = [
+            BuiltInThemeId::Classic,
+            BuiltInThemeId::Moonbase,
+            BuiltInThemeId::Eagle,
+        ];
+        let roles = [
+            FontRole::Debug,
+            FontRole::Meta,
+            FontRole::Label,
+            FontRole::Title,
+            FontRole::Clock,
+            FontRole::Body,
+        ];
+
+        for theme in themes {
+            fonts.reload_for_theme(theme).unwrap();
+
+            for role in roles {
+                fonts
+                    .prepare_text("FocalDesk 123", style_for(role, 16, theme))
+                    .unwrap();
+            }
+        }
+    }
 }

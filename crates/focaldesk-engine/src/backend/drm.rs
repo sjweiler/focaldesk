@@ -8,8 +8,8 @@ use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{atomic::AtomicModeReq, connector, crtc, property};
 use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, KeyState};
-use smithay::backend::renderer::Offscreen;
 use smithay::backend::renderer::gles::GlesError;
+use smithay::backend::renderer::Offscreen;
 use smithay::reexports::drm::control::Device as _;
 // `DrmOutput::render_frame` / `initialize_output` drive an internal [`smithay::backend::drm::compositor::DrmCompositor`].
 
@@ -18,11 +18,11 @@ use smithay::backend::input::KeyboardKeyEvent;
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
-use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::utils::DamageBag;
+use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
-    Id, Kind, render_elements, texture::TextureRenderElement,
+    render_elements, texture::TextureRenderElement, Id, Kind,
 };
 
 use focaldesk_flow::keybinds::BackendKind;
@@ -39,7 +39,7 @@ use focaldesk_flow::keybinds::BackendKind;
 // - many internals are still TODO so you can connect them to your existing FocalDesk code
 
 use crate::core::backend_render::draw_output;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use smithay::backend::renderer::Bind;
 use smithay::utils::DeviceFd;
 
@@ -60,17 +60,17 @@ use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
 
 use smithay::{
     backend::{
-        allocator::{Fourcc, Modifier, gbm::GbmAllocator, gbm::GbmBufferFlags},
+        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
-        egl::{self, EGLContext, context::ContextPriority},
+        egl::{self, context::ContextPriority, EGLContext},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Color32F, ExportMem, ImportDma, ImportEgl,
             element::solid::SolidColorRenderElement,
             gles::{GlesRenderer, GlesTarget, GlesTexture},
+            Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{Session, libseat::LibSeatSession},
-        udev::{UdevBackend, primary_gpu},
+        session::{libseat::LibSeatSession, Session},
+        udev::{primary_gpu, UdevBackend},
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
@@ -91,7 +91,7 @@ use smithay::backend::drm::{
 };
 
 use crate::core::chrome_layout::build_chrome_layout;
-use crate::core::{OutputState, SceneState, desktop::DesktopState, ui_state::UiState};
+use crate::core::{desktop::DesktopState, ui_state::UiState, OutputState, SceneState};
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 
@@ -959,7 +959,9 @@ fn apply_connector_hdr_state(
                     let target = if hdr_enabled {
                         Some(max)
                     } else {
-                        support.current_max_bpc.filter(|value| *value >= min && *value <= max)
+                        support
+                            .current_max_bpc
+                            .filter(|value| *value >= min && *value <= max)
                     };
                     if let Some(target) = target {
                         req.add_property(connector, *prop, property::Value::UnsignedRange(target));

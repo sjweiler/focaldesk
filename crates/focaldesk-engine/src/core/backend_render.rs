@@ -358,6 +358,7 @@ fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::erro
             FontId::RajdhaniSemiBold,
         ],
         BuiltInThemeId::Eagle => &[
+            FontId::IbmPlexSansRegular,
             FontId::IbmPlexSansMedium,
             FontId::OrbitronRegular,
             FontId::OrbitronMedium,
