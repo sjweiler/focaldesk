@@ -1139,6 +1139,18 @@ impl RenderState {
         let text_w = fonts.advance_width(text, style);
         let x_logical = rect_logical.loc.x + ((rect_logical.size.w - text_w).max(0) / 2);
         let y_logical = rect_logical.loc.y + 24;
+        let shadow = [0.02, 0.01, 0.0, color[3].min(0.9)];
+
+        self.draw_text_cached(
+            frame,
+            fonts,
+            text,
+            x_logical + 1,
+            y_logical + 1,
+            style,
+            shadow,
+            scale,
+        )?;
 
         self.draw_text_cached(
             frame, fonts, text, x_logical, y_logical, style, color, scale,

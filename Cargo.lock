@@ -1641,6 +1641,7 @@ dependencies = [
  "focaldesk-logging",
  "focaldesk-power",
  "focaldesk-settings-core",
+ "focaldesk-sounds",
  "gtk4",
  "libadwaita",
  "serde",

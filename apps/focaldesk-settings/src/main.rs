@@ -1,15 +1,16 @@
 use adw::prelude::*;
-use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use focaldesk_config::{FocalDeskConfig, load_config, save_config};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
-    IpcResponse,
+    IpcRequest, IpcResponse, send_desktop_config, send_desktop_request, send_desktop_set,
+    watch_desktop_keys,
 };
 use focaldesk_logging::flog_info;
 use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
-    load_settings, save_settings, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
-    PowerButtonAction, Settings,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
+    load_settings, save_settings,
 };
+use focaldesk_sounds::{SAMPLE_RATE, SoundBuffer, UiSound, UiSoundPlayer, generate_ui_sound};
 
 use gtk::cairo;
 use gtk::glib;
@@ -40,11 +41,6 @@ const ORIENTATION_OPTIONS: &[&str] = &[
     "Portrait Right",
     "Landscape Flipped",
     "Portrait Left",
-];
-const OUTPUT_DEVICE_OPTIONS: &[&str] = &[
-    "Default Output",
-    "S/PDIF Output - USB Audio",
-    "HDMI / DisplayPort",
 ];
 const OUTPUT_CONFIGURATION_OPTIONS: &[&str] = &["HiFi 2.0 channels", "Stereo", "Mono"];
 const ALERT_SOUND_OPTIONS: &[&str] = &["Default", "Click", "Chime", "None"];
@@ -442,40 +438,229 @@ fn dim_label(text: &str) -> gtk::Label {
     label
 }
 
-fn parse_pactl_short_sources(output: &str) -> Vec<String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split('\t');
-            fields.next()?;
-            let name = fields.next()?.trim();
-
-            if name.is_empty() || name.ends_with(".monitor") {
-                return None;
-            }
-
-            let label = name
-                .strip_prefix("alsa_input.")
-                .unwrap_or(name)
-                .replace(['_', '.'], " ");
-            Some(label)
-        })
-        .collect()
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AudioDeviceKind {
+    Sink,
+    Source,
 }
 
-fn parse_wpctl_sources(output: &str) -> Vec<String> {
-    let mut in_sources = false;
-    let mut sources = Vec::new();
+#[derive(Debug, Default)]
+struct PactlAudioDevice {
+    name: Option<String>,
+    description: Option<String>,
+    active_port: Option<String>,
+}
+
+fn normalize_audio_label(label: &str) -> String {
+    label
+        .trim()
+        .trim_matches('"')
+        .strip_prefix("alsa_input.")
+        .or_else(|| label.trim().trim_matches('"').strip_prefix("alsa_output."))
+        .unwrap_or_else(|| label.trim().trim_matches('"'))
+        .replace(['_', '.'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn audio_label_key(label: &str) -> String {
+    label.trim().to_ascii_lowercase()
+}
+
+fn push_unique_audio_label(devices: &mut Vec<String>, label: String, prefer_first: bool) {
+    let label = normalize_audio_label(&label);
+    if label.is_empty() {
+        return;
+    }
+
+    let key = audio_label_key(&label);
+    if devices.iter().any(|known| audio_label_key(known) == key) {
+        return;
+    }
+
+    if prefer_first {
+        devices.insert(0, label);
+    } else {
+        devices.push(label);
+    }
+}
+
+fn pactl_value(line: &str, key: &str) -> Option<String> {
+    line.trim()
+        .strip_prefix(key)?
+        .trim()
+        .trim_matches('"')
+        .trim()
+        .to_string()
+        .into()
+}
+
+fn pactl_port_label(line: &str, port_name: &str) -> Option<String> {
+    let trimmed = line.trim();
+    let rest = trimmed.strip_prefix(port_name)?.strip_prefix(':')?.trim();
+    let label = rest.split(" (").next().unwrap_or(rest).trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+fn pactl_device_label(
+    device: &PactlAudioDevice,
+    ports: &HashMap<String, String>,
+) -> Option<String> {
+    let base = device
+        .description
+        .as_deref()
+        .or(device.name.as_deref())
+        .map(normalize_audio_label)?;
+    if base.is_empty() {
+        return None;
+    }
+
+    let Some(port_name) = device.active_port.as_deref() else {
+        return Some(base);
+    };
+    let Some(port_label) = ports
+        .get(port_name)
+        .map(|label| normalize_audio_label(label))
+    else {
+        return Some(base);
+    };
+    if port_label.is_empty() || audio_label_key(&base).contains(&audio_label_key(&port_label)) {
+        Some(base)
+    } else {
+        Some(format!("{base} - {port_label}"))
+    }
+}
+
+fn push_pactl_device(
+    current: &PactlAudioDevice,
+    ports: &HashMap<String, String>,
+    devices: &mut Vec<String>,
+    kind: AudioDeviceKind,
+    default_name: Option<&str>,
+) {
+    if let Some(name) = current.name.as_deref() {
+        if kind == AudioDeviceKind::Source && name.ends_with(".monitor") {
+            return;
+        }
+    }
+
+    if let Some(label) = pactl_device_label(current, ports) {
+        let prefer_first = current.name.as_deref() == default_name;
+        push_unique_audio_label(devices, label, prefer_first);
+    }
+}
+
+fn parse_pactl_devices(
+    output: &str,
+    kind: AudioDeviceKind,
+    default_name: Option<&str>,
+) -> Vec<String> {
+    let mut devices = Vec::new();
+    let mut current = PactlAudioDevice::default();
+    let mut ports = HashMap::new();
+    let mut in_ports = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let is_header = match kind {
+            AudioDeviceKind::Sink => trimmed.starts_with("Sink #"),
+            AudioDeviceKind::Source => trimmed.starts_with("Source #"),
+        };
+
+        if is_header {
+            if current.name.is_some() || current.description.is_some() {
+                push_pactl_device(&current, &ports, &mut devices, kind, default_name);
+                current = PactlAudioDevice::default();
+                ports.clear();
+                in_ports = false;
+            }
+            continue;
+        }
+
+        if let Some(name) = pactl_value(line, "Name:") {
+            current.name = Some(name);
+            continue;
+        }
+
+        if let Some(description) = pactl_value(line, "Description:") {
+            current.description = Some(description);
+            continue;
+        }
+
+        if trimmed == "Ports:" {
+            in_ports = true;
+            continue;
+        }
+
+        if let Some(active_port) = pactl_value(line, "Active Port:") {
+            current.active_port = Some(active_port);
+            in_ports = false;
+            continue;
+        }
+
+        if in_ports {
+            if !line.starts_with(char::is_whitespace) || trimmed.ends_with(':') {
+                in_ports = false;
+                continue;
+            }
+
+            if let Some((port_name, _)) = trimmed.split_once(':') {
+                if let Some(label) = pactl_port_label(trimmed, port_name.trim()) {
+                    ports.insert(port_name.trim().to_string(), label);
+                }
+            }
+        }
+    }
+
+    if current.name.is_some() || current.description.is_some() {
+        push_pactl_device(&current, &ports, &mut devices, kind, default_name);
+    }
+
+    devices
+}
+
+fn parse_pactl_short_devices(
+    output: &str,
+    kind: AudioDeviceKind,
+    default_name: Option<&str>,
+) -> Vec<String> {
+    let mut devices = Vec::new();
+
+    for line in output.lines() {
+        let mut fields = line.split('\t');
+        fields.next();
+        let Some(name) = fields.next().map(str::trim) else {
+            continue;
+        };
+
+        if name.is_empty() || (kind == AudioDeviceKind::Source && name.ends_with(".monitor")) {
+            continue;
+        }
+
+        push_unique_audio_label(&mut devices, name.to_string(), Some(name) == default_name);
+    }
+
+    devices
+}
+
+fn parse_wpctl_devices(output: &str, kind: AudioDeviceKind) -> Vec<String> {
+    let mut in_section = false;
+    let mut devices = Vec::new();
+    let section = match kind {
+        AudioDeviceKind::Sink => "Sinks:",
+        AudioDeviceKind::Source => "Sources:",
+    };
 
     for line in output.lines() {
         let trimmed = line.trim();
 
-        if trimmed.contains("Sources:") {
-            in_sources = true;
+        if trimmed.contains(section) {
+            in_section = true;
             continue;
         }
 
-        if !in_sources {
+        if !in_section {
             continue;
         }
 
@@ -498,17 +683,43 @@ fn parse_wpctl_sources(output: &str) -> Vec<String> {
             continue;
         }
 
-        sources.push(label.to_string());
+        let prefer_first = trimmed.contains('*');
+        push_unique_audio_label(&mut devices, label.to_string(), prefer_first);
     }
 
-    sources
+    devices
 }
 
-fn load_input_sources() -> Result<Vec<String>, String> {
-    match run_control_command("pactl", &["list", "short", "sources"]) {
-        Ok(output) => Ok(parse_pactl_short_sources(&output)),
+fn parse_pactl_default_device(output: &str, kind: AudioDeviceKind) -> Option<String> {
+    let key = match kind {
+        AudioDeviceKind::Sink => "Default Sink:",
+        AudioDeviceKind::Source => "Default Source:",
+    };
+
+    output.lines().find_map(|line| pactl_value(line, key))
+}
+
+fn load_audio_devices(kind: AudioDeviceKind) -> Result<Vec<String>, String> {
+    let list_arg = match kind {
+        AudioDeviceKind::Sink => "sinks",
+        AudioDeviceKind::Source => "sources",
+    };
+
+    match run_control_command("pactl", &["list", list_arg]) {
+        Ok(output) => {
+            let default_name = run_control_command("pactl", &["info"])
+                .ok()
+                .and_then(|output| parse_pactl_default_device(&output, kind));
+            let devices = parse_pactl_devices(&output, kind, default_name.as_deref());
+            if devices.is_empty() {
+                run_control_command("pactl", &["list", "short", list_arg])
+                    .map(|output| parse_pactl_short_devices(&output, kind, default_name.as_deref()))
+            } else {
+                Ok(devices)
+            }
+        }
         Err(pactl_err) => match run_control_command("wpctl", &["status"]) {
-            Ok(output) => Ok(parse_wpctl_sources(&output)),
+            Ok(output) => Ok(parse_wpctl_devices(&output, kind)),
             Err(wpctl_err) => Err(format!("{pactl_err}; {wpctl_err}")),
         },
     }
@@ -2928,7 +3139,19 @@ fn sound_page() -> adw::NavigationPage {
     output_device_row.set_title("Output Device");
     let speaker_icon = gtk::Image::from_icon_name("audio-speakers-symbolic");
     output_device_row.add_prefix(&speaker_icon);
-    output_device_row.add_suffix(&dropdown_from_strings(OUTPUT_DEVICE_OPTIONS, 1));
+    match load_audio_devices(AudioDeviceKind::Sink) {
+        Ok(devices) if devices.is_empty() => {
+            output_device_row.add_suffix(&dim_label("No Output Devices"));
+        }
+        Ok(devices) => {
+            let labels: Vec<&str> = devices.iter().map(String::as_str).collect();
+            output_device_row.add_suffix(&dropdown_from_strings(&labels, 0));
+        }
+        Err(err) => {
+            output_device_row.add_suffix(&dim_label("Output Detection Unavailable"));
+            output_device_row.set_subtitle(&err);
+        }
+    }
     output_group.add(&output_device_row);
 
     let output_config_row = adw::ActionRow::new();
@@ -2963,6 +3186,7 @@ fn sound_page() -> adw::NavigationPage {
     test_row.set_title("Test Speakers");
     let test_button = gtk::Button::with_label("Test...");
     test_button.add_css_class("pill");
+    test_button.connect_clicked(|_| play_test_speaker_sound());
     test_row.add_suffix(&test_button);
     output_group.add(&test_row);
 
@@ -2973,7 +3197,7 @@ fn sound_page() -> adw::NavigationPage {
 
     let input_device_row = adw::ActionRow::new();
     input_device_row.set_title("Input Device");
-    match load_input_sources() {
+    match load_audio_devices(AudioDeviceKind::Source) {
         Ok(devices) if devices.is_empty() => {
             input_device_row.add_suffix(&dim_label("No Input Devices"));
         }
@@ -3006,6 +3230,11 @@ fn sound_page() -> adw::NavigationPage {
     page.add(&sounds_group);
 
     adw::NavigationPage::new(&page, "Sound")
+}
+
+fn play_test_speaker_sound() {
+    let buffer = SoundBuffer::new(SAMPLE_RATE, 1, generate_ui_sound(UiSound::Success));
+    UiSoundPlayer::new().play(&buffer);
 }
 
 fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
