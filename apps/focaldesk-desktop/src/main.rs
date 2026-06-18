@@ -4,7 +4,7 @@ use focaldesk_logging::{flog_info, logging};
 #[cfg(feature = "drm")]
 use focaldesk_engine::backend::drm;
 
-#[cfg(feature = "winit")]
+#[cfg(all(not(feature = "drm"), feature = "winit"))]
 use focaldesk_engine::backend::winit;
 
 #[cfg(feature = "drm")]

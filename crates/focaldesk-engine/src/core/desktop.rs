@@ -3747,6 +3747,10 @@ impl DesktopState {
                 self.launch_app(self.apps.terminal.clone());
             }
 
+            KeyAction::LockScreen => {
+                self.lock_session();
+            }
+
             KeyAction::ToggleLauncher => {
                 self.render
                     .egui
