@@ -173,22 +173,7 @@ fn save_displays(displays: &[DisplayConfig]) {
         let _ = std::fs::write(path, text);
     }
 
-    let outputs = displays
-        .iter()
-        .map(|display| OutputConfig {
-            connector: display.name.clone(),
-            enabled: display.enabled,
-            x: display.logical_x,
-            y: display.logical_y,
-            width: display.mode_width,
-            height: display.mode_height,
-            refresh_mhz: display.refresh_mhz,
-            scale: display.scale as f32,
-            primary: display.primary,
-            hdr_requested: display.hdr_requested,
-            hdr_enabled: display.hdr_requested,
-        })
-        .collect();
+    let outputs = displays.iter().map(output_config_from_display).collect();
 
     match send_desktop_request(&IpcRequest::SetDisplays { outputs }) {
         Ok(IpcResponse::Ok) => {}
@@ -201,6 +186,22 @@ fn save_displays(displays: &[DisplayConfig]) {
         Err(err) => {
             flog_info!("display IPC unavailable; saved display config directly: {err}");
         }
+    }
+}
+
+fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
+    OutputConfig {
+        connector: display.name.clone(),
+        enabled: display.enabled,
+        x: display.logical_x,
+        y: display.logical_y,
+        width: display.mode_width,
+        height: display.mode_height,
+        refresh_mhz: display.refresh_mhz,
+        scale: display.scale as f32,
+        primary: display.primary,
+        hdr_requested: display.hdr_requested,
+        hdr_enabled: display.hdr_enabled,
     }
 }
 
@@ -4171,4 +4172,35 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
     }
 
     adw::NavigationPage::new(&page, "Displays")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_output_config_keeps_hdr_request_and_runtime_state_separate() {
+        let display = DisplayConfig {
+            name: "DP-1".to_string(),
+            enabled: true,
+            mode_width: 3840,
+            mode_height: 2160,
+            refresh_mhz: 60_000,
+            scale: 1.0,
+            logical_x: 0,
+            logical_y: 0,
+            physical_width_mm: None,
+            physical_height_mm: None,
+            primary: true,
+            transform: "Normal".to_string(),
+            hdr_supported: true,
+            hdr_requested: true,
+            hdr_enabled: false,
+        };
+
+        let output = output_config_from_display(&display);
+
+        assert!(output.hdr_requested);
+        assert!(!output.hdr_enabled);
+    }
 }
