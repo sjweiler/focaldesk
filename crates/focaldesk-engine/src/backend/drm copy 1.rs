@@ -161,10 +161,6 @@ pub struct HdrBpcRange {
 }
 
 impl HdrSupport {
-    fn is_detected(&self) -> bool {
-        self.edid_hdr_static_metadata && self.edid_pq
-    }
-
     fn has_connector_controls(&self) -> bool {
         self.has_hdr_metadata_property || self.has_bt2020_colorspace || self.max_bpc.is_some()
     }
@@ -172,10 +168,6 @@ impl HdrSupport {
     fn can_enable(&self) -> bool {
         self.has_hdr_metadata_property
             && self.has_bt2020_colorspace
-            && self
-                .max_bpc
-                .as_ref()
-                .is_some_and(|range| range.min <= HDR_MAX_BPC && range.max >= HDR_MAX_BPC)
             && self.edid_hdr_static_metadata
             && self.edid_pq
     }
@@ -263,9 +255,6 @@ pub struct DrmSurfaceState {
     pub present_damage: DamageBag<i32, Buffer>,
     pub hdr_support: HdrSupport,
     pub hdr_render_supported: bool,
-    pub sdr_scanout_format: Fourcc,
-    pub sdr_scanout_modifiers: Vec<DrmModifier>,
-    pub hdr_scanout_format: Option<Fourcc>,
     pub hdr_offscreen_format: Option<Fourcc>,
     pub hdr_metadata_blob: Option<u64>,
     pub hdr_enabled_applied: bool,
@@ -290,7 +279,7 @@ enum ConnectorHdrApplyResult {
 const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Abgr8888;
 const HDR_OFFSCREEN_FORMATS: [Fourcc; 2] = [Fourcc::Abgr2101010, Fourcc::Argb2101010];
 const HDR_SCANOUT_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb2101010, Fourcc::Argb2101010];
-const HDR_MAX_BPC: u64 = 10;
+//const HDR_SCANOUT_FORMATS: [Fourcc; 1] = [Fourcc::Xrgb2101010];
 
 type FlowDrmOutputManager = DrmOutputManager<
     GbmAllocator<DrmDeviceFd>,
@@ -749,22 +738,6 @@ fn probe_hdr_scanout_format(
     })
 }
 
-fn set_output_scanout_format(
-    output: &DrmOutput<
-        GbmAllocator<DrmDeviceFd>,
-        GbmFramebufferExporter<DrmDeviceFd>,
-        Option<OutputPresentationFeedback>,
-        DrmDeviceFd,
-    >,
-    allocator: GbmAllocator<DrmDeviceFd>,
-    format: Fourcc,
-    modifiers: impl IntoIterator<Item = DrmModifier>,
-) -> Result<(), anyhow::Error> {
-    output
-        .with_compositor(|compositor| compositor.set_format(allocator, format, modifiers))
-        .map_err(|err| anyhow!("failed to select {format:?} scanout format: {err}"))
-}
-
 fn convert_sdr_scene_to_hdr(
     renderer: &mut GlesRenderer,
     src: &GlesTexture,
@@ -831,7 +804,7 @@ pub(crate) fn collect_display_configs(
 
         let w = surface.mode.size.w;
         let h = surface.mode.size.h;
-        let hdr_supported = surface.hdr_support.is_detected();
+        let hdr_supported = surface.hdr_support.can_enable() && surface.hdr_render_supported;
         let hdr_requested = core_output
             .map(|output| output.hdr_requested)
             .unwrap_or(false);
@@ -1196,7 +1169,7 @@ fn build_connector_hdr_req(
             "max bpc" => {
                 if let property::ValueType::UnsignedRange(min, max) = info.value_type() {
                     let target = if hdr_enabled {
-                        (min <= HDR_MAX_BPC && max >= HDR_MAX_BPC).then_some(HDR_MAX_BPC)
+                        Some(max)
                     } else {
                         Some(8.clamp(min, max))
                     };
@@ -1622,10 +1595,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     data.core.state.render.redraw_all = true;
                 }
                 if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
-                    out.hdr_supported = surface.hdr_support.is_detected();
-                    let mut hdr_target = out.hdr_requested
-                        && surface.hdr_support.can_enable()
-                        && surface.hdr_render_supported;
+                    out.hdr_supported =
+                        surface.hdr_support.can_enable() && surface.hdr_render_supported;
+                    let mut hdr_target = out.hdr_requested && out.hdr_supported;
                     if hdr_target {
                         if let Some(format) = surface.hdr_offscreen_format {
                             if let Err(err) = ensure_offscreen_texture(
@@ -1639,36 +1611,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                     surface.output_id, format
                                 ));
                                 hdr_target = false;
+                                out.hdr_supported = false;
                                 out.hdr_enabled = false;
                             }
                         } else {
                             hdr_target = false;
+                            out.hdr_supported = false;
                             out.hdr_enabled = false;
                         }
                     }
                     if hdr_target != surface.hdr_enabled_applied {
-                        let scanout_allocator = device.drm_output_manager.allocator().clone();
-                        if hdr_target {
-                            let scanout_result = surface.hdr_scanout_format.map_or_else(
-                                || Err(anyhow!("no 10-bit scanout format available")),
-                                |format| {
-                                    set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        format,
-                                        [DrmModifier::Linear],
-                                    )
-                                },
-                            );
-                            if let Err(err) = scanout_result {
-                                flog(&format!(
-                                    "Failed to enable HDR scanout for {:?}: {err}; keeping SDR",
-                                    surface.output_id
-                                ));
-                                hdr_target = false;
-                                out.hdr_enabled = false;
-                            }
-                        }
                         let device = device.drm_output_manager.device();
                         let hdr_metadata_blob = if hdr_target {
                             match ensure_hdr_metadata_blob(
@@ -1682,6 +1634,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                         "Failed to create HDR metadata blob for {:?}: {err}",
                                         surface.output_id
                                     ));
+                                    out.hdr_supported = false;
                                     out.hdr_enabled = false;
                                     surface.hdr_enabled_applied = false;
                                     None
@@ -1706,17 +1659,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                         device,
                                         surface.hdr_metadata_blob.take(),
                                     );
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
                                 }
                             }
                             Ok(ConnectorHdrApplyResult::Unchanged) => {
@@ -1727,17 +1669,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                         device,
                                         surface.hdr_metadata_blob.take(),
                                     );
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
                                 }
                             }
                             Ok(ConnectorHdrApplyResult::Rejected) => {
@@ -1746,23 +1677,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                         "HDR connector state rejected by atomic test for {:?}; keeping SDR",
                                         surface.output_id
                                     ));
+                                    out.hdr_supported = false;
                                     out.hdr_enabled = false;
                                     surface.hdr_enabled_applied = false;
                                     destroy_hdr_metadata_blob(
                                         device,
                                         surface.hdr_metadata_blob.take(),
                                     );
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
                                 } else {
                                     flog(&format!(
                                         "SDR connector state rejected by atomic test for {:?}",
@@ -1775,19 +1696,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                     "Failed to update HDR connector state for {:?}: {err}",
                                     surface.output_id
                                 ));
-                                if hdr_target {
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
-                                }
                             }
                         }
                     } else {
@@ -2075,6 +1983,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         surface.hdr_enabled_applied = false;
                         surface.hdr_render_supported = false;
                         if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                            out.hdr_supported = false;
                             out.hdr_enabled = false;
                         }
                         surface.offscreen = None;
@@ -2564,30 +2473,11 @@ fn device_added(
                     &DrmOutputRenderElements::default(),
                 )?;
 
-            let (sdr_scanout_format, sdr_scanout_modifiers) =
-                drm_output.with_compositor(|compositor| {
-                    (compositor.format(), compositor.modifiers().to_vec())
-                });
-
             let mut hdr_metadata_blob = None;
             let mut hdr_enabled_applied = false;
-            let hdr_requested = hdr_enabled;
-            let mut hdr_enabled = hdr_requested && hdr_render_supported;
-            if let Some(format) = hdr_scanout_format.filter(|_| hdr_enabled) {
-                if let Err(err) = set_output_scanout_format(
-                    &drm_output,
-                    drm_output_manager.allocator().clone(),
-                    format,
-                    [DrmModifier::Linear],
-                ) {
-                    flog(&format!(
-                        "Failed to enable 10-bit scanout for {}: {err}; keeping SDR",
-                        output_name
-                    ));
-                    hdr_enabled = false;
-                }
-            }
             let device = drm_output_manager.device();
+            let hdr_requested = hdr_enabled;
+            let hdr_enabled = hdr_requested && hdr_render_supported;
             let requested_hdr_metadata_blob = if hdr_enabled {
                 match ensure_hdr_metadata_blob(device, &hdr_support, &mut hdr_metadata_blob) {
                     Ok(blob) => Some(blob),
@@ -2635,17 +2525,6 @@ fn device_added(
                             }
                         }
                         destroy_hdr_metadata_blob(device, hdr_metadata_blob.take());
-                        if let Err(err) = set_output_scanout_format(
-                            &drm_output,
-                            drm_output_manager.allocator().clone(),
-                            sdr_scanout_format,
-                            sdr_scanout_modifiers.iter().copied(),
-                        ) {
-                            flog(&format!(
-                                "Failed to restore SDR scanout for {}: {err}",
-                                output_name
-                            ));
-                        }
                     } else {
                         flog(&format!(
                             "SDR connector state rejected by atomic test for {}",
@@ -2659,19 +2538,6 @@ fn device_added(
                         output_name
                     ));
                     destroy_hdr_metadata_blob(device, hdr_metadata_blob.take());
-                    if hdr_enabled {
-                        if let Err(err) = set_output_scanout_format(
-                            &drm_output,
-                            drm_output_manager.allocator().clone(),
-                            sdr_scanout_format,
-                            sdr_scanout_modifiers.iter().copied(),
-                        ) {
-                            flog(&format!(
-                                "Failed to restore SDR scanout for {}: {err}",
-                                output_name
-                            ));
-                        }
-                    }
                 }
             }
 
@@ -2697,7 +2563,7 @@ fn device_added(
                 output_scale,
             );
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
-                out.hdr_supported = hdr_support.is_detected();
+                out.hdr_supported = hdr_support.can_enable() && hdr_render_supported;
                 out.hdr_requested = hdr_requested;
                 out.hdr_enabled = hdr_enabled_applied;
             }
@@ -2719,9 +2585,6 @@ fn device_added(
                     present_damage: DamageBag::default(),
                     hdr_support,
                     hdr_render_supported,
-                    sdr_scanout_format,
-                    sdr_scanout_modifiers,
-                    hdr_scanout_format,
                     hdr_offscreen_format,
                     hdr_metadata_blob,
                     hdr_enabled_applied,
