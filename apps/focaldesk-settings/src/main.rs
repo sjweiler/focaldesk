@@ -1,16 +1,16 @@
 use adw::prelude::*;
-use focaldesk_config::{FocalDeskConfig, load_config, save_config};
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
-    IpcRequest, IpcResponse, send_desktop_config, send_desktop_request, send_desktop_set,
-    watch_desktop_keys,
+    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
+    IpcResponse,
 };
 use focaldesk_logging::flog_info;
 use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
-    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
-    load_settings, save_settings,
+    load_settings, save_settings, DebugLogLevel, LidCloseAction, LowBatteryAction, OutputConfig,
+    PerformanceMode, PowerButtonAction, Settings,
 };
-use focaldesk_sounds::{SAMPLE_RATE, SoundBuffer, UiSound, UiSoundPlayer, generate_ui_sound};
+use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 
 use gtk::cairo;
 use gtk::glib;
@@ -157,6 +157,8 @@ struct DisplayConfig {
     #[serde(default)]
     hdr_supported: bool,
     #[serde(default)]
+    hdr_requested: bool,
+    #[serde(default)]
     hdr_enabled: bool,
 }
 
@@ -183,7 +185,8 @@ fn save_displays(displays: &[DisplayConfig]) {
             refresh_mhz: display.refresh_mhz,
             scale: display.scale as f32,
             primary: display.primary,
-            hdr_enabled: display.hdr_enabled,
+            hdr_requested: display.hdr_requested,
+            hdr_enabled: display.hdr_requested,
         })
         .collect();
 
@@ -1572,7 +1575,7 @@ fn connected_display_row(
         hdr_row.set_title("Enable HDR");
         hdr_row.set_subtitle("Use HDR output when this display and backend support it");
         let hdr = gtk::Switch::new();
-        hdr.set_active(display.hdr_enabled);
+        hdr.set_active(display.hdr_requested || display.hdr_enabled);
         hdr_row.add_suffix(&hdr);
         hdr_row.set_activatable_widget(Some(&hdr));
         row.add_row(&hdr_row);
@@ -1583,7 +1586,10 @@ fn connected_display_row(
             let row = row.clone();
             hdr.connect_active_notify(move |switch| {
                 if let Some(display) = displays.borrow_mut().get_mut(index) {
-                    display.hdr_enabled = display.hdr_supported && switch.is_active();
+                    display.hdr_requested = display.hdr_supported && switch.is_active();
+                    if !display.hdr_requested {
+                        display.hdr_enabled = false;
+                    }
                 }
                 save_display_change(&displays, &area, &row, index);
             });
@@ -1841,7 +1847,7 @@ fn build_ui(app: &adw::Application) {
     pages.insert("Keyboard".to_string(), keyboard_page());
     pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
     pages.insert("Power".to_string(), power_page(settings.clone()));
-    pages.insert("Debug".to_string(), debug_page());
+    pages.insert("Debug".to_string(), debug_page(settings.clone()));
     pages.insert("About".to_string(), about_page());
 
     for (name, page) in &pages {
@@ -3538,6 +3544,16 @@ fn performance_mode_index(mode: PerformanceMode) -> u32 {
     }
 }
 
+fn debug_log_level_index(level: DebugLogLevel) -> u32 {
+    match level {
+        DebugLogLevel::Error => 0,
+        DebugLogLevel::Warn => 1,
+        DebugLogLevel::Info => 2,
+        DebugLogLevel::Debug => 3,
+        DebugLogLevel::Trace => 4,
+    }
+}
+
 fn selected_power_button_action(index: u32) -> PowerButtonAction {
     match index {
         1 => PowerButtonAction::Suspend,
@@ -3570,6 +3586,16 @@ fn selected_performance_mode(index: u32) -> PerformanceMode {
         1 => PerformanceMode::Performance,
         2 => PerformanceMode::PowerSaver,
         _ => PerformanceMode::Balanced,
+    }
+}
+
+fn selected_debug_log_level(index: u32) -> DebugLogLevel {
+    match index {
+        0 => DebugLogLevel::Error,
+        1 => DebugLogLevel::Warn,
+        3 => DebugLogLevel::Debug,
+        4 => DebugLogLevel::Trace,
+        _ => DebugLogLevel::Info,
     }
 }
 
@@ -3792,43 +3818,78 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Power")
 }
 
-fn debug_page() -> adw::NavigationPage {
+fn debug_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Debug");
 
     let logging_group = adw::PreferencesGroup::new();
     logging_group.set_title("Diagnostics");
-    add_dropdown_row(
+    let log_level = add_dropdown_row(
         &logging_group,
         "Log level",
         Some("Runtime logging detail for the desktop session"),
         LOG_LEVEL_OPTIONS,
-        2,
+        debug_log_level_index(settings.borrow().debug.log_level),
     );
-    add_switch_row(
+    {
+        let settings = settings.clone();
+        log_level.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().debug.log_level = selected_debug_log_level(dropdown.selected());
+            persist_settings(&settings.borrow());
+        });
+    }
+    let show_fps = add_switch_row(
         &logging_group,
-        "Show FPS / frame timing",
-        Some("Overlay frame pacing information"),
-        false,
+        "Log FPS / frame timing",
+        Some("Log frame pacing information"),
+        settings.borrow().debug.show_fps,
     );
-    add_switch_row(
+    {
+        let settings = settings.clone();
+        show_fps.connect_active_notify(move |switch| {
+            settings.borrow_mut().debug.show_fps = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    let show_damage_regions = add_switch_row(
         &logging_group,
-        "Show damage regions",
-        Some("Highlight areas redrawn by the compositor"),
-        false,
+        "Log damage regions",
+        Some("Log compositor damage region statistics"),
+        settings.borrow().debug.show_damage_regions,
     );
-    add_switch_row(
+    {
+        let settings = settings.clone();
+        show_damage_regions.connect_active_notify(move |switch| {
+            settings.borrow_mut().debug.show_damage_regions = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    let show_input_events = add_switch_row(
         &logging_group,
-        "Show input events",
+        "Log input events",
         Some("Display pointer and keyboard event traces"),
-        false,
+        settings.borrow().debug.show_input_events,
     );
-    add_switch_row(
+    {
+        let settings = settings.clone();
+        show_input_events.connect_active_notify(move |switch| {
+            settings.borrow_mut().debug.show_input_events = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    let verbose_protocol_logs = add_switch_row(
         &logging_group,
         "Enable verbose Wayland/XWayland logs",
-        Some("More protocol detail for compositor development"),
-        false,
+        Some("Enable extra protocol logging where available"),
+        settings.borrow().debug.verbose_protocol_logs,
     );
+    {
+        let settings = settings.clone();
+        verbose_protocol_logs.connect_active_notify(move |switch| {
+            settings.borrow_mut().debug.verbose_protocol_logs = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&logging_group);
 
     let files_group = adw::PreferencesGroup::new();

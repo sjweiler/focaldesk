@@ -41,6 +41,7 @@ chrono.workspace = true
 image.workspace = true
 glow.workspace = true
 libc = "0.2"
+drm-sys = "0.8"
 #winit
 
 

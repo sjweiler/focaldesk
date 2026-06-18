@@ -1,7 +1,7 @@
 use focaldesk_ipc::{IpcRequest, IpcResponse, SOCKET_PATH};
 use focaldesk_settings_core::{
-    LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, Settings, load_settings,
-    save_settings,
+    DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, Settings,
+    load_settings, save_settings,
 };
 use std::{
     io::{Read, Write},
@@ -215,6 +215,36 @@ fn apply_setting_value(
                     "power_saver" => PerformanceMode::PowerSaver,
                     other => return Err(format!("unknown performance mode: {other}")),
                 };
+        }
+
+        "debug.log_level" => {
+            settings.debug.log_level = match value.as_str().ok_or("log_level must be string")? {
+                "error" => DebugLogLevel::Error,
+                "warn" => DebugLogLevel::Warn,
+                "info" => DebugLogLevel::Info,
+                "debug" => DebugLogLevel::Debug,
+                "trace" => DebugLogLevel::Trace,
+                other => return Err(format!("unknown debug log level: {other}")),
+            };
+        }
+
+        "debug.show_fps" => {
+            settings.debug.show_fps = value.as_bool().ok_or("show_fps must be bool")?;
+        }
+
+        "debug.show_damage_regions" => {
+            settings.debug.show_damage_regions =
+                value.as_bool().ok_or("show_damage_regions must be bool")?;
+        }
+
+        "debug.show_input_events" => {
+            settings.debug.show_input_events =
+                value.as_bool().ok_or("show_input_events must be bool")?;
+        }
+
+        "debug.verbose_protocol_logs" => {
+            settings.debug.verbose_protocol_logs =
+                value.as_bool().ok_or("verbose_protocol_logs must be bool")?;
         }
 
         _ => return Err(format!("unknown setting path: {path}")),

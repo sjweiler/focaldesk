@@ -14,6 +14,7 @@ use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_flow::keybinds::BackendKind;
+use focaldesk_logging::FLogLevel;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowTheme;
 use focaldesk_types::OutputId;
@@ -326,6 +327,22 @@ pub fn prepare_output(
         focus_pulse: focus_pulse_value(now.saturating_duration_since(state.focus_changed_at)),
         portal_capture: force_full_damage,
     };
+
+    if state.debug.show_fps && state.render.frame_no % 120 == 0 {
+        let frame_ms = dt.as_secs_f64() * 1000.0;
+        let fps = if dt.is_zero() {
+            0.0
+        } else {
+            1.0 / dt.as_secs_f64()
+        };
+        focaldesk_logging::logging::flog(
+            FLogLevel::Debug,
+            format!(
+                "frame timing output={output_id:?} frame={} dt={frame_ms:.2}ms fps={fps:.1}",
+                state.render.frame_no
+            ),
+        );
+    }
 
     ui_state
         .chrome

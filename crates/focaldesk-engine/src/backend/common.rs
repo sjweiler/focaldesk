@@ -597,6 +597,7 @@ pub(crate) fn bootstrap_compositor_core(
         theme_manager,
         apps: settings.apps,
         privacy: settings.privacy,
+        debug: settings.debug,
     };
 
     let mut state = DesktopState::new(init);

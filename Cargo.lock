@@ -1486,6 +1486,7 @@ dependencies = [
  "bitflags 2.11.0",
  "calloop 0.12.4",
  "chrono",
+ "drm-sys",
  "egui",
  "focaldesk-config",
  "focaldesk-cursor",

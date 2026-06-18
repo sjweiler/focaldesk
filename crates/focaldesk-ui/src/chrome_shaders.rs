@@ -17,6 +17,7 @@ pub struct ChromeShaders {
     pub font_text: Option<GlesTexProgram>,
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
+    pub sdr_to_hdr_pq: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
 }
@@ -34,6 +35,7 @@ impl ChromeShaders {
             font_text: None,
             rounded_rect: None,
             wallpaper_tint: None,
+            sdr_to_hdr_pq: None,
             pulse: None,
             accent: None,
         }
@@ -134,6 +136,16 @@ impl ChromeShaders {
             self.wallpaper_tint = Some(renderer.compile_custom_texture_shader(
                 WALLPAPER_TINT_FRAG,
                 &[UniformName::new("u_tint", UniformType::_4f)],
+            )?);
+        }
+
+        if self.sdr_to_hdr_pq.is_none() {
+            self.sdr_to_hdr_pq = Some(renderer.compile_custom_texture_shader(
+                SDR_TO_HDR_PQ_FRAG,
+                &[
+                    UniformName::new("u_sdr_white_nits", UniformType::_1f),
+                    UniformName::new("u_max_nits", UniformType::_1f),
+                ],
             )?);
         }
 
@@ -749,6 +761,59 @@ void main() {
     }
 
     gl_FragColor = vec4(u_tint.rgb, src.a * u_tint.a);
+}
+"#;
+
+const SDR_TO_HDR_PQ_FRAG: &str = r#"
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+
+uniform sampler2D tex;
+uniform float u_sdr_white_nits;
+uniform float u_max_nits;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 rec709_to_bt2020(vec3 c) {
+    return mat3(
+        0.6274040, 0.0690970, 0.0163916,
+        0.3292820, 0.9195400, 0.0880132,
+        0.0433136, 0.0113612, 0.8955950
+    ) * c;
+}
+
+float linear_nits_to_pq(float nits) {
+    const float m1 = 0.1593017578125;
+    const float m2 = 78.84375;
+    const float c1 = 0.8359375;
+    const float c2 = 18.8515625;
+    const float c3 = 18.6875;
+
+    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+    vec3 linear709 = srgb_to_linear(src.rgb);
+    vec3 bt2020 = max(rec709_to_bt2020(linear709), vec3(0.0));
+    float sdr_white = clamp(u_sdr_white_nits, 80.0, 500.0);
+    float max_nits = max(u_max_nits, sdr_white);
+    vec3 nits = min(bt2020 * sdr_white, vec3(max_nits));
+    vec3 pq = vec3(
+        linear_nits_to_pq(nits.r),
+        linear_nits_to_pq(nits.g),
+        linear_nits_to_pq(nits.b)
+    );
+    gl_FragColor = vec4(pq, src.a);
 }
 "#;
 

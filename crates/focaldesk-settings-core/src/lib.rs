@@ -12,6 +12,8 @@ pub struct Settings {
     pub privacy: PrivacySettings,
     #[serde(default)]
     pub power: PowerSettings,
+    #[serde(default)]
+    pub debug: DebugSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +43,8 @@ pub struct OutputConfig {
     pub scale: f32,
     pub primary: bool,
     #[serde(default)]
+    pub hdr_requested: bool,
+    #[serde(default)]
     pub hdr_enabled: bool,
 }
 
@@ -55,6 +59,48 @@ pub struct AppSettings {
     pub terminal: String,
     pub browser: String,
     pub file_manager: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl Default for DebugLogLevel {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugSettings {
+    #[serde(default)]
+    pub log_level: DebugLogLevel,
+    #[serde(default)]
+    pub show_fps: bool,
+    #[serde(default)]
+    pub show_damage_regions: bool,
+    #[serde(default)]
+    pub show_input_events: bool,
+    #[serde(default)]
+    pub verbose_protocol_logs: bool,
+}
+
+impl Default for DebugSettings {
+    fn default() -> Self {
+        Self {
+            log_level: DebugLogLevel::default(),
+            show_fps: false,
+            show_damage_regions: false,
+            show_input_events: false,
+            verbose_protocol_logs: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,6 +233,7 @@ pub fn default_settings() -> Settings {
         },
         privacy: PrivacySettings::default(),
         power: PowerSettings::default(),
+        debug: DebugSettings::default(),
     }
 }
 

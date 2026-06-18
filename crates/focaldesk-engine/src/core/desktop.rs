@@ -60,9 +60,11 @@ use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
 use focaldesk_ipc::{IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
-use focaldesk_logging::{flog, flog_error, flog_info, flog_warn};
+use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
 use focaldesk_notifications::NotificationManager;
-use focaldesk_settings_core::{load_settings, AppSettings, OutputConfig, PrivacySettings};
+use focaldesk_settings_core::{
+    load_settings, AppSettings, DebugLogLevel, DebugSettings, OutputConfig, PrivacySettings,
+};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
@@ -300,6 +302,7 @@ pub struct OutputState {
     pub scale_factor: f64,
     pub scale: Scale<f64>,
     pub hdr_supported: bool,
+    pub hdr_requested: bool,
     pub hdr_enabled: bool,
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
@@ -373,6 +376,7 @@ pub struct DesktopInit {
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
     pub privacy: PrivacySettings,
+    pub debug: DebugSettings,
 }
 
 enum DesktopIpcMessage {
@@ -471,6 +475,7 @@ pub struct DesktopState {
     pub client_wayland_display: String,
     pub apps: AppSettings,
     pub privacy: PrivacySettings,
+    pub debug: DebugSettings,
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
     settings_ipc_watchers: Vec<DesktopIpcWatcher>,
     settings_ipc_config: FocalDeskConfig,
@@ -520,6 +525,23 @@ pub struct DesktopState {
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
 pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
+
+fn apply_debug_log_level(level: DebugLogLevel) {
+    let level = match level {
+        DebugLogLevel::Error => FLogLevel::Error,
+        DebugLogLevel::Warn => FLogLevel::Warn,
+        DebugLogLevel::Info => FLogLevel::Info,
+        DebugLogLevel::Debug => FLogLevel::Debug,
+        DebugLogLevel::Trace => FLogLevel::Trace,
+    };
+    set_log_level(level);
+}
+
+fn debug_damage_enabled(debug: &DebugSettings) -> bool {
+    debug.show_damage_regions
+        || std::env::var("FOCALDESK_DAMAGE_DEBUG")
+            .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SidebarPulse {
@@ -687,6 +709,7 @@ impl DesktopState {
                 let settings = load_settings();
                 self.apps = settings.apps;
                 self.privacy = settings.privacy;
+                self.apply_debug_settings(settings.debug);
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 IpcResponse::Ok
             }
@@ -725,6 +748,17 @@ impl DesktopState {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
             },
         }
+    }
+
+    fn apply_debug_settings(&mut self, debug: DebugSettings) {
+        apply_debug_log_level(debug.log_level);
+        self.damage_debug_enabled = debug_damage_enabled(&debug);
+        if debug.verbose_protocol_logs && !self.debug.verbose_protocol_logs {
+            flog_info!(
+                "verbose protocol logs are enabled for components that support runtime logging"
+            );
+        }
+        self.debug = debug;
     }
 
     fn apply_display_configs(&mut self, outputs: Vec<OutputConfig>) -> Result<(), String> {
@@ -766,7 +800,7 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
-                output.hdr_enabled = output.hdr_supported && config.hdr_enabled;
+                output.hdr_requested = config.hdr_requested || config.hdr_enabled;
             }
             self.update_output_size(output_id, physical_size, scale_factor);
 
@@ -2455,6 +2489,7 @@ impl DesktopState {
                 scale_factor,
                 scale: Scale::from((scale_factor, scale_factor)),
                 hdr_supported: false,
+                hdr_requested: false,
                 hdr_enabled: false,
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
@@ -3202,6 +3237,9 @@ impl DesktopState {
     }
 
     pub fn new(init: DesktopInit) -> Self {
+        let debug = init.debug.clone();
+        apply_debug_log_level(debug.log_level);
+
         Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -3272,6 +3310,7 @@ impl DesktopState {
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
             privacy: init.privacy,
+            debug: debug.clone(),
             settings_ipc_rx: start_desktop_settings_ipc(),
             settings_ipc_watchers: Vec::new(),
             settings_ipc_config: load_config(),
@@ -3289,8 +3328,7 @@ impl DesktopState {
             screenshot_all_requested: false,
             screenshot_seq: 0,
             theme: init.theme_manager,
-            damage_debug_enabled: std::env::var("FOCALDESK_DAMAGE_DEBUG")
-                .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
+            damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,
             topbar_pulse: None,
@@ -4257,6 +4295,10 @@ impl DesktopState {
     }
 
     pub fn handle_input(&mut self, event: FlowInputEvent) {
+        if self.debug.show_input_events {
+            focaldesk_logging::logging::flog(FLogLevel::Debug, format!("input event: {event:?}"));
+        }
+
         if self.lock_screen.active {
             match event {
                 FlowInputEvent::Key { keycode, state, .. } => {
@@ -5030,6 +5072,7 @@ impl DesktopState {
                     scale_factor: scale,
                     scale: Scale::from((scale, scale)),
                     hdr_supported: false,
+                    hdr_requested: false,
                     hdr_enabled: false,
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
