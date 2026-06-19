@@ -70,8 +70,8 @@ use smithay::{
             gles::{GlesRenderer, GlesTarget, GlesTexture, Uniform},
             Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{libseat::LibSeatSession, Session},
-        udev::{primary_gpu, UdevBackend},
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+        udev::{primary_gpu, UdevBackend, UdevEvent},
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
@@ -311,6 +311,7 @@ pub struct DrmDeviceState {
 /// Whole backend state for tty/udev/libinput/drm.
 pub struct DrmBackend {
     pub session: LibSeatSession,
+    pub primary_gpu: DrmNode,
     pub devices: HashMap<DrmNode, DrmDeviceState>,
 }
 
@@ -319,6 +320,7 @@ pub(crate) struct DrmLoopData {
     pub core: CompositorCore,
     pub backend: DrmBackend,
     pub libinput: Libinput,
+    pub session_active: bool,
     pub should_stop: bool,
 }
 
@@ -1398,7 +1400,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     // Session / seat ownership
     //
-    let (session, _notifier) =
+    let (session, notifier) =
         LibSeatSession::new().map_err(|e| anyhow!("Could not initialize libseat session: {e}"))?;
 
     //
@@ -1454,9 +1456,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         },
         backend: DrmBackend {
             session: session.clone(),
+            primary_gpu: primary_node,
             devices: HashMap::new(),
         },
         libinput,
+        session_active: session.is_active(),
         should_stop: false,
     };
 
@@ -1476,6 +1480,36 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         dispatch_backend_input_event::<LibinputInputBackend>(&mut data.core.state, &event);
     })?;
 
+    let _session_token = loop_handle.insert_source(notifier, |event, _, data| match event {
+        SessionEvent::PauseSession => {
+            flog("Pausing DRM session");
+            data.session_active = false;
+            data.libinput.suspend();
+            for device in data.backend.devices.values_mut() {
+                device.drm_output_manager.pause();
+            }
+        }
+        SessionEvent::ActivateSession => {
+            flog("Resuming DRM session");
+            if let Err(err) = data.libinput.resume() {
+                flog(&format!("Failed to resume libinput: {err:?}"));
+            }
+
+            for device in data.backend.devices.values_mut() {
+                if let Err(err) = device.drm_output_manager.lock().activate(false) {
+                    flog(&format!("Failed to reactivate DRM device: {err}"));
+                }
+            }
+
+            data.core.last_now = Instant::now();
+            data.core
+                .state
+                .mark_all_outputs_full_damage(DamageSource::Unknown);
+            data.core.state.mark_redraw();
+            data.session_active = true;
+        }
+    })?;
+
     for (device_id, path) in udev.device_list() {
         let node = DrmNode::from_dev_id(device_id)
             .map_err(|e| anyhow!("Failed to build DrmNode from dev id {device_id:?}: {e}"))?;
@@ -1487,6 +1521,60 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         device_added(&mut data, &loop_handle, node, &path)?;
     }
+
+    let udev_handle = loop_handle.clone();
+    let _udev_token = loop_handle.insert_source(udev, move |event, _, data| match event {
+        UdevEvent::Added { device_id, path } => {
+            let Ok(node) = DrmNode::from_dev_id(device_id) else {
+                return;
+            };
+            if node == data.backend.primary_gpu && !data.backend.devices.contains_key(&node) {
+                if let Err(err) = device_added(data, &udev_handle, node, &path) {
+                    flog(&format!(
+                        "Failed to add DRM device {}: {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        UdevEvent::Changed { device_id } => {
+            let Ok(node) = DrmNode::from_dev_id(device_id) else {
+                return;
+            };
+            if let Some(device) = data.backend.devices.get_mut(&node) {
+                if data.session_active {
+                    if let Err(err) = device.drm_output_manager.lock().activate(false) {
+                        flog(&format!("Failed to refresh changed DRM device: {err}"));
+                    }
+                }
+                data.core
+                    .state
+                    .mark_all_outputs_full_damage(DamageSource::Unknown);
+                data.core.state.mark_redraw();
+            }
+        }
+        UdevEvent::Removed { device_id } => {
+            let Ok(node) = DrmNode::from_dev_id(device_id) else {
+                return;
+            };
+            if let Some(device) = data.backend.devices.remove(&node) {
+                udev_handle.remove(device.registration_token);
+                for surface in device.surfaces.into_values() {
+                    data.core.state.space.unmap_output(&surface.output);
+                    data.core.state.outputs.shift_remove(&surface.output_id);
+                    data.core
+                        .output_state
+                        .outputs
+                        .shift_remove(&surface.output_id);
+                }
+                if let Some(output_id) = data.core.state.outputs.keys().next().copied() {
+                    data.core.state.primary_output = output_id;
+                    data.core.state.focused_output = output_id;
+                }
+                data.core.state.mark_redraw();
+            }
+        }
+    })?;
 
     #[cfg(feature = "xwayland")]
     {
@@ -1532,6 +1620,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.process_lock_timers();
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+
+        if !data.session_active {
+            continue;
+        }
 
         if let Some(stream) = data.core.listener.accept()? {
             let client = data.core.display.handle().insert_client(

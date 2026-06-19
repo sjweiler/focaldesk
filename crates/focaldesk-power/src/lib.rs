@@ -102,7 +102,7 @@ impl PowerManager {
     }
 
     pub fn execute(&self, command: PowerCommand) -> Result<(), PowerError> {
-        run_spawn("systemctl", &[command.systemctl_arg()])
+        run_status("systemctl", &["--no-block", command.systemctl_arg()])
     }
 
     pub fn suspend(&self) -> Result<(), PowerError> {
@@ -212,11 +212,6 @@ fn run_status(program: &'static str, args: &[&str]) -> Result<(), PowerError> {
     })
 }
 
-fn run_spawn(program: &'static str, args: &[&str]) -> Result<(), PowerError> {
-    Command::new(program).args(args).spawn()?;
-    Ok(())
-}
-
 pub fn command_timeout() -> Duration {
     Duration::from_secs(2)
 }
@@ -224,6 +219,12 @@ pub fn command_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_a_rejected_command() {
+        let err = run_status("sh", &["-c", "exit 7"]).unwrap_err();
+        assert!(matches!(err, PowerError::CommandFailed { .. }));
+    }
 
     #[test]
     fn reads_battery_snapshot_from_sysfs_shape() {

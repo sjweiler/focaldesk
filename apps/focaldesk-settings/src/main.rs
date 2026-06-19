@@ -383,6 +383,16 @@ fn display_summary(d: &DisplayConfig) -> String {
     )
 }
 
+fn hdr_status_subtitle(hdr_requested: bool, hdr_enabled: bool) -> &'static str {
+    if hdr_enabled {
+        "Active now"
+    } else if hdr_requested {
+        "Requested, but inactive"
+    } else {
+        "Off"
+    }
+}
+
 fn transform_label(transform: &str) -> &'static str {
     match transform {
         "Rotate90" => "Portrait Right",
@@ -1573,8 +1583,11 @@ fn connected_display_row(
 
     if display.hdr_supported {
         let hdr_row = adw::ActionRow::new();
-        hdr_row.set_title("Enable HDR");
-        hdr_row.set_subtitle("Use HDR output when this display and backend support it");
+        hdr_row.set_title("HDR output request");
+        hdr_row.set_subtitle(hdr_status_subtitle(
+            display.hdr_requested,
+            display.hdr_enabled,
+        ));
         let hdr = gtk::Switch::new();
         hdr.set_active(display.hdr_requested || display.hdr_enabled);
         hdr_row.add_suffix(&hdr);
@@ -1585,12 +1598,17 @@ fn connected_display_row(
             let displays = displays.clone();
             let area = area.clone();
             let row = row.clone();
+            let hdr_row = hdr_row.clone();
             hdr.connect_active_notify(move |switch| {
                 if let Some(display) = displays.borrow_mut().get_mut(index) {
                     display.hdr_requested = display.hdr_supported && switch.is_active();
                     if !display.hdr_requested {
                         display.hdr_enabled = false;
                     }
+                    hdr_row.set_subtitle(hdr_status_subtitle(
+                        display.hdr_requested,
+                        display.hdr_enabled,
+                    ));
                 }
                 save_display_change(&displays, &area, &row, index);
             });
@@ -4177,6 +4195,13 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_status_distinguishes_request_from_active_output() {
+        assert_eq!(hdr_status_subtitle(true, true), "Active now");
+        assert_eq!(hdr_status_subtitle(true, false), "Requested, but inactive");
+        assert_eq!(hdr_status_subtitle(false, false), "Off");
+    }
 
     #[test]
     fn display_output_config_keeps_hdr_request_and_runtime_state_separate() {

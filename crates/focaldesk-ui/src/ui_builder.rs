@@ -37,6 +37,16 @@ impl Default for UiBuildOptions {
     }
 }
 
+fn hdr_tooltip(hdr_supported: bool, hdr_enabled: bool) -> &'static str {
+    if hdr_supported && hdr_enabled {
+        "HDR supported (enabled)"
+    } else if hdr_supported {
+        "HDR supported (inactive)"
+    } else {
+        "HDR not detected"
+    }
+}
+
 pub fn build_ui_for_output(ui: &mut UiTree, layout: &ChromeLayout) {
     build_ui_for_output_with_options(ui, layout, UiBuildOptions::default());
 }
@@ -171,13 +181,7 @@ pub fn build_ui_for_output_with_options(
             ),
             3 => (
                 IconId::HDR,
-                if options.hdr_supported && options.hdr_enabled {
-                    "HDR active"
-                } else if options.hdr_supported {
-                    "HDR supported (inactive)"
-                } else {
-                    "HDR not detected"
-                },
+                hdr_tooltip(options.hdr_supported, options.hdr_enabled),
                 UiAction::OpenPanel(PanelKind::Display),
             ),
             4 => (
@@ -225,4 +229,17 @@ pub fn build_ui_for_output_with_options(
         hover_scale: 1.03,
         press_scale: 0.98,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hdr_tooltip;
+
+    #[test]
+    fn hdr_tooltip_only_reports_enabled_for_applied_supported_hdr() {
+        assert_eq!(hdr_tooltip(true, true), "HDR supported (enabled)");
+        assert_eq!(hdr_tooltip(true, false), "HDR supported (inactive)");
+        assert_eq!(hdr_tooltip(false, true), "HDR not detected");
+        assert_eq!(hdr_tooltip(false, false), "HDR not detected");
+    }
 }
