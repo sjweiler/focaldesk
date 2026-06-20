@@ -17,7 +17,8 @@ pub struct ChromeShaders {
     pub font_text: Option<GlesTexProgram>,
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
-    pub sdr_to_hdr_pq: Option<GlesTexProgram>,
+    pub srgb_to_linear: Option<GlesTexProgram>,
+    pub linear_to_srgb: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
 }
@@ -35,7 +36,8 @@ impl ChromeShaders {
             font_text: None,
             rounded_rect: None,
             wallpaper_tint: None,
-            sdr_to_hdr_pq: None,
+            srgb_to_linear: None,
+            linear_to_srgb: None,
             pulse: None,
             accent: None,
         }
@@ -139,14 +141,14 @@ impl ChromeShaders {
             )?);
         }
 
-        if self.sdr_to_hdr_pq.is_none() {
-            self.sdr_to_hdr_pq = Some(renderer.compile_custom_texture_shader(
-                SDR_TO_HDR_PQ_FRAG,
-                &[
-                    UniformName::new("u_sdr_white_nits", UniformType::_1f),
-                    UniformName::new("u_max_nits", UniformType::_1f),
-                ],
-            )?);
+        if self.srgb_to_linear.is_none() {
+            self.srgb_to_linear =
+                Some(renderer.compile_custom_texture_shader(SRGB_TO_LINEAR_FRAG, &[])?);
+        }
+
+        if self.linear_to_srgb.is_none() {
+            self.linear_to_srgb =
+                Some(renderer.compile_custom_texture_shader(LINEAR_TO_SRGB_FRAG, &[])?);
         }
 
         if self.amber_lightbar.is_none() {
@@ -764,16 +766,22 @@ void main() {
 }
 "#;
 
-const SDR_TO_HDR_PQ_FRAG: &str = r#"
+const SRGB_TO_LINEAR_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
 #ifdef GL_ES
 precision highp float;
 #endif
 
 varying vec2 v_coords;
-
-uniform sampler2D tex;
-uniform float u_sdr_white_nits;
-uniform float u_max_nits;
+uniform float alpha;
 
 vec3 srgb_to_linear(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
@@ -782,38 +790,49 @@ vec3 srgb_to_linear(vec3 c) {
     return mix(high, low, vec3(cutoff));
 }
 
-vec3 rec709_to_bt2020(vec3 c) {
-    return mat3(
-        0.6274040, 0.0690970, 0.0163916,
-        0.3292820, 0.9195400, 0.0880132,
-        0.0433136, 0.0113612, 0.8955950
-    ) * c;
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    // Wayland alpha buffers are premultiplied. Decode the straight color, then
+    // premultiply again so Smithay's ONE/ONE_MINUS_SRC_ALPHA blend remains valid.
+    vec3 straight = src.a > 0.0 ? clamp(src.rgb / src.a, 0.0, 1.0) : vec3(0.0);
+    gl_FragColor = vec4(srgb_to_linear(straight) * src.a, src.a) * alpha;
 }
+"#;
 
-float linear_nits_to_pq(float nits) {
-    const float m1 = 0.1593017578125;
-    const float m2 = 78.84375;
-    const float c1 = 0.8359375;
-    const float c2 = 18.8515625;
-    const float c3 = 18.6875;
+const LINEAR_TO_SRGB_FRAG: &str = r#"
+//_DEFINES_
 
-    float y = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
-    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
+    vec3 low = c * 12.92;
+    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
 }
 
 void main() {
     vec4 src = texture2D(tex, v_coords);
-    vec3 linear709 = srgb_to_linear(src.rgb);
-    vec3 bt2020 = max(rec709_to_bt2020(linear709), vec3(0.0));
-    float sdr_white = clamp(u_sdr_white_nits, 80.0, 500.0);
-    float max_nits = max(u_max_nits, sdr_white);
-    vec3 nits = min(bt2020 * sdr_white, vec3(max_nits));
-    vec3 pq = vec3(
-        linear_nits_to_pq(nits.r),
-        linear_nits_to_pq(nits.g),
-        linear_nits_to_pq(nits.b)
-    );
-    gl_FragColor = vec4(pq, src.a);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 straight = src.a > 0.0 ? max(src.rgb / src.a, vec3(0.0)) : vec3(0.0);
+    gl_FragColor = vec4(linear_to_srgb(straight) * src.a, src.a) * alpha;
 }
 "#;
 

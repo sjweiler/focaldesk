@@ -9,7 +9,7 @@ use smithay::utils::{Logical, Physical, Rectangle, Size};
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
 use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
-use crate::core::render::{FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
+use crate::core::render::{ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
 use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
@@ -547,6 +547,32 @@ pub fn draw_output(
     scene: &SceneState,
     output_state: &OutputState,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    draw_output_stage(
+        state,
+        frame,
+        prepared,
+        elements,
+        popup_elements,
+        ui_state,
+        scene,
+        output_state,
+        crate::core::render::OutputRenderStage::All,
+        ClientCompositingMode::Sdr,
+    )
+}
+
+pub fn draw_output_stage(
+    state: &mut DesktopState,
+    frame: &mut GlesFrame<'_, '_>,
+    prepared: &PreparedOutput,
+    elements: &[FlowRenderElement],
+    popup_elements: &[FlowRenderElement],
+    ui_state: &mut UiState<GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    stage: crate::core::render::OutputRenderStage,
+    client_compositing: ClientCompositingMode,
+) -> Result<(), Box<dyn std::error::Error>> {
     let egui_frame_ctx = DesktopFrameCtx {
         output_size: prepared.frame_ctx.output_size,
         output_scale: prepared.frame_ctx.output_scale,
@@ -558,7 +584,10 @@ pub fn draw_output(
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         portal_capture: prepared.frame_ctx.portal_capture,
     };
-    if state
+    if matches!(
+        stage,
+        crate::core::render::OutputRenderStage::All | crate::core::render::OutputRenderStage::Base
+    ) && state
         .render
         .egui
         .is_open_on_output(prepared.frame_ctx.rendering_output)
@@ -607,10 +636,12 @@ pub fn draw_output(
         notifications: &notifications,
         lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
+        client_compositing,
+        surface_transfers: &state.surface_transfers,
     };
 
     let muts = RenderInputsMut { ui: ui_state };
 
-    state.render.render_output(frame, inputs, muts)?;
+    state.render.render_stage(frame, inputs, muts, stage)?;
     Ok(())
 }

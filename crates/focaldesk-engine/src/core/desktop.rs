@@ -19,6 +19,12 @@ use smithay::wayland::shm::ShmState;
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
+use crate::core::color::{
+    effective_transfer, force_linear_surfaces, ColorDescription, SurfaceColorState,
+    TransferFunction,
+};
+use smithay::backend::renderer::element::Id;
+use smithay::reexports::wayland_server::Resource;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
 use focaldesk_ui::element::UiElement;
@@ -31,7 +37,6 @@ use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
-use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
 #[cfg(feature = "xwayland")]
@@ -511,6 +516,8 @@ pub struct DesktopState {
     pub fonts: FontSystem,
 
     pub theme: ThemeManager,
+    /// Latest committed transfer function per Wayland surface render id.
+    pub surface_transfers: HashMap<Id, TransferFunction>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
     pub sidebar_pulse: Option<SidebarPulse>,
@@ -3328,6 +3335,7 @@ impl DesktopState {
             screenshot_all_requested: false,
             screenshot_seq: 0,
             theme: init.theme_manager,
+            surface_transfers: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,
@@ -3552,6 +3560,7 @@ impl DesktopState {
     pub fn handle_commit(&mut self, surface: &WlSurface) {
         dbg_flush("handle_commit hit");
 
+        self.refresh_surface_color(surface);
         self.popups.commit(surface);
 
         let mut to_map: Option<usize> = None;
@@ -5100,6 +5109,28 @@ impl DesktopState {
     /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
     pub fn refresh_space(&mut self) {
         self.space.refresh();
+    }
+
+    pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
+        let force_linear = force_linear_surfaces();
+        let transfer = with_states(surface, |states| effective_transfer(states, force_linear));
+        self.surface_transfers
+            .insert(Id::from_wayland_resource(surface), transfer);
+    }
+
+    pub fn set_surface_color_description(
+        &mut self,
+        surface: &WlSurface,
+        description: ColorDescription,
+    ) {
+        with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceColorState>()
+                .pending()
+                .description = Some(description);
+        });
+        self.refresh_surface_color(surface);
     }
 
     /// Import committed buffers for mapped windows on this output before building render elements.

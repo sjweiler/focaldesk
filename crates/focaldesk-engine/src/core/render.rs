@@ -42,6 +42,7 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
+use crate::core::color::TransferFunction;
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame};
 use crate::core::fonts::style_for;
@@ -102,6 +103,22 @@ pub struct FrameCtx {
     /// Full-frame portal/OBS capture — keep egui and chrome on the captured output.
     pub portal_capture: bool,
     //pub time: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputRenderStage {
+    All,
+    Base,
+    Clients,
+    Overlay,
+}
+
+#[derive(Clone)]
+pub enum ClientCompositingMode {
+    Sdr,
+    Linear {
+        srgb_to_linear: GlesTexProgram,
+    },
 }
 
 impl FrameCtx {
@@ -184,6 +201,8 @@ pub struct RenderInputs<'a> {
     pub notifications: &'a [NotificationSnapshot],
     pub lock_screen: &'a LockScreenSnapshot,
     pub flip_egui_y: bool,
+    pub client_compositing: ClientCompositingMode,
+    pub surface_transfers: &'a std::collections::HashMap<Id, TransferFunction>,
 }
 
 pub struct RenderInputsMut<'a> {
@@ -1375,60 +1394,78 @@ impl RenderState {
         inputs: RenderInputs<'_>,
         muts: RenderInputsMut<'_>,
     ) -> Result<(), GlesError> {
+        self.render_stage(frame, inputs, muts, OutputRenderStage::All)
+    }
+
+    pub fn render_stage(
+        &mut self,
+        frame: &mut GlesFrame<'_, '_>,
+        inputs: RenderInputs<'_>,
+        muts: RenderInputsMut<'_>,
+        stage: OutputRenderStage,
+    ) -> Result<(), GlesError> {
         let theme = inputs.theme;
 
-        self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
+        if matches!(stage, OutputRenderStage::All | OutputRenderStage::Base) {
+            self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
 
-        // Chrome draws opaque bevels over the work region; clients must be composited
-        // after that shell (and work-area wallpaper), or they are fully covered.
-        self.draw_chrome_below_work_wallpaper(
-            frame,
-            inputs.ctx,
-            inputs.layout,
-            inputs.output,
-            inputs.metrics,
-            muts.ui,
-            inputs.sidebar_hover_slot,
-            inputs.sidebar_pulse,
-            inputs.topbar_pulse,
-            inputs.clock_pulse,
-            theme.chrome,
-        );
-
-        self.draw_wallpaper_in_rect(
-            frame,
-            inputs.ctx,
-            inputs.layout.work_area.recess,
-            inputs.ctx.output_scale,
-            theme.wallpaper.clone(),
-        );
-
-        // Work-area glass must sit under client surfaces (trim/icons stay above).
-        if let Some(glass) = self.chrome_shaders.glass.as_ref() {
-            let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-            let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
-                Point::<i32, Physical>::from((0, 0)),
-                Size::<i32, Physical>::from(inputs.ctx.output_size),
-            );
-            let damage = &[fullscreen_rect];
-            self.draw_workarea_glass(
+            // Chrome draws opaque bevels over the work region; clients must be composited
+            // after that shell (and work-area wallpaper), or they are fully covered.
+            self.draw_chrome_below_work_wallpaper(
                 frame,
                 inputs.ctx,
-                glass,
-                inputs.layout.work_area.glass,
+                inputs.layout,
+                inputs.output,
+                inputs.metrics,
+                muts.ui,
+                inputs.sidebar_hover_slot,
+                inputs.sidebar_pulse,
+                inputs.topbar_pulse,
+                inputs.clock_pulse,
+                theme.chrome,
+            );
+
+            self.draw_wallpaper_in_rect(
+                frame,
+                inputs.ctx,
+                inputs.layout.work_area.recess,
                 inputs.ctx.output_scale,
-                damage,
-                &legacy_theme.glass,
-            )?;
+                theme.wallpaper.clone(),
+            );
+
+            // Work-area glass must sit under client surfaces (trim/icons stay above).
+            if let Some(glass) = self.chrome_shaders.glass.as_ref() {
+                let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
+                let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
+                    Point::<i32, Physical>::from((0, 0)),
+                    Size::<i32, Physical>::from(inputs.ctx.output_size),
+                );
+                let damage = &[fullscreen_rect];
+                self.draw_workarea_glass(
+                    frame,
+                    inputs.ctx,
+                    glass,
+                    inputs.layout.work_area.glass,
+                    inputs.ctx.output_scale,
+                    damage,
+                    &legacy_theme.glass,
+                )?;
+            }
         }
 
-        self.draw_clients(
-            frame,
-            inputs.ctx,
-            inputs.scene,
-            inputs.output,
-            inputs.elements,
-        );
+        if matches!(stage, OutputRenderStage::All | OutputRenderStage::Clients) {
+            self.draw_clients(
+                frame,
+                inputs.ctx,
+                inputs.elements,
+                inputs.client_compositing,
+                inputs.surface_transfers,
+            );
+        }
+
+        if matches!(stage, OutputRenderStage::Base | OutputRenderStage::Clients) {
+            return Ok(());
+        }
 
         self.draw_chrome_trim_glass_icons(
             frame,
@@ -2701,17 +2738,42 @@ impl RenderState {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        _scene: &SceneState,
-        _output: &OutputState,
         elements: &[FlowRenderElement],
+        client_compositing: ClientCompositingMode,
+        surface_transfers: &std::collections::HashMap<Id, TransferFunction>,
     ) {
-        // 1) Build elements from Space<Window>
-        //let elements = build_client_elements(&scene.space, renderer, ctx);
+        use smithay::backend::renderer::element::Element;
 
         let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        draw_render_elements(frame, ctx.output_scale.x, &elements, damage).unwrap();
+        let ClientCompositingMode::Linear { srgb_to_linear } = client_compositing else {
+            draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+            return;
+        };
+
+        let mut srgb_batch = Vec::new();
+        let mut linear_batch = Vec::new();
+        for elem in elements {
+            let transfer = surface_transfers
+                .get(elem.id())
+                .copied()
+                .unwrap_or(TransferFunction::Srgb);
+            if transfer == TransferFunction::Linear {
+                linear_batch.push(elem);
+            } else {
+                srgb_batch.push(elem);
+            }
+        }
+
+        if !srgb_batch.is_empty() {
+            frame.override_default_tex_program(srgb_to_linear, Vec::new());
+            draw_render_elements(frame, ctx.output_scale.x, &srgb_batch, damage).unwrap();
+            frame.clear_tex_program_override();
+        }
+        if !linear_batch.is_empty() {
+            draw_render_elements(frame, ctx.output_scale.x, &linear_batch, damage).unwrap();
+        }
     }
 
     /// Top bar, sidebar, work-area bezel, and joints — everything that must sit *under*

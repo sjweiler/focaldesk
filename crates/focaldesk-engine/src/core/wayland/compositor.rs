@@ -1,3 +1,4 @@
+use crate::core::color::SurfaceColorState;
 use crate::core::wayland::client::ClientState;
 #[cfg(feature = "xwayland")]
 use focaldesk_logging::flog;
@@ -11,8 +12,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
 #[allow(unused_imports)]
 use smithay::wayland::compositor::{
-    add_blocker, add_pre_commit_hook, with_states, BufferAssignment, CompositorClientState,
-    SurfaceAttributes,
+    add_blocker, add_destruction_hook, add_pre_commit_hook, with_states, BufferAssignment,
+    CompositorClientState, SurfaceAttributes,
 };
 use smithay::wayland::compositor::{CompositorHandler, CompositorState as SmithayCompositorState};
 use smithay::wayland::dmabuf::get_dmabuf;
@@ -26,6 +27,7 @@ use smithay::desktop::layer_map_for_output;
 
 use crate::core::desktop::DesktopState;
 use smithay::reexports::wayland_server::Client;
+use smithay::backend::renderer::element::Id;
 
 #[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static XWAYLAND_BUFFER_LOGS: AtomicUsize = AtomicUsize::new(0);
@@ -48,6 +50,14 @@ impl CompositorHandler for DesktopState {
     }
 
     fn new_surface(&mut self, surface: &WlSurface) {
+        with_states(surface, |states| {
+            drop(states.cached_state.get::<SurfaceColorState>());
+        });
+        add_destruction_hook::<DesktopState, _>(surface, |state, surface| {
+            state
+                .surface_transfers
+                .remove(&Id::from_wayland_resource(surface));
+        });
         add_pre_commit_hook::<DesktopState, _>(surface, |state, _dh, surface| {
             #[cfg(not(feature = "xwayland"))]
             let _ = state;

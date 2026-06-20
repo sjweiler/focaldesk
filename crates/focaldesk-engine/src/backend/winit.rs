@@ -3,41 +3,38 @@
 // winit backend
 
 use crate::backend::common::{bootstrap_compositor_core, translate_backend_input, BootstrapOutput};
-//use crate::backend::common::{
-//    bootstrap_compositor_core, finish_xwayland_startup, start_xwayland, translate_backend_input,
-//};
 #[cfg(feature = "xwayland")]
 use crate::backend::common::{finish_xwayland_startup, start_xwayland};
 
-use smithay::backend::winit as winit_backend; // Smithay backend glue (has init, WinitEvent, etc.)
-use smithay::backend::winit::WinitEvent; // (optional) import event type
+use smithay::backend::winit as winit_backend;
+use smithay::backend::winit::WinitEvent;
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::winit;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::core::linear_compositing::{
+    present_offscreen_texture, run_linear_staged_pass, run_sdr_pass, supports_linear_sdr,
+    use_linear_sdr_path, LinearOffscreenTargets,
+};
 use crate::core::wayland::client::ClientState;
 use focaldesk_flow::keybinds::BackendKind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::Renderer;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Physical, Size, Transform};
 
 use crate::core::input::FlowInputEvent;
 
-use crate::core::backend_render::draw_output;
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
 use crate::core::desktop::DesktopState;
 use focaldesk_logging::{flog, flog_info};
-use focaldesk_themes::theme::BuiltInThemeId;
-use focaldesk_themes::FlowThemeId;
-use focaldesk_themes::ThemeManager;
 use focaldesk_types::OutputId;
 use smithay::backend::winit::WinitEventLoop;
-use smithay::input::keyboard::keysyms;
+
 fn dispatch_backend_events(
     state: &mut DesktopState,
     event_loop: &mut WinitEventLoop,
@@ -86,19 +83,10 @@ fn dispatch_backend_events(
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     flog("FOCALDESK: entered WINIT backend");
-    // Create Smithay winit backend + renderer
-    //let mut theme_manager =
-    // ThemeManager::new(
-    //    FlowThemeId::BuiltIn(BuiltInThemeId::Eagle)
-    // );
-    //let theme = theme_manager.active_theme();
     let (mut backend, mut event_loop) = winit_backend::init::<GlesRenderer>()?;
 
     backend.window().set_maximized(true);
     backend.window().set_decorations(false);
-    // Ask the host compositor to focus our nested window immediately.
-    // Some WMs will ignore this unless done from user interaction, but
-    // requesting here avoids requiring an initial click on permissive setups.
     backend.window().focus_window();
 
     let size = backend.window_size();
@@ -129,6 +117,20 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
+    let buffer_size_phys = Size::<i32, Physical>::from((size.w, size.h));
+    let mut render_targets = LinearOffscreenTargets {
+        linear_supported: {
+            let (renderer, _framebuffer) = backend.bind()?;
+            let supported = supports_linear_sdr(renderer, buffer_size_phys);
+            flog(&format!(
+                "Linear SDR probe: winit format={:?} supported={supported}",
+                crate::core::linear_compositing::LINEAR_SDR_FORMAT
+            ));
+            supported
+        },
+        ..LinearOffscreenTargets::default()
+    };
+
     let mut requested_focus_after_first_frame = false;
     while nested.state.running {
         #[cfg(feature = "xwayland")]
@@ -139,12 +141,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nested.state.process_notification_timers();
         nested.state.process_lock_timers();
 
-        // dispatch events
         if !dispatch_backend_events(&mut nested.state, &mut event_loop)? {
             break;
         }
 
-        // accept clients
         if let Some(stream) = nested.listener.accept()? {
             flog_info!("accepting client");
             let client = nested
@@ -177,9 +177,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nested.state.refresh_space();
         nested.display.flush_clients()?;
 
-        //tick layout
         nested.state.tick_layout();
-        // render if needed
 
         if nested.state.needs_redraw() {
             nested.last_now = now;
@@ -204,21 +202,74 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let popup_elements =
                     build_output_popup_elements(&mut nested.state, renderer, OutputId(1));
 
-                let mut frame =
-                    renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
+                let srgb_to_linear = nested.state.render.chrome_shaders.srgb_to_linear.clone();
+                let linear_to_srgb = nested.state.render.chrome_shaders.linear_to_srgb.clone();
+                let use_linear = use_linear_sdr_path(renderer, &render_targets, buffer_size_phys)
+                    && srgb_to_linear.is_some()
+                    && linear_to_srgb.is_some();
 
-                draw_output(
-                    &mut nested.state,
-                    &mut frame,
-                    &prepared,
-                    &client_elements,
-                    &popup_elements,
-                    &mut nested.ui_state,
-                    &nested.scene,
-                    &nested.output_state,
-                )?;
+                if use_linear {
+                    if let Err(err) = render_targets.ensure_linear_offscreen(renderer, buffer_size_phys)
+                    {
+                        flog(&format!(
+                            "Linear SDR disabled in winit after FP16 allocation failed: {err}"
+                        ));
+                    }
+                }
 
-                let _ = frame.finish()?;
+                if use_linear && render_targets.linear_offscreen.is_some() {
+            let _ = run_linear_staged_pass(
+                        &mut nested.state,
+                        renderer,
+                        &mut render_targets,
+                        buffer_size_phys,
+                        &prepared,
+                        &client_elements,
+                        &popup_elements,
+                        &mut nested.ui_state,
+                        &nested.scene,
+                        &nested.output_state,
+                        srgb_to_linear.as_ref().unwrap(),
+                        linear_to_srgb.as_ref().unwrap(),
+                    )?;
+                    let offscreen = render_targets
+                        .offscreen
+                        .as_ref()
+                        .ok_or("winit offscreen missing after linear pass")?;
+                    let mut frame =
+                        renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
+                    present_offscreen_texture(
+                        &mut frame,
+                        &offscreen.texture,
+                        buffer_size_phys,
+                    )?;
+                    let _ = frame.finish()?;
+                } else {
+            let _ = run_sdr_pass(
+                        &mut nested.state,
+                        renderer,
+                        &mut render_targets,
+                        buffer_size_phys,
+                        &prepared,
+                        &client_elements,
+                        &popup_elements,
+                        &mut nested.ui_state,
+                        &nested.scene,
+                        &nested.output_state,
+                    )?;
+                    let offscreen = render_targets
+                        .offscreen
+                        .as_ref()
+                        .ok_or("winit offscreen missing after SDR pass")?;
+                    let mut frame =
+                        renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
+                    present_offscreen_texture(
+                        &mut frame,
+                        &offscreen.texture,
+                        buffer_size_phys,
+                    )?;
+                    let _ = frame.finish()?;
+                }
             }
 
             backend.submit(None)?;
