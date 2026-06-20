@@ -1,0 +1,18 @@
+[package]
+name = "focaldesk-color-tag-test"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Wayland client for exercising focaldesk_color_v1"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-color-tag-test"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+libc = "0.2"
+wayland-backend = "0.3"
+wayland-client = "0.31"
+wayland-protocols = { workspace = true, features = ["client"] }
+wayland-scanner = "0.31"
