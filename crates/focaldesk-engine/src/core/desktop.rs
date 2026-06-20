@@ -69,7 +69,7 @@ use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
-use smithay::delegate_output;
+use smithay::delegate_dispatch2;
 use smithay::input::keyboard::FilterResult;
 use smithay::input::Seat;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
@@ -5847,4 +5847,4 @@ impl BufferHandler for DesktopState {
 
 impl OutputHandler for DesktopState {}
 
-delegate_output!(DesktopState);
+delegate_dispatch2!(DesktopState);

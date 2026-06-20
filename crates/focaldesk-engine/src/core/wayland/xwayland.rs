@@ -1,6 +1,5 @@
 use std::os::fd::OwnedFd;
 
-use smithay::delegate_xwayland_shell;
 use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::selection::data_device::{
     clear_data_device_selection, current_data_device_selection_userdata,
@@ -337,5 +336,3 @@ fn x11_resize_edge_to_xdg(
         X11ResizeEdge::BottomRight => ResizeEdge::BottomRight,
     }
 }
-
-delegate_xwayland_shell!(DesktopState);

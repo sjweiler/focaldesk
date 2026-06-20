@@ -4,7 +4,6 @@ use focaldesk_logging::flog;
 #[allow(unused_imports)]
 use smithay::backend::renderer::buffer_type;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::delegate_compositor;
 #[allow(unused_imports)]
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -154,5 +153,3 @@ impl CompositorHandler for DesktopState {
         }
     }
 }
-
-delegate_compositor!(DesktopState);

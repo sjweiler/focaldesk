@@ -1,4 +1,3 @@
-use smithay::delegate_xdg_shell;
 use smithay::desktop::{
     find_popup_root_surface, PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy,
 };
@@ -196,5 +195,3 @@ impl XdgShellHandler for DesktopState {
         self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::CommitBbox);
     }
 }
-
-delegate_xdg_shell!(DesktopState);

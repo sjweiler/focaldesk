@@ -1,6 +1,5 @@
 #![allow(unused_imports)]
 
-use smithay::{delegate_data_device, delegate_primary_selection};
 use std::os::fd::OwnedFd;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
@@ -211,12 +210,8 @@ impl DataDeviceHandler for DesktopState {
     }
 }
 
-delegate_data_device!(DesktopState);
-
 impl PrimarySelectionHandler for DesktopState {
     fn primary_selection_state(&mut self) -> &mut PrimarySelectionState {
         &mut self.primary_selection_state
     }
 }
-
-delegate_primary_selection!(DesktopState);

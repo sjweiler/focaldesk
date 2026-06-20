@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-smithay = { git = "https://github.com/Smithay/smithay", branch = "master", default-features = false }
+smithay.workspace = true
 bitflags = "2"
 focaldesk-types = { path = "../focaldesk-types" }

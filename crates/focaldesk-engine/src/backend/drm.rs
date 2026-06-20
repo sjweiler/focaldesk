@@ -5,12 +5,12 @@ use crate::backend::common::{
     bootstrap_compositor_core, physical_size_mm_from_pixels, refresh_portal_services,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
-use drm::control::{atomic::AtomicModeReq, connector, crtc, property};
+use drm::control::{connector, crtc, property};
 use drm_sys as drm_ffi;
 use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, KeyState};
-use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::Offscreen;
+use smithay::backend::renderer::gles::GlesError;
 use smithay::reexports::drm::control::Device as _;
 // `DrmOutput::render_frame` / `initialize_output` drive an internal [`smithay::backend::drm::compositor::DrmCompositor`].
 
@@ -19,11 +19,11 @@ use smithay::backend::input::KeyboardKeyEvent;
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
-use smithay::backend::renderer::utils::DamageBag;
 use smithay::backend::renderer::Frame;
+use smithay::backend::renderer::utils::DamageBag;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
-    render_elements, texture::TextureRenderElement, Id, Kind,
+    Id, Kind, render_elements, texture::TextureRenderElement,
 };
 
 use focaldesk_flow::keybinds::BackendKind;
@@ -40,7 +40,7 @@ use focaldesk_flow::keybinds::BackendKind;
 // - many internals are still TODO so you can connect them to your existing FocalDesk code
 
 use crate::core::backend_render::draw_output;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use smithay::backend::renderer::Bind;
 use smithay::utils::DeviceFd;
 
@@ -56,22 +56,22 @@ use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use focaldesk_logging::flog;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
-use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::format::{FormatSet, get_opaque};
 use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
 
 use smithay::{
     backend::{
-        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
-        drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
-        egl::{self, context::ContextPriority, EGLContext},
+        allocator::{Fourcc, Modifier, gbm::GbmAllocator, gbm::GbmBufferFlags},
+        drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, HdrState},
+        egl::{self, EGLContext, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
+            Color32F, ExportMem, ImportDma, ImportEgl,
             element::solid::SolidColorRenderElement,
             gles::{GlesRenderer, GlesTarget, GlesTexture, Uniform},
-            Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
-        udev::{primary_gpu, UdevBackend, UdevEvent},
+        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
+        udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
@@ -93,9 +93,9 @@ use smithay::backend::drm::{
 
 use crate::core::chrome_layout::build_chrome_layout;
 use crate::core::{
+    OutputState, SceneState,
     desktop::{DamageSource, DesktopState},
     ui_state::UiState,
-    OutputState, SceneState,
 };
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -150,8 +150,19 @@ pub struct HdrSupport {
     pub current_max_bpc: Option<u64>,
     pub hdr_metadata_blob: Option<u64>,
     pub edid_hdr_static_metadata: bool,
+    pub edid_static_metadata_type1: bool,
     pub edid_pq: bool,
     pub edid_hlg: bool,
+    pub edid_hdr_metadata: Option<EdidHdrMetadata>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EdidHdrMetadata {
+    pub display_primaries: [(u16, u16); 3],
+    pub white_point: (u16, u16),
+    pub max_luminance: u16,
+    pub min_luminance: u16,
+    pub max_fall: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -169,15 +180,20 @@ impl HdrSupport {
         self.has_hdr_metadata_property || self.has_bt2020_colorspace || self.max_bpc.is_some()
     }
 
+    fn supports_hdr_bpc(&self) -> bool {
+        self.max_bpc
+            .as_ref()
+            .is_none_or(|range| range.min <= HDR_MAX_BPC && range.max >= HDR_MAX_BPC)
+    }
+
     fn can_enable(&self) -> bool {
         self.has_hdr_metadata_property
             && self.has_bt2020_colorspace
-            && self
-                .max_bpc
-                .as_ref()
-                .is_some_and(|range| range.min <= HDR_MAX_BPC && range.max >= HDR_MAX_BPC)
+            && self.supports_hdr_bpc()
             && self.edid_hdr_static_metadata
+            && self.edid_static_metadata_type1
             && self.edid_pq
+            && self.edid_hdr_metadata.is_some()
     }
 }
 
@@ -266,9 +282,11 @@ pub struct DrmSurfaceState {
     pub sdr_scanout_format: Fourcc,
     pub sdr_scanout_modifiers: Vec<DrmModifier>,
     pub hdr_scanout_format: Option<Fourcc>,
+    pub hdr_scanout_modifiers: Vec<DrmModifier>,
     pub hdr_offscreen_format: Option<Fourcc>,
     pub hdr_metadata_blob: Option<u64>,
     pub hdr_enabled_applied: bool,
+    pub frame_queued_at: Option<Instant>,
 
     pub drm_output: DrmOutput<
         GbmAllocator<DrmDeviceFd>,
@@ -280,17 +298,17 @@ pub struct DrmSurfaceState {
     pub sdr_offscreen: Option<OffscreenOutput>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectorHdrApplyResult {
-    Unchanged,
-    Applied,
-    Rejected,
-}
-
 const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Abgr8888;
 const HDR_OFFSCREEN_FORMATS: [Fourcc; 2] = [Fourcc::Abgr2101010, Fourcc::Argb2101010];
-const HDR_SCANOUT_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb2101010, Fourcc::Argb2101010];
+const HDR_SCANOUT_FORMATS: [Fourcc; 4] = [
+    Fourcc::Abgr2101010,
+    Fourcc::Xbgr2101010,
+    Fourcc::Xrgb2101010,
+    Fourcc::Argb2101010,
+];
 const HDR_MAX_BPC: u64 = 10;
+const HDR_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+const PCI_VENDOR_NVIDIA: u32 = 0x10de;
 
 type FlowDrmOutputManager = DrmOutputManager<
     GbmAllocator<DrmDeviceFd>,
@@ -303,7 +321,9 @@ type FlowDrmOutputManager = DrmOutputManager<
 pub struct DrmDeviceState {
     pub registration_token: RegistrationToken,
     pub render_node: Option<DrmNode>,
+    pub gpu_vendor_id: Option<u32>,
     pub renderer: GlesRenderer,
+    pub gbm: GbmDevice<DrmDeviceFd>,
     pub drm_output_manager: FlowDrmOutputManager,
     pub surfaces: HashMap<drm::control::crtc::Handle, DrmSurfaceState>,
 }
@@ -392,7 +412,7 @@ fn configured_display_scale(displays: &[DisplayConfig], name: &str) -> f64 {
     scale
 }
 
-fn configured_display_hdr_enabled(displays: &[DisplayConfig], name: &str) -> bool {
+fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> bool {
     displays
         .iter()
         .find(|display| display.name == name)
@@ -735,20 +755,422 @@ fn select_hdr_offscreen_format(
     })
 }
 
-fn probe_hdr_scanout_format(
-    allocator: &mut GbmAllocator<DrmDeviceFd>,
-    size: Size<i32, Physical>,
-) -> Option<Fourcc> {
-    HDR_SCANOUT_FORMATS.iter().copied().find(|format| {
-        allocator
-            .create_buffer(
-                size.w as u32,
-                size.h as u32,
-                *format,
-                &[DrmModifier::Linear],
-            )
-            .is_ok()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HdrScanoutProbe {
+    format: Fourcc,
+    modifiers: Vec<DrmModifier>,
+}
+
+fn plane_lists_format(formats: &FormatSet, code: Fourcc) -> bool {
+    let opaque = get_opaque(code).unwrap_or(code);
+    formats
+        .iter()
+        .any(|format| format.code == code || format.code == opaque)
+}
+
+fn plane_modifiers_for_format(formats: &FormatSet, code: Fourcc) -> Vec<DrmModifier> {
+    let opaque = get_opaque(code).unwrap_or(code);
+    formats
+        .iter()
+        .filter(|format| format.code == code || format.code == opaque)
+        .map(|format| format.modifier)
+        .collect()
+}
+
+fn intersect_modifiers(
+    plane_modifiers: &[DrmModifier],
+    requested: &[DrmModifier],
+) -> Vec<DrmModifier> {
+    if requested.is_empty() {
+        return plane_modifiers.to_vec();
+    }
+    let plane: std::collections::HashSet<_> = plane_modifiers.iter().copied().collect();
+    requested
+        .iter()
+        .copied()
+        .filter(|modifier| plane.contains(modifier))
+        .collect()
+}
+
+fn probe_hdr_scanout_plane_from_formats(
+    plane_formats: &FormatSet,
+    sdr_modifiers: &[DrmModifier],
+    output_name: &str,
+) -> Option<HdrScanoutProbe> {
+    for format in HDR_SCANOUT_FORMATS {
+        if !plane_lists_format(plane_formats, format) {
+            continue;
+        }
+
+        let plane_modifiers = plane_modifiers_for_format(plane_formats, format);
+        for modifier_set in hdr_scanout_modifier_sets(sdr_modifiers) {
+            let intersection = intersect_modifiers(&plane_modifiers, &modifier_set);
+            if intersection.is_empty() {
+                flog(&format!(
+                    "HDR plane probe: output={output_name} format={format:?} plane_modifiers={plane_modifiers:?} tried={modifier_set:?} no intersection"
+                ));
+                continue;
+            }
+
+            flog(&format!(
+                "HDR plane probe: output={output_name} format={format:?} modifiers={intersection:?}"
+            ));
+            return Some(HdrScanoutProbe {
+                format,
+                modifiers: intersection,
+            });
+        }
+    }
+
+    None
+}
+
+fn probe_hdr_scanout_plane(
+    drm_output: &DrmOutput<
+        GbmAllocator<DrmDeviceFd>,
+        GbmFramebufferExporter<DrmDeviceFd>,
+        Option<OutputPresentationFeedback>,
+        DrmDeviceFd,
+    >,
+    sdr_modifiers: &[DrmModifier],
+    output_name: &str,
+) -> Option<HdrScanoutProbe> {
+    drm_output.with_compositor(|compositor| {
+        probe_hdr_scanout_plane_from_formats(
+            &compositor.surface().plane_info().formats,
+            sdr_modifiers,
+            output_name,
+        )
     })
+}
+
+/// Live KMS HDR application is compiled in but remains runtime opt-in. NVIDIA also
+/// requires FOCALDESK_HDR_ALLOW_NVIDIA=1 because dual-head commits have frozen before.
+const HDR_LIVE_KMS_APPLY_ENABLED: bool = true;
+
+/// Live scanout/connector HDR changes are opt-in only. Default off: they have frozen
+/// NVIDIA dual-head sessions when `hdr_requested` is set in config.
+fn hdr_runtime_apply_enabled() -> bool {
+    HDR_LIVE_KMS_APPLY_ENABLED
+        && matches!(
+            std::env::var("FOCALDESK_HDR").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+}
+
+fn hdr_driver_allows_output(gpu_vendor_id: Option<u32>) -> bool {
+    let allow_nvidia = matches!(
+        std::env::var("FOCALDESK_HDR_ALLOW_NVIDIA").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    );
+
+    hdr_driver_allows_output_with_override(gpu_vendor_id, allow_nvidia)
+}
+
+fn hdr_driver_allows_output_with_override(gpu_vendor_id: Option<u32>, allow_nvidia: bool) -> bool {
+    gpu_vendor_id != Some(PCI_VENDOR_NVIDIA) || allow_nvidia
+}
+
+#[cfg(test)]
+mod hdr_tests {
+    use super::{
+        DisplayConfig, DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport,
+        PCI_VENDOR_NVIDIA, configured_display_hdr_requested,
+        hdr_driver_allows_output_with_override, intersect_modifiers, parse_edid_hdr_support,
+    };
+
+    fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
+        DisplayConfig {
+            name: "DP-1".into(),
+            enabled: true,
+            mode_width: 2560,
+            mode_height: 1440,
+            refresh_mhz: 165_000,
+            scale: 1.0,
+            logical_x: 0,
+            logical_y: 0,
+            physical_width_mm: None,
+            physical_height_mm: None,
+            primary: true,
+            transform: DisplayTransform::Normal,
+            hdr_supported: true,
+            hdr_requested,
+            hdr_enabled,
+        }
+    }
+
+    #[test]
+    fn loads_persistent_hdr_request_independently_of_runtime_state() {
+        assert!(configured_display_hdr_requested(
+            &[display_config(true, false)],
+            "DP-1"
+        ));
+        // Preserve compatibility with configs written before hdr_requested existed.
+        assert!(configured_display_hdr_requested(
+            &[display_config(false, true)],
+            "DP-1"
+        ));
+    }
+
+    #[test]
+    fn nvidia_hdr_requires_explicit_override() {
+        assert!(!hdr_driver_allows_output_with_override(
+            Some(PCI_VENDOR_NVIDIA),
+            false
+        ));
+        assert!(hdr_driver_allows_output_with_override(
+            Some(PCI_VENDOR_NVIDIA),
+            true
+        ));
+    }
+
+    #[test]
+    fn other_and_unknown_drivers_remain_allowed() {
+        assert!(hdr_driver_allows_output_with_override(Some(0x8086), false));
+        assert!(hdr_driver_allows_output_with_override(Some(0x1002), false));
+        assert!(hdr_driver_allows_output_with_override(None, false));
+    }
+
+    #[test]
+    fn absent_max_bpc_property_allows_driver_managed_10_bit_scanout() {
+        assert!(HdrSupport::default().supports_hdr_bpc());
+    }
+
+    #[test]
+    fn exposed_max_bpc_property_must_support_ten_bits() {
+        let mut support = HdrSupport {
+            max_bpc: Some(HdrBpcRange { min: 8, max: 8 }),
+            ..HdrSupport::default()
+        };
+        assert!(!support.supports_hdr_bpc());
+
+        support.max_bpc = Some(HdrBpcRange { min: 8, max: 10 });
+        assert!(support.supports_hdr_bpc());
+    }
+
+    #[test]
+    fn intersect_modifiers_keeps_plane_matches_only() {
+        let plane = vec![DrmModifier::Invalid, DrmModifier::Linear];
+        assert_eq!(
+            intersect_modifiers(&plane, &[DrmModifier::Linear]),
+            vec![DrmModifier::Linear]
+        );
+        assert_eq!(
+            intersect_modifiers(&plane, &[DrmModifier::Invalid]),
+            vec![DrmModifier::Invalid]
+        );
+        assert_eq!(intersect_modifiers(&plane, &[]), plane);
+    }
+
+    #[test]
+    fn parses_type1_hdr_metadata_from_edid() {
+        let mut edid = [0_u8; 256];
+        edid[..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+        edid[25..35].copy_from_slice(&[0x7e, 0x45, 0xac, 0x4f, 0x47, 0xa6, 0x27, 0x12, 0x50, 0x54]);
+        edid[126] = 1;
+        edid[128] = 0x02;
+        edid[130] = 11;
+        edid[132..139].copy_from_slice(&[0xe6, 0x06, 0x07, 0x01, 0x61, 0x56, 0x1c]);
+
+        let support = parse_edid_hdr_support(&edid);
+
+        assert!(support.edid_hdr_static_metadata);
+        assert!(support.edid_static_metadata_type1);
+        assert!(support.edid_pq);
+        assert!(!support.edid_hlg);
+        assert_eq!(
+            support.edid_hdr_metadata,
+            Some(EdidHdrMetadata {
+                display_primaries: [(33_643, 15_576), (14_014, 32_520), (7_666, 3_516)],
+                white_point: (15_674, 16_455),
+                max_luminance: 409,
+                min_luminance: 493,
+                max_fall: 322,
+            })
+        );
+    }
+}
+
+fn drm_card_vendor_id(card_path: &Path) -> Option<u32> {
+    let card_name = card_path.file_name()?.to_string_lossy();
+    let vendor_path = PathBuf::from("/sys/class/drm")
+        .join(card_name.as_ref())
+        .join("device/vendor");
+    let vendor = std::fs::read_to_string(vendor_path).ok()?;
+    u32::from_str_radix(vendor.trim().trim_start_matches("0x"), 16).ok()
+}
+
+fn hdr_output_capable(
+    hdr_support: &HdrSupport,
+    hdr_offscreen_format: Option<Fourcc>,
+    hdr_scanout: Option<&HdrScanoutProbe>,
+    gpu_vendor_id: Option<u32>,
+) -> bool {
+    hdr_support.can_enable()
+        && hdr_offscreen_format.is_some()
+        && hdr_scanout.is_some()
+        && hdr_driver_allows_output(gpu_vendor_id)
+}
+
+fn hdr_scanout_modifier_sets(sdr_modifiers: &[DrmModifier]) -> Vec<Vec<DrmModifier>> {
+    let mut sets = Vec::new();
+    if !sdr_modifiers.is_empty() {
+        sets.push(sdr_modifiers.to_vec());
+    }
+    sets.push(vec![DrmModifier::Invalid]);
+    if !sdr_modifiers.contains(&DrmModifier::Linear) {
+        sets.push(vec![DrmModifier::Linear]);
+    }
+    sets
+}
+
+fn clear_pending_hdr_connector_state(
+    surface: &DrmSurfaceState,
+    device: &impl drm::control::Device,
+) {
+    if let Err(err) = configure_smithay_hdr_state(surface, device, false, None) {
+        flog(&format!(
+            "Failed to clear pending HDR connector state for {}: {err}",
+            surface.output.name()
+        ));
+    }
+}
+
+fn rollback_surface_to_sdr(
+    surface: &mut DrmSurfaceState,
+    device: &impl drm::control::Device,
+    allocator: GbmAllocator<DrmDeviceFd>,
+) {
+    destroy_hdr_metadata_blob(device, surface.hdr_metadata_blob.take());
+    clear_pending_hdr_connector_state(surface, device);
+    if let Err(err) = set_output_scanout_format(
+        &surface.drm_output,
+        allocator,
+        surface.sdr_scanout_format,
+        surface.sdr_scanout_modifiers.iter().copied(),
+    ) {
+        flog(&format!(
+            "Failed to restore SDR scanout for {}: {err}",
+            surface.output.name()
+        ));
+    }
+    surface.hdr_enabled_applied = false;
+    surface.sdr_offscreen = None;
+}
+
+fn apply_hdr_output_state(
+    surface: &mut DrmSurfaceState,
+    device: &impl drm::control::Device,
+    allocator: GbmAllocator<DrmDeviceFd>,
+    hdr_target: bool,
+) -> bool {
+    if hdr_target == surface.hdr_enabled_applied {
+        return hdr_target;
+    }
+
+    if !hdr_target {
+        rollback_surface_to_sdr(surface, device, allocator);
+        return false;
+    }
+
+    let Some(format) = surface.hdr_scanout_format else {
+        abort_hdr_rendering_userspace(surface, "no plane-probed HDR scanout format");
+        return false;
+    };
+    if surface.hdr_scanout_modifiers.is_empty() {
+        abort_hdr_rendering_userspace(surface, "no plane-probed HDR scanout modifiers");
+        return false;
+    }
+
+    log_connector_hdr_properties(
+        device,
+        surface.connector,
+        &surface.output.name(),
+        "before-queue",
+    );
+
+    let hdr_metadata_blob = match ensure_hdr_metadata_blob(
+        device,
+        &surface.hdr_support,
+        &mut surface.hdr_metadata_blob,
+    ) {
+        Ok(blob) => Some(blob),
+        Err(err) => {
+            abort_hdr_rendering_userspace(
+                surface,
+                &format!("HDR metadata blob creation failed: {err}"),
+            );
+            return false;
+        }
+    };
+
+    // Queue connector HDR first so compositor.set_format's TEST_ONLY atomic includes it.
+    match configure_smithay_hdr_state(surface, device, true, hdr_metadata_blob) {
+        Ok(true) => {}
+        Ok(false) => {
+            abort_hdr_rendering_userspace(surface, "HDR connector state could not be queued");
+            return false;
+        }
+        Err(err) => {
+            abort_hdr_rendering_userspace(
+                surface,
+                &format!("failed to queue HDR connector state through Smithay: {err}"),
+            );
+            return false;
+        }
+    }
+
+    match set_output_scanout_format(
+        &surface.drm_output,
+        allocator,
+        format,
+        surface.hdr_scanout_modifiers.iter().copied(),
+    ) {
+        Ok(()) => {
+            surface.hdr_enabled_applied = true;
+            log_connector_hdr_properties(
+                device,
+                surface.connector,
+                &surface.output.name(),
+                "after-format-test",
+            );
+            true
+        }
+        Err(err) => {
+            clear_pending_hdr_connector_state(surface, device);
+            abort_hdr_rendering_userspace(
+                surface,
+                &format!("HDR scanout format TEST_ONLY failed: {err}"),
+            );
+            false
+        }
+    }
+}
+
+/// Drop HDR rendering state without touching KMS. Rolling back scanout/connector
+/// properties after a wedged HDR present has triggered NVRM Xid 56 and required hard
+/// resets on nvidia-drm dual-head setups.
+fn abort_hdr_rendering_userspace(surface: &mut DrmSurfaceState, reason: &str) {
+    flog(&format!(
+        "HDR aborted on {}: {reason} (userspace only; KMS unchanged — restart session for clean SDR scanout)",
+        surface.output.name()
+    ));
+    surface.hdr_enabled_applied = false;
+    surface.hdr_render_supported = false;
+    surface.frame_queued_at = None;
+    surface.offscreen = None;
+    surface.sdr_offscreen = None;
+}
+
+fn disable_hdr_rendering_after_error(surface: &mut DrmSurfaceState, error: &anyhow::Error) {
+    abort_hdr_rendering_userspace(surface, &format!("frame setup failed: {error:#}"));
+}
+
+fn recover_timed_out_hdr_frame(surface: &mut DrmSurfaceState) {
+    abort_hdr_rendering_userspace(
+        surface,
+        &format!("frame timed out after {HDR_FRAME_TIMEOUT:?} waiting for vblank"),
+    );
 }
 
 fn set_output_scanout_format(
@@ -966,6 +1388,31 @@ fn parse_edid_hdr_support(edid: &[u8]) -> HdrSupport {
         return support;
     }
 
+    let chromaticity = |high: u8, low: u8| -> u16 {
+        let raw = (u16::from(high) << 2) | u16::from(low);
+        ((u32::from(raw) * 50_000 + 512) / 1024) as u16
+    };
+    let chroma_low_1 = edid[25];
+    let chroma_low_2 = edid[26];
+    let display_primaries = [
+        (
+            chromaticity(edid[27], (chroma_low_1 >> 6) & 0x03),
+            chromaticity(edid[28], (chroma_low_1 >> 4) & 0x03),
+        ),
+        (
+            chromaticity(edid[29], (chroma_low_1 >> 2) & 0x03),
+            chromaticity(edid[30], chroma_low_1 & 0x03),
+        ),
+        (
+            chromaticity(edid[31], (chroma_low_2 >> 6) & 0x03),
+            chromaticity(edid[32], (chroma_low_2 >> 4) & 0x03),
+        ),
+    ];
+    let white_point = (
+        chromaticity(edid[33], (chroma_low_2 >> 2) & 0x03),
+        chromaticity(edid[34], chroma_low_2 & 0x03),
+    );
+
     let extension_count = edid[126] as usize;
     for ext_index in 0..extension_count {
         let start = 128 * (ext_index + 1);
@@ -1001,9 +1448,40 @@ fn parse_edid_hdr_support(edid: &[u8]) -> HdrSupport {
             }
 
             let eotf_flags = block[1];
+            let supports_type1 = block[2] & 0x01 != 0;
             support.edid_hdr_static_metadata = true;
-            support.edid_pq = eotf_flags & (1 << 2) != 0;
-            support.edid_hlg = eotf_flags & (1 << 3) != 0;
+            support.edid_static_metadata_type1 |= supports_type1;
+            support.edid_pq |= eotf_flags & (1 << 2) != 0;
+            support.edid_hlg |= eotf_flags & (1 << 3) != 0;
+            if !supports_type1 {
+                continue;
+            }
+
+            let max_luminance_nits = block
+                .get(3)
+                .map(|code| 50.0 * 2.0_f64.powf(f64::from(*code) / 32.0))
+                .unwrap_or(1_000.0);
+            let max_fall_nits = block
+                .get(4)
+                .map(|code| 50.0 * 2.0_f64.powf(f64::from(*code) / 32.0))
+                .unwrap_or(max_luminance_nits);
+            let min_luminance_nits = block
+                .get(5)
+                .map(|code| {
+                    let ratio = f64::from(*code) / 255.0;
+                    max_luminance_nits * ratio * ratio / 100.0
+                })
+                .unwrap_or(0.0);
+
+            support.edid_hdr_metadata = Some(EdidHdrMetadata {
+                display_primaries,
+                white_point,
+                max_luminance: max_luminance_nits.round().clamp(1.0, f64::from(u16::MAX)) as u16,
+                min_luminance: (min_luminance_nits * 10_000.0)
+                    .round()
+                    .clamp(0.0, f64::from(u16::MAX)) as u16,
+                max_fall: max_fall_nits.round().clamp(1.0, f64::from(u16::MAX)) as u16,
+            });
         }
     }
 
@@ -1023,7 +1501,7 @@ fn log_hdr_support(output_name: &str, support: &HdrSupport) {
     let current_colorspace = support.current_colorspace.as_deref().unwrap_or("unknown");
 
     flog(&format!(
-        "HDR support: output={} metadata_property={} metadata_blob={:?} bt2020_colorspace={} colorspaces={:?} current_colorspace={} max_bpc={} current_max_bpc={} edid_hdr_static_metadata={} edid_pq={} edid_hlg={}",
+        "HDR support: output={} metadata_property={} metadata_blob={:?} bt2020_colorspace={} colorspaces={:?} current_colorspace={} max_bpc={} current_max_bpc={} edid_hdr_static_metadata={} edid_static_metadata_type1={} edid_pq={} edid_hlg={} edid_hdr_metadata={:?}",
         output_name,
         support.has_hdr_metadata_property,
         support.hdr_metadata_blob,
@@ -1033,8 +1511,62 @@ fn log_hdr_support(output_name: &str, support: &HdrSupport) {
         max_bpc,
         current_bpc,
         support.edid_hdr_static_metadata,
+        support.edid_static_metadata_type1,
         support.edid_pq,
         support.edid_hlg,
+        support.edid_hdr_metadata,
+    ));
+}
+
+fn log_connector_hdr_properties(
+    device: &impl drm::control::Device,
+    connector: connector::Handle,
+    output_name: &str,
+    phase: &str,
+) {
+    let props = match device.get_properties(connector) {
+        Ok(props) => props,
+        Err(err) => {
+            flog(&format!(
+                "HDR KMS properties: output={output_name} connector={connector:?} phase={phase} read_error={err}"
+            ));
+            return;
+        }
+    };
+
+    let mut colorspace = "missing".to_string();
+    let mut max_bpc = "missing".to_string();
+    let mut metadata = "missing".to_string();
+
+    for (prop, raw_value) in props.iter() {
+        let Ok(info) = device.get_property(*prop) else {
+            continue;
+        };
+
+        match info.name().to_string_lossy().as_ref() {
+            "Colorspace" => {
+                colorspace = match info.value_type() {
+                    property::ValueType::Enum(values) => values
+                        .get_value_from_raw_value(*raw_value)
+                        .map(|value| format!("{}({raw_value})", value.name().to_string_lossy()))
+                        .unwrap_or_else(|| format!("unknown({raw_value})")),
+                    _ => format!("raw({raw_value})"),
+                };
+            }
+            "max bpc" => max_bpc = raw_value.to_string(),
+            "HDR_OUTPUT_METADATA" => {
+                metadata = if *raw_value == 0 {
+                    "none(0)".to_string()
+                } else {
+                    format!("blob({raw_value})")
+                };
+            }
+            _ => {}
+        }
+    }
+
+    flog(&format!(
+        "HDR KMS properties: output={output_name} connector={connector:?} phase={phase} colorspace={colorspace} max_bpc={max_bpc} metadata={metadata}"
     ));
 }
 
@@ -1046,24 +1578,25 @@ fn hdr_white_point(x: u16, y: u16) -> drm_ffi::hdr_metadata_infoframe__bindgen_t
     drm_ffi::hdr_metadata_infoframe__bindgen_ty_2 { x, y }
 }
 
-fn build_hdr_output_metadata(_support: &HdrSupport) -> drm_ffi::hdr_output_metadata {
+fn build_hdr_output_metadata(support: &HdrSupport) -> drm_ffi::hdr_output_metadata {
     const DRM_MODE_HDR_METADATA_TYPE1: u32 = 0;
     const HDMI_EOTF_SMPTE_ST2084: u8 = 2;
+    // HDMI Static Metadata Descriptor Type 1 is encoded as descriptor ID zero.
     const HDMI_STATIC_METADATA_TYPE1: u8 = 0;
+
+    let metadata = support
+        .edid_hdr_metadata
+        .expect("HDR metadata blob requires parsed EDID Type 1 metadata");
 
     let infoframe = drm_ffi::hdr_metadata_infoframe {
         eotf: HDMI_EOTF_SMPTE_ST2084,
         metadata_type: HDMI_STATIC_METADATA_TYPE1,
-        display_primaries: [
-            hdr_point(34_000, 16_000),
-            hdr_point(13_250, 34_500),
-            hdr_point(7_500, 3_000),
-        ],
-        white_point: hdr_white_point(15_635, 16_450),
-        max_display_mastering_luminance: 1_000,
-        min_display_mastering_luminance: 50,
-        max_cll: 1_000,
-        max_fall: 400,
+        display_primaries: metadata.display_primaries.map(|(x, y)| hdr_point(x, y)),
+        white_point: hdr_white_point(metadata.white_point.0, metadata.white_point.1),
+        max_display_mastering_luminance: metadata.max_luminance,
+        min_display_mastering_luminance: metadata.min_luminance,
+        max_cll: metadata.max_luminance,
+        max_fall: metadata.max_fall,
     };
 
     drm_ffi::hdr_output_metadata {
@@ -1159,13 +1692,13 @@ fn select_colorspace_value(
     selected.map(|value| value.value())
 }
 
-fn build_connector_hdr_req(
+fn build_connector_hdr_state(
     device: &impl drm::control::Device,
     connector: connector::Handle,
     support: &HdrSupport,
     hdr_enabled: bool,
     hdr_metadata_blob: Option<u64>,
-) -> Result<Option<AtomicModeReq>, anyhow::Error> {
+) -> Result<Option<HdrState>, anyhow::Error> {
     if hdr_enabled && (!support.can_enable() || hdr_metadata_blob.is_none()) {
         return Ok(None);
     }
@@ -1178,7 +1711,7 @@ fn build_connector_hdr_req(
         .get_properties(connector)
         .map_err(|err| anyhow!("failed to read connector properties for HDR: {err}"))?;
 
-    let mut req = AtomicModeReq::new();
+    let mut state = HdrState::default();
     let mut changed = false;
 
     for (prop, raw_value) in props.iter() {
@@ -1191,7 +1724,7 @@ fn build_connector_hdr_req(
         match name.as_ref() {
             "Colorspace" => {
                 if let Some(value) = select_colorspace_value(&info, support, hdr_enabled) {
-                    req.add_raw_property(connector.into(), *prop, value);
+                    state.colorspace = Some(value);
                     changed = true;
                 }
             }
@@ -1202,8 +1735,9 @@ fn build_connector_hdr_req(
                     } else {
                         Some(8.clamp(min, max))
                     };
+
                     if let Some(target) = target {
-                        req.add_property(connector, *prop, property::Value::UnsignedRange(target));
+                        state.max_bpc = Some(target);
                         changed = true;
                     }
                 }
@@ -1215,7 +1749,7 @@ fn build_connector_hdr_req(
                     } else {
                         0
                     };
-                    req.add_property(connector, *prop, property::Value::Blob(target));
+                    state.hdr_output_metadata = Some(property::Value::Blob(target));
                     changed = true;
                 }
             }
@@ -1227,58 +1761,32 @@ fn build_connector_hdr_req(
         return Ok(None);
     }
 
-    Ok(Some(req))
+    Ok(Some(state))
 }
 
-fn test_connector_hdr_state(
+fn configure_smithay_hdr_state(
+    surface: &DrmSurfaceState,
     device: &impl drm::control::Device,
-    connector: connector::Handle,
-    support: &HdrSupport,
     hdr_enabled: bool,
     hdr_metadata_blob: Option<u64>,
 ) -> Result<bool, anyhow::Error> {
-    if hdr_enabled && (!support.can_enable() || hdr_metadata_blob.is_none()) {
-        return Ok(false);
-    }
-
-    let Some(req) =
-        build_connector_hdr_req(device, connector, support, hdr_enabled, hdr_metadata_blob)?
+    let Some(state) = build_connector_hdr_state(
+        device,
+        surface.connector,
+        &surface.hdr_support,
+        hdr_enabled,
+        hdr_metadata_blob,
+    )?
     else {
         return Ok(true);
     };
 
-    let flags =
-        drm::control::AtomicCommitFlags::TEST_ONLY | drm::control::AtomicCommitFlags::ALLOW_MODESET;
+    surface
+        .drm_output
+        .with_compositor(|compositor| compositor.use_hdr_state(state))
+        .map_err(|err| anyhow!("failed to queue HDR connector state: {err}"))?;
 
-    Ok(device.atomic_commit(flags, req).is_ok())
-}
-
-fn apply_connector_hdr_state(
-    device: &impl drm::control::Device,
-    connector: connector::Handle,
-    support: &HdrSupport,
-    hdr_enabled: bool,
-    hdr_metadata_blob: Option<u64>,
-) -> Result<ConnectorHdrApplyResult, anyhow::Error> {
-    if hdr_enabled && (!support.can_enable() || hdr_metadata_blob.is_none()) {
-        return Ok(ConnectorHdrApplyResult::Rejected);
-    }
-
-    let Some(req) =
-        build_connector_hdr_req(device, connector, support, hdr_enabled, hdr_metadata_blob)?
-    else {
-        return Ok(ConnectorHdrApplyResult::Unchanged);
-    };
-
-    if !test_connector_hdr_state(device, connector, support, hdr_enabled, hdr_metadata_blob)? {
-        return Ok(ConnectorHdrApplyResult::Rejected);
-    }
-
-    device
-        .atomic_commit(drm::control::AtomicCommitFlags::ALLOW_MODESET, req)
-        .map_err(|err| anyhow!("failed to apply HDR connector state: {err}"))?;
-
-    Ok(ConnectorHdrApplyResult::Applied)
+    Ok(true)
 }
 
 fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
@@ -1666,10 +2174,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .retain(|session| session.alive());
         let portal_active = !data.core.state.image_copy_capture_sessions.is_empty()
             && !data.core.state.pending_portal_captures.is_empty();
+        let hdr_frame_pending = data.backend.devices.values().any(|device| {
+            device
+                .surfaces
+                .values()
+                .any(|surface| surface.hdr_enabled_applied && surface.frame_queued_at.is_some())
+        });
         let should_render = data.core.state.needs_redraw()
             || screenshot_output.is_some()
             || data.core.state.screenshot_all_requested
-            || portal_active;
+            || portal_active
+            || hdr_frame_pending;
         if !should_render {
             if portal_active {
                 if let Some(device) = data.backend.devices.values_mut().next() {
@@ -1690,6 +2205,29 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         for (_node, device) in data.backend.devices.iter_mut() {
             for (_crtc, surface) in device.surfaces.iter_mut() {
+                if let Some(queued_at) = surface.frame_queued_at {
+                    if surface.hdr_enabled_applied
+                        && now.saturating_duration_since(queued_at) >= HDR_FRAME_TIMEOUT
+                    {
+                        flog(&format!(
+                            "HDR frame timed out after {:?} on {}; aborting HDR rendering",
+                            HDR_FRAME_TIMEOUT,
+                            surface.output.name()
+                        ));
+                        recover_timed_out_hdr_frame(surface);
+                        if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                            out.hdr_enabled = false;
+                        }
+                        data.core
+                            .state
+                            .mark_output_full_damage(surface.output_id, DamageSource::Unknown);
+                    } else {
+                        // Wait for the matching vblank before preparing another buffer for this
+                        // CRTC. Other outputs remain independent and continue rendering.
+                        continue;
+                    }
+                }
+
                 let owns_cursor = data.core.state.output_owns_cursor(surface.output_id);
                 let pending_damage = data.core.state.output_has_pending_damage(surface.output_id);
                 let wants_screenshot = screenshot_output == Some(surface.output_id);
@@ -1715,177 +2253,83 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
                     out.hdr_supported = surface.hdr_support.is_detected();
-                    let mut hdr_target = out.hdr_requested
-                        && surface.hdr_support.can_enable()
-                        && surface.hdr_render_supported;
-                    if hdr_target {
-                        if let Some(format) = surface.hdr_offscreen_format {
-                            if let Err(err) = ensure_offscreen_texture(
-                                &mut device.renderer,
-                                &mut surface.offscreen,
-                                surface.size,
-                                format,
-                            ) {
-                                flog(&format!(
-                                    "HDR offscreen texture failed for {:?} format {:?}: {err}; keeping SDR",
-                                    surface.output_id, format
-                                ));
-                                hdr_target = false;
+                    // hdr_enabled_applied is authoritative state managed by apply_hdr_output_state;
+                    // do not reset it here — that was the bug preventing HDR from ever activating.
+                }
+                let mut hdr_state_changed = false;
+
+                // Apply (or revoke) HDR connector/scanout state when the user's request differs
+                // from what is currently applied.  apply_hdr_output_state is idempotent: it
+                // returns immediately when hdr_target == surface.hdr_enabled_applied, so there is
+                // no per-frame atomic-commit overhead on the steady-state path.
+                //
+                // FOCALDESK_HDR=1 enables the experimental KMS path. NVIDIA must also
+                // explicitly opt in with FOCALDESK_HDR_ALLOW_NVIDIA=1.
+                if hdr_runtime_apply_enabled() && surface.hdr_render_supported {
+                    let hdr_target = data
+                        .core
+                        .state
+                        .outputs
+                        .get(&surface.output_id)
+                        .map(|o| o.hdr_requested)
+                        .unwrap_or(false);
+
+                    let drm_device = device.drm_output_manager.device();
+                    let allocator = GbmAllocator::new(
+                        device.gbm.clone(),
+                        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                    );
+
+                    // Allocate everything needed by the first HDR frame before changing the
+                    // scanout and connector state. A format probe can succeed while the real,
+                    // full-size allocation still fails under memory pressure.
+                    if hdr_target && !surface.hdr_enabled_applied {
+                        let target_result = surface
+                            .hdr_offscreen_format
+                            .ok_or_else(|| anyhow!("no HDR offscreen format available"))
+                            .and_then(|format| {
+                                ensure_offscreen_texture(
+                                    &mut device.renderer,
+                                    &mut surface.offscreen,
+                                    surface.size,
+                                    format,
+                                )
+                                .map_err(anyhow::Error::from)
+                            })
+                            .and_then(|()| {
+                                ensure_offscreen_texture(
+                                    &mut device.renderer,
+                                    &mut surface.sdr_offscreen,
+                                    surface.size,
+                                    SDR_OFFSCREEN_FORMAT,
+                                )
+                                .map_err(anyhow::Error::from)
+                            });
+
+                        if let Err(err) = target_result {
+                            disable_hdr_rendering_after_error(surface, &err);
+                            if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
                                 out.hdr_enabled = false;
                             }
-                        } else {
-                            hdr_target = false;
-                            out.hdr_enabled = false;
+                            data.core
+                                .state
+                                .mark_output_full_damage(surface.output_id, DamageSource::Unknown);
+                            continue;
                         }
                     }
-                    if hdr_target != surface.hdr_enabled_applied {
-                        let scanout_allocator = device.drm_output_manager.allocator().clone();
-                        if hdr_target {
-                            let scanout_result = surface.hdr_scanout_format.map_or_else(
-                                || Err(anyhow!("no 10-bit scanout format available")),
-                                |format| {
-                                    set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        format,
-                                        [DrmModifier::Linear],
-                                    )
-                                },
-                            );
-                            if let Err(err) = scanout_result {
-                                flog(&format!(
-                                    "Failed to enable HDR scanout for {:?}: {err}; keeping SDR",
-                                    surface.output_id
-                                ));
-                                hdr_target = false;
-                                out.hdr_enabled = false;
-                            }
-                        }
-                        let device = device.drm_output_manager.device();
-                        let hdr_metadata_blob = if hdr_target {
-                            match ensure_hdr_metadata_blob(
-                                device,
-                                &surface.hdr_support,
-                                &mut surface.hdr_metadata_blob,
-                            ) {
-                                Ok(blob) => Some(blob),
-                                Err(err) => {
-                                    flog(&format!(
-                                        "Failed to create HDR metadata blob for {:?}: {err}",
-                                        surface.output_id
-                                    ));
-                                    out.hdr_enabled = false;
-                                    surface.hdr_enabled_applied = false;
-                                    None
-                                }
-                            }
-                        } else {
-                            None
-                        };
 
-                        match apply_connector_hdr_state(
-                            device,
-                            surface.connector,
-                            &surface.hdr_support,
-                            hdr_target,
-                            hdr_metadata_blob,
-                        ) {
-                            Ok(ConnectorHdrApplyResult::Applied) => {
-                                out.hdr_enabled = hdr_target;
-                                surface.hdr_enabled_applied = hdr_target;
-                                if !hdr_target {
-                                    destroy_hdr_metadata_blob(
-                                        device,
-                                        surface.hdr_metadata_blob.take(),
-                                    );
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
-                                }
-                            }
-                            Ok(ConnectorHdrApplyResult::Unchanged) => {
-                                out.hdr_enabled = hdr_target;
-                                surface.hdr_enabled_applied = hdr_target;
-                                if !hdr_target {
-                                    destroy_hdr_metadata_blob(
-                                        device,
-                                        surface.hdr_metadata_blob.take(),
-                                    );
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
-                                }
-                            }
-                            Ok(ConnectorHdrApplyResult::Rejected) => {
-                                if hdr_target {
-                                    flog(&format!(
-                                        "HDR connector state rejected by atomic test for {:?}; keeping SDR",
-                                        surface.output_id
-                                    ));
-                                    out.hdr_enabled = false;
-                                    surface.hdr_enabled_applied = false;
-                                    destroy_hdr_metadata_blob(
-                                        device,
-                                        surface.hdr_metadata_blob.take(),
-                                    );
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
-                                } else {
-                                    flog(&format!(
-                                        "SDR connector state rejected by atomic test for {:?}",
-                                        surface.output_id
-                                    ));
-                                }
-                            }
-                            Err(err) => {
-                                flog(&format!(
-                                    "Failed to update HDR connector state for {:?}: {err}",
-                                    surface.output_id
-                                ));
-                                if hdr_target {
-                                    if let Err(err) = set_output_scanout_format(
-                                        &surface.drm_output,
-                                        scanout_allocator.clone(),
-                                        surface.sdr_scanout_format,
-                                        surface.sdr_scanout_modifiers.iter().copied(),
-                                    ) {
-                                        flog(&format!(
-                                            "Failed to restore SDR scanout for {:?}: {err}",
-                                            surface.output_id
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        out.hdr_enabled = surface.hdr_enabled_applied;
+                    // Queue the scanout format and connector HDR properties so Smithay
+                    // tests and commits them together with the next frame.
+                    let was_enabled = surface.hdr_enabled_applied;
+                    let actually_enabled =
+                        apply_hdr_output_state(surface, drm_device, allocator, hdr_target);
+                    hdr_state_changed = was_enabled != actually_enabled;
+
+                    if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                        out.hdr_enabled = actually_enabled;
                     }
                 }
+
                 let prepared = prepare_output(
                     &mut data.core.state,
                     &mut device.renderer,
@@ -1897,7 +2341,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     portal_active,
                 )?;
 
-                ensure_offscreen_texture(
+                let target_result = ensure_offscreen_texture(
                     &mut device.renderer,
                     &mut surface.offscreen,
                     surface.size,
@@ -1906,15 +2350,30 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     } else {
                         SDR_OFFSCREEN_FORMAT
                     },
-                )?;
+                )
+                .map_err(anyhow::Error::from);
                 if surface.hdr_enabled_applied {
-                    ensure_offscreen_texture(
-                        &mut device.renderer,
-                        &mut surface.sdr_offscreen,
-                        surface.size,
-                        SDR_OFFSCREEN_FORMAT,
-                    )?;
+                    let target_result = target_result.and_then(|()| {
+                        ensure_offscreen_texture(
+                            &mut device.renderer,
+                            &mut surface.sdr_offscreen,
+                            surface.size,
+                            SDR_OFFSCREEN_FORMAT,
+                        )
+                        .map_err(anyhow::Error::from)
+                    });
+                    if let Err(err) = target_result {
+                        disable_hdr_rendering_after_error(surface, &err);
+                        if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                            out.hdr_enabled = false;
+                        }
+                        data.core
+                            .state
+                            .mark_output_full_damage(surface.output_id, DamageSource::Unknown);
+                        continue;
+                    }
                 } else {
+                    target_result?;
                     surface.sdr_offscreen = None;
                 }
 
@@ -1965,32 +2424,48 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 if surface.hdr_enabled_applied {
-                    let shader = data
+                    let conversion_result = data
                         .core
                         .state
                         .render
                         .chrome_shaders
                         .sdr_to_hdr_pq
                         .as_ref()
-                        .ok_or_else(|| anyhow!("SDR-to-HDR shader missing"))?;
-                    let sdr_texture = surface
-                        .sdr_offscreen
-                        .as_ref()
-                        .ok_or_else(|| anyhow!("SDR offscreen missing before HDR conversion"))?
-                        .texture
-                        .clone();
-                    let hdr_texture = &mut surface
-                        .offscreen
-                        .as_mut()
-                        .ok_or_else(|| anyhow!("HDR offscreen missing before HDR conversion"))?
-                        .texture;
-                    convert_sdr_scene_to_hdr(
-                        &mut device.renderer,
-                        &sdr_texture,
-                        hdr_texture,
-                        surface.size,
-                        shader,
-                    )?;
+                        .ok_or_else(|| anyhow!("SDR-to-HDR shader missing"))
+                        .and_then(|shader| {
+                            let sdr_texture = surface
+                                .sdr_offscreen
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    anyhow!("SDR offscreen missing before HDR conversion")
+                                })?
+                                .texture
+                                .clone();
+                            let hdr_texture = &mut surface
+                                .offscreen
+                                .as_mut()
+                                .ok_or_else(|| {
+                                    anyhow!("HDR offscreen missing before HDR conversion")
+                                })?
+                                .texture;
+                            convert_sdr_scene_to_hdr(
+                                &mut device.renderer,
+                                &sdr_texture,
+                                hdr_texture,
+                                surface.size,
+                                shader,
+                            )
+                        });
+                    if let Err(err) = conversion_result {
+                        disable_hdr_rendering_after_error(surface, &err);
+                        if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                            out.hdr_enabled = false;
+                        }
+                        data.core
+                            .state
+                            .mark_output_full_damage(surface.output_id, DamageSource::Unknown);
+                        continue;
+                    }
                 }
 
                 if let Some(texture) = capture_source_texture(surface).cloned() {
@@ -2146,31 +2621,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 ) {
                     Ok(frame_result) => frame_result,
                     Err(err) if surface.hdr_enabled_applied => {
-                        flog(&format!(
-                            "HDR render_frame failed for {:?}: {err}; restoring SDR",
-                            surface.output_id
-                        ));
-                        let drm_device = device.drm_output_manager.device();
-                        if let Err(restore_err) = apply_connector_hdr_state(
-                            drm_device,
-                            surface.connector,
-                            &surface.hdr_support,
-                            false,
-                            None,
-                        ) {
-                            flog(&format!(
-                                "Failed to restore SDR connector state for {:?}: {restore_err}",
-                                surface.output_id
-                            ));
-                        }
-                        destroy_hdr_metadata_blob(drm_device, surface.hdr_metadata_blob.take());
-                        surface.hdr_enabled_applied = false;
-                        surface.hdr_render_supported = false;
+                        disable_hdr_rendering_after_error(
+                            surface,
+                            &anyhow!("render_frame failed: {err}"),
+                        );
                         if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
                             out.hdr_enabled = false;
                         }
-                        surface.offscreen = None;
-                        surface.sdr_offscreen = None;
                         data.core
                             .state
                             .mark_output_full_damage(surface.output_id, DamageSource::Unknown);
@@ -2185,7 +2642,33 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 );
 
                 if !frame_result.is_empty {
-                    surface.drm_output.queue_frame(None)?;
+                    match surface.drm_output.queue_frame(None) {
+                        Ok(()) => {
+                            surface.frame_queued_at = Some(now);
+                            if hdr_state_changed {
+                                log_connector_hdr_properties(
+                                    device.drm_output_manager.device(),
+                                    surface.connector,
+                                    &surface.output.name(),
+                                    "after-atomic-commit",
+                                );
+                            }
+                        }
+                        Err(err) if surface.hdr_enabled_applied => {
+                            disable_hdr_rendering_after_error(
+                                surface,
+                                &anyhow!("queue_frame failed: {err}"),
+                            );
+                            if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                                out.hdr_enabled = false;
+                            }
+                            data.core
+                                .state
+                                .mark_output_full_damage(surface.output_id, DamageSource::Unknown);
+                            continue;
+                        }
+                        Err(err) => return Err(err.into()),
+                    }
                     data.core.state.compositor_ready = true;
                 }
             }
@@ -2281,6 +2764,8 @@ pub fn make_drm_gpu(
     let color_formats = [
         Fourcc::Argb8888,
         Fourcc::Xrgb8888,
+        Fourcc::Abgr2101010,
+        Fourcc::Xbgr2101010,
         Fourcc::Argb2101010,
         Fourcc::Xrgb2101010,
     ];
@@ -2346,6 +2831,8 @@ fn device_added(
     };
 
     flog("Device-added DRM node open succeeded");
+
+    let gpu_vendor_id = drm_card_vendor_id(path);
 
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
 
@@ -2427,6 +2914,8 @@ fn device_added(
         [
             Fourcc::Argb8888,
             Fourcc::Xrgb8888,
+            Fourcc::Abgr2101010,
+            Fourcc::Xbgr2101010,
             Fourcc::Argb2101010,
             Fourcc::Xrgb2101010,
         ],
@@ -2547,7 +3036,8 @@ fn device_added(
             // (e.g. OBS projector shows all DRM outputs on top of each other).
             let origin = Point::<i32, Logical>::from((next_x, 0));
             let output_scale = configured_display_scale(&configured_displays, &output_name);
-            let hdr_enabled = configured_display_hdr_enabled(&configured_displays, &output_name);
+            let hdr_requested =
+                configured_display_hdr_requested(&configured_displays, &output_name);
             let output_scale_int = output_scale.round().max(1.0) as i32;
             let logical_size = Size::<i32, Logical>::from((
                 (w as f64 / output_scale).round() as i32,
@@ -2633,16 +3123,7 @@ fn device_added(
                 Fourcc::Argb8888,
                 &[DrmModifier::Linear],
             )?;
-            let hdr_scanout_format = probe_hdr_scanout_format(&mut allocator, tex_phys_size);
             let hdr_offscreen_format = select_hdr_offscreen_format(&mut renderer, tex_phys_size);
-            let hdr_render_supported =
-                hdr_scanout_format.is_some() && hdr_offscreen_format.is_some();
-            if hdr_support.can_enable() {
-                flog(&format!(
-                    "HDR render probe: output={} scanout={:?} offscreen={:?} supported={}",
-                    output_name, hdr_scanout_format, hdr_offscreen_format, hdr_render_supported
-                ));
-            }
 
             let drm_output = drm_output_manager
                 .lock()
@@ -2661,112 +3142,46 @@ fn device_added(
                     (compositor.format(), compositor.modifiers().to_vec())
                 });
 
-            let mut hdr_metadata_blob = None;
-            let mut hdr_enabled_applied = false;
-            let hdr_requested = hdr_enabled;
-            let mut hdr_enabled = hdr_requested && hdr_render_supported;
-            if let Some(format) = hdr_scanout_format.filter(|_| hdr_enabled) {
-                if let Err(err) = set_output_scanout_format(
-                    &drm_output,
-                    drm_output_manager.allocator().clone(),
-                    format,
-                    [DrmModifier::Linear],
-                ) {
-                    flog(&format!(
-                        "Failed to enable 10-bit scanout for {}: {err}; keeping SDR",
-                        output_name
-                    ));
-                    hdr_enabled = false;
-                }
-            }
-            let device = drm_output_manager.device();
-            let requested_hdr_metadata_blob = if hdr_enabled {
-                match ensure_hdr_metadata_blob(device, &hdr_support, &mut hdr_metadata_blob) {
-                    Ok(blob) => Some(blob),
-                    Err(err) => {
-                        flog(&format!(
-                            "Failed to create HDR metadata blob for {}: {err}; keeping SDR",
-                            output_name
-                        ));
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            match apply_connector_hdr_state(
-                device,
-                *conn,
+            let hdr_scanout_probe =
+                probe_hdr_scanout_plane(&drm_output, &sdr_scanout_modifiers, &output_name);
+            let hdr_scanout_format = hdr_scanout_probe.as_ref().map(|probe| probe.format);
+            let hdr_scanout_modifiers = hdr_scanout_probe
+                .as_ref()
+                .map(|probe| probe.modifiers.clone())
+                .unwrap_or_default();
+            let hdr_render_supported = hdr_output_capable(
                 &hdr_support,
-                hdr_enabled,
-                requested_hdr_metadata_blob,
-            ) {
-                Ok(ConnectorHdrApplyResult::Applied | ConnectorHdrApplyResult::Unchanged) => {
-                    hdr_enabled_applied = hdr_enabled && hdr_support.can_enable();
-                    if !hdr_enabled_applied {
-                        destroy_hdr_metadata_blob(device, hdr_metadata_blob.take());
-                    }
-                }
-                Ok(ConnectorHdrApplyResult::Rejected) => {
-                    if hdr_enabled {
-                        flog(&format!(
-                            "HDR connector state rejected by atomic test for {}; keeping SDR",
-                            output_name
-                        ));
-                        match apply_connector_hdr_state(device, *conn, &hdr_support, false, None) {
-                            Ok(
-                                ConnectorHdrApplyResult::Applied
-                                | ConnectorHdrApplyResult::Unchanged
-                                | ConnectorHdrApplyResult::Rejected,
-                            ) => {}
-                            Err(err) => {
-                                flog(&format!(
-                                    "Failed to restore SDR connector state for {}: {err}",
-                                    output_name
-                                ));
-                            }
-                        }
-                        destroy_hdr_metadata_blob(device, hdr_metadata_blob.take());
-                        if let Err(err) = set_output_scanout_format(
-                            &drm_output,
-                            drm_output_manager.allocator().clone(),
-                            sdr_scanout_format,
-                            sdr_scanout_modifiers.iter().copied(),
-                        ) {
-                            flog(&format!(
-                                "Failed to restore SDR scanout for {}: {err}",
-                                output_name
-                            ));
-                        }
-                    } else {
-                        flog(&format!(
-                            "SDR connector state rejected by atomic test for {}",
-                            output_name
-                        ));
-                    }
-                }
-                Err(err) => {
-                    flog(&format!(
-                        "Failed to apply HDR connector state for {}: {err}",
-                        output_name
-                    ));
-                    destroy_hdr_metadata_blob(device, hdr_metadata_blob.take());
-                    if hdr_enabled {
-                        if let Err(err) = set_output_scanout_format(
-                            &drm_output,
-                            drm_output_manager.allocator().clone(),
-                            sdr_scanout_format,
-                            sdr_scanout_modifiers.iter().copied(),
-                        ) {
-                            flog(&format!(
-                                "Failed to restore SDR scanout for {}: {err}",
-                                output_name
-                            ));
-                        }
-                    }
-                }
+                hdr_offscreen_format,
+                hdr_scanout_probe.as_ref(),
+                gpu_vendor_id,
+            );
+            if hdr_support.can_enable() {
+                flog(&format!(
+                    "HDR render probe: output={} scanout={:?} scanout_modifiers={:?} offscreen={:?} supported={} runtime_apply={} kms_apply={} driver_ok={}",
+                    output_name,
+                    hdr_scanout_format,
+                    hdr_scanout_modifiers,
+                    hdr_offscreen_format,
+                    hdr_render_supported,
+                    hdr_runtime_apply_enabled(),
+                    HDR_LIVE_KMS_APPLY_ENABLED,
+                    hdr_driver_allows_output(gpu_vendor_id),
+                ));
             }
 
+            if hdr_requested && !hdr_runtime_apply_enabled() {
+                flog(&format!(
+                    "HDR requested on {output_name} but live KMS apply is disabled; using SDR scanout"
+                ));
+            } else if hdr_requested && !hdr_render_supported {
+                flog(&format!(
+                    "HDR requested on {output_name} but the current DRM path cannot apply it; preserving the request"
+                ));
+            }
+            let hdr_metadata_blob = None;
+            // hdr_enabled_applied starts false; live KMS apply is gated on HDR_LIVE_KMS_APPLY_ENABLED
+            // and FOCALDESK_HDR=1 (see apply_hdr_output_state in the render loop).
+            let hdr_enabled_applied = false;
             //let offscreen = OffscreenOutput {
             //    size: tex_phys_size,
             //    texture: None,
@@ -2814,9 +3229,11 @@ fn device_added(
                     sdr_scanout_format,
                     sdr_scanout_modifiers,
                     hdr_scanout_format,
+                    hdr_scanout_modifiers,
                     hdr_offscreen_format,
                     hdr_metadata_blob,
                     hdr_enabled_applied,
+                    frame_queued_at: None,
                     drm_output,
                     offscreen: None,
                     sdr_offscreen: None,
@@ -2841,6 +3258,7 @@ fn device_added(
                                 node, crtc, err
                             ));
                         }
+                        surface.frame_queued_at = None;
                     }
                 }
             }
@@ -2863,7 +3281,9 @@ fn device_added(
     let temp_device = DrmDeviceState {
         registration_token,
         render_node: render_node_for_gpu,
+        gpu_vendor_id,
         renderer,
+        gbm: gbm.clone(),
         drm_output_manager,
         surfaces,
     };

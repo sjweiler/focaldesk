@@ -80,7 +80,7 @@ fn dispatch_backend_events(
     Ok(state.running
         && matches!(
             status,
-            smithay::reexports::winit::platform::pump_events::PumpStatus::Continue
+            smithay::reexports::winit::event_loop::pump_events::PumpStatus::Continue
         ))
 }
 

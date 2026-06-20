@@ -96,6 +96,7 @@ pub fn start_xwayland(
         display_handle,
         None,
         xwayland_env,
+        std::iter::empty::<&str>(),
         true,
         Stdio::inherit(),
         Stdio::inherit(),

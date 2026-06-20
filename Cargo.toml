@@ -28,7 +28,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-smithay = { git = "https://github.com/Smithay/smithay", default-features = false, branch = "master", features = [
+smithay = {  path = "../smithay", default-features = false, features = [
   "wayland_frontend",
   "desktop",
   "backend_winit",
