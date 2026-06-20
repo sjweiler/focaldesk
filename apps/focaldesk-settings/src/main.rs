@@ -1862,7 +1862,7 @@ fn build_ui(app: &adw::Application) {
         "Applications".to_string(),
         applications_page(settings.clone()),
     );
-    pages.insert("Workspaces".to_string(), workspaces_page());
+    pages.insert("Workspaces".to_string(), workspaces_page(settings.clone()));
     pages.insert("Keyboard".to_string(), keyboard_page());
     pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
     pages.insert("Power".to_string(), power_page(settings.clone()));
@@ -3331,7 +3331,7 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Applications")
 }
 
-fn workspaces_page() -> adw::NavigationPage {
+fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Workspaces");
 
@@ -3362,12 +3362,19 @@ fn workspaces_page() -> adw::NavigationPage {
         Some("Keep each display on its own active workspace"),
         false,
     );
-    add_switch_row(
+    let restore_session = add_switch_row(
         &behavior_group,
-        "Remember apps on workspace",
-        Some("Restore apps to their previous workspace after restart"),
-        true,
+        "Restore session",
+        Some("Restore apps to their previous workspaces after restart"),
+        settings.borrow().workspaces.restore_session,
     );
+    {
+        let settings = settings.clone();
+        restore_session.connect_active_notify(move |switch| {
+            settings.borrow_mut().workspaces.restore_session = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     add_switch_row(
         &behavior_group,
         "Wrap around when switching",

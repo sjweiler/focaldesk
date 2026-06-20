@@ -9,6 +9,8 @@ pub struct Settings {
     pub input: InputSettings,
     pub apps: AppSettings,
     #[serde(default)]
+    pub workspaces: WorkspaceSettings,
+    #[serde(default)]
     pub privacy: PrivacySettings,
     #[serde(default)]
     pub power: PowerSettings,
@@ -59,6 +61,20 @@ pub struct AppSettings {
     pub terminal: String,
     pub browser: String,
     pub file_manager: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSettings {
+    #[serde(default = "default_restore_session")]
+    pub restore_session: bool,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            restore_session: default_restore_session(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +247,7 @@ pub fn default_settings() -> Settings {
             browser: "google-chrome".into(),
             file_manager: "focaldesk-files".into(),
         },
+        workspaces: WorkspaceSettings::default(),
         privacy: PrivacySettings::default(),
         power: PowerSettings::default(),
         debug: DebugSettings::default(),
@@ -238,6 +255,10 @@ pub fn default_settings() -> Settings {
 }
 
 fn default_recent_files() -> bool {
+    true
+}
+
+fn default_restore_session() -> bool {
     true
 }
 
@@ -281,4 +302,24 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
 
     let json = serde_json::to_string_pretty(settings)?;
     fs::write(path, json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_restore_setting_defaults_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("workspaces");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.workspaces.restore_session);
+
+        let mut settings = settings;
+        settings.workspaces.restore_session = false;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!restored.workspaces.restore_session);
+    }
 }
