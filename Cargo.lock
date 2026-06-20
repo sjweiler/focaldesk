@@ -1486,6 +1486,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-color-tag-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-scanner",
+]
+
+[[package]]
 name = "focaldesk-config"
 version = "0.1.0"
 dependencies = [
@@ -1554,7 +1566,9 @@ dependencies = [
  "smithay",
  "tracing",
  "tracing-subscriber",
+ "wayland-backend",
  "wayland-protocols",
+ "wayland-scanner",
  "wayland-server",
  "winit 0.30.13",
  "zbus 3.15.2",

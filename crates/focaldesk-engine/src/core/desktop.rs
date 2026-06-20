@@ -371,6 +371,7 @@ pub struct DesktopInit {
     pub output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
@@ -439,6 +440,7 @@ pub struct DesktopState {
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
     pub image_copy_capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
+    pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
@@ -3289,6 +3291,7 @@ impl DesktopState {
             output_capture_source_state: init.output_capture_source_state,
             image_copy_capture_state: init.image_copy_capture_state,
             image_copy_capture_sessions: Vec::new(),
+            color_tag_state: init.color_tag_state,
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
             portal_frame_cache: HashMap::new(),
@@ -5114,8 +5117,14 @@ impl DesktopState {
     pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
         let force_linear = force_linear_surfaces();
         let transfer = with_states(surface, |states| effective_transfer(states, force_linear));
-        self.surface_transfers
-            .insert(Id::from_wayland_resource(surface), transfer);
+        let id = Id::from_wayland_resource(surface);
+        let previous = self.surface_transfers.get(&id).copied();
+        if previous != Some(transfer) {
+            focaldesk_logging::flog(&format!(
+                "color tag applied: surface={id:?} transfer={transfer:?}"
+            ));
+        }
+        self.surface_transfers.insert(id, transfer);
     }
 
     pub fn set_surface_color_description(

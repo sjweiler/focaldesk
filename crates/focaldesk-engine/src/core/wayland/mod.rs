@@ -1,4 +1,5 @@
 pub mod client;
+pub mod color_protocol;
 pub mod compositor;
 pub mod data_device;
 pub mod dmabuf;

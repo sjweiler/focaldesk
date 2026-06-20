@@ -10,6 +10,8 @@ smithay.workspace = true
 nix = { version = "0.27", features = ["fs"] }
 calloop = "0.12"
 wayland-server = "0.31"
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
 wayland-protocols.workspace = true
 serde = { workspace = true }
 tracing = { workspace = true }

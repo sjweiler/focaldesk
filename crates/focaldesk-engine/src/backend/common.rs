@@ -525,6 +525,7 @@ pub(crate) fn bootstrap_compositor_core(
         smithay::wayland::image_capture_source::OutputCaptureSourceState::new::<DesktopState>(&dh);
     let image_copy_capture_state =
         smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<DesktopState>(&dh);
+    crate::core::wayland::color_protocol::ColorTagState::bind_global::<DesktopState>(&dh);
     #[cfg(feature = "xwayland")]
     let xwayland_shell_state = XWaylandShellState::new::<DesktopState>(&dh);
 
@@ -588,6 +589,7 @@ pub(crate) fn bootstrap_compositor_core(
         image_capture_source_state,
         output_capture_source_state,
         image_copy_capture_state,
+        color_tag_state: Default::default(),
         backend_kind: backend,
         cursor_manager,
         seat,
