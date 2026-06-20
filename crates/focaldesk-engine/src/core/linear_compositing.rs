@@ -1,12 +1,18 @@
 //! Shared linear-light compositing for SDR scanout (FP16 working space, sRGB KMS buffer).
 
-use crate::core::backend_render::{draw_output, draw_output_stage, PreparedOutput};
+use crate::core::backend_render::{
+    build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
+    prepare_output, PreparedOutput,
+};
 use crate::core::color::linear_sdr_runtime_enabled;
 use crate::core::desktop::DesktopState;
 use crate::core::render::{ClientCompositingMode, ChromeGlassPass, FlowRenderElement, OutputRenderStage};
 use crate::core::{OutputState, SceneState};
-use anyhow::{anyhow, Context, Result};
 use crate::core::ui_state::UiState;
+use anyhow::{anyhow, Context, Result};
+use focaldesk_logging::flog;
+use focaldesk_types::OutputId;
+use std::time::{Duration, Instant};
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
@@ -277,6 +283,79 @@ pub fn run_linear_staged_pass(
         )
         .map_err(|err| anyhow!("{err}"))?;
         frame.finish().map_err(Into::into)
+    }
+}
+
+/// Render one output into the SDR offscreen target using the same linear/legacy path as scanout.
+pub fn render_output_offscreen(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+    ui_state: &mut UiState<GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    now: Instant,
+    dt: Duration,
+    portal_capture: bool,
+) -> Result<SyncPoint> {
+    let srgb_to_linear = state.render.chrome_shaders.srgb_to_linear.clone();
+    let composite_linear_layer = state.render.chrome_shaders.composite_linear_layer.clone();
+    let use_linear = use_linear_sdr_path(renderer, targets, buffer_size)
+        && srgb_to_linear.is_some()
+        && composite_linear_layer.is_some();
+
+    if use_linear {
+        if let Err(err) = targets.ensure_linear_offscreen(renderer, buffer_size) {
+            flog(&format!(
+                "Linear SDR disabled for offscreen render after FP16 allocation failed: {err}"
+            ));
+        }
+    }
+
+    let client_elements = build_output_client_elements(state, renderer, output_id);
+    let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    let mut prepared = prepare_output(
+        state,
+        renderer,
+        output_id,
+        buffer_size,
+        ui_state,
+        now,
+        dt,
+        portal_capture,
+    )
+    .map_err(|err| anyhow!("{err}"))?;
+
+    if use_linear && targets.linear_offscreen.is_some() {
+        run_linear_staged_pass(
+            state,
+            renderer,
+            targets,
+            buffer_size,
+            &mut prepared,
+            &client_elements,
+            &popup_elements,
+            ui_state,
+            scene,
+            output_state,
+            srgb_to_linear.as_ref().unwrap(),
+            composite_linear_layer.as_ref().unwrap(),
+        )
+    } else {
+        run_sdr_pass(
+            state,
+            renderer,
+            targets,
+            buffer_size,
+            &prepared,
+            &client_elements,
+            &popup_elements,
+            ui_state,
+            scene,
+            output_state,
+        )
     }
 }
 

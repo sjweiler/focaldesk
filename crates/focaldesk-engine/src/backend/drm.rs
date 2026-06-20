@@ -2336,13 +2336,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 if let Some(texture) = capture_source_texture(surface).cloned() {
-                    data.core.state.portal_capture_source.insert(
+                    crate::core::portal::publish_portal_capture_source(
+                        &mut data.core.state,
                         surface.output_id,
-                        crate::core::portal::PortalCaptureSource {
-                            texture,
-                            size: surface.size,
-                            captured_at: now,
-                        },
+                        texture,
+                        surface.size,
+                        now,
                     );
                 }
 

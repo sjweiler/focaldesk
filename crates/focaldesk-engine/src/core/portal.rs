@@ -20,10 +20,11 @@ use smithay::utils::{Buffer, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
-use crate::core::backend_render::{
-    build_output_client_elements, build_output_popup_elements, draw_output, prepare_output,
-};
 use crate::core::desktop::DesktopState;
+use crate::core::linear_compositing::{
+    present_offscreen_texture, render_output_offscreen, supports_linear_sdr,
+    LinearOffscreenTargets,
+};
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
 use crate::core::OutputState;
@@ -91,6 +92,56 @@ impl DesktopState {
     }
 }
 
+/// Store the latest scanout offscreen texture for portal/OBS clients on this output.
+pub fn publish_portal_capture_source(
+    state: &mut DesktopState,
+    output_id: OutputId,
+    texture: GlesTexture,
+    size: Size<i32, Physical>,
+    captured_at: Instant,
+) {
+    state.portal_capture_source.insert(
+        output_id,
+        PortalCaptureSource {
+            texture,
+            size,
+            captured_at,
+        },
+    );
+    state.compositor_ready = true;
+}
+
+fn portal_offscreen_targets_for_output(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+    size: Size<i32, Physical>,
+) -> LinearOffscreenTargets {
+    let mut targets = state
+        .portal_offscreen_targets
+        .remove(&output_id)
+        .unwrap_or_else(|| LinearOffscreenTargets {
+            linear_supported: supports_linear_sdr(renderer, size),
+            ..LinearOffscreenTargets::default()
+        });
+    if targets.offscreen_size() != size {
+        targets.offscreen = None;
+        targets.linear_offscreen = None;
+    }
+    if !targets.linear_supported {
+        targets.linear_supported = supports_linear_sdr(renderer, size);
+    }
+    targets
+}
+
+fn store_portal_offscreen_targets(
+    state: &mut DesktopState,
+    output_id: OutputId,
+    targets: LinearOffscreenTargets,
+) {
+    state.portal_offscreen_targets.insert(output_id, targets);
+}
+
 pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Option<OutputId> {
     use smithay::output::WeakOutput;
 
@@ -109,52 +160,20 @@ pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Opti
 
 /// Renders the active output into the portal client's buffer, if dispatch context is set.
 ///
-/// On DRM the frame is queued and completed in [`complete_pending_portal_captures`] after the
-/// offscreen draw so OBS receives the same pixels as the monitor.
+/// Frames are queued and completed after the offscreen draw so OBS receives the same pixels
+/// as the monitor (including linear SDR compositing when enabled).
 pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id: OutputId) {
     if state.portal_dispatch_ctx.is_none() {
         frame.fail(CaptureFailureReason::Unknown);
         return;
     }
 
-    if state.backend_kind == focaldesk_flow::keybinds::BackendKind::Drm {
-        state
-            .pending_portal_captures
-            .push(PendingPortalCapture { output_id, frame });
-        return;
-    }
-
-    render_portal_frame_now(state, frame, output_id);
+    state
+        .pending_portal_captures
+        .push(PendingPortalCapture { output_id, frame });
 }
 
-fn render_portal_frame_now(state: &mut DesktopState, frame: Frame, output_id: OutputId) {
-    let Some(ctx) = state.portal_dispatch_ctx.as_mut() else {
-        frame.fail(CaptureFailureReason::Unknown);
-        return;
-    };
-
-    // SAFETY: `ctx` is only populated around `dispatch_clients` and cleared immediately after.
-    let renderer = unsafe { &mut *ctx.renderer.as_ptr() };
-    let ui_state = unsafe { &mut *ctx.ui_state.as_ptr() };
-    let scene = unsafe { &*ctx.scene.as_ptr() };
-    let output_state = unsafe { &*ctx.output_state.as_ptr() };
-    let now = ctx.now;
-    let dt = ctx.dt;
-
-    complete_portal_frame(
-        state,
-        renderer,
-        ui_state,
-        scene,
-        output_state,
-        output_id,
-        frame,
-        now,
-        dt,
-    );
-}
-
-/// Finish portal frames queued during `dispatch_clients` using the latest DRM offscreen texture.
+/// Finish portal frames queued during `dispatch_clients` using the latest offscreen texture.
 pub fn complete_pending_portal_captures(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -481,31 +500,35 @@ fn render_portal_output_to_texture(
     transform: Transform,
     target_texture: &mut GlesTexture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut target = renderer.bind(target_texture)?;
-    let prepared = prepare_output(
+    let mut targets =
+        portal_offscreen_targets_for_output(state, renderer, output_id, render_size);
+    let sync = render_output_offscreen(
         state,
         renderer,
+        &mut targets,
         output_id,
         render_size,
         ui_state,
+        scene,
+        output_state,
         now,
         dt,
         true,
     )?;
-    let client_elements = build_output_client_elements(state, renderer, output_id);
-    let popup_elements = build_output_popup_elements(state, renderer, output_id);
-    let mut gles_frame = renderer.render(&mut target, render_size, transform)?;
-    draw_output(
-        state,
-        &mut gles_frame,
-        &prepared,
-        &client_elements,
-        &popup_elements,
-        ui_state,
-        scene,
-        output_state,
-    )?;
-    let sync = gles_frame.finish()?;
+    renderer.wait(&sync)?;
+
+    let offscreen = targets
+        .offscreen
+        .as_ref()
+        .ok_or("portal offscreen missing after render")?
+        .texture
+        .clone();
+    store_portal_offscreen_targets(state, output_id, targets);
+
+    let mut target = renderer.bind(target_texture)?;
+    let mut frame = renderer.render(&mut target, render_size, transform)?;
+    present_offscreen_texture(&mut frame, &offscreen, render_size)?;
+    let sync = frame.finish()?;
     renderer.wait(&sync)?;
     Ok(())
 }

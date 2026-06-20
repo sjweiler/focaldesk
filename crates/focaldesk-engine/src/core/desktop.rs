@@ -446,6 +446,8 @@ pub struct DesktopState {
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
     /// Latest DRM offscreen texture per output for portal/OBS capture.
     pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
+    /// Offscreen targets for portal re-render fallback (matches linear/legacy scanout path).
+    pub portal_offscreen_targets: HashMap<OutputId, crate::core::linear_compositing::LinearOffscreenTargets>,
     /// Set after the first successful DRM present; portal capture waits for this.
     pub compositor_ready: bool,
     pub backend_kind: BackendKind,
@@ -3296,6 +3298,7 @@ impl DesktopState {
             pending_portal_captures: Vec::new(),
             portal_frame_cache: HashMap::new(),
             portal_capture_source: HashMap::new(),
+            portal_offscreen_targets: HashMap::new(),
             compositor_ready: false,
             backend_kind: init.backend_kind,
             cursor_manager: init.cursor_manager,
