@@ -9,7 +9,10 @@ use smithay::utils::{Logical, Physical, Rectangle, Size};
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
 use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
-use crate::core::render::{ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
+use crate::core::render::{
+    ClientCompositingMode, ChromeGlassPass, FlowRenderElement, FrameCtx, RenderInputs,
+    RenderInputsMut,
+};
 use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
@@ -558,6 +561,7 @@ pub fn draw_output(
         output_state,
         crate::core::render::OutputRenderStage::All,
         ClientCompositingMode::Sdr,
+        ChromeGlassPass::InBaseSdr,
     )
 }
 
@@ -572,6 +576,7 @@ pub fn draw_output_stage(
     output_state: &OutputState,
     stage: crate::core::render::OutputRenderStage,
     client_compositing: ClientCompositingMode,
+    chrome_glass_pass: ChromeGlassPass,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let egui_frame_ctx = DesktopFrameCtx {
         output_size: prepared.frame_ctx.output_size,
@@ -637,6 +642,7 @@ pub fn draw_output_stage(
         lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         client_compositing,
+        chrome_glass_pass,
         surface_transfers: &state.surface_transfers,
     };
 

@@ -3,7 +3,7 @@
 use crate::core::backend_render::{draw_output, draw_output_stage, PreparedOutput};
 use crate::core::color::linear_sdr_runtime_enabled;
 use crate::core::desktop::DesktopState;
-use crate::core::render::{ClientCompositingMode, FlowRenderElement, OutputRenderStage};
+use crate::core::render::{ClientCompositingMode, ChromeGlassPass, FlowRenderElement, OutputRenderStage};
 use crate::core::{OutputState, SceneState};
 use anyhow::{anyhow, Context, Result};
 use crate::core::ui_state::UiState;
@@ -182,6 +182,7 @@ pub fn run_linear_staged_pass(
             output_state,
             OutputRenderStage::Base,
             ClientCompositingMode::Sdr,
+            ChromeGlassPass::Skip,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
@@ -213,10 +214,25 @@ pub fn run_linear_staged_pass(
             ui_state,
             scene,
             output_state,
+            OutputRenderStage::LinearGlassUnderClients,
+            ClientCompositingMode::Sdr,
+            ChromeGlassPass::LinearUnderClients,
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        draw_output_stage(
+            state,
+            &mut frame,
+            prepared,
+            client_elements,
+            popup_elements,
+            ui_state,
+            scene,
+            output_state,
             OutputRenderStage::Clients,
             ClientCompositingMode::Linear {
                 srgb_to_linear: srgb_to_linear.clone(),
             },
+            ChromeGlassPass::Skip,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
@@ -254,6 +270,7 @@ pub fn run_linear_staged_pass(
             output_state,
             OutputRenderStage::Overlay,
             ClientCompositingMode::Sdr,
+            ChromeGlassPass::Skip,
         )
         .map_err(|err| anyhow!("{err}"))?;
         frame.finish().map_err(Into::into)

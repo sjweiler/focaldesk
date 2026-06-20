@@ -42,7 +42,7 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
-use crate::core::color::TransferFunction;
+use crate::core::color::{srgb_to_linear, TransferFunction};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame};
 use crate::core::fonts::style_for;
@@ -109,8 +109,22 @@ pub struct FrameCtx {
 pub enum OutputRenderStage {
     All,
     Base,
+    /// Work-area glass in FP16 after the opaque base blit, before clients.
+    LinearGlassUnderClients,
     Clients,
     Overlay,
+}
+
+/// Where work-area glass is composited in the staged linear SDR path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChromeGlassPass {
+    /// Legacy single-pass SDR: glass in the base stage.
+    #[default]
+    InBaseSdr,
+    /// Staged linear: opaque base only; glass deferred.
+    Skip,
+    /// Staged linear: draw glass into the FP16 target with linearized colors.
+    LinearUnderClients,
 }
 
 #[derive(Clone)]
@@ -202,11 +216,29 @@ pub struct RenderInputs<'a> {
     pub lock_screen: &'a LockScreenSnapshot,
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
+    pub chrome_glass_pass: ChromeGlassPass,
     pub surface_transfers: &'a std::collections::HashMap<Id, TransferFunction>,
 }
 
 pub struct RenderInputsMut<'a> {
     pub ui: &'a mut UiState<GlesTexture>,
+}
+
+fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
+    [
+        srgb_to_linear(c[0]),
+        srgb_to_linear(c[1]),
+        srgb_to_linear(c[2]),
+        c[3],
+    ]
+}
+
+fn glass_style_linear(style: &GlassStyle) -> GlassStyle {
+    GlassStyle {
+        tint: linearize_rgba(style.tint),
+        edge_color: linearize_rgba(style.edge_color),
+        ..*style
+    }
 }
 
 fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> ChromeTheme {
@@ -1434,23 +1466,14 @@ impl RenderState {
             );
 
             // Work-area glass must sit under client surfaces (trim/icons stay above).
-            if let Some(glass) = self.chrome_shaders.glass.as_ref() {
-                let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-                let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
-                    Point::<i32, Physical>::from((0, 0)),
-                    Size::<i32, Physical>::from(inputs.ctx.output_size),
-                );
-                let damage = &[fullscreen_rect];
-                self.draw_workarea_glass(
-                    frame,
-                    inputs.ctx,
-                    glass,
-                    inputs.layout.work_area.glass,
-                    inputs.ctx.output_scale,
-                    damage,
-                    &legacy_theme.glass,
-                )?;
+            if matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr) {
+                self.draw_work_area_glass_layer(frame, &inputs, theme)?;
             }
+        }
+
+        if matches!(stage, OutputRenderStage::LinearGlassUnderClients) {
+            self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+            return Ok(());
         }
 
         if matches!(stage, OutputRenderStage::All | OutputRenderStage::Clients) {
@@ -1463,7 +1486,12 @@ impl RenderState {
             );
         }
 
-        if matches!(stage, OutputRenderStage::Base | OutputRenderStage::Clients) {
+        if matches!(
+            stage,
+            OutputRenderStage::Base
+                | OutputRenderStage::Clients
+                | OutputRenderStage::LinearGlassUnderClients
+        ) {
             return Ok(());
         }
 
@@ -2134,6 +2162,37 @@ impl RenderState {
             _ => None,
         }
     }
+    fn draw_work_area_glass_layer(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        inputs: &RenderInputs<'_>,
+        theme: &FlowTheme,
+    ) -> Result<(), GlesError> {
+        let Some(glass) = self.chrome_shaders.glass.as_ref() else {
+            return Ok(());
+        };
+        let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
+        let style = if matches!(inputs.chrome_glass_pass, ChromeGlassPass::LinearUnderClients) {
+            glass_style_linear(&legacy_theme.glass)
+        } else {
+            legacy_theme.glass
+        };
+        let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
+            Point::<i32, Physical>::from((0, 0)),
+            Size::<i32, Physical>::from(inputs.ctx.output_size),
+        );
+        let damage = &[fullscreen_rect];
+        self.draw_workarea_glass(
+            frame,
+            inputs.ctx,
+            glass,
+            inputs.layout.work_area.glass,
+            inputs.ctx.output_scale,
+            damage,
+            &style,
+        )
+    }
+
     fn draw_workarea_glass(
         &self,
         frame: &mut GlesFrame<'_, '_>,
