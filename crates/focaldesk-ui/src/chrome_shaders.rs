@@ -19,6 +19,7 @@ pub struct ChromeShaders {
     pub wallpaper_tint: Option<GlesTexProgram>,
     pub srgb_to_linear: Option<GlesTexProgram>,
     pub linear_to_srgb: Option<GlesTexProgram>,
+    pub composite_linear_layer: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
 }
@@ -38,6 +39,7 @@ impl ChromeShaders {
             wallpaper_tint: None,
             srgb_to_linear: None,
             linear_to_srgb: None,
+            composite_linear_layer: None,
             pulse: None,
             accent: None,
         }
@@ -149,6 +151,11 @@ impl ChromeShaders {
         if self.linear_to_srgb.is_none() {
             self.linear_to_srgb =
                 Some(renderer.compile_custom_texture_shader(LINEAR_TO_SRGB_FRAG, &[])?);
+        }
+
+        if self.composite_linear_layer.is_none() {
+            self.composite_linear_layer =
+                Some(renderer.compile_custom_texture_shader(COMPOSITE_LINEAR_LAYER_FRAG, &[])?);
         }
 
         if self.amber_lightbar.is_none() {
@@ -799,6 +806,43 @@ void main() {
     // premultiply again so Smithay's ONE/ONE_MINUS_SRC_ALPHA blend remains valid.
     vec3 straight = src.a > 0.0 ? clamp(src.rgb / src.a, 0.0, 1.0) : vec3(0.0);
     gl_FragColor = vec4(srgb_to_linear(straight) * src.a, src.a) * alpha;
+}
+"#;
+
+const COMPOSITE_LINEAR_LAYER_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
+    vec3 low = c * 12.92;
+    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    if (src.a < 0.0001) {
+        discard;
+    }
+    vec3 straight = src.rgb / src.a;
+    gl_FragColor = vec4(linear_to_srgb(straight) * src.a, src.a) * alpha;
 }
 "#;
 

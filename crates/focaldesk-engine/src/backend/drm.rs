@@ -2250,7 +2250,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     out.hdr_enabled = false;
                 }
 
-                let prepared = prepare_output(
+                let mut prepared = prepare_output(
                     &mut data.core.state,
                     &mut device.renderer,
                     surface.output_id,
@@ -2273,13 +2273,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 );
 
                 let srgb_to_linear = data.core.state.render.chrome_shaders.srgb_to_linear.clone();
-                let linear_to_srgb = data.core.state.render.chrome_shaders.linear_to_srgb.clone();
+                let composite_linear_layer = data
+                    .core
+                    .state
+                    .render
+                    .chrome_shaders
+                    .composite_linear_layer
+                    .clone();
                 let use_linear_sdr = use_linear_sdr_path(
                     &mut device.renderer,
                     &surface.render_targets,
                     surface.size,
                 ) && srgb_to_linear.is_some()
-                    && linear_to_srgb.is_some();
+                    && composite_linear_layer.is_some();
 
                 if use_linear_sdr {
                     if let Err(err) = surface
@@ -2299,14 +2305,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &mut device.renderer,
                         &mut surface.render_targets,
                         surface.size,
-                        &prepared,
+                        &mut prepared,
                         &client_elements,
                         &popup_elements,
                         &mut data.core.ui_state,
                         &data.core.scene,
                         &data.core.output_state,
                         srgb_to_linear.as_ref().unwrap(),
-                        linear_to_srgb.as_ref().unwrap(),
+                        composite_linear_layer.as_ref().unwrap(),
                     )?
                 } else {
                     run_sdr_pass(
@@ -2322,6 +2328,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &data.core.output_state,
                     )?
                 };
+                if use_linear_sdr && surface.render_targets.linear_offscreen.is_some() {
+                    surface.present_damage.reset();
+                }
                 if portal_active {
                     device.renderer.wait(&sync)?;
                 }

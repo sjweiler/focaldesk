@@ -8,12 +8,14 @@ use crate::core::{OutputState, SceneState};
 use anyhow::{anyhow, Context, Result};
 use crate::core::ui_state::UiState;
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTexProgram, GlesTexture};
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture};
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Bind, Frame, Offscreen, Renderer, Texture};
-use smithay::utils::{Buffer, Physical, Size, Transform};
+use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Texture};
+use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 
-pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Abgr8888;
+/// Opaque offscreen: avoids alpha=0 holes that the sRGB↔linear blit decodes as black.
+pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Xbgr8888;
+/// Alpha FP16 so unset pixels stay transparent for selective composite onto SDR.
 pub const LINEAR_SDR_FORMAT: Fourcc = Fourcc::Abgr16161616f;
 
 #[derive(Clone)]
@@ -99,43 +101,52 @@ pub fn ensure_offscreen_texture(
     Ok(())
 }
 
-pub fn convert_fullscreen_texture(
+/// Composite a linear FP16 client layer onto an existing SDR offscreen.
+/// Pixels with alpha≈0 are discarded so wallpaper/chrome from the SDR base pass remain intact.
+pub fn composite_linear_layer_onto_sdr(
     renderer: &mut GlesRenderer,
-    src: &GlesTexture,
-    dst: &mut GlesTexture,
+    linear: &GlesTexture,
+    sdr: &mut GlesTexture,
     size: Size<i32, Physical>,
     shader: &GlesTexProgram,
-    label: &str,
 ) -> Result<()> {
     let mut target = renderer
-        .bind(dst)
-        .with_context(|| format!("bind target for {label}"))?;
+        .bind(sdr)
+        .context("bind SDR target for linear composite")?;
     let mut frame = renderer
         .render(&mut target, size, Transform::Normal)
-        .with_context(|| format!("begin {label} frame"))?;
+        .context("begin linear composite frame")?;
+    let tex_size = linear.size();
     let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
         (0.0, 0.0),
-        (size.w as f64, size.h as f64),
+        (tex_size.w as f64, tex_size.h as f64),
     );
     let dst_rect = smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
     let damage = [dst_rect];
     frame
         .render_texture_from_to(
-            src,
+            linear,
             src_rect,
             dst_rect,
             &damage,
-            &damage,
+            &[],
             Transform::Normal,
             1.0,
             Some(shader),
             &[],
         )
-        .with_context(|| format!("render {label}"))?;
-    let _sync = frame
-        .finish()
-        .with_context(|| format!("finish {label}"))?;
+        .context("render linear composite")?;
+    let _sync = frame.finish().context("finish linear composite")?;
     Ok(())
+}
+
+fn clear_offscreen(
+    frame: &mut GlesFrame<'_, '_>,
+    size: Size<i32, Physical>,
+    color: Color32F,
+) -> Result<(), GlesError> {
+    let full = Rectangle::from_loc_and_size((0, 0), size);
+    frame.clear(color, std::slice::from_ref(&full))
 }
 
 pub fn run_linear_staged_pass(
@@ -143,22 +154,25 @@ pub fn run_linear_staged_pass(
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
     buffer_size: Size<i32, Physical>,
-    prepared: &PreparedOutput,
+    prepared: &mut PreparedOutput,
     client_elements: &[FlowRenderElement],
     popup_elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
     srgb_to_linear: &GlesTexProgram,
-    linear_to_srgb: &GlesTexProgram,
+    composite_linear_layer: &GlesTexProgram,
 ) -> Result<SyncPoint> {
+    // Staged passes rewrite the full offscreen each frame; partial damage leaves
+    // unscissored regions black on scanout when KMS presents with damage clips.
+    prepared.frame_ctx.damage = vec![Rectangle::from_loc_and_size((0, 0), buffer_size)];
+
     targets.ensure_offscreen(renderer, buffer_size)?;
     targets.ensure_linear_offscreen(renderer, buffer_size)?;
 
-    let linear = targets
-        .linear_offscreen
-        .as_mut()
-        .ok_or_else(|| anyhow!("linear offscreen missing after allocation"))?;
+    let bg = state.theme.active_theme().background.color;
+    let clear_color = Color32F::new(bg[0], bg[1], bg[2], bg[3]);
+    let transparent = Color32F::new(0.0, 0.0, 0.0, 0.0);
 
     {
         let sdr = targets
@@ -171,6 +185,8 @@ pub fn run_linear_staged_pass(
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin SDR base frame: {e}"))?;
+        clear_offscreen(&mut frame, buffer_size, clear_color)
+            .map_err(|e| anyhow!("clear SDR base target: {e}"))?;
         draw_output_stage(
             state,
             &mut frame,
@@ -182,43 +198,25 @@ pub fn run_linear_staged_pass(
             output_state,
             OutputRenderStage::Base,
             ClientCompositingMode::Sdr,
-            ChromeGlassPass::Skip,
+            ChromeGlassPass::InBaseSdr,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
     }
 
-    let sdr_texture = targets.offscreen.as_ref().unwrap().texture.clone();
-    convert_fullscreen_texture(
-        renderer,
-        &sdr_texture,
-        &mut linear.texture,
-        buffer_size,
-        srgb_to_linear,
-        "sRGB base to linear SDR",
-    )?;
-
     {
+        let linear = targets
+            .linear_offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("linear offscreen missing after allocation"))?;
         let mut target = renderer
             .bind(&mut linear.texture)
             .map_err(|e| anyhow!("bind linear SDR target: {e}"))?;
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin linear SDR frame: {e}"))?;
-        draw_output_stage(
-            state,
-            &mut frame,
-            prepared,
-            client_elements,
-            popup_elements,
-            ui_state,
-            scene,
-            output_state,
-            OutputRenderStage::LinearGlassUnderClients,
-            ClientCompositingMode::Sdr,
-            ChromeGlassPass::LinearUnderClients,
-        )
-        .map_err(|err| anyhow!("{err}"))?;
+        clear_offscreen(&mut frame, buffer_size, transparent)
+            .map_err(|e| anyhow!("clear linear client layer: {e}"))?;
         draw_output_stage(
             state,
             &mut frame,
@@ -238,21 +236,26 @@ pub fn run_linear_staged_pass(
         let _sync = frame.finish()?;
     }
 
-    let linear_texture = targets.linear_offscreen.as_ref().unwrap().texture.clone();
-    let sdr = targets
-        .offscreen
-        .as_mut()
-        .ok_or_else(|| anyhow!("SDR offscreen missing before encode"))?;
-    convert_fullscreen_texture(
-        renderer,
-        &linear_texture,
-        &mut sdr.texture,
-        buffer_size,
-        linear_to_srgb,
-        "linear SDR to sRGB output",
-    )?;
+    {
+        let linear_texture = targets.linear_offscreen.as_ref().unwrap().texture.clone();
+        let sdr = targets
+            .offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("SDR offscreen missing before composite"))?;
+        composite_linear_layer_onto_sdr(
+            renderer,
+            &linear_texture,
+            &mut sdr.texture,
+            buffer_size,
+            composite_linear_layer,
+        )?;
+    }
 
     {
+        let sdr = targets
+            .offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("SDR offscreen missing before overlay"))?;
         let mut target = renderer
             .bind(&mut sdr.texture)
             .map_err(|e| anyhow!("bind SDR overlay target: {e}"))?;

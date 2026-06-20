@@ -2486,7 +2486,6 @@ impl RenderState {
         let dst = dst_world;
 
         let dsts = [dst];
-        let damage = [target_physical];
 
         let tw = src.w as f64;
         let th = src.h as f64;
@@ -2510,7 +2509,7 @@ impl RenderState {
                 src_rect,
                 dst,
                 &dsts,
-                &damage,
+                &[],
                 Transform::Normal,
                 1.0,
                 wallpaper_tint,

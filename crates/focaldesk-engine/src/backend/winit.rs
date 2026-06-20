@@ -186,7 +186,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let (renderer, mut framebuffer) = backend.bind()?;
 
-                let prepared = prepare_output(
+                let mut prepared = prepare_output(
                     &mut nested.state,
                     renderer,
                     OutputId(1),
@@ -203,10 +203,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     build_output_popup_elements(&mut nested.state, renderer, OutputId(1));
 
                 let srgb_to_linear = nested.state.render.chrome_shaders.srgb_to_linear.clone();
-                let linear_to_srgb = nested.state.render.chrome_shaders.linear_to_srgb.clone();
+                let composite_linear_layer = nested
+                    .state
+                    .render
+                    .chrome_shaders
+                    .composite_linear_layer
+                    .clone();
                 let use_linear = use_linear_sdr_path(renderer, &render_targets, buffer_size_phys)
                     && srgb_to_linear.is_some()
-                    && linear_to_srgb.is_some();
+                    && composite_linear_layer.is_some();
 
                 if use_linear {
                     if let Err(err) = render_targets.ensure_linear_offscreen(renderer, buffer_size_phys)
@@ -223,14 +228,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         renderer,
                         &mut render_targets,
                         buffer_size_phys,
-                        &prepared,
+                        &mut prepared,
                         &client_elements,
                         &popup_elements,
                         &mut nested.ui_state,
                         &nested.scene,
                         &nested.output_state,
                         srgb_to_linear.as_ref().unwrap(),
-                        linear_to_srgb.as_ref().unwrap(),
+                        composite_linear_layer.as_ref().unwrap(),
                     )?;
                     let offscreen = render_targets
                         .offscreen
