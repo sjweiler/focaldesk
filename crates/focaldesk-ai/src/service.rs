@@ -3,7 +3,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
+use tracing::{info, warn};
 
+use crate::permissions::authorize_ai_chat;
 use crate::provider::AiProvider;
 use crate::providers::{
     AnthropicProvider, LocalCpuProvider, OllamaProvider, OpenAICompatibleProvider,
@@ -91,14 +93,71 @@ impl AiService {
             .cloned()
             .ok_or_else(|| anyhow!("unknown AI provider: {provider_id}"))?;
 
+        info!(
+            target: "focaldesk.ai",
+            provider = %provider_id,
+            model = request.model.as_deref().unwrap_or("-"),
+            messages = request.messages.len(),
+            "AI chat request received"
+        );
+
+        let prompt_title = format!("Allow AI chat from {provider_id}?");
+        let prompt_message = build_prompt_message(&request, &provider_id);
+        authorize_ai_chat(&prompt_title, &prompt_message, true)
+            .with_context(|| format!("AI chat blocked for provider {provider_id}"))?;
+
         let _permit = self
             .concurrency
             .acquire()
             .await
             .context("AI request concurrency limiter closed")?;
 
-        timeout(self.request_timeout, provider.chat(request))
+        let started = std::time::Instant::now();
+        let response = timeout(self.request_timeout, provider.chat(request))
             .await
-            .with_context(|| format!("AI provider {provider_id} timed out"))?
+            .with_context(|| format!("AI provider {provider_id} timed out"))??;
+
+        info!(
+            target: "focaldesk.ai",
+            provider = %response.provider,
+            model = response.model.as_deref().unwrap_or("-"),
+            content_len = response.content.len(),
+            elapsed_ms = started.elapsed().as_millis(),
+            "AI chat response completed"
+        );
+
+        if response.provider != provider_id {
+            warn!(
+                target: "focaldesk.ai",
+                expected_provider = %provider_id,
+                actual_provider = %response.provider,
+                "AI provider returned a mismatched provider id"
+            );
+        }
+
+        Ok(response)
     }
+}
+
+fn build_prompt_message(request: &ChatRequest, provider_id: &str) -> String {
+    let model = request.model.as_deref().unwrap_or("default model");
+    let preview = request
+        .messages
+        .iter()
+        .find(|message| matches!(message.role, crate::types::ChatRole::User))
+        .map(|message| truncate_preview(&message.content, 160))
+        .unwrap_or_else(|| "no user message preview available".to_string());
+
+    format!(
+        "Provider: {provider_id}\nModel: {model}\nMessages: {}\nPreview: {preview}",
+        request.messages.len()
+    )
+}
+
+fn truncate_preview(text: &str, max_chars: usize) -> String {
+    let mut preview = text.chars().take(max_chars).collect::<String>();
+    if text.chars().count() > max_chars {
+        preview.push_str("...");
+    }
+    preview
 }

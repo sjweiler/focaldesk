@@ -89,6 +89,10 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             message: "request is handled by focaldesk-desktop".to_string(),
         },
 
+        Ok(IpcRequest::AiPermissionPrompt { .. }) => IpcResponse::Error {
+            message: "request is handled by focaldesk-desktop".to_string(),
+        },
+
         Err(e) => IpcResponse::Error {
             message: e.to_string(),
         },

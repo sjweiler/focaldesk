@@ -18,6 +18,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 focaldesk-ui = { path = "../focaldesk-ui" }
+focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-flow = { path = "../focaldesk-flow" }
 focaldesk-types = { path = "../focaldesk-types" }
 focaldesk-logging = { path = "../focaldesk-logging" }

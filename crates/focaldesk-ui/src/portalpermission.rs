@@ -126,6 +126,7 @@ impl PortalPermissionKind {
             | PermissionResource::ScreenShareOutput => Some(Self::ScreenCast),
             PermissionResource::RemoteInput => Some(Self::RemoteDesktop),
             PermissionResource::FileOpen | PermissionResource::FileSave => Some(Self::FileChooser),
+            PermissionResource::AiChat => None,
             PermissionResource::Microphone
             | PermissionResource::Camera
             | PermissionResource::ClipboardRead

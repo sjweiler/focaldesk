@@ -9,6 +9,7 @@ focaldesk-themes = { path = "../focaldesk-themes" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
+focaldesk-ai = { path = "../focaldesk-ai" }
 image = "0.25"
 egui = "0.31"
 egui_glow = "0.31"

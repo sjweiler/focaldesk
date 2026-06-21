@@ -129,6 +129,7 @@ use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
+use focaldesk_ui::ai_permission::AiPermissionDialog;
 use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogId};
 use focaldesk_ui::dialog_layout::layout_dialog;
@@ -137,6 +138,25 @@ use focaldesk_ui::ui_builder::{
     SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_1_ID, SIDEBAR_WORKSPACE_2_ID,
     SIDEBAR_WORKSPACE_3_ID,
 };
+
+fn clamp_rect_to_bounds(
+    mut geometry: Rectangle<i32, Logical>,
+    bounds: Rectangle<i32, Logical>,
+) -> Rectangle<i32, Logical> {
+    if bounds.size.w <= 0 || bounds.size.h <= 0 {
+        return geometry;
+    }
+
+    geometry.size.w = geometry.size.w.clamp(1, bounds.size.w);
+    geometry.size.h = geometry.size.h.clamp(1, bounds.size.h);
+
+    let max_x = (bounds.loc.x + bounds.size.w - geometry.size.w).max(bounds.loc.x);
+    let max_y = (bounds.loc.y + bounds.size.h - geometry.size.h).max(bounds.loc.y);
+
+    geometry.loc.x = geometry.loc.x.clamp(bounds.loc.x, max_x);
+    geometry.loc.y = geometry.loc.y.clamp(bounds.loc.y, max_y);
+    geometry
+}
 
 pub(crate) const DND_CURSOR_ENDED: u8 = 0;
 pub(crate) const DND_CURSOR_FILE: u8 = 1;
@@ -480,6 +500,7 @@ pub struct DesktopState {
         crate::core::wayland::color_management_protocol::ColorManagementState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
+    pending_ai_permission_responses: HashMap<DialogId, (u64, mpsc::Sender<IpcResponse>)>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
     /// Latest DRM offscreen texture per output for portal/OBS capture.
     pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
@@ -568,6 +589,7 @@ pub struct DesktopState {
     pub ui_sound_player: UiSoundPlayer,
     last_sidebar_hover_sound_target: Option<(OutputId, ElementId)>,
     last_clock_text: String,
+    next_dialog_id: DialogId,
     //pub popups: Vec<PopupState>,
 }
 
@@ -640,9 +662,11 @@ impl DesktopState {
         while let Ok(message) = self.settings_ipc_rx.try_recv() {
             match message {
                 DesktopIpcMessage::Request { request, response } => {
-                    let response_value =
-                        self.handle_settings_ipc_request(request, response.clone());
-                    let _ = response.send(response_value);
+                    if let Some(response_value) =
+                        self.handle_settings_ipc_request(request, response.clone())
+                    {
+                        let _ = response.send(response_value);
+                    }
                 }
             }
         }
@@ -692,20 +716,20 @@ impl DesktopState {
         &mut self,
         request: IpcRequest,
         response: mpsc::Sender<IpcResponse>,
-    ) -> IpcResponse {
+    ) -> Option<IpcResponse> {
         match request {
             IpcRequest::Get { key } => match get_config_key(&load_config(), &key) {
-                Some(value) => IpcResponse::Value { key, value },
-                None => IpcResponse::Error {
+                Some(value) => Some(IpcResponse::Value { key, value }),
+                None => Some(IpcResponse::Error {
                     message: format!("unknown config key: {key}"),
-                },
+                }),
             },
-            IpcRequest::Set { key, value } => self.set_config_key_and_notify(key, value),
+            IpcRequest::Set { key, value } => Some(self.set_config_key_and_notify(key, value)),
             IpcRequest::Watch { keys } => {
                 if keys.is_empty() {
-                    return IpcResponse::Error {
+                    return Some(IpcResponse::Error {
                         message: "watch requires at least one key".to_string(),
-                    };
+                    });
                 }
 
                 let config = load_config();
@@ -714,18 +738,18 @@ impl DesktopState {
                     .find(|key| get_config_key(&config, key).is_none())
                     .cloned()
                 {
-                    return IpcResponse::Error {
+                    return Some(IpcResponse::Error {
                         message: format!("unknown config key: {key}"),
-                    };
+                    });
                 }
 
                 self.settings_ipc_watchers
                     .push(DesktopIpcWatcher { keys, response });
-                IpcResponse::Ok
+                Some(IpcResponse::Ok)
             }
-            IpcRequest::GetConfig => IpcResponse::Config {
+            IpcRequest::GetConfig => Some(IpcResponse::Config {
                 config: load_config(),
-            },
+            }),
             IpcRequest::SetConfig { config } => {
                 let old_config = self.settings_ipc_config.clone();
                 match save_config(&config) {
@@ -733,11 +757,11 @@ impl DesktopState {
                         self.notify_config_changes(&old_config, &config);
                         self.settings_ipc_config = config.clone();
                         self.apply_config(config);
-                        IpcResponse::Ok
+                        Some(IpcResponse::Ok)
                     }
-                    Err(err) => IpcResponse::Error {
+                    Err(err) => Some(IpcResponse::Error {
                         message: err.to_string(),
-                    },
+                    }),
                 }
             }
             IpcRequest::ReloadConfig => {
@@ -746,7 +770,7 @@ impl DesktopState {
                 self.notify_config_changes(&old_config, &config);
                 self.settings_ipc_config = config.clone();
                 self.apply_config(config);
-                IpcResponse::Ok
+                Some(IpcResponse::Ok)
             }
             IpcRequest::Reload => {
                 let old_config = self.settings_ipc_config.clone();
@@ -760,7 +784,7 @@ impl DesktopState {
                 self.privacy = settings.privacy;
                 self.apply_debug_settings(settings.debug);
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
-                IpcResponse::Ok
+                Some(IpcResponse::Ok)
             }
             IpcRequest::IdentifyDisplays => {
                 self.topbar_pulse = Some(TopbarPulse {
@@ -770,7 +794,7 @@ impl DesktopState {
                     started_at: Instant::now(),
                 });
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
-                IpcResponse::Ok
+                Some(IpcResponse::Ok)
             }
             IpcRequest::Notify {
                 title,
@@ -787,15 +811,43 @@ impl DesktopState {
                     self.notifications.push(title, body)
                 };
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
-                IpcResponse::Notification { id }
+                Some(IpcResponse::Notification { id })
+            }
+            IpcRequest::AiPermissionPrompt {
+                request_id,
+                title,
+                message,
+                allow_persistent,
+            } => {
+                if self.active_dialog.is_some() || !self.pending_ai_permission_responses.is_empty()
+                {
+                    return Some(IpcResponse::Error {
+                        message: "another modal dialog is already active".to_string(),
+                    });
+                }
+
+                if self.outputs.is_empty() {
+                    return Some(IpcResponse::Error {
+                        message: "no output available for AI permission dialog".to_string(),
+                    });
+                }
+
+                self.open_ai_permission_dialog(
+                    request_id,
+                    title,
+                    message,
+                    allow_persistent,
+                    response,
+                );
+                None
             }
             IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
-                Ok(()) => IpcResponse::Ok,
-                Err(message) => IpcResponse::Error { message },
+                Ok(()) => Some(IpcResponse::Ok),
+                Err(message) => Some(IpcResponse::Error { message }),
             },
-            IpcRequest::GetAll | IpcRequest::SetValue { .. } => IpcResponse::Error {
+            IpcRequest::GetAll | IpcRequest::SetValue { .. } => Some(IpcResponse::Error {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
-            },
+            }),
         }
     }
 
@@ -2776,6 +2828,21 @@ impl DesktopState {
     }
 
     #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_clamp_override_redirect_geometry(
+        &self,
+        output_id: OutputId,
+        geometry: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        let Some(bounds) = self
+            .work_recess_for_output(output_id)
+            .or_else(|| self.output_logical_rect(output_id))
+        else {
+            return geometry;
+        };
+        clamp_rect_to_bounds(geometry, bounds)
+    }
+
+    #[cfg(feature = "xwayland")]
     pub(crate) fn xwayland_or_compositor_loc(
         &self,
         surface: &smithay::xwayland::X11Surface,
@@ -3451,6 +3518,7 @@ impl DesktopState {
             color_management_state: init.color_management_state,
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
+            pending_ai_permission_responses: HashMap::new(),
             portal_frame_cache: HashMap::new(),
             portal_capture_source: HashMap::new(),
             portal_offscreen_targets: HashMap::new(),
@@ -3505,6 +3573,7 @@ impl DesktopState {
             ui_sound_player: UiSoundPlayer::new(),
             last_sidebar_hover_sound_target: None,
             last_clock_text: String::new(),
+            next_dialog_id: 1,
         }
     }
 
@@ -3655,16 +3724,21 @@ impl DesktopState {
         let window = self.windows[idx].window.clone();
         let requested_geometry = surface.geometry();
         let output_id = self
-            .output_under_pointer(self.input.pointer_pos)
-            .unwrap_or(self.primary_output);
+            .window_id_for_x11_surface(&surface)
+            .map(|window_id| self.xwayland_output_id_for_window(window_id))
+            .unwrap_or_else(|| {
+                self.output_under_pointer(self.input.pointer_pos)
+                    .unwrap_or(self.primary_output)
+            });
 
         let should_float = self.windows[idx].floating;
         let (bbox_location, configure_size, maximize_on_map) = if surface.is_override_redirect() {
-            (
+            let geometry = Rectangle::from_loc_and_size(
                 self.xwayland_or_compositor_loc(&surface, requested_geometry.loc),
                 requested_geometry.size,
-                false,
-            )
+            );
+            let geometry = self.xwayland_clamp_override_redirect_geometry(output_id, geometry);
+            (geometry.loc, geometry.size, false)
         } else if should_float {
             (
                 self.default_toplevel_map_location(output_id),
@@ -3730,6 +3804,39 @@ impl DesktopState {
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
+    fn alloc_dialog_id(&mut self) -> DialogId {
+        let id = self.next_dialog_id;
+        self.next_dialog_id = self
+            .next_dialog_id
+            .checked_add(1)
+            .expect("dialog id counter overflowed");
+        id
+    }
+
+    fn open_ai_permission_dialog(
+        &mut self,
+        request_id: u64,
+        title: String,
+        message: String,
+        allow_persistent: bool,
+        response: mpsc::Sender<IpcResponse>,
+    ) -> DialogId {
+        let dialog_id = self.alloc_dialog_id();
+        let owner_output = self.focused_output;
+        let output = self
+            .outputs
+            .get(&owner_output)
+            .expect("AI permission dialog requires at least one output");
+        let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
+        let helper = AiPermissionDialog::new(request_id, title, message, allow_persistent);
+        let dialog = helper.to_dialog(dialog_id, owner_output, screen);
+
+        self.pending_ai_permission_responses
+            .insert(dialog_id, (request_id, response));
+        self.open_dialog(dialog);
+        dialog_id
+    }
+
     pub fn close_dialog(&mut self, id: DialogId) {
         self.dialogs.retain(|d| d.id != id);
 
@@ -3741,6 +3848,24 @@ impl DesktopState {
     }
 
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
+        let maybe_ai_response =
+            self.pending_ai_permission_responses
+                .remove(&id)
+                .map(|(request_id, response)| {
+                    let prompt = AiPermissionDialog::response_for_action(action);
+                    let _ = response.send(IpcResponse::AiPermissionDecision {
+                        request_id,
+                        allow: matches!(
+                            prompt.decision,
+                            focaldesk_permissions::PermissionDecision::Allow
+                        ),
+                        persistent: matches!(
+                            prompt.scope,
+                            focaldesk_permissions::PermissionScope::Persistent
+                        ),
+                    });
+                });
+
         match action {
             DialogAction::Confirm => {
                 tracing::info!(
@@ -3750,9 +3875,6 @@ impl DesktopState {
                     action = "confirm",
                     "dialog action"
                 );
-
-                // Example: allow screenshot
-                // self.allow_screenshot = true;
             }
 
             DialogAction::Cancel => {
@@ -3778,6 +3900,7 @@ impl DesktopState {
         }
 
         self.close_dialog(id);
+        let _ = maybe_ai_response;
     }
 
     /// Import the committed surface tree into the active renderer (during Wayland dispatch).
@@ -6235,7 +6358,8 @@ fn is_obs_like(app_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_browser_like;
+    use super::{clamp_rect_to_bounds, is_browser_like};
+    use smithay::utils::Rectangle;
 
     #[test]
     fn browser_like_matches_common_browser_executables() {
@@ -6245,6 +6369,28 @@ mod tests {
         assert!(is_browser_like("brave-browser"));
         assert!(!is_browser_like("alacritty"));
         assert!(!is_browser_like("cursor"));
+    }
+
+    #[test]
+    fn clamp_rect_to_bounds_keeps_rect_inside_area() {
+        let rect = Rectangle::from_loc_and_size((90, 90), (40, 40));
+        let bounds = Rectangle::from_loc_and_size((10, 20), (100, 80));
+
+        let clamped = clamp_rect_to_bounds(rect, bounds);
+
+        assert_eq!(clamped.loc, (70, 60).into());
+        assert_eq!(clamped.size, (40, 40).into());
+    }
+
+    #[test]
+    fn clamp_rect_to_bounds_shrinks_oversized_rect() {
+        let rect = Rectangle::from_loc_and_size((0, 0), (200, 200));
+        let bounds = Rectangle::from_loc_and_size((10, 20), (100, 80));
+
+        let clamped = clamp_rect_to_bounds(rect, bounds);
+
+        assert_eq!(clamped.loc, (10, 20).into());
+        assert_eq!(clamped.size, (100, 80).into());
     }
 }
 

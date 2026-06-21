@@ -1,5 +1,6 @@
 #![allow(dead_code, deprecated)]
 
+pub mod ai_permission;
 pub mod atlas;
 pub mod chrome;
 pub mod element;

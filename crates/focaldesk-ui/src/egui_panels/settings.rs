@@ -1,9 +1,13 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
+use focaldesk_ai::{AiPermissionRecord, list_ai_permission_records, revoke_ai_permission};
 use focaldesk_config::{FocalDeskConfig, save_config};
+use focaldesk_permissions::request::PermissionTarget;
+use focaldesk_permissions::{PermissionDecision, PermissionScope};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fill = if selected {
@@ -404,6 +408,7 @@ pub struct SettingsPanel {
     network_status: String,
     bluetooth_status: String,
     bluetooth_scanning: bool,
+    ai_permissions_status: String,
     debug_status: String,
 }
 
@@ -416,6 +421,7 @@ enum SettingsPage {
     Workspaces,
     Keyboard,
     Privacy,
+    AiPermissions,
     Power,
     Debug,
     About,
@@ -430,6 +436,7 @@ impl Default for SettingsPanel {
             network_status: String::new(),
             bluetooth_status: String::new(),
             bluetooth_scanning: false,
+            ai_permissions_status: String::new(),
             debug_status: "Diagnostics are generated locally".to_string(),
             open: false,
         }
@@ -468,6 +475,16 @@ impl SettingsPanel {
 
         if sidebar_button(ui, "Privacy", self.tab == SettingsPage::Privacy).clicked() {
             self.tab = SettingsPage::Privacy;
+        }
+
+        if sidebar_button(
+            ui,
+            "AI Permissions",
+            self.tab == SettingsPage::AiPermissions,
+        )
+        .clicked()
+        {
+            self.tab = SettingsPage::AiPermissions;
         }
 
         if sidebar_button(ui, "Power", self.tab == SettingsPage::Power).clicked() {
@@ -836,6 +853,55 @@ impl SettingsPanel {
         });
     }
 
+    fn ai_permissions_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("AI Permissions");
+        ui.add_space(8.0);
+        ui.label("Stored AI permissions live on disk and can be revoked here.");
+        ui.add_space(8.0);
+
+        match list_ai_permission_records() {
+            Ok(records) if records.is_empty() => {
+                ui.group(|ui| {
+                    ui.label("No saved AI permissions yet.");
+                });
+            }
+            Ok(records) => {
+                for record in records {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(ai_permission_heading(&record));
+                                ui.label(ai_permission_details(&record));
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Revoke").clicked() {
+                                        self.ai_permissions_status = revoke_ai_permission(&record)
+                                            .map(|_| "AI permission revoked".to_string())
+                                            .unwrap_or_else(|err| err.to_string());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+            Err(err) => {
+                ui.group(|ui| {
+                    ui.label(format!("Unable to load AI permissions: {err}"));
+                });
+            }
+        }
+
+        if !self.ai_permissions_status.is_empty() {
+            ui.add_space(8.0);
+            ui.label(&self.ai_permissions_status);
+        }
+    }
+
     fn about_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("About");
         ui.add_space(8.0);
@@ -938,6 +1004,7 @@ impl SettingsPanel {
                                 SettingsPage::Workspaces => self.show_placeholder(ui, "Workspaces"),
                                 SettingsPage::Keyboard => self.show_placeholder(ui, "Keyboard"),
                                 SettingsPage::Privacy => self.show_placeholder(ui, "Privacy"),
+                                SettingsPage::AiPermissions => self.ai_permissions_page(ui),
                                 SettingsPage::Power => self.show_placeholder(ui, "Power"),
                                 SettingsPage::Debug => self.debug_page(ui),
                                 SettingsPage::About => self.about_page(ui),
@@ -954,5 +1021,75 @@ impl SettingsPanel {
     fn show_placeholder(&mut self, ui: &mut egui::Ui, title: &str) {
         ui.heading(title);
         ui.label(format!("{title} settings"));
+    }
+}
+
+fn ai_permission_heading(record: &AiPermissionRecord) -> String {
+    format!(
+        "{} {}",
+        permission_decision_label(record.decision),
+        permission_resource_label(record.resource)
+    )
+}
+
+fn ai_permission_details(record: &AiPermissionRecord) -> String {
+    format!(
+        "App: {} | Target: {} | Scope: {} | Updated: {}",
+        record.app_identity,
+        permission_target_label(&record.target),
+        permission_scope_label(record.scope),
+        format_system_time(record.updated_at)
+    )
+}
+
+fn permission_decision_label(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "Allowed",
+        PermissionDecision::Deny => "Denied",
+        PermissionDecision::Ask => "Ask",
+    }
+}
+
+fn permission_scope_label(scope: PermissionScope) -> &'static str {
+    match scope {
+        PermissionScope::Once => "Once",
+        PermissionScope::Session => "Session",
+        PermissionScope::Persistent => "Persistent",
+    }
+}
+
+fn permission_target_label(target: &PermissionTarget) -> String {
+    match target {
+        PermissionTarget::Global => "Global".to_string(),
+        PermissionTarget::Named(name) => name.clone(),
+    }
+}
+
+fn permission_resource_label(resource: focaldesk_permissions::PermissionResource) -> &'static str {
+    match resource {
+        focaldesk_permissions::PermissionResource::Screenshot => "Screenshot",
+        focaldesk_permissions::PermissionResource::Screencast => "Screencast",
+        focaldesk_permissions::PermissionResource::ScreenShareWindow => "Window share",
+        focaldesk_permissions::PermissionResource::ScreenShareOutput => "Output share",
+        focaldesk_permissions::PermissionResource::AiChat => "AI chat",
+        focaldesk_permissions::PermissionResource::Microphone => "Microphone",
+        focaldesk_permissions::PermissionResource::Camera => "Camera",
+        focaldesk_permissions::PermissionResource::ClipboardRead => "Clipboard read",
+        focaldesk_permissions::PermissionResource::ClipboardWrite => "Clipboard write",
+        focaldesk_permissions::PermissionResource::RemoteInput => "Remote input",
+        focaldesk_permissions::PermissionResource::Notifications => "Notifications",
+        focaldesk_permissions::PermissionResource::FileOpen => "File open",
+        focaldesk_permissions::PermissionResource::FileSave => "File save",
+    }
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let seconds = duration.as_secs();
+            let nanos = duration.subsec_nanos();
+            format!("{seconds}.{nanos:09}s since epoch")
+        }
+        Err(_) => "before epoch".to_string(),
     }
 }

@@ -9,6 +9,13 @@ use std::os::unix::net::UnixStream;
 pub const DESKTOP_SOCKET_PATH: &str = "/tmp/focaldesk-desktop.sock";
 pub const SOCKET_PATH: &str = DESKTOP_SOCKET_PATH;
 
+fn desktop_socket_path() -> String {
+    std::env::var("FOCALDESK_DESKTOP_SOCKET_PATH")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DESKTOP_SOCKET_PATH.to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcRequest {
@@ -43,23 +50,50 @@ pub enum IpcRequest {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    AiPermissionPrompt {
+        request_id: u64,
+        title: String,
+        message: String,
+        #[serde(default)]
+        allow_persistent: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status")]
 pub enum IpcResponse {
     Ok,
-    Value { key: String, value: Value },
-    Event { key: String, value: Value },
-    Notification { id: u64 },
-    Config { config: FocalDeskConfig },
-    Settings { settings: Settings },
-    Error { message: String },
+    Value {
+        key: String,
+        value: Value,
+    },
+    Event {
+        key: String,
+        value: Value,
+    },
+    Notification {
+        id: u64,
+    },
+    Config {
+        config: FocalDeskConfig,
+    },
+    Settings {
+        settings: Settings,
+    },
+    AiPermissionDecision {
+        request_id: u64,
+        allow: bool,
+        persistent: bool,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String> {
-    let mut stream = UnixStream::connect(DESKTOP_SOCKET_PATH)
-        .map_err(|err| format!("could not connect to {DESKTOP_SOCKET_PATH}: {err}"))?;
+    let path = desktop_socket_path();
+    let mut stream =
+        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
     let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
@@ -96,8 +130,9 @@ pub fn watch_desktop_keys(
     keys: Vec<String>,
     mut on_response: impl FnMut(IpcResponse),
 ) -> Result<(), String> {
-    let mut stream = UnixStream::connect(DESKTOP_SOCKET_PATH)
-        .map_err(|err| format!("could not connect to {DESKTOP_SOCKET_PATH}: {err}"))?;
+    let path = desktop_socket_path();
+    let mut stream =
+        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
     let json = serde_json::to_vec(&IpcRequest::Watch { keys }).map_err(|err| err.to_string())?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;

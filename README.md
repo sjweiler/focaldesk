@@ -79,6 +79,23 @@ Because FocalDesk is alpha compositor/system software, run it from a safe
 development session first. Avoid switching important work over to it until you
 know the current state of your local build.
 
+## AI Service
+
+The background server exposes AI chat over the local IPC socket used by
+`focaldesk-cli ai ...`.
+
+By default the AI service asks the compositor to show a native approval modal,
+logs each request, and records the decision through the normal FocalDesk
+logging pipeline. If the desktop socket is unavailable, it falls back to the
+service terminal.
+
+You can tighten or relax the permission gate with:
+
+- `FOCALDESK_AI_PERMISSION=prompt` to ask via the compositor modal before each request
+- `FOCALDESK_AI_PERMISSION=allow-session` to allow chat for the current session
+- `FOCALDESK_AI_PERMISSION=allow-persistent` to persist the allow decision on disk across restarts
+- `FOCALDESK_AI_PERMISSION=deny` to block AI chat
+
 ## License
 
 FocalDesk is licensed under the MIT License. See [LICENSE](LICENSE).

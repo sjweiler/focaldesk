@@ -1462,10 +1462,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "dirs 6.0.0",
+ "focaldesk-ipc",
+ "focaldesk-permissions",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
@@ -1561,6 +1566,7 @@ dependencies = [
  "focaldesk-ipc",
  "focaldesk-logging",
  "focaldesk-notifications",
+ "focaldesk-permissions",
  "focaldesk-power",
  "focaldesk-resources",
  "focaldesk-settings-core",
@@ -1769,6 +1775,7 @@ dependencies = [
  "cosmic-text",
  "egui",
  "egui_glow",
+ "focaldesk-ai",
  "focaldesk-config",
  "focaldesk-logging",
  "focaldesk-permissions",
