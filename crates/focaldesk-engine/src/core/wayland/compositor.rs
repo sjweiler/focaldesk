@@ -26,8 +26,8 @@ use std::sync::atomic::Ordering;
 use smithay::desktop::layer_map_for_output;
 
 use crate::core::desktop::DesktopState;
-use smithay::reexports::wayland_server::Client;
 use smithay::backend::renderer::element::Id;
+use smithay::reexports::wayland_server::Client;
 
 #[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static XWAYLAND_BUFFER_LOGS: AtomicUsize = AtomicUsize::new(0);

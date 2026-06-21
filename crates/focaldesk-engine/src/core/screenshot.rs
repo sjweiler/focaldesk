@@ -1,11 +1,12 @@
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::utils::{Size, Physical};
 use smithay::backend::renderer::Bind;
-use focaldesk_logging::flog_info;
+use focaldesk_logging::session_id;
 
 use image::{ImageBuffer, Rgba};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::info;
 
 pub fn capture_screenshot(
     renderer: &mut GlesRenderer,
@@ -40,7 +41,12 @@ pub fn capture_screenshot(
 
     img.save(&path)?;
 
-    flog_info!("Saved screenshot: {:?}", path);
+    info!(
+        target: "focaldesk",
+        session_id = session_id(),
+        path = %path.display(),
+        "saved screenshot"
+    );
 
     Ok(())
 }

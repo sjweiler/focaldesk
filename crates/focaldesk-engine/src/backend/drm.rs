@@ -2,7 +2,8 @@
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
 use crate::backend::common::{
-    bootstrap_compositor_core, physical_size_mm_from_pixels, refresh_portal_services,
+    bootstrap_compositor_core, is_nonfatal_wayland_io_error, physical_size_mm_from_pixels,
+    refresh_portal_services,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc};
@@ -30,6 +31,7 @@ use smithay::backend::renderer::element::{
 };
 
 use focaldesk_flow::keybinds::BackendKind;
+use focaldesk_logging::flog_warn;
 
 // DRM/KMS backend for FocalDesk.
 //
@@ -110,6 +112,7 @@ use chrono::Local;
 use image::{ImageBuffer, Rgba};
 use std::fs;
 
+use crate::backend::common::client_state_from_stream;
 #[cfg(feature = "xwayland")]
 use crate::backend::common::{finish_xwayland_startup, start_xwayland};
 use drm::control::Mode;
@@ -2152,10 +2155,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         if let Some(stream) = data.core.listener.accept()? {
-            let client = data.core.display.handle().insert_client(
-                stream,
-                std::sync::Arc::new(crate::core::wayland::client::ClientState::default()),
-            )?;
+            let client_state = client_state_from_stream(&stream);
+            let client = data
+                .core
+                .display
+                .handle()
+                .insert_client(stream, std::sync::Arc::new(client_state))?;
             data.core.clients.push(client);
         }
 
@@ -2177,12 +2182,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         if data.core.state.wayland_clients_may_dispatch() {
-            data.core.display.dispatch_clients(&mut data.core.state)?;
+            if let Err(err) = data.core.display.dispatch_clients(&mut data.core.state) {
+                if !is_nonfatal_wayland_io_error(&err) {
+                    return Err(err.into());
+                }
+                flog_warn!("ignoring nonfatal Wayland dispatch error: {err}");
+            }
         }
         data.core.state.end_portal_dispatch();
 
         data.core.state.refresh_space();
-        data.core.display.handle().flush_clients()?;
+        if let Err(err) = data.core.display.handle().flush_clients() {
+            if !is_nonfatal_wayland_io_error(&err) {
+                return Err(err.into());
+            }
+            flog_warn!("ignoring nonfatal Wayland flush error: {err}");
+        }
         data.core.state.tick_layout();
 
         let screenshot_output = data.core.state.screenshot_request();

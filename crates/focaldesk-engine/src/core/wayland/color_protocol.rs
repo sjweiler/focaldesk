@@ -42,11 +42,15 @@ impl ColorTagState {
         D: GlobalDispatch<focaldesk_color_manager_v1::FocaldeskColorManagerV1, ()>
             + Dispatch<focaldesk_color_manager_v1::FocaldeskColorManagerV1, ()>
             + Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorTag>
+            + Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, OrphanSurfaceColorTag>
             + 'static,
     {
         display.create_global::<D, focaldesk_color_manager_v1::FocaldeskColorManagerV1, _>(1, ());
     }
 }
+
+/// Placeholder when `get_surface` hits `surface_exists` but Wayland still allocates the `NewId`.
+pub struct OrphanSurfaceColorTag;
 
 #[derive(Debug, Clone)]
 pub struct SurfaceColorTag {
@@ -68,7 +72,9 @@ impl SurfaceColorTag {
     }
 }
 
-fn transfer_from_wire(value: WEnum<focaldesk_surface_color_v1::Transfer>) -> Option<TransferFunction> {
+fn transfer_from_wire(
+    value: WEnum<focaldesk_surface_color_v1::Transfer>,
+) -> Option<TransferFunction> {
     use focaldesk_surface_color_v1::Transfer;
     match value {
         WEnum::Value(Transfer::Srgb) => Some(TransferFunction::Srgb),
@@ -113,7 +119,12 @@ impl Dispatch<focaldesk_color_manager_v1::FocaldeskColorManagerV1, ()> for Deskt
         match request {
             focaldesk_color_manager_v1::Request::Destroy => {}
             focaldesk_color_manager_v1::Request::GetSurface { id, surface } => {
-                if state.color_tag_state.tagged_surfaces.contains(&surface.id()) {
+                if state
+                    .color_tag_state
+                    .tagged_surfaces
+                    .contains(&surface.id())
+                {
+                    data_init.init(id, OrphanSurfaceColorTag);
                     resource.post_error(
                         focaldesk_color_manager_v1::Error::SurfaceExists,
                         "surface already has a focaldesk_surface_color_v1 object",
@@ -129,7 +140,28 @@ impl Dispatch<focaldesk_color_manager_v1::FocaldeskColorManagerV1, ()> for Deskt
     }
 }
 
-impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorTag> for DesktopState {
+impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, OrphanSurfaceColorTag>
+    for DesktopState
+{
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &focaldesk_surface_color_v1::FocaldeskSurfaceColorV1,
+        request: focaldesk_surface_color_v1::Request,
+        _data: &OrphanSurfaceColorTag,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        match request {
+            focaldesk_surface_color_v1::Request::Destroy => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorTag>
+    for DesktopState
+{
     fn request(
         _state: &mut Self,
         _client: &Client,

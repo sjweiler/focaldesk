@@ -6,18 +6,22 @@ use crate::core::backend_render::{
 };
 use crate::core::color::linear_sdr_runtime_enabled;
 use crate::core::desktop::DesktopState;
-use crate::core::render::{ClientCompositingMode, ChromeGlassPass, FlowRenderElement, OutputRenderStage};
-use crate::core::{OutputState, SceneState};
+use crate::core::render::{
+    ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
+};
 use crate::core::ui_state::UiState;
+use crate::core::{OutputState, SceneState};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_logging::flog;
 use focaldesk_types::OutputId;
-use std::time::{Duration, Instant};
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture};
+use smithay::backend::renderer::gles::{
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture,
+};
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Texture};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
+use std::time::{Duration, Instant};
 
 /// Opaque offscreen: avoids alpha=0 holes that the sRGB↔linear blit decodes as black.
 pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Xbgr8888;
@@ -75,8 +79,12 @@ impl LinearOffscreenTargets {
         if !self.linear_supported {
             return Ok(());
         }
-        match ensure_offscreen_texture(renderer, &mut self.linear_offscreen, size, LINEAR_SDR_FORMAT)
-        {
+        match ensure_offscreen_texture(
+            renderer,
+            &mut self.linear_offscreen,
+            size,
+            LINEAR_SDR_FORMAT,
+        ) {
             Ok(()) => Ok(()),
             Err(err) => {
                 self.linear_supported = false;

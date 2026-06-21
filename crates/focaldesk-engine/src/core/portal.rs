@@ -22,8 +22,7 @@ use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
 use crate::core::desktop::DesktopState;
 use crate::core::linear_compositing::{
-    present_offscreen_texture, render_output_offscreen, supports_linear_sdr,
-    LinearOffscreenTargets,
+    present_offscreen_texture, render_output_offscreen, supports_linear_sdr, LinearOffscreenTargets,
 };
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
@@ -500,8 +499,7 @@ fn render_portal_output_to_texture(
     transform: Transform,
     target_texture: &mut GlesTexture,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut targets =
-        portal_offscreen_targets_for_output(state, renderer, output_id, render_size);
+    let mut targets = portal_offscreen_targets_for_output(state, renderer, output_id, render_size);
     let sync = render_output_offscreen(
         state,
         renderer,

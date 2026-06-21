@@ -2,6 +2,7 @@
 
 //! Shared setup for nested compositor backends (winit, future DRM/KMS, etc.).
 
+use std::io;
 use std::path::PathBuf;
 #[cfg(feature = "xwayland")]
 use std::process::Stdio;
@@ -11,7 +12,7 @@ use std::time::Instant;
 
 use focaldesk_cursor::CursorManager;
 use focaldesk_flow::Keybinds;
-use focaldesk_logging::{flog, flog_info};
+use focaldesk_logging::{flog, flog_info, session_id};
 use focaldesk_notifications::NotificationManager;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
@@ -40,6 +41,7 @@ use crate::core::input::{
 };
 use crate::core::render::RenderState;
 use crate::core::ui_state::UiState;
+use crate::core::wayland::client::ClientState;
 use crate::core::OutputState;
 use crate::core::SceneState;
 use focaldesk_config::FocalDeskConfig;
@@ -53,6 +55,11 @@ use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
+use tracing::{error, info, warn};
+
+pub(crate) fn client_state_from_stream(stream: &std::os::unix::net::UnixStream) -> ClientState {
+    ClientState::from_stream(stream)
+}
 
 pub(crate) fn physical_size_mm_from_pixels(size: Size<i32, Physical>) -> (i32, i32) {
     const MM_PER_INCH: f64 = 25.4;
@@ -69,6 +76,16 @@ pub(crate) struct BootstrapOutput {
     pub scale_factor: f64,
 }
 
+pub(crate) fn is_nonfatal_wayland_io_error(err: &io::Error) -> bool {
+    matches!(
+        err.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::NotConnected
+    )
+}
+
 /// Spawn XWayland and register it on `handle`. Sets `DISPLAY` once the server is up.
 #[cfg(feature = "xwayland")]
 pub fn start_xwayland(
@@ -76,7 +93,12 @@ pub fn start_xwayland(
     display_handle: &DisplayHandle,
     handle: LoopHandle<'static, DesktopState>,
 ) -> anyhow::Result<()> {
-    flog("XWAYLAND: preparing to launch XWayland server");
+    info!(
+        target: "focaldesk",
+        session_id = session_id(),
+        backend = "xwayland",
+        "preparing to launch XWayland server"
+    );
     state.xwayland_loop_handle = Some(handle.clone());
     let xwayland_env = std::env::vars().filter(|(key, _)| {
         matches!(
@@ -106,9 +128,12 @@ pub fn start_xwayland(
     let xwayland_display = format!(":{}", xwayland.display_number());
     state.xwayland_display = Some(xwayland_display.clone());
     std::env::set_var("DISPLAY", &xwayland_display);
-    flog(&format!(
-        "XWAYLAND: launched; reserved DISPLAY={xwayland_display}"
-    ));
+    info!(
+        target: "focaldesk",
+        session_id = session_id(),
+        display = %xwayland_display,
+        "launched XWayland and reserved DISPLAY"
+    );
 
     let wm_handle = handle.clone();
     let wm_dh = display_handle.clone();
@@ -117,12 +142,16 @@ pub fn start_xwayland(
             x11_socket,
             display_number,
         } => {
-            let display = format!(":{display_number}");
-            data.xwayland_display = Some(display.clone());
-            std::env::set_var("DISPLAY", &display);
-            flog(&format!(
-                "XWAYLAND READY: display={display} socket_fd={x11_socket:?}"
-            ));
+            let xwayland_display_name = format!(":{display_number}");
+            data.xwayland_display = Some(xwayland_display_name.clone());
+            std::env::set_var("DISPLAY", &xwayland_display_name);
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                xwayland_display = %xwayland_display_name,
+                socket_fd = ?x11_socket,
+                "XWayland ready"
+            );
 
             match X11Wm::start_wm(
                 wm_handle.clone(),
@@ -132,16 +161,31 @@ pub fn start_xwayland(
             ) {
                 Ok(wm) => {
                     data.xwm = Some(wm);
-                    flog(&format!("XWayland WM attached on DISPLAY={display}"));
+                    info!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        xwayland_display = %xwayland_display_name,
+                        "XWayland WM attached"
+                    );
                 }
                 Err(err) => {
-                    flog(&format!("failed to start XWayland WM: {err}"));
+                    error!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        xwayland_display = %xwayland_display_name,
+                        error = %err,
+                        "failed to start XWayland WM"
+                    );
                     data.disable_xwayland();
                 }
             }
         }
         XWaylandEvent::Error => {
-            flog("XWayland failed to start");
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                "XWayland failed to start"
+            );
             data.disable_xwayland();
         }
     })?;
@@ -159,11 +203,20 @@ pub fn pump_xwayland_ready(
     let deadline = Instant::now() + timeout;
     while state.xwm.is_none() {
         if state.xwayland_client.is_none() {
-            flog("XWayland client disconnected during startup");
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                "XWayland client disconnected during startup"
+            );
             return Ok(false);
         }
         if Instant::now() >= deadline {
-            flog("XWayland WM not ready before timeout");
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                timeout_ms = timeout.as_millis(),
+                "XWayland WM not ready before timeout"
+            );
             return Ok(false);
         }
         // XWayland cannot finish startup until its Wayland client roundtrips with the compositor.
@@ -183,7 +236,11 @@ pub fn finish_xwayland_startup(
     timeout: Duration,
 ) -> anyhow::Result<()> {
     if pump_xwayland_ready(event_loop, display, state, timeout)? {
-        flog("XWayland startup complete");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            "XWayland startup complete"
+        );
     } else {
         state.disable_xwayland();
     }
@@ -526,6 +583,11 @@ pub(crate) fn bootstrap_compositor_core(
     let image_copy_capture_state =
         smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<DesktopState>(&dh);
     crate::core::wayland::color_protocol::ColorTagState::bind_global::<DesktopState>(&dh);
+    if crate::core::color::wp_color_management_enabled() {
+        crate::core::wayland::color_management_protocol::ColorManagementState::bind_global::<
+            DesktopState,
+        >(&dh);
+    }
     #[cfg(feature = "xwayland")]
     let xwayland_shell_state = XWaylandShellState::new::<DesktopState>(&dh);
 
@@ -590,6 +652,7 @@ pub(crate) fn bootstrap_compositor_core(
         output_capture_source_state,
         image_copy_capture_state,
         color_tag_state: Default::default(),
+        color_management_state: Default::default(),
         backend_kind: backend,
         cursor_manager,
         seat,

@@ -4,7 +4,7 @@ use focaldesk_ipc::{
     send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
     IpcResponse,
 };
-use focaldesk_logging::flog_info;
+use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
     load_settings, save_settings, DebugLogLevel, LidCloseAction, LowBatteryAction, OutputConfig,
@@ -23,6 +23,7 @@ use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("100 %", 1.0),
@@ -178,13 +179,28 @@ fn save_displays(displays: &[DisplayConfig]) {
     match send_desktop_request(&IpcRequest::SetDisplays { outputs }) {
         Ok(IpcResponse::Ok) => {}
         Ok(IpcResponse::Error { message }) => {
-            flog_info!("display IPC update rejected: {message}");
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                message = %message,
+                "display IPC update rejected"
+            );
         }
         Ok(other) => {
-            flog_info!("unexpected display IPC response: {other:?}");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                response = ?other,
+                "unexpected display IPC response"
+            );
         }
         Err(err) => {
-            flog_info!("display IPC unavailable; saved display config directly: {err}");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "display IPC unavailable; saved display config directly"
+            );
         }
     }
 }
@@ -1620,26 +1636,47 @@ fn connected_display_row(
 
 fn persist_config(config: &FocalDeskConfig) {
     if let Err(err) = send_desktop_config(config.clone()) {
-        flog_info!("settings IPC unavailable; saving config directly: {err}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            error = %err,
+            "settings IPC unavailable; saving config directly"
+        );
         let _ = save_config(config);
     }
 }
 
 fn persist_config_key(config: &FocalDeskConfig, key: &str, value: serde_json::Value) {
     if let Err(err) = send_desktop_set(key, value) {
-        flog_info!("settings IPC set failed for {key}; saving config directly: {err}");
+        warn!(
+            target: "focaldesk",
+            session_id = session_id(),
+            key = %key,
+            error = %err,
+            "settings IPC set failed; saving config directly"
+        );
         let _ = save_config(config);
     }
 }
 
 fn persist_settings(settings: &Settings) {
     if let Err(err) = save_settings(settings) {
-        flog_info!("failed to save settings: {err}");
+        error!(
+            target: "focaldesk",
+            session_id = session_id(),
+            error = %err,
+            "failed to save settings"
+        );
         return;
     }
 
     if let Err(err) = send_desktop_request(&IpcRequest::Reload) {
-        flog_info!("settings IPC reload unavailable after settings save: {err}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            error = %err,
+            "settings IPC reload unavailable after settings save"
+        );
     }
 }
 
@@ -1758,11 +1795,21 @@ fn start_config_watch(keys: &[&str]) -> mpsc::Receiver<ConfigEvent> {
                 let _ = tx.send(ConfigEvent { key, value });
             }
             IpcResponse::Error { message } => {
-                flog_info!("settings IPC watch error: {message}");
+                warn!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    message = %message,
+                    "settings IPC watch error"
+                );
             }
             _ => {}
         }) {
-            flog_info!("settings IPC watch unavailable: {err}");
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "settings IPC watch unavailable"
+            );
         }
     });
 
@@ -1782,6 +1829,7 @@ fn set_scale_if_changed(scale: &gtk::Scale, value: f64) {
 }
 
 fn main() {
+    init_default_logging();
     let app = adw::Application::new(
         Some("com.focaldesk.Settings"),
         gtk::gio::ApplicationFlags::NON_UNIQUE,
@@ -2031,7 +2079,11 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
         reset_button.connect_clicked(move |_| {
             *config.borrow_mut() = FocalDeskConfig::default();
             persist_config(&config.borrow());
-            flog_info!("Reset config");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                "reset config"
+            );
         });
     }
 
@@ -3665,7 +3717,12 @@ fn run_power_action(manager: &PowerManager, command: PowerCommand, status: &gtk:
     match manager.execute(command) {
         Ok(()) => status.set_text("Power action started"),
         Err(err) => {
-            flog_info!("power action failed: {err}");
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "power action failed"
+            );
             status.set_text("Power action failed");
         }
     }
@@ -3796,7 +3853,12 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
 
             if let Err(err) = manager.set_performance_profile(performance_profile_name(mode)) {
-                flog_info!("failed to set performance profile: {err}");
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = %err,
+                    "failed to set performance profile"
+                );
                 status_label.set_text("Performance profile change failed");
             } else {
                 status_label.set_text(&power_status_text(&manager));
@@ -3934,7 +3996,12 @@ fn debug_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
                 match open_path(&path) {
                     Ok(()) => debug_status.set_text("Opened log file"),
                     Err(err) => {
-                        flog_info!("failed to open log file: {err}");
+                        warn!(
+                            target: "focaldesk",
+                            session_id = session_id(),
+                            error = %err,
+                            "failed to open log file"
+                        );
                         debug_status.set_text("Unable to open log file");
                     }
                 }

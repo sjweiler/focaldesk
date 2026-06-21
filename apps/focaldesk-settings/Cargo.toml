@@ -18,3 +18,4 @@ focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }
 focaldesk-power = { path = "../../crates/focaldesk-power" }
 focaldesk-sounds = { path = "../../crates/focaldesk-sounds" }
+tracing = { workspace = true }

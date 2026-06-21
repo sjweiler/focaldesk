@@ -13,8 +13,8 @@ use protocol::client::{focaldesk_color_manager_v1, focaldesk_surface_color_v1};
 use std::env;
 use std::ffi::CString;
 use std::fs::File;
-use std::os::fd::FromRawFd;
 use std::os::fd::BorrowedFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::io::AsRawFd;
 use std::ptr;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
@@ -90,10 +90,7 @@ impl App {
 
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
-        toplevel.set_title(format!(
-            "focaldesk color tag test ({:?})",
-            self.transfer
-        ));
+        toplevel.set_title(format!("focaldesk color tag test ({:?})", self.transfer));
 
         self.surface = Some(surface);
         Ok(())
@@ -107,21 +104,8 @@ impl App {
         let mut mapping = ShmMapping::map(fd, size, memfd)?;
         fill_test_pattern(mapping.as_mut(), self.transfer);
 
-        let pool = shm.create_pool(
-            unsafe { BorrowedFd::borrow_raw(fd) },
-            size as i32,
-            qh,
-            (),
-        );
-        let buffer = pool.create_buffer(
-            0,
-            WIDTH,
-            HEIGHT,
-            STRIDE,
-            wl_shm::Format::Argb8888,
-            qh,
-            (),
-        );
+        let pool = shm.create_pool(unsafe { BorrowedFd::borrow_raw(fd) }, size as i32, qh, ());
+        let buffer = pool.create_buffer(0, WIDTH, HEIGHT, STRIDE, wl_shm::Format::Argb8888, qh, ());
         surface.attach(Some(&buffer), 0, 0);
         std::mem::forget((pool, buffer, mapping));
         Ok(())
@@ -331,8 +315,7 @@ fn create_memfd(size: usize) -> Result<File> {
         bail!("memfd_create failed");
     }
     let file = unsafe { File::from_raw_fd(fd) };
-    file.set_len(size as u64)
-        .context("failed to size memfd")?;
+    file.set_len(size as u64).context("failed to size memfd")?;
     Ok(file)
 }
 

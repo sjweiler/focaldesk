@@ -7,12 +7,12 @@ edition = "2021"
 indexmap = "2"
 bitflags = "2"
 smithay.workspace = true
-nix = { version = "0.27", features = ["fs"] }
+nix = { version = "0.27", features = ["fs", "socket"] }
 calloop = "0.12"
 wayland-server = "0.31"
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
-wayland-protocols.workspace = true
+wayland-protocols = { workspace = true, features = ["server", "staging"] }
 serde = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

@@ -10,7 +10,7 @@ use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
 use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
 use crate::core::render::{
-    ClientCompositingMode, ChromeGlassPass, FlowRenderElement, FrameCtx, RenderInputs,
+    ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
     RenderInputsMut,
 };
 use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};

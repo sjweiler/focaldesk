@@ -18,6 +18,8 @@ use wayland_server::protocol::wl_surface::WlSurface;
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
 use focaldesk_logging::flog;
+use focaldesk_logging::session_id;
+use tracing::{debug, info_span, trace};
 
 impl XWaylandShellHandler for DesktopState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
@@ -70,24 +72,34 @@ impl XwmHandler for DesktopState {
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        flog(&format!(
-            "xwayland override-redirect mapped title={:?} class={:?} geometry={:?}",
-            window.title(),
-            window.class(),
-            window.geometry()
-        ));
+        let window_id = self.window_id_for_x11_surface(&window);
+        let _span = info_span!(
+            "xwayland_override_redirect_mapped",
+            session_id = session_id(),
+            window_id = ?window_id,
+            title = ?window.title(),
+            class = ?window.class(),
+            geometry = ?window.geometry()
+        )
+        .entered();
+        trace!(target: "focaldesk", "xwayland override-redirect mapped");
         self.map_xwayland_window(window);
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        flog(&format!(
-            "xwayland window unmapped override_redirect={} title={:?} class={:?} geometry={:?}",
-            window.is_override_redirect(),
-            window.title(),
-            window.class(),
-            window.geometry()
-        ));
-        let Some(id) = self.window_id_for_x11_surface(&window) else {
+        let window_id = self.window_id_for_x11_surface(&window);
+        let _span = info_span!(
+            "xwayland_window_unmapped",
+            session_id = session_id(),
+            window_id = ?window_id,
+            override_redirect = window.is_override_redirect(),
+            title = ?window.title(),
+            class = ?window.class(),
+            geometry = ?window.geometry()
+        )
+        .entered();
+        debug!(target: "focaldesk", "xwayland window unmapped");
+        let Some(id) = window_id else {
             return;
         };
         self.mark_window_id_damage(id, crate::core::desktop::DamageSource::CommitBbox);
@@ -104,7 +116,18 @@ impl XwmHandler for DesktopState {
     }
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        let Some(id) = self.window_id_for_x11_surface(&window) else {
+        let window_id = self.window_id_for_x11_surface(&window);
+        let _span = info_span!(
+            "xwayland_window_destroyed",
+            session_id = session_id(),
+            window_id = ?window_id,
+            override_redirect = window.is_override_redirect(),
+            title = ?window.title(),
+            class = ?window.class(),
+            geometry = ?window.geometry()
+        )
+        .entered();
+        let Some(id) = window_id else {
             return;
         };
         self.mark_window_id_damage(id, crate::core::desktop::DamageSource::CommitBbox);
@@ -154,9 +177,17 @@ impl XwmHandler for DesktopState {
         geometry: Rectangle<i32, Logical>,
         _above: Option<u32>,
     ) {
-        let Some(id) = self.window_id_for_x11_surface(&window) else {
+        let window_id = self.window_id_for_x11_surface(&window);
+        let Some(id) = window_id else {
             return;
         };
+        let _span = info_span!(
+            "xwayland_configure_notify",
+            session_id = session_id(),
+            window_id = ?window_id,
+            geometry = ?geometry
+        )
+        .entered();
         let Some(managed) = self.window(id).map(|managed| managed.window.clone()) else {
             return;
         };

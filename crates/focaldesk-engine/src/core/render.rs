@@ -31,7 +31,7 @@ use smithay::backend::renderer::gles::GlesTexProgram;
 use crate::core::scene::SceneState;
 //use crate::core::output::OutputId;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
-use focaldesk_logging::{flog, flog_error, flog_info};
+use focaldesk_logging::{flog, flog_error, flog_info, session_id};
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
@@ -73,6 +73,7 @@ use smithay::backend::renderer::gles::Uniform;
 use smithay::wayland::seat::WaylandFocus;
 #[cfg(feature = "xwayland")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::{error, info};
 
 //use crate::core::chrome_svg::ChromeSvgCache;
 
@@ -130,9 +131,7 @@ pub enum ChromeGlassPass {
 #[derive(Clone)]
 pub enum ClientCompositingMode {
     Sdr,
-    Linear {
-        srgb_to_linear: GlesTexProgram,
-    },
+    Linear { srgb_to_linear: GlesTexProgram },
 }
 
 impl FrameCtx {
@@ -710,7 +709,12 @@ impl RenderState {
                 Some(program),
                 &[Uniform::new("u_tint", color)],
             ) {
-                flog_error!("tinted icon render failed: {:?}", e);
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = ?e,
+                    "tinted icon render failed"
+                );
             }
 
             // ✅ MUST be inside loop
@@ -906,7 +910,13 @@ impl RenderState {
                 Some(program),
                 &[Uniform::new("u_tint", style.tint)], //&[Uniform::new("u_tint", tint)],
             ) {
-                flog_error!("tinted icon render failed for {:?}: {:?}", icon, e);
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    icon = ?icon,
+                    error = ?e,
+                    "tinted icon render failed"
+                );
             }
         }
     }
@@ -1214,33 +1224,56 @@ impl RenderState {
         if self.wallpaper_texture.is_some() {
             return;
         }
-        flog_info!("ensure_wallpaper_loaded: attempting load...");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            "ensure_wallpaper_loaded: attempting load"
+        );
 
         let tex = Self::load_wallpaper(
             renderer,
             "/home/steve/focaldesk/assets/wallpaper/focaldesk_wallpaper.png",
         );
-        flog_info!(
-            "ensure_wallpaper_loaded: load result is_some={}",
-            tex.is_some()
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            loaded = tex.is_some(),
+            "ensure_wallpaper_loaded: load result"
         );
 
         self.wallpaper_texture = tex;
     }
 
     pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<GlesTexture> {
-        flog_info!("load_wallpaper: opening {path}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            path = %path,
+            "load_wallpaper: opening"
+        );
 
         let img = match image::open(path) {
             Ok(i) => i,
             Err(e) => {
-                flog_error!("load_wallpaper: image::open failed: {e:?}");
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    path = %path,
+                    error = ?e,
+                    "load_wallpaper: image::open failed"
+                );
                 return None;
             }
         };
 
         let (w, h) = img.dimensions();
-        flog_info!("load_wallpaper: decoded {w}x{h}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            width = w,
+            height = h,
+            "load_wallpaper: decoded"
+        );
 
         //let rgba = img.to_rgba8();
         let mut rgba = img.to_rgba8();
@@ -1250,19 +1283,38 @@ impl RenderState {
         }
 
         //let fourcc = Fourcc::Rgba8888;
-        flog_info!("load_wallpaper: rgba bytes={}", rgba.len());
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            bytes = rgba.len(),
+            "load_wallpaper: rgba bytes"
+        );
 
         // IMPORTANT: your buffer is RGBA; ABGR is often wrong here.
         let fourcc = Fourcc::Argb8888; // try this first
-        flog_info!("load_wallpaper: importing to GPU as {fourcc:?}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            fourcc = ?fourcc,
+            "load_wallpaper: importing to GPU"
+        );
 
         match renderer.import_memory(&rgba, fourcc, (w as i32, h as i32).into(), false) {
             Ok(tex) => {
-                flog_info!("load_wallpaper: import_memory OK");
+                info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    "load_wallpaper: import_memory OK"
+                );
                 Some(tex)
             }
             Err(e) => {
-                flog_error!("load_wallpaper: import_memory FAILED: {e:?}");
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = ?e,
+                    "load_wallpaper: import_memory FAILED"
+                );
                 None
             }
         }
@@ -1540,7 +1592,12 @@ impl RenderState {
         }
 
         if let Err(err) = self.draw_active_output_glow(frame, inputs.ctx, theme) {
-            flog_error!("active output accent render failed: {:?}", err);
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = ?err,
+                "active output accent render failed"
+            );
         }
 
         let egui_frame_ctx = DesktopFrameCtx {
@@ -2172,7 +2229,10 @@ impl RenderState {
             return Ok(());
         };
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-        let style = if matches!(inputs.chrome_glass_pass, ChromeGlassPass::LinearUnderClients) {
+        let style = if matches!(
+            inputs.chrome_glass_pass,
+            ChromeGlassPass::LinearUnderClients
+        ) {
             glass_style_linear(&legacy_theme.glass)
         } else {
             legacy_theme.glass

@@ -123,8 +123,18 @@ pub fn linear_sdr_runtime_enabled() -> bool {
 /// Debug/testing hook: treat every committed surface as linear-encoded.
 pub fn force_linear_surfaces() -> bool {
     matches!(
-        std::env::var("FOCALDESK_FORCE_LINEAR_SURFACES").ok().as_deref(),
+        std::env::var("FOCALDESK_FORCE_LINEAR_SURFACES")
+            .ok()
+            .as_deref(),
         Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// When false, do not advertise `wp_color_management_v1`.
+pub fn wp_color_management_enabled() -> bool {
+    !matches!(
+        std::env::var("FOCALDESK_WP_COLOR").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
     )
 }
 
@@ -180,5 +190,16 @@ mod tests {
         assert!(!linear_sdr_runtime_enabled());
         std::env::remove_var("FOCALDESK_LINEAR_SDR");
         assert!(linear_sdr_runtime_enabled());
+    }
+
+    #[test]
+    fn wp_color_management_respects_disable_env() {
+        std::env::remove_var("FOCALDESK_WP_COLOR");
+        assert!(wp_color_management_enabled());
+
+        std::env::set_var("FOCALDESK_WP_COLOR", "0");
+        assert!(!wp_color_management_enabled());
+
+        std::env::remove_var("FOCALDESK_WP_COLOR");
     }
 }

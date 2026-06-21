@@ -1,5 +1,5 @@
 use adw::prelude::*;
-use focaldesk_logging::flog_info;
+use focaldesk_logging::{init_default_logging, session_id};
 use gtk::gio;
 use gtk::glib;
 use std::cell::RefCell;
@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use tracing::info;
 
 #[derive(Debug, Clone)]
 struct FileItem {
@@ -83,6 +84,7 @@ struct FileManager {
 }
 
 fn main() {
+    init_default_logging();
     let app = adw::Application::new(
         Some("com.focaldesk.Files"),
         gio::ApplicationFlags::HANDLES_OPEN,
@@ -261,7 +263,12 @@ impl FileManager {
         let open_tab =
             gio::SimpleAction::new("sidebar-open-tab", Some(&String::static_variant_type()));
         open_tab.connect_activate(|_, _| {
-            flog_info!("Open in new tab");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "sidebar-open-tab",
+                "open in new tab"
+            );
         });
         self.window.add_action(&open_tab);
 
@@ -282,14 +289,24 @@ impl FileManager {
 
         let empty_trash = gio::SimpleAction::new("empty-trash", None);
         empty_trash.connect_activate(|_, _| {
-            flog_info!("Empty Trash...");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "empty-trash",
+                "empty trash"
+            );
         });
         self.window.add_action(&empty_trash);
 
         let properties =
             gio::SimpleAction::new("sidebar-properties", Some(&String::static_variant_type()));
         properties.connect_activate(|_, _| {
-            flog_info!("Show properties");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "sidebar-properties",
+                "show properties"
+            );
         });
         self.window.add_action(&properties);
     }
@@ -330,19 +347,34 @@ impl FileManager {
 
         let move_to = gio::SimpleAction::new("file-move-to", None);
         move_to.connect_activate(|_, _| {
-            flog_info!("Move file item to...");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-move-to",
+                "move file item to"
+            );
         });
         self.window.add_action(&move_to);
 
         let copy_to = gio::SimpleAction::new("file-copy-to", None);
         copy_to.connect_activate(|_, _| {
-            flog_info!("Copy file item to...");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-copy-to",
+                "copy file item to"
+            );
         });
         self.window.add_action(&copy_to);
 
         let rename = gio::SimpleAction::new("file-rename", None);
         rename.connect_activate(|_, _| {
-            flog_info!("Rename file item");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-rename",
+                "rename file item"
+            );
         });
         self.window.add_action(&rename);
 
@@ -355,7 +387,12 @@ impl FileManager {
 
         let compress = gio::SimpleAction::new("file-compress", None);
         compress.connect_activate(|_, _| {
-            flog_info!("Compress file item");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-compress",
+                "compress file item"
+            );
         });
         self.window.add_action(&compress);
 
@@ -369,7 +406,12 @@ impl FileManager {
 
         let properties = gio::SimpleAction::new("file-properties", None);
         properties.connect_activate(|_, _| {
-            flog_info!("Show file properties");
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-properties",
+                "show file properties"
+            );
         });
         self.window.add_action(&properties);
     }
