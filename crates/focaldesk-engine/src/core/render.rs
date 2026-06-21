@@ -508,6 +508,12 @@ fn icon_tint(state: IconState, alpha: f32) -> [f32; 4] {
     }
 }
 
+impl Default for RenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderState {
     pub fn new() -> Self {
         let zero: Rectangle<i32, Physical> = Rectangle::from_size(Size::from((0, 0)));
@@ -699,7 +705,7 @@ impl RenderState {
                 Rectangle::<i32, Physical>::from_loc_and_size((0, 0), (dst.size.w, dst.size.h));
 
             if let Err(e) = frame.render_texture_from_to(
-                &tex,
+                tex,
                 src,
                 dst,
                 &[damage_local],
@@ -2034,7 +2040,7 @@ impl RenderState {
         let title_baseline = layout.title_rect.loc.y + layout.title_rect.size.h - 8;
         let mut y = layout.message_rect.loc.y + 20;
 
-        flog(&format!("DRAW REAL FONT TITLE: {}", dialog.title));
+        flog(format!("DRAW REAL FONT TITLE: {}", dialog.title));
         self.draw_text_cached(
             frame,
             fonts,
@@ -2727,15 +2733,20 @@ impl RenderState {
             };
 
             for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+                let geo = window.geometry();
+
+                let popup_loc = window_loc - geo.loc + popup_offset - popup.geometry().loc;
+
                 let mut popup_bbox = popup.geometry();
-                popup_bbox.loc += window_loc + popup_offset - popup.geometry().loc;
+                popup_bbox.loc += popup_loc;
+
                 if !region.overlaps(popup_bbox) {
                     continue;
                 }
 
-                let popup_loc = window_loc + popup_offset - popup.geometry().loc;
                 let output_loc = popup_loc - region.loc;
                 let render_pos = output_loc.to_physical_precise_round(scale);
+
                 out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
                     renderer,
                     popup.wl_surface(),
@@ -3310,7 +3321,7 @@ impl RenderState {
                 fonts,
                 layout,
                 "FOCALDESK",
-                &active_theme,
+                active_theme,
                 ctx.output_scale,
             );
 
@@ -3321,7 +3332,7 @@ impl RenderState {
                 "FOCALDESK",
                 output_number,
                 workspace_number,
-                &active_theme,
+                active_theme,
                 ctx.output_scale,
             );
 

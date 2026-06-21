@@ -1,7 +1,7 @@
 use focaldesk_ipc::{IpcRequest, IpcResponse, SOCKET_PATH};
 use focaldesk_settings_core::{
-    DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, Settings,
-    load_settings, save_settings,
+    BrowserLaunchBackend, DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode,
+    PowerButtonAction, Settings, load_settings, save_settings,
 };
 use std::{
     io::{Read, Write},
@@ -142,6 +142,18 @@ fn apply_setting_value(
 
         "apps.browser" => {
             settings.apps.browser = value.as_str().ok_or("browser must be string")?.to_string();
+        }
+
+        "apps.browser_launch_backend" => {
+            settings.apps.browser_launch_backend = match value
+                .as_str()
+                .ok_or("browser_launch_backend must be string")?
+            {
+                "auto" => BrowserLaunchBackend::Auto,
+                "wayland" => BrowserLaunchBackend::Wayland,
+                "xwayland" => BrowserLaunchBackend::Xwayland,
+                other => return Err(format!("unknown browser_launch_backend: {other}")),
+            };
         }
 
         "apps.file_manager" => {

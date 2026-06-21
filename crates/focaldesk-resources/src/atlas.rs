@@ -106,6 +106,7 @@ fn rasterize_svg_bytes(svg_bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(img.into_raw())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn blit_rgba(
     atlas: &mut [u8],
     atlas_w: u32,
@@ -141,6 +142,7 @@ impl IconAtlas {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_atlas_icon(
     frame: &mut impl smithay::backend::renderer::Frame<TextureId = GlesTexture, Error = GlesError>,
     atlas: &GlesTexture,

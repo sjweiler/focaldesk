@@ -57,8 +57,8 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
         let h = (r.size.h as f64 * scale).round() as i32;
         Rectangle::from_loc_and_size((x, y), (w.max(1), h.max(1)))
     };
-    let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(|r| sc(r));
-    let sc_vec = |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(|r| sc(r)).collect();
+    let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(&sc);
+    let sc_vec = |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(&sc).collect();
     ChromeLayout {
         topbar: TopBarLayout {
             outer: sc(layout.topbar.outer),
@@ -164,6 +164,7 @@ fn inset_rect<Kind>(rect: Rectangle<i32, Kind>, inset: i32) -> Rectangle<i32, Ki
     Rectangle::from_loc_and_size((x, y), (w, h))
 }
 
+#[allow(clippy::type_complexity)]
 fn build_status_cluster(
     topbar_inner: Rectangle<i32, Logical>,
     right_pad: i32,

@@ -33,6 +33,12 @@ pub struct SceneState {
     pub mru: Vec<WindowId>,
 }
 
+impl Default for SceneState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SceneState {
     pub fn new() -> Self {
         Self {

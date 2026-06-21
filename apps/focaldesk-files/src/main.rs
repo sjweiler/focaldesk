@@ -416,6 +416,7 @@ impl FileManager {
         self.window.add_action(&properties);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn connect_actions(
         &self,
         back_button: gtk::Button,
@@ -1687,7 +1688,7 @@ fn copy_dropped_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
             gio::Cancellable::NONE,
             None,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+        .map_err(|err| io::Error::other(err.to_string()))
     }
 }
 
@@ -1722,7 +1723,7 @@ fn move_clipboard_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
             gio::Cancellable::NONE,
             None,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+        .map_err(|err| io::Error::other(err.to_string()))
     }
 }
 
@@ -1815,12 +1816,9 @@ fn launch_desktop_entry(path: &Path) -> io::Result<()> {
         log_launch("unset WAYLAND_DISPLAY for .exe desktop entry (XWayland-only launch)");
     }
 
-    app_info.launch(&[], Some(&context)).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("desktop entry launch failed: {err}"),
-        )
-    })?;
+    app_info
+        .launch(&[], Some(&context))
+        .map_err(|err| io::Error::other(format!("desktop entry launch failed: {err}")))?;
 
     log_launch(&format!(
         "desktop entry launched via GIO: {}",

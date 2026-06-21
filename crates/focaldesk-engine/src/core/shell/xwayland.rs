@@ -1,5 +1,6 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum XwaylandSurfaceRole {
+    #[default]
     Toplevel,
     Dialog,
     Transient,
@@ -9,13 +10,6 @@ pub enum XwaylandSurfaceRole {
     Splash,
     Unknown,
 }
-
-impl Default for XwaylandSurfaceRole {
-    fn default() -> Self {
-        Self::Toplevel
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct XwaylandWindowMeta {
     pub title: Option<String>,

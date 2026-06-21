@@ -24,6 +24,12 @@ pub struct ChromeShaders {
     pub accent: Option<GlesPixelProgram>,
 }
 
+impl Default for ChromeShaders {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ChromeShaders {
     pub fn new() -> Self {
         Self {
@@ -67,7 +73,7 @@ impl ChromeShaders {
                     self.beveled_panel = Some(program);
                 }
                 Err(e) => {
-                    flog(&format!("beveled_panel compile failed: {:?}", e));
+                    flog(format!("beveled_panel compile failed: {:?}", e));
                     flog("==== BEVELED_PANEL_FRAG V2 ====");
                     flog(BEVELED_PANEL_FRAG_V2);
                     return Err(e);
@@ -223,7 +229,7 @@ impl ChromeShaders {
                     self.accent = Some(program);
                 }
                 Err(err) => {
-                    flog(&format!(
+                    flog(format!(
                         "accent shader compile failed; disabling active-output glow: {:?}",
                         err
                     ));

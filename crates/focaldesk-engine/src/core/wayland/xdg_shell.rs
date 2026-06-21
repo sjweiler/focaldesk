@@ -25,11 +25,19 @@ impl XdgShellHandler for DesktopState {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         self.add_xdg_toplevel(surface.clone());
+        let output_id = self.focused_output;
+        let size = self
+            .work_recess_for_output(output_id)
+            .map(|work| work.size)
+            .unwrap_or_else(|| (1280, 720).into());
         surface.with_pending_state(|state| {
             state
                 .states
                 .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
-            state.size = Some((1280, 720).into());
+            state
+                .states
+                .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            state.size = Some(size);
         });
         surface.send_configure();
     }

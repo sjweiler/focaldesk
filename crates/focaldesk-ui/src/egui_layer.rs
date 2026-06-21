@@ -412,12 +412,12 @@ impl EguiLayer {
                         modifiers: modifiers.into(),
                     });
                 }
-                if pressed {
-                    if let Some(text) = text {
-                        if !modifiers.ctrl && !modifiers.command {
-                            self.raw_input.events.push(Event::Text(text));
-                        }
-                    }
+                if pressed
+                    && let Some(text) = text
+                    && !modifiers.ctrl
+                    && !modifiers.command
+                {
+                    self.raw_input.events.push(Event::Text(text));
                 }
             }
         }

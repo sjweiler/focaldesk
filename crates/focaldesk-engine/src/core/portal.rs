@@ -172,6 +172,25 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         .push(PendingPortalCapture { output_id, frame });
 }
 
+/// True when every queued portal frame can be satisfied from the latest scanout texture.
+pub fn pending_portal_outputs_have_capture_source(state: &DesktopState) -> bool {
+    state
+        .pending_portal_captures
+        .iter()
+        .all(|cap| state.portal_capture_source.contains_key(&cap.output_id))
+}
+
+/// Portal frames waiting to be completed after `dispatch_clients`.
+pub fn portal_capture_pending(state: &DesktopState) -> bool {
+    !state.pending_portal_captures.is_empty()
+}
+
+/// Whether portal capture requires a fresh compositor draw this frame.
+pub fn portal_needs_composite(state: &DesktopState) -> bool {
+    portal_capture_pending(state)
+        && (!state.compositor_ready || !pending_portal_outputs_have_capture_source(state))
+}
+
 /// Finish portal frames queued during `dispatch_clients` using the latest offscreen texture.
 pub fn complete_pending_portal_captures(
     state: &mut DesktopState,
@@ -246,6 +265,37 @@ fn blit_offscreen_source_to_dmabuf_scaled(
     transform: Transform,
     target_dmabuf: &mut Dmabuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Prefer a GPU blit into the portal dmabuf. The readback path is a fallback for drivers
+    // where `render_texture_from_to` drops chrome when sourcing from an FBO texture handle.
+    if source_size == target_size {
+        match blit_texture_to_dmabuf(
+            renderer,
+            texture.clone(),
+            source_size,
+            transform,
+            target_dmabuf,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => flog(format!(
+                "portal dmabuf GPU blit failed ({err}); falling back to readback"
+            )),
+        }
+    } else {
+        match blit_texture_to_dmabuf_scaled(
+            renderer,
+            texture.clone(),
+            source_size,
+            target_size,
+            transform,
+            target_dmabuf,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => flog(format!(
+                "portal dmabuf GPU scaled blit failed ({err}); falling back to readback"
+            )),
+        }
+    }
+
     let mut bound = texture;
     let rgba = read_bound_offscreen_rgba(renderer, &mut bound, source_size)?;
     let imported = renderer.import_memory(
@@ -254,7 +304,6 @@ fn blit_offscreen_source_to_dmabuf_scaled(
         Size::from((source_size.w, source_size.h)),
         false,
     )?;
-
     blit_texture_to_dmabuf_scaled(
         renderer,
         imported,
@@ -335,39 +384,22 @@ fn complete_portal_frame(
         if let Some(node) = state.dmabuf_node {
             dmabuf.set_node(node);
         }
-        let render_size = output_size;
         let target_size = stream_size;
         let render_res = if let Some(source) = state.portal_capture_source.get(&output_id) {
-            if source.size == render_size {
-                blit_offscreen_source_to_dmabuf_scaled(
-                    renderer,
-                    source.texture.clone(),
-                    render_size, // 2560x1440 source
-                    target_size, // 2048x1152 OBS buffer
-                    transform,
-                    &mut dmabuf,
-                )
-            } else {
-                render_portal_output_to_dmabuf(
-                    state,
-                    renderer,
-                    output_id,
-                    render_size,
-                    ui_state,
-                    scene,
-                    output_state,
-                    now,
-                    dt,
-                    transform,
-                    &mut dmabuf,
-                )
-            }
+            blit_offscreen_source_to_dmabuf_scaled(
+                renderer,
+                source.texture.clone(),
+                source.size,
+                target_size,
+                transform,
+                &mut dmabuf,
+            )
         } else {
             render_portal_output_to_dmabuf(
                 state,
                 renderer,
                 output_id,
-                render_size,
+                output_size,
                 ui_state,
                 scene,
                 output_state,
@@ -378,7 +410,7 @@ fn complete_portal_frame(
             )
         };
         if let Err(err) = render_res {
-            flog(&format!("portal dmabuf capture render failed: {err:?}"));
+            flog(format!("portal dmabuf capture render failed: {err:?}"));
             frame.fail(CaptureFailureReason::Unknown);
             return;
         }
@@ -401,7 +433,7 @@ fn complete_portal_frame(
         match read_bound_offscreen_rgba(renderer, &mut tex, render_size) {
             Ok(pixels) => pixels,
             Err(err) => {
-                flog(&format!("portal shm readback failed: {err}"));
+                flog(format!("portal shm readback failed: {err}"));
                 frame.fail(CaptureFailureReason::Unknown);
                 return;
             }
@@ -433,7 +465,7 @@ fn complete_portal_frame(
         );
 
         if let Err(err) = render_res {
-            flog(&format!("portal shm capture render failed: {err:?}"));
+            flog(format!("portal shm capture render failed: {err:?}"));
             frame.fail(CaptureFailureReason::Unknown);
             return;
         }

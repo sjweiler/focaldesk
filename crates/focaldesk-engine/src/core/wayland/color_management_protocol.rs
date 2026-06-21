@@ -2,6 +2,7 @@
 
 use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorState, TransferFunction};
 use crate::core::desktop::DesktopState;
+use crate::core::desktop::is_browser_like;
 use crate::core::wayland::client::ClientState;
 use focaldesk_logging::{flog, flog_critical};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -60,6 +61,26 @@ fn client_is_cursor(client: &Client) -> bool {
     };
 
     is_cursor_executable_name(exe_name.as_ref())
+}
+
+fn client_is_browser_like(client: &Client) -> bool {
+    let Some(client_state) = client.get_data::<ClientState>() else {
+        return false;
+    };
+    let Some(credentials) = client_state.credentials else {
+        return false;
+    };
+
+    let exe_path = std::fs::read_link(format!("/proc/{}/exe", credentials.pid)).ok();
+    let Some(exe_name) = exe_path
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy())
+    else {
+        return false;
+    };
+
+    is_browser_like(exe_name.as_ref())
 }
 
 fn send_image_description_ready(
@@ -401,7 +422,7 @@ fn post_creator_error(
 
 impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
     fn can_view(client: Client, _global_data: &()) -> bool {
-        !client_is_cursor(&client)
+        !client_is_cursor(&client) && !client_is_browser_like(&client)
     }
 
     fn bind(
@@ -744,33 +765,17 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_cursor_executable_name;
-
-    #[test]
-    fn cursor_executable_name_filter_is_strict() {
-        assert!(is_cursor_executable_name("cursor"));
-        assert!(is_cursor_executable_name("cursor-bin"));
-        assert!(!is_cursor_executable_name("Cursor"));
-        assert!(!is_cursor_executable_name("cursor.exe"));
-        assert!(!is_cursor_executable_name("code"));
-    }
-}
-
 impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, ()> for DesktopState {
     fn request(
         _state: &mut Self,
         _client: &Client,
         _resource: &wp_image_description_info_v1::WpImageDescriptionInfoV1,
-        request: wp_image_description_info_v1::Request,
+        _request: wp_image_description_info_v1::Request,
         _data: &(),
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            _ => {}
-        }
+        {}
     }
 }
 
@@ -941,7 +946,7 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
                     );
                     return;
                 }
-                flog(&format!(
+                flog(format!(
                     "wp color pending: surface={:?} transfer={:?}",
                     surface_mgmt.surface.id(),
                     data.description.transfer
@@ -1004,9 +1009,20 @@ impl
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wp_color_management_surface_v1::Request::Destroy => {}
-            _ => {}
-        }
+        if let wp_color_management_surface_v1::Request::Destroy = request {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cursor_executable_name;
+
+    #[test]
+    fn cursor_executable_name_filter_is_strict() {
+        assert!(is_cursor_executable_name("cursor"));
+        assert!(is_cursor_executable_name("cursor-bin"));
+        assert!(!is_cursor_executable_name("Cursor"));
+        assert!(!is_cursor_executable_name("cursor.exe"));
+        assert!(!is_cursor_executable_name("code"));
     }
 }

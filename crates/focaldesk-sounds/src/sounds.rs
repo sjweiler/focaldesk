@@ -111,7 +111,7 @@ fn double_buzz(freq: f32, buzz_duration: f32, volume: f32) -> Vec<f32> {
 
         if buzz == 0 {
             let gap = (0.045 * SAMPLE_RATE as f32) as usize;
-            out.extend(std::iter::repeat(0.0).take(gap));
+            out.extend(std::iter::repeat_n(0.0, gap));
         }
     }
 

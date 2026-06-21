@@ -8,6 +8,7 @@ pub mod svg;
 pub mod text;
 pub mod types;
 pub mod widgets;
+#[derive(Default)]
 pub struct UiState;
 pub mod chrome_draw;
 pub mod chrome_layout;

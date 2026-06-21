@@ -220,12 +220,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .state
             .image_copy_capture_sessions
             .retain(|session| session.alive());
-        let portal_active = !nested.state.image_copy_capture_sessions.is_empty()
-            && !nested.state.pending_portal_captures.is_empty();
-        let should_render = nested.state.needs_redraw() || portal_active;
+        let portal_pending = crate::core::portal::portal_capture_pending(&nested.state);
+        let portal_needs_composite = crate::core::portal::portal_needs_composite(&nested.state);
+        let should_render = nested.state.needs_redraw() || portal_needs_composite;
 
         if !should_render {
-            if portal_active {
+            if portal_pending {
                 let (renderer, _framebuffer) = backend.bind()?;
                 complete_pending_portal_captures(
                     &mut nested.state,
@@ -276,7 +276,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     now,
                 );
 
-                if portal_active {
+                if portal_pending {
                     complete_pending_portal_captures_for_output(
                         &mut nested.state,
                         renderer,

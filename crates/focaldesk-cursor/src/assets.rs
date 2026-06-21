@@ -1,7 +1,7 @@
 // assets.rs
 use crate::cursor::CursorIcon;
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 
 #[derive(Clone, Debug)]
 pub struct CursorImage {
@@ -35,6 +35,12 @@ pub struct CursorAssets {
     cache: HashMap<CacheKey, CursorImage>,
 }
 
+impl Default for CursorAssets {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CursorAssets {
     pub fn new() -> Self {
         Self {
@@ -49,12 +55,12 @@ impl CursorAssets {
             scale_milli: (scale * 1000.0) as u32,
         };
 
-        if !self.cache.contains_key(&key) {
+        if let Entry::Vacant(entry) = self.cache.entry(key) {
             let px = ((size as f32) * scale).round().max(1.0) as u32;
             let svg = svg_bytes_for(icon);
             let hotspot = hotspot_for(icon, px);
             let image = rasterize_svg(svg, px, px, hotspot, size, scale)?;
-            self.cache.insert(key, image);
+            entry.insert(image);
         }
 
         self.cache

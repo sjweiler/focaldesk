@@ -25,7 +25,7 @@ where
     let size = Size::from((rgba.width() as i32, rgba.height() as i32));
 
     let tex = renderer
-        .import_memory(&rgba.as_raw(), Fourcc::Abgr8888, size, false)
+        .import_memory(rgba.as_raw(), Fourcc::Abgr8888, size, false)
         .map_err(|e| anyhow!("import_memory failed for SVG texture: {:?}", e))?;
 
     Ok(tex)

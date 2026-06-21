@@ -60,7 +60,18 @@ pub struct InputSettings {
 pub struct AppSettings {
     pub terminal: String,
     pub browser: String,
+    #[serde(default)]
+    pub browser_launch_backend: BrowserLaunchBackend,
     pub file_manager: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserLaunchBackend {
+    #[default]
+    Auto,
+    Wayland,
+    Xwayland,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,23 +88,18 @@ impl Default for WorkspaceSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DebugLogLevel {
     Error,
     Warn,
+    #[default]
     Info,
     Debug,
     Trace,
 }
 
-impl Default for DebugLogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DebugSettings {
     #[serde(default)]
     pub log_level: DebugLogLevel,
@@ -105,18 +111,6 @@ pub struct DebugSettings {
     pub show_input_events: bool,
     #[serde(default)]
     pub verbose_protocol_logs: bool,
-}
-
-impl Default for DebugSettings {
-    fn default() -> Self {
-        Self {
-            log_level: DebugLogLevel::default(),
-            show_fps: false,
-            show_damage_regions: false,
-            show_input_events: false,
-            verbose_protocol_logs: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,63 +162,43 @@ impl Default for PowerSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerButtonAction {
+    #[default]
     ShowPowerMenu,
     Suspend,
     PowerOff,
     DoNothing,
 }
 
-impl Default for PowerButtonAction {
-    fn default() -> Self {
-        Self::ShowPowerMenu
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LidCloseAction {
+    #[default]
     Suspend,
     BlankScreen,
     LockScreen,
     DoNothing,
 }
 
-impl Default for LidCloseAction {
-    fn default() -> Self {
-        Self::Suspend
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LowBatteryAction {
+    #[default]
     NotifyOnly,
     Suspend,
     Hibernate,
     PowerOff,
 }
 
-impl Default for LowBatteryAction {
-    fn default() -> Self {
-        Self::NotifyOnly
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PerformanceMode {
+    #[default]
     Balanced,
     Performance,
     PowerSaver,
-}
-
-impl Default for PerformanceMode {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 pub fn default_settings() -> Settings {
@@ -245,6 +219,7 @@ pub fn default_settings() -> Settings {
         apps: AppSettings {
             terminal: "alacritty".into(),
             browser: "google-chrome".into(),
+            browser_launch_backend: BrowserLaunchBackend::Auto,
             file_manager: "focaldesk-files".into(),
         },
         workspaces: WorkspaceSettings::default(),

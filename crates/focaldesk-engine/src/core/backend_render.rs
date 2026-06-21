@@ -129,43 +129,6 @@ fn compact_damage(
     rects
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compact_damage_merges_nearby_rects() {
-        let output_size = Size::<i32, Physical>::from((100, 100));
-        let damage = [
-            Rectangle::from_loc_and_size((10, 10), (10, 10)),
-            Rectangle::from_loc_and_size((23, 10), (10, 10)),
-        ];
-
-        let compacted = compact_damage(&damage, output_size);
-
-        assert_eq!(
-            compacted,
-            vec![Rectangle::from_loc_and_size((10, 10), (23, 10))]
-        );
-    }
-
-    #[test]
-    fn compact_damage_uses_full_output_for_large_area() {
-        let output_size = Size::<i32, Physical>::from((100, 100));
-        let damage = [Rectangle::from_loc_and_size((0, 0), (80, 60))];
-
-        let compacted = compact_damage(&damage, output_size);
-
-        assert_eq!(
-            compacted,
-            vec![Rectangle::<i32, Physical>::from_loc_and_size(
-                (0, 0),
-                output_size
-            )]
-        );
-    }
-}
-
 pub fn prepare_output(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -331,7 +294,7 @@ pub fn prepare_output(
         portal_capture: force_full_damage,
     };
 
-    if state.debug.show_fps && state.render.frame_no % 120 == 0 {
+    if state.debug.show_fps && state.render.frame_no.is_multiple_of(120) {
         let frame_ms = dt.as_secs_f64() * 1000.0;
         let fps = if dt.is_zero() {
             0.0
@@ -621,7 +584,7 @@ pub fn draw_output_stage(
         scene,
         output: output_state,
         metrics: &state.chrome.metrics,
-        elements: &elements,
+        elements,
         popup_elements,
         sidebar_hover_slot: state.sidebar_hover_for_output(prepared.frame_ctx.active_output),
         sidebar_pulse: state
@@ -637,7 +600,7 @@ pub fn draw_output_stage(
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,
         fonts: &state.fonts,
-        theme: &state.theme.active_theme(),
+        theme: state.theme.active_theme(),
         notifications: &notifications,
         lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
@@ -650,4 +613,41 @@ pub fn draw_output_stage(
 
     state.render.render_stage(frame, inputs, muts, stage)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_damage_merges_nearby_rects() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let damage = [
+            Rectangle::from_loc_and_size((10, 10), (10, 10)),
+            Rectangle::from_loc_and_size((23, 10), (10, 10)),
+        ];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::from_loc_and_size((10, 10), (23, 10))]
+        );
+    }
+
+    #[test]
+    fn compact_damage_uses_full_output_for_large_area() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let damage = [Rectangle::from_loc_and_size((0, 0), (80, 60))];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::<i32, Physical>::from_loc_and_size(
+                (0, 0),
+                output_size
+            )]
+        );
+    }
 }

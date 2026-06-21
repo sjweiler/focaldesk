@@ -14,6 +14,12 @@ pub struct WorkArea {
     pub elements: Vec<UiElement>,
 }
 
+impl Default for WorkArea {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkArea {
     pub fn new() -> Self {
         Self {

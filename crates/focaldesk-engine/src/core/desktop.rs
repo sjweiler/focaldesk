@@ -71,7 +71,8 @@ use focaldesk_logging::{
 };
 use focaldesk_notifications::NotificationManager;
 use focaldesk_settings_core::{
-    load_settings, AppSettings, DebugLogLevel, DebugSettings, OutputConfig, PrivacySettings,
+    load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings, OutputConfig,
+    PrivacySettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
@@ -1135,7 +1136,7 @@ impl DesktopState {
         let Some(action) = self.peek_ui_action_at_pointer() else {
             return false;
         };
-        flog(&format!("ACTION={:?}", action));
+        flog(format!("ACTION={:?}", action));
         self.dispatch_ui_action(action);
         true
     }
@@ -2052,11 +2053,11 @@ impl DesktopState {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        let under = self.pointer_surface_under(pos).map(|(s, p)| (s, p));
+        let under = self.pointer_surface_under(pos);
         static POINTER_FORWARD_LOGS: AtomicUsize = AtomicUsize::new(0);
         let seq = POINTER_FORWARD_LOGS.fetch_add(1, Ordering::Relaxed);
         if seq < 120 {
-            flog(&format!(
+            flog(format!(
                 "Pointer forward pos={:?} target={:?}",
                 pos,
                 under
@@ -2693,7 +2694,10 @@ impl DesktopState {
         layout.work_area.recess.contains((px, py))
     }
 
-    fn work_recess_for_output(&self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+    pub(crate) fn work_recess_for_output(
+        &self,
+        output_id: OutputId,
+    ) -> Option<Rectangle<i32, Logical>> {
         let output = self.outputs.get(&output_id)?;
         let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
         let layout = build_chrome_layout(
@@ -2704,6 +2708,114 @@ impl DesktopState {
         let mut recess = layout.work_area.recess;
         recess.loc += output.logical_origin;
         Some(recess)
+    }
+
+    #[cfg(feature = "xwayland")]
+    fn output_logical_rect(&self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+        let output = self.outputs.get(&output_id)?;
+        Some(Rectangle::from_loc_and_size(
+            output.logical_origin,
+            Size::from((output.logical_size.w, output.logical_size.h)),
+        ))
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_output_id_for_window(&self, id: WindowId) -> OutputId {
+        self.window(id)
+            .and_then(|window| window.output)
+            .or_else(|| self.output_under_pointer(self.input.pointer_pos))
+            .unwrap_or(self.focused_output)
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_request_fills_output(
+        &self,
+        output_id: OutputId,
+        size: Size<i32, Logical>,
+    ) -> bool {
+        let Some(output_rect) = self.output_logical_rect(output_id) else {
+            return false;
+        };
+        const SLACK: i32 = 16;
+        size.w >= output_rect.size.w.saturating_sub(SLACK)
+            && size.h >= output_rect.size.h.saturating_sub(SLACK)
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_compositor_loc_for_window(&self, id: WindowId) -> Point<i32, Logical> {
+        let output_id = self.xwayland_output_id_for_window(id);
+        let Some(window) = self.window(id) else {
+            return self.default_toplevel_map_location(output_id);
+        };
+        self.space
+            .element_bbox(&window.window)
+            .map(|bbox| bbox.loc)
+            .or(window.float_rect.map(|rect| rect.loc))
+            .unwrap_or_else(|| self.default_toplevel_map_location(output_id))
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_clamp_toplevel_geometry(
+        &self,
+        output_id: OutputId,
+        mut geometry: Rectangle<i32, Logical>,
+        window_id: Option<WindowId>,
+    ) -> Rectangle<i32, Logical> {
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return geometry;
+        };
+        if self.xwayland_request_fills_output(output_id, geometry.size) {
+            return work;
+        }
+        geometry.loc = window_id
+            .map(|id| self.xwayland_compositor_loc_for_window(id))
+            .unwrap_or_else(|| self.default_toplevel_map_location(output_id));
+        geometry.size.w = geometry.size.w.clamp(1, work.size.w);
+        geometry.size.h = geometry.size.h.clamp(1, work.size.h);
+        geometry
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_or_compositor_loc(
+        &self,
+        surface: &smithay::xwayland::X11Surface,
+        x11_loc: Point<i32, Logical>,
+    ) -> Point<i32, Logical> {
+        let Some(parent_xid) = surface.is_transient_for() else {
+            return x11_loc;
+        };
+        let Some(parent) = self.windows.iter().find(|managed| {
+            managed
+                .window
+                .x11_surface()
+                .is_some_and(|x11| x11.window_id() == parent_xid)
+        }) else {
+            return x11_loc;
+        };
+        // Use the parent's geometry origin, not its bbox origin.
+        // `element_bbox()` includes any already-mapped popups, which can shift
+        // the anchor for new override-redirect children as menus open and close.
+        let Some(compositor_parent_loc) =
+            self.space.element_location(&parent.window).or_else(|| {
+                parent
+                    .float_rect
+                    .map(|rect| rect.loc + parent.window.geometry().loc)
+            })
+        else {
+            return x11_loc;
+        };
+        let x11_parent_loc = parent
+            .window
+            .x11_surface()
+            .map(|x11| x11.geometry().loc)
+            .unwrap_or(Point::from((0, 0)));
+        x11_loc + (compositor_parent_loc - x11_parent_loc)
+    }
+
+    fn output_id_for_space_output(&self, output: &Output) -> Option<OutputId> {
+        self.outputs
+            .iter()
+            .find_map(|(id, state)| (&state.handle == output).then_some(*id))
     }
 
     /// Default map location for a new toplevel: top-left of the work recess (global logical).
@@ -3126,9 +3238,7 @@ impl DesktopState {
             if !w.mapped || w.maximized || w.fullscreen || w.minimized {
                 return None;
             }
-            if window.x11_surface().is_none() {
-                return None;
-            }
+            window.x11_surface()?;
             let bbox = self.global_window_bbox(window)?;
             let edges = resize_edges_at(bbox, px, py, RESIZE_BORDER_PX)?;
             Some((w.id, edges))
@@ -3548,16 +3658,32 @@ impl DesktopState {
             .output_under_pointer(self.input.pointer_pos)
             .unwrap_or(self.primary_output);
 
-        let bbox_location = if surface.is_override_redirect() {
-            requested_geometry.loc
+        let should_float = self.windows[idx].floating;
+        let (bbox_location, configure_size, maximize_on_map) = if surface.is_override_redirect() {
+            (
+                self.xwayland_or_compositor_loc(&surface, requested_geometry.loc),
+                requested_geometry.size,
+                false,
+            )
+        } else if should_float {
+            (
+                self.default_toplevel_map_location(output_id),
+                requested_geometry.size,
+                false,
+            )
         } else {
-            self.default_toplevel_map_location(output_id)
+            let work = self
+                .work_recess_for_output(output_id)
+                .unwrap_or(requested_geometry);
+            (work.loc, work.size, true)
         };
 
-        self.windows[idx].float_rect = Some(Rectangle::from_loc_and_size(
-            bbox_location,
-            requested_geometry.size,
-        ));
+        if maximize_on_map {
+            self.windows[idx].set_maximized(true);
+        }
+
+        self.windows[idx].float_rect =
+            Some(Rectangle::from_loc_and_size(bbox_location, configure_size));
 
         window.on_commit();
         self.map_window_bbox_location(window.clone(), bbox_location, true);
@@ -3570,13 +3696,7 @@ impl DesktopState {
         );
 
         if !surface.is_override_redirect() {
-            let configure_rect = self
-                .space
-                .element_bbox(&window)
-                .filter(|bbox| bbox.size.w > 0 && bbox.size.h > 0)
-                .unwrap_or_else(|| {
-                    Rectangle::from_loc_and_size(bbox_location, requested_geometry.size)
-                });
+            let configure_rect = Rectangle::from_loc_and_size(bbox_location, configure_size);
             debug!(
                 target: "focaldesk",
                 window_id = ?id,
@@ -3585,6 +3705,9 @@ impl DesktopState {
                 "xwayland configure"
             );
             let _ = surface.configure(Some(configure_rect));
+            if maximize_on_map {
+                let _ = surface.set_maximized(true);
+            }
             self.focus_window_id(id);
         }
 
@@ -3709,27 +3832,40 @@ impl DesktopState {
                         .take()
                 });
                 if let Some(buffer_offset) = buffer_offset {
-                    if let Some(current_loc) = self.space.element_location(&window) {
-                        tracing::info!(
-                            target: "focaldesk",
-                            session_id = session_id(),
-                            window_id = ?self.window_id_for_wl_surface(&root),
-                            buffer_offset = ?buffer_offset,
-                            current_loc = ?current_loc,
-                            "xwayland buffer delta"
-                        );
-                        self.map_window_bbox_location(
-                            window.clone(),
-                            current_loc - window.geometry().loc + buffer_offset,
-                            false,
-                        );
-                        if let Some(old_bbox) = old_bbox {
-                            self.mark_window_bbox_damage_source(old_bbox, DamageSource::CommitBbox);
+                    let maximized = self
+                        .windows
+                        .iter()
+                        .find(|managed| managed.window == window)
+                        .is_some_and(|managed| managed.maximized);
+                    if !maximized {
+                        if let Some(current_loc) = self.space.element_location(&window) {
+                            tracing::info!(
+                                target: "focaldesk",
+                                session_id = session_id(),
+                                window_id = ?self.window_id_for_wl_surface(&root),
+                                buffer_offset = ?buffer_offset,
+                                current_loc = ?current_loc,
+                                "xwayland buffer delta"
+                            );
+                            self.map_window_bbox_location(
+                                window.clone(),
+                                current_loc - window.geometry().loc + buffer_offset,
+                                false,
+                            );
+                            if let Some(old_bbox) = old_bbox {
+                                self.mark_window_bbox_damage_source(
+                                    old_bbox,
+                                    DamageSource::CommitBbox,
+                                );
+                            }
+                            if let Some(new_bbox) = self.global_window_bbox(&window) {
+                                self.mark_window_bbox_damage_source(
+                                    new_bbox,
+                                    DamageSource::CommitBbox,
+                                );
+                            }
+                            commit_damage_queued = true;
                         }
-                        if let Some(new_bbox) = self.global_window_bbox(&window) {
-                            self.mark_window_bbox_damage_source(new_bbox, DamageSource::CommitBbox);
-                        }
-                        commit_damage_queued = true;
                     }
                 }
             }
@@ -3864,31 +4000,58 @@ impl DesktopState {
 
     /// Clamp pending popup geometry to the union of outputs that contain the parent window.
     pub(crate) fn unconstrain_popup(&self, popup: &PopupSurface) {
-        let Ok(root) = find_popup_root_surface(&PopupKind::from(popup.clone())) else {
+        let popup_kind = PopupKind::from(popup.clone());
+        let popup_toplevel_coords = get_popup_toplevel_coords(&popup_kind);
+
+        // Nested popups already have a client-chosen direction relative to their parent popup.
+        // Let the client keep that placement unless it explicitly repositions again.
+        if popup_toplevel_coords != (0, 0).into() {
+            return;
+        }
+
+        let Ok(root) = find_popup_root_surface(&popup_kind) else {
             return;
         };
         let Some(window) = self.window_for_wl_surface(&root) else {
             return;
         };
 
-        let mut outputs_for_window = self.space.outputs_for_element(&window);
+        let outputs_for_window = self.space.outputs_for_element(&window);
         if outputs_for_window.is_empty() {
             return;
         }
 
-        let mut outputs_geo = self
-            .space
-            .output_geometry(&outputs_for_window.pop().unwrap())
-            .unwrap();
-        for output in outputs_for_window {
-            outputs_geo = outputs_geo.merge(self.space.output_geometry(&output).unwrap());
-        }
-
         let window_geo = self.space.element_geometry(&window).unwrap();
 
-        let mut target = outputs_geo;
-        target.loc -= get_popup_toplevel_coords(&PopupKind::from(popup.clone()));
-        target.loc -= window_geo.loc;
+        let mut target: Option<Rectangle<i32, Logical>> = None;
+        for output in &outputs_for_window {
+            let Some(output_id) = self.output_id_for_space_output(output) else {
+                continue;
+            };
+            let Some(work) = self.work_recess_for_output(output_id) else {
+                continue;
+            };
+            let parent_relative =
+                Rectangle::from_loc_and_size(work.loc - window_geo.loc, work.size);
+            target = Some(match target {
+                None => parent_relative,
+                Some(existing) => existing.merge(parent_relative),
+            });
+        }
+
+        let target = target.unwrap_or_else(|| {
+            let mut outputs_geo = self.space.output_geometry(&outputs_for_window[0]).unwrap();
+            for output in outputs_for_window.iter().skip(1) {
+                outputs_geo = outputs_geo.merge(self.space.output_geometry(output).unwrap());
+            }
+            let mut fallback = outputs_geo;
+            fallback.loc -= popup_toplevel_coords;
+            fallback.loc -= window_geo.loc;
+            fallback
+        });
+        if target.size.w <= 0 || target.size.h <= 0 {
+            return;
+        }
 
         popup.with_pending_state(|state| {
             state.geometry = state.positioner.get_unconstrained_geometry(target);
@@ -4059,6 +4222,7 @@ impl DesktopState {
     pub fn launch_app(&self, app: String) {
         let app_name = app.clone();
         let chrome_like = is_chrome_like(&app_name);
+        let browser_like = is_browser_like(&app_name);
         let cursor_like = is_cursor_like(&app_name);
         #[cfg(feature = "xwayland")]
         let xwayland_display = self.xwayland_display.as_deref();
@@ -4071,6 +4235,7 @@ impl DesktopState {
             session_id = session_id(),
             app = %app_name,
             chrome_like,
+            browser_like,
             cursor_like,
             backend = ?self.backend_kind,
             wayland_display = %self.client_wayland_display,
@@ -4078,13 +4243,12 @@ impl DesktopState {
         );
         let _enter = launch_span.enter();
         chrome_launch_note(format!(
-            "launch_app app={app_name} chrome_like={chrome_like} pid={} client_wayland_display={} xwayland_display={:?}",
+            "launch_app app={app_name} chrome_like={chrome_like} browser_like={browser_like} pid={} client_wayland_display={} xwayland_display={:?}",
             id(),
             self.client_wayland_display,
             xwayland_display
         ));
 
-        let use_x11_for_chrome = chrome_like && xwayland_display.is_some();
         let display_env = xwayland_display.map(str::to_string);
         let launch_candidates = if chrome_like {
             chrome_exec_fallbacks(&app_name)
@@ -4100,11 +4264,27 @@ impl DesktopState {
         for candidate in launch_candidates {
             chrome_launch_note(format!("trying candidate={candidate}"));
             let mut command = Command::new(&candidate);
-            if use_x11_for_chrome {
-                command.env_remove("WAYLAND_DISPLAY");
-                if let Some(display) = xwayland_display {
-                    command.env("DISPLAY", display);
+
+            let browser_backend = self.apps.browser_launch_backend;
+            let prefer_x11 = match browser_backend {
+                BrowserLaunchBackend::Auto => false,
+                BrowserLaunchBackend::Wayland => false,
+                BrowserLaunchBackend::Xwayland => true,
+            };
+            if chrome_like || browser_like {
+                if prefer_x11 && xwayland_display.is_some() {
+                    command.env_remove("WAYLAND_DISPLAY");
+                    if let Some(display) = xwayland_display {
+                        command.env("DISPLAY", display);
+                    }
+                } else {
+                    command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
+                    command.env_remove("DISPLAY");
                 }
+                chrome_launch_note(format!(
+                    "browser backend policy for {app_name}: {:?} prefer_x11={prefer_x11}",
+                    browser_backend
+                ));
             } else {
                 command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
                 command.env_remove("DISPLAY");
@@ -4113,7 +4293,7 @@ impl DesktopState {
                 }
             }
             if chrome_like || cursor_like {
-                configure_chrome_command(&mut command, use_x11_for_chrome);
+                configure_chrome_command(&mut command, prefer_x11);
                 if let Some(file) = open_session_log_file() {
                     if let Ok(stderr_file) = file.try_clone() {
                         command.stdout(Stdio::from(file));
@@ -4210,7 +4390,7 @@ impl DesktopState {
                     mask |= ModMask::SUPER;
                 }
 
-                flog(&format!(
+                flog(format!(
                     "KEY DEBUG: keycode={} sym={} state={:?} mods={:?}",
                     keycode, sym, state, mods
                 ));
@@ -4267,7 +4447,7 @@ impl DesktopState {
         );
 
         if let Some(action) = resolved_action {
-            flog(&format!("ACTION={:?}", action,));
+            flog(format!("ACTION={:?}", action,));
 
             self.handle_action(action);
         }
@@ -4576,12 +4756,13 @@ impl DesktopState {
 
         match event {
             FlowInputEvent::Key { keycode, state, .. } => {
-                if matches!(state, FlowKeyState::Pressed) && keycode == 1 {
-                    if self.render.egui.has_open_panels() {
-                        self.render.egui.close_all_panels();
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
-                        return;
-                    }
+                if matches!(state, FlowKeyState::Pressed)
+                    && keycode == 1
+                    && self.render.egui.has_open_panels()
+                {
+                    self.render.egui.close_all_panels();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    return;
                 }
                 if self.handle_egui_input(&event) {
                     self.mark_focused_output_full_damage(DamageSource::Unknown);
@@ -5180,12 +5361,12 @@ impl DesktopState {
         full_damage: bool,
         redraw_all: bool,
     ) {
-        if !self.damage_debug_enabled || self.render.frame_no % 120 != 0 {
+        if !self.damage_debug_enabled || !self.render.frame_no.is_multiple_of(120) {
             return;
         }
 
         let c = self.damage_source_counts;
-        flog(&format!(
+        flog(format!(
             "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, hover={}, commit={}, full_fallback={}, unknown={})",
             output_id,
             self.render.frame_no,
@@ -5257,7 +5438,7 @@ impl DesktopState {
         };
         let scale_int = scale.round().max(1.0) as i32;
         handle.change_current_state(
-            Some(mode.clone()),
+            Some(mode),
             Some(Transform::Normal),
             Some(OutputScaleSmithay::Custom {
                 advertised_integer: scale_int,
@@ -5322,7 +5503,7 @@ impl DesktopState {
         let id = Id::from_wayland_resource(surface);
         let previous = self.surface_transfers.get(&id).copied();
         if previous != Some(transfer) {
-            focaldesk_logging::flog(&format!(
+            focaldesk_logging::flog(format!(
                 "surface color applied: surface={id:?} transfer={transfer:?}"
             ));
         }
@@ -5399,7 +5580,7 @@ impl DesktopState {
                         })
                         .unwrap_or_else(|| "unchanged".to_string())
                 });
-                focaldesk_logging::flog(&format!(
+                focaldesk_logging::flog(format!(
                     "frame surface import failed: {err:?}; root_buffer={buffer_info}"
                 ));
             }
@@ -5899,14 +6080,14 @@ fn clear_stale_chrome_singleton(profile: &Path) {
         let path = profile.join(name);
         if let Err(err) = std::fs::remove_file(&path) {
             if err.kind() != std::io::ErrorKind::NotFound {
-                flog(&format!(
+                flog(format!(
                     "failed to remove stale Chrome singleton {}: {err}",
                     path.display()
                 ));
             }
         }
     }
-    flog(&format!(
+    flog(format!(
         "removed stale Chrome profile singleton for pid {pid}"
     ));
 }
@@ -6013,6 +6194,35 @@ fn is_chrome_like(app_name: &str) -> bool {
     )
 }
 
+pub(crate) fn is_browser_like(app_name: &str) -> bool {
+    let executable = app_name.rsplit('/').next().unwrap_or(app_name);
+    matches!(
+        executable,
+        "firefox"
+            | "firefox-esr"
+            | "firefox-beta"
+            | "firefox-developer-edition"
+            | "mozilla-firefox"
+            | "google-chrome"
+            | "google-chrome-stable"
+            | "google-chrome-beta"
+            | "google-chrome-unstable"
+            | "chromium"
+            | "chromium-browser"
+            | "microsoft-edge"
+            | "microsoft-edge-stable"
+            | "microsoft-edge-beta"
+            | "microsoft-edge-dev"
+            | "edge"
+            | "edge-beta"
+            | "edge-dev"
+            | "brave"
+            | "brave-browser"
+            | "librewolf"
+            | "waterfox"
+    )
+}
+
 fn is_cursor_like(app_name: &str) -> bool {
     let executable = app_name.rsplit('/').next().unwrap_or(app_name);
     matches!(executable, "cursor" | "cursor-bin")
@@ -6021,6 +6231,21 @@ fn is_cursor_like(app_name: &str) -> bool {
 fn is_obs_like(app_name: &str) -> bool {
     let executable = app_name.rsplit('/').next().unwrap_or(app_name);
     matches!(executable, "obs" | "obs-studio" | "com.obsproject.Studio")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_browser_like;
+
+    #[test]
+    fn browser_like_matches_common_browser_executables() {
+        assert!(is_browser_like("google-chrome"));
+        assert!(is_browser_like("firefox"));
+        assert!(is_browser_like("microsoft-edge"));
+        assert!(is_browser_like("brave-browser"));
+        assert!(!is_browser_like("alacritty"));
+        assert!(!is_browser_like("cursor"));
+    }
 }
 
 fn home_videos_dir() -> Option<PathBuf> {
@@ -6046,7 +6271,7 @@ fn configure_obs_recording_dir() {
         return;
     };
     if let Err(err) = std::fs::create_dir_all(&videos_dir) {
-        flog(&format!(
+        flog(format!(
             "failed to create OBS recording directory {}: {err}",
             videos_dir.display()
         ));
@@ -6115,7 +6340,7 @@ fn configure_obs_profile_recording_dir(path: &Path, videos_dir: &Path) {
     let mut output = lines.join("\n");
     output.push('\n');
     if let Err(err) = std::fs::write(path, output) {
-        flog(&format!(
+        flog(format!(
             "failed to update OBS recording directory in {}: {err}",
             path.display()
         ));

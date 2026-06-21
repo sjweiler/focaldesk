@@ -7,6 +7,12 @@ pub struct RenderResources {
     pub ui_sounds: UiSoundBuffers,
 }
 
+impl Default for RenderResources {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderResources {
     pub fn new() -> Self {
         Self {

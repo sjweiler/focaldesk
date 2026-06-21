@@ -41,7 +41,7 @@ impl DmabufHandler for DesktopState {
         let seq = DMABUF_IMPORT_LOGS.fetch_add(1, Ordering::Relaxed);
         if renderer.has_dmabuf_format(format) {
             if seq < 200 {
-                flog(&format!(
+                flog(format!(
                     "linux-dmabuf accepted format={:?} planes={} y_inverted={}",
                     format,
                     dmabuf.num_planes(),
@@ -50,7 +50,7 @@ impl DmabufHandler for DesktopState {
             }
             let _ = notifier.successful::<DesktopState>();
         } else {
-            flog(&format!(
+            flog(format!(
                 "linux-dmabuf rejected unsupported format={:?} planes={} y_inverted={}",
                 format,
                 dmabuf.num_planes(),

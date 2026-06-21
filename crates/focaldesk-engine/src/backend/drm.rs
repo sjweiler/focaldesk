@@ -2205,14 +2205,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .state
             .image_copy_capture_sessions
             .retain(|session| session.alive());
-        let portal_active = !data.core.state.image_copy_capture_sessions.is_empty()
-            && !data.core.state.pending_portal_captures.is_empty();
+        let portal_pending = crate::core::portal::portal_capture_pending(&data.core.state);
+        let portal_needs_composite = crate::core::portal::portal_needs_composite(&data.core.state);
         let should_render = data.core.state.needs_redraw()
             || screenshot_output.is_some()
             || data.core.state.screenshot_all_requested
-            || portal_active;
+            || portal_needs_composite;
         if !should_render {
-            if portal_active {
+            if portal_pending {
                 if let Some(device) = data.backend.devices.values_mut().next() {
                     crate::core::portal::complete_pending_portal_captures(
                         &mut data.core.state,
@@ -2225,320 +2225,334 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     );
                 }
             }
-            continue;
-        }
-        data.core.last_now = now;
+        } else {
+            data.core.last_now = now;
 
-        for (_node, device) in data.backend.devices.iter_mut() {
-            for (_crtc, surface) in device.surfaces.iter_mut() {
-                if surface.frame_queued_at.is_some() {
-                    // Wait for the matching vblank before preparing another buffer for this
-                    // CRTC. Other outputs remain independent and continue rendering.
-                    continue;
-                }
+            for (_node, device) in data.backend.devices.iter_mut() {
+                for (_crtc, surface) in device.surfaces.iter_mut() {
+                    if surface.frame_queued_at.is_some() {
+                        // Wait for the matching vblank before preparing another buffer for this
+                        // CRTC. Other outputs remain independent and continue rendering.
+                        continue;
+                    }
 
-                let owns_cursor = data.core.state.output_owns_cursor(surface.output_id);
-                let pending_damage = data.core.state.output_has_pending_damage(surface.output_id);
-                let wants_screenshot = screenshot_output == Some(surface.output_id);
-                let should_skip = !data.core.state.render.redraw_all
-                    && !data.core.state.screenshot_all_requested
-                    && !portal_active
-                    && !pending_damage
-                    && !wants_screenshot
-                    && !owns_cursor;
+                    let owns_cursor = data.core.state.output_owns_cursor(surface.output_id);
+                    let pending_damage =
+                        data.core.state.output_has_pending_damage(surface.output_id);
+                    let wants_screenshot = screenshot_output == Some(surface.output_id);
+                    let portal_output_pending = data
+                        .core
+                        .state
+                        .pending_portal_captures
+                        .iter()
+                        .any(|cap| cap.output_id == surface.output_id);
+                    let should_skip = !data.core.state.render.redraw_all
+                        && !data.core.state.screenshot_all_requested
+                        && !portal_needs_composite
+                        && !portal_output_pending
+                        && !pending_damage
+                        && !wants_screenshot
+                        && !owns_cursor;
 
-                if should_skip {
-                    continue;
-                }
+                    if should_skip {
+                        continue;
+                    }
 
-                data.core.state.drm_try_pass_cursor_this_frame = owns_cursor
-                    && data.core.state.drm_submit_hw_cursor
-                    && data.core.state.cursor_manager.visible();
+                    data.core.state.drm_try_pass_cursor_this_frame = owns_cursor
+                        && data.core.state.drm_submit_hw_cursor
+                        && data.core.state.cursor_manager.visible();
 
-                let buffer_size = Size::from((surface.size.w, surface.size.h));
+                    let buffer_size = Size::from((surface.size.w, surface.size.h));
 
-                if portal_active {
-                    data.core.state.render.redraw_all = true;
-                }
-                if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
-                    out.hdr_supported = false;
-                    out.hdr_enabled = false;
-                }
+                    if portal_needs_composite {
+                        data.core.state.render.redraw_all = true;
+                    }
+                    if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
+                        out.hdr_supported = false;
+                        out.hdr_enabled = false;
+                    }
 
-                let mut prepared = prepare_output(
-                    &mut data.core.state,
-                    &mut device.renderer,
-                    surface.output_id,
-                    buffer_size,
-                    &mut data.core.ui_state,
-                    now,
-                    dt,
-                    portal_active,
-                )?;
+                    let mut prepared = prepare_output(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        surface.output_id,
+                        buffer_size,
+                        &mut data.core.ui_state,
+                        now,
+                        dt,
+                        portal_needs_composite,
+                    )?;
 
-                let client_elements = build_output_client_elements(
-                    &mut data.core.state,
-                    &mut device.renderer,
-                    surface.output_id,
-                );
-                let popup_elements = build_output_popup_elements(
-                    &mut data.core.state,
-                    &mut device.renderer,
-                    surface.output_id,
-                );
+                    let client_elements = build_output_client_elements(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        surface.output_id,
+                    );
+                    let popup_elements = build_output_popup_elements(
+                        &mut data.core.state,
+                        &mut device.renderer,
+                        surface.output_id,
+                    );
 
-                let srgb_to_linear = data.core.state.render.chrome_shaders.srgb_to_linear.clone();
-                let composite_linear_layer = data
-                    .core
-                    .state
-                    .render
-                    .chrome_shaders
-                    .composite_linear_layer
-                    .clone();
-                let use_linear_sdr = use_linear_sdr_path(
-                    &mut device.renderer,
-                    &surface.render_targets,
-                    surface.size,
-                ) && srgb_to_linear.is_some()
-                    && composite_linear_layer.is_some();
+                    let srgb_to_linear =
+                        data.core.state.render.chrome_shaders.srgb_to_linear.clone();
+                    let composite_linear_layer = data
+                        .core
+                        .state
+                        .render
+                        .chrome_shaders
+                        .composite_linear_layer
+                        .clone();
+                    let use_linear_sdr = use_linear_sdr_path(
+                        &mut device.renderer,
+                        &surface.render_targets,
+                        surface.size,
+                    ) && srgb_to_linear.is_some()
+                        && composite_linear_layer.is_some();
 
-                if use_linear_sdr {
-                    if let Err(err) = surface
-                        .render_targets
-                        .ensure_linear_offscreen(&mut device.renderer, surface.size)
-                    {
-                        flog(&format!(
-                            "Linear SDR disabled on {} after FP16 allocation failed: {err}",
-                            surface.output.name()
-                        ));
+                    if use_linear_sdr {
+                        if let Err(err) = surface
+                            .render_targets
+                            .ensure_linear_offscreen(&mut device.renderer, surface.size)
+                        {
+                            flog(&format!(
+                                "Linear SDR disabled on {} after FP16 allocation failed: {err}",
+                                surface.output.name()
+                            ));
+                        }
+                    }
+
+                    let sync =
+                        if use_linear_sdr && surface.render_targets.linear_offscreen.is_some() {
+                            run_linear_staged_pass(
+                                &mut data.core.state,
+                                &mut device.renderer,
+                                &mut surface.render_targets,
+                                surface.size,
+                                &mut prepared,
+                                &client_elements,
+                                &popup_elements,
+                                &mut data.core.ui_state,
+                                &data.core.scene,
+                                &data.core.output_state,
+                                srgb_to_linear.as_ref().unwrap(),
+                                composite_linear_layer.as_ref().unwrap(),
+                            )?
+                        } else {
+                            run_sdr_pass(
+                                &mut data.core.state,
+                                &mut device.renderer,
+                                &mut surface.render_targets,
+                                surface.size,
+                                &prepared,
+                                &client_elements,
+                                &popup_elements,
+                                &mut data.core.ui_state,
+                                &data.core.scene,
+                                &data.core.output_state,
+                            )?
+                        };
+                    if use_linear_sdr && surface.render_targets.linear_offscreen.is_some() {
+                        surface.present_damage.reset();
+                    }
+                    if portal_needs_composite || portal_output_pending {
+                        device.renderer.wait(&sync)?;
+                    }
+
+                    if let Some(texture) = capture_source_texture(surface).cloned() {
+                        crate::core::portal::publish_portal_capture_source(
+                            &mut data.core.state,
+                            surface.output_id,
+                            texture,
+                            surface.size,
+                            now,
+                        );
+                    }
+
+                    if portal_output_pending {
+                        crate::core::portal::complete_pending_portal_captures_for_output(
+                            &mut data.core.state,
+                            &mut device.renderer,
+                            &mut data.core.ui_state,
+                            &data.core.scene,
+                            &data.core.output_state,
+                            surface.output_id,
+                            now,
+                            dt,
+                        );
+                    }
+
+                    if wants_screenshot {
+                        data.core.state.screenshot_seq += 1;
+                        let seq = data.core.state.screenshot_seq;
+                        let output_name = format!("output-{}", surface.output_id.0);
+
+                        match save_offscreen_screenshot(
+                            &mut device.renderer,
+                            surface,
+                            &output_name,
+                            seq,
+                        ) {
+                            Ok(path) => {
+                                flog(&format!("Screenshot saved to {}", path.display()));
+                            }
+                            Err(err) => {
+                                flog(&format!("Screenshot failed: {err}"));
+                            }
+                        }
+                        data.core.state.clear_screenshot_request(surface.output_id);
+                    }
+
+                    // now borrow immutably after the mutable borrow is gone
+                    let texture = present_source_texture(surface)
+                        .expect("offscreen texture missing")
+                        .clone();
+                    let output_scale = data
+                        .core
+                        .state
+                        .outputs
+                        .get(&surface.output_id)
+                        .map(|o| o.scale_factor)
+                        .unwrap_or(1.0)
+                        .max(1.0);
+                    let present_logical_size = Size::<i32, Logical>::from((
+                        (surface.size.w as f64 / output_scale).round() as i32,
+                        (surface.size.h as f64 / output_scale).round() as i32,
+                    ));
+                    let present_src = Rectangle::<f64, Logical>::from_loc_and_size(
+                        (0.0, 0.0),
+                        (surface.size.w as f64, surface.size.h as f64),
+                    );
+                    surface
+                        .present_damage
+                        .add(prepared.frame_ctx.damage.iter().map(|rect| {
+                            Rectangle::<i32, Buffer>::from_loc_and_size(
+                                (rect.loc.x, rect.loc.y),
+                                (rect.size.w, rect.size.h),
+                            )
+                        }));
+                    let present_damage = surface.present_damage.snapshot();
+
+                    let texture_elem = TextureRenderElement::from_texture_with_damage(
+                        surface.present_render_id.clone(),
+                        device.renderer.context_id(),
+                        (0.0, 0.0),
+                        texture,
+                        1,
+                        Transform::Normal,
+                        Some(1.0),
+                        Some(present_src),
+                        Some(present_logical_size),
+                        None,
+                        present_damage,
+                        Kind::Unspecified,
+                    );
+
+                    let mut present_elements: Vec<DrmPresentElement> =
+                        Vec::with_capacity(if data.core.state.drm_try_pass_cursor_this_frame {
+                            2
+                        } else {
+                            1
+                        });
+
+                    if data.core.state.drm_try_pass_cursor_this_frame {
+                        if let Some(ct) = data.core.state.render.sw_cursor_texture.as_ref() {
+                            let scale = data
+                                .core
+                                .state
+                                .outputs
+                                .get(&surface.output_id)
+                                .map(|o| o.scale)
+                                .unwrap_or_else(|| Scale::from((1.0, 1.0)));
+                            let rel = data
+                                .core
+                                .state
+                                .pointer_relative_to_output_logical(surface.output_id)
+                                .unwrap_or(data.core.state.pointer_pos);
+                            let phys: Point<i32, Physical> =
+                                rel.to_physical_precise_round::<f64, i32>(scale);
+                            let (hx, hy) = data.core.state.render.sw_cursor_hotspot;
+                            let (tw, th) = data.core.state.render.sw_cursor_tex_size;
+                            let cursor_logical_size = Size::<i32, Logical>::from((
+                                (tw as f64 / output_scale).round().max(1.0) as i32,
+                                (th as f64 / output_scale).round().max(1.0) as i32,
+                            ));
+                            let cursor_src = Rectangle::<f64, Logical>::from_loc_and_size(
+                                (0.0, 0.0),
+                                (tw as f64, th as f64),
+                            );
+                            let cursor_elem = TextureRenderElement::from_static_texture(
+                                data.core.state.drm_cursor_render_id.clone(),
+                                device.renderer.context_id(),
+                                Point::<f64, Physical>::from((
+                                    (phys.x - hx) as f64,
+                                    (phys.y - hy) as f64,
+                                )),
+                                ct.clone(),
+                                1,
+                                Transform::Normal,
+                                Some(1.0),
+                                Some(cursor_src),
+                                Some(cursor_logical_size),
+                                None,
+                                Kind::Cursor,
+                            );
+                            present_elements.push(DrmPresentElement::Texture(cursor_elem));
+                        }
+                    }
+
+                    present_elements.push(DrmPresentElement::Texture(texture_elem));
+
+                    let frame_result = surface.drm_output.render_frame(
+                        &mut device.renderer,
+                        &present_elements,
+                        Color32F::new(0.0, 0.0, 0.0, 1.0),
+                        FrameFlags::DEFAULT,
+                    )?;
+
+                    data.core.state.update_cursor_policy_after_drm_present(
+                        &frame_result.states,
+                        frame_result.cursor_element.is_some(),
+                    );
+
+                    if !frame_result.is_empty {
+                        surface.drm_output.queue_frame(None)?;
+                        surface.frame_queued_at = Some(now);
+                        data.core.state.compositor_ready = true;
                     }
                 }
 
-                let sync = if use_linear_sdr && surface.render_targets.linear_offscreen.is_some() {
-                    run_linear_staged_pass(
-                        &mut data.core.state,
-                        &mut device.renderer,
-                        &mut surface.render_targets,
-                        surface.size,
-                        &mut prepared,
-                        &client_elements,
-                        &popup_elements,
-                        &mut data.core.ui_state,
-                        &data.core.scene,
-                        &data.core.output_state,
-                        srgb_to_linear.as_ref().unwrap(),
-                        composite_linear_layer.as_ref().unwrap(),
-                    )?
-                } else {
-                    run_sdr_pass(
-                        &mut data.core.state,
-                        &mut device.renderer,
-                        &mut surface.render_targets,
-                        surface.size,
-                        &prepared,
-                        &client_elements,
-                        &popup_elements,
-                        &mut data.core.ui_state,
-                        &data.core.scene,
-                        &data.core.output_state,
-                    )?
-                };
-                if use_linear_sdr && surface.render_targets.linear_offscreen.is_some() {
-                    surface.present_damage.reset();
-                }
-                if portal_active {
-                    device.renderer.wait(&sync)?;
-                }
+                // screen capture all outputs
+                if data.core.state.screenshot_all_requested {
+                    data.core.state.screenshot_seq += 1;
+                    let seq = data.core.state.screenshot_seq;
 
-                if let Some(texture) = capture_source_texture(surface).cloned() {
-                    crate::core::portal::publish_portal_capture_source(
-                        &mut data.core.state,
-                        surface.output_id,
-                        texture,
-                        surface.size,
-                        now,
-                    );
+                    match save_all_outputs_screenshot(
+                        &mut device.renderer,
+                        &mut device.surfaces,
+                        seq,
+                    ) {
+                        Ok(path) => flog(&format!(
+                            "All-outputs screenshot saved to {}",
+                            path.display()
+                        )),
+                        Err(err) => flog(&format!("All-outputs screenshot failed: {err}")),
+                    }
                 }
+            }
 
-                if portal_active {
-                    crate::core::portal::complete_pending_portal_captures_for_output(
+            if portal_pending {
+                if let Some(device) = data.backend.devices.values_mut().next() {
+                    crate::core::portal::complete_pending_portal_captures(
                         &mut data.core.state,
                         &mut device.renderer,
                         &mut data.core.ui_state,
                         &data.core.scene,
                         &data.core.output_state,
-                        surface.output_id,
                         now,
                         dt,
                     );
                 }
-
-                if wants_screenshot {
-                    data.core.state.screenshot_seq += 1;
-                    let seq = data.core.state.screenshot_seq;
-                    let output_name = format!("output-{}", surface.output_id.0);
-
-                    match save_offscreen_screenshot(
-                        &mut device.renderer,
-                        surface,
-                        &output_name,
-                        seq,
-                    ) {
-                        Ok(path) => {
-                            flog(&format!("Screenshot saved to {}", path.display()));
-                        }
-                        Err(err) => {
-                            flog(&format!("Screenshot failed: {err}"));
-                        }
-                    }
-                    data.core.state.clear_screenshot_request(surface.output_id);
-                }
-
-                // now borrow immutably after the mutable borrow is gone
-                let texture = present_source_texture(surface)
-                    .expect("offscreen texture missing")
-                    .clone();
-                let output_scale = data
-                    .core
-                    .state
-                    .outputs
-                    .get(&surface.output_id)
-                    .map(|o| o.scale_factor)
-                    .unwrap_or(1.0)
-                    .max(1.0);
-                let present_logical_size = Size::<i32, Logical>::from((
-                    (surface.size.w as f64 / output_scale).round() as i32,
-                    (surface.size.h as f64 / output_scale).round() as i32,
-                ));
-                let present_src = Rectangle::<f64, Logical>::from_loc_and_size(
-                    (0.0, 0.0),
-                    (surface.size.w as f64, surface.size.h as f64),
-                );
-                surface
-                    .present_damage
-                    .add(prepared.frame_ctx.damage.iter().map(|rect| {
-                        Rectangle::<i32, Buffer>::from_loc_and_size(
-                            (rect.loc.x, rect.loc.y),
-                            (rect.size.w, rect.size.h),
-                        )
-                    }));
-                let present_damage = surface.present_damage.snapshot();
-
-                let texture_elem = TextureRenderElement::from_texture_with_damage(
-                    surface.present_render_id.clone(),
-                    device.renderer.context_id(),
-                    (0.0, 0.0),
-                    texture,
-                    1,
-                    Transform::Normal,
-                    Some(1.0),
-                    Some(present_src),
-                    Some(present_logical_size),
-                    None,
-                    present_damage,
-                    Kind::Unspecified,
-                );
-
-                let mut present_elements: Vec<DrmPresentElement> =
-                    Vec::with_capacity(if data.core.state.drm_try_pass_cursor_this_frame {
-                        2
-                    } else {
-                        1
-                    });
-
-                if data.core.state.drm_try_pass_cursor_this_frame {
-                    if let Some(ct) = data.core.state.render.sw_cursor_texture.as_ref() {
-                        let scale = data
-                            .core
-                            .state
-                            .outputs
-                            .get(&surface.output_id)
-                            .map(|o| o.scale)
-                            .unwrap_or_else(|| Scale::from((1.0, 1.0)));
-                        let rel = data
-                            .core
-                            .state
-                            .pointer_relative_to_output_logical(surface.output_id)
-                            .unwrap_or(data.core.state.pointer_pos);
-                        let phys: Point<i32, Physical> =
-                            rel.to_physical_precise_round::<f64, i32>(scale);
-                        let (hx, hy) = data.core.state.render.sw_cursor_hotspot;
-                        let (tw, th) = data.core.state.render.sw_cursor_tex_size;
-                        let cursor_logical_size = Size::<i32, Logical>::from((
-                            (tw as f64 / output_scale).round().max(1.0) as i32,
-                            (th as f64 / output_scale).round().max(1.0) as i32,
-                        ));
-                        let cursor_src = Rectangle::<f64, Logical>::from_loc_and_size(
-                            (0.0, 0.0),
-                            (tw as f64, th as f64),
-                        );
-                        let cursor_elem = TextureRenderElement::from_static_texture(
-                            data.core.state.drm_cursor_render_id.clone(),
-                            device.renderer.context_id(),
-                            Point::<f64, Physical>::from((
-                                (phys.x - hx) as f64,
-                                (phys.y - hy) as f64,
-                            )),
-                            ct.clone(),
-                            1,
-                            Transform::Normal,
-                            Some(1.0),
-                            Some(cursor_src),
-                            Some(cursor_logical_size),
-                            None,
-                            Kind::Cursor,
-                        );
-                        present_elements.push(DrmPresentElement::Texture(cursor_elem));
-                    }
-                }
-
-                present_elements.push(DrmPresentElement::Texture(texture_elem));
-
-                let frame_result = surface.drm_output.render_frame(
-                    &mut device.renderer,
-                    &present_elements,
-                    Color32F::new(0.0, 0.0, 0.0, 1.0),
-                    FrameFlags::DEFAULT,
-                )?;
-
-                data.core.state.update_cursor_policy_after_drm_present(
-                    &frame_result.states,
-                    frame_result.cursor_element.is_some(),
-                );
-
-                if !frame_result.is_empty {
-                    surface.drm_output.queue_frame(None)?;
-                    surface.frame_queued_at = Some(now);
-                    data.core.state.compositor_ready = true;
-                }
-            }
-
-            // screen capture all outputs
-            if data.core.state.screenshot_all_requested {
-                data.core.state.screenshot_seq += 1;
-                let seq = data.core.state.screenshot_seq;
-
-                match save_all_outputs_screenshot(&mut device.renderer, &mut device.surfaces, seq) {
-                    Ok(path) => flog(&format!(
-                        "All-outputs screenshot saved to {}",
-                        path.display()
-                    )),
-                    Err(err) => flog(&format!("All-outputs screenshot failed: {err}")),
-                }
-            }
-        }
-
-        if portal_active {
-            if let Some(device) = data.backend.devices.values_mut().next() {
-                crate::core::portal::complete_pending_portal_captures(
-                    &mut data.core.state,
-                    &mut device.renderer,
-                    &mut data.core.ui_state,
-                    &data.core.scene,
-                    &data.core.output_state,
-                    now,
-                    dt,
-                );
             }
         }
 

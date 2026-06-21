@@ -212,7 +212,7 @@ pub fn run_linear_staged_pass(
             output_state,
             OutputRenderStage::Base,
             ClientCompositingMode::Sdr,
-            ChromeGlassPass::InBaseSdr,
+            ChromeGlassPass::Skip,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
@@ -231,6 +231,20 @@ pub fn run_linear_staged_pass(
             .map_err(|e| anyhow!("begin linear SDR frame: {e}"))?;
         clear_offscreen(&mut frame, buffer_size, transparent)
             .map_err(|e| anyhow!("clear linear client layer: {e}"))?;
+        draw_output_stage(
+            state,
+            &mut frame,
+            prepared,
+            client_elements,
+            popup_elements,
+            ui_state,
+            scene,
+            output_state,
+            OutputRenderStage::LinearGlassUnderClients,
+            ClientCompositingMode::Sdr,
+            ChromeGlassPass::LinearUnderClients,
+        )
+        .map_err(|err| anyhow!("{err}"))?;
         draw_output_stage(
             state,
             &mut frame,
@@ -316,7 +330,7 @@ pub fn render_output_offscreen(
 
     if use_linear {
         if let Err(err) = targets.ensure_linear_offscreen(renderer, buffer_size) {
-            flog(&format!(
+            flog(format!(
                 "Linear SDR disabled for offscreen render after FP16 allocation failed: {err}"
             ));
         }

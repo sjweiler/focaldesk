@@ -393,13 +393,13 @@ fn publish_portal_environment(wayland_display: &str) {
         .status();
 
     match status {
-        Ok(status) if status.success() => flog(&format!(
+        Ok(status) if status.success() => flog(format!(
             "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=wlroots"
         )),
-        Ok(status) => flog(&format!(
+        Ok(status) => flog(format!(
             "failed to publish portal environment: dbus-update-activation-environment exited with {status}"
         )),
-        Err(err) => flog(&format!(
+        Err(err) => flog(format!(
             "failed to publish portal environment: dbus-update-activation-environment: {err}"
         )),
     }
@@ -424,7 +424,7 @@ fn ensure_standard_user_dirs() {
     for name in ["Desktop", "Downloads", "Music", "Pictures", "Videos"] {
         let path = home.join(name);
         if let Err(err) = std::fs::create_dir_all(&path) {
-            flog(&format!(
+            flog(format!(
                 "failed to create user directory {}: {err}",
                 path.display()
             ));
@@ -438,7 +438,7 @@ fn ensure_xdg_videos_dir() {
     let user_dirs_path = xdg_config_dir().join("user-dirs.dirs");
     if let Some(parent) = user_dirs_path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            flog(&format!(
+            flog(format!(
                 "failed to create XDG user dirs config directory {}: {err}",
                 parent.display()
             ));
@@ -478,7 +478,7 @@ fn ensure_xdg_videos_dir() {
     let mut output = lines.join("\n");
     output.push('\n');
     if let Err(err) = std::fs::write(&user_dirs_path, output) {
-        flog(&format!(
+        flog(format!(
             "failed to write XDG videos directory to {}: {err}",
             user_dirs_path.display()
         ));
@@ -496,10 +496,10 @@ fn restart_portal_services() {
         Ok(status) if status.success() => {
             flog("reset failed state for xdg-desktop-portal-wlr.service")
         }
-        Ok(status) => flog(&format!(
+        Ok(status) => flog(format!(
             "failed to reset xdg-desktop-portal-wlr.service state: systemctl exited with {status}"
         )),
-        Err(err) => flog(&format!(
+        Err(err) => flog(format!(
             "failed to reset xdg-desktop-portal-wlr.service state: systemctl: {err}"
         )),
     }
@@ -518,10 +518,10 @@ fn restart_portal_services() {
         Ok(status) if status.success() => {
             flog("requested async restart of xdg-desktop-portal and xdg-desktop-portal-wlr")
         }
-        Ok(status) => flog(&format!(
+        Ok(status) => flog(format!(
             "failed to restart xdg-desktop-portal services: systemctl exited with {status}"
         )),
-        Err(err) => flog(&format!(
+        Err(err) => flog(format!(
             "failed to restart xdg-desktop-portal services: systemctl: {err}"
         )),
     }
@@ -544,7 +544,7 @@ pub(crate) fn bootstrap_compositor_core(
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
     publish_portal_environment(&wayland_display);
-    flog(&format!("FocalDesk client socket is {}", wayland_display));
+    flog(format!("FocalDesk client socket is {}", wayland_display));
 
     let display = Display::<DesktopState>::new()?;
     let dh = display.handle();

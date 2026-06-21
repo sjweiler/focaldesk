@@ -7,8 +7,8 @@ use focaldesk_ipc::{
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
-    load_settings, save_settings, DebugLogLevel, LidCloseAction, LowBatteryAction, OutputConfig,
-    PerformanceMode, PowerButtonAction, Settings,
+    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, LidCloseAction,
+    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 
@@ -57,6 +57,7 @@ const POWER_BUTTON_OPTIONS: &[&str] = &["Show power menu", "Suspend", "Power off
 const LID_CLOSE_OPTIONS: &[&str] = &["Suspend", "Blank screen", "Lock screen", "Do nothing"];
 const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "Power off"];
 const PERFORMANCE_MODE_OPTIONS: &[&str] = &["Balanced", "Performance", "Power saver"];
+const BROWSER_LAUNCH_BACKEND_OPTIONS: &[&str] = &["Auto", "Wayland", "XWayland"];
 
 #[derive(Debug, Clone)]
 struct WifiNetwork {
@@ -1192,9 +1193,7 @@ fn sanitize_printer_name(name: &str) -> String {
     let mut last_was_separator = false;
 
     for ch in name.chars() {
-        let ch = if ch.is_ascii_alphanumeric() {
-            ch
-        } else if matches!(ch, '_' | '-' | '.') {
+        let ch = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
             ch
         } else if ch.is_whitespace() || matches!(ch, ':' | '/' | '%' | '?' | '&' | '=') {
             '_'
@@ -1251,10 +1250,7 @@ fn parse_installable_printers(
         let kind = kind.trim();
         let uri = uri.trim();
 
-        if kind.is_empty()
-            || uri.is_empty()
-            || configured_uris.iter().any(|configured| *configured == uri)
-        {
+        if kind.is_empty() || uri.is_empty() || configured_uris.contains(&uri) {
             continue;
         }
 
@@ -3344,6 +3340,22 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
 
+    let browser_backend = add_dropdown_row(
+        &defaults_group,
+        "Browser backend",
+        Some("Auto launches browsers as Wayland clients; XWayland stays explicit"),
+        BROWSER_LAUNCH_BACKEND_OPTIONS,
+        browser_launch_backend_index(settings.borrow().apps.browser_launch_backend),
+    );
+    {
+        let settings = settings.clone();
+        browser_backend.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().apps.browser_launch_backend =
+                selected_browser_launch_backend(dropdown.selected());
+            persist_settings(&settings.borrow());
+        });
+    }
+
     let file_manager = add_entry_row(&defaults_group, "File manager", "focaldesk-files");
     file_manager.set_text(&settings.borrow().apps.file_manager);
     {
@@ -3368,12 +3380,14 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         let settings = settings.clone();
         let terminal = terminal.clone();
         let browser = browser.clone();
+        let browser_backend = browser_backend.clone();
         let file_manager = file_manager.clone();
         move |_| {
             settings.borrow_mut().apps = focaldesk_settings_core::default_settings().apps;
             let apps = settings.borrow().apps.clone();
             terminal.set_text(&apps.terminal);
             browser.set_text(&apps.browser);
+            browser_backend.set_selected(browser_launch_backend_index(apps.browser_launch_backend));
             file_manager.set_text(&apps.file_manager);
             persist_settings(&settings.borrow());
         }
@@ -3622,6 +3636,14 @@ fn performance_mode_index(mode: PerformanceMode) -> u32 {
     }
 }
 
+fn browser_launch_backend_index(backend: BrowserLaunchBackend) -> u32 {
+    match backend {
+        BrowserLaunchBackend::Auto => 0,
+        BrowserLaunchBackend::Wayland => 1,
+        BrowserLaunchBackend::Xwayland => 2,
+    }
+}
+
 fn debug_log_level_index(level: DebugLogLevel) -> u32 {
     match level {
         DebugLogLevel::Error => 0,
@@ -3656,6 +3678,14 @@ fn selected_low_battery_action(index: u32) -> LowBatteryAction {
         2 => LowBatteryAction::Hibernate,
         3 => LowBatteryAction::PowerOff,
         _ => LowBatteryAction::NotifyOnly,
+    }
+}
+
+fn selected_browser_launch_backend(index: u32) -> BrowserLaunchBackend {
+    match index {
+        1 => BrowserLaunchBackend::Wayland,
+        2 => BrowserLaunchBackend::Xwayland,
+        _ => BrowserLaunchBackend::Auto,
     }
 }
 

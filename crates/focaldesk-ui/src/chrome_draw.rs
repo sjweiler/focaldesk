@@ -218,6 +218,7 @@ pub fn draw_chrome_below_work_wallpaper(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_chrome_trim_glass_icons(
     frame: &mut GlesFrame<'_, '_>,
     shaders: &ChromeShaders,

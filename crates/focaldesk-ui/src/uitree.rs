@@ -1,6 +1,7 @@
 use crate::element::UiElement;
 use crate::types::ElementId;
 
+#[derive(Default)]
 pub struct UiTree {
     pub elements: Vec<UiElement>,
     pub hovered: Option<ElementId>,
@@ -20,15 +21,5 @@ impl UiTree {
             .iter_mut()
             .rev()
             .find(|e| e.visible && e.bounds.contains(x, y))
-    }
-}
-
-impl Default for UiTree {
-    fn default() -> Self {
-        Self {
-            elements: Vec::new(),
-            hovered: None,
-            pressed: None,
-        }
     }
 }

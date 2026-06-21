@@ -7,6 +7,12 @@ pub struct ClockWidget {
     pub last_update: Instant,
 }
 
+impl Default for ClockWidget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ClockWidget {
     pub fn new() -> Self {
         Self {
