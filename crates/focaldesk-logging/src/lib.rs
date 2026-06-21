@@ -2,7 +2,8 @@ pub mod logging;
 
 pub use logging::{
     current_log_level, enabled, init_default_logging, init_logging, init_logging_from_env,
-    set_log_level, BuildMode, FLogLevel,
+    install_panic_hook, log_file_path_candidates, session_id, set_log_level, startup_banner,
+    BuildMode, FLogLevel,
 };
 
 pub fn flog(msg: impl AsRef<str>) {

@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="focaldesk_color_v1">
+  <copyright>
+    Copyright 2026 FocalDesk contributors.
+
+    Permission to use, copy, modify, and/or distribute this protocol for any
+    purpose is hereby granted, provided that the above copyright notice and
+    this permission notice appear in all copies.
+  </copyright>
+
+  <description summary="FocalDesk surface color tags (staging)">
+    Minimal staging protocol for tagging wl_surface buffer color encoding.
+    Full color management should eventually use wp_color_management_v1.
+  </description>
+
+  <interface name="focaldesk_color_manager_v1" version="1">
+    <description summary="color tag manager">
+      Singleton for attaching color tags to wl_surface objects.
+    </description>
+
+    <request name="destroy" type="destructor"/>
+
+    <enum name="error">
+      <entry name="surface_exists" value="0"
+             summary="a color tag object already exists for the surface"/>
+    </enum>
+
+    <request name="get_surface">
+      <description summary="create a color tag for a wl_surface">
+        If a focaldesk_surface_color_v1 object already exists for the given
+        wl_surface, the surface_exists protocol error is raised.
+      </description>
+      <arg name="id" type="new_id" interface="focaldesk_surface_color_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+  </interface>
+
+  <interface name="focaldesk_surface_color_v1" version="1">
+    <description summary="color tag on one wl_surface">
+      Tag state is double-buffered and takes effect on the next wl_surface.commit.
+    </description>
+
+    <request name="destroy" type="destructor"/>
+
+    <enum name="error">
+      <entry name="inert" value="0"
+             summary="the wl_surface was destroyed"/>
+    </enum>
+
+    <enum name="transfer">
+      <entry name="srgb" value="0"
+             summary="sRGB-encoded buffer (BT.709 primaries)"/>
+      <entry name="linear_srgb" value="1"
+             summary="linear-light buffer with sRGB primaries"/>
+    </enum>
+
+    <request name="set_transfer">
+      <description summary="set the buffer transfer function">
+        If this object is inert, the inert protocol error is raised.
+      </description>
+      <arg name="transfer" type="uint" enum="transfer"/>
+    </request>
+
+    <request name="unset">
+      <description summary="clear the explicit tag">
+        After commit the surface reverts to the compositor default (sRGB).
+      </description>
+    </request>
+  </interface>
+</protocol>

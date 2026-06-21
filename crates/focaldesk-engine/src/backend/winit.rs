@@ -2,42 +2,43 @@
 
 // winit backend
 
-use crate::backend::common::{bootstrap_compositor_core, translate_backend_input, BootstrapOutput};
-//use crate::backend::common::{
-//    bootstrap_compositor_core, finish_xwayland_startup, start_xwayland, translate_backend_input,
-//};
+use crate::backend::common::client_state_from_stream;
+use crate::backend::common::{
+    bootstrap_compositor_core, is_nonfatal_wayland_io_error, translate_backend_input,
+    BootstrapOutput,
+};
 #[cfg(feature = "xwayland")]
 use crate::backend::common::{finish_xwayland_startup, start_xwayland};
 
-use smithay::backend::winit as winit_backend; // Smithay backend glue (has init, WinitEvent, etc.)
-use smithay::backend::winit::WinitEvent; // (optional) import event type
+use smithay::backend::winit as winit_backend;
+use smithay::backend::winit::WinitEvent;
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::winit;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::core::desktop::DesktopState;
+use crate::core::linear_compositing::{
+    present_offscreen_texture, render_output_offscreen, supports_linear_sdr, LinearOffscreenTargets,
+};
+use crate::core::portal::{
+    complete_pending_portal_captures, complete_pending_portal_captures_for_output,
+    publish_portal_capture_source,
+};
 use crate::core::wayland::client::ClientState;
 use focaldesk_flow::keybinds::BackendKind;
+use focaldesk_logging::session_id;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::Renderer;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{IsAlive, Physical, Size, Transform};
 
 use crate::core::input::FlowInputEvent;
-
-use crate::core::backend_render::draw_output;
-use crate::core::backend_render::{
-    build_output_client_elements, build_output_popup_elements, prepare_output,
-};
-use crate::core::desktop::DesktopState;
-use focaldesk_logging::{flog, flog_info};
-use focaldesk_themes::theme::BuiltInThemeId;
-use focaldesk_themes::FlowThemeId;
-use focaldesk_themes::ThemeManager;
 use focaldesk_types::OutputId;
 use smithay::backend::winit::WinitEventLoop;
-use smithay::input::keyboard::keysyms;
+use tracing::{debug, info, warn};
+
 fn dispatch_backend_events(
     state: &mut DesktopState,
     event_loop: &mut WinitEventLoop,
@@ -80,25 +81,21 @@ fn dispatch_backend_events(
     Ok(state.running
         && matches!(
             status,
-            smithay::reexports::winit::platform::pump_events::PumpStatus::Continue
+            smithay::reexports::winit::event_loop::pump_events::PumpStatus::Continue
         ))
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    flog("FOCALDESK: entered WINIT backend");
-    // Create Smithay winit backend + renderer
-    //let mut theme_manager =
-    // ThemeManager::new(
-    //    FlowThemeId::BuiltIn(BuiltInThemeId::Eagle)
-    // );
-    //let theme = theme_manager.active_theme();
+    info!(
+        target: "focaldesk",
+        session_id = session_id(),
+        backend = "winit",
+        "entered backend"
+    );
     let (mut backend, mut event_loop) = winit_backend::init::<GlesRenderer>()?;
 
     backend.window().set_maximized(true);
     backend.window().set_decorations(false);
-    // Ask the host compositor to focus our nested window immediately.
-    // Some WMs will ignore this unless done from user interaction, but
-    // requesting here avoids requiring an initial click on permissive setups.
     backend.window().focus_window();
 
     let size = backend.window_size();
@@ -129,6 +126,23 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         )?;
     }
 
+    let buffer_size_phys = Size::<i32, Physical>::from((size.w, size.h));
+    let mut render_targets = LinearOffscreenTargets {
+        linear_supported: {
+            let (renderer, _framebuffer) = backend.bind()?;
+            let supported = supports_linear_sdr(renderer, buffer_size_phys);
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                format = ?crate::core::linear_compositing::LINEAR_SDR_FORMAT,
+                supported,
+                "linear SDR probe"
+            );
+            supported
+        },
+        ..LinearOffscreenTargets::default()
+    };
+
     let mut requested_focus_after_first_frame = false;
     while nested.state.running {
         #[cfg(feature = "xwayland")]
@@ -139,18 +153,21 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nested.state.process_notification_timers();
         nested.state.process_lock_timers();
 
-        // dispatch events
         if !dispatch_backend_events(&mut nested.state, &mut event_loop)? {
             break;
         }
 
-        // accept clients
         if let Some(stream) = nested.listener.accept()? {
-            flog_info!("accepting client");
+            debug!(
+                target: "focaldesk",
+                session_id = session_id(),
+                "accepting client"
+            );
+            let client_state = client_state_from_stream(&stream);
             let client = nested
                 .display
                 .handle()
-                .insert_client(stream, Arc::new(ClientState::default()))?;
+                .insert_client(stream, Arc::new(client_state))?;
             nested.clients.push(client);
         }
 
@@ -168,57 +185,109 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dt,
             );
             if nested.state.wayland_clients_may_dispatch() {
-                nested.display.dispatch_clients(&mut nested.state)?;
+                if let Err(err) = nested.display.dispatch_clients(&mut nested.state) {
+                    if !is_nonfatal_wayland_io_error(&err) {
+                        return Err(err.into());
+                    }
+                    warn!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        error = %err,
+                        "ignoring nonfatal Wayland dispatch error"
+                    );
+                }
             }
             nested.state.end_portal_dispatch();
             std::mem::drop(framebuffer);
         }
 
         nested.state.refresh_space();
-        nested.display.flush_clients()?;
+        if let Err(err) = nested.display.flush_clients() {
+            if !is_nonfatal_wayland_io_error(&err) {
+                return Err(err.into());
+            }
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "ignoring nonfatal Wayland flush error"
+            );
+        }
 
-        //tick layout
         nested.state.tick_layout();
-        // render if needed
 
-        if nested.state.needs_redraw() {
+        nested
+            .state
+            .image_copy_capture_sessions
+            .retain(|session| session.alive());
+        let portal_active = !nested.state.image_copy_capture_sessions.is_empty()
+            && !nested.state.pending_portal_captures.is_empty();
+        let should_render = nested.state.needs_redraw() || portal_active;
+
+        if !should_render {
+            if portal_active {
+                let (renderer, _framebuffer) = backend.bind()?;
+                complete_pending_portal_captures(
+                    &mut nested.state,
+                    renderer,
+                    &mut nested.ui_state,
+                    &nested.scene,
+                    &nested.output_state,
+                    now,
+                    dt,
+                );
+            }
+        } else {
             nested.last_now = now;
 
             let buffer_size = backend.window_size();
+            let buffer_size_phys = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
             {
                 let (renderer, mut framebuffer) = backend.bind()?;
 
-                let prepared = prepare_output(
+                let _sync = render_output_offscreen(
                     &mut nested.state,
                     renderer,
+                    &mut render_targets,
                     OutputId(1),
-                    buffer_size,
+                    buffer_size_phys,
                     &mut nested.ui_state,
+                    &nested.scene,
+                    &nested.output_state,
                     now,
                     dt,
                     false,
                 )?;
 
-                let client_elements =
-                    build_output_client_elements(&mut nested.state, renderer, OutputId(1));
-                let popup_elements =
-                    build_output_popup_elements(&mut nested.state, renderer, OutputId(1));
-
+                let offscreen = render_targets
+                    .offscreen
+                    .as_ref()
+                    .ok_or("winit offscreen missing after render")?;
                 let mut frame =
                     renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
-
-                draw_output(
-                    &mut nested.state,
-                    &mut frame,
-                    &prepared,
-                    &client_elements,
-                    &popup_elements,
-                    &mut nested.ui_state,
-                    &nested.scene,
-                    &nested.output_state,
-                )?;
-
+                present_offscreen_texture(&mut frame, &offscreen.texture, buffer_size_phys)?;
                 let _ = frame.finish()?;
+
+                publish_portal_capture_source(
+                    &mut nested.state,
+                    OutputId(1),
+                    offscreen.texture.clone(),
+                    buffer_size_phys,
+                    now,
+                );
+
+                if portal_active {
+                    complete_pending_portal_captures_for_output(
+                        &mut nested.state,
+                        renderer,
+                        &mut nested.ui_state,
+                        &nested.scene,
+                        &nested.output_state,
+                        OutputId(1),
+                        now,
+                        dt,
+                    );
+                }
             }
 
             backend.submit(None)?;

@@ -24,7 +24,6 @@ use crate::core::portal::{self, attach_output_to_capture_source};
 impl ImageCaptureSourceHandler for DesktopState {
     fn source_destroyed(&mut self, _source: ImageCaptureSource) {}
 }
-smithay::delegate_image_capture_source!(DesktopState);
 
 impl OutputCaptureSourceHandler for DesktopState {
     fn output_capture_source_state(&mut self) -> &mut OutputCaptureSourceState {
@@ -35,7 +34,6 @@ impl OutputCaptureSourceHandler for DesktopState {
         attach_output_to_capture_source(&source, output);
     }
 }
-smithay::delegate_output_capture_source!(DesktopState);
 
 impl ImageCopyCaptureHandler for DesktopState {
     fn image_copy_capture_state(&mut self) -> &mut ImageCopyCaptureState {
@@ -107,7 +105,6 @@ impl ImageCopyCaptureHandler for DesktopState {
         portal::try_render_portal_frame(self, frame, output_id);
     }
 }
-smithay::delegate_image_copy_capture!(DesktopState);
 
 impl WlrLayerShellHandler for DesktopState {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
@@ -153,4 +150,3 @@ impl WlrLayerShellHandler for DesktopState {
         }
     }
 }
-smithay::delegate_layer_shell!(DesktopState);

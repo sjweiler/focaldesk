@@ -11,6 +11,8 @@ pub fn hotspot_for(icon: CursorIcon) -> CursorHotspot {
         CursorIcon::Wait => CursorHotspot::new(16, 16),
         CursorIcon::Help => CursorHotspot::new(8, 4),
         CursorIcon::NotAllowed => CursorHotspot::new(16, 16),
+        CursorIcon::FileDrag => CursorHotspot::new(4, 4),
+        CursorIcon::FileDragCopy => CursorHotspot::new(4, 4),
         CursorIcon::EwResize => CursorHotspot::new(16, 16),
         CursorIcon::NsResize => CursorHotspot::new(16, 16),
         CursorIcon::NwseResize => CursorHotspot::new(16, 16),

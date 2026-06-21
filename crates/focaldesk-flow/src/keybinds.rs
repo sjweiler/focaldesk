@@ -1,7 +1,7 @@
 // all my keybind stuff goes here
 use crate::actions::KeyAction;
 use bitflags::bitflags;
-use smithay::input::keyboard::keysyms;
+use smithay::input::keyboard::{keysyms, xkb};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,23 +71,15 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_Q,
+                sym: keysyms::KEY_l,
             },
-            KeyAction::CloseFocused,
+            KeyAction::LockScreen,
         );
 
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
                 sym: keysyms::KEY_q,
-            },
-            KeyAction::QuitCompositor,
-        );
-
-        self.map.insert(
-            KeyCombo {
-                mods: ModMask::SUPER | ModMask::SHIFT,
-                sym: keysyms::KEY_Q,
             },
             KeyAction::QuitCompositor,
         );
@@ -313,9 +305,27 @@ impl Keybinds {
     }
 
     pub fn resolve(&self, sym: u32, mods: ModMask) -> Option<KeyAction> {
+        let sym = keysym_to_lower(sym);
         let combo = KeyCombo { mods, sym };
         self.map.get(&combo).copied()
     }
+}
+
+fn keysym_to_lower(sym: u32) -> u32 {
+    let utf32 = xkb::keysym_to_utf32(sym.into());
+    let Some(ch) = char::from_u32(utf32) else {
+        return sym;
+    };
+
+    let mut lower = ch.to_lowercase();
+    let Some(ch) = lower.next() else {
+        return sym;
+    };
+    if lower.next().is_some() {
+        return sym;
+    }
+
+    xkb::utf32_to_keysym(ch as u32).raw()
 }
 
 impl Default for Keybinds {

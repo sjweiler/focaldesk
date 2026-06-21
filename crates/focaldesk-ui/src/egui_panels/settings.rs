@@ -1,6 +1,9 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
 use focaldesk_config::{FocalDeskConfig, save_config};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
 
 fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fill = if selected {
@@ -24,15 +27,391 @@ fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Respon
     )
 }
 
+#[derive(Debug, Clone)]
+struct WifiNetwork {
+    active: bool,
+    ssid: String,
+    security: String,
+    signal: u8,
+}
+
+#[derive(Debug, Clone)]
+struct EthernetDevice {
+    device: String,
+    state: String,
+    connection: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct BluetoothDevice {
+    address: String,
+    name: String,
+    paired: bool,
+    connected: bool,
+}
+
+fn run_control_command(program: &str, args: &[&str]) -> Result<String, String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|err| format!("{program}: {err}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if stderr.is_empty() { stdout } else { stderr };
+        Err(format!("{program}: {message}"))
+    }
+}
+
+fn focaldesk_config_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
+        .join("config.toml")
+}
+
+fn focaldesk_log_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(path) = std::env::var("FOCALDESK_LOG_FILE") {
+        paths.push(PathBuf::from(path));
+    }
+
+    if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })
+    {
+        paths.push(state_dir.join("focaldesk").join("focaldesk.log"));
+    }
+
+    if let Some(cache_dir) = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+    {
+        paths.push(cache_dir.join("focaldesk").join("focaldesk.log"));
+    }
+
+    paths.push(PathBuf::from("/tmp/focaldesk.log"));
+    paths
+}
+
+fn existing_focaldesk_log_path() -> Option<PathBuf> {
+    focaldesk_log_candidates()
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn open_path(path: &PathBuf) -> Result<(), String> {
+    Command::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("xdg-open failed: {err}"))
+}
+
+fn session_type_label() -> String {
+    std::env::var("XDG_SESSION_TYPE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("WAYLAND_DISPLAY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| "wayland".to_string())
+        })
+        .or_else(|| {
+            std::env::var("DISPLAY")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|_| "x11".to_string())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn diagnostics_text() -> String {
+    let log_path = existing_focaldesk_log_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not found".to_string());
+    let current_exe = std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "FocalDesk diagnostics\n\
+         Version: {}\n\
+         Build hash: {}\n\
+         Build profile: {}\n\
+         OS/arch: {}/{}\n\
+         Session type: {}\n\
+         Current executable: {}\n\
+         Config path: {}\n\
+         Log path: {}\n\
+         WAYLAND_DISPLAY: {}\n\
+         DISPLAY: {}\n\
+         XDG_CURRENT_DESKTOP: {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("development"),
+        if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        session_type_label(),
+        current_exe,
+        focaldesk_config_path().display(),
+        log_path,
+        std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("DISPLAY").unwrap_or_else(|_| "unset".to_string()),
+        std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_else(|_| "unset".to_string()),
+    )
+}
+
+fn split_nmcli_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escape = false;
+
+    for ch in line.chars() {
+        if escape {
+            current.push(ch);
+            escape = false;
+        } else if ch == '\\' {
+            escape = true;
+        } else if ch == ':' {
+            fields.push(current);
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+
+    fields.push(current);
+    fields
+}
+
+fn wifi_enabled() -> Result<bool, String> {
+    let output = run_control_command("nmcli", &["-t", "-f", "WIFI", "radio"])?;
+    Ok(output.lines().next().unwrap_or_default().trim() == "enabled")
+}
+
+fn load_wifi_networks() -> Result<Vec<WifiNetwork>, String> {
+    let output = run_control_command(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "IN-USE,SSID,SECURITY,SIGNAL",
+            "device",
+            "wifi",
+            "list",
+            "--rescan",
+            "yes",
+        ],
+    )?;
+
+    let mut networks = Vec::new();
+
+    for line in output.lines() {
+        let fields = split_nmcli_line(line);
+        let ssid = fields.get(1).map(String::as_str).unwrap_or_default().trim();
+        if ssid.is_empty() {
+            continue;
+        }
+
+        networks.push(WifiNetwork {
+            active: fields.first().map(String::as_str).unwrap_or_default() == "*",
+            ssid: ssid.to_string(),
+            security: fields
+                .get(2)
+                .map(String::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+            signal: fields
+                .get(3)
+                .and_then(|value| value.parse::<u8>().ok())
+                .unwrap_or(0),
+        });
+    }
+
+    networks.sort_by(|a, b| b.active.cmp(&a.active).then(b.signal.cmp(&a.signal)));
+    networks.dedup_by(|a, b| a.ssid == b.ssid);
+    Ok(networks)
+}
+
+fn wifi_security_label(security: &str) -> &str {
+    if security.trim().is_empty() || security == "--" {
+        "Open network"
+    } else {
+        "Secured network"
+    }
+}
+
+fn connect_wifi(ssid: &str, password: &str) -> Result<String, String> {
+    if password.is_empty() {
+        run_control_command("nmcli", &["device", "wifi", "connect", ssid])
+    } else {
+        run_control_command(
+            "nmcli",
+            &["device", "wifi", "connect", ssid, "password", password],
+        )
+    }
+}
+
+fn load_ethernet_devices() -> Result<Vec<EthernetDevice>, String> {
+    let output = run_control_command(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "DEVICE,TYPE,STATE,CONNECTION",
+            "device",
+            "status",
+        ],
+    )?;
+
+    let mut devices = Vec::new();
+
+    for line in output.lines() {
+        let fields = split_nmcli_line(line);
+        if fields.get(1).map(String::as_str) != Some("ethernet") {
+            continue;
+        }
+
+        let device = fields.first().cloned().unwrap_or_default();
+        if device.is_empty() {
+            continue;
+        }
+
+        let connection = fields
+            .get(3)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != "--")
+            .map(str::to_string);
+
+        devices.push(EthernetDevice {
+            device,
+            state: fields
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            connection,
+        });
+    }
+
+    devices.sort_by(|a, b| {
+        ethernet_connected(b)
+            .cmp(&ethernet_connected(a))
+            .then(a.device.cmp(&b.device))
+    });
+    Ok(devices)
+}
+
+fn ethernet_connected(device: &EthernetDevice) -> bool {
+    matches!(
+        device.state.as_str(),
+        "connected" | "connecting (getting IP configuration)"
+    )
+}
+
+fn bluetooth_powered() -> Result<bool, String> {
+    let output = run_control_command("bluetoothctl", &["show"])?;
+    Ok(bluetooth_info_value(&output, "Powered"))
+}
+
+fn parse_bluetooth_devices(output: &str, paired: bool) -> Vec<BluetoothDevice> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(3, ' ');
+            if parts.next()? != "Device" {
+                return None;
+            }
+
+            Some(BluetoothDevice {
+                address: parts.next()?.to_string(),
+                name: parts.next().unwrap_or("Unknown Device").to_string(),
+                paired,
+                connected: false,
+            })
+        })
+        .collect()
+}
+
+fn bluetooth_info_value(info: &str, key: &str) -> bool {
+    info.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix(key)
+            .and_then(|value| value.trim().strip_prefix(':'))
+            .map(|value| value.trim() == "yes")
+            .unwrap_or(false)
+    })
+}
+
+fn load_bluetooth_devices() -> Result<Vec<BluetoothDevice>, String> {
+    let paired_output = run_control_command("bluetoothctl", &["paired-devices"])?;
+    let all_output = run_control_command("bluetoothctl", &["devices"])?;
+
+    let mut devices = parse_bluetooth_devices(&paired_output, true);
+
+    for device in parse_bluetooth_devices(&all_output, false) {
+        if !devices.iter().any(|known| known.address == device.address) {
+            devices.push(device);
+        }
+    }
+
+    for device in &mut devices {
+        if let Ok(info) = run_control_command("bluetoothctl", &["info", &device.address]) {
+            device.connected = bluetooth_info_value(&info, "Connected");
+            device.paired = device.paired || bluetooth_info_value(&info, "Paired");
+        }
+    }
+
+    devices.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then(b.paired.cmp(&a.paired))
+            .then(a.name.cmp(&b.name))
+    });
+
+    Ok(devices)
+}
+
 pub struct SettingsPanel {
     pub open: bool,
     tab: SettingsPage,
     config: FocalDeskConfig,
+    wifi_passwords: HashMap<String, String>,
+    network_status: String,
+    bluetooth_status: String,
+    bluetooth_scanning: bool,
+    debug_status: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     Appearance,
+    Network,
+    Bluetooth,
     Displays,
     Workspaces,
     Keyboard,
@@ -47,6 +426,11 @@ impl Default for SettingsPanel {
         Self {
             tab: SettingsPage::Appearance,
             config: FocalDeskConfig::default(),
+            wifi_passwords: HashMap::new(),
+            network_status: String::new(),
+            bluetooth_status: String::new(),
+            bluetooth_scanning: false,
+            debug_status: "Diagnostics are generated locally".to_string(),
             open: false,
         }
     }
@@ -60,6 +444,14 @@ impl SettingsPanel {
 
         if sidebar_button(ui, "Appearance", self.tab == SettingsPage::Appearance).clicked() {
             self.tab = SettingsPage::Appearance;
+        }
+
+        if sidebar_button(ui, "Network", self.tab == SettingsPage::Network).clicked() {
+            self.tab = SettingsPage::Network;
+        }
+
+        if sidebar_button(ui, "Bluetooth", self.tab == SettingsPage::Bluetooth).clicked() {
+            self.tab = SettingsPage::Bluetooth;
         }
 
         if sidebar_button(ui, "Displays", self.tab == SettingsPage::Displays).clicked() {
@@ -148,6 +540,350 @@ impl SettingsPanel {
         }
     }
 
+    fn network_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Network");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.heading("Ethernet");
+
+            match load_ethernet_devices() {
+                Ok(devices) if devices.is_empty() => {
+                    ui.label("No Ethernet devices found");
+                }
+                Ok(devices) => {
+                    for device in devices {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(&device.device);
+                                ui.label(format!(
+                                    "{} | {}",
+                                    device.state,
+                                    device
+                                        .connection
+                                        .as_deref()
+                                        .unwrap_or("No active connection")
+                                ));
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let command = if ethernet_connected(&device) {
+                                        "disconnect"
+                                    } else {
+                                        "connect"
+                                    };
+                                    let label = if ethernet_connected(&device) {
+                                        "Disconnect"
+                                    } else {
+                                        "Connect"
+                                    };
+
+                                    if ui.button(label).clicked() {
+                                        self.network_status = run_control_command(
+                                            "nmcli",
+                                            &["device", command, &device.device],
+                                        )
+                                        .unwrap_or_else(|err| err);
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+                Err(err) => {
+                    ui.label(err);
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Wi-Fi");
+
+            let mut wifi_enabled = wifi_enabled().unwrap_or(false);
+            if ui.checkbox(&mut wifi_enabled, "Wi-Fi enabled").changed() {
+                let state = if wifi_enabled { "on" } else { "off" };
+                self.network_status = run_control_command("nmcli", &["radio", "wifi", state])
+                    .unwrap_or_else(|err| err);
+            }
+
+            ui.add_space(8.0);
+
+            match load_wifi_networks() {
+                Ok(networks) if networks.is_empty() => {
+                    ui.label(if wifi_enabled {
+                        "No Wi-Fi networks found"
+                    } else {
+                        "Turn on Wi-Fi to scan for networks"
+                    });
+                }
+                Ok(networks) => {
+                    for network in networks {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(if network.active {
+                                    format!("{} (connected)", network.ssid)
+                                } else {
+                                    network.ssid.clone()
+                                });
+                                ui.label(format!(
+                                    "{} | Signal {}%",
+                                    wifi_security_label(&network.security),
+                                    network.signal
+                                ));
+                            });
+
+                            if !network.active {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.button("Connect").clicked() {
+                                            let password = self
+                                                .wifi_passwords
+                                                .get(&network.ssid)
+                                                .cloned()
+                                                .unwrap_or_default();
+                                            self.network_status =
+                                                connect_wifi(&network.ssid, &password)
+                                                    .unwrap_or_else(|err| err);
+                                        }
+
+                                        if !network.security.trim().is_empty()
+                                            && network.security != "--"
+                                        {
+                                            let password = self
+                                                .wifi_passwords
+                                                .entry(network.ssid.clone())
+                                                .or_default();
+                                            ui.add(
+                                                egui::TextEdit::singleline(password)
+                                                    .password(true)
+                                                    .hint_text("Password")
+                                                    .desired_width(160.0),
+                                            );
+                                        }
+                                    },
+                                );
+                            }
+                        });
+                    }
+                }
+                Err(err) => {
+                    ui.label(err);
+                }
+            }
+        });
+
+        if !self.network_status.is_empty() {
+            ui.add_space(8.0);
+            ui.label(&self.network_status);
+        }
+    }
+
+    fn bluetooth_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Bluetooth");
+        ui.add_space(8.0);
+
+        let mut powered = bluetooth_powered().unwrap_or(false);
+        if ui.checkbox(&mut powered, "Bluetooth powered").changed() {
+            let state = if powered { "on" } else { "off" };
+            self.bluetooth_status =
+                run_control_command("bluetoothctl", &["power", state]).unwrap_or_else(|err| err);
+        }
+
+        if ui
+            .checkbox(&mut self.bluetooth_scanning, "Scan for devices")
+            .changed()
+        {
+            let state = if self.bluetooth_scanning { "on" } else { "off" };
+            self.bluetooth_status =
+                run_control_command("bluetoothctl", &["scan", state]).unwrap_or_else(|err| err);
+        }
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Devices");
+
+            match load_bluetooth_devices() {
+                Ok(devices) if devices.is_empty() => {
+                    ui.label(if powered {
+                        "No Bluetooth devices found"
+                    } else {
+                        "Turn on Bluetooth to manage devices"
+                    });
+                }
+                Ok(devices) => {
+                    for device in devices {
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(&device.name);
+                                ui.label(format!(
+                                    "{}{} | {}",
+                                    if device.connected {
+                                        "Connected"
+                                    } else {
+                                        "Disconnected"
+                                    },
+                                    if device.paired { " | Paired" } else { "" },
+                                    device.address
+                                ));
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    let command = if device.connected {
+                                        "disconnect"
+                                    } else {
+                                        "connect"
+                                    };
+                                    let label = if device.connected {
+                                        "Disconnect"
+                                    } else {
+                                        "Connect"
+                                    };
+
+                                    if ui.button(label).clicked() {
+                                        self.bluetooth_status = run_control_command(
+                                            "bluetoothctl",
+                                            &[command, &device.address],
+                                        )
+                                        .unwrap_or_else(|err| err);
+                                    }
+
+                                    if device.paired && ui.button("Trust").clicked() {
+                                        self.bluetooth_status = run_control_command(
+                                            "bluetoothctl",
+                                            &["trust", &device.address],
+                                        )
+                                        .unwrap_or_else(|err| err);
+                                    }
+
+                                    if !device.paired && ui.button("Pair").clicked() {
+                                        self.bluetooth_status = run_control_command(
+                                            "bluetoothctl",
+                                            &["pair", &device.address],
+                                        )
+                                        .unwrap_or_else(|err| err);
+                                    }
+                                },
+                            );
+                        });
+                    }
+                }
+                Err(err) => {
+                    ui.label(err);
+                }
+            }
+        });
+
+        if !self.bluetooth_status.is_empty() {
+            ui.add_space(8.0);
+            ui.label(&self.bluetooth_status);
+        }
+    }
+
+    fn debug_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Debug");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.heading("Diagnostics");
+            ui.label(format!("Session type: {}", session_type_label()));
+            ui.label(format!(
+                "Build profile: {}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            ));
+            ui.label(format!(
+                "Log file: {}",
+                existing_focaldesk_log_path()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".to_string())
+            ));
+
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Open log file").clicked() {
+                    if let Some(path) = existing_focaldesk_log_path() {
+                        self.debug_status = match open_path(&path) {
+                            Ok(()) => "Opened log file".to_string(),
+                            Err(err) => err,
+                        };
+                    } else {
+                        self.debug_status = "No FocalDesk log file was found".to_string();
+                    }
+                }
+
+                if ui.button("Copy diagnostics").clicked() {
+                    ui.ctx().copy_text(diagnostics_text());
+                    self.debug_status = "Diagnostics copied to clipboard".to_string();
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.label(&self.debug_status);
+        });
+    }
+
+    fn about_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("About");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.heading("FocalDesk");
+            ui.label("A Rust desktop environment built on Smithay and GTK4");
+            ui.separator();
+            ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+            ui.label(format!(
+                "Build hash: {}",
+                option_env!("VERGEN_GIT_SHA").unwrap_or("development")
+            ));
+            ui.label("Status: Early alpha");
+        });
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Session");
+            ui.label(format!("Session type: {}", session_type_label()));
+            ui.label(format!(
+                "Build profile: {}",
+                if cfg!(debug_assertions) {
+                    "debug"
+                } else {
+                    "release"
+                }
+            ));
+            ui.label(format!(
+                "Config path: {}",
+                focaldesk_config_path().display()
+            ));
+        });
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Project");
+            ui.label("License: See LICENSE");
+            ui.hyperlink_to(
+                "Source code and issue tracking",
+                "https://github.com/sjweiler/focaldesk",
+            );
+            ui.label("Credits: Smithay, GTK4, PipeWire, Rust");
+        });
+    }
+
     pub fn show(
         &mut self,
         ctx: &egui::Context,
@@ -196,13 +932,15 @@ impl SettingsPanel {
                             ui.add_space(12.0);
                             match self.tab {
                                 SettingsPage::Appearance => self.appearance_page(ui),
+                                SettingsPage::Network => self.network_page(ui),
+                                SettingsPage::Bluetooth => self.bluetooth_page(ui),
                                 SettingsPage::Displays => self.displays_page(ui),
                                 SettingsPage::Workspaces => self.show_placeholder(ui, "Workspaces"),
                                 SettingsPage::Keyboard => self.show_placeholder(ui, "Keyboard"),
                                 SettingsPage::Privacy => self.show_placeholder(ui, "Privacy"),
                                 SettingsPage::Power => self.show_placeholder(ui, "Power"),
-                                SettingsPage::Debug => self.show_placeholder(ui, "Debug"),
-                                SettingsPage::About => self.show_placeholder(ui, "About"),
+                                SettingsPage::Debug => self.debug_page(ui),
+                                SettingsPage::About => self.about_page(ui),
                             }
                         });
                 });

@@ -9,11 +9,15 @@ use smithay::utils::{Logical, Physical, Rectangle, Size};
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
 use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
-use crate::core::render::{FlowRenderElement, FrameCtx, RenderInputs, RenderInputsMut};
+use crate::core::render::{
+    ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
+    RenderInputsMut,
+};
 use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_flow::keybinds::BackendKind;
+use focaldesk_logging::FLogLevel;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowTheme;
 use focaldesk_types::OutputId;
@@ -303,9 +307,7 @@ pub fn prepare_output(
         state.render.fonts_prewarm_done = true;
     }
 
-    if force_full_damage {
-        prepare_portal_chrome_glyphs(state, scale_factor)?;
-    }
+    prepare_portal_chrome_glyphs(state, scale_factor)?;
 
     prepare_lock_screen_glyphs(state)?;
 
@@ -328,6 +330,22 @@ pub fn prepare_output(
         focus_pulse: focus_pulse_value(now.saturating_duration_since(state.focus_changed_at)),
         portal_capture: force_full_damage,
     };
+
+    if state.debug.show_fps && state.render.frame_no % 120 == 0 {
+        let frame_ms = dt.as_secs_f64() * 1000.0;
+        let fps = if dt.is_zero() {
+            0.0
+        } else {
+            1.0 / dt.as_secs_f64()
+        };
+        focaldesk_logging::logging::flog(
+            FLogLevel::Debug,
+            format!(
+                "frame timing output={output_id:?} frame={} dt={frame_ms:.2}ms fps={fps:.1}",
+                state.render.frame_no
+            ),
+        );
+    }
 
     ui_state
         .chrome
@@ -360,6 +378,7 @@ fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::erro
             FontId::RajdhaniSemiBold,
         ],
         BuiltInThemeId::Eagle => &[
+            FontId::IbmPlexSansRegular,
             FontId::IbmPlexSansMedium,
             FontId::OrbitronRegular,
             FontId::OrbitronMedium,
@@ -444,7 +463,7 @@ fn prepare_portal_chrome_glyphs(
     let title_style = style_for(FontRole::Title, 24, builtin_id);
     state.fonts.prepare_text("FOCALDESK", title_style)?;
 
-    let meta_style = style_for(FontRole::Meta, 14, builtin_id);
+    let meta_style = style_for(FontRole::Meta, 18, builtin_id);
     let output_number = state.focused_output.0;
     let meta = format!("OUT {output_number} · WS 1");
     state.fonts.prepare_text(&meta, meta_style)?;
@@ -531,6 +550,34 @@ pub fn draw_output(
     scene: &SceneState,
     output_state: &OutputState,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    draw_output_stage(
+        state,
+        frame,
+        prepared,
+        elements,
+        popup_elements,
+        ui_state,
+        scene,
+        output_state,
+        crate::core::render::OutputRenderStage::All,
+        ClientCompositingMode::Sdr,
+        ChromeGlassPass::InBaseSdr,
+    )
+}
+
+pub fn draw_output_stage(
+    state: &mut DesktopState,
+    frame: &mut GlesFrame<'_, '_>,
+    prepared: &PreparedOutput,
+    elements: &[FlowRenderElement],
+    popup_elements: &[FlowRenderElement],
+    ui_state: &mut UiState<GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    stage: crate::core::render::OutputRenderStage,
+    client_compositing: ClientCompositingMode,
+    chrome_glass_pass: ChromeGlassPass,
+) -> Result<(), Box<dyn std::error::Error>> {
     let egui_frame_ctx = DesktopFrameCtx {
         output_size: prepared.frame_ctx.output_size,
         output_scale: prepared.frame_ctx.output_scale,
@@ -542,7 +589,10 @@ pub fn draw_output(
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         portal_capture: prepared.frame_ctx.portal_capture,
     };
-    if state
+    if matches!(
+        stage,
+        crate::core::render::OutputRenderStage::All | crate::core::render::OutputRenderStage::Base
+    ) && state
         .render
         .egui
         .is_open_on_output(prepared.frame_ctx.rendering_output)
@@ -555,9 +605,14 @@ pub fn draw_output(
         .get(&prepared.frame_ctx.rendering_output)
         .map(|o| o.active_workspace)
         .unwrap_or(state.active_workspace);
-    let notifications = state
-        .notifications
-        .visible_snapshots(prepared.frame_ctx.now);
+    let notifications = if state.lock_screen.active && state.privacy.hide_lock_screen_notifications
+    {
+        Vec::new()
+    } else {
+        state
+            .notifications
+            .visible_snapshots(prepared.frame_ctx.now)
+    };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
 
     let inputs = RenderInputs {
@@ -586,10 +641,13 @@ pub fn draw_output(
         notifications: &notifications,
         lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
+        client_compositing,
+        chrome_glass_pass,
+        surface_transfers: &state.surface_transfers,
     };
 
     let muts = RenderInputsMut { ui: ui_state };
 
-    state.render.render_output(frame, inputs, muts)?;
+    state.render.render_stage(frame, inputs, muts, stage)?;
     Ok(())
 }

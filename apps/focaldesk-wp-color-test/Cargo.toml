@@ -1,0 +1,16 @@
+[package]
+name = "focaldesk-wp-color-test"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal Wayland client for exercising wp_color_management_v1"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-wp-color-test"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+libc = "0.2"
+wayland-client = "0.31"
+wayland-protocols = { workspace = true, features = ["client", "staging"] }

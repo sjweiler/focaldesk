@@ -1,5 +1,7 @@
-use focaldesk_logging::flog_info;
+use focaldesk_logging::{init_default_logging, session_id};
+use tracing::info;
 
 fn main() {
-    flog_info!("Hello, world!");
+    init_default_logging();
+    info!(target: "focaldesk", session_id = session_id(), "ipc daemon started");
 }

@@ -1,7 +1,6 @@
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer;
 use smithay::backend::renderer::ImportDma;
-use smithay::delegate_dmabuf;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 
 use crate::core::desktop::DesktopState;
@@ -61,5 +60,3 @@ impl DmabufHandler for DesktopState {
         }
     }
 }
-
-delegate_dmabuf!(DesktopState);

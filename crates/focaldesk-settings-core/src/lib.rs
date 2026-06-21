@@ -8,6 +8,14 @@ pub struct Settings {
     pub displays: DisplaySettings,
     pub input: InputSettings,
     pub apps: AppSettings,
+    #[serde(default)]
+    pub workspaces: WorkspaceSettings,
+    #[serde(default)]
+    pub privacy: PrivacySettings,
+    #[serde(default)]
+    pub power: PowerSettings,
+    #[serde(default)]
+    pub debug: DebugSettings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +44,10 @@ pub struct OutputConfig {
     pub refresh_mhz: i32,
     pub scale: f32,
     pub primary: bool,
+    #[serde(default)]
+    pub hdr_requested: bool,
+    #[serde(default)]
+    pub hdr_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +61,170 @@ pub struct AppSettings {
     pub terminal: String,
     pub browser: String,
     pub file_manager: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSettings {
+    #[serde(default = "default_restore_session")]
+    pub restore_session: bool,
+}
+
+impl Default for WorkspaceSettings {
+    fn default() -> Self {
+        Self {
+            restore_session: default_restore_session(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DebugLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl Default for DebugLogLevel {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebugSettings {
+    #[serde(default)]
+    pub log_level: DebugLogLevel,
+    #[serde(default)]
+    pub show_fps: bool,
+    #[serde(default)]
+    pub show_damage_regions: bool,
+    #[serde(default)]
+    pub show_input_events: bool,
+    #[serde(default)]
+    pub verbose_protocol_logs: bool,
+}
+
+impl Default for DebugSettings {
+    fn default() -> Self {
+        Self {
+            log_level: DebugLogLevel::default(),
+            show_fps: false,
+            show_damage_regions: false,
+            show_input_events: false,
+            verbose_protocol_logs: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivacySettings {
+    #[serde(default = "default_recent_files")]
+    pub recent_files: bool,
+    #[serde(default = "default_location_services")]
+    pub location_services: bool,
+    #[serde(default = "default_hide_lock_screen_notifications")]
+    pub hide_lock_screen_notifications: bool,
+}
+
+impl Default for PrivacySettings {
+    fn default() -> Self {
+        Self {
+            recent_files: default_recent_files(),
+            location_services: default_location_services(),
+            hide_lock_screen_notifications: default_hide_lock_screen_notifications(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowerSettings {
+    #[serde(default = "default_blank_screen_minutes")]
+    pub blank_screen_minutes: Option<u32>,
+    #[serde(default = "default_suspend_minutes")]
+    pub suspend_minutes: Option<u32>,
+    #[serde(default)]
+    pub power_button_action: PowerButtonAction,
+    #[serde(default)]
+    pub lid_close_action: LidCloseAction,
+    #[serde(default)]
+    pub low_battery_action: LowBatteryAction,
+    #[serde(default)]
+    pub performance_mode: PerformanceMode,
+}
+
+impl Default for PowerSettings {
+    fn default() -> Self {
+        Self {
+            blank_screen_minutes: default_blank_screen_minutes(),
+            suspend_minutes: default_suspend_minutes(),
+            power_button_action: PowerButtonAction::default(),
+            lid_close_action: LidCloseAction::default(),
+            low_battery_action: LowBatteryAction::default(),
+            performance_mode: PerformanceMode::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerButtonAction {
+    ShowPowerMenu,
+    Suspend,
+    PowerOff,
+    DoNothing,
+}
+
+impl Default for PowerButtonAction {
+    fn default() -> Self {
+        Self::ShowPowerMenu
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LidCloseAction {
+    Suspend,
+    BlankScreen,
+    LockScreen,
+    DoNothing,
+}
+
+impl Default for LidCloseAction {
+    fn default() -> Self {
+        Self::Suspend
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LowBatteryAction {
+    NotifyOnly,
+    Suspend,
+    Hibernate,
+    PowerOff,
+}
+
+impl Default for LowBatteryAction {
+    fn default() -> Self {
+        Self::NotifyOnly
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceMode {
+    Balanced,
+    Performance,
+    PowerSaver,
+}
+
+impl Default for PerformanceMode {
+    fn default() -> Self {
+        Self::Balanced
+    }
 }
 
 pub fn default_settings() -> Settings {
@@ -71,7 +247,35 @@ pub fn default_settings() -> Settings {
             browser: "google-chrome".into(),
             file_manager: "focaldesk-files".into(),
         },
+        workspaces: WorkspaceSettings::default(),
+        privacy: PrivacySettings::default(),
+        power: PowerSettings::default(),
+        debug: DebugSettings::default(),
     }
+}
+
+fn default_recent_files() -> bool {
+    true
+}
+
+fn default_restore_session() -> bool {
+    true
+}
+
+fn default_location_services() -> bool {
+    false
+}
+
+fn default_hide_lock_screen_notifications() -> bool {
+    true
+}
+
+fn default_blank_screen_minutes() -> Option<u32> {
+    Some(10)
+}
+
+fn default_suspend_minutes() -> Option<u32> {
+    Some(15)
 }
 
 pub fn settings_path() -> PathBuf {
@@ -98,4 +302,24 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
 
     let json = serde_json::to_string_pretty(settings)?;
     fs::write(path, json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_restore_setting_defaults_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("workspaces");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.workspaces.restore_session);
+
+        let mut settings = settings;
+        settings.workspaces.restore_session = false;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!restored.workspaces.restore_session);
+    }
 }

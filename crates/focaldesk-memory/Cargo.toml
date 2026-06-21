@@ -2,7 +2,7 @@
 name = "focaldesk-memory"
 version = "0.1.0"
 edition = "2021"
-description = "Core primitives, traits, and shared types for FocalDesk"
+description = "Vector storage, embedding generation, semantic search, and long-term memory support for FocalDesk AI"
 license = "MIT"
 authors = ["Steve"]
 

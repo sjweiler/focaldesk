@@ -1,8 +1,10 @@
 pub mod app;
+pub mod color;
 pub mod consts;
 pub mod desktop;
 pub mod input;
 pub mod layout;
+pub mod linear_compositing;
 pub mod lock;
 pub mod output;
 pub mod output_store;

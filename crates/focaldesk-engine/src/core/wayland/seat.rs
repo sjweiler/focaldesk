@@ -1,5 +1,4 @@
 use focaldesk_flow::keybinds::BackendKind;
-use smithay::delegate_seat;
 use smithay::input::{
     pointer::CursorIcon, pointer::CursorImageStatus, Seat, SeatHandler, SeatState,
 };
@@ -51,7 +50,6 @@ impl SeatHandler for DesktopState {
         set_primary_focus(&self.display_handle, seat, client);
     }
 }
-delegate_seat!(DesktopState);
 
 impl DesktopState {
     pub fn init_seat(

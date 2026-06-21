@@ -38,6 +38,10 @@ impl CursorManager {
         self.state.set(icon.into());
     }
 
+    pub fn set_flow_icon(&mut self, icon: FlowCursorIcon) {
+        self.state.set(icon);
+    }
+
     pub fn current_flow_icon(&self) -> FlowCursorIcon {
         self.state.current()
     }

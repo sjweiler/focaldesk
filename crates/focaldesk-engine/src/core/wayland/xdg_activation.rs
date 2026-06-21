@@ -1,4 +1,3 @@
-use smithay::delegate_xdg_activation;
 use smithay::wayland::xdg_activation::{
     XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
 };
@@ -24,5 +23,3 @@ impl XdgActivationHandler for DesktopState {
         let _ = self.xdg_activation_state.remove_token(&token);
     }
 }
-
-delegate_xdg_activation!(DesktopState);

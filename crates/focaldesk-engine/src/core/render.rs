@@ -31,7 +31,7 @@ use smithay::backend::renderer::gles::GlesTexProgram;
 use crate::core::scene::SceneState;
 //use crate::core::output::OutputId;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
-use focaldesk_logging::{flog, flog_error, flog_info};
+use focaldesk_logging::{flog, flog_error, flog_info, session_id};
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
@@ -42,6 +42,7 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
+use crate::core::color::{srgb_to_linear, TransferFunction};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame};
 use crate::core::fonts::style_for;
@@ -72,6 +73,7 @@ use smithay::backend::renderer::gles::Uniform;
 use smithay::wayland::seat::WaylandFocus;
 #[cfg(feature = "xwayland")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+use tracing::{error, info};
 
 //use crate::core::chrome_svg::ChromeSvgCache;
 
@@ -102,6 +104,34 @@ pub struct FrameCtx {
     /// Full-frame portal/OBS capture — keep egui and chrome on the captured output.
     pub portal_capture: bool,
     //pub time: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputRenderStage {
+    All,
+    Base,
+    /// Work-area glass in FP16 after the opaque base blit, before clients.
+    LinearGlassUnderClients,
+    Clients,
+    Overlay,
+}
+
+/// Where work-area glass is composited in the staged linear SDR path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ChromeGlassPass {
+    /// Legacy single-pass SDR: glass in the base stage.
+    #[default]
+    InBaseSdr,
+    /// Staged linear: opaque base only; glass deferred.
+    Skip,
+    /// Staged linear: draw glass into the FP16 target with linearized colors.
+    LinearUnderClients,
+}
+
+#[derive(Clone)]
+pub enum ClientCompositingMode {
+    Sdr,
+    Linear { srgb_to_linear: GlesTexProgram },
 }
 
 impl FrameCtx {
@@ -184,10 +214,30 @@ pub struct RenderInputs<'a> {
     pub notifications: &'a [NotificationSnapshot],
     pub lock_screen: &'a LockScreenSnapshot,
     pub flip_egui_y: bool,
+    pub client_compositing: ClientCompositingMode,
+    pub chrome_glass_pass: ChromeGlassPass,
+    pub surface_transfers: &'a std::collections::HashMap<Id, TransferFunction>,
 }
 
 pub struct RenderInputsMut<'a> {
     pub ui: &'a mut UiState<GlesTexture>,
+}
+
+fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
+    [
+        srgb_to_linear(c[0]),
+        srgb_to_linear(c[1]),
+        srgb_to_linear(c[2]),
+        c[3],
+    ]
+}
+
+fn glass_style_linear(style: &GlassStyle) -> GlassStyle {
+    GlassStyle {
+        tint: linearize_rgba(style.tint),
+        edge_color: linearize_rgba(style.edge_color),
+        ..*style
+    }
 }
 
 fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> ChromeTheme {
@@ -659,7 +709,12 @@ impl RenderState {
                 Some(program),
                 &[Uniform::new("u_tint", color)],
             ) {
-                flog_error!("tinted icon render failed: {:?}", e);
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = ?e,
+                    "tinted icon render failed"
+                );
             }
 
             // ✅ MUST be inside loop
@@ -855,7 +910,13 @@ impl RenderState {
                 Some(program),
                 &[Uniform::new("u_tint", style.tint)], //&[Uniform::new("u_tint", tint)],
             ) {
-                flog_error!("tinted icon render failed for {:?}: {:?}", icon, e);
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    icon = ?icon,
+                    error = ?e,
+                    "tinted icon render failed"
+                );
             }
         }
     }
@@ -1139,6 +1200,18 @@ impl RenderState {
         let text_w = fonts.advance_width(text, style);
         let x_logical = rect_logical.loc.x + ((rect_logical.size.w - text_w).max(0) / 2);
         let y_logical = rect_logical.loc.y + 24;
+        let shadow = [0.02, 0.01, 0.0, color[3].min(0.9)];
+
+        self.draw_text_cached(
+            frame,
+            fonts,
+            text,
+            x_logical + 1,
+            y_logical + 1,
+            style,
+            shadow,
+            scale,
+        )?;
 
         self.draw_text_cached(
             frame, fonts, text, x_logical, y_logical, style, color, scale,
@@ -1151,33 +1224,56 @@ impl RenderState {
         if self.wallpaper_texture.is_some() {
             return;
         }
-        flog_info!("ensure_wallpaper_loaded: attempting load...");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            "ensure_wallpaper_loaded: attempting load"
+        );
 
         let tex = Self::load_wallpaper(
             renderer,
             "/home/steve/focaldesk/assets/wallpaper/focaldesk_wallpaper.png",
         );
-        flog_info!(
-            "ensure_wallpaper_loaded: load result is_some={}",
-            tex.is_some()
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            loaded = tex.is_some(),
+            "ensure_wallpaper_loaded: load result"
         );
 
         self.wallpaper_texture = tex;
     }
 
     pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<GlesTexture> {
-        flog_info!("load_wallpaper: opening {path}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            path = %path,
+            "load_wallpaper: opening"
+        );
 
         let img = match image::open(path) {
             Ok(i) => i,
             Err(e) => {
-                flog_error!("load_wallpaper: image::open failed: {e:?}");
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    path = %path,
+                    error = ?e,
+                    "load_wallpaper: image::open failed"
+                );
                 return None;
             }
         };
 
         let (w, h) = img.dimensions();
-        flog_info!("load_wallpaper: decoded {w}x{h}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            width = w,
+            height = h,
+            "load_wallpaper: decoded"
+        );
 
         //let rgba = img.to_rgba8();
         let mut rgba = img.to_rgba8();
@@ -1187,19 +1283,38 @@ impl RenderState {
         }
 
         //let fourcc = Fourcc::Rgba8888;
-        flog_info!("load_wallpaper: rgba bytes={}", rgba.len());
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            bytes = rgba.len(),
+            "load_wallpaper: rgba bytes"
+        );
 
         // IMPORTANT: your buffer is RGBA; ABGR is often wrong here.
         let fourcc = Fourcc::Argb8888; // try this first
-        flog_info!("load_wallpaper: importing to GPU as {fourcc:?}");
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            fourcc = ?fourcc,
+            "load_wallpaper: importing to GPU"
+        );
 
         match renderer.import_memory(&rgba, fourcc, (w as i32, h as i32).into(), false) {
             Ok(tex) => {
-                flog_info!("load_wallpaper: import_memory OK");
+                info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    "load_wallpaper: import_memory OK"
+                );
                 Some(tex)
             }
             Err(e) => {
-                flog_error!("load_wallpaper: import_memory FAILED: {e:?}");
+                error!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = ?e,
+                    "load_wallpaper: import_memory FAILED"
+                );
                 None
             }
         }
@@ -1363,60 +1478,74 @@ impl RenderState {
         inputs: RenderInputs<'_>,
         muts: RenderInputsMut<'_>,
     ) -> Result<(), GlesError> {
+        self.render_stage(frame, inputs, muts, OutputRenderStage::All)
+    }
+
+    pub fn render_stage(
+        &mut self,
+        frame: &mut GlesFrame<'_, '_>,
+        inputs: RenderInputs<'_>,
+        muts: RenderInputsMut<'_>,
+        stage: OutputRenderStage,
+    ) -> Result<(), GlesError> {
         let theme = inputs.theme;
 
-        self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
+        if matches!(stage, OutputRenderStage::All | OutputRenderStage::Base) {
+            self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
 
-        // Chrome draws opaque bevels over the work region; clients must be composited
-        // after that shell (and work-area wallpaper), or they are fully covered.
-        self.draw_chrome_below_work_wallpaper(
-            frame,
-            inputs.ctx,
-            inputs.layout,
-            inputs.output,
-            inputs.metrics,
-            muts.ui,
-            inputs.sidebar_hover_slot,
-            inputs.sidebar_pulse,
-            inputs.topbar_pulse,
-            inputs.clock_pulse,
-            theme.chrome,
-        );
-
-        self.draw_wallpaper_in_rect(
-            frame,
-            inputs.ctx,
-            inputs.layout.work_area.recess,
-            inputs.ctx.output_scale,
-            theme.wallpaper.clone(),
-        );
-
-        // Work-area glass must sit under client surfaces (trim/icons stay above).
-        if let Some(glass) = self.chrome_shaders.glass.as_ref() {
-            let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-            let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
-                Point::<i32, Physical>::from((0, 0)),
-                Size::<i32, Physical>::from(inputs.ctx.output_size),
-            );
-            let damage = &[fullscreen_rect];
-            self.draw_workarea_glass(
+            // Chrome draws opaque bevels over the work region; clients must be composited
+            // after that shell (and work-area wallpaper), or they are fully covered.
+            self.draw_chrome_below_work_wallpaper(
                 frame,
                 inputs.ctx,
-                glass,
-                inputs.layout.work_area.glass,
+                inputs.layout,
+                inputs.output,
+                inputs.metrics,
+                muts.ui,
+                inputs.sidebar_hover_slot,
+                inputs.sidebar_pulse,
+                inputs.topbar_pulse,
+                inputs.clock_pulse,
+                theme.chrome,
+            );
+
+            self.draw_wallpaper_in_rect(
+                frame,
+                inputs.ctx,
+                inputs.layout.work_area.recess,
                 inputs.ctx.output_scale,
-                damage,
-                &legacy_theme.glass,
-            )?;
+                theme.wallpaper.clone(),
+            );
+
+            // Work-area glass must sit under client surfaces (trim/icons stay above).
+            if matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr) {
+                self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+            }
         }
 
-        self.draw_clients(
-            frame,
-            inputs.ctx,
-            inputs.scene,
-            inputs.output,
-            inputs.elements,
-        );
+        if matches!(stage, OutputRenderStage::LinearGlassUnderClients) {
+            self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+            return Ok(());
+        }
+
+        if matches!(stage, OutputRenderStage::All | OutputRenderStage::Clients) {
+            self.draw_clients(
+                frame,
+                inputs.ctx,
+                inputs.elements,
+                inputs.client_compositing,
+                inputs.surface_transfers,
+            );
+        }
+
+        if matches!(
+            stage,
+            OutputRenderStage::Base
+                | OutputRenderStage::Clients
+                | OutputRenderStage::LinearGlassUnderClients
+        ) {
+            return Ok(());
+        }
 
         self.draw_chrome_trim_glass_icons(
             frame,
@@ -1463,7 +1592,12 @@ impl RenderState {
         }
 
         if let Err(err) = self.draw_active_output_glow(frame, inputs.ctx, theme) {
-            flog_error!("active output accent render failed: {:?}", err);
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = ?err,
+                "active output accent render failed"
+            );
         }
 
         let egui_frame_ctx = DesktopFrameCtx {
@@ -2085,6 +2219,40 @@ impl RenderState {
             _ => None,
         }
     }
+    fn draw_work_area_glass_layer(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        inputs: &RenderInputs<'_>,
+        theme: &FlowTheme,
+    ) -> Result<(), GlesError> {
+        let Some(glass) = self.chrome_shaders.glass.as_ref() else {
+            return Ok(());
+        };
+        let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
+        let style = if matches!(
+            inputs.chrome_glass_pass,
+            ChromeGlassPass::LinearUnderClients
+        ) {
+            glass_style_linear(&legacy_theme.glass)
+        } else {
+            legacy_theme.glass
+        };
+        let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
+            Point::<i32, Physical>::from((0, 0)),
+            Size::<i32, Physical>::from(inputs.ctx.output_size),
+        );
+        let damage = &[fullscreen_rect];
+        self.draw_workarea_glass(
+            frame,
+            inputs.ctx,
+            glass,
+            inputs.layout.work_area.glass,
+            inputs.ctx.output_scale,
+            damage,
+            &style,
+        )
+    }
+
     fn draw_workarea_glass(
         &self,
         frame: &mut GlesFrame<'_, '_>,
@@ -2378,7 +2546,6 @@ impl RenderState {
         let dst = dst_world;
 
         let dsts = [dst];
-        let damage = [target_physical];
 
         let tw = src.w as f64;
         let th = src.h as f64;
@@ -2402,7 +2569,7 @@ impl RenderState {
                 src_rect,
                 dst,
                 &dsts,
-                &damage,
+                &[],
                 Transform::Normal,
                 1.0,
                 wallpaper_tint,
@@ -2689,17 +2856,42 @@ impl RenderState {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
-        _scene: &SceneState,
-        _output: &OutputState,
         elements: &[FlowRenderElement],
+        client_compositing: ClientCompositingMode,
+        surface_transfers: &std::collections::HashMap<Id, TransferFunction>,
     ) {
-        // 1) Build elements from Space<Window>
-        //let elements = build_client_elements(&scene.space, renderer, ctx);
+        use smithay::backend::renderer::element::Element;
 
         let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        draw_render_elements(frame, ctx.output_scale.x, &elements, damage).unwrap();
+        let ClientCompositingMode::Linear { srgb_to_linear } = client_compositing else {
+            draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+            return;
+        };
+
+        let mut srgb_batch = Vec::new();
+        let mut linear_batch = Vec::new();
+        for elem in elements {
+            let transfer = surface_transfers
+                .get(elem.id())
+                .copied()
+                .unwrap_or(TransferFunction::Srgb);
+            if transfer == TransferFunction::Linear {
+                linear_batch.push(elem);
+            } else {
+                srgb_batch.push(elem);
+            }
+        }
+
+        if !srgb_batch.is_empty() {
+            frame.override_default_tex_program(srgb_to_linear, Vec::new());
+            draw_render_elements(frame, ctx.output_scale.x, &srgb_batch, damage).unwrap();
+            frame.clear_tex_program_override();
+        }
+        if !linear_batch.is_empty() {
+            draw_render_elements(frame, ctx.output_scale.x, &linear_batch, damage).unwrap();
+        }
     }
 
     /// Top bar, sidebar, work-area bezel, and joints — everything that must sit *under*

@@ -16,6 +16,10 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
+use crate::core::color::{
+    effective_transfer, force_linear_surfaces, ColorDescription, SurfaceColorState,
+    TransferFunction,
+};
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
@@ -24,14 +28,15 @@ use focaldesk_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton,
 use focaldesk_ui::element::UiElement;
 use focaldesk_ui::types::{ElementId, PanelKind, UiAction, UiElementKind};
 use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState};
+use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::{keysyms, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
+use smithay::reexports::wayland_server::Resource;
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
-use focaldesk_cursor::CursorManager;
-use smithay::backend::renderer::element::Id;
+use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
 #[cfg(feature = "xwayland")]
@@ -40,7 +45,8 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
@@ -59,14 +65,19 @@ use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
 use focaldesk_ipc::{IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
-use focaldesk_logging::{flog, flog_error, flog_info, flog_warn};
+use focaldesk_logging::session_id;
+use focaldesk_logging::{
+    flog, flog_error, flog_info, flog_warn, log_file_path_candidates, set_log_level, FLogLevel,
+};
 use focaldesk_notifications::NotificationManager;
-use focaldesk_settings_core::{AppSettings, OutputConfig};
+use focaldesk_settings_core::{
+    load_settings, AppSettings, DebugLogLevel, DebugSettings, OutputConfig, PrivacySettings,
+};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
-use smithay::delegate_output;
+use smithay::delegate_dispatch2;
 use smithay::input::keyboard::FilterResult;
 use smithay::input::Seat;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
@@ -83,6 +94,7 @@ use std::path::{Path, PathBuf};
 use std::process::id;
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tracing::{debug, info_span, trace};
 use tracing_subscriber::fmt::time;
 use wayland_protocols::xdg::shell::server::xdg_toplevel::{self, ResizeEdge};
 
@@ -95,8 +107,10 @@ use smithay::wayland::xdg_activation::XdgActivationState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::X11Wm;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use wayland_server::DisplayHandle;
@@ -123,10 +137,22 @@ use focaldesk_ui::ui_builder::{
     SIDEBAR_WORKSPACE_3_ID,
 };
 
+pub(crate) const DND_CURSOR_ENDED: u8 = 0;
+pub(crate) const DND_CURSOR_FILE: u8 = 1;
+pub(crate) const DND_CURSOR_VALID: u8 = 2;
+pub(crate) const DND_CURSOR_INVALID: u8 = 3;
+
 pub(crate) fn dbg_flush(msg: &str) {
-    let mut stderr = io::stderr();
-    let _ = writeln!(stderr, "{msg}");
-    let _ = stderr.flush();
+    if !focaldesk_logging::enabled(FLogLevel::Debug) {
+        return;
+    }
+
+    tracing::debug!(
+        target: "focaldesk",
+        session_id = session_id(),
+        message = %msg,
+        "dbg_flush"
+    );
 }
 
 fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
@@ -137,19 +163,38 @@ fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
         let listener = match UnixListener::bind(DESKTOP_SOCKET_PATH) {
             Ok(listener) => listener,
             Err(err) => {
-                flog_warn!("failed to bind desktop settings IPC socket: {err}");
+                tracing::warn!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    path = %DESKTOP_SOCKET_PATH,
+                    error = %err,
+                    "failed to bind desktop settings IPC socket"
+                );
                 return;
             }
         };
 
-        flog_info!("desktop settings IPC listening on {DESKTOP_SOCKET_PATH}");
+        tracing::info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            path = %DESKTOP_SOCKET_PATH,
+            "desktop settings IPC listening"
+        );
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
                     let tx = tx.clone();
                     thread::spawn(move || handle_desktop_settings_ipc_stream(&mut stream, &tx));
                 }
-                Err(err) => flog_warn!("desktop settings IPC accept failed: {err}"),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        path = %DESKTOP_SOCKET_PATH,
+                        error = %err,
+                        "desktop settings IPC accept failed"
+                    );
+                }
             }
         }
     });
@@ -294,6 +339,7 @@ pub struct OutputState {
     pub scale_factor: f64,
     pub scale: Scale<f64>,
     pub hdr_supported: bool,
+    pub hdr_requested: bool,
     pub hdr_enabled: bool,
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
@@ -357,6 +403,9 @@ pub struct DesktopInit {
     pub output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
+    pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
+    pub color_management_state:
+        crate::core::wayland::color_management_protocol::ColorManagementState,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
@@ -366,6 +415,8 @@ pub struct DesktopInit {
     pub client_wayland_display: String,
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
+    pub privacy: PrivacySettings,
+    pub debug: DebugSettings,
 }
 
 enum DesktopIpcMessage {
@@ -423,11 +474,17 @@ pub struct DesktopState {
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
     pub image_copy_capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
+    pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
+    pub color_management_state:
+        crate::core::wayland::color_management_protocol::ColorManagementState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
     /// Latest DRM offscreen texture per output for portal/OBS capture.
     pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
+    /// Offscreen targets for portal re-render fallback (matches linear/legacy scanout path).
+    pub portal_offscreen_targets:
+        HashMap<OutputId, crate::core::linear_compositing::LinearOffscreenTargets>,
     /// Set after the first successful DRM present; portal capture waits for this.
     pub compositor_ready: bool,
     pub backend_kind: BackendKind,
@@ -448,6 +505,7 @@ pub struct DesktopState {
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
+    pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
 
     // shell/chrome
     //pub topbar: TopBarModel,
@@ -462,6 +520,8 @@ pub struct DesktopState {
 
     pub client_wayland_display: String,
     pub apps: AppSettings,
+    pub privacy: PrivacySettings,
+    pub debug: DebugSettings,
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
     settings_ipc_watchers: Vec<DesktopIpcWatcher>,
     settings_ipc_config: FocalDeskConfig,
@@ -497,6 +557,8 @@ pub struct DesktopState {
     pub fonts: FontSystem,
 
     pub theme: ThemeManager,
+    /// Latest committed transfer function per Wayland surface render id.
+    pub surface_transfers: HashMap<Id, TransferFunction>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
     pub sidebar_pulse: Option<SidebarPulse>,
@@ -511,6 +573,23 @@ pub struct DesktopState {
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
 pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
+
+fn apply_debug_log_level(level: DebugLogLevel) {
+    let level = match level {
+        DebugLogLevel::Error => FLogLevel::Error,
+        DebugLogLevel::Warn => FLogLevel::Warn,
+        DebugLogLevel::Info => FLogLevel::Info,
+        DebugLogLevel::Debug => FLogLevel::Debug,
+        DebugLogLevel::Trace => FLogLevel::Trace,
+    };
+    set_log_level(level);
+}
+
+fn debug_damage_enabled(debug: &DebugSettings) -> bool {
+    debug.show_damage_regions
+        || std::env::var("FOCALDESK_DAMAGE_DEBUG")
+            .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct SidebarPulse {
@@ -660,12 +739,26 @@ impl DesktopState {
                     },
                 }
             }
-            IpcRequest::ReloadConfig | IpcRequest::Reload => {
+            IpcRequest::ReloadConfig => {
                 let old_config = self.settings_ipc_config.clone();
                 let config = load_config();
                 self.notify_config_changes(&old_config, &config);
                 self.settings_ipc_config = config.clone();
                 self.apply_config(config);
+                IpcResponse::Ok
+            }
+            IpcRequest::Reload => {
+                let old_config = self.settings_ipc_config.clone();
+                let config = load_config();
+                self.notify_config_changes(&old_config, &config);
+                self.settings_ipc_config = config.clone();
+                self.apply_config(config);
+
+                let settings = load_settings();
+                self.apps = settings.apps;
+                self.privacy = settings.privacy;
+                self.apply_debug_settings(settings.debug);
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 IpcResponse::Ok
             }
             IpcRequest::IdentifyDisplays => {
@@ -703,6 +796,17 @@ impl DesktopState {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
             },
         }
+    }
+
+    fn apply_debug_settings(&mut self, debug: DebugSettings) {
+        apply_debug_log_level(debug.log_level);
+        self.damage_debug_enabled = debug_damage_enabled(&debug);
+        if debug.verbose_protocol_logs && !self.debug.verbose_protocol_logs {
+            flog_info!(
+                "verbose protocol logs are enabled for components that support runtime logging"
+            );
+        }
+        self.debug = debug;
     }
 
     fn apply_display_configs(&mut self, outputs: Vec<OutputConfig>) -> Result<(), String> {
@@ -744,6 +848,7 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
+                output.hdr_requested = config.hdr_requested || config.hdr_enabled;
             }
             self.update_output_size(output_id, physical_size, scale_factor);
 
@@ -871,7 +976,22 @@ impl DesktopState {
     }
 
     fn apply_config(&mut self, config: FocalDeskConfig) {
-        self.theme.set_builtin(theme_id_from_config(&config));
+        let old_theme_id = self.theme.active_theme().id.clone();
+        let new_theme_id = theme_id_from_config(&config);
+
+        self.theme.set_builtin(new_theme_id.clone());
+
+        if old_theme_id != new_theme_id {
+            if let Some(theme_id) = new_theme_id.builtin_id() {
+                if let Err(err) = self.fonts.reload_for_theme(theme_id) {
+                    flog_error!("failed to reload fonts for theme {:?}: {err}", theme_id);
+                }
+            }
+
+            self.render.fonts_prewarm_done = false;
+            self.render.font_atlas_texture = None;
+        }
+
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
@@ -1784,6 +1904,13 @@ impl DesktopState {
         activate: bool,
     ) {
         let space_loc = bbox_loc + window.geometry().loc;
+        trace!(
+            target: "focaldesk",
+            ?bbox_loc,
+            ?space_loc,
+            activate,
+            "map window bbox"
+        );
         self.space.map_element(window, space_loc, activate);
     }
 
@@ -2178,12 +2305,12 @@ impl DesktopState {
                 self.running = false;
             }
             focaldesk_ui::types::SystemCommand::Restart => {
-                if let Err(err) = Command::new("systemctl").arg("reboot").spawn() {
+                if let Err(err) = focaldesk_power::PowerManager::new().reboot() {
                     flog_error!("failed to start reboot: {err}");
                 }
             }
             focaldesk_ui::types::SystemCommand::Shutdown => {
-                if let Err(err) = Command::new("systemctl").arg("poweroff").spawn() {
+                if let Err(err) = focaldesk_power::PowerManager::new().power_off() {
                     flog_error!("failed to start poweroff: {err}");
                 }
             }
@@ -2417,6 +2544,7 @@ impl DesktopState {
                 scale_factor,
                 scale: Scale::from((scale_factor, scale_factor)),
                 hdr_supported: false,
+                hdr_requested: false,
                 hdr_enabled: false,
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
@@ -3008,6 +3136,19 @@ impl DesktopState {
     }
 
     fn update_pointer_cursor(&mut self, position: Point<f64, Logical>) {
+        if self
+            .dnd_cursor_phase
+            .as_ref()
+            .is_some_and(|phase| phase.load(Ordering::Relaxed) == DND_CURSOR_ENDED)
+        {
+            self.dnd_cursor_phase = None;
+        }
+
+        if let Some(icon) = self.dnd_cursor_icon(position) {
+            self.set_flow_cursor_icon(icon);
+            return;
+        }
+
         if let Some(interaction) = &self.toplevel_pointer {
             let icon = match interaction {
                 ToplevelPointerInteraction::Resize { edges, .. } => cursor_for_resize_edges(*edges),
@@ -3028,6 +3169,42 @@ impl DesktopState {
         } else {
             self.cursor_manager.set_icon(CursorIcon::Default);
         }
+    }
+
+    pub(crate) fn begin_dnd_cursor(&mut self, phase: Arc<AtomicU8>) {
+        phase.store(DND_CURSOR_FILE, Ordering::Relaxed);
+        self.dnd_cursor_phase = Some(phase);
+        self.set_flow_cursor_icon(FlowCursorIcon::FileDrag);
+    }
+
+    pub(crate) fn end_dnd_cursor(&mut self) {
+        self.dnd_cursor_phase = None;
+        self.set_flow_cursor_icon(FlowCursorIcon::Default);
+    }
+
+    fn dnd_cursor_icon(&self, position: Point<f64, Logical>) -> Option<FlowCursorIcon> {
+        let phase_cell = self.dnd_cursor_phase.as_ref()?;
+        if phase_cell.load(Ordering::Relaxed) == DND_CURSOR_FILE
+            && self.pointer_surface_under(position).is_none()
+        {
+            phase_cell.store(DND_CURSOR_INVALID, Ordering::Relaxed);
+        }
+
+        let phase = phase_cell.load(Ordering::Relaxed);
+        match phase {
+            DND_CURSOR_VALID => Some(FlowCursorIcon::FileDragCopy),
+            DND_CURSOR_INVALID => Some(FlowCursorIcon::NotAllowed),
+            _ => Some(FlowCursorIcon::FileDrag),
+        }
+    }
+
+    pub(crate) fn set_flow_cursor_icon(&mut self, icon: FlowCursorIcon) {
+        if self.cursor_manager.current_flow_icon() == icon {
+            return;
+        }
+        self.cursor_manager.set_flow_icon(icon);
+        self.drm_submit_hw_cursor = true;
+        self.mark_focused_output_full_damage(DamageSource::Cursor);
     }
 
     pub(crate) fn focus_window_id(&mut self, window_id: WindowId) {
@@ -3115,6 +3292,9 @@ impl DesktopState {
     }
 
     pub fn new(init: DesktopInit) -> Self {
+        let debug = init.debug.clone();
+        apply_debug_log_level(debug.log_level);
+
         Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -3157,10 +3337,13 @@ impl DesktopState {
             output_capture_source_state: init.output_capture_source_state,
             image_copy_capture_state: init.image_copy_capture_state,
             image_copy_capture_sessions: Vec::new(),
+            color_tag_state: init.color_tag_state,
+            color_management_state: init.color_management_state,
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
             portal_frame_cache: HashMap::new(),
             portal_capture_source: HashMap::new(),
+            portal_offscreen_targets: HashMap::new(),
             compositor_ready: false,
             backend_kind: init.backend_kind,
             cursor_manager: init.cursor_manager,
@@ -3176,6 +3359,7 @@ impl DesktopState {
             focused_window: None,
             pointer_pos: (0.0, 0.0).into(),
             toplevel_pointer: None,
+            dnd_cursor_phase: None,
 
             notifications: init.notifications,
             lock_screen: LockScreenState::new(),
@@ -3183,6 +3367,8 @@ impl DesktopState {
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
+            privacy: init.privacy,
+            debug: debug.clone(),
             settings_ipc_rx: start_desktop_settings_ipc(),
             settings_ipc_watchers: Vec::new(),
             settings_ipc_config: load_config(),
@@ -3200,8 +3386,8 @@ impl DesktopState {
             screenshot_all_requested: false,
             screenshot_seq: 0,
             theme: init.theme_manager,
-            damage_debug_enabled: std::env::var("FOCALDESK_DAMAGE_DEBUG")
-                .is_ok_and(|value| value != "0" && !value.eq_ignore_ascii_case("false")),
+            surface_transfers: HashMap::new(),
+            damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,
             topbar_pulse: None,
@@ -3219,14 +3405,17 @@ impl DesktopState {
     }
 
     pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) {
-        dbg_flush("entered add_xdg_toplevel");
-        dbg_flush(&format!("self={:p}", self));
-        dbg_flush(&format!(
-            "before map space={}",
-            self.space.elements().count()
-        ));
-
         let id = self.alloc_window_id();
+        let _span = info_span!(
+            "add_xdg_toplevel",
+            session_id = session_id(),
+            window_id = ?id,
+            surface = ?surface.wl_surface().id(),
+            windows = self.windows.len(),
+            space = self.space.elements().count()
+        )
+        .entered();
+
         let window = Window::new_wayland_window(surface.clone());
         let workspace = self.focused_workspace();
         let meta = WaylandWindowMeta::new(None, None);
@@ -3236,7 +3425,12 @@ impl DesktopState {
 
         let managed = ManagedWindow::new_wayland(id, window.clone(), meta, workspace);
         self.windows.push(managed);
-        dbg_flush(&format!("after push windows={}", self.windows.len()));
+        trace!(
+            target: "focaldesk",
+            window_id = ?id,
+            windows = self.windows.len(),
+            "wayland toplevel added"
+        );
 
         self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
@@ -3248,6 +3442,15 @@ impl DesktopState {
         override_redirect: bool,
     ) -> WindowId {
         let id = self.alloc_window_id();
+        let _span = info_span!(
+            "add_xwayland_window",
+            session_id = session_id(),
+            window_id = ?id,
+            title = ?surface.title(),
+            class = ?surface.class(),
+            override_redirect
+        )
+        .entered();
         let window = Window::new_x11_window(surface.clone());
         let workspace = self.focused_workspace();
         let meta = XwaylandWindowMeta::from_surface(&surface)
@@ -3257,6 +3460,12 @@ impl DesktopState {
         managed.floating = meta.should_float();
         managed.mapped = false;
         self.windows.push(managed);
+        trace!(
+            target: "focaldesk",
+            window_id = ?id,
+            windows = self.windows.len(),
+            "xwayland window added"
+        );
         id
     }
 
@@ -3300,6 +3509,15 @@ impl DesktopState {
         let id = self.window_id_for_x11_surface(&surface).unwrap_or_else(|| {
             self.add_xwayland_window(surface.clone(), surface.is_override_redirect())
         });
+        let _span = info_span!(
+            "map_xwayland_window",
+            session_id = session_id(),
+            window_id = ?id,
+            title = ?surface.title(),
+            class = ?surface.class(),
+            override_redirect = surface.is_override_redirect()
+        )
+        .entered();
 
         self.sync_xwayland_window_meta(&surface);
 
@@ -3316,9 +3534,10 @@ impl DesktopState {
             let window = self.windows[idx].window.clone();
             self.space.unmap_elem(&window);
             self.windows[idx].mapped = false;
-            flog_info!(
-                "XWayland map deferred id={:?}: no associated wl_surface yet",
-                id
+            debug!(
+                target: "focaldesk",
+                window_id = ?id,
+                "xwayland map deferred: no associated wl_surface yet"
             );
             return;
         }
@@ -3343,6 +3562,12 @@ impl DesktopState {
         window.on_commit();
         self.map_window_bbox_location(window.clone(), bbox_location, true);
         self.windows[idx].mapped = true;
+        trace!(
+            target: "focaldesk",
+            window_id = ?id,
+            ?bbox_location,
+            "xwayland window mapped"
+        );
 
         if !surface.is_override_redirect() {
             let configure_rect = self
@@ -3352,11 +3577,12 @@ impl DesktopState {
                 .unwrap_or_else(|| {
                     Rectangle::from_loc_and_size(bbox_location, requested_geometry.size)
                 });
-            flog_info!(
-                "XWayland map configure id={:?} requested={:?} configure={:?}",
-                id,
-                requested_geometry,
-                configure_rect
+            debug!(
+                target: "focaldesk",
+                window_id = ?id,
+                requested_geometry = ?requested_geometry,
+                configure_rect = ?configure_rect,
+                "xwayland configure"
             );
             let _ = surface.configure(Some(configure_rect));
             self.focus_window_id(id);
@@ -3370,10 +3596,12 @@ impl DesktopState {
         self.active_dialog = Some(dialog.id);
         self.dialogs.push(dialog);
 
-        flog_info!(
-            "after open_dialog: dialogs={}, active_dialog={:?}",
-            self.dialogs.len(),
-            self.active_dialog
+        tracing::info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            dialogs = self.dialogs.len(),
+            active_dialog = ?self.active_dialog,
+            "dialog opened"
         );
 
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
@@ -3392,18 +3620,37 @@ impl DesktopState {
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
         match action {
             DialogAction::Confirm => {
-                flog_info!("Dialog {} confirmed", id);
+                tracing::info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    dialog_id = ?id,
+                    action = "confirm",
+                    "dialog action"
+                );
 
                 // Example: allow screenshot
                 // self.allow_screenshot = true;
             }
 
             DialogAction::Cancel => {
-                flog_info!("Dialog {} canceled", id);
+                tracing::info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    dialog_id = ?id,
+                    action = "cancel",
+                    "dialog action"
+                );
             }
 
             DialogAction::Custom(v) => {
-                flog_info!("Dialog {} custom action {}", id, v);
+                tracing::info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    dialog_id = ?id,
+                    action = "custom",
+                    value = %v,
+                    "dialog action"
+                );
             }
         }
 
@@ -3418,13 +3665,24 @@ impl DesktopState {
         // SAFETY: only called synchronously from `dispatch_clients` while ctx is set.
         let renderer = unsafe { &mut *ctx.renderer.as_ptr() };
         if let Err(err) = import_surface_tree(renderer, surface) {
-            focaldesk_logging::flog(&format!("early surface import failed: {err:?}"));
+            tracing::error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = ?err,
+                "early surface import failed"
+            );
         }
     }
 
     pub fn handle_commit(&mut self, surface: &WlSurface) {
-        dbg_flush("handle_commit hit");
+        tracing::trace!(
+            target: "focaldesk",
+            session_id = session_id(),
+            surface = ?surface.id(),
+            "handle_commit"
+        );
 
+        self.refresh_surface_color(surface);
         self.popups.commit(surface);
 
         let mut to_map: Option<usize> = None;
@@ -3452,10 +3710,13 @@ impl DesktopState {
                 });
                 if let Some(buffer_offset) = buffer_offset {
                     if let Some(current_loc) = self.space.element_location(&window) {
-                        flog_info!(
-                            "XWayland buffer_delta {:?} for window at {:?}",
-                            buffer_offset,
-                            current_loc
+                        tracing::info!(
+                            target: "focaldesk",
+                            session_id = session_id(),
+                            window_id = ?self.window_id_for_wl_surface(&root),
+                            buffer_offset = ?buffer_offset,
+                            current_loc = ?current_loc,
+                            "xwayland buffer delta"
                         );
                         self.map_window_bbox_location(
                             window.clone(),
@@ -3478,20 +3739,26 @@ impl DesktopState {
                 .iter()
                 .position(|managed| managed.window == window)
             {
-                dbg_flush(&format!(
-                    "commit matched window idx={idx} (toplevel or subsurface)"
-                ));
-                dbg_flush(&format!(
-                    "already in space={}",
-                    self.space.elements().any(|e| e == &window)
-                ));
-                dbg_flush(&format!("managed.mapped={}", self.windows[idx].mapped));
+                tracing::trace!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    window_id = ?self.windows[idx].id,
+                    idx,
+                    in_space = self.space.elements().any(|e| e == &window),
+                    mapped = self.windows[idx].mapped,
+                    "commit matched managed window"
+                );
                 let in_space = self.space.elements().any(|e| e == &window);
                 if in_space && !self.windows[idx].mapped && !self.windows[idx].minimized {
                     self.windows[idx].mapped = true;
                     let window_id = self.windows[idx].id;
                     self.focus_window_id(window_id);
-                    dbg_flush("marked existing space window mapped from commit");
+                    tracing::trace!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        window_id = ?window_id,
+                        "existing space window marked mapped"
+                    );
                 } else if window.x11_surface().is_some() {
                     if !in_space {
                         to_map = Some(idx);
@@ -3512,9 +3779,12 @@ impl DesktopState {
                 if belongs {
                     committed_window = Some(managed.window.clone());
                     managed.window.on_commit();
-                    dbg_flush(&format!(
-                        "commit matched window idx={idx} (toplevel or subsurface)"
-                    ));
+                    tracing::trace!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        idx,
+                        "commit matched surface"
+                    );
                     if !self.space.elements().any(|e| e == &managed.window) {
                         to_map = Some(idx);
                     }
@@ -3540,11 +3810,13 @@ impl DesktopState {
             self.windows[idx].mapped = true;
             let window_id = self.windows[idx].id;
             self.focus_window_id(window_id);
-            dbg_flush("mapped window from commit");
-            dbg_flush(&format!(
-                "space count after map={}",
-                self.space.elements().count()
-            ));
+            tracing::trace!(
+                target: "focaldesk",
+                session_id = session_id(),
+                window_id = ?window_id,
+                space_count = self.space.elements().count(),
+                "window mapped from commit"
+            );
             mapped_window = true;
         }
 
@@ -3638,7 +3910,12 @@ impl DesktopState {
     pub fn handle_action(&mut self, action: KeyAction) {
         match action {
             KeyAction::QuitCompositor => {
-                flog_info!("Quit");
+                tracing::info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    action = "quit_compositor",
+                    "quit compositor"
+                );
                 self.running = false;
             }
 
@@ -3656,6 +3933,10 @@ impl DesktopState {
 
             KeyAction::LaunchTerminal => {
                 self.launch_app(self.apps.terminal.clone());
+            }
+
+            KeyAction::LockScreen => {
+                self.lock_session();
             }
 
             KeyAction::ToggleLauncher => {
@@ -3679,12 +3960,22 @@ impl DesktopState {
 
             KeyAction::TakeScreenshot => {
                 self.request_screenshot();
-                dbg_flush("SCREENSHOT ACTION FIRED");
+                tracing::debug!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    action = "take_screenshot",
+                    "screenshot action fired"
+                );
             }
 
             KeyAction::TakeScreenshotAll => {
                 self.request_screenshot_all();
-                dbg_flush("SCREENSHOT ALL ACTION FIRED");
+                tracing::debug!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    action = "take_screenshot_all",
+                    "screenshot-all action fired"
+                );
             }
 
             KeyAction::ForceExit => {
@@ -3768,57 +4059,111 @@ impl DesktopState {
     pub fn launch_app(&self, app: String) {
         let app_name = app.clone();
         let chrome_like = is_chrome_like(&app_name);
-
+        let cursor_like = is_cursor_like(&app_name);
         #[cfg(feature = "xwayland")]
         let xwayland_display = self.xwayland_display.as_deref();
 
         #[cfg(not(feature = "xwayland"))]
         let xwayland_display: Option<&str> = None;
 
+        let launch_span = tracing::info_span!(
+            "launch_app",
+            session_id = session_id(),
+            app = %app_name,
+            chrome_like,
+            cursor_like,
+            backend = ?self.backend_kind,
+            wayland_display = %self.client_wayland_display,
+            xwayland_display = ?xwayland_display
+        );
+        let _enter = launch_span.enter();
+        chrome_launch_note(format!(
+            "launch_app app={app_name} chrome_like={chrome_like} pid={} client_wayland_display={} xwayland_display={:?}",
+            id(),
+            self.client_wayland_display,
+            xwayland_display
+        ));
+
+        let use_x11_for_chrome = chrome_like && xwayland_display.is_some();
         let display_env = xwayland_display.map(str::to_string);
         let launch_candidates = if chrome_like {
             chrome_exec_fallbacks(&app_name)
         } else {
             vec![app_name.clone()]
         };
+        chrome_launch_note(format!(
+            "launch candidates for {app_name}: {:?}",
+            launch_candidates
+        ));
 
         let mut last_error = None;
         for candidate in launch_candidates {
+            chrome_launch_note(format!("trying candidate={candidate}"));
             let mut command = Command::new(&candidate);
-            command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
-            command.env_remove("DISPLAY");
-            if let Some(display) = xwayland_display {
-                command.env("DISPLAY", display);
+            if use_x11_for_chrome {
+                command.env_remove("WAYLAND_DISPLAY");
+                if let Some(display) = xwayland_display {
+                    command.env("DISPLAY", display);
+                }
+            } else {
+                command.env("WAYLAND_DISPLAY", &self.client_wayland_display);
+                command.env_remove("DISPLAY");
+                if let Some(display) = xwayland_display {
+                    command.env("DISPLAY", display);
+                }
             }
-            if chrome_like {
-                configure_chrome_command(&mut command);
+            if chrome_like || cursor_like {
+                configure_chrome_command(&mut command, use_x11_for_chrome);
+                if let Some(file) = open_session_log_file() {
+                    if let Ok(stderr_file) = file.try_clone() {
+                        command.stdout(Stdio::from(file));
+                        command.stderr(Stdio::from(stderr_file));
+                    }
+                }
             }
             if is_obs_like(&candidate) {
                 configure_obs_recording_dir();
             }
 
             match command.spawn() {
-                Ok(child) => {
-                    flog(&format!(
-                        "launched {candidate} pid={} WAYLAND_DISPLAY={} DISPLAY={display_env:?}",
-                        child.id(),
+                Ok(mut child) => {
+                    let child_pid = child.id();
+                    chrome_launch_note(format!(
+                        "spawned candidate={candidate} pid={child_pid} wayland_display={} display={display_env:?}",
                         self.client_wayland_display,
                     ));
-                    if xwayland_display.is_none() && !chrome_like {
-                        flog(
-                            "warning: launched without DISPLAY; X11 apps (Steam/Proton/Wine) need XWayland",
+                    let trace_candidate = candidate.clone();
+                    thread::spawn(move || {
+                        match child.wait() {
+                            Ok(status) => chrome_launch_note(format!(
+                                "child exited candidate={trace_candidate} pid={child_pid} status={status}"
+                            )),
+                            Err(err) => chrome_launch_note(format!(
+                                "child wait failed candidate={trace_candidate} pid={child_pid} err={err}"
+                            )),
+                        }
+                    });
+                    if xwayland_display.is_none() && !(chrome_like || cursor_like) {
+                        tracing::warn!(
+                            target: "focaldesk",
+                            session_id = session_id(),
+                            candidate = %candidate,
+                            "launched without DISPLAY; X11 apps need XWayland"
                         );
                     }
                     return;
                 }
                 Err(err) => {
+                    chrome_launch_note(format!("spawn failed candidate={candidate} err={err}"));
                     last_error = Some((candidate, err));
                 }
             }
         }
 
         if let Some((candidate, err)) = last_error {
-            flog(&format!("failed to launch {candidate}: {err}"));
+            chrome_launch_note(format!(
+                "all launch candidates failed last_candidate={candidate} err={err}"
+            ));
         }
     }
 
@@ -4164,6 +4509,10 @@ impl DesktopState {
     }
 
     pub fn handle_input(&mut self, event: FlowInputEvent) {
+        if self.debug.show_input_events {
+            focaldesk_logging::logging::flog(FLogLevel::Debug, format!("input event: {event:?}"));
+        }
+
         if self.lock_screen.active {
             match event {
                 FlowInputEvent::Key { keycode, state, .. } => {
@@ -4937,6 +5286,7 @@ impl DesktopState {
                     scale_factor: scale,
                     scale: Scale::from((scale, scale)),
                     hdr_supported: false,
+                    hdr_requested: false,
                     hdr_enabled: false,
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
@@ -4964,6 +5314,34 @@ impl DesktopState {
     /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
     pub fn refresh_space(&mut self) {
         self.space.refresh();
+    }
+
+    pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
+        let force_linear = force_linear_surfaces();
+        let transfer = with_states(surface, |states| effective_transfer(states, force_linear));
+        let id = Id::from_wayland_resource(surface);
+        let previous = self.surface_transfers.get(&id).copied();
+        if previous != Some(transfer) {
+            focaldesk_logging::flog(&format!(
+                "surface color applied: surface={id:?} transfer={transfer:?}"
+            ));
+        }
+        self.surface_transfers.insert(id, transfer);
+    }
+
+    pub fn set_surface_color_description(
+        &mut self,
+        surface: &WlSurface,
+        description: ColorDescription,
+    ) {
+        with_states(surface, |states| {
+            states
+                .cached_state
+                .get::<SurfaceColorState>()
+                .pending()
+                .description = Some(description);
+        });
+        self.refresh_surface_color(surface);
     }
 
     /// Import committed buffers for mapped windows on this output before building render elements.
@@ -5554,15 +5932,49 @@ fn focaldesk_settings_command() -> String {
         .unwrap_or_else(|| "focaldesk-settings".to_string())
 }
 
-fn configure_chrome_command(command: &mut Command) {
+fn configure_chrome_command(command: &mut Command, use_x11: bool) {
     let profile = chrome_profile_dir();
     clear_stale_chrome_singleton(&profile);
+    let ozone_platform = if use_x11 { "x11" } else { "wayland" };
     command
-        .arg("--ozone-platform=wayland")
+        .arg(format!("--ozone-platform={ozone_platform}"))
+        .arg("--disable-features=Vulkan")
         .arg(format!("--user-data-dir={}", profile.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--new-window");
+}
+
+fn chrome_launch_trace_path() -> PathBuf {
+    PathBuf::from("/tmp/focaldesk-chrome.trace")
+}
+
+fn chrome_launch_trace(msg: impl AsRef<str>) {
+    let line = format!("[chrome-launch] {}", msg.as_ref());
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(chrome_launch_trace_path())
+    {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
+fn chrome_launch_note(msg: impl AsRef<str>) {
+    let message = msg.as_ref().to_string();
+    chrome_launch_trace(&message);
+    flog_warn!("[chrome-launch] {message}");
+}
+
+fn open_session_log_file() -> Option<std::fs::File> {
+    for path in log_file_path_candidates() {
+        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
+            return Some(file);
+        }
+    }
+
+    None
 }
 
 fn chrome_exec_fallbacks(app_name: &str) -> Vec<String> {
@@ -5599,6 +6011,11 @@ fn is_chrome_like(app_name: &str) -> bool {
             | "chromium"
             | "chromium-browser"
     )
+}
+
+fn is_cursor_like(app_name: &str) -> bool {
+    let executable = app_name.rsplit('/').next().unwrap_or(app_name);
+    matches!(executable, "cursor" | "cursor-bin")
 }
 
 fn is_obs_like(app_name: &str) -> bool {
@@ -5711,4 +6128,4 @@ impl BufferHandler for DesktopState {
 
 impl OutputHandler for DesktopState {}
 
-delegate_output!(DesktopState);
+delegate_dispatch2!(DesktopState);
