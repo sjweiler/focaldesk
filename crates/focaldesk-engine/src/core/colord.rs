@@ -28,12 +28,25 @@ fn colord_connection() -> Option<Connection> {
 }
 
 /// Resolve the best available color profile for a monitor.
+///
+/// Order: colord active profile → EDID-hash ICC on disk → monitor ICC scan → EDID primaries.
 pub fn resolve_output_color_profile(
     make: &str,
     model: &str,
     serial: &str,
     edid: Option<&[u8]>,
 ) -> Option<ParsedIccProfile> {
+    if colord_runtime_enabled() {
+        let _ = ensure_colord_display_device(make, model, serial);
+        if let Some(parsed) = load_display_profile_via_colord(make, model, serial) {
+            flog(format!(
+                "output color: loaded colord ICC ({} bytes) for {make} {model} serial={serial}",
+                parsed.bytes.len()
+            ));
+            return Some(parsed);
+        }
+    }
+
     if let Some(edid) = edid {
         if let Some(parsed) = icc::load_display_profile_by_edid_hash(edid) {
             flog(format!(
@@ -44,9 +57,7 @@ pub fn resolve_output_color_profile(
         }
     }
 
-    let _ = ensure_colord_display_device(make, model, serial);
-    load_display_profile_via_colord(make, model, serial)
-        .or_else(|| icc::load_display_profile_for_monitor(make, model, serial))
+    icc::load_display_profile_for_monitor(make, model, serial)
         .or_else(|| {
             edid
                 .and_then(icc::color_description_from_edid)
