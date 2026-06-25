@@ -83,7 +83,7 @@ pub fn ensure_colord_display_device(make: &str, model: &str, serial: &str) -> bo
         ("Colorspace", "RGB"),
     ]);
 
-    match cm.call_method("CreateDevice", &(device_id.as_str(), "temp", props)) {
+    match cm.call_method("CreateDevice", &(device_id.as_str(), "normal", props)) {
         Ok(_) => {
             flog(format!("colord: registered display device {device_id}"));
             true
