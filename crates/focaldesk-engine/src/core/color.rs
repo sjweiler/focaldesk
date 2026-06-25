@@ -247,6 +247,21 @@ pub fn kms_scanout_encode_description(output: ColorDescription) -> ColorDescript
     output
 }
 
+/// Whether the finished scene sRGB buffer needs a full-frame output encode pass.
+pub fn output_encode_scanout_needed(description: ColorDescription) -> bool {
+    if matches!(
+        std::env::var("FOCALDESK_OUTPUT_ENCODE").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    ) {
+        return false;
+    }
+    description.primaries != ColorPrimaries::Srgb
+        || !matches!(
+            description.transfer,
+            TransferFunction::Srgb | TransferFunction::Bt1886
+        )
+}
+
 /// Row-major 3×3 matrix: linear `src` RGB → linear `dst` RGB.
 pub fn gamut_matrix_linear_rgb(
     src: ColorPrimaries,
@@ -427,6 +442,18 @@ mod tests {
         for encoded in [0.0, 0.003, 0.04045, 0.18, 0.5, 1.0] {
             close(linear_to_srgb(srgb_to_linear(encoded)), encoded, 1e-6);
         }
+    }
+
+    #[test]
+    fn output_encode_skipped_for_default_srgb_output() {
+        assert!(!output_encode_scanout_needed(ColorDescription::SRGB));
+    }
+
+    #[test]
+    fn output_encode_needed_for_display_p3_monitor() {
+        assert!(output_encode_scanout_needed(
+            ColorDescription::DISPLAY_P3_SRGB
+        ));
     }
 
     #[test]

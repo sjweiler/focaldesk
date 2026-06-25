@@ -548,10 +548,8 @@ fn render_portal_output_to_texture(
     renderer.wait(&sync)?;
 
     let offscreen = targets
-        .offscreen
-        .as_ref()
+        .scanout_texture()
         .ok_or("portal offscreen missing after render")?
-        .texture
         .clone();
     store_portal_offscreen_targets(state, output_id, targets);
 

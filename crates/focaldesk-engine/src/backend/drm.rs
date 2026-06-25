@@ -510,33 +510,35 @@ fn capture_surface_pixels(
     renderer: &mut GlesRenderer,
     surface: &mut DrmSurfaceState,
 ) -> Result<Vec<u8>> {
-    let offscreen = surface
-        .render_targets
-        .offscreen
-        .as_mut()
-        .ok_or_else(|| anyhow!("offscreen texture missing for capture"))?;
+    let (texture, size) = if surface.render_targets.encoded_scanout {
+        let scratch = surface
+            .render_targets
+            .encode_scratch
+            .as_mut()
+            .ok_or_else(|| anyhow!("encode scratch missing for capture"))?;
+        (&mut scratch.texture, scratch.size)
+    } else {
+        let offscreen = surface
+            .render_targets
+            .offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("offscreen texture missing for capture"))?;
+        (&mut offscreen.texture, offscreen.size)
+    };
 
     let target = renderer
-        .bind(&mut offscreen.texture)
+        .bind(texture)
         .map_err(|e| anyhow!("bind offscreen for capture: {e}"))?;
 
-    copy_framebuffer_target_to_png_rgba(renderer, &target, offscreen.size.w, offscreen.size.h)
+    copy_framebuffer_target_to_png_rgba(renderer, &target, size.w, size.h)
 }
 
 fn present_source_texture(surface: &DrmSurfaceState) -> Option<&GlesTexture> {
-    surface
-        .render_targets
-        .offscreen
-        .as_ref()
-        .map(|offscreen| &offscreen.texture)
+    surface.render_targets.scanout_texture()
 }
 
 fn capture_source_texture(surface: &DrmSurfaceState) -> Option<&GlesTexture> {
-    surface
-        .render_targets
-        .offscreen
-        .as_ref()
-        .map(|offscreen| &offscreen.texture)
+    surface.render_targets.scanout_texture()
 }
 
 fn blit_rgba(
@@ -2298,19 +2300,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .chrome_shaders
                         .client_to_scene_linear
                         .clone();
-                    let composite_linear_layer = data
+                    let linear_to_srgb = data
                         .core
                         .state
                         .render
                         .chrome_shaders
-                        .composite_linear_layer
+                        .linear_to_srgb
                         .clone();
                     let use_linear_sdr = use_linear_sdr_path(
                         &mut device.renderer,
                         &surface.render_targets,
                         surface.size,
                     ) && client_to_scene.is_some()
-                        && composite_linear_layer.is_some();
+                        && linear_to_srgb.is_some();
 
                     if use_linear_sdr {
                         if let Err(err) = surface
@@ -2339,13 +2341,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 &data.core.scene,
                                 &data.core.output_state,
                                 client_to_scene.as_ref().unwrap(),
-                                composite_linear_layer.as_ref().unwrap(),
+                                linear_to_srgb.as_ref().unwrap(),
                             )?
                         } else {
                             run_sdr_pass(
                                 &mut data.core.state,
                                 &mut device.renderer,
                                 &mut surface.render_targets,
+                                surface.output_id,
                                 surface.size,
                                 &prepared,
                                 &client_elements,

@@ -263,18 +263,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
 
                 let offscreen = render_targets
-                    .offscreen
-                    .as_ref()
+                    .scanout_texture()
                     .ok_or("winit offscreen missing after render")?;
                 let mut frame =
                     renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
-                present_offscreen_texture(&mut frame, &offscreen.texture, buffer_size_phys)?;
+                present_offscreen_texture(&mut frame, offscreen, buffer_size_phys)?;
                 let _ = frame.finish()?;
 
                 publish_portal_capture_source(
                     &mut nested.state,
                     OutputId(1),
-                    offscreen.texture.clone(),
+                    offscreen.clone(),
                     buffer_size_phys,
                     now,
                 );

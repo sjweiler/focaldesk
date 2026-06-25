@@ -21,6 +21,8 @@ pub struct ChromeShaders {
     pub client_to_scene_linear: Option<GlesTexProgram>,
     pub linear_to_srgb: Option<GlesTexProgram>,
     pub composite_linear_layer: Option<GlesTexProgram>,
+    /// Full-frame scene sRGB → monitor encode (C1b).
+    pub output_encode_sdr: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
     pub flow_field: Option<GlesPixelProgram>,
@@ -49,6 +51,7 @@ impl ChromeShaders {
             client_to_scene_linear: None,
             linear_to_srgb: None,
             composite_linear_layer: None,
+            output_encode_sdr: None,
             pulse: None,
             accent: None,
             flow_field: None,
@@ -189,6 +192,18 @@ impl ChromeShaders {
                         UniformName::new("u_m2", UniformType::_3f),
                     ],
                 )?);
+        }
+
+        if self.output_encode_sdr.is_none() {
+            self.output_encode_sdr = Some(renderer.compile_custom_texture_shader(
+                OUTPUT_ENCODE_SDR_FRAG,
+                &[
+                    UniformName::new("u_encode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
         }
 
         if self.amber_lightbar.is_none() {
@@ -972,6 +987,71 @@ void main() {
     }
     vec3 straight = src.rgb / src.a;
     vec3 encoded = encode_color(mul_mat3(straight));
+    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+}
+"#;
+
+/// Scene-linear Rec.709 sRGB framebuffer → monitor primaries + transfer.
+const OUTPUT_ENCODE_SDR_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_encode_tf;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
+    vec3 low = c * 12.92;
+    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 linear_to_gamma22(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+vec3 encode_color(vec3 c) {
+    if (u_encode_tf < 0.5) {
+        return linear_to_srgb(c);
+    }
+    if (u_encode_tf < 1.5) {
+        return c;
+    }
+    return linear_to_gamma22(c);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
+    vec3 encoded = encode_color(mul_mat3(srgb_to_linear(straight)));
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;
