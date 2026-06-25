@@ -17,6 +17,7 @@ to debug Linux desktop, Wayland, graphics, and input issues.
 
 - `apps/focaldesk-desktop`: compositor executable
 - `apps/focaldesk-cli`: command-line interface
+- `apps/focaldesk-ai-console`: interface app for ai
 - `apps/focaldesk-files`: file app prototype
 - `apps/focaldesk-settings`: settings app prototype
 - `apps/focaldesk-portal`: portal-related app code
