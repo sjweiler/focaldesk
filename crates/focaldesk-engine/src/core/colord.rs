@@ -22,6 +22,11 @@ pub fn colord_runtime_enabled() -> bool {
     )
 }
 
+/// colord (`org.freedesktop.ColorManager`) is a system-bus service.
+fn colord_connection() -> Option<Connection> {
+    Connection::system().ok()
+}
+
 /// Resolve the best available color profile for a monitor.
 pub fn resolve_output_color_profile(
     make: &str,
@@ -58,7 +63,7 @@ pub fn ensure_colord_display_device(make: &str, model: &str, serial: &str) -> bo
         return false;
     }
 
-    let Ok(conn) = Connection::session() else {
+    let Some(conn) = colord_connection() else {
         return false;
     };
     let Ok(cm) = colord_manager_proxy(&conn) else {
@@ -156,8 +161,8 @@ fn colord_watch_main(notify: impl Fn() + Send + Sync + 'static) {
         return;
     }
 
-    let Ok(conn) = Connection::session() else {
-        flog("colord watch: no session D-Bus");
+    let Some(conn) = colord_connection() else {
+        flog("colord watch: no system D-Bus");
         return;
     };
 
@@ -215,7 +220,7 @@ pub fn load_display_profile_via_colord(
         return None;
     }
 
-    let conn = Connection::session().ok()?;
+    let conn = colord_connection()?;
     let device = find_colord_device(&conn, make, model, serial)?;
     load_profile_from_colord_device(&conn, &device)
 }
