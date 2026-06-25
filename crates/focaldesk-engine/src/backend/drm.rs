@@ -1997,12 +1997,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if let InputEvent::Keyboard { event, .. } = &event {
             let keycode = event.key_code();
             let state = event.state();
-            if state == KeyState::Pressed && (keycode == 1u32.into() || keycode == 9u32.into()) {
-                flog("Emergency exit: ESC pressed");
-                data.should_stop = true;
-                data.core.state.running = false;
-                return;
-            }
             flog(&format!("key event: code={:?} state={:?}", keycode, state));
         }
 
@@ -2188,6 +2182,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
                 flog_warn!("ignoring nonfatal Wayland dispatch error: {err}");
             }
+            crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
+                &mut data.core.state,
+            );
         }
         data.core.state.end_portal_dispatch();
 
@@ -2294,8 +2291,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         surface.output_id,
                     );
 
-                    let srgb_to_linear =
-                        data.core.state.render.chrome_shaders.srgb_to_linear.clone();
+                    let client_to_scene = data
+                        .core
+                        .state
+                        .render
+                        .chrome_shaders
+                        .client_to_scene_linear
+                        .clone();
                     let composite_linear_layer = data
                         .core
                         .state
@@ -2307,7 +2309,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         &mut device.renderer,
                         &surface.render_targets,
                         surface.size,
-                    ) && srgb_to_linear.is_some()
+                    ) && client_to_scene.is_some()
                         && composite_linear_layer.is_some();
 
                     if use_linear_sdr {
@@ -2335,7 +2337,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 &mut data.core.ui_state,
                                 &data.core.scene,
                                 &data.core.output_state,
-                                srgb_to_linear.as_ref().unwrap(),
+                                client_to_scene.as_ref().unwrap(),
                                 composite_linear_layer.as_ref().unwrap(),
                             )?
                         } else {
@@ -3012,6 +3014,27 @@ fn device_added(
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
                 out.hdr_supported = false;
                 out.hdr_enabled = false;
+            }
+
+            let color_setup = crate::core::icc::load_display_profile_for_monitor(
+                &make,
+                &model,
+                &serial_number,
+            )
+            .or_else(|| {
+                edid.as_deref()
+                    .and_then(crate::core::icc::color_description_from_edid)
+                    .map(|description| crate::core::icc::ParsedIccProfile {
+                        description,
+                        bytes: Vec::new(),
+                    })
+            });
+            if let Some(parsed) = color_setup {
+                data.core.state.set_output_color(
+                    output_id,
+                    parsed.description,
+                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                );
             }
 
             if !initialized_one {

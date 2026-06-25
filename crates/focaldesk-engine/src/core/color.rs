@@ -1,13 +1,74 @@
 //! Color descriptions and reference transfer functions used by the compositor.
+//!
+//! Phase A: scene-linear Rec.709 working space, relative gamut mapping, SDR output.
 
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::wayland::compositor::{Cacheable, SurfaceData};
 
-/// Pixel color primaries attached to a client surface.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// CIE 1931 xy chromaticities for RGB primaries + D65 white.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrimariesChromaticity {
+    pub r: [f32; 2],
+    pub g: [f32; 2],
+    pub b: [f32; 2],
+    pub w: [f32; 2],
+}
+
+/// Pixel color primaries attached to a client surface or output.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ColorPrimaries {
-    #[default]
     Srgb,
+    DisplayP3,
+    Bt2020,
+    Custom(PrimariesChromaticity),
+}
+
+impl Default for ColorPrimaries {
+    fn default() -> Self {
+        Self::Srgb
+    }
+}
+
+impl ColorPrimaries {
+    pub fn chromaticity(self) -> PrimariesChromaticity {
+        match self {
+            Self::Srgb => PrimariesChromaticity::SRGB,
+            Self::DisplayP3 => PrimariesChromaticity::DISPLAY_P3,
+            Self::Bt2020 => PrimariesChromaticity::BT2020,
+            Self::Custom(c) => c,
+        }
+    }
+
+    pub fn from_wp_named(primaries: wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::Primaries) -> Option<Self> {
+        use wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::Primaries;
+        match primaries {
+            Primaries::Srgb => Some(Self::Srgb),
+            Primaries::DisplayP3 => Some(Self::DisplayP3),
+            Primaries::Bt2020 => Some(Self::Bt2020),
+            _ => None,
+        }
+    }
+}
+
+impl PrimariesChromaticity {
+    pub const SRGB: Self = Self {
+        r: [0.640, 0.330],
+        g: [0.300, 0.600],
+        b: [0.150, 0.060],
+        w: [0.3127, 0.3290],
+    };
+    pub const DISPLAY_P3: Self = Self {
+        r: [0.680, 0.320],
+        g: [0.265, 0.690],
+        b: [0.150, 0.060],
+        w: [0.3127, 0.3290],
+    };
+    pub const BT2020: Self = Self {
+        r: [0.708, 0.292],
+        g: [0.170, 0.797],
+        b: [0.131, 0.046],
+        w: [0.3127, 0.3290],
+    };
 }
 
 /// Electrical-to-optical transfer function attached to a client surface.
@@ -15,10 +76,33 @@ pub enum ColorPrimaries {
 pub enum TransferFunction {
     #[default]
     Srgb,
+    /// Piecewise sRGB / BT.1886 for SDR video-style content.
+    Bt1886,
+    /// Simple gamma 2.2 power law.
+    Gamma22,
     Linear,
 }
 
-/// Color interpretation of a surface buffer.
+/// Shader decode mode sent as `u_decode_tf`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum TransferDecodeMode {
+    SrgbPiecewise = 0,
+    LinearPassThrough = 1,
+    Gamma22 = 2,
+}
+
+impl TransferFunction {
+    pub fn decode_mode(self) -> TransferDecodeMode {
+        match self {
+            Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
+            Self::Gamma22 => TransferDecodeMode::Gamma22,
+            Self::Linear => TransferDecodeMode::LinearPassThrough,
+        }
+    }
+}
+
+/// Color interpretation of a surface buffer or output.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ColorDescription {
     pub primaries: ColorPrimaries,
@@ -48,6 +132,15 @@ impl ColorDescription {
         max_cll_nits: None,
         max_fall_nits: None,
     };
+
+    pub const DISPLAY_P3_SRGB: Self = Self {
+        primaries: ColorPrimaries::DisplayP3,
+        transfer: TransferFunction::Srgb,
+        reference_white_nits: 80.0,
+        max_luminance_nits: 80.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+    };
 }
 
 impl Default for ColorDescription {
@@ -64,6 +157,31 @@ pub enum RenderingIntent {
     Absolute,
 }
 
+/// Committed color state used when drawing a client surface.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceColorRenderState {
+    pub description: ColorDescription,
+    pub intent: RenderingIntent,
+    /// Row-major 3×3: linear client RGB → scene-linear Rec.709.
+    pub client_to_scene: [[f32; 3]; 3],
+}
+
+impl SurfaceColorRenderState {
+    pub fn for_description(description: ColorDescription, intent: RenderingIntent) -> Self {
+        let client_to_scene =
+            gamut_matrix_linear_rgb(description.primaries, scene_working_primaries(), intent);
+        Self {
+            description,
+            intent,
+            client_to_scene,
+        }
+    }
+
+    pub fn srgb_default() -> Self {
+        Self::for_description(ColorDescription::SRGB, RenderingIntent::Perceptual)
+    }
+}
+
 /// Double-buffered color state associated with a `wl_surface`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurfaceColorState {
@@ -74,6 +192,10 @@ pub struct SurfaceColorState {
 impl SurfaceColorState {
     pub fn effective_description(&self) -> ColorDescription {
         self.description.unwrap_or(ColorDescription::SRGB)
+    }
+
+    pub fn render_state(&self) -> SurfaceColorRenderState {
+        SurfaceColorRenderState::for_description(self.effective_description(), self.intent)
     }
 }
 
@@ -94,6 +216,107 @@ impl Cacheable for SurfaceColorState {
     fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
         *into = self;
     }
+}
+
+/// Scene compositing space: linear-light Rec.709 (same primaries as sRGB).
+pub fn scene_working_primaries() -> ColorPrimaries {
+    ColorPrimaries::Srgb
+}
+
+/// Default SDR output description for an output when no ICC/EDID data is available.
+pub fn default_output_color_description() -> ColorDescription {
+    ColorDescription::SRGB
+}
+
+/// Color description used when encoding the KMS framebuffer.
+///
+/// Monitor ICC/EDID profiles are advertised to clients via `wp_color_management_v1`, but
+/// scanout is still a vanilla sRGB buffer until HDR/LUT output paths land (Phase C).
+/// Applying the monitor gamut matrix here would shift all app colors (e.g. cool tint).
+pub fn kms_scanout_color_description() -> ColorDescription {
+    ColorDescription::SRGB
+}
+
+/// Row-major 3×3 matrix: linear `src` RGB → linear `dst` RGB.
+pub fn gamut_matrix_linear_rgb(
+    src: ColorPrimaries,
+    dst: ColorPrimaries,
+    intent: RenderingIntent,
+) -> [[f32; 3]; 3] {
+    let _ = intent;
+    // Phase A: perceptual/absolute fall back to relative colorimetric clipping.
+    let m_src = primaries_to_rgb_to_xyz(src.chromaticity());
+    let m_dst = primaries_to_rgb_to_xyz(dst.chromaticity());
+    let inv_dst = invert_3x3(m_dst);
+    multiply_3x3(inv_dst, m_src)
+}
+
+/// Row-major 3×3: scene-linear Rec.709 → linear output primaries.
+pub fn scene_to_output_matrix(
+    output: ColorDescription,
+    intent: RenderingIntent,
+) -> [[f32; 3]; 3] {
+    gamut_matrix_linear_rgb(scene_working_primaries(), output.primaries, intent)
+}
+
+fn primaries_to_rgb_to_xyz(ch: PrimariesChromaticity) -> [[f32; 3]; 3] {
+    let xr = xy_to_xyz(ch.r);
+    let xg = xy_to_xyz(ch.g);
+    let xb = xy_to_xyz(ch.b);
+    let xw = xy_to_xyz(ch.w);
+
+    let s = invert_3x3([
+        [xr[0], xg[0], xb[0]],
+        [xr[1], xg[1], xb[1]],
+        [xr[2], xg[2], xb[2]],
+    ]);
+    let sr = s[0][0] * xw[0] + s[0][1] * xw[1] + s[0][2] * xw[2];
+    let sg = s[1][0] * xw[0] + s[1][1] * xw[1] + s[1][2] * xw[2];
+    let sb = s[2][0] * xw[0] + s[2][1] * xw[1] + s[2][2] * xw[2];
+
+    [
+        [xr[0] * sr, xg[0] * sg, xb[0] * sb],
+        [xr[1] * sr, xg[1] * sg, xb[1] * sb],
+        [xr[2] * sr, xg[2] * sg, xb[2] * sb],
+    ]
+}
+
+fn xy_to_xyz(xy: [f32; 2]) -> [f32; 3] {
+    [xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]]
+}
+
+fn multiply_3x3(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = a[i][0] * b[0][j] + a[i][1] * b[1][j] + a[i][2] * b[2][j];
+        }
+    }
+    out
+}
+
+fn invert_3x3(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    let inv_det = 1.0 / det;
+    [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        ],
+    ]
 }
 
 pub fn srgb_to_linear(value: f32) -> f32 {
@@ -138,15 +361,27 @@ pub fn wp_color_management_enabled() -> bool {
     )
 }
 
-pub fn effective_transfer(states: &SurfaceData, force_linear: bool) -> TransferFunction {
+pub fn effective_surface_render_state(
+    states: &SurfaceData,
+    force_linear: bool,
+) -> SurfaceColorRenderState {
     if force_linear {
-        return TransferFunction::Linear;
+        return SurfaceColorRenderState::for_description(
+            ColorDescription::LINEAR_SRGB,
+            RenderingIntent::Perceptual,
+        );
     }
     states
         .cached_state
         .get::<SurfaceColorState>()
         .current()
-        .effective_description()
+        .render_state()
+}
+
+/// Legacy helper — transfer only.
+pub fn effective_transfer(states: &SurfaceData, force_linear: bool) -> TransferFunction {
+    effective_surface_render_state(states, force_linear)
+        .description
         .transfer
 }
 
@@ -181,6 +416,21 @@ mod tests {
     fn srgb_transfer_round_trips() {
         for encoded in [0.0, 0.003, 0.04045, 0.18, 0.5, 1.0] {
             close(linear_to_srgb(srgb_to_linear(encoded)), encoded, 1e-6);
+        }
+    }
+
+    #[test]
+    fn identity_gamut_matrix_for_matching_primaries() {
+        let m = gamut_matrix_linear_rgb(
+            ColorPrimaries::Srgb,
+            ColorPrimaries::Srgb,
+            RenderingIntent::Relative,
+        );
+        for i in 0..3 {
+            for j in 0..3 {
+                let expected = if i == j { 1.0 } else { 0.0 };
+                close(m[i][j], expected, 1e-4);
+            }
         }
     }
 

@@ -13,7 +13,7 @@ use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
     RenderInputsMut,
 };
-use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
+use crate::core::ui_builder::{build_ui_for_output_with_options, AiFlowMode, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_flow::keybinds::BackendKind;
@@ -178,6 +178,7 @@ pub fn prepare_output(
         state.chrome.metrics.topbar_h,
         state.chrome.metrics.sidebar_w,
     );
+    let ai_flow_mode = state.ai_flow_mode();
 
     let workspace_count = state.workspace_names.len();
     let active_workspace = state.focused_workspace().0;
@@ -190,6 +191,7 @@ pub fn prepare_output(
             hdr_enabled,
             workspace_count,
             active_workspace,
+            ai_flow_mode,
         },
     );
     state.refresh_ui_hover_for_output(output_id);
@@ -204,6 +206,15 @@ pub fn prepare_output(
     }
 
     if let Some(rect) = state.active_topbar_pulse_damage_rect(output_id, now) {
+        state.mark_output_logical_damage(
+            output_id,
+            rect,
+            0,
+            crate::core::desktop::DamageSource::Unknown,
+        );
+    }
+
+    if let Some(rect) = state.active_flow_field_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(
             output_id,
             rect,
@@ -591,6 +602,10 @@ pub fn draw_output_stage(
             .sidebar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         topbar_pulse: state
             .topbar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
+        flow_field_pulse: state.flow_field_pulse_for_output(
+            prepared.frame_ctx.rendering_output,
+            prepared.frame_ctx.now,
+        ),
         clock_pulse: state
             .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
@@ -606,7 +621,7 @@ pub fn draw_output_stage(
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         client_compositing,
         chrome_glass_pass,
-        surface_transfers: &state.surface_transfers,
+        surface_colors: &state.surface_colors,
     };
 
     let muts = RenderInputsMut { ui: ui_state };

@@ -42,9 +42,11 @@ use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
-use crate::core::color::{srgb_to_linear, TransferFunction};
+use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
 use crate::core::desktop::DesktopState;
-use crate::core::desktop::{ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame};
+use crate::core::desktop::{
+    ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame,
+};
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
@@ -59,6 +61,7 @@ use focaldesk_themes::IconTheme;
 use focaldesk_themes::TextTheme;
 use focaldesk_themes::WallpaperTheme;
 use focaldesk_types::WorkspaceId;
+use focaldesk_ui::chrome_draw::draw_flow_field;
 use focaldesk_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical};
 use focaldesk_ui::chrome_shaders::ChromeShaders;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
@@ -131,7 +134,7 @@ pub enum ChromeGlassPass {
 #[derive(Clone)]
 pub enum ClientCompositingMode {
     Sdr,
-    Linear { srgb_to_linear: GlesTexProgram },
+    Linear { client_to_scene: GlesTexProgram },
 }
 
 impl FrameCtx {
@@ -201,6 +204,7 @@ pub struct RenderInputs<'a> {
     pub sidebar_hover_slot: Option<usize>, // 👈 ADD THIS
     pub sidebar_pulse: Option<SidebarPulseFrame>,
     pub topbar_pulse: Option<TopbarPulseFrame>,
+    pub flow_field_pulse: Option<FlowFieldPulseFrame>,
     pub clock_pulse: Option<ClockPulseFrame>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
@@ -216,7 +220,7 @@ pub struct RenderInputs<'a> {
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
     pub chrome_glass_pass: ChromeGlassPass,
-    pub surface_transfers: &'a std::collections::HashMap<Id, TransferFunction>,
+    pub surface_colors: &'a std::collections::HashMap<Id, SurfaceColorRenderState>,
 }
 
 pub struct RenderInputsMut<'a> {
@@ -348,6 +352,10 @@ fn tooltip_rect_for_element(
     let (x, y) = match el_kind {
         UiElementKind::TopbarIndicator | UiElementKind::TopbarButton => (
             (el_bounds.x + (el_bounds.w - width) / 2).clamp(6, max_x),
+            (el_bounds.y + el_bounds.h + gap).clamp(6, max_y),
+        ),
+        UiElementKind::TopbarFlowField => (
+            (el_bounds.x + 8).clamp(6, max_x),
             (el_bounds.y + el_bounds.h + gap).clamp(6, max_y),
         ),
         _ => (
@@ -751,6 +759,7 @@ impl RenderState {
                         | UiElementKind::WorkspaceSlot
                         | UiElementKind::TopbarIndicator
                         | UiElementKind::TopbarButton
+                        | UiElementKind::TopbarFlowField
                 )
         }) else {
             return Ok(());
@@ -1540,7 +1549,7 @@ impl RenderState {
                 inputs.ctx,
                 inputs.elements,
                 inputs.client_compositing,
-                inputs.surface_transfers,
+                inputs.surface_colors,
             );
         }
 
@@ -1563,6 +1572,7 @@ impl RenderState {
             inputs.ui_tree,
             inputs.current_workspace,
             inputs.fonts,
+            inputs.flow_field_pulse,
             theme,
         );
 
@@ -2869,39 +2879,46 @@ impl RenderState {
         ctx: &FrameCtx,
         elements: &[FlowRenderElement],
         client_compositing: ClientCompositingMode,
-        surface_transfers: &std::collections::HashMap<Id, TransferFunction>,
+        surface_colors: &std::collections::HashMap<Id, SurfaceColorRenderState>,
     ) {
         use smithay::backend::renderer::element::Element;
+        use smithay::backend::renderer::gles::Uniform;
 
         let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        let ClientCompositingMode::Linear { srgb_to_linear } = client_compositing else {
+        let ClientCompositingMode::Linear { client_to_scene } = client_compositing else {
             draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
             return;
         };
 
-        let mut srgb_batch = Vec::new();
-        let mut linear_batch = Vec::new();
+        let mut batches: Vec<(SurfaceColorRenderState, Vec<&FlowRenderElement>)> = Vec::new();
         for elem in elements {
-            let transfer = surface_transfers
+            let color = surface_colors
                 .get(elem.id())
                 .copied()
-                .unwrap_or(TransferFunction::Srgb);
-            if transfer == TransferFunction::Linear {
-                linear_batch.push(elem);
+                .unwrap_or_else(SurfaceColorRenderState::srgb_default);
+            if let Some((_, batch)) = batches.iter_mut().find(|(c, _)| *c == color) {
+                batch.push(elem);
             } else {
-                srgb_batch.push(elem);
+                batches.push((color, vec![elem]));
             }
         }
 
-        if !srgb_batch.is_empty() {
-            frame.override_default_tex_program(srgb_to_linear, Vec::new());
-            draw_render_elements(frame, ctx.output_scale.x, &srgb_batch, damage).unwrap();
+        for (color, batch) in batches {
+            let m = color.client_to_scene;
+            let uniforms = vec![
+                Uniform::new(
+                    "u_decode_tf",
+                    color.description.transfer.decode_mode() as u32 as f32,
+                ),
+                Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
+                Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
+                Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
+            ];
+            frame.override_default_tex_program(client_to_scene.clone(), uniforms);
+            draw_render_elements(frame, ctx.output_scale.x, &batch, damage).unwrap();
             frame.clear_tex_program_override();
-        }
-        if !linear_batch.is_empty() {
-            draw_render_elements(frame, ctx.output_scale.x, &linear_batch, damage).unwrap();
         }
     }
 
@@ -2962,11 +2979,11 @@ impl RenderState {
         let _ = Self::draw_top_bar(
             frame,
             top_bar,
-            layout.topbar.outer,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.top_bar,
-        );
+                layout.topbar.outer,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.top_bar,
+            );
 
         let _ = Self::draw_beveled_panel(
             frame,
@@ -3043,6 +3060,15 @@ impl RenderState {
             damage,
             &legacy_theme.panel_inner,
         );
+
+        let _ = Self::draw_beveled_panel(
+            frame,
+            &beveled,
+                layout.topbar.flow_field,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.panel_inner,
+            );
 
         let _ = Self::draw_beveled_panel(
             frame,
@@ -3269,6 +3295,7 @@ impl RenderState {
         ui_tree: &UiTree,
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
+        flow_field_pulse: Option<FlowFieldPulseFrame>,
         theme: &FlowTheme,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
@@ -3457,6 +3484,78 @@ impl RenderState {
                                 ctx.output_scale,
                                 style,
                                 &tinted_icon,
+                            );
+                        }
+                    }
+
+                    UiElementKind::TopbarFlowField => {
+                        let mode = if !el.enabled {
+                            4
+                        } else if el.active && el.selected {
+                            3
+                        } else if el.active {
+                            2
+                        } else if el.selected {
+                            1
+                        } else {
+                            0
+                        };
+
+                        let energy = if !el.enabled {
+                            0.96
+                        } else if el.active && el.selected {
+                            0.96
+                        } else if el.active {
+                            0.88
+                        } else if el.selected {
+                            0.94
+                        } else {
+                            0.40
+                        };
+
+                        let accent = active_theme.chrome.accent_color;
+                        let mut color = match mode {
+                            1 => [accent[0], accent[1], accent[2], 0.98],
+                            2 => [0.94, 0.97, 1.00, 0.92],
+                            3 => [1.00, 0.72, 0.18, 1.00],
+                            4 => [0.98, 0.30, 0.30, 1.00],
+                            _ => [accent[0] * 0.72, accent[1] * 0.90, accent[2], 0.70],
+                        };
+                        if el.hovered {
+                            color[3] = (color[3] + 0.12).min(1.0);
+                        }
+
+                        if let Some(program) = self.chrome_shaders.flow_field.as_ref() {
+                            let _ = draw_flow_field(
+                                frame,
+                                program,
+                                base_rect_logical,
+                                ctx.output_scale,
+                                damage,
+                                mode,
+                                energy,
+                                color,
+                            );
+                        }
+
+                        if let (Some(pulse_shader), Some(pulse_frame)) =
+                            (self.chrome_shaders.pulse.as_ref(), flow_field_pulse)
+                        {
+                            let pulse_color = [
+                                color[0].max(0.6),
+                                color[1].max(0.7),
+                                color[2].max(0.9),
+                                1.0,
+                            ];
+                            let _ = Self::draw_pulse(
+                                frame,
+                                pulse_shader,
+                                base_rect_logical,
+                                pulse_frame.click_local,
+                                pulse_frame.elapsed,
+                                ctx.output_scale,
+                                damage,
+                                pulse_color,
                             );
                         }
                     }

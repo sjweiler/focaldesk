@@ -164,6 +164,14 @@ impl XwmHandler for DesktopState {
             if let Some(y) = y {
                 geometry.loc.y = y;
             }
+            let output_id = self
+                .window_id_for_x11_surface(&window)
+                .map(|window_id| self.xwayland_output_id_for_window(window_id))
+                .unwrap_or_else(|| {
+                    self.output_under_pointer(self.input.pointer_pos)
+                        .unwrap_or(self.primary_output)
+                });
+            geometry = self.xwayland_clamp_override_redirect_geometry(output_id, geometry);
             let _ = window.configure(geometry);
             return;
         }
@@ -216,11 +224,14 @@ impl XwmHandler for DesktopState {
         self.mark_window_id_damage(id, crate::core::desktop::DamageSource::WindowResize);
         if window.is_override_redirect() {
             let compositor_loc = self.xwayland_or_compositor_loc(&window, geometry.loc);
-            let rect = Rectangle::from_loc_and_size(compositor_loc, geometry.size);
+            let rect = self.xwayland_clamp_override_redirect_geometry(
+                self.xwayland_output_id_for_window(id),
+                Rectangle::from_loc_and_size(compositor_loc, geometry.size),
+            );
             if let Some(state) = self.window_mut(id) {
                 state.float_rect = Some(rect);
             }
-            self.map_window_bbox_location(managed, compositor_loc, false);
+            self.map_window_bbox_location(managed, rect.loc, false);
         } else {
             let output_id = self.xwayland_output_id_for_window(id);
             let fills_output = self.xwayland_request_fills_output(output_id, geometry.size);

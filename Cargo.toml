@@ -25,7 +25,7 @@ members = [
     "apps/focaldesk-settings",
 
     # services
-    "services/focaldesk-server", "crates/focaldesk-types", "crates/focaldesk-power", "crates/focaldesk-audio", "crates/focaldesk-bluetooth", "crates/focaldesk-notifications", "crates/focaldesk-resources", "crates/focaldesk-cursor", "crates/focaldesk-spawn", "crates/focaldesk-config", "crates/focaldesk-permissions", "apps/focaldesk-portal", "apps/focaldesk-settings", "crates/focaldesk-themes", "crates/focaldesk-sounds", 
+    "services/focaldesk-server", "crates/focaldesk-types", "crates/focaldesk-power", "crates/focaldesk-audio", "crates/focaldesk-bluetooth", "crates/focaldesk-notifications", "crates/focaldesk-resources", "crates/focaldesk-cursor", "crates/focaldesk-spawn", "crates/focaldesk-config", "crates/focaldesk-permissions", "apps/focaldesk-portal", "apps/focaldesk-settings", "crates/focaldesk-themes", "crates/focaldesk-sounds", "apps/focaldesk-ai-console", 
 ]
 resolver = "2"
 

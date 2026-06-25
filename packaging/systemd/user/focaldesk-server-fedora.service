@@ -1,0 +1,16 @@
+[Unit]
+Description=FocalDesk server
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/focaldesk-server
+Restart=on-failure
+RestartSec=2
+Environment=FOCALDESK_AI_SOCKET=%t/focaldesk-ai.sock
+EnvironmentFile=-%h/.config/focaldesk/focaldesk-server.env
+Environment=FOCALDESK_AI_PERMISSION=prompt
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

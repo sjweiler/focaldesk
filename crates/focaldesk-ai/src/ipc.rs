@@ -2,32 +2,42 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::service::AiService;
-use crate::types::{ChatRequest, ChatResponse, ProviderInfo};
+use crate::types::{AiDaemonStatus, ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo};
 
-pub const AI_SOCKET_PATH: &str = "/tmp/focaldesk-ai.sock";
+pub const AI_SOCKET_NAME: &str = "focaldesk-ai.sock";
+pub const AI_SOCKET_ENV: &str = "FOCALDESK_AI_SOCKET";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AiIpcRequest {
     ListProviders,
+    ListModels { provider: String },
     Chat { request: ChatRequest },
+    Status,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "status")]
+#[serde(tag = "kind")]
 pub enum AiIpcResponse {
     Providers {
         default_provider: String,
         providers: Vec<ProviderInfo>,
     },
+    Models {
+        provider: String,
+        models: Vec<ProviderModelInfo>,
+    },
     Chat {
         response: ChatResponse,
+    },
+    Status {
+        status: AiDaemonStatus,
     },
     Error {
         message: String,
@@ -35,7 +45,8 @@ pub enum AiIpcResponse {
 }
 
 pub async fn serve_ai_ipc(service: Arc<AiService>) -> Result<()> {
-    serve_ai_ipc_at(service, AI_SOCKET_PATH).await
+    let path = ai_socket_path();
+    serve_ai_ipc_at(service, &path).await
 }
 
 pub async fn serve_ai_ipc_at(service: Arc<AiService>, path: impl AsRef<Path>) -> Result<()> {
@@ -74,11 +85,20 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
             default_provider: service.default_provider().to_string(),
             providers: service.providers(),
         },
+        Ok(AiIpcRequest::ListModels { provider }) => match service.provider_models(&provider).await {
+            Ok(models) => AiIpcResponse::Models { provider, models },
+            Err(err) => AiIpcResponse::Error {
+                message: err.to_string(),
+            },
+        },
         Ok(AiIpcRequest::Chat { request }) => match service.chat(request).await {
             Ok(response) => AiIpcResponse::Chat { response },
             Err(err) => AiIpcResponse::Error {
                 message: err.to_string(),
             },
+        },
+        Ok(AiIpcRequest::Status) => AiIpcResponse::Status {
+            status: service.status(),
         },
         Err(err) => AiIpcResponse::Error {
             message: format!("invalid AI IPC request: {err}"),
@@ -96,7 +116,19 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
 }
 
 pub fn send_ai_request(request: &AiIpcRequest) -> Result<AiIpcResponse> {
-    send_ai_request_at(AI_SOCKET_PATH, request)
+    let path = ai_socket_path();
+    send_ai_request_at(&path, request)
+}
+
+pub fn ai_socket_path() -> PathBuf {
+    if let Some(path) = std::env::var_os(AI_SOCKET_ENV) {
+        return PathBuf::from(path);
+    }
+
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(AI_SOCKET_NAME)
 }
 
 pub fn send_ai_request_at(path: impl AsRef<Path>, request: &AiIpcRequest) -> Result<AiIpcResponse> {

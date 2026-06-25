@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::provider::AiProvider;
-use crate::types::{ChatMessage, ChatRequest, ChatResponse, ProviderInfo};
+use crate::types::{ChatMessage, ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo};
 
 #[derive(Debug, Clone)]
 pub struct OpenAICompatibleProvider {
@@ -71,6 +71,40 @@ impl AiProvider for OpenAICompatibleProvider {
             base_url: Some(self.base_url.clone()),
             default_model: self.default_model.clone(),
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        let mut builder = self
+            .client
+            .get(format!("{}/models", self.base_url));
+
+        if let Some(api_key) = &self.api_key {
+            builder = builder.bearer_auth(api_key);
+        }
+
+        let response = builder
+            .send()
+            .await
+            .with_context(|| format!("{} model list request failed", self.id))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read model list response body")?;
+
+        if !status.is_success() {
+            bail!("{} returned HTTP {} while listing models: {}", self.id, status, body);
+        }
+
+        let decoded: OpenAIModelsResponse = serde_json::from_str(&body)
+            .with_context(|| format!("failed to parse {} model list", self.id))?;
+
+        Ok(decoded
+            .data
+            .into_iter()
+            .map(|model| ProviderModelInfo { id: model.id })
+            .filter(|model| !model.id.trim().is_empty())
+            .collect())
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
@@ -164,6 +198,16 @@ impl From<&ChatMessage> for OpenAIChatMessage {
 #[derive(Debug, Deserialize)]
 struct OpenAIChatResponse {
     choices: Vec<OpenAIChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIModelsResponse {
+    data: Vec<OpenAIModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIModelInfo {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -7,6 +7,7 @@ use crate::uitree::UiTree;
 
 const SIDEBAR_BASE: u32 = 1_000;
 const CLOCK_ID: u32 = 100_000;
+pub const TOPBAR_FLOW_FIELD_ID: u32 = 100_001;
 pub const SIDEBAR_SETTINGS_ID: u32 = SIDEBAR_BASE + 1;
 pub const SIDEBAR_WORKSPACE_1_ID: u32 = SIDEBAR_BASE + 2;
 pub const SIDEBAR_ADD_WORKSPACE_ID: u32 = SIDEBAR_BASE + 3;
@@ -18,12 +19,22 @@ pub const SIDEBAR_WORKSPACE_2_ID: u32 = SIDEBAR_BASE + 8;
 pub const SIDEBAR_WORKSPACE_3_ID: u32 = SIDEBAR_BASE + 9;
 pub const SIDEBAR_WORKSPACE_OVERFLOW_ID: u32 = SIDEBAR_BASE + 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiFlowMode {
+    Idle,
+    Thinking,
+    Acting,
+    PermissionWait,
+    Error,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UiBuildOptions {
     pub hdr_supported: bool,
     pub hdr_enabled: bool,
     pub workspace_count: usize,
     pub active_workspace: u32,
+    pub ai_flow_mode: AiFlowMode,
 }
 
 impl Default for UiBuildOptions {
@@ -33,6 +44,7 @@ impl Default for UiBuildOptions {
             hdr_enabled: false,
             workspace_count: 1,
             active_workspace: 1,
+            ai_flow_mode: AiFlowMode::Idle,
         }
     }
 }
@@ -59,6 +71,14 @@ pub fn build_ui_for_output_with_options(
     ui.elements.clear();
 
     let workspace_count = options.workspace_count.max(1);
+    let (flow_selected, flow_active, flow_enabled) = match options.ai_flow_mode {
+        AiFlowMode::Idle => (false, false, true),
+        AiFlowMode::Thinking => (true, false, true),
+        AiFlowMode::Acting => (false, true, true),
+        AiFlowMode::PermissionWait => (true, true, true),
+        AiFlowMode::Error => (false, false, false),
+    };
+
     let mut sidebar_entries = vec![
         (
             SIDEBAR_SETTINGS_ID,
@@ -162,6 +182,26 @@ pub fn build_ui_for_output_with_options(
         ui.elements.push(el);
     }
 
+    let mut flow_field = UiElement::topbar_indicator(
+        TOPBAR_FLOW_FIELD_ID,
+        IconId::Launcher,
+        "Launch FocalDesk AI Console",
+    );
+    flow_field.kind = UiElementKind::TopbarFlowField;
+    flow_field.action = Some(UiAction::LaunchApp("focaldesk-ai-console"));
+    flow_field.bounds = UiRect {
+        x: layout.topbar.flow_field.loc.x,
+        y: layout.topbar.flow_field.loc.y,
+        w: layout.topbar.flow_field.size.w,
+        h: layout.topbar.flow_field.size.h,
+    };
+    flow_field.hover_scale = 1.0;
+    flow_field.press_scale = 1.0;
+    flow_field.selected = flow_selected;
+    flow_field.active = flow_active;
+    flow_field.enabled = flow_enabled;
+    ui.elements.push(flow_field);
+
     for (i, rect) in layout.topbar.status_wells.iter().enumerate() {
         let (icon, tooltip, action) = match i {
             0 => (
@@ -234,6 +274,10 @@ pub fn build_ui_for_output_with_options(
 #[cfg(test)]
 mod tests {
     use super::hdr_tooltip;
+    use crate::ui_builder::{
+        build_ui_for_output_with_options, UiAction, UiBuildOptions, TOPBAR_FLOW_FIELD_ID,
+    };
+    use crate::uitree::UiTree;
 
     #[test]
     fn hdr_tooltip_only_reports_enabled_for_applied_supported_hdr() {
@@ -241,5 +285,23 @@ mod tests {
         assert_eq!(hdr_tooltip(true, false), "HDR supported (inactive)");
         assert_eq!(hdr_tooltip(false, true), "HDR not detected");
         assert_eq!(hdr_tooltip(false, false), "HDR not detected");
+    }
+
+    #[test]
+    fn topbar_flow_field_launches_ai_console_directly() {
+        let action = build_flow_field_action();
+        assert!(matches!(action, UiAction::LaunchApp("focaldesk-ai-console")));
+    }
+
+    fn build_flow_field_action() -> UiAction {
+        let output_size = smithay::utils::Size::from((1920, 1080));
+        let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(&mut ui, &layout, UiBuildOptions::default());
+        ui.elements
+            .iter()
+            .find(|el| el.id == TOPBAR_FLOW_FIELD_ID)
+            .and_then(|el| el.action.clone())
+            .expect("flow field action")
     }
 }

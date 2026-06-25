@@ -84,6 +84,10 @@ know the current state of your local build.
 The background server exposes AI chat over the local IPC socket used by
 `focaldesk-cli ai ...`.
 
+The socket path resolves from `FOCALDESK_AI_SOCKET` first, then
+`$XDG_RUNTIME_DIR/focaldesk-ai.sock` inside a user session, and finally
+`/tmp/focaldesk-ai.sock` when no runtime directory is available.
+
 By default the AI service asks the compositor to show a native approval modal,
 logs each request, and records the decision through the normal FocalDesk
 logging pipeline. If the desktop socket is unavailable, it falls back to the
@@ -95,6 +99,30 @@ You can tighten or relax the permission gate with:
 - `FOCALDESK_AI_PERMISSION=allow-session` to allow chat for the current session
 - `FOCALDESK_AI_PERMISSION=allow-persistent` to persist the allow decision on disk across restarts
 - `FOCALDESK_AI_PERMISSION=deny` to block AI chat
+
+## Systemd Service
+
+The repo includes a user service unit at
+[packaging/systemd/user/focaldesk-server.service](packaging/systemd/user/focaldesk-server.service).
+
+To build and install it with `just`:
+
+```sh
+just install-server-service
+```
+
+That recipe builds a release binary, installs it to `~/.local/bin`, copies the
+unit to `~/.config/systemd/user`, and enables the service.
+
+If you are packaging for Fedora, install the binary to `/usr/bin/focaldesk-server`
+and place the user unit in `/usr/lib/systemd/user/focaldesk-server.service`
+using [packaging/systemd/user/focaldesk-server-fedora.service](packaging/systemd/user/focaldesk-server-fedora.service).
+
+Use the Fedora recipe if you want the standard distro locations:
+
+```sh
+just install-server-service-fedora
+```
 
 ## License
 

@@ -185,6 +185,14 @@ impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorT
                 let description = match transfer {
                     TransferFunction::Srgb => ColorDescription::SRGB,
                     TransferFunction::Linear => ColorDescription::LINEAR_SRGB,
+                    TransferFunction::Bt1886 => ColorDescription {
+                        transfer: TransferFunction::Bt1886,
+                        ..ColorDescription::SRGB
+                    },
+                    TransferFunction::Gamma22 => ColorDescription {
+                        transfer: TransferFunction::Gamma22,
+                        ..ColorDescription::SRGB
+                    },
                 };
                 set_pending_description(&tag.surface, Some(description));
                 flog(format!(

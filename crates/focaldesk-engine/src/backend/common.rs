@@ -221,6 +221,9 @@ pub fn pump_xwayland_ready(
         }
         // XWayland cannot finish startup until its Wayland client roundtrips with the compositor.
         display.dispatch_clients(state)?;
+        crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
+            state,
+        );
         display.handle().flush_clients()?;
         event_loop.dispatch(Some(Duration::ZERO), state)?;
     }

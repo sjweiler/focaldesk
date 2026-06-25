@@ -656,6 +656,10 @@ fn main() -> Result<()> {
         event_queue
             .roundtrip(&mut app)
             .context("output image description roundtrip failed")?;
+        // get_information is queued from the Ready handler; flush it before checking.
+        event_queue
+            .roundtrip(&mut app)
+            .context("output get_information roundtrip failed")?;
         if !app.chrome_output_ready {
             bail!("output wp_image_description_v1 path did not complete");
         }

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod color;
+pub mod icc;
 pub mod consts;
 pub mod desktop;
 pub mod input;

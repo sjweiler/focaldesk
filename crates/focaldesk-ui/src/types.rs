@@ -64,6 +64,7 @@ pub enum UiElementKind {
     SidebarButton,
     TopbarIndicator,
     TopbarButton,
+    TopbarFlowField,
     WorkspaceSlot,
     Clock,
     OutputLabel,

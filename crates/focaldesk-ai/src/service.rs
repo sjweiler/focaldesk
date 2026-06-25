@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
 use tracing::{info, warn};
@@ -10,13 +11,14 @@ use crate::provider::AiProvider;
 use crate::providers::{
     AnthropicProvider, LocalCpuProvider, OllamaProvider, OpenAICompatibleProvider,
 };
-use crate::types::{ChatRequest, ChatResponse, ProviderInfo};
+use crate::types::{ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo};
 
 pub struct AiService {
     providers: BTreeMap<String, Arc<dyn AiProvider>>,
     default_provider: String,
     request_timeout: Duration,
     concurrency: Arc<Semaphore>,
+    active_requests: Arc<AtomicUsize>,
 }
 
 impl AiService {
@@ -26,6 +28,7 @@ impl AiService {
             default_provider: default_provider.into(),
             request_timeout: Duration::from_secs(120),
             concurrency: Arc::new(Semaphore::new(2)),
+            active_requests: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -78,8 +81,25 @@ impl AiService {
             .collect()
     }
 
+    pub async fn provider_models(&self, provider_id: &str) -> Result<Vec<ProviderModelInfo>> {
+        let provider = self
+            .providers
+            .get(provider_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown AI provider: {provider_id}"))?;
+        provider.list_models().await
+    }
+
     pub fn default_provider(&self) -> &str {
         &self.default_provider
+    }
+
+    pub fn status(&self) -> crate::types::AiDaemonStatus {
+        crate::types::AiDaemonStatus {
+            active_requests: self.active_requests.load(Ordering::Relaxed) as u32,
+            default_provider: self.default_provider.clone(),
+            provider_count: self.providers.len(),
+        }
     }
 
     pub async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
@@ -111,6 +131,18 @@ impl AiService {
             .acquire()
             .await
             .context("AI request concurrency limiter closed")?;
+        self.active_requests.fetch_add(1, Ordering::Relaxed);
+        struct ActiveRequestGuard<'a> {
+            counter: &'a AtomicUsize,
+        }
+        impl Drop for ActiveRequestGuard<'_> {
+            fn drop(&mut self) {
+                self.counter.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let _active_guard = ActiveRequestGuard {
+            counter: &self.active_requests,
+        };
 
         let started = std::time::Instant::now();
         let response = timeout(self.request_timeout, provider.chat(request))

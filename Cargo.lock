@@ -1151,6 +1151,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "dunce"
+version = "1.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
+
+[[package]]
 name = "ecolor"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1474,6 +1480,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-ai-console"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs 6.0.0",
+ "focaldesk-ai",
+ "focaldesk-ipc",
+ "focaldesk-settings-core",
+ "glib",
+ "gtk4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "focaldesk-audio"
 version = "0.1.0"
 
@@ -1501,6 +1522,7 @@ dependencies = [
  "anyhow",
  "focaldesk-ai",
  "focaldesk-ipc",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1560,6 +1582,7 @@ dependencies = [
  "calloop 0.12.4",
  "chrono",
  "egui",
+ "focaldesk-ai",
  "focaldesk-config",
  "focaldesk-cursor",
  "focaldesk-flow",
@@ -1579,6 +1602,7 @@ dependencies = [
  "glow",
  "image",
  "indexmap",
+ "lcms2",
  "libc",
  "nix 0.27.1",
  "pipewire",
@@ -2969,6 +2993,29 @@ name = "lazycell"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
+
+[[package]]
+name = "lcms2"
+version = "6.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75877b724685dd49310bdbadbf973fc69b1d01992a6d4a861b928fc3943f87b"
+dependencies = [
+ "bytemuck",
+ "foreign-types",
+ "lcms2-sys",
+]
+
+[[package]]
+name = "lcms2-sys"
+version = "4.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c2604b23848ca80b2add60f0fb2270fd980e622c25029b6597fa01cfd5f8d5f"
+dependencies = [
+ "cc",
+ "dunce",
+ "libc",
+ "pkg-config",
+]
 
 [[package]]
 name = "leb128fmt"

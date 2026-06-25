@@ -282,14 +282,6 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::empty(),
-                sym: keysyms::KEY_Escape,
-            },
-            KeyAction::ForceExit,
-        );
-
-        self.map.insert(
-            KeyCombo {
-                mods: ModMask::empty(),
                 sym: keysyms::KEY_Print,
             },
             KeyAction::TakeScreenshot,

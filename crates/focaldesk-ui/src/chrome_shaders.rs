@@ -18,10 +18,12 @@ pub struct ChromeShaders {
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
     pub srgb_to_linear: Option<GlesTexProgram>,
+    pub client_to_scene_linear: Option<GlesTexProgram>,
     pub linear_to_srgb: Option<GlesTexProgram>,
     pub composite_linear_layer: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
+    pub flow_field: Option<GlesPixelProgram>,
 }
 
 impl Default for ChromeShaders {
@@ -44,10 +46,12 @@ impl ChromeShaders {
             rounded_rect: None,
             wallpaper_tint: None,
             srgb_to_linear: None,
+            client_to_scene_linear: None,
             linear_to_srgb: None,
             composite_linear_layer: None,
             pulse: None,
             accent: None,
+            flow_field: None,
         }
     }
 
@@ -154,6 +158,18 @@ impl ChromeShaders {
                 Some(renderer.compile_custom_texture_shader(SRGB_TO_LINEAR_FRAG, &[])?);
         }
 
+        if self.client_to_scene_linear.is_none() {
+            self.client_to_scene_linear = Some(renderer.compile_custom_texture_shader(
+                CLIENT_TO_SCENE_LINEAR_FRAG,
+                &[
+                    UniformName::new("u_decode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
+        }
+
         if self.linear_to_srgb.is_none() {
             self.linear_to_srgb =
                 Some(renderer.compile_custom_texture_shader(LINEAR_TO_SRGB_FRAG, &[])?);
@@ -161,7 +177,14 @@ impl ChromeShaders {
 
         if self.composite_linear_layer.is_none() {
             self.composite_linear_layer =
-                Some(renderer.compile_custom_texture_shader(COMPOSITE_LINEAR_LAYER_FRAG, &[])?);
+                Some(renderer.compile_custom_texture_shader(
+                    COMPOSITE_LINEAR_LAYER_FRAG,
+                    &[
+                        UniformName::new("u_m0", UniformType::_3f),
+                        UniformName::new("u_m1", UniformType::_3f),
+                        UniformName::new("u_m2", UniformType::_3f),
+                    ],
+                )?);
         }
 
         if self.amber_lightbar.is_none() {
@@ -235,6 +258,20 @@ impl ChromeShaders {
                     ));
                 }
             }
+        }
+
+        if self.flow_field.is_none() {
+            self.flow_field = Some(renderer.compile_custom_pixel_shader(
+                FLOW_FIELD_FRAG,
+                &[
+                    UniformName::new("u_resolution", UniformType::_2f),
+                    UniformName::new("u_rect", UniformType::_4f),
+                    UniformName::new("u_time", UniformType::_1f),
+                    UniformName::new("u_mode", UniformType::_1f),
+                    UniformName::new("u_energy", UniformType::_1f),
+                    UniformName::new("u_color", UniformType::_4f),
+                ],
+            )?);
         }
 
         Ok(())
@@ -779,6 +816,66 @@ void main() {
 }
 "#;
 
+const CLIENT_TO_SCENE_LINEAR_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_decode_tf;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 gamma22_to_linear(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(2.2));
+}
+
+vec3 decode_color(vec3 c) {
+    if (u_decode_tf < 0.5) {
+        return srgb_to_linear(c);
+    }
+    if (u_decode_tf < 1.5) {
+        return c;
+    }
+    return gamma22_to_linear(c);
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    if (src.a < 0.0001) {
+        discard;
+    }
+    vec3 straight = clamp(src.rgb / src.a, 0.0, 1.0);
+    vec3 linear = mul_mat3(decode_color(straight));
+    gl_FragColor = vec4(linear * src.a, src.a) * alpha;
+}
+"#;
+
 const SRGB_TO_LINEAR_FRAG: &str = r#"
 //_DEFINES_
 
@@ -831,12 +928,19 @@ precision highp float;
 
 varying vec2 v_coords;
 uniform float alpha;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
 
 vec3 linear_to_srgb(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
     vec3 low = c * 12.92;
     vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
     return mix(high, low, vec3(cutoff));
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
 }
 
 void main() {
@@ -848,7 +952,8 @@ void main() {
         discard;
     }
     vec3 straight = src.rgb / src.a;
-    gl_FragColor = vec4(linear_to_srgb(straight) * src.a, src.a) * alpha;
+    vec3 encoded = linear_to_srgb(mul_mat3(straight));
+    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;
 
@@ -1080,6 +1185,206 @@ void main() {
         );
 
     float out_alpha = alpha * u_accent.a;
-    gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
+gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
+}
+"#;
+
+const FLOW_FIELD_FRAG: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform vec2  u_resolution;
+uniform vec4  u_rect;
+uniform float u_time;
+uniform float u_mode;
+uniform float u_energy;
+uniform vec4  u_color;
+
+varying vec2 v_coords;
+
+float hash11(float n) {
+    return fract(sin(n) * 43758.5453123);
+}
+
+vec2 hash21(float n) {
+    return vec2(hash11(n), hash11(n + 19.19));
+}
+
+float mode_energy(float mode) {
+    if (mode < 0.5) {
+        return 0.30;
+    } else if (mode < 1.5) {
+        return 1.00;
+    } else if (mode < 2.5) {
+        return 0.90;
+    } else if (mode < 3.5) {
+        return 0.96;
+    }
+    return 1.00;
+}
+
+float motion_amp_for_mode(float mode) {
+    if (mode < 0.5) {
+        return 0.92;
+    } else if (mode < 1.5) {
+        return 1.42;
+    } else if (mode < 2.5) {
+        return 1.18;
+    } else if (mode < 3.5) {
+        return 1.48;
+    }
+    return 1.72;
+}
+
+float particle_count_for_mode(float mode) {
+    if (mode < 0.5) {
+        return 40.0;
+    } else if (mode < 1.5) {
+        return 72.0;
+    } else if (mode < 2.5) {
+        return 60.0;
+    } else if (mode < 3.5) {
+        return 54.0;
+    }
+    return 48.0;
+}
+
+vec3 mode_tint(float mode) {
+    if (mode < 0.5) {
+        return vec3(0.40, 0.62, 1.00);
+    } else if (mode < 1.5) {
+        return vec3(0.55, 0.95, 1.00);
+    } else if (mode < 2.5) {
+        return vec3(0.44, 1.00, 0.80);
+    } else if (mode < 3.5) {
+        return vec3(1.00, 0.74, 0.20);
+    }
+    return vec3(1.00, 0.30, 0.30);
+}
+
+float pulse(float t, float freq) {
+    return 0.5 + 0.5 * sin(t * freq);
+}
+
+void main() {
+    vec2 pos = v_coords * u_resolution;
+    vec2 local = pos - u_rect.xy;
+    vec2 size = max(u_rect.zw, vec2(1.0));
+
+    float inside_x = step(u_rect.x, pos.x) * step(pos.x, u_rect.x + u_rect.z);
+    float inside_y = step(u_rect.y, pos.y) * step(pos.y, u_rect.y + u_rect.w);
+    float mask = inside_x * inside_y;
+    if (mask <= 0.0) {
+        discard;
+    }
+
+    float mode = floor(u_mode + 0.5);
+    float energy = clamp(u_energy, 0.0, 1.0) * mode_energy(mode);
+    float count = particle_count_for_mode(mode);
+    float motion_amp = motion_amp_for_mode(mode);
+    float speed = mix(0.03, 0.20, energy);
+    float glow = mix(0.20, 0.94, energy) * mix(0.84, 1.18, motion_amp);
+    vec3 tint = mode_tint(mode) * u_color.rgb;
+
+    vec3 accum = vec3(0.0);
+    float center_y = size.y * 0.5;
+    float center_x = size.x * 0.5;
+
+    const int PARTICLES = 48;
+    for (int i = 0; i < PARTICLES; ++i) {
+        float fi = float(i);
+        float enabled = step(fi, count - 1.0);
+        vec2 seed = hash21(fi * 13.37 + mode * 61.7);
+        float phase = fract(seed.x + u_time * speed + fi * 0.013);
+
+        float x = 0.5;
+        float y = 0.5;
+        float core_scale = 1.0;
+        float trail = 0.0;
+        float bloom = 0.0;
+        float fracture = 0.0;
+
+        if (mode < 0.5) {
+            float orbit = u_time * 0.28 + fi * 0.37 + seed.x * 6.28318;
+            x = mix(0.10, 0.90, fract(seed.x + u_time * 0.018 + fi * 0.004))
+                + sin(orbit) * 0.020 * motion_amp;
+            y = 0.20 + 0.58 * seed.y + cos(orbit * 1.27) * 0.035 * motion_amp;
+            core_scale = 1.06;
+            bloom = pulse(u_time * 0.38 + seed.x * 2.0, 0.9) * 0.85;
+        } else if (mode < 1.5) {
+            x = mix(-0.14, 1.12, phase);
+            y = 0.24 + 0.54 * seed.y
+                + sin(u_time * (0.95 + seed.x * 0.55) + fi * 0.31) * 0.05 * motion_amp;
+            trail = smoothstep(-18.0, 14.0, (x - 0.5) * size.x)
+                * (1.0 - abs(seed.y - 0.5) * 1.4);
+            core_scale = 0.92;
+        } else if (mode < 2.5) {
+            float orbit = u_time * 1.55 + fi * 0.63 + seed.x * 5.2;
+            x = 0.5 + (seed.x - 0.5) * 0.18 + cos(orbit) * 0.035 * motion_amp;
+            y = 0.5 + (seed.y - 0.5) * 0.16 + sin(orbit * 1.2) * 0.045 * motion_amp;
+            bloom = 1.0 - smoothstep(0.0, 1.0, abs(y - 0.5) * 2.4);
+            core_scale = 1.10;
+        } else if (mode < 3.5) {
+            float rise = pulse(u_time * 2.4 + seed.x * 7.0, 1.0);
+            x = mix(0.18, 0.82, fract(seed.x + u_time * 0.06 + fi * 0.01));
+            y = 0.50 + (seed.y - 0.5) * 0.14 + (rise - 0.5) * 0.18 * motion_amp;
+            bloom = 1.0 - smoothstep(0.0, 1.0, abs((y - 0.5) / 0.18));
+            core_scale = 0.98;
+        } else {
+            float jitter = hash11(fi * 9.3 + floor(u_time * 18.0));
+            float shard = step(0.42, jitter);
+            x = mix(-0.08, 1.08, fract(seed.x + u_time * 0.10 + fi * 0.017));
+            y = 0.20 + 0.60 * seed.y
+                + sign(seed.x - 0.5) * 0.05
+                + sin(u_time * (2.6 + seed.y) + fi * 0.91) * 0.06 * motion_amp;
+            fracture = shard * (0.45 + 0.55 * step(0.68, hash11(fi * 5.7 + floor(u_time * 10.0))));
+            trail = step(0.12, fract(seed.y + u_time * 0.25)) * 0.5;
+            core_scale = 0.88;
+        }
+
+        vec2 particle = u_rect.xy + vec2(x * size.x, y * size.y);
+        vec2 delta = local - (particle - u_rect.xy);
+        float dist = length(delta);
+
+        float core = exp(-(dist * dist) / (mix(170.0, 56.0, energy) * core_scale));
+        float streak = exp(-abs(delta.y) / mix(11.0, 3.8, energy))
+            * smoothstep(-18.0, 20.0, delta.x)
+            * trail;
+        float ring = exp(-pow((dist - size.y * 0.16) / max(size.y * 0.12, 1.0), 2.0));
+        float drift = (0.12 + 0.08 * sin(u_time * 0.18 + fi * 0.4)) * motion_amp;
+        float flicker = 0.70 + 0.30 * hash11(fi * 3.7 + floor(u_time * (10.0 + motion_amp * 4.0)));
+        float edge_shard = step(0.52, hash11(fi * 4.4 + floor(u_time * 14.0)));
+
+        if (mode < 0.5) {
+            float orbit_glow = 0.50 + 0.50 * sin(u_time * 0.65 + fi * 0.33);
+            accum += tint * enabled * vec3(core * 0.72 + ring * 0.14 + orbit_glow * 0.025 + bloom * 0.03);
+        } else if (mode < 1.5) {
+            accum += tint * enabled * vec3(core * 0.82 + streak * 1.85 + drift * 0.02);
+        } else if (mode < 2.5) {
+            accum += tint * enabled * vec3(core * 0.68 + ring * 0.98 + bloom * 0.20);
+        } else if (mode < 3.5) {
+            float pulse_ring = 1.0 - smoothstep(0.0, 0.12 * size.y, abs(dist - size.y * 0.10));
+            float pulse_flash = pulse(u_time * 2.2 + seed.x * 5.0, 1.0);
+            accum += tint * enabled * vec3(core * 0.34 + ring * 1.24 + pulse_ring * pulse_flash * 0.54);
+        } else {
+            accum += tint * enabled * vec3(
+                core * (0.62 + 0.64 * flicker) +
+                streak * (0.80 + 0.88 * edge_shard) +
+                fracture * 0.58 +
+                drift * 0.02
+            );
+        }
+    }
+
+    float density = clamp(dot(accum, vec3(0.3333)), 0.0, 1.0);
+    float normalized_x = local.x / max(size.x, 1.0);
+    float normalized_y = local.y / max(size.y, 1.0);
+    float wave = 0.5 + 0.5 * sin(normalized_x * 8.0 - u_time * 2.2 + normalized_y * 2.6);
+    float ripple = exp(-pow((normalized_y - 0.5 - 0.14 * sin(u_time * 0.85)) / 0.22, 2.0));
+    float edge = 1.0 - smoothstep(0.0, 10.0, min(min(local.x, local.y), min(size.x - local.x, size.y - local.y)));
+    float alpha = clamp(density * glow * 1.45 + edge * 0.18 + wave * ripple * 0.22, 0.0, 1.0) * u_color.a;
+
+    gl_FragColor = vec4(tint * (alpha + wave * ripple * 0.18), alpha);
 }
 "#;

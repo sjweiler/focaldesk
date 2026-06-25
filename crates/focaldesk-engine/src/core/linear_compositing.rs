@@ -4,7 +4,7 @@ use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
     prepare_output, PreparedOutput,
 };
-use crate::core::color::linear_sdr_runtime_enabled;
+use crate::core::color::{kms_scanout_color_description, linear_sdr_runtime_enabled, scene_to_output_matrix, RenderingIntent};
 use crate::core::desktop::DesktopState;
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
@@ -123,7 +123,10 @@ pub fn composite_linear_layer_onto_sdr(
     sdr: &mut GlesTexture,
     size: Size<i32, Physical>,
     shader: &GlesTexProgram,
+    scene_to_output: [[f32; 3]; 3],
 ) -> Result<()> {
+    use smithay::backend::renderer::gles::Uniform;
+
     let mut target = renderer
         .bind(sdr)
         .context("bind SDR target for linear composite")?;
@@ -137,6 +140,23 @@ pub fn composite_linear_layer_onto_sdr(
     );
     let dst_rect = smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
     let damage = [dst_rect];
+    let uniforms = vec![
+        Uniform::new("u_m0", [
+            scene_to_output[0][0],
+            scene_to_output[0][1],
+            scene_to_output[0][2],
+        ]),
+        Uniform::new("u_m1", [
+            scene_to_output[1][0],
+            scene_to_output[1][1],
+            scene_to_output[1][2],
+        ]),
+        Uniform::new("u_m2", [
+            scene_to_output[2][0],
+            scene_to_output[2][1],
+            scene_to_output[2][2],
+        ]),
+    ];
     frame
         .render_texture_from_to(
             linear,
@@ -147,7 +167,7 @@ pub fn composite_linear_layer_onto_sdr(
             Transform::Normal,
             1.0,
             Some(shader),
-            &[],
+            &uniforms,
         )
         .context("render linear composite")?;
     let _sync = frame.finish().context("finish linear composite")?;
@@ -174,7 +194,7 @@ pub fn run_linear_staged_pass(
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
-    srgb_to_linear: &GlesTexProgram,
+    client_to_scene: &GlesTexProgram,
     composite_linear_layer: &GlesTexProgram,
 ) -> Result<SyncPoint> {
     // Staged passes rewrite the full offscreen each frame; partial damage leaves
@@ -256,7 +276,7 @@ pub fn run_linear_staged_pass(
             output_state,
             OutputRenderStage::Clients,
             ClientCompositingMode::Linear {
-                srgb_to_linear: srgb_to_linear.clone(),
+                client_to_scene: client_to_scene.clone(),
             },
             ChromeGlassPass::Skip,
         )
@@ -270,12 +290,17 @@ pub fn run_linear_staged_pass(
             .offscreen
             .as_mut()
             .ok_or_else(|| anyhow!("SDR offscreen missing before composite"))?;
+        let scene_to_output = scene_to_output_matrix(
+            kms_scanout_color_description(),
+            RenderingIntent::Relative,
+        );
         composite_linear_layer_onto_sdr(
             renderer,
             &linear_texture,
             &mut sdr.texture,
             buffer_size,
             composite_linear_layer,
+            scene_to_output,
         )?;
     }
 
@@ -322,10 +347,10 @@ pub fn render_output_offscreen(
     dt: Duration,
     portal_capture: bool,
 ) -> Result<SyncPoint> {
-    let srgb_to_linear = state.render.chrome_shaders.srgb_to_linear.clone();
+    let client_to_scene = state.render.chrome_shaders.client_to_scene_linear.clone();
     let composite_linear_layer = state.render.chrome_shaders.composite_linear_layer.clone();
     let use_linear = use_linear_sdr_path(renderer, targets, buffer_size)
-        && srgb_to_linear.is_some()
+        && client_to_scene.is_some()
         && composite_linear_layer.is_some();
 
     if use_linear {
@@ -362,7 +387,7 @@ pub fn render_output_offscreen(
             ui_state,
             scene,
             output_state,
-            srgb_to_linear.as_ref().unwrap(),
+            client_to_scene.as_ref().unwrap(),
             composite_linear_layer.as_ref().unwrap(),
         )
     } else {

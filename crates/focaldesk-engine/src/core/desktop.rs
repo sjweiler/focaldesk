@@ -17,8 +17,8 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    effective_transfer, force_linear_surfaces, ColorDescription, SurfaceColorState,
-    TransferFunction,
+    effective_surface_render_state, force_linear_surfaces, ColorDescription,
+    RenderingIntent, SurfaceColorRenderState, SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
@@ -125,7 +125,8 @@ use crate::core::toplevel_interaction::{
     cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
     ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
-use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
+use crate::core::ui_builder::{build_ui_for_output_with_options, AiFlowMode, UiBuildOptions};
+use focaldesk_ai::{send_ai_request, AiDaemonStatus, AiIpcRequest, AiIpcResponse};
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
@@ -365,6 +366,8 @@ pub struct OutputState {
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
+    pub color_description: crate::core::color::ColorDescription,
+    pub icc_profile: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -579,13 +582,16 @@ pub struct DesktopState {
     pub fonts: FontSystem,
 
     pub theme: ThemeManager,
-    /// Latest committed transfer function per Wayland surface render id.
-    pub surface_transfers: HashMap<Id, TransferFunction>,
+    /// Latest committed color state per Wayland surface render id.
+    pub surface_colors: HashMap<Id, SurfaceColorRenderState>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
     pub sidebar_pulse: Option<SidebarPulse>,
     pub topbar_pulse: Option<TopbarPulse>,
+    pub flow_field_pulse: Option<FlowFieldPulse>,
     pub clock_pulse: Option<ClockPulse>,
+    ai_flow_mode_cache: AiFlowMode,
+    ai_flow_mode_last_poll: Instant,
     pub ui_sound_player: UiSoundPlayer,
     last_sidebar_hover_sound_target: Option<(OutputId, ElementId)>,
     last_clock_text: String,
@@ -595,6 +601,7 @@ pub struct DesktopState {
 
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
 pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
+pub(crate) const FLOW_FIELD_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 
 fn apply_debug_log_level(level: DebugLogLevel) {
@@ -640,6 +647,19 @@ pub struct TopbarPulse {
 #[derive(Clone, Copy, Debug)]
 pub struct TopbarPulseFrame {
     pub indicator: usize,
+    pub click_local: Point<f64, Logical>,
+    pub elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FlowFieldPulse {
+    pub output_id: OutputId,
+    pub click_local: Point<f64, Logical>,
+    pub started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FlowFieldPulseFrame {
     pub click_local: Point<f64, Logical>,
     pub elapsed: Duration,
 }
@@ -1151,6 +1171,34 @@ impl DesktopState {
             .and_then(|el| el.action.clone())
     }
 
+    pub(crate) fn ai_flow_mode(&self) -> AiFlowMode {
+        if self.pending_ai_permission_responses.is_empty() {
+            self.ai_flow_mode_cache
+        } else {
+            AiFlowMode::PermissionWait
+        }
+    }
+
+    fn refresh_ai_flow_mode(&mut self) {
+        if !self.pending_ai_permission_responses.is_empty() {
+            self.ai_flow_mode_cache = AiFlowMode::PermissionWait;
+            return;
+        }
+
+        let now = Instant::now();
+        if now.saturating_duration_since(self.ai_flow_mode_last_poll) < Duration::from_millis(800) {
+            return;
+        }
+        self.ai_flow_mode_last_poll = now;
+
+        self.ai_flow_mode_cache = match send_ai_request(&AiIpcRequest::Status) {
+            Ok(AiIpcResponse::Status { status }) => ai_flow_mode_from_status(&status),
+            Ok(AiIpcResponse::Error { .. }) => AiFlowMode::Error,
+            Ok(_) => AiFlowMode::Error,
+            Err(_) => AiFlowMode::Error,
+        };
+    }
+
     fn ui_element_at_pointer_for_output(&self, output_id: OutputId) -> Option<&UiElement> {
         let local = self.pointer_relative_to_output_logical(output_id)?;
         let x = local.x.round() as i32;
@@ -1167,6 +1215,7 @@ impl DesktopState {
             self.chrome.metrics.topbar_h,
             self.chrome.metrics.sidebar_w,
         );
+        let ai_flow_mode = self.ai_flow_mode();
         build_ui_for_output_with_options(
             &mut self.ui,
             &layout,
@@ -1175,6 +1224,7 @@ impl DesktopState {
                 hdr_enabled: output.hdr_enabled,
                 workspace_count: self.workspace_names.len(),
                 active_workspace: output.active_workspace.0,
+                ai_flow_mode,
             },
         );
     }
@@ -1189,6 +1239,12 @@ impl DesktopState {
             return false;
         };
         flog(format!("ACTION={:?}", action));
+        if self
+            .ui_element_at_pointer_for_output(self.focused_output)
+            .is_some_and(|el| el.kind == UiElementKind::TopbarFlowField)
+        {
+            let _ = self.trigger_flow_field_pulse_at_pointer(self.focused_output);
+        }
         self.dispatch_ui_action(action);
         true
     }
@@ -2273,6 +2329,9 @@ impl DesktopState {
 
             UiAction::Custom(id) => match id {
                 SIDEBAR_SETTINGS_ID => self.launch_app(focaldesk_settings_command()),
+                focaldesk_ui::ui_builder::TOPBAR_FLOW_FIELD_ID => {
+                    self.launch_app(focaldesk_ai_console_command())
+                }
                 SIDEBAR_WORKSPACE_1_ID => self.set_focused_workspace(WorkspaceId(1)),
                 SIDEBAR_WORKSPACE_2_ID => {
                     if self.workspace_names.len() > 1 {
@@ -2602,6 +2661,8 @@ impl DesktopState {
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
                 last_sw_cursor_rect: None,
+                color_description: crate::core::color::default_output_color_description(),
+                icc_profile: None,
             }
         });
 
@@ -2996,6 +3057,35 @@ impl DesktopState {
         self.topbar_pulse_for_output(output_id, now).is_some()
     }
 
+    pub fn flow_field_pulse_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<FlowFieldPulseFrame> {
+        let pulse = self.flow_field_pulse?;
+        if pulse.output_id != output_id {
+            return None;
+        }
+
+        let elapsed = now.saturating_duration_since(pulse.started_at);
+        if elapsed >= FLOW_FIELD_PULSE_DURATION {
+            return None;
+        }
+
+        Some(FlowFieldPulseFrame {
+            click_local: pulse.click_local,
+            elapsed,
+        })
+    }
+
+    pub fn output_has_active_flow_field_pulse(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> bool {
+        self.flow_field_pulse_for_output(output_id, now).is_some()
+    }
+
     pub fn clock_pulse_for_output(
         &self,
         output_id: OutputId,
@@ -3051,6 +3141,22 @@ impl DesktopState {
             self.chrome.metrics.sidebar_w,
         );
         layout.topbar.status_wells.get(pulse.indicator).copied()
+    }
+
+    pub fn active_flow_field_pulse_damage_rect(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<Rectangle<i32, Logical>> {
+        self.flow_field_pulse_for_output(output_id, now)?;
+        let output = self.outputs.get(&output_id)?;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        Some(layout.topbar.flow_field)
     }
 
     pub fn active_clock_pulse_damage_rect(
@@ -3133,6 +3239,42 @@ impl DesktopState {
         if let Some(rect) = layout.topbar.status_wells.get(indicator) {
             self.mark_output_logical_damage(output_id, *rect, 0, DamageSource::Unknown);
         }
+
+        true
+    }
+
+    fn trigger_flow_field_pulse_at_pointer(&mut self, output_id: OutputId) -> bool {
+        let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
+            return false;
+        };
+        let Some(output) = self.outputs.get(&output_id) else {
+            return false;
+        };
+
+        let px = local.x.round() as i32;
+        let py = local.y.round() as i32;
+        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
+        let layout = build_chrome_layout(
+            size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+        );
+        if !layout.topbar.flow_field.contains((px, py)) {
+            return false;
+        }
+
+        self.flow_field_pulse = Some(FlowFieldPulse {
+            output_id,
+            click_local: local,
+            started_at: Instant::now(),
+        });
+
+        self.mark_output_logical_damage(
+            output_id,
+            layout.topbar.flow_field,
+            0,
+            DamageSource::Unknown,
+        );
 
         true
     }
@@ -3564,12 +3706,15 @@ impl DesktopState {
             screenshot_all_requested: false,
             screenshot_seq: 0,
             theme: init.theme_manager,
-            surface_transfers: HashMap::new(),
+            surface_colors: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,
             topbar_pulse: None,
+            flow_field_pulse: None,
             clock_pulse: None,
+            ai_flow_mode_cache: AiFlowMode::Idle,
+            ai_flow_mode_last_poll: Instant::now(),
             ui_sound_player: UiSoundPlayer::new(),
             last_sidebar_hover_sound_target: None,
             last_clock_text: String::new(),
@@ -4262,10 +4407,6 @@ impl DesktopState {
                     action = "take_screenshot_all",
                     "screenshot-all action fired"
                 );
-            }
-
-            KeyAction::ForceExit => {
-                panic!("Emergency shutdown");
             }
 
             KeyAction::LaunchBrowser => {
@@ -5350,6 +5491,9 @@ impl DesktopState {
             || self.topbar_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < TOPBAR_PULSE_DURATION
             })
+            || self.flow_field_pulse.is_some_and(|pulse| {
+                now.saturating_duration_since(pulse.started_at) < FLOW_FIELD_PULSE_DURATION
+            })
             || self.clock_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
             })
@@ -5364,6 +5508,7 @@ impl DesktopState {
             .unwrap_or(false)
             || self.output_has_active_sidebar_pulse(output_id, now)
             || self.output_has_active_topbar_pulse(output_id, now)
+            || self.output_has_active_flow_field_pulse(output_id, now)
             || self.output_has_active_clock_pulse(output_id, now)
             || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
@@ -5434,6 +5579,7 @@ impl DesktopState {
                 [
                     (*output_id, layout.sidebar.outer),
                     (*output_id, layout.topbar.inner),
+                    (*output_id, layout.topbar.flow_field),
                 ]
             })
             .collect();
@@ -5595,6 +5741,8 @@ impl DesktopState {
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
                     last_sw_cursor_rect: None,
+                    color_description: crate::core::color::default_output_color_description(),
+                    icc_profile: None,
                 },
             );
         }
@@ -5613,6 +5761,7 @@ impl DesktopState {
 
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();
+        self.refresh_ai_flow_mode();
     }
 
     /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
@@ -5620,17 +5769,61 @@ impl DesktopState {
         self.space.refresh();
     }
 
-    pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
-        let force_linear = force_linear_surfaces();
-        let transfer = with_states(surface, |states| effective_transfer(states, force_linear));
-        let id = Id::from_wayland_resource(surface);
-        let previous = self.surface_transfers.get(&id).copied();
-        if previous != Some(transfer) {
+    pub fn output_color_description(&self, output_id: focaldesk_types::OutputId) -> ColorDescription {
+        self.outputs
+            .get(&output_id)
+            .map(|output| output.color_description)
+            .unwrap_or_else(crate::core::color::default_output_color_description)
+    }
+
+    pub fn output_color_description_for(&self, output: &smithay::output::Output) -> ColorDescription {
+        self.outputs
+            .values()
+            .find(|state| &state.handle == output)
+            .map(|state| state.color_description)
+            .unwrap_or_else(crate::core::color::default_output_color_description)
+    }
+
+    pub fn output_icc_profile_for(&self, output: &smithay::output::Output) -> Option<Vec<u8>> {
+        self.outputs
+            .values()
+            .find(|state| &state.handle == output)
+            .and_then(|state| state.icc_profile.clone())
+    }
+
+    pub fn set_output_color(
+        &mut self,
+        output_id: focaldesk_types::OutputId,
+        description: ColorDescription,
+        icc_profile: Option<Vec<u8>>,
+    ) {
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            output.color_description = description;
+            output.icc_profile = icc_profile;
             focaldesk_logging::flog(format!(
-                "surface color applied: surface={id:?} transfer={transfer:?}"
+                "output color: id={output_id:?} primaries={:?} transfer={:?} icc={}",
+                description.primaries,
+                description.transfer,
+                output.icc_profile.as_ref().map(|p| p.len()).unwrap_or(0),
             ));
         }
-        self.surface_transfers.insert(id, transfer);
+    }
+
+    pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
+        let force_linear = force_linear_surfaces();
+        let color = with_states(surface, |states| {
+            crate::core::color::effective_surface_render_state(states, force_linear)
+        });
+        let id = Id::from_wayland_resource(surface);
+        let previous = self.surface_colors.get(&id).copied();
+        if previous != Some(color) {
+            focaldesk_logging::flog(format!(
+                "surface color applied: surface={id:?} transfer={:?} primaries={:?}",
+                color.description.transfer,
+                color.description.primaries
+            ));
+        }
+        self.surface_colors.insert(id, color);
     }
 
     pub fn set_surface_color_description(
@@ -6215,6 +6408,16 @@ fn clear_stale_chrome_singleton(profile: &Path) {
     ));
 }
 
+fn ai_flow_mode_from_status(status: &AiDaemonStatus) -> AiFlowMode {
+    if status.active_requests > 0 {
+        AiFlowMode::Thinking
+    } else if status.provider_count == 0 {
+        AiFlowMode::Error
+    } else {
+        AiFlowMode::Idle
+    }
+}
+
 fn focaldesk_files_command() -> String {
     std::env::current_exe()
         .ok()
@@ -6234,6 +6437,18 @@ fn focaldesk_settings_command() -> String {
         .filter(|path| path.exists())
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "focaldesk-settings".to_string())
+}
+
+fn focaldesk_ai_console_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("focaldesk-ai-console"))
+        })
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "focaldesk-ai-console".to_string())
 }
 
 fn configure_chrome_command(command: &mut Command, use_x11: bool) {
@@ -6312,6 +6527,7 @@ fn is_chrome_like(app_name: &str) -> bool {
             | "google-chrome-stable"
             | "google-chrome-beta"
             | "google-chrome-unstable"
+            | "chrome"
             | "chromium"
             | "chromium-browser"
     )
@@ -6330,6 +6546,7 @@ pub(crate) fn is_browser_like(app_name: &str) -> bool {
             | "google-chrome-stable"
             | "google-chrome-beta"
             | "google-chrome-unstable"
+            | "chrome"
             | "chromium"
             | "chromium-browser"
             | "microsoft-edge"
@@ -6364,6 +6581,7 @@ mod tests {
     #[test]
     fn browser_like_matches_common_browser_executables() {
         assert!(is_browser_like("google-chrome"));
+        assert!(is_browser_like("chrome"));
         assert!(is_browser_like("firefox"));
         assert!(is_browser_like("microsoft-edge"));
         assert!(is_browser_like("brave-browser"));

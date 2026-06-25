@@ -31,7 +31,6 @@ pub enum KeyAction {
     AssignSlot(usize),
     TakeScreenshot,
     TakeScreenshotAll,
-    ForceExit,
     LaunchBrowser,
     LaunchFiles,
 }

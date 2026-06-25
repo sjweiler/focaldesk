@@ -196,6 +196,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "ignoring nonfatal Wayland dispatch error"
                     );
                 }
+                crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
+                    &mut nested.state,
+                );
             }
             nested.state.end_portal_dispatch();
             std::mem::drop(framebuffer);
