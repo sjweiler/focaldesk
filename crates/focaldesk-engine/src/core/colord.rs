@@ -82,7 +82,7 @@ pub fn ensure_colord_display_device(make: &str, model: &str, serial: &str) -> bo
     };
 
     let device_id = colord_device_id(make, model, serial);
-    if colord_find_by_property(&cm, "DeviceId", &device_id).is_some() {
+    if colord_find_device_by_id(&cm, &device_id).is_some() {
         return true;
     }
 
@@ -245,18 +245,20 @@ fn find_colord_device(
     let cm = colord_manager_proxy(conn).ok()?;
 
     let device_id = colord_device_id(make, model, serial);
-    if let Some(path) = colord_find_by_property(&cm, "DeviceId", &device_id) {
+    if let Some(path) = colord_find_device_by_id(&cm, &device_id) {
         return Some(path);
     }
 
     if !serial.is_empty() {
-        if let Some(path) = colord_find_by_property(&cm, "serial", serial) {
-            return Some(path);
+        if let Some(path) = colord_find_by_property(&cm, "SerialNumber", serial) {
+            if colord_device_matches(&conn, &path, make, model, serial) {
+                return Some(path);
+            }
         }
     }
 
     if !model.is_empty() {
-        if let Some(path) = colord_find_by_property(&cm, "model", model) {
+        if let Some(path) = colord_find_by_property(&cm, "Model", model) {
             if colord_device_matches(&conn, &path, make, model, serial) {
                 return Some(path);
             }
@@ -264,7 +266,7 @@ fn find_colord_device(
     }
 
     if !make.is_empty() {
-        if let Some(path) = colord_find_by_property(&cm, "vendor", make) {
+        if let Some(path) = colord_find_by_property(&cm, "Vendor", make) {
             if colord_device_matches(&conn, &path, make, model, serial) {
                 return Some(path);
             }
@@ -284,6 +286,11 @@ fn colord_manager_proxy(conn: &Connection) -> zbus::Result<Proxy<'_>> {
         "/org/freedesktop/ColorManager",
         "org.freedesktop.ColorManager",
     )
+}
+
+fn colord_find_device_by_id(cm: &Proxy<'_>, device_id: &str) -> Option<OwnedObjectPath> {
+    let reply = cm.call_method("FindDeviceById", &(device_id,)).ok()?;
+    reply.body().ok()
 }
 
 fn colord_find_by_property(
@@ -371,7 +378,12 @@ fn load_profile_from_colord_device(
     )
     .ok()?;
 
-    let profile_path: OwnedObjectPath = device.get_property("Profile").ok()?;
+    let qualifiers: Vec<&str> = vec!["*"];
+    let profile_path: OwnedObjectPath = device
+        .call_method("GetProfileForQualifiers", &(qualifiers,))
+        .ok()?
+        .body()
+        .ok()?;
     let profile = Proxy::new(
         conn,
         "org.freedesktop.ColorManager",
