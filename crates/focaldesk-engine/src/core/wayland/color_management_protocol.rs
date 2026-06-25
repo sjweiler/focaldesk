@@ -125,9 +125,18 @@ fn preferred_output_description_identity(state: &mut DesktopState) -> u64 {
     }
 }
 
+/// Notify all `wp_color_management_surface_feedback_v1` objects after an output profile change.
+pub fn notify_preferred_color_changed(state: &mut DesktopState) {
+    let identity = state.color_management_state.next_description_identity();
+    for feedback in &state.color_management_state.surface_feedbacks {
+        send_surface_feedback_preferred_changed(feedback, identity);
+    }
+}
+
 #[derive(Default)]
 pub struct ColorManagementState {
     pub surface_objects: HashSet<backend::ObjectId>,
+    pub surface_feedbacks: Vec<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1>,
     next_description_identity: u64,
     canonical_sdr_identity: Option<u64>,
     /// `wp_image_description_info_v1.done` is a destructor event; sending it inside
@@ -187,6 +196,10 @@ impl ColorManagementState {
     fn next_identity(&mut self) -> u64 {
         self.next_description_identity = self.next_description_identity.wrapping_add(1).max(1);
         self.next_description_identity
+    }
+
+    pub(crate) fn next_description_identity(&mut self) -> u64 {
+        self.next_identity()
     }
 
     fn canonical_sdr_identity(&mut self) -> u64 {
@@ -710,6 +723,10 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
                 let feedback = data_init.init(id, SurfaceColorFeedback::new(surface));
                 let identity = preferred_output_description_identity(state);
                 send_surface_feedback_preferred_changed(&feedback, identity);
+                state
+                    .color_management_state
+                    .surface_feedbacks
+                    .push(feedback);
             }
             wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
                 wp_color_trace(format!(
@@ -1202,6 +1219,10 @@ impl
         match request {
             wp_color_management_surface_feedback_v1::Request::Destroy => {
                 wp_color_trace("surface feedback destroy");
+                state
+                    .color_management_state
+                    .surface_feedbacks
+                    .retain(|f| f.id() != resource.id());
                 if feedback.is_inert() {
                     resource.post_error(
                         wp_color_management_surface_feedback_v1::Error::Inert,

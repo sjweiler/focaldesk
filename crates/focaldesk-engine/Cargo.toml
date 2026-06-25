@@ -46,6 +46,7 @@ image.workspace = true
 glow.workspace = true
 libc = "0.2"
 lcms2 = "6.1.1"
+md5 = "0.7"
 #winit
 
 

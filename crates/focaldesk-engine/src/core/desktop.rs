@@ -368,6 +368,10 @@ pub struct OutputState {
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
     pub color_description: crate::core::color::ColorDescription,
     pub icc_profile: Option<Vec<u8>>,
+    pub monitor_make: String,
+    pub monitor_model: String,
+    pub monitor_serial: String,
+    pub monitor_edid: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2663,6 +2667,10 @@ impl DesktopState {
                 last_sw_cursor_rect: None,
                 color_description: crate::core::color::default_output_color_description(),
                 icc_profile: None,
+                monitor_make: String::new(),
+                monitor_model: String::new(),
+                monitor_serial: String::new(),
+                monitor_edid: None,
             }
         });
 
@@ -5743,6 +5751,10 @@ impl DesktopState {
                     last_sw_cursor_rect: None,
                     color_description: crate::core::color::default_output_color_description(),
                     icc_profile: None,
+                    monitor_make: String::new(),
+                    monitor_model: String::new(),
+                    monitor_serial: String::new(),
+                    monitor_edid: None,
                 },
             );
         }
@@ -5789,6 +5801,22 @@ impl DesktopState {
             .values()
             .find(|state| &state.handle == output)
             .and_then(|state| state.icc_profile.clone())
+    }
+
+    pub fn set_output_monitor_identity(
+        &mut self,
+        output_id: focaldesk_types::OutputId,
+        make: String,
+        model: String,
+        serial: String,
+        edid: Option<Vec<u8>>,
+    ) {
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            output.monitor_make = make;
+            output.monitor_model = model;
+            output.monitor_serial = serial;
+            output.monitor_edid = edid;
+        }
     }
 
     pub fn set_output_color(

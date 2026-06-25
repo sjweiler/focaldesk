@@ -257,6 +257,29 @@ pub fn color_description_from_edid(edid: &[u8]) -> Option<ColorDescription> {
     })
 }
 
+/// MD5 hex of the full EDID blob (colord `edid-{hash}.icc` naming).
+pub fn edid_md5_hex(edid: &[u8]) -> String {
+    format!("{:x}", md5::compute(edid))
+}
+
+/// Load `edid-{md5}.icc` from the standard ICC search dirs (GNOME/KDE generated).
+pub fn load_display_profile_by_edid_hash(edid: &[u8]) -> Option<ParsedIccProfile> {
+    if edid.is_empty() {
+        return None;
+    }
+    let name = format!("edid-{}.icc", edid_md5_hex(edid));
+    for dir in icc_search_dirs() {
+        let path = dir.join(&name);
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Ok(parsed) = parse_icc_profile(&bytes) {
+            return Some(parsed);
+        }
+    }
+    None
+}
+
 /// Locate a display ICC profile on disk for the given monitor identity.
 pub fn load_display_profile_for_monitor(
     make: &str,
@@ -374,6 +397,36 @@ mod tests {
     #[test]
     fn rejects_empty_icc() {
         assert!(parse_icc_profile(&[]).is_err());
+    }
+
+    #[test]
+    fn edid_generated_profile_parses_if_present() {
+        let path = std::path::Path::new(env!("HOME")).join(
+            ".local/share/icc/edid-80cab7f6884553b4890a7fa9c986c84d.icc",
+        );
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read edid icc");
+        parse_icc_profile(&bytes).expect("parse edid-generated icc");
+    }
+
+    #[test]
+    fn edid_hash_profile_loads_if_present() {
+        let edid_path = std::path::Path::new("/sys/class/drm/card2-DP-4/edid");
+        if !edid_path.exists() {
+            return;
+        }
+        let edid = std::fs::read(edid_path).expect("read edid");
+        let parsed = load_display_profile_by_edid_hash(&edid).expect("load by hash");
+        assert!(!parsed.bytes.is_empty());
+    }
+
+    #[test]
+    fn edid_md5_hex_is_lowercase_32_chars() {
+        let hash = edid_md5_hex(b"edid-bytes");
+        assert_eq!(hash.len(), 32);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]

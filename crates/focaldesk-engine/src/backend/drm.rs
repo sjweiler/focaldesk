@@ -2005,6 +2005,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         dispatch_backend_input_event::<LibinputInputBackend>(&mut data.core.state, &event);
     })?;
 
+    let (colord_tx, colord_rx) = calloop::channel::channel();
+    if let Err(err) = crate::core::colord::spawn_colord_watch(move || {
+        let _ = colord_tx.send(());
+    }) {
+        flog(format!("colord watch thread failed to start: {err:?}"));
+    } else {
+        let _colord_token = loop_handle.insert_source(colord_rx, |event, _, data| {
+            if let calloop::channel::Event::Msg(()) = event {
+                if crate::core::colord::refresh_all_output_colors(&mut data.core.state) {
+                    flog("colord: output color profiles refreshed");
+                }
+            }
+        })?;
+    }
+
     let _session_token = loop_handle.insert_source(notifier, |event, _, data| match event {
         SessionEvent::PauseSession => {
             flog("Pausing DRM session");
@@ -3020,20 +3035,19 @@ fn device_added(
                 out.hdr_enabled = false;
             }
 
-            let color_setup = crate::core::icc::load_display_profile_for_monitor(
+            data.core.state.set_output_monitor_identity(
+                output_id,
+                make.clone(),
+                model.clone(),
+                serial_number.clone(),
+                edid.clone(),
+            );
+            if let Some(parsed) = crate::core::colord::resolve_output_color_profile(
                 &make,
                 &model,
                 &serial_number,
-            )
-            .or_else(|| {
-                edid.as_deref()
-                    .and_then(crate::core::icc::color_description_from_edid)
-                    .map(|description| crate::core::icc::ParsedIccProfile {
-                        description,
-                        bytes: Vec::new(),
-                    })
-            });
-            if let Some(parsed) = color_setup {
+                edid.as_deref(),
+            ) {
                 data.core.state.set_output_color(
                     output_id,
                     parsed.description,

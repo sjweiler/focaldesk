@@ -2,6 +2,7 @@
 //!
 //! Phase A/B: scene-linear Rec.709 working space, relative gamut mapping.
 //! Phase C1: SDR scanout encode uses each output's ICC/EDID description.
+//! Phase C2: colord D-Bus hotplug/profile refresh (`core::colord`).
 
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::wayland::compositor::{Cacheable, SurfaceData};
