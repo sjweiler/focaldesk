@@ -117,6 +117,8 @@ pub enum OutputRenderStage {
     LinearGlassUnderClients,
     Clients,
     Overlay,
+    /// egui + software cursor only (sRGB), after linear scene → KMS encode.
+    EguiOverlay,
 }
 
 /// Where work-area glass is composited in the staged linear SDR path.
@@ -134,7 +136,15 @@ pub enum ChromeGlassPass {
 #[derive(Clone)]
 pub enum ClientCompositingMode {
     Sdr,
+    /// sRGB-encoded chrome/wallpaper assets → scene-linear Rec.709.
+    LinearUi { srgb_to_linear: GlesTexProgram },
     Linear { client_to_scene: GlesTexProgram },
+}
+
+impl ClientCompositingMode {
+    pub fn ui_textures_linear(&self) -> bool {
+        matches!(self, Self::LinearUi { .. })
+    }
 }
 
 impl FrameCtx {
@@ -220,6 +230,8 @@ pub struct RenderInputs<'a> {
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
     pub chrome_glass_pass: ChromeGlassPass,
+    /// When true, egui/cursor are drawn in a follow-up SDR pass (egui_glow outputs sRGB).
+    pub defer_egui_to_sdr: bool,
     pub surface_colors: &'a std::collections::HashMap<Id, SurfaceColorRenderState>,
 }
 
@@ -236,12 +248,33 @@ fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-fn glass_style_linear(style: &GlassStyle) -> GlassStyle {
-    GlassStyle {
-        tint: linearize_rgba(style.tint),
-        edge_color: linearize_rgba(style.edge_color),
-        ..*style
-    }
+fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
+    let mut t = theme.clone();
+    t.background.color = linearize_rgba(t.background.color);
+    t.wallpaper.tint_color = linearize_rgba(t.wallpaper.tint_color);
+    t.chrome.bg_color = linearize_rgba(t.chrome.bg_color);
+    t.chrome.panel_color = linearize_rgba(t.chrome.panel_color);
+    t.chrome.accent_color = linearize_rgba(t.chrome.accent_color);
+    t.chrome.trim_color = linearize_rgba(t.chrome.trim_color);
+    t.chrome.glass_tint = linearize_rgba(t.chrome.glass_tint);
+    t.dialog.panel_color = linearize_rgba(t.dialog.panel_color);
+    t.dialog.title_color = linearize_rgba(t.dialog.title_color);
+    t.dialog.text_color = linearize_rgba(t.dialog.text_color);
+    t.dialog.button_color = linearize_rgba(t.dialog.button_color);
+    t.dialog.overlay_dim = linearize_rgba(t.dialog.overlay_dim);
+    t.text.title = linearize_rgba(t.text.title);
+    t.text.normal = linearize_rgba(t.text.normal);
+    t.text.dim = linearize_rgba(t.text.dim);
+    t.text.accent = linearize_rgba(t.text.accent);
+    t.text.meta_label = linearize_rgba(t.text.meta_label);
+    t.text.meta_value = linearize_rgba(t.text.meta_value);
+    t.text.clock = linearize_rgba(t.text.clock);
+    t.icons.inactive = linearize_rgba(t.icons.inactive);
+    t.icons.hover = linearize_rgba(t.icons.hover);
+    t.icons.active = linearize_rgba(t.icons.active);
+    t.icons.disabled = linearize_rgba(t.icons.disabled);
+    t.icons.glow = linearize_rgba(t.icons.glow);
+    t
 }
 
 fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> ChromeTheme {
@@ -1439,11 +1472,18 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         elements: &[FlowRenderElement],
+        client_compositing: &ClientCompositingMode,
     ) -> Result<(), GlesError> {
         let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+        if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
+            frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
+            draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+            frame.clear_tex_program_override();
+        } else {
+            draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+        }
 
         Ok(())
     }
@@ -1503,7 +1543,15 @@ impl RenderState {
         muts: RenderInputsMut<'_>,
         stage: OutputRenderStage,
     ) -> Result<(), GlesError> {
-        let theme = inputs.theme;
+        let linear_theme_storage;
+        let theme = if inputs.client_compositing.ui_textures_linear()
+            || matches!(inputs.chrome_glass_pass, ChromeGlassPass::LinearUnderClients)
+        {
+            linear_theme_storage = linearize_flow_theme(inputs.theme);
+            &linear_theme_storage
+        } else {
+            inputs.theme
+        };
 
         if matches!(stage, OutputRenderStage::All | OutputRenderStage::Base) {
             self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
@@ -1530,6 +1578,7 @@ impl RenderState {
                 inputs.layout.work_area.recess,
                 inputs.ctx.output_scale,
                 theme.wallpaper.clone(),
+                &inputs.client_compositing,
             );
 
             // Work-area glass must sit under client surfaces (trim/icons stay above).
@@ -1548,7 +1597,7 @@ impl RenderState {
                 frame,
                 inputs.ctx,
                 inputs.elements,
-                inputs.client_compositing,
+                &inputs.client_compositing,
                 inputs.surface_colors,
             );
         }
@@ -1559,6 +1608,42 @@ impl RenderState {
                 | OutputRenderStage::Clients
                 | OutputRenderStage::LinearGlassUnderClients
         ) {
+            return Ok(());
+        }
+
+        if matches!(stage, OutputRenderStage::EguiOverlay) {
+            let egui_frame_ctx = DesktopFrameCtx {
+                output_size: inputs.ctx.output_size,
+                output_scale: inputs.ctx.output_scale,
+                work: inputs.layout.work_area.recess,
+                active_output: inputs.ctx.active_output,
+                rendering_output: inputs.ctx.rendering_output,
+                now: inputs.ctx.now,
+                start_time: self.start_time,
+                flip_egui_y: inputs.flip_egui_y,
+                portal_capture: inputs.ctx.portal_capture,
+            };
+            let full_output_damage = [Rectangle::<i32, Physical>::from_loc_and_size(
+                (0, 0),
+                Size::<i32, Physical>::from(inputs.ctx.output_size),
+            )];
+            let egui_damage = if self.egui.is_open_on_output(inputs.ctx.rendering_output)
+                || inputs.ctx.portal_capture
+            {
+                &full_output_damage[..]
+            } else {
+                &inputs.ctx.damage[..]
+            };
+            self.egui.render(
+                frame,
+                &egui_frame_ctx,
+                egui_damage,
+                &self.chrome_shaders,
+                inputs.theme,
+            )?;
+            if inputs.draw_software_cursor {
+                self.draw_software_cursor_overlay(frame, inputs.ctx)?;
+            }
             return Ok(());
         }
 
@@ -1577,7 +1662,7 @@ impl RenderState {
         );
 
         // xdg popups are included in [`Window::render_elements`] when [`PopupManager::commit`] runs.
-        self.draw_popup_elements(frame, inputs.ctx, inputs.popup_elements)?;
+        self.draw_popup_elements(frame, inputs.ctx, inputs.popup_elements, &inputs.client_compositing)?;
 
         if inputs.ctx.active_output == inputs.ctx.rendering_output {
             self.draw_notifications(frame, inputs.ctx, inputs.notifications, inputs.fonts, theme)?;
@@ -1616,6 +1701,12 @@ impl RenderState {
             );
         }
 
+        self.draw_lock_screen(frame, inputs.ctx, inputs.lock_screen, inputs.fonts, theme)?;
+
+        if inputs.defer_egui_to_sdr {
+            return Ok(());
+        }
+
         let egui_frame_ctx = DesktopFrameCtx {
             output_size: inputs.ctx.output_size,
             output_scale: inputs.ctx.output_scale,
@@ -1645,10 +1736,6 @@ impl RenderState {
             &self.chrome_shaders,
             theme,
         )?;
-
-        self.draw_lock_screen(frame, inputs.ctx, inputs.lock_screen, inputs.fonts, theme)?;
-
-        //self.draw_text_test(frame, inputs.fonts)?;
 
         if inputs.draw_software_cursor {
             self.draw_software_cursor_overlay(frame, inputs.ctx)?;
@@ -2245,14 +2332,7 @@ impl RenderState {
             return Ok(());
         };
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-        let style = if matches!(
-            inputs.chrome_glass_pass,
-            ChromeGlassPass::LinearUnderClients
-        ) {
-            glass_style_linear(&legacy_theme.glass)
-        } else {
-            legacy_theme.glass
-        };
+        let style = legacy_theme.glass;
         let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
             Point::<i32, Physical>::from((0, 0)),
             Size::<i32, Physical>::from(inputs.ctx.output_size),
@@ -2525,6 +2605,7 @@ impl RenderState {
         target_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
         theme: WallpaperTheme,
+        _client_compositing: &ClientCompositingMode,
     ) {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
@@ -2561,7 +2642,7 @@ impl RenderState {
         //    RenderState::rect_apply_flipped180(dst_world, (ctx.output_size.0, ctx.output_size.1));
         let dst = dst_world;
 
-        let dsts = [dst];
+        let damage_local = dest_local_damage(dst.size);
 
         let tw = src.w as f64;
         let th = src.h as f64;
@@ -2575,20 +2656,21 @@ impl RenderState {
                 .into(),
         );
 
-        let uniforms = [Uniform::new("u_tint", theme.tint_color)];
-
-        let wallpaper_tint = self.chrome_shaders.wallpaper_tint.as_ref();
+        let uniforms = [
+            Uniform::new("u_tint", theme.tint_color),
+            Uniform::new("u_decode_srgb", 0.0f32),
+        ];
 
         frame
             .render_texture_from_to(
                 tex,
                 src_rect,
                 dst,
-                &dsts,
+                &damage_local,
                 &[],
                 Transform::Normal,
                 1.0,
-                wallpaper_tint,
+                self.chrome_shaders.wallpaper_tint.as_ref(),
                 &uniforms,
             )
             .unwrap();
@@ -2878,7 +2960,7 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         elements: &[FlowRenderElement],
-        client_compositing: ClientCompositingMode,
+        client_compositing: &ClientCompositingMode,
         surface_colors: &std::collections::HashMap<Id, SurfaceColorRenderState>,
     ) {
         use smithay::backend::renderer::element::Element;
@@ -2888,7 +2970,13 @@ impl RenderState {
         let damage = std::slice::from_ref(&full);
 
         let ClientCompositingMode::Linear { client_to_scene } = client_compositing else {
-            draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+            if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
+                frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
+                draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+                frame.clear_tex_program_override();
+            } else {
+                draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+            }
             return;
         };
 

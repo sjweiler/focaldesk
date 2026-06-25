@@ -149,7 +149,10 @@ impl ChromeShaders {
         if self.wallpaper_tint.is_none() {
             self.wallpaper_tint = Some(renderer.compile_custom_texture_shader(
                 WALLPAPER_TINT_FRAG,
-                &[UniformName::new("u_tint", UniformType::_4f)],
+                &[
+                    UniformName::new("u_tint", UniformType::_4f),
+                    UniformName::new("u_decode_srgb", UniformType::_1f),
+                ],
             )?);
         }
 
@@ -1126,15 +1129,28 @@ precision mediump float;
 
 uniform sampler2D tex;
 uniform vec4 u_tint;
+uniform float u_decode_srgb;
 
 varying vec2 v_coords;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
 
 void main() {
     vec4 src = texture2D(tex, v_coords);
 
-    vec3 rgb = mix(src.rgb, u_tint.rgb, u_tint.a);
+    vec3 src_rgb = src.rgb;
+    if (u_decode_srgb > 0.5) {
+        src_rgb = srgb_to_linear(src.rgb);
+    }
 
-    gl_FragColor = vec4(rgb, src.a);
+    vec3 rgb = mix(src_rgb, u_tint.rgb, u_tint.a);
+
+    gl_FragColor = vec4(rgb * src.a, src.a);
 }
 "#;
 

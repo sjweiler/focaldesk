@@ -26,9 +26,9 @@ use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Tex
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use std::time::{Duration, Instant};
 
-/// Opaque offscreen: avoids alpha=0 holes that the sRGB↔linear blit decodes as black.
+/// Opaque offscreen: wallpaper/chrome in sRGB, KMS scanout target.
 pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Xbgr8888;
-/// Alpha FP16 so unset pixels stay transparent for selective composite onto SDR.
+/// Alpha FP16 client layer composited onto the SDR base.
 pub const LINEAR_SDR_FORMAT: Fourcc = Fourcc::Abgr16161616f;
 
 #[derive(Clone)]
@@ -118,8 +118,8 @@ pub fn ensure_offscreen_texture(
     Ok(())
 }
 
-/// Composite a linear FP16 client layer onto an existing SDR offscreen.
-/// Pixels with alpha≈0 are discarded so wallpaper/chrome from the SDR base pass remain intact.
+/// Composite the FP16 client layer onto an existing SDR base (wallpaper/chrome).
+/// Transparent pixels are discarded so the base pass remains visible.
 pub fn composite_linear_layer_onto_sdr(
     renderer: &mut GlesRenderer,
     linear: &GlesTexture,
@@ -143,7 +143,7 @@ pub fn composite_linear_layer_onto_sdr(
         (tex_size.w as f64, tex_size.h as f64),
     );
     let dst_rect = smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
-    let damage = [dst_rect];
+    let damage = [Rectangle::from_loc_and_size((0, 0), size)];
     let uniforms = vec![
         Uniform::new("u_encode_tf", encode_tf),
         Uniform::new("u_m0", [
@@ -203,8 +203,6 @@ pub fn run_linear_staged_pass(
     client_to_scene: &GlesTexProgram,
     composite_linear_layer: &GlesTexProgram,
 ) -> Result<SyncPoint> {
-    // Staged passes rewrite the full offscreen each frame; partial damage leaves
-    // unscissored regions black on scanout when KMS presents with damage clips.
     prepared.frame_ctx.damage = vec![Rectangle::from_loc_and_size((0, 0), buffer_size)];
 
     targets.ensure_offscreen(renderer, buffer_size)?;
@@ -239,6 +237,7 @@ pub fn run_linear_staged_pass(
             OutputRenderStage::Base,
             ClientCompositingMode::Sdr,
             ChromeGlassPass::Skip,
+            false,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
@@ -269,6 +268,7 @@ pub fn run_linear_staged_pass(
             OutputRenderStage::LinearGlassUnderClients,
             ClientCompositingMode::Sdr,
             ChromeGlassPass::LinearUnderClients,
+            true,
         )
         .map_err(|err| anyhow!("{err}"))?;
         draw_output_stage(
@@ -285,6 +285,7 @@ pub fn run_linear_staged_pass(
                 client_to_scene: client_to_scene.clone(),
             },
             ChromeGlassPass::Skip,
+            true,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
@@ -298,8 +299,7 @@ pub fn run_linear_staged_pass(
             .ok_or_else(|| anyhow!("SDR offscreen missing before composite"))?;
         let output_encode =
             kms_scanout_encode_description(state.output_color_description(output_id));
-        let scene_to_output =
-            scene_to_output_matrix(output_encode, RenderingIntent::Relative);
+        let scene_to_output = scene_to_output_matrix(output_encode, RenderingIntent::Relative);
         let encode_tf = output_encode.transfer.encode_mode() as u32 as f32;
         composite_linear_layer_onto_sdr(
             renderer,
@@ -335,6 +335,22 @@ pub fn run_linear_staged_pass(
             OutputRenderStage::Overlay,
             ClientCompositingMode::Sdr,
             ChromeGlassPass::Skip,
+            true,
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        draw_output_stage(
+            state,
+            &mut frame,
+            prepared,
+            client_elements,
+            popup_elements,
+            ui_state,
+            scene,
+            output_state,
+            OutputRenderStage::EguiOverlay,
+            ClientCompositingMode::Sdr,
+            ChromeGlassPass::Skip,
+            false,
         )
         .map_err(|err| anyhow!("{err}"))?;
         frame.finish().map_err(Into::into)

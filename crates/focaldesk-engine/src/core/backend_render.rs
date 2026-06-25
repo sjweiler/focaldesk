@@ -536,6 +536,7 @@ pub fn draw_output(
         crate::core::render::OutputRenderStage::All,
         ClientCompositingMode::Sdr,
         ChromeGlassPass::InBaseSdr,
+        false,
     )
 }
 
@@ -551,6 +552,7 @@ pub fn draw_output_stage(
     stage: crate::core::render::OutputRenderStage,
     client_compositing: ClientCompositingMode,
     chrome_glass_pass: ChromeGlassPass,
+    defer_egui_to_sdr: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let egui_frame_ctx = DesktopFrameCtx {
         output_size: prepared.frame_ctx.output_size,
@@ -565,7 +567,9 @@ pub fn draw_output_stage(
     };
     if matches!(
         stage,
-        crate::core::render::OutputRenderStage::All | crate::core::render::OutputRenderStage::Base
+        crate::core::render::OutputRenderStage::All
+            | crate::core::render::OutputRenderStage::Base
+            | crate::core::render::OutputRenderStage::Overlay
     ) && state
         .render
         .egui
@@ -621,6 +625,7 @@ pub fn draw_output_stage(
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         client_compositing,
         chrome_glass_pass,
+        defer_egui_to_sdr,
         surface_colors: &state.surface_colors,
     };
 
