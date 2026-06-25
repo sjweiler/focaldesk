@@ -1,6 +1,7 @@
 //! Color descriptions and reference transfer functions used by the compositor.
 //!
-//! Phase A: scene-linear Rec.709 working space, relative gamut mapping, SDR output.
+//! Phase A/B: scene-linear Rec.709 working space, relative gamut mapping.
+//! Phase C1: SDR scanout encode uses each output's ICC/EDID description.
 
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::wayland::compositor::{Cacheable, SurfaceData};
@@ -98,6 +99,16 @@ impl TransferFunction {
             Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
             Self::Gamma22 => TransferDecodeMode::Gamma22,
             Self::Linear => TransferDecodeMode::LinearPassThrough,
+        }
+    }
+
+    /// Electrical encoding applied when writing the KMS framebuffer.
+    pub fn encode_mode(self) -> TransferDecodeMode {
+        match self {
+            Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
+            Self::Gamma22 => TransferDecodeMode::Gamma22,
+            // Displays are not scanned out in linear; fall back to sRGB encode.
+            Self::Linear => TransferDecodeMode::SrgbPiecewise,
         }
     }
 }
@@ -228,13 +239,12 @@ pub fn default_output_color_description() -> ColorDescription {
     ColorDescription::SRGB
 }
 
-/// Color description used when encoding the KMS framebuffer.
+/// Color description used when encoding the KMS framebuffer for a given output.
 ///
-/// Monitor ICC/EDID profiles are advertised to clients via `wp_color_management_v1`, but
-/// scanout is still a vanilla sRGB buffer until HDR/LUT output paths land (Phase C).
-/// Applying the monitor gamut matrix here would shift all app colors (e.g. cool tint).
-pub fn kms_scanout_color_description() -> ColorDescription {
-    ColorDescription::SRGB
+/// Uses the output's ICC/EDID profile (same data advertised via `wp_color_management_v1`).
+/// HDR PQ/HLG scanout remains deferred to a later phase.
+pub fn kms_scanout_encode_description(output: ColorDescription) -> ColorDescription {
+    output
 }
 
 /// Row-major 3×3 matrix: linear `src` RGB → linear `dst` RGB.
@@ -417,6 +427,24 @@ mod tests {
         for encoded in [0.0, 0.003, 0.04045, 0.18, 0.5, 1.0] {
             close(linear_to_srgb(srgb_to_linear(encoded)), encoded, 1e-6);
         }
+    }
+
+    #[test]
+    fn kms_scanout_encode_uses_output_description() {
+        let p3 = ColorDescription::DISPLAY_P3_SRGB;
+        assert_eq!(kms_scanout_encode_description(p3), p3);
+    }
+
+    #[test]
+    fn display_p3_output_produces_non_identity_scene_matrix() {
+        let m = scene_to_output_matrix(
+            ColorDescription::DISPLAY_P3_SRGB,
+            RenderingIntent::Relative,
+        );
+        let identity = m[0][0] == 1.0 && m[0][1] == 0.0 && m[0][2] == 0.0
+            && m[1][0] == 0.0 && m[1][1] == 1.0 && m[1][2] == 0.0
+            && m[2][0] == 0.0 && m[2][1] == 0.0 && m[2][2] == 1.0;
+        assert!(!identity, "Display P3 output should remap scene primaries");
     }
 
     #[test]

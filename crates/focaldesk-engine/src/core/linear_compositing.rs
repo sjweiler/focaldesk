@@ -4,7 +4,10 @@ use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
     prepare_output, PreparedOutput,
 };
-use crate::core::color::{kms_scanout_color_description, linear_sdr_runtime_enabled, scene_to_output_matrix, RenderingIntent};
+use crate::core::color::{
+    kms_scanout_encode_description, linear_sdr_runtime_enabled, scene_to_output_matrix,
+    RenderingIntent,
+};
 use crate::core::desktop::DesktopState;
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
@@ -124,6 +127,7 @@ pub fn composite_linear_layer_onto_sdr(
     size: Size<i32, Physical>,
     shader: &GlesTexProgram,
     scene_to_output: [[f32; 3]; 3],
+    encode_tf: f32,
 ) -> Result<()> {
     use smithay::backend::renderer::gles::Uniform;
 
@@ -141,6 +145,7 @@ pub fn composite_linear_layer_onto_sdr(
     let dst_rect = smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
     let damage = [dst_rect];
     let uniforms = vec![
+        Uniform::new("u_encode_tf", encode_tf),
         Uniform::new("u_m0", [
             scene_to_output[0][0],
             scene_to_output[0][1],
@@ -187,6 +192,7 @@ pub fn run_linear_staged_pass(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     prepared: &mut PreparedOutput,
     client_elements: &[FlowRenderElement],
@@ -290,10 +296,11 @@ pub fn run_linear_staged_pass(
             .offscreen
             .as_mut()
             .ok_or_else(|| anyhow!("SDR offscreen missing before composite"))?;
-        let scene_to_output = scene_to_output_matrix(
-            kms_scanout_color_description(),
-            RenderingIntent::Relative,
-        );
+        let output_encode =
+            kms_scanout_encode_description(state.output_color_description(output_id));
+        let scene_to_output =
+            scene_to_output_matrix(output_encode, RenderingIntent::Relative);
+        let encode_tf = output_encode.transfer.encode_mode() as u32 as f32;
         composite_linear_layer_onto_sdr(
             renderer,
             &linear_texture,
@@ -301,6 +308,7 @@ pub fn run_linear_staged_pass(
             buffer_size,
             composite_linear_layer,
             scene_to_output,
+            encode_tf,
         )?;
     }
 
@@ -380,6 +388,7 @@ pub fn render_output_offscreen(
             state,
             renderer,
             targets,
+            output_id,
             buffer_size,
             &mut prepared,
             &client_elements,

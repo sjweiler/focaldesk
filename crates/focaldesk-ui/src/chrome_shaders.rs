@@ -180,6 +180,7 @@ impl ChromeShaders {
                 Some(renderer.compile_custom_texture_shader(
                     COMPOSITE_LINEAR_LAYER_FRAG,
                     &[
+                        UniformName::new("u_encode_tf", UniformType::_1f),
                         UniformName::new("u_m0", UniformType::_3f),
                         UniformName::new("u_m1", UniformType::_3f),
                         UniformName::new("u_m2", UniformType::_3f),
@@ -928,6 +929,7 @@ precision highp float;
 
 varying vec2 v_coords;
 uniform float alpha;
+uniform float u_encode_tf;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -939,8 +941,22 @@ vec3 linear_to_srgb(vec3 c) {
     return mix(high, low, vec3(cutoff));
 }
 
+vec3 linear_to_gamma22(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+}
+
 vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+vec3 encode_color(vec3 c) {
+    if (u_encode_tf < 0.5) {
+        return linear_to_srgb(c);
+    }
+    if (u_encode_tf < 1.5) {
+        return c;
+    }
+    return linear_to_gamma22(c);
 }
 
 void main() {
@@ -952,7 +968,7 @@ void main() {
         discard;
     }
     vec3 straight = src.rgb / src.a;
-    vec3 encoded = linear_to_srgb(mul_mat3(straight));
+    vec3 encoded = encode_color(mul_mat3(straight));
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;

@@ -2330,6 +2330,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 &mut data.core.state,
                                 &mut device.renderer,
                                 &mut surface.render_targets,
+                                surface.output_id,
                                 surface.size,
                                 &mut prepared,
                                 &client_elements,
