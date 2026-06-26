@@ -3052,6 +3052,7 @@ fn device_added(
                     output_id,
                     parsed.description,
                     (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                    parsed.output_lut,
                 );
             }
 
@@ -3083,6 +3084,12 @@ fn device_added(
             flog("Output initialized (Wayland + DRM)");
             data.core.state.drm_submit_hw_cursor = true;
             initialized_one = true;
+        }
+    }
+
+    if initialized_one {
+        if crate::core::colord::refresh_all_output_colors(&mut data.core.state) {
+            flog_warn!("colord: output colors refreshed after DRM init");
         }
     }
 

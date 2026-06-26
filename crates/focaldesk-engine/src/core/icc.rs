@@ -3,6 +3,7 @@
 use crate::core::color::{
     ColorDescription, ColorPrimaries, PrimariesChromaticity, TransferFunction,
 };
+use crate::core::icc_lut::{self, OutputIccLut};
 use lcms2::{
     ColorSpaceSignature, Profile, ProfileClassSignature, Tag, TagSignature, ToneCurveRef,
 };
@@ -38,6 +39,8 @@ impl From<lcms2::Error> for IccError {
 pub struct ParsedIccProfile {
     pub description: ColorDescription,
     pub bytes: Vec<u8>,
+    /// Baked sRGB → device 3D LUT (C2c); used when present instead of parametric encode.
+    pub output_lut: Option<OutputIccLut>,
 }
 
 /// Read `length` bytes at `offset` from a client-supplied seekable fd.
@@ -69,6 +72,7 @@ pub fn parse_icc_profile(data: &[u8]) -> Result<ParsedIccProfile, IccError> {
     let primaries = primaries_from_profile(&profile)?;
     let transfer = transfer_from_profile(&profile);
     let (reference_white_nits, max_luminance_nits) = luminances_from_profile(&profile);
+    let output_lut = icc_lut::build_srgb_to_device_lut(data).ok();
 
     Ok(ParsedIccProfile {
         description: ColorDescription {
@@ -80,6 +84,7 @@ pub fn parse_icc_profile(data: &[u8]) -> Result<ParsedIccProfile, IccError> {
             max_fall_nits: None,
         },
         bytes: data.to_vec(),
+        output_lut,
     })
 }
 

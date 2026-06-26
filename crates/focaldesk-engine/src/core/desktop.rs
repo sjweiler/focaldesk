@@ -368,6 +368,7 @@ pub struct OutputState {
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
     pub color_description: crate::core::color::ColorDescription,
     pub icc_profile: Option<Vec<u8>>,
+    pub output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
     pub monitor_make: String,
     pub monitor_model: String,
     pub monitor_serial: String,
@@ -2667,6 +2668,7 @@ impl DesktopState {
                 last_sw_cursor_rect: None,
                 color_description: crate::core::color::default_output_color_description(),
                 icc_profile: None,
+                output_icc_lut: None,
                 monitor_make: String::new(),
                 monitor_model: String::new(),
                 monitor_serial: String::new(),
@@ -5751,6 +5753,7 @@ impl DesktopState {
                     last_sw_cursor_rect: None,
                     color_description: crate::core::color::default_output_color_description(),
                     icc_profile: None,
+                output_icc_lut: None,
                     monitor_make: String::new(),
                     monitor_model: String::new(),
                     monitor_serial: String::new(),
@@ -5819,21 +5822,39 @@ impl DesktopState {
         }
     }
 
+    pub fn output_icc_lut_for(
+        &self,
+        output_id: focaldesk_types::OutputId,
+    ) -> Option<&crate::core::icc_lut::OutputIccLut> {
+        self.outputs
+            .get(&output_id)
+            .and_then(|output| output.output_icc_lut.as_ref())
+    }
+
     pub fn set_output_color(
         &mut self,
         output_id: focaldesk_types::OutputId,
         description: ColorDescription,
         icc_profile: Option<Vec<u8>>,
+        output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
     ) {
+        let output_lut = output_icc_lut.or_else(|| {
+            icc_profile
+                .as_ref()
+                .and_then(|bytes| crate::core::icc_lut::build_srgb_to_device_lut(bytes).ok())
+        });
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.color_description = description;
             output.icc_profile = icc_profile;
-            focaldesk_logging::flog(format!(
-                "output color: id={output_id:?} primaries={:?} transfer={:?} icc={}",
+            output.output_icc_lut = output_lut;
+            flog_warn!(
+                "output color: id={output_id:?} serial={} primaries={:?} transfer={:?} icc={} lut={}",
+                output.monitor_serial,
                 description.primaries,
                 description.transfer,
                 output.icc_profile.as_ref().map(|p| p.len()).unwrap_or(0),
-            ));
+                output.output_icc_lut.as_ref().map(|l| l.rgb.len()).unwrap_or(0),
+            );
         }
     }
 

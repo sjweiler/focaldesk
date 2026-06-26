@@ -249,7 +249,13 @@ pub fn kms_scanout_encode_description(output: ColorDescription) -> ColorDescript
 }
 
 /// Whether the finished scene sRGB buffer needs a full-frame output encode pass.
-pub fn output_encode_scanout_needed(description: ColorDescription) -> bool {
+pub fn output_encode_scanout_needed(
+    description: ColorDescription,
+    icc_lut: Option<&crate::core::icc_lut::OutputIccLut>,
+) -> bool {
+    if icc_lut.is_some() && crate::core::icc_lut::icc_lut_shader_enabled() {
+        return true;
+    }
     if matches!(
         std::env::var("FOCALDESK_OUTPUT_ENCODE").ok().as_deref(),
         Some("0") | Some("false") | Some("no") | Some("off")
@@ -447,13 +453,14 @@ mod tests {
 
     #[test]
     fn output_encode_skipped_for_default_srgb_output() {
-        assert!(!output_encode_scanout_needed(ColorDescription::SRGB));
+        assert!(!output_encode_scanout_needed(ColorDescription::SRGB, None));
     }
 
     #[test]
     fn output_encode_needed_for_display_p3_monitor() {
         assert!(output_encode_scanout_needed(
-            ColorDescription::DISPLAY_P3_SRGB
+            ColorDescription::DISPLAY_P3_SRGB,
+            None
         ));
     }
 

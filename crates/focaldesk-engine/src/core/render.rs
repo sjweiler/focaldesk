@@ -15,8 +15,8 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
-use smithay::backend::renderer::ImportMem;
-use smithay::backend::renderer::Texture;
+use smithay::backend::renderer::{ImportMem, Texture};
+use std::collections::HashMap;
 use smithay::desktop::Window;
 use smithay::desktop::{PopupManager, Space};
 use smithay::output::Output;
@@ -201,6 +201,12 @@ pub struct RenderState {
     pub font_atlas_texture: Option<GlesTexture>,
     pub fonts_prewarm_done: bool,
     pub portal_capture_blit_id: Id,
+    output_icc_lut_gpu: HashMap<OutputId, OutputIccLutGpu>,
+}
+
+struct OutputIccLutGpu {
+    lut: crate::core::icc_lut::OutputIccLut,
+    texture: GlesTexture,
 }
 
 pub struct RenderInputs<'a> {
@@ -578,7 +584,38 @@ impl RenderState {
             font_atlas_texture: None,
             fonts_prewarm_done: false,
             portal_capture_blit_id: Id::new(),
+            output_icc_lut_gpu: HashMap::new(),
         }
+    }
+
+    /// Upload or reuse the ICC LUT 2D atlas for an output.
+    pub fn ensure_output_icc_lut_texture(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        output_id: OutputId,
+        lut: &crate::core::icc_lut::OutputIccLut,
+    ) -> Result<&GlesTexture, smithay::backend::renderer::gles::GlesError> {
+        let needs_upload = self
+            .output_icc_lut_gpu
+            .get(&output_id)
+            .map(|cached| cached.lut != *lut)
+            .unwrap_or(true);
+        if needs_upload {
+            let (w, h) = lut.atlas_size();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for chunk in lut.rgb.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            let texture = renderer.import_memory(
+                &rgba,
+                Fourcc::Abgr8888,
+                Size::from((w as i32, h as i32)),
+                false,
+            )?;
+            self.output_icc_lut_gpu
+                .insert(output_id, OutputIccLutGpu { lut: lut.clone(), texture });
+        }
+        Ok(&self.output_icc_lut_gpu.get(&output_id).unwrap().texture)
     }
 
     fn draw_topbar_meta(

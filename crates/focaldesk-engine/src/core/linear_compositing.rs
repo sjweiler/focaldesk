@@ -8,6 +8,7 @@ use crate::core::color::{
     kms_scanout_encode_description, linear_sdr_runtime_enabled, output_encode_scanout_needed,
     scene_to_output_matrix, RenderingIntent,
 };
+use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::desktop::DesktopState;
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
@@ -19,7 +20,7 @@ use focaldesk_logging::flog;
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture,
+    ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Texture};
@@ -177,21 +178,141 @@ pub fn composite_linear_layer_onto_sdr_srgb(
     Ok(())
 }
 
-/// Full-frame scene sRGB → monitor primaries + transfer (C1b).
-pub fn apply_output_encode_sdr(
-    state: &DesktopState,
+/// Full-frame scene sRGB → monitor encode (C1b parametric or C2c ICC LUT).
+pub fn apply_output_encode(
+    state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
-    shader: &GlesTexProgram,
 ) -> Result<Option<SyncPoint>> {
     let output_encode =
         kms_scanout_encode_description(state.output_color_description(output_id));
-    if !output_encode_scanout_needed(output_encode) {
+    let lut_owned = state
+        .outputs
+        .get(&output_id)
+        .and_then(|output| output.output_icc_lut.clone());
+    if !output_encode_scanout_needed(output_encode, lut_owned.as_ref()) {
         return Ok(None);
     }
 
+    let lut_shader = state.render.chrome_shaders.output_encode_lut.clone();
+    if lut_owned.is_some() && icc_lut_shader_enabled() {
+        if let Some(shader) = lut_shader.as_ref() {
+            return apply_output_encode_lut(
+                state,
+                renderer,
+                targets,
+                output_id,
+                buffer_size,
+                lut_owned.as_ref().unwrap(),
+                shader,
+            );
+        }
+    }
+
+    let parametric_shader = state
+        .render
+        .chrome_shaders
+        .output_encode_sdr
+        .clone()
+        .ok_or_else(|| anyhow!("output encode shader missing"))?;
+    apply_output_encode_parametric(
+        state,
+        renderer,
+        targets,
+        output_id,
+        buffer_size,
+        output_encode,
+        &parametric_shader,
+    )
+}
+
+fn apply_output_encode_lut(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+    lut: &crate::core::icc_lut::OutputIccLut,
+    shader: &GlesTexProgram,
+) -> Result<Option<SyncPoint>> {
+    let lut_texture = state
+        .render
+        .ensure_output_icc_lut_texture(renderer, output_id, lut)
+        .map_err(|e| anyhow!("upload ICC LUT atlas: {e}"))?;
+
+    let scene_texture = targets
+        .offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("SDR offscreen missing before output encode"))?
+        .texture
+        .clone();
+    targets.ensure_encode_scratch(renderer, buffer_size)?;
+    let scratch = targets
+        .encode_scratch
+        .as_mut()
+        .ok_or_else(|| anyhow!("encode scratch missing after allocation"))?;
+
+    let grid = lut.grid_size as f32;
+    let uniforms = vec![
+        Uniform::new("u_lut_tex", 1i32),
+        Uniform::new("u_grid", grid),
+    ];
+
+    let mut target = renderer
+        .bind(&mut scratch.texture)
+        .map_err(|e| anyhow!("bind encode scratch: {e}"))?;
+    let mut frame = renderer
+        .render(&mut target, buffer_size, Transform::Normal)
+        .map_err(|e| anyhow!("begin output encode frame: {e}"))?;
+
+    let lut_tex_id = lut_texture.tex_id();
+    frame
+        .with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, lut_tex_id);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+        })
+        .map_err(|e| anyhow!("bind ICC LUT texture: {e}"))?;
+
+    let tex_size = scene_texture.size();
+    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (tex_size.w as f64, tex_size.h as f64),
+    );
+    let dst_rect = Rectangle::from_loc_and_size((0, 0), buffer_size);
+    let damage = [dst_rect];
+    frame
+        .render_texture_from_to(
+            &scene_texture,
+            src_rect,
+            dst_rect,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(shader),
+            &uniforms,
+        )
+        .map_err(|e| anyhow!("render ICC LUT output encode: {e}"))?;
+    let sync = frame
+        .finish()
+        .map_err(|e| anyhow!("finish ICC LUT output encode: {e}"))?;
+    targets.encoded_scanout = true;
+    Ok(Some(sync))
+}
+
+fn apply_output_encode_parametric(
+    _state: &DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    _output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+    output_encode: crate::core::color::ColorDescription,
+    shader: &GlesTexProgram,
+) -> Result<Option<SyncPoint>> {
     let scene_texture = targets
         .offscreen
         .as_ref()
@@ -259,19 +380,17 @@ pub fn apply_output_encode_sdr(
 }
 
 fn finish_with_output_encode(
-    state: &DesktopState,
+    state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     sync: SyncPoint,
 ) -> Result<SyncPoint> {
-    if let Some(shader) = state.render.chrome_shaders.output_encode_sdr.as_ref() {
-        if let Some(encode_sync) =
-            apply_output_encode_sdr(state, renderer, targets, output_id, buffer_size, shader)?
-        {
-            return Ok(encode_sync);
-        }
+    if let Some(encode_sync) =
+        apply_output_encode(state, renderer, targets, output_id, buffer_size)?
+    {
+        return Ok(encode_sync);
     }
     Ok(sync)
 }

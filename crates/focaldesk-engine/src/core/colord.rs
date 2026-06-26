@@ -64,6 +64,7 @@ pub fn resolve_output_color_profile(
                 .map(|description| ParsedIccProfile {
                     description,
                     bytes: Vec::new(),
+                    output_lut: None,
                 })
         })
 }
@@ -120,13 +121,14 @@ pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
                 output.monitor_edid.clone(),
                 output.color_description,
                 output.icc_profile.clone(),
+                output.output_icc_lut.clone(),
             )
         })
         .collect();
 
     let mut any_changed = false;
-    for (output_id, make, model, serial, edid, old_desc, old_icc) in snapshots {
-        let (new_desc, new_icc) = match resolve_output_color_profile(
+    for (output_id, make, model, serial, edid, old_desc, old_icc, old_lut) in snapshots {
+        let (new_desc, new_icc, new_lut) = match resolve_output_color_profile(
             &make,
             &model,
             &serial,
@@ -135,12 +137,13 @@ pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
             Some(parsed) => (
                 parsed.description,
                 (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                parsed.output_lut,
             ),
-            None => (default_output_color_description(), None),
+            None => (default_output_color_description(), None, None),
         };
 
-        if new_desc != old_desc || new_icc != old_icc {
-            state.set_output_color(output_id, new_desc, new_icc);
+        if new_desc != old_desc || new_icc != old_icc || new_lut != old_lut {
+            state.set_output_color(output_id, new_desc, new_icc, new_lut);
             any_changed = true;
             flog(format!(
                 "output color refreshed: id={output_id:?} primaries={:?} transfer={:?}",
@@ -418,5 +421,21 @@ mod tests {
             "123ABC"
         ));
         assert!(!monitor_tokens_match("LG", "27UP850", "123", "Dell", "U2720Q", "999"));
+    }
+
+    /// Live colord bus required; run with `cargo test -p focaldesk-engine colord_load_asus -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn colord_load_asus_profiles_differ() {
+        use crate::core::color::output_encode_scanout_needed;
+
+        let left = load_display_profile_via_colord("AUS", "ASUS VG32VQR", "55700")
+            .expect("55700 colord profile");
+        let right = load_display_profile_via_colord("AUS", "ASUS VG32VQR", "55498")
+            .expect("55498 colord profile");
+
+        eprintln!("55700: {:?} encode={}", left.description, output_encode_scanout_needed(left.description, left.output_lut.as_ref()));
+        eprintln!("55498: {:?} encode={}", right.description, output_encode_scanout_needed(right.description, right.output_lut.as_ref()));
+        assert_ne!(left.description.primaries, right.description.primaries);
     }
 }

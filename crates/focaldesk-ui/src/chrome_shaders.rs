@@ -23,6 +23,8 @@ pub struct ChromeShaders {
     pub composite_linear_layer: Option<GlesTexProgram>,
     /// Full-frame scene sRGB → monitor encode (C1b).
     pub output_encode_sdr: Option<GlesTexProgram>,
+    /// Full-frame scene sRGB → monitor ICC LUT encode (C2c).
+    pub output_encode_lut: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
     pub flow_field: Option<GlesPixelProgram>,
@@ -52,6 +54,7 @@ impl ChromeShaders {
             linear_to_srgb: None,
             composite_linear_layer: None,
             output_encode_sdr: None,
+            output_encode_lut: None,
             pulse: None,
             accent: None,
             flow_field: None,
@@ -202,6 +205,16 @@ impl ChromeShaders {
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
+        }
+
+        if self.output_encode_lut.is_none() {
+            self.output_encode_lut = Some(renderer.compile_custom_texture_shader(
+                OUTPUT_ENCODE_LUT_FRAG,
+                &[
+                    UniformName::new("u_lut_tex", UniformType::_1i),
+                    UniformName::new("u_grid", UniformType::_1f),
                 ],
             )?);
         }
@@ -1052,6 +1065,71 @@ void main() {
 #endif
     vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
     vec3 encoded = encode_color(mul_mat3(srgb_to_linear(straight)));
+    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+}
+"#;
+
+/// Scene sRGB framebuffer → monitor ICC LUT (2D atlas, trilinear).
+const OUTPUT_ENCODE_LUT_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform sampler2D u_lut_tex;
+uniform float u_grid;
+
+vec3 lut_sample_at(ivec3 cell) {
+    float n = u_grid;
+    float ir = float(cell.x);
+    float ig = float(cell.y);
+    float ib = float(cell.z);
+    vec2 uv = vec2((ig * n + ir + 0.5) / (n * n), (ib + 0.5) / n);
+    return texture2D(u_lut_tex, uv).rgb;
+}
+
+vec3 lut_lookup(vec3 c) {
+    float n = u_grid;
+    vec3 x = clamp(c, 0.0, 1.0) * (n - 1.0);
+    ivec3 i0 = ivec3(floor(x + 1e-5));
+    vec3 f = x - vec3(i0);
+    ivec3 i1 = min(i0 + ivec3(1), ivec3(int(n) - 1));
+
+    vec3 c000 = lut_sample_at(ivec3(i0.x, i0.y, i0.z));
+    vec3 c100 = lut_sample_at(ivec3(i1.x, i0.y, i0.z));
+    vec3 c010 = lut_sample_at(ivec3(i0.x, i1.y, i0.z));
+    vec3 c110 = lut_sample_at(ivec3(i1.x, i1.y, i0.z));
+    vec3 c001 = lut_sample_at(ivec3(i0.x, i0.y, i1.z));
+    vec3 c101 = lut_sample_at(ivec3(i1.x, i0.y, i1.z));
+    vec3 c011 = lut_sample_at(ivec3(i0.x, i1.y, i1.z));
+    vec3 c111 = lut_sample_at(ivec3(i1.x, i1.y, i1.z));
+
+    vec3 c00 = mix(c000, c100, f.x);
+    vec3 c10 = mix(c010, c110, f.x);
+    vec3 c01 = mix(c001, c101, f.x);
+    vec3 c11 = mix(c011, c111, f.x);
+    vec3 c0 = mix(c00, c10, f.y);
+    vec3 c1 = mix(c01, c11, f.y);
+    return mix(c0, c1, f.z);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
+    vec3 encoded = lut_lookup(straight);
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;

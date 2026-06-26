@@ -2,6 +2,7 @@ pub mod app;
 pub mod color;
 pub mod colord;
 pub mod icc;
+pub mod icc_lut;
 pub mod consts;
 pub mod desktop;
 pub mod input;
