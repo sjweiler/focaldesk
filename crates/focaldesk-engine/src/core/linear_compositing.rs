@@ -1,12 +1,13 @@
-//! Shared linear-light compositing for SDR scanout (FP16 working space, sRGB KMS buffer).
+//! Shared linear-light compositing for SDR scanout (FP16 working space, sRGB KMS buffer)
+//! and HDR PQ scanout (C3b: scRGB working space, 10-bit PQ offscreen).
 
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
     prepare_output, PreparedOutput,
 };
 use crate::core::color::{
-    kms_scanout_encode_description, linear_sdr_runtime_enabled, output_encode_scanout_needed,
-    scene_to_output_matrix, RenderingIntent,
+    hdr_render_runtime_enabled, kms_scanout_encode_description, linear_sdr_runtime_enabled,
+    output_encode_scanout_needed, scene_to_output_matrix, RenderingIntent,
 };
 use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::desktop::DesktopState;
@@ -31,6 +32,8 @@ use std::time::{Duration, Instant};
 pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Xbgr8888;
 /// Alpha FP16 client layer composited onto the SDR base.
 pub const LINEAR_SDR_FORMAT: Fourcc = Fourcc::Abgr16161616f;
+/// PQ-encoded HDR scanout (C3b).
+pub const HDR_OFFSCREEN_FORMATS: [Fourcc; 2] = [Fourcc::Abgr2101010, Fourcc::Argb2101010];
 
 #[derive(Clone)]
 pub struct OffscreenTexture {
@@ -41,17 +44,36 @@ pub struct OffscreenTexture {
 #[derive(Default)]
 pub struct LinearOffscreenTargets {
     pub linear_supported: bool,
+    pub hdr_supported: bool,
+    pub hdr_format: Option<Fourcc>,
     pub offscreen: Option<OffscreenTexture>,
     pub linear_offscreen: Option<OffscreenTexture>,
-    /// Ping-pong target for full-frame output encode (C1b).
+    /// Ping-pong target for full-frame output encode (C1b/C2c SDR).
     pub encode_scratch: Option<OffscreenTexture>,
+    /// PQ-encoded HDR scanout buffer (C3b).
+    pub hdr_offscreen: Option<OffscreenTexture>,
     pub encoded_scanout: bool,
+    pub encoded_hdr: bool,
 }
 
 pub fn supports_linear_sdr(renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> bool {
     let tex_size = Size::<i32, Buffer>::from((size.w, size.h));
     <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(renderer, LINEAR_SDR_FORMAT, tex_size)
         .is_ok()
+}
+
+pub fn select_hdr_offscreen_format(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+) -> Option<Fourcc> {
+    let tex_size = Size::<i32, Buffer>::from((size.w, size.h));
+    HDR_OFFSCREEN_FORMATS.iter().copied().find(|format| {
+        <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(renderer, *format, tex_size).is_ok()
+    })
+}
+
+pub fn supports_hdr_offscreen(renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> bool {
+    select_hdr_offscreen_format(renderer, size).is_some()
 }
 
 pub fn use_linear_sdr_path(
@@ -109,13 +131,35 @@ impl LinearOffscreenTargets {
         ensure_offscreen_texture(renderer, &mut self.encode_scratch, size, SDR_OFFSCREEN_FORMAT)
     }
 
-    /// Texture to present or capture after the render pass (encode scratch when C1b ran).
+    pub fn ensure_hdr_offscreen(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+    ) -> Result<(), GlesError> {
+        let format = match self.hdr_format {
+            Some(format) => format,
+            None => {
+                let Some(format) = select_hdr_offscreen_format(renderer, size) else {
+                    self.hdr_supported = false;
+                    return Ok(());
+                };
+                self.hdr_format = Some(format);
+                self.hdr_supported = true;
+                format
+            }
+        };
+        ensure_offscreen_texture(renderer, &mut self.hdr_offscreen, size, format)
+    }
+
+    /// Texture to present or capture after the render pass (HDR PQ or SDR encode scratch).
     pub fn scanout_texture(&self) -> Option<&GlesTexture> {
         if self.encoded_scanout {
-            self.encode_scratch.as_ref().map(|t| &t.texture)
-        } else {
-            self.offscreen.as_ref().map(|t| &t.texture)
+            if self.encoded_hdr {
+                return self.hdr_offscreen.as_ref().map(|t| &t.texture);
+            }
+            return self.encode_scratch.as_ref().map(|t| &t.texture);
         }
+        self.offscreen.as_ref().map(|t| &t.texture)
     }
 }
 
@@ -178,7 +222,7 @@ pub fn composite_linear_layer_onto_sdr_srgb(
     Ok(())
 }
 
-/// Full-frame scene sRGB → monitor encode (C1b parametric or C2c ICC LUT).
+/// Full-frame scene sRGB → monitor encode (C1b parametric, C2c ICC LUT, or C3b HDR PQ).
 pub fn apply_output_encode(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -186,13 +230,51 @@ pub fn apply_output_encode(
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
 ) -> Result<Option<SyncPoint>> {
+    targets.encoded_hdr = false;
     let output_state = state.outputs.get(&output_id);
     let hdr_active = output_state.map(|o| o.hdr_enabled).unwrap_or(false);
     let hdr_max = output_state.and_then(|o| o.edid_hdr_max_luminance_nits);
     let hdr_fall = output_state.and_then(|o| o.edid_hdr_max_fall_nits);
+    let sdr_white_nits = output_state
+        .map(|o| o.color_description.reference_white_nits)
+        .unwrap_or(80.0);
+
+    if hdr_active && hdr_render_runtime_enabled() {
+        if let Some(max_nits) = hdr_max.filter(|n| *n > 0.0) {
+            if targets.hdr_supported {
+                match apply_hdr_pq_encode(
+                    state,
+                    renderer,
+                    targets,
+                    buffer_size,
+                    max_nits,
+                    sdr_white_nits,
+                ) {
+                    Ok(sync) => return Ok(sync),
+                    Err(err) => {
+                        flog_warn!(
+                            "HDR PQ encode failed for {:?}: {err}; falling back to SDR encode",
+                            output_id
+                        );
+                    }
+                }
+            } else {
+                flog_warn!(
+                    "HDR render requested for {:?} but 10-bit offscreen is unavailable; using SDR encode",
+                    output_id
+                );
+            }
+        } else {
+            flog_warn!(
+                "HDR render requested for {:?} but EDID max luminance is missing; using SDR encode",
+                output_id
+            );
+        }
+    }
+
     let output_encode = kms_scanout_encode_description(
         state.output_color_description(output_id),
-        hdr_active,
+        false,
         hdr_max,
         hdr_fall,
     );
@@ -267,6 +349,117 @@ fn disable_output_icc_lut(state: &mut DesktopState, output_id: OutputId, reason:
         }
     }
     state.notify_runtime_display_status_changes();
+}
+
+fn blit_with_shader(
+    renderer: &mut GlesRenderer,
+    src: &GlesTexture,
+    dst: &mut GlesTexture,
+    size: Size<i32, Physical>,
+    shader: &GlesTexProgram,
+    uniforms: &[Uniform<'_>],
+    label: &str,
+) -> Result<SyncPoint> {
+    let mut target = renderer
+        .bind(dst)
+        .map_err(|e| anyhow!("bind target for {label}: {e}"))?;
+    let mut frame = renderer
+        .render(&mut target, size, Transform::Normal)
+        .map_err(|e| anyhow!("begin {label} frame: {e}"))?;
+    let tex_size = src.size();
+    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (tex_size.w as f64, tex_size.h as f64),
+    );
+    let dst_rect = Rectangle::from_loc_and_size((0, 0), size);
+    let damage = [dst_rect];
+    frame
+        .render_texture_from_to(
+            src,
+            src_rect,
+            dst_rect,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(shader),
+            uniforms,
+        )
+        .map_err(|e| anyhow!("render {label}: {e}"))?;
+    frame
+        .finish()
+        .map_err(|e| anyhow!("finish {label}: {e}"))
+}
+
+fn apply_hdr_pq_encode(
+    state: &DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    buffer_size: Size<i32, Physical>,
+    max_nits: f32,
+    sdr_white_nits: f32,
+) -> Result<Option<SyncPoint>> {
+    let sdr_to_scrgb = state
+        .render
+        .chrome_shaders
+        .sdr_to_linear_scrgb
+        .as_ref()
+        .ok_or_else(|| anyhow!("sdr_to_linear_scrgb shader missing"))?;
+    let scrgb_to_pq = state
+        .render
+        .chrome_shaders
+        .linear_scrgb_to_pq
+        .as_ref()
+        .ok_or_else(|| anyhow!("linear_scrgb_to_pq shader missing"))?;
+
+    let scene_texture = targets
+        .offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("SDR offscreen missing before HDR PQ encode"))?
+        .texture
+        .clone();
+
+    targets.ensure_linear_offscreen(renderer, buffer_size)?;
+    targets.ensure_hdr_offscreen(renderer, buffer_size)?;
+
+    let working_texture = targets
+        .linear_offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("FP16 working buffer missing for HDR PQ encode"))?
+        .texture
+        .clone();
+
+    let _sync = blit_with_shader(
+        renderer,
+        &scene_texture,
+        &mut targets
+            .linear_offscreen
+            .as_mut()
+            .expect("linear offscreen")
+            .texture,
+        buffer_size,
+        sdr_to_scrgb,
+        &[Uniform::new("u_sdr_white_nits", sdr_white_nits)],
+        "SDR-to-linear-scRGB",
+    )?;
+
+    let sync = blit_with_shader(
+        renderer,
+        &working_texture,
+        &mut targets
+            .hdr_offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("HDR offscreen missing after allocation"))?
+            .texture,
+        buffer_size,
+        scrgb_to_pq,
+        &[Uniform::new("u_max_nits", max_nits)],
+        "linear-scRGB-to-PQ",
+    )?;
+
+    targets.encoded_scanout = true;
+    targets.encoded_hdr = true;
+    Ok(Some(sync))
 }
 
 fn apply_output_encode_lut(
@@ -527,6 +720,7 @@ pub fn run_linear_staged_pass(
     linear_to_srgb: &GlesTexProgram,
 ) -> Result<SyncPoint> {
     targets.encoded_scanout = false;
+    targets.encoded_hdr = false;
     prepared.frame_ctx.damage = vec![Rectangle::from_loc_and_size((0, 0), buffer_size)];
 
     targets.ensure_offscreen(renderer, buffer_size)?;
@@ -774,6 +968,7 @@ pub fn run_sdr_pass(
     output_state: &OutputState,
 ) -> Result<SyncPoint> {
     targets.encoded_scanout = false;
+    targets.encoded_hdr = false;
     targets.ensure_offscreen(renderer, buffer_size)?;
 
     let sync = {

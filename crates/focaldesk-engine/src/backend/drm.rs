@@ -20,8 +20,8 @@ use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, prepare_output,
 };
 use crate::core::linear_compositing::{
-    run_linear_staged_pass, run_sdr_pass, supports_linear_sdr, use_linear_sdr_path,
-    LinearOffscreenTargets, OffscreenTexture,
+    run_linear_staged_pass, run_sdr_pass, select_hdr_offscreen_format, supports_linear_sdr,
+    use_linear_sdr_path, LinearOffscreenTargets, OffscreenTexture,
 };
 use smithay::backend::renderer::utils::DamageBag;
 use smithay::backend::renderer::Frame;
@@ -718,16 +718,6 @@ fn save_offscreen_screenshot(
 ///
 /// This must **not** open the device: the udev `device_added` path opens it once through the session.
 
-fn select_hdr_offscreen_format(
-    renderer: &mut GlesRenderer,
-    size: Size<i32, Physical>,
-) -> Option<Fourcc> {
-    let tex_size = Size::<i32, Buffer>::from((size.w, size.h));
-    HDR_OFFSCREEN_FORMATS.iter().copied().find(|format| {
-        <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(renderer, *format, tex_size).is_ok()
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HdrScanoutProbe {
     format: Fourcc,
@@ -863,6 +853,10 @@ fn sync_output_hdr_flags(
         output.edid_hdr_max_luminance_nits = None;
         output.edid_hdr_max_fall_nits = None;
     }
+    output.hdr_enabled = crate::core::color::output_hdr_render_active(
+        output.hdr_requested,
+        output.hdr_supported,
+    );
 }
 
 #[cfg(test)]
@@ -3026,6 +3020,11 @@ fn device_added(
                 "Linear SDR probe: output={output_name} format={:?} supported={linear_sdr_supported}",
                 crate::core::linear_compositing::LINEAR_SDR_FORMAT
             ));
+            let hdr_format = select_hdr_offscreen_format(&mut renderer, tex_phys_size);
+            let hdr_offscreen_supported = hdr_format.is_some();
+            flog(&format!(
+                "HDR offscreen probe: output={output_name} format={hdr_format:?} supported={hdr_offscreen_supported}"
+            ));
             let drm_output = drm_output_manager
                 .lock()
                 .initialize_output::<_, SolidColorRenderElement>(
@@ -3101,6 +3100,8 @@ fn device_added(
                     present_damage: DamageBag::default(),
                     render_targets: LinearOffscreenTargets {
                         linear_supported: linear_sdr_supported,
+                        hdr_supported: hdr_offscreen_supported,
+                        hdr_format,
                         ..LinearOffscreenTargets::default()
                     },
                     hdr_support,

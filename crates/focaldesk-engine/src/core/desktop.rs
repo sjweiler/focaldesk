@@ -964,9 +964,10 @@ impl DesktopState {
                 output.logical_origin = logical_origin;
                 let requested = config.hdr_requested || config.hdr_enabled;
                 output.hdr_requested = output.hdr_supported && requested;
-                if !output.hdr_requested {
-                    output.hdr_enabled = false;
-                }
+                output.hdr_enabled = crate::core::color::output_hdr_render_active(
+                    output.hdr_requested,
+                    output.hdr_supported,
+                );
             }
             self.update_output_size(output_id, physical_size, scale_factor);
 

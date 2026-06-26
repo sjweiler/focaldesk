@@ -22,7 +22,8 @@ use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
 use crate::core::desktop::DesktopState;
 use crate::core::linear_compositing::{
-    present_offscreen_texture, render_output_offscreen, supports_linear_sdr, LinearOffscreenTargets,
+    present_offscreen_texture, render_output_offscreen, select_hdr_offscreen_format,
+    supports_linear_sdr, LinearOffscreenTargets,
 };
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
@@ -119,16 +120,27 @@ fn portal_offscreen_targets_for_output(
     let mut targets = state
         .portal_offscreen_targets
         .remove(&output_id)
-        .unwrap_or_else(|| LinearOffscreenTargets {
-            linear_supported: supports_linear_sdr(renderer, size),
-            ..LinearOffscreenTargets::default()
+        .unwrap_or_else(|| {
+            let hdr_format = select_hdr_offscreen_format(renderer, size);
+            LinearOffscreenTargets {
+                linear_supported: supports_linear_sdr(renderer, size),
+                hdr_supported: hdr_format.is_some(),
+                hdr_format,
+                ..LinearOffscreenTargets::default()
+            }
         });
     if targets.offscreen_size() != size {
         targets.offscreen = None;
         targets.linear_offscreen = None;
+        targets.hdr_offscreen = None;
+        targets.encode_scratch = None;
     }
     if !targets.linear_supported {
         targets.linear_supported = supports_linear_sdr(renderer, size);
+    }
+    if !targets.hdr_supported {
+        targets.hdr_format = select_hdr_offscreen_format(renderer, size);
+        targets.hdr_supported = targets.hdr_format.is_some();
     }
     targets
 }

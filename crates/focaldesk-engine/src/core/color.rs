@@ -411,6 +411,18 @@ pub fn force_linear_surfaces() -> bool {
     )
 }
 
+/// When true, composite HDR PQ offscreen buffers (C3b userspace path; KMS apply is C3c).
+pub fn hdr_render_runtime_enabled() -> bool {
+    matches!(
+        std::env::var("FOCALDESK_HDR_RENDER").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+pub fn output_hdr_render_active(hdr_requested: bool, hdr_supported: bool) -> bool {
+    hdr_render_runtime_enabled() && hdr_supported && hdr_requested
+}
+
 /// When false, do not advertise `wp_color_management_v1`.
 pub fn wp_color_management_enabled() -> bool {
     !matches!(
@@ -506,6 +518,17 @@ mod tests {
         assert_eq!(hdr.primaries, ColorPrimaries::Bt2020);
         assert_eq!(hdr.transfer, TransferFunction::St2084Pq);
         assert_eq!(hdr.max_luminance_nits, 600.0);
+    }
+
+    #[test]
+    fn hdr_render_active_requires_env_and_flags() {
+        std::env::remove_var("FOCALDESK_HDR_RENDER");
+        assert!(!output_hdr_render_active(true, true));
+        std::env::set_var("FOCALDESK_HDR_RENDER", "1");
+        assert!(output_hdr_render_active(true, true));
+        assert!(!output_hdr_render_active(false, true));
+        assert!(!output_hdr_render_active(true, false));
+        std::env::remove_var("FOCALDESK_HDR_RENDER");
     }
 
     #[test]
