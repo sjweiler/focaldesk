@@ -83,6 +83,8 @@ pub enum TransferFunction {
     /// Simple gamma 2.2 power law.
     Gamma22,
     Linear,
+    /// SMPTE ST 2084 perceptual quantizer (HDR PQ scanout).
+    St2084Pq,
 }
 
 /// Shader decode mode sent as `u_decode_tf`.
@@ -92,6 +94,7 @@ pub enum TransferDecodeMode {
     SrgbPiecewise = 0,
     LinearPassThrough = 1,
     Gamma22 = 2,
+    St2084Pq = 3,
 }
 
 impl TransferFunction {
@@ -100,6 +103,7 @@ impl TransferFunction {
             Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
             Self::Gamma22 => TransferDecodeMode::Gamma22,
             Self::Linear => TransferDecodeMode::LinearPassThrough,
+            Self::St2084Pq => TransferDecodeMode::St2084Pq,
         }
     }
 
@@ -108,8 +112,8 @@ impl TransferFunction {
         match self {
             Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
             Self::Gamma22 => TransferDecodeMode::Gamma22,
-            // Displays are not scanned out in linear; fall back to sRGB encode.
             Self::Linear => TransferDecodeMode::SrgbPiecewise,
+            Self::St2084Pq => TransferDecodeMode::St2084Pq,
         }
     }
 }
@@ -153,6 +157,18 @@ impl ColorDescription {
         max_cll_nits: None,
         max_fall_nits: None,
     };
+
+    /// BT.2020 + PQ from EDID Type-1 static metadata (HDR scanout target).
+    pub fn bt2020_pq_hdr(max_luminance_nits: f32, max_fall_nits: f32) -> Self {
+        Self {
+            primaries: ColorPrimaries::Bt2020,
+            transfer: TransferFunction::St2084Pq,
+            reference_white_nits: 203.0,
+            max_luminance_nits,
+            max_cll_nits: Some(max_luminance_nits),
+            max_fall_nits: Some(max_fall_nits),
+        }
+    }
 }
 
 impl Default for ColorDescription {
@@ -243,8 +259,18 @@ pub fn default_output_color_description() -> ColorDescription {
 /// Color description used when encoding the KMS framebuffer for a given output.
 ///
 /// Uses the output's ICC/EDID profile (same data advertised via `wp_color_management_v1`).
-/// HDR PQ/HLG scanout remains deferred to a later phase.
-pub fn kms_scanout_encode_description(output: ColorDescription) -> ColorDescription {
+/// When HDR is active, returns BT.2020 + PQ from EDID metadata instead of ICC SDR.
+pub fn kms_scanout_encode_description(
+    output: ColorDescription,
+    hdr_active: bool,
+    hdr_max_luminance_nits: Option<f32>,
+    hdr_max_fall_nits: Option<f32>,
+) -> ColorDescription {
+    if hdr_active {
+        if let (Some(max), Some(fall)) = (hdr_max_luminance_nits, hdr_max_fall_nits) {
+            return ColorDescription::bt2020_pq_hdr(max, fall);
+        }
+    }
     output
 }
 
@@ -467,7 +493,19 @@ mod tests {
     #[test]
     fn kms_scanout_encode_uses_output_description() {
         let p3 = ColorDescription::DISPLAY_P3_SRGB;
-        assert_eq!(kms_scanout_encode_description(p3), p3);
+        assert_eq!(
+            kms_scanout_encode_description(p3, false, None, None),
+            p3
+        );
+    }
+
+    #[test]
+    fn kms_scanout_encode_returns_bt2020_pq_when_hdr_active() {
+        let sdr = ColorDescription::SRGB;
+        let hdr = kms_scanout_encode_description(sdr, true, Some(600.0), Some(400.0));
+        assert_eq!(hdr.primaries, ColorPrimaries::Bt2020);
+        assert_eq!(hdr.transfer, TransferFunction::St2084Pq);
+        assert_eq!(hdr.max_luminance_nits, 600.0);
     }
 
     #[test]

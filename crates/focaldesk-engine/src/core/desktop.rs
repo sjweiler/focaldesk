@@ -64,7 +64,7 @@ use focaldesk_flow::actions::KeyAction;
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
-use focaldesk_ipc::{IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
+use focaldesk_ipc::{DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
 use focaldesk_logging::session_id;
 use focaldesk_logging::{
     flog, flog_error, flog_info, flog_warn, log_file_path_candidates, set_log_level, FLogLevel,
@@ -320,6 +320,29 @@ fn get_json_key<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde
     Some(current)
 }
 
+fn runtime_display_status_key() -> &'static str {
+    "displays.runtime"
+}
+
+fn runtime_display_status_value(state: &DesktopState) -> serde_json::Value {
+    let outputs: Vec<DisplayRuntimeOutputStatus> = state
+        .outputs
+        .values()
+        .map(|output| DisplayRuntimeOutputStatus {
+            connector: output.handle.name().to_string(),
+            icc_lut_fallback_active: output.icc_lut_fallback_active,
+        })
+        .collect();
+    serde_json::to_value(outputs).unwrap_or(serde_json::Value::Null)
+}
+
+fn get_runtime_key(state: &DesktopState, key: &str) -> Option<serde_json::Value> {
+    if key == runtime_display_status_key() {
+        return Some(runtime_display_status_value(state));
+    }
+    None
+}
+
 fn set_json_key(
     value: &mut serde_json::Value,
     key: &str,
@@ -363,12 +386,16 @@ pub struct OutputState {
     pub hdr_supported: bool,
     pub hdr_requested: bool,
     pub hdr_enabled: bool,
+    /// EDID Type-1 HDR static metadata (nits), when detected.
+    pub edid_hdr_max_luminance_nits: Option<f32>,
+    pub edid_hdr_max_fall_nits: Option<f32>,
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
     pub color_description: crate::core::color::ColorDescription,
     pub icc_profile: Option<Vec<u8>>,
     pub output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
+    pub icc_lut_fallback_active: bool,
     pub monitor_make: String,
     pub monitor_model: String,
     pub monitor_serial: String,
@@ -743,12 +770,15 @@ impl DesktopState {
         response: mpsc::Sender<IpcResponse>,
     ) -> Option<IpcResponse> {
         match request {
-            IpcRequest::Get { key } => match get_config_key(&load_config(), &key) {
-                Some(value) => Some(IpcResponse::Value { key, value }),
-                None => Some(IpcResponse::Error {
-                    message: format!("unknown config key: {key}"),
-                }),
-            },
+            IpcRequest::Get { key } => {
+                match get_config_key(&load_config(), &key).or_else(|| get_runtime_key(self, &key))
+                {
+                    Some(value) => Some(IpcResponse::Value { key, value }),
+                    None => Some(IpcResponse::Error {
+                        message: format!("unknown config key: {key}"),
+                    }),
+                }
+            }
             IpcRequest::Set { key, value } => Some(self.set_config_key_and_notify(key, value)),
             IpcRequest::Watch { keys } => {
                 if keys.is_empty() {
@@ -760,7 +790,10 @@ impl DesktopState {
                 let config = load_config();
                 if let Some(key) = keys
                     .iter()
-                    .find(|key| get_config_key(&config, key).is_none())
+                    .find(|key| {
+                        get_config_key(&config, key).is_none()
+                            && get_runtime_key(self, key).is_none()
+                    })
                     .cloned()
                 {
                     return Some(IpcResponse::Error {
@@ -870,6 +903,9 @@ impl DesktopState {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),
             },
+            IpcRequest::GetDisplayRuntimeStatus => Some(IpcResponse::DisplayRuntimeStatus {
+                outputs: self.runtime_display_statuses(),
+            }),
             IpcRequest::GetAll | IpcRequest::SetValue { .. } => Some(IpcResponse::Error {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
             }),
@@ -926,7 +962,11 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
-                output.hdr_requested = config.hdr_requested || config.hdr_enabled;
+                let requested = config.hdr_requested || config.hdr_enabled;
+                output.hdr_requested = output.hdr_supported && requested;
+                if !output.hdr_requested {
+                    output.hdr_enabled = false;
+                }
             }
             self.update_output_size(output_id, physical_size, scale_factor);
 
@@ -1050,6 +1090,35 @@ impl DesktopState {
             }
 
             true
+        });
+    }
+
+    fn runtime_display_statuses(&self) -> Vec<DisplayRuntimeOutputStatus> {
+        self.outputs
+            .values()
+            .map(|output| DisplayRuntimeOutputStatus {
+                connector: output.handle.name().to_string(),
+                icc_lut_fallback_active: output.icc_lut_fallback_active,
+            })
+            .collect()
+    }
+
+    pub(crate) fn notify_runtime_display_status_changes(&mut self) {
+        let key = runtime_display_status_key().to_string();
+        let value = runtime_display_status_value(self);
+
+        self.settings_ipc_watchers.retain(|watcher| {
+            if !watcher.keys.iter().any(|watched| watched == &key) {
+                return true;
+            }
+
+            watcher
+                .response
+                .send(IpcResponse::Event {
+                    key: key.clone(),
+                    value: value.clone(),
+                })
+                .is_ok()
         });
     }
 
@@ -2663,12 +2732,15 @@ impl DesktopState {
                 hdr_supported: false,
                 hdr_requested: false,
                 hdr_enabled: false,
+                edid_hdr_max_luminance_nits: None,
+                edid_hdr_max_fall_nits: None,
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
                 last_sw_cursor_rect: None,
                 color_description: crate::core::color::default_output_color_description(),
                 icc_profile: None,
                 output_icc_lut: None,
+                icc_lut_fallback_active: false,
                 monitor_make: String::new(),
                 monitor_model: String::new(),
                 monitor_serial: String::new(),
@@ -5748,12 +5820,15 @@ impl DesktopState {
                     hdr_supported: false,
                     hdr_requested: false,
                     hdr_enabled: false,
+                    edid_hdr_max_luminance_nits: None,
+                    edid_hdr_max_fall_nits: None,
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
                     last_sw_cursor_rect: None,
                     color_description: crate::core::color::default_output_color_description(),
                     icc_profile: None,
-                output_icc_lut: None,
+                    output_icc_lut: None,
+                    icc_lut_fallback_active: false,
                     monitor_make: String::new(),
                     monitor_model: String::new(),
                     monitor_serial: String::new(),
@@ -5839,14 +5914,26 @@ impl DesktopState {
         output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
     ) {
         let output_lut = output_icc_lut.or_else(|| {
-            icc_profile
-                .as_ref()
-                .and_then(|bytes| crate::core::icc_lut::build_srgb_to_device_lut(bytes).ok())
+            let Some(bytes) = icc_profile.as_ref() else {
+                return None;
+            };
+            match crate::core::icc_lut::build_srgb_to_device_lut(bytes) {
+                Ok(lut) => Some(lut),
+                Err(err) => {
+                    flog_warn!(
+                        "output color: failed to bake ICC LUT for output {:?}: {:?}",
+                        output_id,
+                        err
+                    );
+                    None
+                }
+            }
         });
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.color_description = description;
             output.icc_profile = icc_profile;
             output.output_icc_lut = output_lut;
+            output.icc_lut_fallback_active = false;
             flog_warn!(
                 "output color: id={output_id:?} serial={} primaries={:?} transfer={:?} icc={} lut={}",
                 output.monitor_serial,
@@ -5856,6 +5943,7 @@ impl DesktopState {
                 output.output_icc_lut.as_ref().map(|l| l.rgb.len()).unwrap_or(0),
             );
         }
+        self.notify_runtime_display_status_changes();
     }
 
     pub fn refresh_surface_color(&mut self, surface: &WlSurface) {

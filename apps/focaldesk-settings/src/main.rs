@@ -1,8 +1,8 @@
 use adw::prelude::*;
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
-    IpcResponse,
+    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys,
+    DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
 };
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_power::{PowerCommand, PowerManager};
@@ -162,6 +162,8 @@ struct DisplayConfig {
     hdr_requested: bool,
     #[serde(default)]
     hdr_enabled: bool,
+    #[serde(skip)]
+    icc_lut_fallback_active: bool,
 }
 
 fn save_displays(displays: &[DisplayConfig]) {
@@ -389,14 +391,19 @@ fn load_displays() -> Vec<DisplayConfig> {
 
 fn display_summary(d: &DisplayConfig) -> String {
     format!(
-        "{}x{} @ {} Hz  |  {}  |  Scale {:.2}{}{}",
+        "{}x{} @ {} Hz  |  {}  |  Scale {:.2}{}{}{}",
         d.mode_width,
         d.mode_height,
         d.refresh_mhz / 1000,
         transform_label(&d.transform),
         d.scale,
         if d.primary { "  |  Primary" } else { "" },
-        if d.enabled { "" } else { "  |  Disabled" }
+        if d.enabled { "" } else { "  |  Disabled" },
+        if d.icc_lut_fallback_active {
+            "  |  ICC LUT fallback active"
+        } else {
+            ""
+        }
     )
 }
 
@@ -1439,12 +1446,16 @@ fn connected_display_row(
     index: usize,
     displays: Rc<RefCell<Vec<DisplayConfig>>>,
     area: gtk::DrawingArea,
+    row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>>,
 ) -> adw::ExpanderRow {
     let display = displays.borrow()[index].clone();
     let row = adw::ExpanderRow::new();
     row.set_title(&display.name);
     row.set_subtitle(&display_summary(&display));
     row.set_enable_expansion(true);
+    row_registry
+        .borrow_mut()
+        .insert(display.name.clone(), row.clone());
 
     let info = gtk::Image::from_icon_name("dialog-information-symbolic");
     info.set_tooltip_text(Some("Display details"));
@@ -1810,6 +1821,57 @@ fn start_config_watch(keys: &[&str]) -> mpsc::Receiver<ConfigEvent> {
     });
 
     rx
+}
+
+fn load_display_runtime_statuses() -> Vec<DisplayRuntimeOutputStatus> {
+    match send_desktop_request(&IpcRequest::GetDisplayRuntimeStatus) {
+        Ok(IpcResponse::DisplayRuntimeStatus { outputs }) => outputs,
+        Ok(IpcResponse::Error { message }) => {
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                message = %message,
+                "display runtime status query rejected"
+            );
+            Vec::new()
+        }
+        Ok(other) => {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                response = ?other,
+                "unexpected display runtime status response"
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "display runtime status unavailable"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn apply_runtime_statuses(
+    displays: &Rc<RefCell<Vec<DisplayConfig>>>,
+    statuses: &[DisplayRuntimeOutputStatus],
+) {
+    let mut displays_ref = displays.borrow_mut();
+    for display in displays_ref.iter_mut() {
+        let active = statuses
+            .iter()
+            .find(|status| status.connector == display.name)
+            .map(|status| status.icc_lut_fallback_active)
+            .unwrap_or(false);
+
+        if display.icc_lut_fallback_active != active {
+            display.icc_lut_fallback_active = active;
+        }
+    }
 }
 
 fn set_switch_if_changed(switch: &gtk::Switch, active: bool) {
@@ -4139,6 +4201,8 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
     page.set_title("Displays");
 
     let detected_displays = Rc::new(RefCell::new(load_displays()));
+    let row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let arrangement_group = adw::PreferencesGroup::new();
     arrangement_group.set_title("Arrangement");
     arrangement_group.set_description(Some(
@@ -4161,7 +4225,12 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         outputs_group.add(&row);
     } else {
         for index in 0..display_count {
-            let row = connected_display_row(index, detected_displays.clone(), area.clone());
+            let row = connected_display_row(
+                index,
+                detected_displays.clone(),
+                area.clone(),
+                row_registry.clone(),
+            );
             outputs_group.add(&row);
         }
     }
@@ -4293,6 +4362,38 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         });
     }
 
+    {
+        let runtime_statuses = load_display_runtime_statuses();
+        apply_runtime_statuses(&detected_displays, &runtime_statuses);
+        for display in detected_displays.borrow().iter() {
+            if let Some(row) = row_registry.borrow().get(&display.name) {
+                row.set_subtitle(&display_summary(display));
+            }
+        }
+
+        let displays = detected_displays.clone();
+        let row_registry = row_registry.clone();
+        let rx = start_config_watch(&["displays.runtime"]);
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            while let Ok(event) = rx.try_recv() {
+                if event.key.as_str() != "displays.runtime" {
+                    continue;
+                }
+
+                let statuses = serde_json::from_value::<Vec<DisplayRuntimeOutputStatus>>(event.value)
+                    .unwrap_or_default();
+                apply_runtime_statuses(&displays, &statuses);
+                for display in displays.borrow().iter() {
+                    if let Some(row) = row_registry.borrow().get(&display.name) {
+                        row.set_subtitle(&display_summary(display));
+                    }
+                }
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
+
     adw::NavigationPage::new(&page, "Displays")
 }
 
@@ -4325,6 +4426,7 @@ mod tests {
             hdr_supported: true,
             hdr_requested: true,
             hdr_enabled: false,
+            icc_lut_fallback_active: false,
         };
 
         let output = output_config_from_display(&display);

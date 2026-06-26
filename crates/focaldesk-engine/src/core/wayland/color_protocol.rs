@@ -193,6 +193,7 @@ impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorT
                         transfer: TransferFunction::Gamma22,
                         ..ColorDescription::SRGB
                     },
+                    TransferFunction::St2084Pq => return,
                 };
                 set_pending_description(&tag.surface, Some(description));
                 flog(format!(

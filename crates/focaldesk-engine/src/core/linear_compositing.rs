@@ -16,7 +16,7 @@ use crate::core::render::{
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use anyhow::{anyhow, Context, Result};
-use focaldesk_logging::flog;
+use focaldesk_logging::{flog, flog_warn};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
@@ -186,8 +186,16 @@ pub fn apply_output_encode(
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
 ) -> Result<Option<SyncPoint>> {
-    let output_encode =
-        kms_scanout_encode_description(state.output_color_description(output_id));
+    let output_state = state.outputs.get(&output_id);
+    let hdr_active = output_state.map(|o| o.hdr_enabled).unwrap_or(false);
+    let hdr_max = output_state.and_then(|o| o.edid_hdr_max_luminance_nits);
+    let hdr_fall = output_state.and_then(|o| o.edid_hdr_max_fall_nits);
+    let output_encode = kms_scanout_encode_description(
+        state.output_color_description(output_id),
+        hdr_active,
+        hdr_max,
+        hdr_fall,
+    );
     let lut_owned = state
         .outputs
         .get(&output_id)
@@ -197,17 +205,33 @@ pub fn apply_output_encode(
     }
 
     let lut_shader = state.render.chrome_shaders.output_encode_lut.clone();
-    if lut_owned.is_some() && icc_lut_shader_enabled() {
-        if let Some(shader) = lut_shader.as_ref() {
-            return apply_output_encode_lut(
-                state,
-                renderer,
-                targets,
-                output_id,
-                buffer_size,
-                lut_owned.as_ref().unwrap(),
-                shader,
-            );
+    if let Some(lut) = lut_owned.as_ref() {
+        if icc_lut_shader_enabled() {
+            if let Some(shader) = lut_shader.as_ref() {
+                match apply_output_encode_lut(
+                    state,
+                    renderer,
+                    targets,
+                    output_id,
+                    buffer_size,
+                    lut,
+                    shader,
+                ) {
+                    Ok(sync) => return Ok(sync),
+                    Err(err) => {
+                        flog_warn!(
+                            "ICC LUT output encode failed for {:?}: {err}; falling back to parametric encode",
+                            output_id
+                        );
+                        disable_output_icc_lut(state, output_id, "ICC LUT encode failed");
+                    }
+                }
+            } else {
+                flog_warn!(
+                    "ICC LUT shader unavailable for {:?}; falling back to parametric encode",
+                    output_id
+                );
+            }
         }
     }
 
@@ -226,6 +250,23 @@ pub fn apply_output_encode(
         output_encode,
         &parametric_shader,
     )
+}
+
+fn disable_output_icc_lut(state: &mut DesktopState, output_id: OutputId, reason: &str) {
+    if let Some(output) = state.outputs.get_mut(&output_id) {
+        if output.output_icc_lut.take().is_some() {
+            output.icc_lut_fallback_active = true;
+            let first_notice = state.render.icc_lut_fallback_logged.insert(output_id);
+            if first_notice {
+                flog_warn!(
+                    "ICC LUT fallback active for {:?}: {}; using parametric SDR encode until restart",
+                    output_id,
+                    reason
+                );
+            }
+        }
+    }
+    state.notify_runtime_display_status_changes();
 }
 
 fn apply_output_encode_lut(
@@ -387,12 +428,17 @@ fn finish_with_output_encode(
     buffer_size: Size<i32, Physical>,
     sync: SyncPoint,
 ) -> Result<SyncPoint> {
-    if let Some(encode_sync) =
-        apply_output_encode(state, renderer, targets, output_id, buffer_size)?
-    {
-        return Ok(encode_sync);
+    match apply_output_encode(state, renderer, targets, output_id, buffer_size) {
+        Ok(Some(encode_sync)) => Ok(encode_sync),
+        Ok(None) => Ok(sync),
+        Err(err) => {
+            flog_warn!(
+                "output encode disabled for {:?} after encode failure: {err}",
+                output_id
+            );
+            Ok(sync)
+        }
     }
-    Ok(sync)
 }
 
 /// Composite the FP16 client layer onto an existing SDR base (wallpaper/chrome).

@@ -312,6 +312,8 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_feature(Feature::SetPrimaries);
     manager.supported_feature(Feature::SetTfPower);
     manager.supported_feature(Feature::SetLuminances);
+    manager.supported_feature(Feature::SetMasteringDisplayPrimaries);
+    manager.supported_feature(Feature::ExtendedTargetVolume);
 
     manager.supported_tf_named(TransferFunction::Bt1886);
     manager.supported_tf_named(TransferFunction::Gamma22);
@@ -469,10 +471,9 @@ fn send_canonical_sdr_image_description_info(
     queue_image_description_info_done(info, state);
 }
 
-fn send_image_description_info(
-    info: wp_image_description_info_v1::WpImageDescriptionInfoV1,
+fn emit_image_description_info_events(
+    info: &wp_image_description_info_v1::WpImageDescriptionInfoV1,
     description: &ColorDescription,
-    state: &mut DesktopState,
 ) {
     use wp_color_manager_v1::{Primaries, TransferFunction};
 
@@ -509,6 +510,8 @@ fn send_image_description_info(
         CoreTransferFunction::Srgb | CoreTransferFunction::Bt1886 => TransferFunction::Bt1886,
         CoreTransferFunction::Gamma22 => TransferFunction::Gamma22,
         CoreTransferFunction::Linear => TransferFunction::ExtLinear,
+        // C3d: advertise PQ named transfer when wp_color HDR is wired.
+        CoreTransferFunction::St2084Pq => TransferFunction::ExtLinear,
     };
     info.tf_named(tf_named);
 
@@ -518,6 +521,14 @@ fn send_image_description_info(
         // SDR: target volume equals primary volume — omit target_primaries.
         info.target_luminance(min_lum, max_lum);
     }
+}
+
+fn send_image_description_info(
+    info: wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    description: &ColorDescription,
+    state: &mut DesktopState,
+) {
+    emit_image_description_info_events(&info, description);
     queue_image_description_info_done(info, state);
 }
 
@@ -1105,7 +1116,12 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
                     return;
                 }
                 let info = data_init.init(information, ());
-                if let Some(icc) = &data.icc_profile {
+                if data.advertise_as_canonical_sdr {
+                    send_canonical_sdr_image_description_info(info, state);
+                } else if let Some(icc) = &data.icc_profile {
+                    // Chromium ignores icc_file (NOTIMPLEMENTED) and needs parametric
+                    // primaries/tf/luminances to learn output gamut.
+                    emit_image_description_info_events(&info, &data.description);
                     match icc::memfd_from_bytes(icc) {
                         Ok(fd) => {
                             info.icc_file(fd.as_fd(), icc.len() as u32);
@@ -1120,8 +1136,6 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
                             );
                         }
                     }
-                } else if data.advertise_as_canonical_sdr {
-                    send_canonical_sdr_image_description_info(info, state);
                 } else {
                     send_image_description_info(info, &data.description, state);
                 }

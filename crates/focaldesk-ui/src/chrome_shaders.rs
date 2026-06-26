@@ -25,6 +25,10 @@ pub struct ChromeShaders {
     pub output_encode_sdr: Option<GlesTexProgram>,
     /// Full-frame scene sRGB → monitor ICC LUT encode (C2c).
     pub output_encode_lut: Option<GlesTexProgram>,
+    /// Scene sRGB → linear scRGB (HDR working space, C3).
+    pub sdr_to_linear_scrgb: Option<GlesTexProgram>,
+    /// Linear scRGB (nits) → PQ-encoded HDR (C3).
+    pub linear_scrgb_to_pq: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
     pub flow_field: Option<GlesPixelProgram>,
@@ -55,6 +59,8 @@ impl ChromeShaders {
             composite_linear_layer: None,
             output_encode_sdr: None,
             output_encode_lut: None,
+            sdr_to_linear_scrgb: None,
+            linear_scrgb_to_pq: None,
             pulse: None,
             accent: None,
             flow_field: None,
@@ -210,12 +216,37 @@ impl ChromeShaders {
         }
 
         if self.output_encode_lut.is_none() {
-            self.output_encode_lut = Some(renderer.compile_custom_texture_shader(
+            match renderer.compile_custom_texture_shader(
                 OUTPUT_ENCODE_LUT_FRAG,
                 &[
                     UniformName::new("u_lut_tex", UniformType::_1i),
                     UniformName::new("u_grid", UniformType::_1f),
                 ],
+            ) {
+                Ok(program) => {
+                    flog("output_encode_lut shader compiled OK");
+                    self.output_encode_lut = Some(program);
+                }
+                Err(err) => {
+                    flog(format!(
+                        "startup: output_encode_lut shader compile failed; disabling ICC LUT output encode for this session and falling back to parametric encode: {:?}",
+                        err
+                    ));
+                }
+            }
+        }
+
+        if self.sdr_to_linear_scrgb.is_none() {
+            self.sdr_to_linear_scrgb = Some(renderer.compile_custom_texture_shader(
+                SDR_TO_LINEAR_SCRGB_FRAG,
+                &[UniformName::new("u_sdr_white_nits", UniformType::_1f)],
+            )?);
+        }
+
+        if self.linear_scrgb_to_pq.is_none() {
+            self.linear_scrgb_to_pq = Some(renderer.compile_custom_texture_shader(
+                LINEAR_SCRGB_TO_PQ_FRAG,
+                &[UniformName::new("u_max_nits", UniformType::_1f)],
             )?);
         }
 
@@ -1102,7 +1133,7 @@ vec3 lut_lookup(vec3 c) {
     float n = u_grid;
     vec3 x = clamp(c, 0.0, 1.0) * (n - 1.0);
     ivec3 i0 = ivec3(floor(x + 1e-5));
-    vec3 f = x - vec3(i0);
+    vec3 f = x - vec3(float(i0.x), float(i0.y), float(i0.z));
     ivec3 i1 = min(i0 + ivec3(1), ivec3(int(n) - 1));
 
     vec3 c000 = lut_sample_at(ivec3(i0.x, i0.y, i0.z));
@@ -1131,6 +1162,86 @@ void main() {
     vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
     vec3 encoded = lut_lookup(straight);
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+}
+"#;
+
+/// Scene sRGB → linear scRGB extended (nits above reference white).
+const SDR_TO_LINEAR_SCRGB_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_sdr_white_nits;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
+    vec3 linear = srgb_to_linear(straight);
+    vec3 scrgb = linear * (u_sdr_white_nits / 80.0);
+    gl_FragColor = vec4(scrgb * src.a, src.a) * alpha;
+}
+"#;
+
+/// Linear scRGB (nits) → SMPTE ST 2084 PQ (0–1 electrical).
+const LINEAR_SCRGB_TO_PQ_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_max_nits;
+
+float pq_oetf(float nits) {
+    float L = max(nits, 0.0) / 10000.0;
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    float Lm = pow(L, m1);
+    return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 nits = src.a > 0.0001 ? max(src.rgb / src.a, vec3(0.0)) : max(src.rgb, vec3(0.0));
+    nits = min(nits, vec3(u_max_nits));
+    vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
+    gl_FragColor = vec4(pq * src.a, src.a) * alpha;
 }
 "#;
 

@@ -177,21 +177,11 @@ pub struct HdrBpcRange {
 }
 
 impl HdrSupport {
-    fn is_detected(&self) -> bool {
+    pub(crate) fn is_detected(&self) -> bool {
         self.edid_hdr_static_metadata && self.edid_pq
     }
 
-    fn has_connector_controls(&self) -> bool {
-        self.has_hdr_metadata_property || self.has_bt2020_colorspace || self.max_bpc.is_some()
-    }
-
-    fn supports_hdr_bpc(&self) -> bool {
-        self.max_bpc
-            .as_ref()
-            .is_none_or(|range| range.min <= HDR_MAX_BPC && range.max >= HDR_MAX_BPC)
-    }
-
-    fn can_enable(&self) -> bool {
+    pub(crate) fn can_enable(&self) -> bool {
         self.has_hdr_metadata_property
             && self.has_bt2020_colorspace
             && self.supports_hdr_bpc()
@@ -199,6 +189,16 @@ impl HdrSupport {
             && self.edid_static_metadata_type1
             && self.edid_pq
             && self.edid_hdr_metadata.is_some()
+    }
+
+    fn has_connector_controls(&self) -> bool {
+        self.has_hdr_metadata_property || self.has_bt2020_colorspace || self.max_bpc.is_some()
+    }
+
+    pub(crate) fn supports_hdr_bpc(&self) -> bool {
+        self.max_bpc
+            .as_ref()
+            .is_none_or(|range| range.min <= HDR_MAX_BPC && range.max >= HDR_MAX_BPC)
     }
 }
 
@@ -280,6 +280,7 @@ pub struct DrmSurfaceState {
     pub present_render_id: Id,
     pub present_damage: DamageBag<i32, Buffer>,
     pub render_targets: LinearOffscreenTargets,
+    pub hdr_support: HdrSupport,
     pub frame_queued_at: Option<Instant>,
 
     pub drm_output: DrmOutput<
@@ -845,12 +846,32 @@ fn hdr_driver_allows_output_with_override(gpu_vendor_id: Option<u32>, allow_nvid
     gpu_vendor_id != Some(PCI_VENDOR_NVIDIA) || allow_nvidia
 }
 
-#[cfg(any())]
+/// Sync `OutputState` HDR flags from EDID/KMS detection and persisted config.
+fn sync_output_hdr_flags(
+    output: &mut crate::core::desktop::OutputState,
+    support: &HdrSupport,
+    gpu_vendor_id: Option<u32>,
+    hdr_requested_from_config: bool,
+) {
+    let driver_ok = hdr_driver_allows_output(gpu_vendor_id);
+    output.hdr_supported = support.is_detected() && driver_ok;
+    output.hdr_requested = hdr_requested_from_config && output.hdr_supported;
+    if let Some(meta) = support.edid_hdr_metadata.as_ref() {
+        output.edid_hdr_max_luminance_nits = Some(meta.max_luminance as f32);
+        output.edid_hdr_max_fall_nits = Some(meta.max_fall as f32);
+    } else {
+        output.edid_hdr_max_luminance_nits = None;
+        output.edid_hdr_max_fall_nits = None;
+    }
+}
+
+#[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, hdr_driver_allows_output_with_override,
-        intersect_modifiers, parse_edid_hdr_support, DisplayConfig, DisplayTransform, DrmModifier,
-        EdidHdrMetadata, HdrBpcRange, HdrSupport, PCI_VENDOR_NVIDIA,
+        configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
+        hdr_driver_allows_output_with_override, intersect_modifiers, DisplayConfig,
+        DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport,
+        PCI_VENDOR_NVIDIA,
     };
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -1272,11 +1293,11 @@ pub(crate) fn collect_display_configs(
 
         let w = surface.mode.size.w;
         let h = surface.mode.size.h;
-        let hdr_supported = false;
+        let hdr_supported = core_output.map(|output| output.hdr_supported).unwrap_or(false);
         let hdr_requested = core_output
             .map(|output| output.hdr_requested)
             .unwrap_or(false);
-        let hdr_enabled = false;
+        let hdr_enabled = core_output.map(|output| output.hdr_enabled).unwrap_or(false);
 
         displays.push(DisplayConfig {
             name: surface.output.name(),
@@ -1340,11 +1361,10 @@ fn connector_edid(
     None
 }
 
-#[cfg(any())]
-mod retired_hdr_detection {
+mod hdr_detection {
     use super::*;
 
-    fn connector_hdr_support(
+    pub(crate) fn connector_hdr_support(
         device: &impl drm::control::Device,
         connector: connector::Handle,
         edid: Option<&[u8]>,
@@ -1399,7 +1419,7 @@ mod retired_hdr_detection {
         support
     }
 
-    fn parse_edid_hdr_support(edid: &[u8]) -> HdrSupport {
+    pub(crate) fn parse_edid_hdr_support(edid: &[u8]) -> HdrSupport {
         let mut support = HdrSupport::default();
         if edid.len() < 128
             || edid.get(0..8) != Some([0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0].as_slice())
@@ -1508,7 +1528,7 @@ mod retired_hdr_detection {
         support
     }
 
-    fn log_hdr_support(output_name: &str, support: &HdrSupport) {
+    pub(crate) fn log_hdr_support(output_name: &str, support: &HdrSupport) {
         let max_bpc = support
             .max_bpc
             .as_ref()
@@ -1538,7 +1558,11 @@ mod retired_hdr_detection {
         ));
     }
 
-    fn log_connector_hdr_properties(
+    #[cfg(any())]
+    mod hdr_kms_apply {
+        use super::*;
+
+        fn log_connector_hdr_properties(
         device: &impl drm::control::Device,
         connector: connector::Handle,
         output_name: &str,
@@ -1809,6 +1833,7 @@ mod retired_hdr_detection {
             .map_err(|err| anyhow!("failed to queue HDR connector state: {err}"))?;
 
         Ok(true)
+    }
     }
 }
 
@@ -2280,10 +2305,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                     if portal_needs_composite {
                         data.core.state.render.redraw_all = true;
-                    }
-                    if let Some(out) = data.core.state.outputs.get_mut(&surface.output_id) {
-                        out.hdr_supported = false;
-                        out.hdr_enabled = false;
                     }
 
                     let mut prepared = prepare_output(
@@ -2875,6 +2896,14 @@ fn device_added(
                 .unwrap_or(fallback_mm);
 
             let edid = connector_edid(drm_output_manager.device(), *conn);
+            let hdr_support = hdr_detection::connector_hdr_support(
+                drm_output_manager.device(),
+                *conn,
+                edid.as_deref(),
+            );
+            hdr_detection::log_hdr_support(&output_name, &hdr_support);
+            let hdr_requested_config =
+                configured_display_hdr_requested(&configured_displays, &output_name);
             let edid_identity = edid.as_deref().and_then(parse_edid_identity);
             let make = edid_identity
                 .as_ref()
@@ -3031,8 +3060,7 @@ fn device_added(
                 output_scale,
             );
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
-                out.hdr_supported = false;
-                out.hdr_enabled = false;
+                sync_output_hdr_flags(out, &hdr_support, gpu_vendor_id, hdr_requested_config);
             }
 
             data.core.state.set_output_monitor_identity(
@@ -3075,6 +3103,7 @@ fn device_added(
                         linear_supported: linear_sdr_supported,
                         ..LinearOffscreenTargets::default()
                     },
+                    hdr_support,
                     frame_queued_at: None,
                     drm_output,
                 },

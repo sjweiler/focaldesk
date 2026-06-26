@@ -202,6 +202,7 @@ pub struct RenderState {
     pub fonts_prewarm_done: bool,
     pub portal_capture_blit_id: Id,
     output_icc_lut_gpu: HashMap<OutputId, OutputIccLutGpu>,
+    pub icc_lut_fallback_logged: std::collections::HashSet<OutputId>,
 }
 
 struct OutputIccLutGpu {
@@ -585,6 +586,7 @@ impl RenderState {
             fonts_prewarm_done: false,
             portal_capture_blit_id: Id::new(),
             output_icc_lut_gpu: HashMap::new(),
+            icc_lut_fallback_logged: std::collections::HashSet::new(),
         }
     }
 

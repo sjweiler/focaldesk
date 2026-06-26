@@ -41,6 +41,7 @@ pub enum IpcRequest {
     SetDisplays {
         outputs: Vec<OutputConfig>,
     },
+    GetDisplayRuntimeStatus,
     IdentifyDisplays,
     Reload,
     ReloadConfig,
@@ -80,6 +81,9 @@ pub enum IpcResponse {
     Settings {
         settings: Settings,
     },
+    DisplayRuntimeStatus {
+        outputs: Vec<DisplayRuntimeOutputStatus>,
+    },
     AiPermissionDecision {
         request_id: u64,
         allow: bool,
@@ -88,6 +92,13 @@ pub enum IpcResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DisplayRuntimeOutputStatus {
+    pub connector: String,
+    #[serde(default)]
+    pub icc_lut_fallback_active: bool,
 }
 
 pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String> {
