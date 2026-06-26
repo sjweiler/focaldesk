@@ -6,7 +6,7 @@ use crate::backend::common::{
     refresh_portal_services,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
-use drm::control::{connector, crtc};
+use drm::control::{connector, crtc, property};
 use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, KeyState};
 use smithay::backend::renderer::gles::GlesError;
@@ -93,6 +93,7 @@ use smithay::backend::drm::{
     compositor::FrameFlags,
     exporter::gbm::GbmFramebufferExporter,
     output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
+    HdrState,
 };
 
 use crate::core::chrome_layout::build_chrome_layout;
@@ -105,6 +106,8 @@ use crate::core::{
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
 
 use smithay::reexports::drm;
+
+use drm_ffi;
 
 use smithay::reexports::rustix::fs::OFlags;
 
@@ -281,6 +284,13 @@ pub struct DrmSurfaceState {
     pub present_damage: DamageBag<i32, Buffer>,
     pub render_targets: LinearOffscreenTargets,
     pub hdr_support: HdrSupport,
+    pub hdr_metadata_blob: Option<u64>,
+    pub hdr_enabled_applied: bool,
+    pub hdr_render_supported: bool,
+    pub sdr_scanout_format: Fourcc,
+    pub sdr_scanout_modifiers: Vec<DrmModifier>,
+    pub hdr_scanout_format: Option<Fourcc>,
+    pub hdr_scanout_modifiers: Vec<DrmModifier>,
     pub frame_queued_at: Option<Instant>,
 
     pub drm_output: DrmOutput<
@@ -755,7 +765,18 @@ fn intersect_modifiers(
         .collect()
 }
 
-#[cfg(any())]
+fn hdr_scanout_modifier_sets(sdr_modifiers: &[DrmModifier]) -> Vec<Vec<DrmModifier>> {
+    let mut sets = Vec::new();
+    if !sdr_modifiers.is_empty() {
+        sets.push(sdr_modifiers.to_vec());
+    }
+    sets.push(vec![DrmModifier::Invalid]);
+    if !sdr_modifiers.contains(&DrmModifier::Linear) {
+        sets.push(vec![DrmModifier::Linear]);
+    }
+    sets
+}
+
 fn probe_hdr_scanout_plane_from_formats(
     plane_formats: &FormatSet,
     sdr_modifiers: &[DrmModifier],
@@ -789,7 +810,6 @@ fn probe_hdr_scanout_plane_from_formats(
     None
 }
 
-#[cfg(any())]
 fn probe_hdr_scanout_plane(
     drm_output: &DrmOutput<
         GbmAllocator<DrmDeviceFd>,
@@ -989,41 +1009,28 @@ fn drm_card_vendor_id(card_path: &Path) -> Option<u32> {
     u32::from_str_radix(vendor.trim().trim_start_matches("0x"), 16).ok()
 }
 
-#[cfg(any())]
-mod retired_hdr_output_path {
+fn hdr_output_capable(
+    hdr_support: &HdrSupport,
+    hdr_offscreen_format: Option<Fourcc>,
+    hdr_working_format: Option<Fourcc>,
+    hdr_scanout: Option<&HdrScanoutProbe>,
+    gpu_vendor_id: Option<u32>,
+) -> bool {
+    hdr_support.can_enable()
+        && hdr_offscreen_format.is_some()
+        && hdr_working_format.is_some()
+        && hdr_scanout.is_some()
+        && hdr_driver_allows_output(gpu_vendor_id)
+}
+
+mod hdr_output {
     use super::*;
-
-    fn hdr_output_capable(
-        hdr_support: &HdrSupport,
-        hdr_offscreen_format: Option<Fourcc>,
-        hdr_working_format: Option<Fourcc>,
-        hdr_scanout: Option<&HdrScanoutProbe>,
-        gpu_vendor_id: Option<u32>,
-    ) -> bool {
-        hdr_support.can_enable()
-            && hdr_offscreen_format.is_some()
-            && hdr_working_format.is_some()
-            && hdr_scanout.is_some()
-            && hdr_driver_allows_output(gpu_vendor_id)
-    }
-
-    fn hdr_scanout_modifier_sets(sdr_modifiers: &[DrmModifier]) -> Vec<Vec<DrmModifier>> {
-        let mut sets = Vec::new();
-        if !sdr_modifiers.is_empty() {
-            sets.push(sdr_modifiers.to_vec());
-        }
-        sets.push(vec![DrmModifier::Invalid]);
-        if !sdr_modifiers.contains(&DrmModifier::Linear) {
-            sets.push(vec![DrmModifier::Linear]);
-        }
-        sets
-    }
 
     fn clear_pending_hdr_connector_state(
         surface: &DrmSurfaceState,
         device: &impl drm::control::Device,
     ) {
-        if let Err(err) = configure_smithay_hdr_state(surface, device, false, None) {
+        if let Err(err) = hdr_detection::hdr_kms::configure_smithay_hdr_state(surface, device, false, None) {
             flog(&format!(
                 "Failed to clear pending HDR connector state for {}: {err}",
                 surface.output.name()
@@ -1031,12 +1038,28 @@ mod retired_hdr_output_path {
         }
     }
 
+    fn set_output_scanout_format(
+        output: &DrmOutput<
+            GbmAllocator<DrmDeviceFd>,
+            GbmFramebufferExporter<DrmDeviceFd>,
+            Option<OutputPresentationFeedback>,
+            DrmDeviceFd,
+        >,
+        allocator: GbmAllocator<DrmDeviceFd>,
+        format: Fourcc,
+        modifiers: impl IntoIterator<Item = DrmModifier>,
+    ) -> Result<(), anyhow::Error> {
+        output
+            .with_compositor(|compositor| compositor.set_format(allocator, format, modifiers))
+            .map_err(|err| anyhow!("failed to select {format:?} scanout format: {err}"))
+    }
+
     fn rollback_surface_to_sdr(
         surface: &mut DrmSurfaceState,
         device: &impl drm::control::Device,
         allocator: GbmAllocator<DrmDeviceFd>,
     ) {
-        destroy_hdr_metadata_blob(device, surface.hdr_metadata_blob.take());
+        hdr_detection::hdr_kms::destroy_hdr_metadata_blob(device, surface.hdr_metadata_blob.take());
         clear_pending_hdr_connector_state(surface, device);
         if let Err(err) = set_output_scanout_format(
             &surface.drm_output,
@@ -1050,11 +1073,31 @@ mod retired_hdr_output_path {
             ));
         }
         surface.hdr_enabled_applied = false;
-        surface.sdr_offscreen = None;
-        surface.working_offscreen = None;
+        surface.render_targets.offscreen = None;
+        surface.render_targets.linear_offscreen = None;
+        surface.render_targets.hdr_offscreen = None;
+        surface.render_targets.encode_scratch = None;
+        surface.render_targets.encoded_scanout = false;
+        surface.render_targets.encoded_hdr = false;
     }
 
-    fn apply_hdr_output_state(
+    fn abort_hdr_rendering_userspace(surface: &mut DrmSurfaceState, reason: &str) {
+        flog(&format!(
+            "HDR aborted on {}: {reason} (userspace only; KMS unchanged — restart session for clean SDR scanout)",
+            surface.output.name()
+        ));
+        surface.hdr_enabled_applied = false;
+        surface.hdr_render_supported = false;
+        surface.frame_queued_at = None;
+        surface.render_targets.offscreen = None;
+        surface.render_targets.linear_offscreen = None;
+        surface.render_targets.hdr_offscreen = None;
+        surface.render_targets.encode_scratch = None;
+        surface.render_targets.encoded_scanout = false;
+        surface.render_targets.encoded_hdr = false;
+    }
+
+    pub(crate) fn apply_hdr_output_state(
         surface: &mut DrmSurfaceState,
         device: &impl drm::control::Device,
         allocator: GbmAllocator<DrmDeviceFd>,
@@ -1078,14 +1121,14 @@ mod retired_hdr_output_path {
             return false;
         }
 
-        log_connector_hdr_properties(
+        hdr_detection::hdr_kms::log_connector_hdr_properties(
             device,
             surface.connector,
             &surface.output.name(),
             "before-queue",
         );
 
-        let hdr_metadata_blob = match ensure_hdr_metadata_blob(
+        let hdr_metadata_blob = match hdr_detection::hdr_kms::ensure_hdr_metadata_blob(
             device,
             &surface.hdr_support,
             &mut surface.hdr_metadata_blob,
@@ -1100,8 +1143,7 @@ mod retired_hdr_output_path {
             }
         };
 
-        // Queue connector HDR first so compositor.set_format's TEST_ONLY atomic includes it.
-        match configure_smithay_hdr_state(surface, device, true, hdr_metadata_blob) {
+        match hdr_detection::hdr_kms::configure_smithay_hdr_state(surface, device, true, hdr_metadata_blob) {
             Ok(true) => {}
             Ok(false) => {
                 abort_hdr_rendering_userspace(surface, "HDR connector state could not be queued");
@@ -1124,7 +1166,7 @@ mod retired_hdr_output_path {
         ) {
             Ok(()) => {
                 surface.hdr_enabled_applied = true;
-                log_connector_hdr_properties(
+                hdr_detection::hdr_kms::log_connector_hdr_properties(
                     device,
                     surface.connector,
                     &surface.output.name(),
@@ -1141,125 +1183,6 @@ mod retired_hdr_output_path {
                 false
             }
         }
-    }
-
-    /// Drop HDR rendering state without touching KMS. Rolling back scanout/connector
-    /// properties after a wedged HDR present has triggered NVRM Xid 56 and required hard
-    /// resets on nvidia-drm dual-head setups.
-    fn abort_hdr_rendering_userspace(surface: &mut DrmSurfaceState, reason: &str) {
-        flog(&format!(
-            "HDR aborted on {}: {reason} (userspace only; KMS unchanged — restart session for clean SDR scanout)",
-            surface.output.name()
-        ));
-        surface.hdr_enabled_applied = false;
-        surface.hdr_render_supported = false;
-        surface.frame_queued_at = None;
-        surface.offscreen = None;
-        surface.sdr_offscreen = None;
-        surface.working_offscreen = None;
-    }
-
-    fn disable_hdr_rendering_after_error(surface: &mut DrmSurfaceState, error: &anyhow::Error) {
-        abort_hdr_rendering_userspace(surface, &format!("frame setup failed: {error:#}"));
-    }
-
-    fn recover_timed_out_hdr_frame(surface: &mut DrmSurfaceState) {
-        abort_hdr_rendering_userspace(
-            surface,
-            &format!("frame timed out after {HDR_FRAME_TIMEOUT:?} waiting for vblank"),
-        );
-    }
-
-    fn set_output_scanout_format(
-        output: &DrmOutput<
-            GbmAllocator<DrmDeviceFd>,
-            GbmFramebufferExporter<DrmDeviceFd>,
-            Option<OutputPresentationFeedback>,
-            DrmDeviceFd,
-        >,
-        allocator: GbmAllocator<DrmDeviceFd>,
-        format: Fourcc,
-        modifiers: impl IntoIterator<Item = DrmModifier>,
-    ) -> Result<(), anyhow::Error> {
-        output
-            .with_compositor(|compositor| compositor.set_format(allocator, format, modifiers))
-            .map_err(|err| anyhow!("failed to select {format:?} scanout format: {err}"))
-    }
-
-    fn convert_texture(
-        renderer: &mut GlesRenderer,
-        src: &GlesTexture,
-        dst: &mut GlesTexture,
-        size: Size<i32, Physical>,
-        shader: &smithay::backend::renderer::gles::GlesTexProgram,
-        uniforms: &[Uniform<'_>],
-        label: &str,
-    ) -> Result<(), anyhow::Error> {
-        let mut target = renderer
-            .bind(dst)
-            .map_err(|err| anyhow!("bind target for {label}: {err}"))?;
-        let mut frame = renderer
-            .render(&mut target, size, Transform::Normal)
-            .map_err(|err| anyhow!("begin {label} frame: {err}"))?;
-        let src_rect =
-            Rectangle::<f64, Buffer>::from_loc_and_size((0.0, 0.0), (size.w as f64, size.h as f64));
-        let dst_rect = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
-        let damage = [dst_rect];
-        frame
-            .render_texture_from_to(
-                src,
-                src_rect,
-                dst_rect,
-                &damage,
-                &damage,
-                Transform::Normal,
-                1.0,
-                Some(shader),
-                uniforms,
-            )
-            .map_err(|err| anyhow!("render {label}: {err}"))?;
-        let _sync = frame
-            .finish()
-            .map_err(|err| anyhow!("finish {label}: {err}"))?;
-        Ok(())
-    }
-
-    fn convert_sdr_scene_to_linear_scrgb(
-        renderer: &mut GlesRenderer,
-        src: &GlesTexture,
-        dst: &mut GlesTexture,
-        size: Size<i32, Physical>,
-        shader: &smithay::backend::renderer::gles::GlesTexProgram,
-    ) -> Result<(), anyhow::Error> {
-        const SDR_WHITE_NITS: f32 = 200.0;
-        convert_texture(
-            renderer,
-            src,
-            dst,
-            size,
-            shader,
-            &[Uniform::new("u_sdr_white_nits", SDR_WHITE_NITS)],
-            "SDR-to-linear-scRGB conversion",
-        )
-    }
-
-    fn convert_linear_scrgb_to_hdr(
-        renderer: &mut GlesRenderer,
-        src: &GlesTexture,
-        dst: &mut GlesTexture,
-        size: Size<i32, Physical>,
-        shader: &smithay::backend::renderer::gles::GlesTexProgram,
-        max_nits: f32,
-    ) -> Result<(), anyhow::Error> {
-        convert_texture(
-            renderer,
-            src,
-            dst,
-            size,
-            shader,
-            &[Uniform::new("u_max_nits", max_nits)],
-            "linear-scRGB-to-HDR conversion",
-        )
     }
 }
 
@@ -1552,11 +1475,10 @@ mod hdr_detection {
         ));
     }
 
-    #[cfg(any())]
-    mod hdr_kms_apply {
+    pub(crate) mod hdr_kms {
         use super::*;
 
-        fn log_connector_hdr_properties(
+        pub(crate) fn log_connector_hdr_properties(
         device: &impl drm::control::Device,
         connector: connector::Handle,
         output_name: &str,
@@ -1645,7 +1567,7 @@ mod hdr_detection {
         }
     }
 
-    fn create_hdr_metadata_blob(
+    pub(crate) fn create_hdr_metadata_blob(
         device: &impl drm::control::Device,
         support: &HdrSupport,
     ) -> Result<u64, anyhow::Error> {
@@ -1666,7 +1588,7 @@ mod hdr_detection {
         }
     }
 
-    fn destroy_hdr_metadata_blob(device: &impl drm::control::Device, blob: Option<u64>) {
+    pub(crate) fn destroy_hdr_metadata_blob(device: &impl drm::control::Device, blob: Option<u64>) {
         if let Some(blob) = blob {
             if let Err(err) = device.destroy_property_blob(blob) {
                 flog(&format!(
@@ -1676,7 +1598,7 @@ mod hdr_detection {
         }
     }
 
-    fn ensure_hdr_metadata_blob(
+    pub(crate) fn ensure_hdr_metadata_blob(
         device: &impl drm::control::Device,
         support: &HdrSupport,
         blob: &mut Option<u64>,
@@ -1730,7 +1652,6 @@ mod hdr_detection {
         selected.map(|value| value.value())
     }
 
-    #[cfg(any())]
     fn build_connector_hdr_state(
         device: &impl drm::control::Device,
         connector: connector::Handle,
@@ -1803,8 +1724,7 @@ mod hdr_detection {
         Ok(Some(state))
     }
 
-    #[cfg(any())]
-    fn configure_smithay_hdr_state(
+    pub(crate) fn configure_smithay_hdr_state(
         surface: &DrmSurfaceState,
         device: &impl drm::control::Device,
         hdr_enabled: bool,
@@ -2296,6 +2216,37 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         && data.core.state.cursor_manager.visible();
 
                     let buffer_size = Size::from((surface.size.w, surface.size.h));
+
+                    if hdr_runtime_apply_enabled() {
+                        let hdr_target = data
+                            .core
+                            .state
+                            .outputs
+                            .get(&surface.output_id)
+                            .map(|output| output.hdr_requested && surface.hdr_render_supported)
+                            .unwrap_or(false);
+                        let applied = hdr_output::apply_hdr_output_state(
+                            surface,
+                            device.drm_output_manager.device(),
+                            GbmAllocator::new(
+                                device.gbm.clone(),
+                                GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+                            ),
+                            hdr_target,
+                        );
+                        if let Some(output) =
+                            data.core.state.outputs.get_mut(&surface.output_id)
+                        {
+                            output.hdr_enabled = if applied && hdr_target {
+                                true
+                            } else {
+                                crate::core::color::output_hdr_render_active(
+                                    output.hdr_requested,
+                                    output.hdr_supported,
+                                )
+                            };
+                        }
+                    }
 
                     if portal_needs_composite {
                         data.core.state.render.redraw_all = true;
@@ -3037,6 +2988,29 @@ fn device_added(
                     &DrmOutputRenderElements::default(),
                 )?;
 
+            let (sdr_scanout_format, sdr_scanout_modifiers) = drm_output.with_compositor(|c| {
+                (c.format(), c.modifiers().to_vec())
+            });
+            let hdr_scanout =
+                probe_hdr_scanout_plane(&drm_output, &sdr_scanout_modifiers, &output_name);
+            let hdr_scanout_format = hdr_scanout.as_ref().map(|probe| probe.format);
+            let hdr_scanout_modifiers = hdr_scanout
+                .as_ref()
+                .map(|probe| probe.modifiers.clone())
+                .unwrap_or_default();
+            let hdr_working_format = linear_sdr_supported
+                .then_some(crate::core::linear_compositing::LINEAR_SDR_FORMAT);
+            let hdr_render_supported = hdr_output_capable(
+                &hdr_support,
+                hdr_format,
+                hdr_working_format,
+                hdr_scanout.as_ref(),
+                gpu_vendor_id,
+            );
+            flog(&format!(
+                "HDR render capability: output={output_name} supported={hdr_render_supported} scanout_format={hdr_scanout_format:?} scanout_modifiers={hdr_scanout_modifiers:?}"
+            ));
+
             //let offscreen = OffscreenOutput {
             //    size: tex_phys_size,
             //    texture: None,
@@ -3105,6 +3079,13 @@ fn device_added(
                         ..LinearOffscreenTargets::default()
                     },
                     hdr_support,
+                    hdr_metadata_blob: None,
+                    hdr_enabled_applied: false,
+                    hdr_render_supported,
+                    sdr_scanout_format,
+                    sdr_scanout_modifiers,
+                    hdr_scanout_format,
+                    hdr_scanout_modifiers,
                     frame_queued_at: None,
                     drm_output,
                 },

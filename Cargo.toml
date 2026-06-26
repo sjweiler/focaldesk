@@ -30,7 +30,7 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-smithay = { git = "https://github.com/Smithay/smithay", rev = "e1fb2496c9d7ec4d994cc50fe61b7439686ba8b9", default-features = false, features = [
+smithay = { git = "https://github.com/Smithay/smithay", rev = "a394efa7058e987c89ffd90aa58b6ac13b2272a9", default-features = false, features = [
   "wayland_frontend",
   "desktop",
   "backend_winit",
@@ -46,6 +46,7 @@ smithay = { git = "https://github.com/Smithay/smithay", rev = "e1fb2496c9d7ec4d9
 anyhow = "1"
 nix = "0.27"
 drm = "0.11"
+drm-ffi = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
