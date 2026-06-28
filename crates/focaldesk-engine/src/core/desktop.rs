@@ -471,6 +471,7 @@ pub struct DesktopInit {
     pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub color_management_state:
         crate::core::wayland::color_management_protocol::ColorManagementState,
+    pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
@@ -543,6 +544,7 @@ pub struct DesktopState {
     pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub color_management_state:
         crate::core::wayland::color_management_protocol::ColorManagementState,
+    pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
     pending_ai_permission_responses: HashMap<DialogId, (u64, mpsc::Sender<IpcResponse>)>,
@@ -3915,9 +3917,12 @@ impl DesktopState {
             self.cursor_manager.set_icon(cursor_for_resize_edges(edges));
         } else if self.pending_compositor_move.is_some() {
             self.cursor_manager.set_icon(CursorIcon::Move);
-        } else {
+        } else if !self.pointer_in_work_recess(position) {
+            // Topbar/sidebar chrome: compositor owns the cursor.
             self.cursor_manager.set_icon(CursorIcon::Default);
         }
+        // Over client surfaces in the work area, keep the cursor the client set via
+        // wl_pointer / wp_cursor_shape_v1 (see `SeatHandler::cursor_image`).
     }
 
     pub(crate) fn begin_dnd_cursor(&mut self, phase: Arc<AtomicU8>) {
@@ -4088,6 +4093,7 @@ impl DesktopState {
             image_copy_capture_sessions: Vec::new(),
             color_tag_state: init.color_tag_state,
             color_management_state: init.color_management_state,
+            cursor_shape_state: init.cursor_shape_state,
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
             pending_ai_permission_responses: HashMap::new(),

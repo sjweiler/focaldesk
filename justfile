@@ -17,6 +17,9 @@ install-server-service:
 install-portal:
     cargo build --release -p focaldesk-portal
     install -Dm755 target/release/focaldesk-portal "$HOME/.local/bin/focaldesk-portal"
+    mkdir -p "$HOME/.config/xdg-desktop-portal-wlr"
+    target/release/focaldesk-portal --print-xdpw-config > "$HOME/.config/xdg-desktop-portal-wlr/config"
+    systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"
 
 install-desktop:
     cargo build --release -p focaldesk-desktop --no-default-features --features="drm xwayland"

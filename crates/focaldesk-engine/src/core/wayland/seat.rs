@@ -10,6 +10,9 @@ use wayland_server::Resource;
 
 use crate::core::desktop::DesktopState;
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
+use smithay::wayland::tablet_manager::TabletSeatHandler;
+
+impl TabletSeatHandler for DesktopState {}
 
 impl SeatHandler for DesktopState {
     type KeyboardFocus = KeyboardFocusTarget;
@@ -35,8 +38,10 @@ impl SeatHandler for DesktopState {
                 self.cursor_manager.set_icon(icon);
             }
             CursorImageStatus::Surface(_) => {
+                // Client-provided bitmap cursor (common for XWayland). Use the hand
+                // cursor rather than forcing the arrow until we render cursor surfaces.
                 self.cursor_manager.set_visible(true);
-                self.cursor_manager.set_icon(CursorIcon::Default);
+                self.cursor_manager.set_icon(CursorIcon::Pointer);
             }
         }
         self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::Cursor);

@@ -385,8 +385,93 @@ pub(crate) fn bind_wayland_socket() -> anyhow::Result<(ListeningSocket, String)>
     Ok((socket, name))
 }
 
+fn shell_quote_for_xdpw_config(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_focaldesk_portal_executable() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let sibling = parent.join("focaldesk-portal");
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+
+    for candidate in [
+        "/usr/local/bin/focaldesk-portal",
+        "/usr/bin/focaldesk-portal",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let local = PathBuf::from(home).join(".local/bin/focaldesk-portal");
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+
+    None
+}
+
+/// xdpw reads `~/.config/xdg-desktop-portal-wlr/config` once; stale chooser paths break OBS capture.
+fn ensure_xdpw_screencast_config() {
+    let Some(portal_exe) = resolve_focaldesk_portal_executable() else {
+        flog("focaldesk-portal not found; skipping xdpw screencast config update");
+        return;
+    };
+
+    let config_dir = xdg_config_dir().join("xdg-desktop-portal-wlr");
+    if let Err(err) = std::fs::create_dir_all(&config_dir) {
+        flog(format!(
+            "failed to create xdpw config directory {}: {err}",
+            config_dir.display()
+        ));
+        return;
+    }
+
+    let config_path = config_dir.join("config");
+    let chooser_cmd = shell_quote_for_xdpw_config(&portal_exe.to_string_lossy());
+    let desired = format!(
+        "[screencast]\nchooser_type=simple\nchooser_cmd={chooser_cmd}\n"
+    );
+
+    let current = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if current == desired {
+        return;
+    }
+
+    match std::fs::write(&config_path, &desired) {
+        Ok(()) => flog(format!(
+            "updated xdpw screencast chooser to {}",
+            portal_exe.display()
+        )),
+        Err(err) => flog(format!(
+            "failed to write xdpw config {}: {err}",
+            config_path.display()
+        )),
+    }
+}
+
 fn publish_portal_environment(wayland_display: &str) {
     ensure_standard_user_dirs();
+    ensure_xdpw_screencast_config();
 
     std::env::set_var("WAYLAND_DISPLAY", wayland_display);
     std::env::set_var("XDG_CURRENT_DESKTOP", "wlroots");
@@ -656,6 +741,9 @@ pub(crate) fn bootstrap_compositor_core(
         image_copy_capture_state,
         color_tag_state: Default::default(),
         color_management_state: Default::default(),
+        cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<
+            DesktopState,
+        >(&dh),
         backend_kind: backend,
         cursor_manager,
         seat,
