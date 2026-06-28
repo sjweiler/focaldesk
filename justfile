@@ -1,5 +1,10 @@
+desktop_bin := "/usr/local/bin/focaldesk-desktop"
+
 build:
     cargo build
+
+release-desktop:
+    cargo build --release -p focaldesk-desktop
 
 release-server:
     cargo build --release -p focaldesk-server
@@ -21,9 +26,24 @@ install-portal:
     target/release/focaldesk-portal --print-xdpw-config > "$HOME/.config/xdg-desktop-portal-wlr/config"
     systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"
 
+install-files:
+    cargo build --release -p focaldesk-files
+    sudo install -Dm755 target/release/focaldesk-files /usr/local/bin/focaldesk-files
+
+install-settings:
+    cargo build --release -p focaldesk-settings
+    sudo install -Dm755 target/release/focaldesk-settings /usr/local/bin/focaldesk-settings
+
 install-desktop:
-    cargo build --release -p focaldesk-desktop --no-default-features --features="drm xwayland"
-    sudo install -Dm755 target/release/focaldesk-desktop /usr/bin/focaldesk-desktop
+    cargo build --release -p focaldesk-desktop
+    @echo "Build artifact:"
+    @md5sum target/release/focaldesk-desktop
+    # mv over the running binary: direct install/cp to the live path gets "Text file busy".
+    sudo install -Dm755 target/release/focaldesk-desktop "{{desktop_bin}}.new"
+    sudo mv -f "{{desktop_bin}}.new" "{{desktop_bin}}"
+    @echo "Installed to {{desktop_bin}}:"
+    @md5sum "{{desktop_bin}}"
+    @bash -c 'b=$(md5sum target/release/focaldesk-desktop | cut -d" " -f1); i=$(md5sum "{{desktop_bin}}" | cut -d" " -f1); test "$b" = "$i" && echo "md5 OK: $i" || { echo "md5 MISMATCH: build=$b installed=$i" >&2; exit 1; }'
 
 install-desktop-session:
     sudo install -Dm644 packaging/wayland-sessions/focaldesk.desktop /usr/share/wayland-sessions/focaldesk.desktop

@@ -1,6 +1,7 @@
 use focaldesk_flow::keybinds::BackendKind;
 use smithay::input::{
-    pointer::CursorIcon, pointer::CursorImageStatus, Seat, SeatHandler, SeatState,
+    pointer::{CursorIcon, CursorImageStatus},
+    Seat, SeatHandler, SeatState,
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
@@ -29,19 +30,27 @@ impl SeatHandler for DesktopState {
             // GTK/XWayland often hides the seat cursor while using a subsurface cursor; keep the
             // compositor fallback visible on DRM so the pointer does not disappear entirely.
             CursorImageStatus::Hidden if self.backend_kind == BackendKind::Drm => {
+                self.render.clear_sw_cursor_texture();
                 self.cursor_manager.set_visible(true);
                 self.cursor_manager.set_icon(CursorIcon::Default);
             }
-            CursorImageStatus::Hidden => self.cursor_manager.set_visible(false),
+            CursorImageStatus::Hidden => {
+                self.render.clear_sw_cursor_texture();
+                self.cursor_manager.set_visible(false);
+            }
             CursorImageStatus::Named(icon) => {
+                self.render.clear_sw_cursor_texture();
                 self.cursor_manager.set_visible(true);
                 self.cursor_manager.set_icon(icon);
+                self.drm_submit_hw_cursor = true;
             }
             CursorImageStatus::Surface(_) => {
-                // Client-provided bitmap cursor (common for XWayland). Use the hand
-                // cursor rather than forcing the arrow until we render cursor surfaces.
+                // XWayland subsurface cursors: keep the theme cursor on the KMS plane.
+                // Rendering client cursor surfaces in-frame was hiding the HW cursor entirely.
+                self.render.clear_sw_cursor_texture();
                 self.cursor_manager.set_visible(true);
                 self.cursor_manager.set_icon(CursorIcon::Pointer);
+                self.drm_submit_hw_cursor = true;
             }
         }
         self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::Cursor);

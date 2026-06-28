@@ -3,6 +3,7 @@
 use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::renderer::buffer_dimensions;
 use smithay::backend::renderer::utils::import_surface_tree;
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
@@ -29,9 +30,12 @@ use focaldesk_ui::element::UiElement;
 use focaldesk_ui::types::{ElementId, PanelKind, UiAction, UiElementKind};
 use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState};
 use smithay::backend::renderer::element::Id;
+use smithay::backend::renderer::element::Element;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::{keysyms, xkb};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, CursorIcon, MotionEvent};
+use smithay::input::pointer::{
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, MotionEvent, RelativeMotionEvent,
+};
 use smithay::reexports::wayland_server::Resource;
 
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
@@ -45,6 +49,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -72,9 +77,9 @@ use focaldesk_logging::{
 use focaldesk_notifications::NotificationManager;
 use focaldesk_power::{PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
-    load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings, LidCloseAction,
-    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings,
-    PrivacySettings,
+    load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
+    DisplayColorProfile, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
+    PowerButtonAction, PowerSettings, PrivacySettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
@@ -91,6 +96,7 @@ use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::path::{Path, PathBuf};
@@ -338,6 +344,8 @@ fn runtime_display_status_value(state: &DesktopState) -> serde_json::Value {
         .map(|output| DisplayRuntimeOutputStatus {
             connector: output.handle.name().to_string(),
             icc_lut_fallback_active: output.icc_lut_fallback_active,
+            wide_gamut_active: output.color_description.primaries
+                != crate::core::color::ColorPrimaries::Srgb,
         })
         .collect();
     serde_json::to_value(outputs).unwrap_or(serde_json::Value::Null)
@@ -401,7 +409,10 @@ pub struct OutputState {
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
+    pub base_color_description: crate::core::color::ColorDescription,
     pub color_description: crate::core::color::ColorDescription,
+    pub color_profile_override: DisplayColorProfile,
+    pub icc_profile_path: Option<String>,
     pub icc_profile: Option<Vec<u8>>,
     pub output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
     pub icc_lut_fallback_active: bool,
@@ -463,6 +474,7 @@ pub struct DesktopInit {
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub relative_pointer_state: RelativePointerManagerState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
     pub output_capture_source_state:
@@ -535,6 +547,7 @@ pub struct DesktopState {
     pub output_manager_state: smithay::wayland::output::OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub relative_pointer_state: RelativePointerManagerState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
     pub output_capture_source_state:
@@ -1190,8 +1203,11 @@ impl DesktopState {
                     output.hdr_supported,
                     output.hdr_kms_applied,
                 );
+                output.color_profile_override = config.color_profile;
+                output.icc_profile_path = config.icc_profile_path.clone();
             }
             self.update_output_size(output_id, physical_size, scale_factor);
+            self.refresh_output_color(output_id);
 
             if config.primary {
                 self.primary_output = output_id;
@@ -1212,6 +1228,7 @@ impl DesktopState {
         }
 
         if changed {
+            crate::core::wayland::color_management_protocol::notify_preferred_color_changed(self);
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
             self.cursor_manager.set_base_size_and_scale(
                 24,
@@ -1322,6 +1339,8 @@ impl DesktopState {
             .map(|output| DisplayRuntimeOutputStatus {
                 connector: output.handle.name().to_string(),
                 icc_lut_fallback_active: output.icc_lut_fallback_active,
+                wide_gamut_active: output.color_description.primaries
+                    != crate::core::color::ColorPrimaries::Srgb,
             })
             .collect()
     }
@@ -2042,7 +2061,7 @@ impl DesktopState {
         };
 
         let egui_event = match *event {
-            FlowInputEvent::PointerMoved { position } => {
+            FlowInputEvent::PointerMoved { position, .. } => {
                 let Some(output_id) = self.output_under_pointer(position) else {
                     return false;
                 };
@@ -2271,15 +2290,12 @@ impl DesktopState {
     }
 
     fn software_cursor_damage_pending_for_output(&self, output_id: OutputId) -> bool {
-        self.output_owns_cursor(output_id)
-            && self.cursor_manager.software_cursor_needed()
-            && !self.drm_try_pass_cursor_this_frame
+        self.output_owns_cursor(output_id) && self.cursor_manager.software_cursor_needed()
     }
 
     fn update_cursor_owner_damage(&mut self) -> bool {
-        let owner = self
-            .cursor_manager
-            .visible()
+        let cursor_visible = self.cursor_manager.visible();
+        let owner = cursor_visible
             .then_some(self.focused_output)
             .filter(|&output_id| self.output_contains_pointer(output_id));
 
@@ -2527,6 +2543,31 @@ impl DesktopState {
             },
         );
         pointer.frame(self);
+    }
+
+    fn forward_pointer_relative_motion(
+        &mut self,
+        previous_pos: Point<f64, Logical>,
+        pos: Point<f64, Logical>,
+        delta_unaccel: Point<f64, Logical>,
+    ) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let delta = pos - previous_pos;
+        if delta.x == 0.0 && delta.y == 0.0 {
+            return;
+        }
+        let under = self.pointer_surface_under(pos);
+        pointer.relative_motion(
+            self,
+            under,
+            &RelativeMotionEvent {
+                delta,
+                delta_unaccel,
+                utime: u64::from(Self::wl_pointer_time_ms()) * 1000,
+            },
+        );
     }
 
     fn forward_pointer_button(
@@ -3047,7 +3088,10 @@ impl DesktopState {
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
                 last_sw_cursor_rect: None,
+                base_color_description: crate::core::color::default_output_color_description(),
                 color_description: crate::core::color::default_output_color_description(),
+                color_profile_override: DisplayColorProfile::Auto,
+                icc_profile_path: None,
                 icc_profile: None,
                 output_icc_lut: None,
                 icc_lut_fallback_active: false,
@@ -3886,6 +3930,14 @@ impl DesktopState {
         })
     }
 
+    /// Compositor-owned cursor (chrome, resize, move): theme bitmap + KMS plane, not client surface.
+    fn set_compositor_cursor_icon(&mut self, icon: CursorIcon) {
+        self.render.clear_sw_cursor_texture();
+        self.cursor_manager.set_visible(true);
+        self.cursor_manager.set_icon(icon);
+        self.drm_submit_hw_cursor = true;
+    }
+
     fn update_pointer_cursor(&mut self, position: Point<f64, Logical>) {
         if self
             .dnd_cursor_phase
@@ -3905,7 +3957,7 @@ impl DesktopState {
                 ToplevelPointerInteraction::Resize { edges, .. } => cursor_for_resize_edges(*edges),
                 ToplevelPointerInteraction::Move { .. } => CursorIcon::Move,
             };
-            self.cursor_manager.set_icon(icon);
+            self.set_compositor_cursor_icon(icon);
             return;
         }
 
@@ -3914,12 +3966,12 @@ impl DesktopState {
         }
 
         if let Some((_, edges)) = self.top_window_resize_edge_at(position) {
-            self.cursor_manager.set_icon(cursor_for_resize_edges(edges));
+            self.set_compositor_cursor_icon(cursor_for_resize_edges(edges));
         } else if self.pending_compositor_move.is_some() {
-            self.cursor_manager.set_icon(CursorIcon::Move);
+            self.set_compositor_cursor_icon(CursorIcon::Move);
         } else if !self.pointer_in_work_recess(position) {
             // Topbar/sidebar chrome: compositor owns the cursor.
-            self.cursor_manager.set_icon(CursorIcon::Default);
+            self.set_compositor_cursor_icon(CursorIcon::Default);
         }
         // Over client surfaces in the work area, keep the cursor the client set via
         // wl_pointer / wp_cursor_shape_v1 (see `SeatHandler::cursor_image`).
@@ -4086,6 +4138,7 @@ impl DesktopState {
             output_manager_state: init.output_manager_state,
             data_device_state: init.data_device_state,
             primary_selection_state: init.primary_selection_state,
+            relative_pointer_state: init.relative_pointer_state,
             layer_shell_state: init.layer_shell_state,
             image_capture_source_state: init.image_capture_source_state,
             output_capture_source_state: init.output_capture_source_state,
@@ -4337,8 +4390,12 @@ impl DesktopState {
             let geometry = self.xwayland_clamp_override_redirect_geometry(output_id, geometry);
             (geometry.loc, geometry.size, false)
         } else if should_float {
-            (
+            let location = self.xwayland_or_compositor_loc(
+                &surface,
                 self.default_toplevel_map_location(output_id),
+            );
+            (
+                location,
                 requested_geometry.size,
                 false,
             )
@@ -5518,11 +5575,11 @@ impl DesktopState {
                 FlowInputEvent::Key { keycode, state, .. } => {
                     self.handle_lock_key_event(keycode, state);
                 }
-                FlowInputEvent::PointerMoved { position } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
+            FlowInputEvent::PointerMoved { position, .. } => {
+                self.input.pointer_pos = position;
+                self.pointer_pos = position;
+                self.cursor_manager.move_to(position.x, position.y);
+                self.clear_client_pointer_focus(position);
                 }
                 FlowInputEvent::PointerButton {
                     button,
@@ -5593,7 +5650,11 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
-            FlowInputEvent::PointerMoved { position } => {
+            FlowInputEvent::PointerMoved {
+                position,
+                delta_unaccel,
+            } => {
+                let previous_pos = self.pointer_pos;
                 self.input.pointer_pos = position;
                 self.pointer_pos = position;
                 if let Some(id) = self.output_under_pointer(position) {
@@ -5650,6 +5711,13 @@ impl DesktopState {
                 self.update_pointer_cursor(position);
                 if !self.compositor_pointer_grab_active() {
                     self.forward_pointer_to_clients(position);
+                    if let Some(delta_unaccel) = delta_unaccel {
+                        self.forward_pointer_relative_motion(
+                            previous_pos,
+                            position,
+                            delta_unaccel,
+                        );
+                    }
                 }
                 let precise_cursor_damage =
                     self.software_cursor_damage_pending_for_output(self.focused_output);
@@ -6302,7 +6370,10 @@ impl DesktopState {
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
                     last_sw_cursor_rect: None,
+                    base_color_description: crate::core::color::default_output_color_description(),
                     color_description: crate::core::color::default_output_color_description(),
+                    color_profile_override: DisplayColorProfile::Auto,
+                    icc_profile_path: None,
                     icc_profile: None,
                     output_icc_lut: None,
                     icc_lut_fallback_active: false,
@@ -6356,6 +6427,16 @@ impl DesktopState {
             .find(|state| &state.handle == output)
             .map(|state| state.color_description)
             .unwrap_or_else(crate::core::color::default_output_color_description)
+    }
+
+    pub fn output_color_profile_override_for(
+        &self,
+        output_id: focaldesk_types::OutputId,
+    ) -> DisplayColorProfile {
+        self.outputs
+            .get(&output_id)
+            .map(|output| output.color_profile_override)
+            .unwrap_or_default()
     }
 
     pub fn output_icc_profile_for(&self, output: &smithay::output::Output) -> Option<Vec<u8>> {
@@ -6414,17 +6495,89 @@ impl DesktopState {
             }
         });
         if let Some(output) = self.outputs.get_mut(&output_id) {
-            output.color_description = description;
+            output.base_color_description = description;
+            output.color_description = crate::core::color::apply_output_color_profile_override(
+                description,
+                output.color_profile_override,
+            );
             output.icc_profile = icc_profile;
             output.output_icc_lut = output_lut;
             output.icc_lut_fallback_active = false;
             flog_warn!(
-                "output color: id={output_id:?} serial={} primaries={:?} transfer={:?} icc={} lut={}",
+                "output color: id={output_id:?} serial={} override={:?} primaries={:?} transfer={:?} icc={} lut={}",
                 output.monitor_serial,
-                description.primaries,
-                description.transfer,
+                output.color_profile_override,
+                output.color_description.primaries,
+                output.color_description.transfer,
                 output.icc_profile.as_ref().map(|p| p.len()).unwrap_or(0),
                 output.output_icc_lut.as_ref().map(|l| l.rgb.len()).unwrap_or(0),
+            );
+        }
+        self.notify_runtime_display_status_changes();
+    }
+
+    pub fn set_output_color_source(
+        &mut self,
+        output_id: focaldesk_types::OutputId,
+        icc_profile_path: Option<String>,
+    ) {
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            output.icc_profile_path = icc_profile_path;
+        }
+    }
+
+    pub fn refresh_output_color(&mut self, output_id: focaldesk_types::OutputId) {
+        let Some(output) = self.outputs.get(&output_id) else {
+            return;
+        };
+
+        let path = output.icc_profile_path.clone();
+        let make = output.monitor_make.clone();
+        let model = output.monitor_model.clone();
+        let serial = output.monitor_serial.clone();
+        let edid = output.monitor_edid.clone();
+
+        let resolved = if let Some(path) = path {
+            match crate::core::icc::load_display_profile_from_path(Path::new(&path)) {
+                Ok(parsed) => Some((parsed.description, Some(parsed.bytes), parsed.output_lut)),
+                Err(err) => {
+                    flog_warn!("output color: failed to load ICC file {path}: {:?}", err);
+                    crate::core::colord::resolve_output_color_profile(&make, &model, &serial, edid.as_deref())
+                        .map(|parsed| {
+                            (
+                                parsed.description,
+                                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                                parsed.output_lut,
+                            )
+                        })
+                }
+            }
+        } else {
+            crate::core::colord::resolve_output_color_profile(&make, &model, &serial, edid.as_deref())
+                .map(|parsed| {
+                    (
+                        parsed.description,
+                        (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                        parsed.output_lut,
+                    )
+                })
+        };
+
+        if let Some((description, icc_profile, output_icc_lut)) = resolved {
+            self.set_output_color(output_id, description, icc_profile, output_icc_lut);
+        }
+    }
+
+    pub fn set_output_color_profile_override(
+        &mut self,
+        output_id: focaldesk_types::OutputId,
+        override_profile: DisplayColorProfile,
+    ) {
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            output.color_profile_override = override_profile;
+            output.color_description = crate::core::color::apply_output_color_profile_override(
+                output.base_color_description,
+                override_profile,
             );
         }
         self.notify_runtime_display_status_changes();
@@ -6894,12 +7047,12 @@ impl DesktopState {
             return Ok(());
         }
 
+        // Upload every visible frame: KMS cursor pass reads `sw_cursor_texture` even when we
+        // are not compositing the cursor into the scene buffer.
         self.render
             .upload_cursor_texture_for_desktop(renderer, &mut self.cursor_manager)?;
 
-        let need_sw = self.output_owns_cursor(output_id)
-            && self.cursor_manager.software_cursor_needed()
-            && !self.drm_try_pass_cursor_this_frame;
+        let need_sw = self.output_owns_cursor(output_id) && self.cursor_manager.software_cursor_needed();
         if need_sw {
             let rel = self
                 .pointer_relative_to_output_logical(output_id)
@@ -6967,7 +7120,7 @@ impl DesktopState {
                     s.presentation_state,
                     RenderElementPresentationState::Skipped
                 ) {
-                    self.drm_submit_hw_cursor = false;
+                    // Keep trying the HW cursor each frame; fall back to SW overlay until upload works.
                     self.cursor_manager.set_hardware_cursor_ready(false);
                     return;
                 }

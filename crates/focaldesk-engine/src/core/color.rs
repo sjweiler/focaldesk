@@ -6,6 +6,7 @@
 
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::wayland::compositor::{Cacheable, SurfaceData};
+use focaldesk_settings_core::DisplayColorProfile;
 
 /// CIE 1931 xy chromaticities for RGB primaries + D65 white.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,6 +175,16 @@ impl ColorDescription {
         max_fall_nits: None,
     };
 
+    /// Windows-scRGB (`create_windows_scrgb`): sRGB primaries, extended linear, 203 nits ref white.
+    pub const WINDOWS_SCRGB: Self = Self {
+        primaries: ColorPrimaries::Srgb,
+        transfer: TransferFunction::Linear,
+        reference_white_nits: 203.0,
+        max_luminance_nits: 10_000.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+    };
+
     pub const DISPLAY_P3_SRGB: Self = Self {
         primaries: ColorPrimaries::DisplayP3,
         transfer: TransferFunction::Srgb,
@@ -279,6 +290,18 @@ pub fn scene_working_primaries() -> ColorPrimaries {
 /// Default SDR output description for an output when no ICC/EDID data is available.
 pub fn default_output_color_description() -> ColorDescription {
     ColorDescription::SRGB
+}
+
+/// Apply a user-selected output profile override on top of the resolved base output description.
+pub fn apply_output_color_profile_override(
+    base: ColorDescription,
+    override_profile: DisplayColorProfile,
+) -> ColorDescription {
+    match override_profile {
+        DisplayColorProfile::Auto => base,
+        DisplayColorProfile::Srgb => ColorDescription::SRGB,
+        DisplayColorProfile::DisplayP3 => ColorDescription::DISPLAY_P3_SRGB,
+    }
 }
 
 /// Color description used when encoding the KMS framebuffer for a given output.

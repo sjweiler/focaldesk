@@ -116,21 +116,26 @@ fn send_surface_feedback_preferred_changed(
 }
 
 fn should_advertise_output_profiles(state: &DesktopState) -> bool {
+    let any_wide_gamut_output = state.outputs.values().any(|output| {
+        output.color_description.primaries != ColorDescription::SRGB.primaries
+    });
     crate::core::color::wp_color_wide_gamut_enabled(
-        state.render.chrome_shaders.output_encode_lut.is_some(),
+        state.render.chrome_shaders.output_encode_lut.is_some() || any_wide_gamut_output,
     )
 }
 
-fn output_has_icc_profile(state: &DesktopState, output_id: OutputId) -> bool {
+fn output_uses_wide_gamut_description(state: &DesktopState, output_id: OutputId) -> bool {
     state
         .outputs
         .get(&output_id)
-        .and_then(|output| output.icc_profile.as_ref())
-        .is_some_and(|icc| !icc.is_empty())
+        .is_some_and(|output| output.color_description != ColorDescription::SRGB)
 }
 
 fn preferred_identity_for_output(state: &mut DesktopState, output_id: OutputId) -> u64 {
-    if !should_advertise_output_profiles(state) || !output_has_icc_profile(state, output_id) {
+    if !should_advertise_output_profiles(state) {
+        return state.color_management_state.canonical_sdr_identity();
+    }
+    if !output_uses_wide_gamut_description(state, output_id) {
         return state.color_management_state.canonical_sdr_identity();
     }
     state
@@ -140,7 +145,9 @@ fn preferred_identity_for_output(state: &mut DesktopState, output_id: OutputId) 
 
 fn refresh_preferred_identities(state: &mut DesktopState) {
     for output_id in state.outputs.keys().copied().collect::<Vec<_>>() {
-        if output_has_icc_profile(state, output_id) {
+        if should_advertise_output_profiles(state)
+            && output_uses_wide_gamut_description(state, output_id)
+        {
             state
                 .color_management_state
                 .refresh_preferred_identity(output_id);
@@ -368,6 +375,10 @@ impl SurfaceColorManagement {
     }
 }
 
+fn windows_scrgb_supported() -> bool {
+    crate::core::color::linear_sdr_runtime_enabled()
+}
+
 fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     use wp_color_manager_v1::{Feature, Primaries, RenderIntent, TransferFunction};
 
@@ -381,10 +392,15 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_feature(Feature::SetLuminances);
     manager.supported_feature(Feature::SetMasteringDisplayPrimaries);
     manager.supported_feature(Feature::ExtendedTargetVolume);
+    if windows_scrgb_supported() {
+        manager.supported_feature(Feature::WindowsScrgb);
+    }
 
     manager.supported_tf_named(TransferFunction::Bt1886);
     manager.supported_tf_named(TransferFunction::Gamma22);
     manager.supported_tf_named(TransferFunction::ExtLinear);
+    // Chromium maps gfx::ColorSpace::SRGB → WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB.
+    manager.supported_tf_named(TransferFunction::Srgb);
     manager.supported_tf_named(TransferFunction::CompoundPower24);
 
     manager.supported_primaries_named(Primaries::Srgb);
@@ -490,21 +506,33 @@ fn finish_output_image_description<D>(
 ) where
     D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
 {
-    if should_advertise_output_profiles(state)
-        && icc_profile.as_ref().is_some_and(|icc| !icc.is_empty())
-    {
+    let has_icc_profile = icc_profile.as_ref().is_some_and(|icc| !icc.is_empty());
+
+    if should_advertise_output_profiles(state) && has_icc_profile {
         finish_image_description(
             state,
             data_init,
             id,
-            client_preferred_description(description),
+            output_advertised_description(description),
             true,
             icc_profile,
             false,
             None,
         );
+    } else if should_advertise_output_profiles(state)
+        && description != ColorDescription::SRGB
+    {
+        finish_image_description(
+            state,
+            data_init,
+            id,
+            output_advertised_description(description),
+            true,
+            None,
+            false,
+            None,
+        );
     } else {
-        let _ = description;
         finish_canonical_sdr_image_description(state, data_init, id, ColorDescription::SRGB);
     }
 }
@@ -520,22 +548,34 @@ fn finish_preferred_output_image_description<D>(
     D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
 {
     let identity = Some(preferred_identity_for_output(state, output_id));
-    if should_advertise_output_profiles(state)
-        && icc_profile.as_ref().is_some_and(|icc| !icc.is_empty())
-    {
+    let has_icc_profile = icc_profile.as_ref().is_some_and(|icc| !icc.is_empty());
+
+    if should_advertise_output_profiles(state) && has_icc_profile {
         // Use the output ICC description as-is (primaries + transfer from colord).
         finish_image_description(
             state,
             data_init,
             id,
-            client_preferred_description(description),
+            output_advertised_description(description),
             true,
             icc_profile,
             false,
             identity,
         );
+    } else if should_advertise_output_profiles(state)
+        && description != ColorDescription::SRGB
+    {
+        finish_image_description(
+            state,
+            data_init,
+            id,
+            output_advertised_description(description),
+            true,
+            None,
+            false,
+            identity,
+        );
     } else {
-        let _ = description;
         finish_canonical_sdr_image_description(state, data_init, id, ColorDescription::SRGB);
     }
 }
@@ -625,10 +665,11 @@ fn sanitize_client_color_description(
             ..description
         }
     };
-    client_preferred_description(description)
+    description
 }
 
-fn client_preferred_description(description: ColorDescription) -> ColorDescription {
+/// Normalize output/preferred descriptions for client queries (ICC gamma → sRGB-class TF).
+fn output_advertised_description(description: ColorDescription) -> ColorDescription {
     // Chrome rejects Bt1886/Gamma22/ExtLinear for internal BT709/sRGB paths ("non-power-curve").
     // Advertise sRGB-class transfer to clients; ICC LUT scanout still uses the profile TRC.
     ColorDescription {
@@ -689,8 +730,8 @@ fn emit_image_description_info_events(
     }
 
     let tf_named = match description.transfer {
-        CoreTransferFunction::Srgb
-        | CoreTransferFunction::Bt1886
+        CoreTransferFunction::Srgb => TransferFunction::Srgb,
+        CoreTransferFunction::Bt1886
         | CoreTransferFunction::Gamma22 => TransferFunction::CompoundPower24,
         CoreTransferFunction::Linear => TransferFunction::ExtLinear,
         // C3d: advertise PQ named transfer when wp_color HDR is wired.
@@ -730,7 +771,8 @@ fn build_description_from_params(
         ParametricTransfer::Named(tf) => match tf {
             wp_color_manager_v1::TransferFunction::Bt1886 => CoreTransferFunction::Bt1886,
             wp_color_manager_v1::TransferFunction::Gamma22 => CoreTransferFunction::Gamma22,
-            wp_color_manager_v1::TransferFunction::CompoundPower24 => CoreTransferFunction::Srgb,
+            wp_color_manager_v1::TransferFunction::Srgb
+            | wp_color_manager_v1::TransferFunction::CompoundPower24 => CoreTransferFunction::Srgb,
             wp_color_manager_v1::TransferFunction::ExtLinear => CoreTransferFunction::Linear,
             _ => return Err("unsupported named transfer function".into()),
         },
@@ -942,17 +984,30 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
             }
             wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
                 wp_color_trace(format!(
-                    "manager create_windows_scrgb rejected: {}",
+                    "manager create_windows_scrgb: {}",
                     client_trace_prefix(client, dh)
                 ));
-                init_failed_image_description(
+                if !windows_scrgb_supported() {
+                    init_failed_image_description(
+                        data_init,
+                        image_description,
+                        "Windows-scRGB requires linear compositing (FOCALDESK_LINEAR_SDR=0?)",
+                    );
+                    resource.post_error(
+                        wp_color_manager_v1::Error::UnsupportedFeature,
+                        "windows_scrgb not supported",
+                    );
+                    return;
+                }
+                finish_image_description(
+                    state,
                     data_init,
                     image_description,
-                    "Windows-scRGB is not supported",
-                );
-                resource.post_error(
-                    wp_color_manager_v1::Error::UnsupportedFeature,
-                    "request not supported",
+                    ColorDescription::WINDOWS_SCRGB,
+                    true,
+                    None,
+                    false,
+                    None,
                 );
             }
             wp_color_manager_v1::Request::GetImageDescription {
@@ -1186,7 +1241,7 @@ impl
                 wp_color_trace("parametric creator create");
                 let inner = creator.inner.lock().unwrap();
                 let description = match build_description_from_params(&inner) {
-                    Ok(description) => client_preferred_description(description),
+                    Ok(description) => description,
                     Err(msg) => {
                         init_failed_image_description(data_init, image_description, msg);
                         return;
@@ -1621,6 +1676,7 @@ impl
 mod tests {
     use super::{is_cursor_executable_name, primary_luminance_wire_values};
     use crate::core::color::ColorDescription;
+    use wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::TransferFunction as WpTransferFunction;
 
     #[test]
     fn cursor_executable_name_filter_is_strict() {
@@ -1680,5 +1736,38 @@ mod tests {
         };
         assert!(data.advertise_as_canonical_sdr);
         assert!(data.icc_profile.is_none());
+    }
+
+    #[test]
+    fn non_srgb_output_without_icc_is_not_forced_to_canonical_sdr() {
+        let description = ColorDescription::DISPLAY_P3_SRGB;
+        let advertised = super::output_advertised_description(description);
+        assert_eq!(advertised.primaries, crate::core::color::ColorPrimaries::DisplayP3);
+        assert_eq!(advertised.transfer, crate::core::color::TransferFunction::Srgb);
+    }
+
+    #[test]
+    fn parametric_ext_linear_is_preserved_for_client_surfaces() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::Srgb),
+            tf: Some(super::ParametricTransfer::Named(
+                WpTransferFunction::ExtLinear,
+            )),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid params");
+        assert_eq!(description.transfer, crate::core::color::TransferFunction::Linear);
+    }
+
+    #[test]
+    fn parametric_srgb_tf_maps_to_internal_srgb() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::DisplayP3),
+            tf: Some(super::ParametricTransfer::Named(WpTransferFunction::Srgb)),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid params");
+        assert_eq!(description.primaries, crate::core::color::ColorPrimaries::DisplayP3);
+        assert_eq!(description.transfer, crate::core::color::TransferFunction::Srgb);
     }
 }

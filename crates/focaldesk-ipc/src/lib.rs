@@ -114,6 +114,8 @@ pub struct DisplayRuntimeOutputStatus {
     pub connector: String,
     #[serde(default)]
     pub icc_lut_fallback_active: bool,
+    #[serde(default)]
+    pub wide_gamut_active: bool,
 }
 
 pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String> {

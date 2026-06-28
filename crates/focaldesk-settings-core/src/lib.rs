@@ -45,9 +45,22 @@ pub struct OutputConfig {
     pub scale: f32,
     pub primary: bool,
     #[serde(default)]
+    pub color_profile: DisplayColorProfile,
+    #[serde(default)]
+    pub icc_profile_path: Option<String>,
+    #[serde(default)]
     pub hdr_requested: bool,
     #[serde(default)]
     pub hdr_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayColorProfile {
+    #[default]
+    Auto,
+    Srgb,
+    DisplayP3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

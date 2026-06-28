@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::io::FromRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const MAX_ICC_BYTES: usize = 32 * 1024 * 1024;
 
@@ -88,6 +88,11 @@ pub fn parse_icc_profile(data: &[u8]) -> Result<ParsedIccProfile, IccError> {
         bytes: data.to_vec(),
         output_lut,
     })
+}
+
+pub fn load_display_profile_from_path(path: &Path) -> Result<ParsedIccProfile, IccError> {
+    let bytes = std::fs::read(path)?;
+    parse_icc_profile(&bytes)
 }
 
 fn validate_icc_profile(profile: &Profile) -> Result<(), IccError> {

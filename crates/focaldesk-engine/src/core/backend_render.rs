@@ -169,9 +169,7 @@ pub fn prepare_output(
 
     let pointer_on_this_output = state.output_owns_cursor(output_id);
 
-    let draw_software_cursor = pointer_on_this_output
-        && state.cursor_manager.software_cursor_needed()
-        && !state.drm_try_pass_cursor_this_frame;
+    let draw_software_cursor = pointer_on_this_output && state.cursor_manager.software_cursor_needed();
 
     let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
 

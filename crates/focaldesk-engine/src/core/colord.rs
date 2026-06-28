@@ -1,6 +1,5 @@
 //! colord D-Bus integration (Phase C2): live ICC profile updates.
 
-use crate::core::color::default_output_color_description;
 use crate::core::desktop::{DamageSource, DesktopState};
 use crate::core::icc::{self, ParsedIccProfile};
 use crate::core::wayland::color_management_protocol;
@@ -119,7 +118,8 @@ pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
                 output.monitor_model.clone(),
                 output.monitor_serial.clone(),
                 output.monitor_edid.clone(),
-                output.color_description,
+                output.icc_profile_path.clone(),
+                output.base_color_description,
                 output.icc_profile.clone(),
                 output.output_icc_lut.clone(),
             )
@@ -127,16 +127,42 @@ pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
         .collect();
 
     let mut any_changed = false;
-    for (output_id, make, model, serial, edid, old_desc, old_icc, old_lut) in snapshots {
-        let (new_desc, new_icc, new_lut) =
-            match resolve_output_color_profile(&make, &model, &serial, edid.as_deref()) {
-                Some(parsed) => (
+    for (output_id, make, model, serial, edid, custom_path, old_desc, old_icc, old_lut) in
+        snapshots
+    {
+        let resolved = if let Some(path) = custom_path {
+            match crate::core::icc::load_display_profile_from_path(std::path::Path::new(&path)) {
+                Ok(parsed) => Some((
                     parsed.description,
                     (!parsed.bytes.is_empty()).then_some(parsed.bytes),
                     parsed.output_lut,
-                ),
-                None => (default_output_color_description(), None, None),
-            };
+                )),
+                Err(err) => {
+                    flog(format!("output color: failed to load ICC file {path}: {err:?}"));
+                    resolve_output_color_profile(&make, &model, &serial, edid.as_deref()).map(
+                        |parsed| {
+                            (
+                                parsed.description,
+                                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                                parsed.output_lut,
+                            )
+                        },
+                    )
+                }
+            }
+        } else {
+            resolve_output_color_profile(&make, &model, &serial, edid.as_deref()).map(|parsed| {
+                (
+                    parsed.description,
+                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                    parsed.output_lut,
+                )
+            })
+        };
+
+        let Some((new_desc, new_icc, new_lut)) = resolved else {
+            continue;
+        };
 
         if new_desc != old_desc || new_icc != old_icc || new_lut != old_lut {
             state.set_output_color(output_id, new_desc, new_icc, new_lut);

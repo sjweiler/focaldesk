@@ -81,6 +81,7 @@ struct FileManager {
     file_clipboard: Rc<RefCell<Option<FileClipboard>>>,
     back_stack: Rc<RefCell<Vec<Location>>>,
     forward_stack: Rc<RefCell<Vec<Location>>>,
+    context_menu_index: Rc<RefCell<Option<i32>>>,
 }
 
 fn main() {
@@ -98,6 +99,7 @@ fn main() {
     app.set_accels_for_action("win.file-copy", &["<Control>c"]);
     app.set_accels_for_action("win.file-paste", &["<Control>v"]);
     app.set_accels_for_action("win.file-move-to-trash", &["Delete"]);
+    app.set_accels_for_action("win.file-rename", &["F2"]);
     app.run();
 }
 
@@ -225,6 +227,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         file_clipboard: Rc::new(RefCell::new(None)),
         back_stack: Rc::new(RefCell::new(Vec::new())),
         forward_stack: Rc::new(RefCell::new(Vec::new())),
+        context_menu_index: Rc::new(RefCell::new(None)),
     };
 
     ensure_standard_user_dirs();
@@ -368,13 +371,10 @@ impl FileManager {
         self.window.add_action(&copy_to);
 
         let rename = gio::SimpleAction::new("file-rename", None);
-        rename.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-rename",
-                "rename file item"
-            );
+        let this = self.clone();
+        rename.connect_activate(move |_, _| {
+            let this = this.clone();
+            glib::idle_add_local_once(move || this.show_rename_dialog());
         });
         self.window.add_action(&rename);
 
@@ -692,8 +692,10 @@ impl FileManager {
             attach_file_drag_source(&row, item.clone());
             let list = self.list.clone();
             let row_for_context = row.clone();
+            let context_index = self.context_menu_index.clone();
             attach_file_context_menu(&row, file_context_target(item), move || {
                 list.select_row(Some(&row_for_context));
+                *context_index.borrow_mut() = Some(row_for_context.index());
             });
             self.list.append(&row);
 
@@ -701,8 +703,10 @@ impl FileManager {
             attach_file_drag_source(&child, item.clone());
             let grid = self.grid.clone();
             let child_for_context = child.clone();
+            let context_index = self.context_menu_index.clone();
             attach_file_context_menu(&child, file_context_target(item), move || {
                 grid.select_child(&child_for_context);
+                *context_index.borrow_mut() = Some(child_for_context.index());
             });
             self.grid.append(&child);
         }
@@ -777,6 +781,108 @@ impl FileManager {
                 this.set_status("Folder names cannot be empty or contain '/'.");
             }
             dialog_for_create.close();
+        });
+
+        dialog.present();
+    }
+
+    fn show_rename_dialog(&self) {
+        let Some(index) = self.selected_index_for_action() else {
+            self.set_status("Select an item to rename.");
+            return;
+        };
+
+        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
+            return;
+        };
+
+        let Some(source_path) = item.path.clone() else {
+            self.set_status("Only local files and folders can be renamed.");
+            return;
+        };
+
+        let Some(parent_dir) = source_path.parent().map(Path::to_path_buf) else {
+            self.set_status("Cannot rename this item.");
+            return;
+        };
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Rename")
+            .default_width(360)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let label = gtk::Label::new(Some("New name"));
+        label.set_xalign(0.0);
+        let entry = gtk::Entry::new();
+        entry.set_text(&item.name);
+        entry.select_region(0, item.name.chars().count() as i32);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let rename = gtk::Button::with_label("OK");
+        rename.add_css_class("suggested-action");
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+        actions.append(&rename);
+
+        content.append(&label);
+        content.append(&entry);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+        dialog.set_default_widget(Some(&rename));
+
+        let rename_for_enter = rename.clone();
+        entry.connect_activate(move |_| rename_for_enter.emit_clicked());
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+        let key_controller = gtk::EventControllerKey::new();
+        let dialog_for_escape = dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk::gdk::Key::Escape {
+                dialog_for_escape.close();
+                return glib::Propagation::Stop;
+            }
+
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(key_controller);
+
+        let this = self.clone();
+        let dialog_for_rename = dialog.clone();
+        rename.connect_clicked(move |_| {
+            let name = entry.text().trim().to_string();
+            if name.is_empty() || name.contains('/') {
+                this.set_status("Names cannot be empty or contain '/'.");
+                return;
+            }
+
+            let destination = parent_dir.join(&name);
+            if destination == source_path {
+                dialog_for_rename.close();
+                return;
+            }
+
+            match std::fs::rename(&source_path, &destination) {
+                Ok(()) => {
+                    this.reload();
+                    this.set_status(&format!("Renamed {} to {}.", item.name, name));
+                    dialog_for_rename.close();
+                }
+                Err(err) => {
+                    this.set_status(&format!("Could not rename {}: {err}", item.name));
+                }
+            }
         });
 
         dialog.present();
@@ -1040,6 +1146,16 @@ impl FileManager {
                 .map(|row| row.index())
                 .filter(|index| *index >= 0),
         }
+    }
+
+    fn selected_index_for_action(&self) -> Option<i32> {
+        if let Some(index) = self.context_menu_index.borrow_mut().take() {
+            if index >= 0 {
+                return Some(index);
+            }
+        }
+
+        self.selected_index()
     }
 
     fn set_view_mode(&self, view_mode: ViewMode) {

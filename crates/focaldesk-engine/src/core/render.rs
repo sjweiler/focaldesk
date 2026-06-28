@@ -41,6 +41,7 @@ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
+use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
 use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
 use crate::core::desktop::DesktopState;
@@ -190,6 +191,8 @@ pub struct RenderState {
     pub wallpaper_texture: Option<GlesTexture>,
     /// Software cursor: GPU texture + layout (physical pixels), when not on the DRM cursor plane.
     pub sw_cursor_texture: Option<GlesTexture>,
+    pub sw_cursor_surface: Option<WlSurface>,
+    pub sw_cursor_surface_elements: Vec<FlowRenderElement>,
     sw_cursor_cache_key: Option<(FlowCursorIcon, u32, u32)>,
     pub sw_cursor_hotspot: (i32, i32),
     pub sw_cursor_tex_size: (i32, i32),
@@ -576,6 +579,8 @@ impl RenderState {
             scratch_damage_len: 0,
             wallpaper_texture: None,
             sw_cursor_texture: None,
+            sw_cursor_surface: None,
+            sw_cursor_surface_elements: Vec::new(),
             sw_cursor_cache_key: None,
             sw_cursor_hotspot: (0, 0),
             sw_cursor_tex_size: (0, 0),
@@ -904,8 +909,14 @@ impl RenderState {
 
     pub fn clear_sw_cursor_texture(&mut self) {
         self.sw_cursor_texture = None;
+        self.sw_cursor_surface = None;
+        self.sw_cursor_surface_elements.clear();
         self.sw_cursor_cache_key = None;
         self.sw_cursor_dst_rect = None;
+    }
+
+    pub fn clear_sw_cursor_cache_key(&mut self) {
+        self.sw_cursor_cache_key = None;
     }
 
     /// Upload cursor RGBA for DRM scan-out and/or software overlay; cheap when the pixmap is unchanged.
@@ -948,6 +959,17 @@ impl RenderState {
         let Some((dx, dy, _w, _h)) = self.sw_cursor_dst_rect else {
             return Ok(());
         };
+        let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
+        if !self.sw_cursor_surface_elements.is_empty() {
+            draw_render_elements(
+                frame,
+                ctx.output_scale.x,
+                &self.sw_cursor_surface_elements,
+                std::slice::from_ref(&full),
+            )?;
+            return Ok(());
+        }
+
         let Some(tex) = self.sw_cursor_texture.as_ref() else {
             return Ok(());
         };
@@ -968,7 +990,7 @@ impl RenderState {
             frame,
             ctx.output_scale,
             std::slice::from_ref(&elem),
-            &ctx.damage,
+            std::slice::from_ref(&full),
         )?;
         Ok(())
     }

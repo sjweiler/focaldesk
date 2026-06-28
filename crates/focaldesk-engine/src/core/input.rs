@@ -72,6 +72,7 @@ pub enum FlowInputEvent {
 
     PointerMoved {
         position: Point<f64, Logical>,
+        delta_unaccel: Option<Point<f64, Logical>>,
     },
 
     PointerButton {

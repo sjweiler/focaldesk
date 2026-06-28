@@ -9,6 +9,7 @@ use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
     load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, LidCloseAction,
     LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
+    DisplayColorProfile,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 
@@ -58,6 +59,7 @@ const LID_CLOSE_OPTIONS: &[&str] = &["Suspend", "Blank screen", "Lock screen", "
 const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "Power off"];
 const PERFORMANCE_MODE_OPTIONS: &[&str] = &["Balanced", "Performance", "Power saver"];
 const BROWSER_LAUNCH_BACKEND_OPTIONS: &[&str] = &["Auto", "Wayland", "XWayland"];
+const DISPLAY_COLOR_PROFILE_OPTIONS: &[&str] = &["Auto", "sRGB", "Display P3"];
 
 #[derive(Debug, Clone)]
 struct WifiNetwork {
@@ -162,8 +164,14 @@ struct DisplayConfig {
     hdr_requested: bool,
     #[serde(default)]
     hdr_enabled: bool,
+    #[serde(default)]
+    color_profile: DisplayColorProfile,
+    #[serde(default)]
+    icc_profile_path: Option<String>,
     #[serde(skip)]
     icc_lut_fallback_active: bool,
+    #[serde(skip)]
+    wide_gamut_active: bool,
 }
 
 fn save_displays(displays: &[DisplayConfig]) {
@@ -219,6 +227,8 @@ fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
         refresh_mhz: display.refresh_mhz,
         scale: display.scale as f32,
         primary: display.primary,
+        color_profile: display.color_profile,
+        icc_profile_path: display.icc_profile_path.clone(),
         hdr_requested: display.hdr_requested,
         hdr_enabled: display.hdr_enabled,
     }
@@ -390,12 +400,24 @@ fn load_displays() -> Vec<DisplayConfig> {
 }
 
 fn display_summary(d: &DisplayConfig) -> String {
+    let profile = d
+        .icc_profile_path
+        .as_deref()
+        .map(display_icc_profile_label)
+        .unwrap_or_else(|| display_color_profile_label(d.color_profile));
+    let gamut = if d.wide_gamut_active {
+        "Wide-gamut active"
+    } else {
+        "sRGB advertised"
+    };
     format!(
-        "{}x{} @ {} Hz  |  {}  |  Scale {:.2}{}{}{}",
+        "{}x{} @ {} Hz  |  {}  |  {}  |  {}  |  Scale {:.2}{}{}{}",
         d.mode_width,
         d.mode_height,
         d.refresh_mhz / 1000,
         transform_label(&d.transform),
+        profile,
+        gamut,
         d.scale,
         if d.primary { "  |  Primary" } else { "" },
         if d.enabled { "" } else { "  |  Disabled" },
@@ -415,6 +437,21 @@ fn hdr_status_subtitle(hdr_requested: bool, hdr_enabled: bool) -> &'static str {
     } else {
         "Off"
     }
+}
+
+fn display_color_profile_label(profile: DisplayColorProfile) -> &'static str {
+    match profile {
+        DisplayColorProfile::Auto => "Auto color profile",
+        DisplayColorProfile::Srgb => "sRGB output",
+        DisplayColorProfile::DisplayP3 => "Display P3 output",
+    }
+}
+
+fn display_icc_profile_label(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
 }
 
 fn transform_label(transform: &str) -> &'static str {
@@ -441,6 +478,22 @@ fn transform_from_index(index: u32) -> &'static str {
         2 => "Rotate180",
         3 => "Rotate270",
         _ => "Normal",
+    }
+}
+
+fn display_color_profile_index(profile: DisplayColorProfile) -> u32 {
+    match profile {
+        DisplayColorProfile::Auto => 0,
+        DisplayColorProfile::Srgb => 1,
+        DisplayColorProfile::DisplayP3 => 2,
+    }
+}
+
+fn selected_display_color_profile(index: u32) -> DisplayColorProfile {
+    match index {
+        1 => DisplayColorProfile::Srgb,
+        2 => DisplayColorProfile::DisplayP3,
+        _ => DisplayColorProfile::Auto,
     }
 }
 
@@ -1447,6 +1500,7 @@ fn connected_display_row(
     displays: Rc<RefCell<Vec<DisplayConfig>>>,
     area: gtk::DrawingArea,
     row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>>,
+    parent: adw::ApplicationWindow,
 ) -> adw::ExpanderRow {
     let display = displays.borrow()[index].clone();
     let row = adw::ExpanderRow::new();
@@ -1636,6 +1690,106 @@ fn connected_display_row(
                 save_display_change(&displays, &area, &row, index);
             });
         }
+    }
+
+    let color_row = adw::ActionRow::new();
+    color_row.set_title("Color profile");
+    color_row.set_subtitle("Choose the output profile the compositor should advertise");
+    let color_dropdown = dropdown_from_strings(
+        DISPLAY_COLOR_PROFILE_OPTIONS,
+        display_color_profile_index(display.color_profile),
+    );
+    color_row.add_suffix(&color_dropdown);
+    color_row.set_activatable_widget(Some(&color_dropdown));
+    row.add_row(&color_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        color_dropdown.connect_selected_notify(move |dropdown| {
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.color_profile = selected_display_color_profile(dropdown.selected());
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let icc_row = adw::ActionRow::new();
+    icc_row.set_title("ICC profile file");
+    let icc_subtitle = display
+        .icc_profile_path
+        .as_deref()
+        .map(|path| format!("Selected: {}", display_icc_profile_label(path)))
+        .unwrap_or_else(|| "No ICC file selected".to_string());
+    icc_row.set_subtitle(&icc_subtitle);
+    let icc_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let choose_icc = gtk::Button::with_label("Choose ICC...");
+    let clear_icc = gtk::Button::with_label("Clear");
+    icc_buttons.append(&choose_icc);
+    icc_buttons.append(&clear_icc);
+    icc_row.add_suffix(&icc_buttons);
+    icc_row.set_activatable_widget(Some(&choose_icc));
+    row.add_row(&icc_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        let parent = parent.clone();
+        let icc_row = icc_row.clone();
+        choose_icc.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Choose ICC Profile");
+            dialog.open(
+                Some(&parent),
+                None::<&gtk::gio::Cancellable>,
+                {
+                    let displays = displays.clone();
+                    let area = area.clone();
+                    let row = row.clone();
+                    let icc_row = icc_row.clone();
+                    move |result| {
+                        if let Ok(file) = result {
+                            if let Some(path) = file.path() {
+                                if let Some(display) = displays.borrow_mut().get_mut(index) {
+                                    display.icc_profile_path =
+                                        Some(path.to_string_lossy().into_owned());
+                                }
+                                if let Some(display) = displays.borrow().get(index) {
+                                    let subtitle = display
+                                        .icc_profile_path
+                                        .as_deref()
+                                        .map(|p| {
+                                            format!(
+                                                "Selected: {}",
+                                                display_icc_profile_label(p)
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "No ICC file selected".to_string());
+                                    icc_row.set_subtitle(&subtitle);
+                                }
+                                save_display_change(&displays, &area, &row, index);
+                            }
+                        }
+                    }
+                },
+            );
+        });
+    }
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        let icc_row = icc_row.clone();
+        clear_icc.connect_clicked(move |_| {
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.icc_profile_path = None;
+            }
+            icc_row.set_subtitle("No ICC file selected");
+            save_display_change(&displays, &area, &row, index);
+        });
     }
 
     row
@@ -1862,14 +2016,24 @@ fn apply_runtime_statuses(
 ) {
     let mut displays_ref = displays.borrow_mut();
     for display in displays_ref.iter_mut() {
-        let active = statuses
+        let status = statuses
             .iter()
             .find(|status| status.connector == display.name)
+            .cloned();
+        let fallback_active = status
+            .as_ref()
             .map(|status| status.icc_lut_fallback_active)
             .unwrap_or(false);
+        let wide_gamut_active = status
+            .as_ref()
+            .map(|status| status.wide_gamut_active)
+            .unwrap_or(false);
 
-        if display.icc_lut_fallback_active != active {
-            display.icc_lut_fallback_active = active;
+        if display.icc_lut_fallback_active != fallback_active {
+            display.icc_lut_fallback_active = fallback_active;
+        }
+        if display.wide_gamut_active != wide_gamut_active {
+            display.wide_gamut_active = wide_gamut_active;
         }
     }
 }
@@ -1962,7 +2126,10 @@ fn build_ui(app: &adw::Application) {
     pages.insert("Network".to_string(), network_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Printers".to_string(), printers_page());
-    pages.insert("Displays".to_string(), displays_page(config.clone()));
+    pages.insert(
+        "Displays".to_string(),
+        displays_page(config.clone(), window.clone()),
+    );
     pages.insert("Sound".to_string(), sound_page());
     pages.insert(
         "Applications".to_string(),
@@ -4196,7 +4363,10 @@ fn about_page() -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "About")
 }
 
-fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
+fn displays_page(
+    config: Rc<RefCell<FocalDeskConfig>>,
+    window: adw::ApplicationWindow,
+) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Displays");
 
@@ -4230,6 +4400,7 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
                 detected_displays.clone(),
                 area.clone(),
                 row_registry.clone(),
+                window.clone(),
             );
             outputs_group.add(&row);
         }
@@ -4424,6 +4595,8 @@ mod tests {
             physical_height_mm: None,
             primary: true,
             transform: "Normal".to_string(),
+            color_profile: DisplayColorProfile::Auto,
+            icc_profile_path: None,
             hdr_supported: true,
             hdr_requested: true,
             hdr_enabled: false,

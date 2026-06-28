@@ -76,12 +76,34 @@ The main compositor binary is:
 cargo run -p focaldesk-desktop
 ```
 
-To make FocalDesk show up in GDM, install the Wayland session file:
+To make FocalDesk show up in GDM, install the compositor and Wayland session:
 
 ```sh
 just install-desktop
 just install-desktop-session
 ```
+
+That recipe builds a release binary and installs it to
+`/usr/local/bin/focaldesk-desktop` (same path as the Wayland session `Exec=`).
+Re-run `just install-desktop-session` after changing the session file.
+
+To build and install the file manager prototype:
+
+```sh
+just install-files
+```
+
+That recipe builds a release binary and installs it to
+`/usr/local/bin/focaldesk-files`.
+
+To build and install the settings app:
+
+```sh
+just install-settings
+```
+
+That recipe builds a release binary and installs it to
+`/usr/local/bin/focaldesk-settings`.
 
 Because FocalDesk is alpha compositor/system software, run it from a safe
 development session first. Avoid switching important work over to it until you

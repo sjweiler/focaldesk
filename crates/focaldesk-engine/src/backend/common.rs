@@ -273,6 +273,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
         }
         InputEvent::PointerMotion { event, .. } => {
             let pos = pointer_pos + event.delta();
+            let delta_unaccel = event.delta_unaccel();
             let min_x = clamp_rect.loc.x as f64;
             let min_y = clamp_rect.loc.y as f64;
             let max_x = (clamp_rect.loc.x + clamp_rect.size.w) as f64 - f64::EPSILON;
@@ -283,6 +284,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                     pos.x.clamp(min_x, max_x.max(min_x)),
                     pos.y.clamp(min_y, max_y.max(min_y)),
                 )),
+                delta_unaccel: Some(delta_unaccel),
             })
         }
         InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -292,7 +294,10 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                 clamp_rect.loc.y as f64 + local.y,
             ));
 
-            Some(FlowInputEvent::PointerMoved { position: pos })
+            Some(FlowInputEvent::PointerMoved {
+                position: pos,
+                delta_unaccel: None,
+            })
         }
         InputEvent::PointerButton { event, .. } => {
             let button = match event.button_code() {
@@ -448,9 +453,7 @@ fn ensure_xdpw_screencast_config() {
 
     let config_path = config_dir.join("config");
     let chooser_cmd = shell_quote_for_xdpw_config(&portal_exe.to_string_lossy());
-    let desired = format!(
-        "[screencast]\nchooser_type=simple\nchooser_cmd={chooser_cmd}\n"
-    );
+    let desired = format!("[screencast]\nchooser_type=simple\nchooser_cmd={chooser_cmd}\n");
 
     let current = std::fs::read_to_string(&config_path).unwrap_or_default();
     if current == desired {
@@ -735,6 +738,10 @@ pub(crate) fn bootstrap_compositor_core(
         output_manager_state,
         data_device_state,
         primary_selection_state,
+        relative_pointer_state:
+            smithay::wayland::relative_pointer::RelativePointerManagerState::new::<DesktopState>(
+                &dh,
+            ),
         layer_shell_state,
         image_capture_source_state,
         output_capture_source_state,

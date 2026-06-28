@@ -32,6 +32,7 @@ use smithay::backend::renderer::element::{
 
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::flog_warn;
+use focaldesk_settings_core::DisplayColorProfile;
 
 // DRM/KMS backend for FocalDesk.
 //
@@ -146,6 +147,10 @@ pub struct DisplayConfig {
     pub hdr_requested: bool,
     #[serde(default)]
     pub hdr_enabled: bool,
+    #[serde(default)]
+    pub color_profile: DisplayColorProfile,
+    #[serde(default)]
+    pub icc_profile_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -421,6 +426,17 @@ fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> b
         .find(|display| display.name == name)
         .map(|display| display.hdr_requested || display.hdr_enabled)
         .unwrap_or(false)
+}
+
+fn configured_display_color_profile(
+    displays: &[DisplayConfig],
+    name: &str,
+) -> DisplayColorProfile {
+    displays
+        .iter()
+        .find(|display| display.name == name)
+        .map(|display| display.color_profile)
+        .unwrap_or_default()
 }
 
 fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
@@ -964,6 +980,8 @@ mod hdr_tests {
             hdr_supported: true,
             hdr_requested,
             hdr_enabled,
+            color_profile: DisplayColorProfile::Auto,
+            icc_profile_path: None,
         }
     }
 
@@ -1259,6 +1277,7 @@ mod hdr_output {
 pub(crate) fn collect_display_configs(
     device: &DrmDeviceState,
     core: &CompositorCore,
+    configured_displays: &[DisplayConfig],
 ) -> Vec<DisplayConfig> {
     let mut displays = Vec::new();
 
@@ -1289,9 +1308,15 @@ pub(crate) fn collect_display_configs(
         let hdr_enabled = core_output
             .map(|output| output.hdr_enabled)
             .unwrap_or(false);
+        let output_name = surface.output.name();
+        let color_profile = configured_display_color_profile(configured_displays, &output_name);
+        let icc_profile_path = configured_displays
+            .iter()
+            .find(|display| display.name == output_name)
+            .and_then(|display| display.icc_profile_path.clone());
 
         displays.push(DisplayConfig {
-            name: surface.output.name(),
+            name: output_name,
             enabled: true,
 
             mode_width: w,
@@ -1313,6 +1338,8 @@ pub(crate) fn collect_display_configs(
             hdr_supported,
             hdr_requested,
             hdr_enabled,
+            color_profile,
+            icc_profile_path,
         });
     }
 
@@ -1920,7 +1947,7 @@ fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
         state.input.modifiers,
     ) {
         if matches!(input, InputEvent::PointerMotion { .. }) {
-            if let crate::core::input::FlowInputEvent::PointerMoved { position } = &mut event {
+            if let crate::core::input::FlowInputEvent::PointerMoved { position, .. } = &mut event {
                 let scale = scale.max(1.0);
                 let old_pos = state.input.pointer_pos;
                 let scaled = Point::<f64, Logical>::from((
@@ -2305,9 +2332,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         continue;
                     }
 
+                    let surface_cursor = data.core.state.render.sw_cursor_surface.is_some();
+                    if owns_cursor && !surface_cursor {
+                        // Retry KMS cursor each frame; SW overlay covers Skipped uploads.
+                        data.core.state.drm_submit_hw_cursor = true;
+                    }
                     data.core.state.drm_try_pass_cursor_this_frame = owns_cursor
                         && data.core.state.drm_submit_hw_cursor
-                        && data.core.state.cursor_manager.visible();
+                        && data.core.state.cursor_manager.visible()
+                        && !surface_cursor;
 
                     let buffer_size = Size::from((surface.size.w, surface.size.h));
 
@@ -3146,19 +3179,15 @@ fn device_added(
                 serial_number.clone(),
                 edid.clone(),
             );
-            if let Some(parsed) = crate::core::colord::resolve_output_color_profile(
-                &make,
-                &model,
-                &serial_number,
-                edid.as_deref(),
-            ) {
-                data.core.state.set_output_color(
-                    output_id,
-                    parsed.description,
-                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                    parsed.output_lut,
-                );
+            if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
+                out.color_profile_override =
+                    configured_display_color_profile(&configured_displays, &output_name);
+                out.icc_profile_path = configured_displays
+                    .iter()
+                    .find(|display| display.name == output_name)
+                    .and_then(|display| display.icc_profile_path.clone());
             }
+            data.core.state.refresh_output_color(output_id);
 
             if !initialized_one {
                 data.core.state.primary_output = output_id;
@@ -3249,7 +3278,7 @@ fn device_added(
         surfaces,
     };
 
-    let displays = collect_display_configs(&temp_device, &data.core);
+    let displays = collect_display_configs(&temp_device, &data.core, &configured_displays);
 
     if let Err(err) = write_display_config(&displays) {
         flog(&format!("Failed to write display config: {err}"));
