@@ -57,16 +57,14 @@ pub fn resolve_output_color_profile(
         }
     }
 
-    icc::load_display_profile_for_monitor(make, model, serial)
-        .or_else(|| {
-            edid
-                .and_then(icc::color_description_from_edid)
-                .map(|description| ParsedIccProfile {
-                    description,
-                    bytes: Vec::new(),
-                    output_lut: None,
-                })
-        })
+    icc::load_display_profile_for_monitor(make, model, serial).or_else(|| {
+        edid.and_then(icc::color_description_from_edid)
+            .map(|description| ParsedIccProfile {
+                description,
+                bytes: Vec::new(),
+                output_lut: None,
+            })
+    })
 }
 
 /// Register the output with colord (normally done by gnome-settings-daemon / colord-kde).
@@ -101,7 +99,9 @@ pub fn ensure_colord_display_device(make: &str, model: &str, serial: &str) -> bo
             true
         }
         Err(err) => {
-            flog(format!("colord: CreateDevice failed for {device_id}: {err}"));
+            flog(format!(
+                "colord: CreateDevice failed for {device_id}: {err}"
+            ));
             false
         }
     }
@@ -128,19 +128,15 @@ pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
 
     let mut any_changed = false;
     for (output_id, make, model, serial, edid, old_desc, old_icc, old_lut) in snapshots {
-        let (new_desc, new_icc, new_lut) = match resolve_output_color_profile(
-            &make,
-            &model,
-            &serial,
-            edid.as_deref(),
-        ) {
-            Some(parsed) => (
-                parsed.description,
-                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                parsed.output_lut,
-            ),
-            None => (default_output_color_description(), None, None),
-        };
+        let (new_desc, new_icc, new_lut) =
+            match resolve_output_color_profile(&make, &model, &serial, edid.as_deref()) {
+                Some(parsed) => (
+                    parsed.description,
+                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                    parsed.output_lut,
+                ),
+                None => (default_output_color_description(), None, None),
+            };
 
         if new_desc != old_desc || new_icc != old_icc || new_lut != old_lut {
             state.set_output_color(output_id, new_desc, new_icc, new_lut);
@@ -222,7 +218,10 @@ fn is_colord_refresh_signal(msg: &zbus::Message) -> bool {
     msg.interface()
         .as_deref()
         .is_some_and(|i| i == "org.freedesktop.ColorManager")
-        && msg.member().as_deref().is_some_and(|m| m == "DeviceChanged" || m == "ProfileChanged")
+        && msg
+            .member()
+            .as_deref()
+            .is_some_and(|m| m == "DeviceChanged" || m == "ProfileChanged")
 }
 
 pub fn load_display_profile_via_colord(
@@ -296,11 +295,7 @@ fn colord_find_device_by_id(cm: &Proxy<'_>, device_id: &str) -> Option<OwnedObje
     reply.body().ok()
 }
 
-fn colord_find_by_property(
-    cm: &Proxy<'_>,
-    property: &str,
-    value: &str,
-) -> Option<OwnedObjectPath> {
+fn colord_find_by_property(cm: &Proxy<'_>, property: &str, value: &str) -> Option<OwnedObjectPath> {
     let reply = cm
         .call_method("FindDeviceByProperty", &(property, value))
         .ok()?;
@@ -327,14 +322,7 @@ fn colord_device_matches(
     let dev_model: String = device.get_property("Model").unwrap_or_default();
     let dev_serial: String = device.get_property("SerialNumber").unwrap_or_default();
 
-    monitor_tokens_match(
-        make,
-        model,
-        serial,
-        &vendor,
-        &dev_model,
-        &dev_serial,
-    )
+    monitor_tokens_match(make, model, serial, &vendor, &dev_model, &dev_serial)
 }
 
 fn monitor_tokens_match(
@@ -361,7 +349,11 @@ fn monitor_tokens_match(
         return false;
     }
 
-    let haystacks = [vendor_l.as_str(), dev_model_l.as_str(), dev_serial_l.as_str()];
+    let haystacks = [
+        vendor_l.as_str(),
+        dev_model_l.as_str(),
+        dev_serial_l.as_str(),
+    ];
     let matched = tokens
         .iter()
         .filter(|token| haystacks.iter().any(|h| h.contains(**token)))
@@ -420,7 +412,9 @@ mod tests {
             "27UP850-W",
             "123ABC"
         ));
-        assert!(!monitor_tokens_match("LG", "27UP850", "123", "Dell", "U2720Q", "999"));
+        assert!(!monitor_tokens_match(
+            "LG", "27UP850", "123", "Dell", "U2720Q", "999"
+        ));
     }
 
     /// Live colord bus required; run with `cargo test -p focaldesk-engine colord_load_asus -- --nocapture`.
@@ -434,8 +428,16 @@ mod tests {
         let right = load_display_profile_via_colord("AUS", "ASUS VG32VQR", "55498")
             .expect("55498 colord profile");
 
-        eprintln!("55700: {:?} encode={}", left.description, output_encode_scanout_needed(left.description, left.output_lut.as_ref()));
-        eprintln!("55498: {:?} encode={}", right.description, output_encode_scanout_needed(right.description, right.output_lut.as_ref()));
+        eprintln!(
+            "55700: {:?} encode={}",
+            left.description,
+            output_encode_scanout_needed(left.description, left.output_lut.as_ref())
+        );
+        eprintln!(
+            "55498: {:?} encode={}",
+            right.description,
+            output_encode_scanout_needed(right.description, right.output_lut.as_ref())
+        );
         assert_ne!(left.description.primaries, right.description.primaries);
     }
 }

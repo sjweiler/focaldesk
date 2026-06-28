@@ -1,27 +1,20 @@
-use gtk4::prelude::*;
-use glib::ControlFlow;
 use anyhow::Context;
-use gtk4::{
-    Application, ApplicationWindow, Box, Button, ComboBoxText, Entry, Label, Orientation, Paned,
-    Revealer, ScrolledWindow, Switch, TextBuffer, TextView,
-};
 use focaldesk_ai::{
     AiDaemonStatus, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, ProviderInfo,
     ProviderModelInfo, send_ai_request,
 };
 use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
 use focaldesk_settings_core::load_settings;
+use glib::ControlFlow;
+use gtk4::prelude::*;
+use gtk4::{
+    Application, ApplicationWindow, Box, Button, ComboBoxText, Entry, Label, Orientation, Paned,
+    Revealer, ScrolledWindow, Switch, TextBuffer, TextView,
+};
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
-    fs,
-    path::PathBuf,
-    process::Command,
-    rc::Rc,
-    collections::BTreeMap,
-    sync::mpsc,
-    thread,
-    time::Duration,
+    cell::RefCell, collections::BTreeMap, fs, path::PathBuf, process::Command, rc::Rc, sync::mpsc,
+    thread, time::Duration,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -226,8 +219,7 @@ fn is_placeholder_model_name(model: &str) -> bool {
 }
 
 fn effective_model_label(state: &PersistedState, runtime: &AiConsoleRuntime) -> String {
-    effective_runtime_model(state, runtime)
-        .unwrap_or_else(|| "unset".to_string())
+    effective_runtime_model(state, runtime).unwrap_or_else(|| "unset".to_string())
 }
 
 fn effective_runtime_model(state: &PersistedState, runtime: &AiConsoleRuntime) -> Option<String> {
@@ -280,7 +272,11 @@ fn sync_active_model_with_provider(state: &mut PersistedState, runtime: &AiConso
         .iter()
         .find(|provider| provider.id == provider_id)
         .and_then(|provider| provider.default_model.clone())
-        .filter(|default_model| installed_models.iter().any(|model| model.id == *default_model))
+        .filter(|default_model| {
+            installed_models
+                .iter()
+                .any(|model| model.id == *default_model)
+        })
     {
         state.app_state.active_model = default_model;
         return;
@@ -293,16 +289,13 @@ fn sync_active_model_with_provider(state: &mut PersistedState, runtime: &AiConso
 
 fn selected_model_for_provider(runtime: &AiConsoleRuntime, provider_id: &str) -> Option<String> {
     runtime.provider_models.get(provider_id).and_then(|models| {
-        models
-            .first()
-            .map(|model| model.id.clone())
-            .or_else(|| {
-                runtime
-                    .providers
-                    .iter()
-                    .find(|provider| provider.id == provider_id)
-                    .and_then(|provider| provider.default_model.clone())
-            })
+        models.first().map(|model| model.id.clone()).or_else(|| {
+            runtime
+                .providers
+                .iter()
+                .find(|provider| provider.id == provider_id)
+                .and_then(|provider| provider.default_model.clone())
+        })
     })
 }
 
@@ -477,7 +470,11 @@ fn build_ui(app: &Application) {
         detail_toggle.clone().connect_clicked(move |_| {
             let reveal = !detail_revealer.reveals_child();
             detail_revealer.set_reveal_child(reveal);
-            detail_toggle_state.set_label(if reveal { "Hide details" } else { "Show details" });
+            detail_toggle_state.set_label(if reveal {
+                "Hide details"
+            } else {
+                "Show details"
+            });
         });
     }
 
@@ -538,11 +535,7 @@ fn build_ui(app: &Application) {
         Some("conversations"),
         "Conversations",
     );
-    stack.add_titled(
-        &providers_page.page,
-        Some("providers"),
-        "Providers",
-    );
+    stack.add_titled(&providers_page.page, Some("providers"), "Providers");
     stack.add_titled(
         &tools_page(
             chat_view.clone(),
@@ -834,7 +827,10 @@ fn build_backend_banner(
             *model_combo_syncing_for_provider.borrow_mut() = false;
             append_log(
                 &log_buffer_clone,
-                &format!("[mode] provider switched to {}", state.app_state.active_provider),
+                &format!(
+                    "[mode] provider switched to {}",
+                    state.app_state.active_provider
+                ),
             );
         }
     });
@@ -959,7 +955,12 @@ fn refresh_backend_banner(
         let status = runtime
             .status
             .as_ref()
-            .map(|status| format!("active requests: {}, providers: {}", status.active_requests, status.provider_count))
+            .map(|status| {
+                format!(
+                    "active requests: {}, providers: {}",
+                    status.active_requests, status.provider_count
+                )
+            })
             .unwrap_or_else(|| "daemon status unavailable".to_string());
         subtitle_label.set_text(&format!(
             "{provider_count} providers available. Active: {active_provider} / {active_model}. {status}"
@@ -995,7 +996,10 @@ fn populate_provider_combo(
         backend_combo.append(Some(&provider.id), &provider_label(provider));
     }
 
-    if providers.iter().any(|provider| provider.id == selected_provider) {
+    if providers
+        .iter()
+        .any(|provider| provider.id == selected_provider)
+    {
         backend_combo.set_active_id(Some(selected_provider));
     } else if let Some(default_provider) = providers.first() {
         backend_combo.set_active_id(Some(&default_provider.id));
@@ -1062,9 +1066,7 @@ fn refresh_composer_status_label(
     };
     let model = effective_model_label(state, runtime);
 
-    label.set_text(&format!(
-        "Composer backend: {provider} / {model}"
-    ));
+    label.set_text(&format!("Composer backend: {provider} / {model}"));
 }
 
 fn provider_label(provider: &ProviderInfo) -> String {
@@ -1107,7 +1109,11 @@ fn build_providers_page(
         list_toggle.connect_clicked(move |_| {
             let reveal = !list_revealer.reveals_child();
             list_revealer.set_reveal_child(reveal);
-            list_toggle_state.set_label(if reveal { "Hide providers" } else { "Show providers" });
+            list_toggle_state.set_label(if reveal {
+                "Hide providers"
+            } else {
+                "Show providers"
+            });
         });
     }
     summary_box.append(&list_toggle);
@@ -1128,7 +1134,10 @@ fn build_providers_page(
 }
 
 fn build_quick_prompts_page() -> Rc<QuickPromptsPage> {
-    let page = section_shell("Quick Prompts", "Real prompts that route through the AI daemon");
+    let page = section_shell(
+        "Quick Prompts",
+        "Real prompts that route through the AI daemon",
+    );
     let activity_box = Box::new(Orientation::Vertical, 6);
     let detail_box = Box::new(Orientation::Vertical, 6);
     activity_box.set_hexpand(true);
@@ -1156,7 +1165,11 @@ fn build_quick_prompts_page() -> Rc<QuickPromptsPage> {
         detail_toggle.connect_clicked(move |_| {
             let reveal = !detail_revealer.reveals_child();
             detail_revealer.set_reveal_child(reveal);
-            detail_toggle_state.set_label(if reveal { "Hide response" } else { "Show response" });
+            detail_toggle_state.set_label(if reveal {
+                "Hide response"
+            } else {
+                "Show response"
+            });
         });
     }
     activity_box.append(&detail_toggle);
@@ -1180,17 +1193,11 @@ fn refresh_quick_prompts_page_view(view: Rc<QuickPromptsPage>) {
     view.activity_box.append(&info_card(&[
         format!(
             "Last prompt: {}",
-            snapshot
-                .last_label
-                .as_deref()
-                .unwrap_or("none")
+            snapshot.last_label.as_deref().unwrap_or("none")
         ),
         format!(
             "Active backend: {} / {}",
-            snapshot
-                .active_provider
-                .as_deref()
-                .unwrap_or("unknown"),
+            snapshot.active_provider.as_deref().unwrap_or("unknown"),
             snapshot.active_model.as_deref().unwrap_or("unknown")
         ),
         if snapshot.in_flight {
@@ -1244,7 +1251,10 @@ fn refresh_providers_page_view(view: Rc<ProvidersPage>) {
 
     view.summary_box.append(&info_card(&[
         format!("Active provider: {}", snapshot.app_state.active_provider),
-        format!("Active model: {}", effective_model_label(&snapshot, &runtime_snapshot)),
+        format!(
+            "Active model: {}",
+            effective_model_label(&snapshot, &runtime_snapshot)
+        ),
         runtime_snapshot
             .status
             .as_ref()
@@ -1361,7 +1371,10 @@ fn tools_page(
             "Summarize chat",
             "Summarize the current conversation and note the next action.",
         ),
-        ("Draft reply", "Draft a concise reply to the current conversation."),
+        (
+            "Draft reply",
+            "Draft a concise reply to the current conversation.",
+        ),
         (
             "Analyze provider",
             "Review the active AI provider and suggest whether it is suitable for this task.",
@@ -1421,9 +1434,7 @@ fn tools_page(
                 })
                 .map_err(anyhow::Error::msg)
                 .and_then(|response| match response {
-                    IpcResponse::Notification { id } => {
-                        Ok(format!("notification queued: {id}"))
-                    }
+                    IpcResponse::Notification { id } => Ok(format!("notification queued: {id}")),
                     IpcResponse::Ok => Ok("notification sent".to_string()),
                     IpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
                     other => Err(anyhow::anyhow!("unexpected desktop response: {other:?}")),
@@ -1592,11 +1603,7 @@ fn dispatch_chat_request_async(
             persist_state(&store);
             render_active_conversation(&chat_view_for_result, &store);
             if let Some(conversation) = store.conversations.get(active_idx).cloned() {
-                render_conversation_panel(
-                    &detail_for_result,
-                    &conversation,
-                    "Active conversation",
-                );
+                render_conversation_panel(&detail_for_result, &conversation, "Active conversation");
             }
             append_log(
                 &log_buffer_for_result,
@@ -1627,11 +1634,7 @@ fn dispatch_chat_request_async(
             persist_state(&store);
             render_active_conversation(&chat_view_for_result, &store);
             if let Some(conversation) = store.conversations.get(active_idx).cloned() {
-                render_conversation_panel(
-                    &detail_for_result,
-                    &conversation,
-                    "Active conversation",
-                );
+                render_conversation_panel(&detail_for_result, &conversation, "Active conversation");
             }
             append_log(&log_buffer_for_result, &format!("[chat] {error_message}"));
             if let Some(view) = quick_prompts_page_for_result.as_ref() {
@@ -1658,9 +1661,8 @@ fn dispatch_chat_request_async(
             if let Some(view) = quick_prompts_page_for_result.as_ref() {
                 {
                     let mut prompt_state = view.state.borrow_mut();
-                    prompt_state.last_error = Some(
-                        "response channel disconnected before completion".to_string(),
-                    );
+                    prompt_state.last_error =
+                        Some("response channel disconnected before completion".to_string());
                     prompt_state.in_flight = false;
                     prompt_state.active_provider = Some(provider_for_result.clone());
                     prompt_state.active_model = Some(model_for_result.clone());
@@ -1715,7 +1717,9 @@ fn build_chat_request(store: &PersistedState, prompt: &str) -> ChatRequest {
         );
         for message in conversation.messages.iter().rev().take(8).rev() {
             if let Some(user_content) = message.strip_prefix("User: ") {
-                request.messages.insert(2, ChatMessage::user(user_content.to_string()));
+                request
+                    .messages
+                    .insert(2, ChatMessage::user(user_content.to_string()));
             } else if let Some(ai_content) = message.strip_prefix("AI: ") {
                 request
                     .messages
@@ -1751,7 +1755,10 @@ fn create_new_conversation(
         persist_state(&state);
         render_active_conversation(chat_view, &state);
         render_conversation_panel(conversation_detail, &conversation, "Active conversation");
-        append_log(log_buffer, &format!("[chat] reused empty conversation {}", index + 1));
+        append_log(
+            log_buffer,
+            &format!("[chat] reused empty conversation {}", index + 1),
+        );
         return;
     }
 
@@ -1767,14 +1774,13 @@ fn create_new_conversation(
     if let Some(conversation) = state.conversations.last().cloned() {
         render_conversation_panel(conversation_detail, &conversation, "Active conversation");
     }
-    append_log(log_buffer, &format!("[chat] created conversation {next_number}"));
+    append_log(
+        log_buffer,
+        &format!("[chat] created conversation {next_number}"),
+    );
 }
 
-fn load_active_conversation(
-    chat_view: &Box,
-    conversations: &[Conversation],
-    app_state: &AppState,
-) {
+fn load_active_conversation(chat_view: &Box, conversations: &[Conversation], app_state: &AppState) {
     if let Some(conversation) = conversations
         .get(app_state.active_conversation)
         .or_else(|| conversations.first())
@@ -1867,7 +1873,11 @@ fn conversations_page(
         detail_toggle.clone().connect_clicked(move |_| {
             let reveal = !detail_revealer.reveals_child();
             detail_revealer.set_reveal_child(reveal);
-            detail_toggle_state.set_label(if reveal { "Hide details" } else { "Show details" });
+            detail_toggle_state.set_label(if reveal {
+                "Hide details"
+            } else {
+                "Show details"
+            });
         });
     }
 
@@ -2049,7 +2059,12 @@ fn settings_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> 
         ("Auto-scroll chat", snapshot.auto_scroll),
         ("Verbose tool output", snapshot.verbose_output),
     ] {
-        page.append(&toggle_row(label, active, store.clone(), log_buffer.clone()));
+        page.append(&toggle_row(
+            label,
+            active,
+            store.clone(),
+            log_buffer.clone(),
+        ));
     }
 
     page

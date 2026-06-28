@@ -438,6 +438,10 @@ impl EguiLayer {
         self.owner_output = None;
     }
 
+    pub fn refresh_power_status_now(&mut self) {
+        self.settings.refresh_power_status_now();
+    }
+
     pub fn open_add_workspace_dialog(&mut self, owner_output: OutputId, name: impl Into<String>) {
         self.close_all_panels();
         self.workspace_dialog.open_add(name);

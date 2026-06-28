@@ -301,6 +301,14 @@ impl EguiPanelView for PowerPanel {
                     actions.push(UiAction::SystemCommand(SystemCommand::Lock));
                     close_requested = true;
                 }
+                if power_button(ui, "Suspend").clicked() {
+                    actions.push(UiAction::SystemCommand(SystemCommand::Suspend));
+                    close_requested = true;
+                }
+                if power_button(ui, "Hibernate").clicked() {
+                    actions.push(UiAction::SystemCommand(SystemCommand::Hibernate));
+                    close_requested = true;
+                }
                 if power_button(ui, "Logout").clicked() {
                     actions.push(UiAction::SystemCommand(SystemCommand::Logout));
                     close_requested = true;

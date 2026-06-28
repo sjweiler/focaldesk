@@ -32,6 +32,7 @@ pub struct ChromeShaders {
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
     pub flow_field: Option<GlesPixelProgram>,
+    pub screensaver: Option<GlesPixelProgram>,
 }
 
 impl Default for ChromeShaders {
@@ -64,6 +65,7 @@ impl ChromeShaders {
             pulse: None,
             accent: None,
             flow_field: None,
+            screensaver: None,
         }
     }
 
@@ -191,16 +193,15 @@ impl ChromeShaders {
         }
 
         if self.composite_linear_layer.is_none() {
-            self.composite_linear_layer =
-                Some(renderer.compile_custom_texture_shader(
-                    COMPOSITE_LINEAR_LAYER_FRAG,
-                    &[
-                        UniformName::new("u_encode_tf", UniformType::_1f),
-                        UniformName::new("u_m0", UniformType::_3f),
-                        UniformName::new("u_m1", UniformType::_3f),
-                        UniformName::new("u_m2", UniformType::_3f),
-                    ],
-                )?);
+            self.composite_linear_layer = Some(renderer.compile_custom_texture_shader(
+                COMPOSITE_LINEAR_LAYER_FRAG,
+                &[
+                    UniformName::new("u_encode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
         }
 
         if self.output_encode_sdr.is_none() {
@@ -224,14 +225,14 @@ impl ChromeShaders {
                 ],
             ) {
                 Ok(program) => {
-                    flog("output_encode_lut shader compiled OK");
+                    focaldesk_logging::flog_info!("output_encode_lut shader compiled OK");
                     self.output_encode_lut = Some(program);
                 }
                 Err(err) => {
-                    flog(format!(
+                    focaldesk_logging::flog_warn!(
                         "startup: output_encode_lut shader compile failed; disabling ICC LUT output encode for this session and falling back to parametric encode: {:?}",
                         err
-                    ));
+                    );
                 }
             }
         }
@@ -333,6 +334,16 @@ impl ChromeShaders {
                     UniformName::new("u_mode", UniformType::_1f),
                     UniformName::new("u_energy", UniformType::_1f),
                     UniformName::new("u_color", UniformType::_4f),
+                ],
+            )?);
+        }
+
+        if self.screensaver.is_none() {
+            self.screensaver = Some(renderer.compile_custom_pixel_shader(
+                SCREENSAVER_FRAG,
+                &[
+                    UniformName::new("u_resolution", UniformType::_2f),
+                    UniformName::new("u_time", UniformType::_1f),
                 ],
             )?);
         }
@@ -883,14 +894,17 @@ const CLIENT_TO_SCENE_LINEAR_FRAG: &str = r#"
 //_DEFINES_
 
 #if defined(EXTERNAL)
-#extension GL_OES_EGL_image_external : require
-uniform samplerExternalOES tex;
-#else
-uniform sampler2D tex;
+#extension GL_OES_EGL_image_external : enable
 #endif
 
 #ifdef GL_ES
 precision highp float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
 #endif
 
 varying vec2 v_coords;
@@ -933,7 +947,14 @@ void main() {
     if (src.a < 0.0001) {
         discard;
     }
-    vec3 straight = clamp(src.rgb / src.a, 0.0, 1.0);
+    vec3 straight = src.rgb / src.a;
+    // ExtLinear (wp_color wide gamut): preserve scRGB headroom above 1.0 in the FP16 scene.
+    bool extended_linear = u_decode_tf >= 0.5 && u_decode_tf < 1.5;
+    if (extended_linear) {
+        straight = max(straight, vec3(0.0));
+    } else {
+        straight = clamp(straight, 0.0, 1.0);
+    }
     vec3 linear = mul_mat3(decode_color(straight));
     gl_FragColor = vec4(linear * src.a, src.a) * alpha;
 }
@@ -1101,49 +1122,48 @@ void main() {
 "#;
 
 /// Scene sRGB framebuffer → monitor ICC LUT (2D atlas, trilinear).
+/// Always `sampler2D tex` — this pass only reads offscreen FBOs, never EGL external textures.
+/// Smithay may define EXTERNAL for custom texture shaders; using samplerExternalOES here breaks
+/// on NVIDIA GLES (C7531) when combined with the second sampler2D LUT atlas.
 const OUTPUT_ENCODE_LUT_FRAG: &str = r#"
 //_DEFINES_
-
-#if defined(EXTERNAL)
-#extension GL_OES_EGL_image_external : require
-uniform samplerExternalOES tex;
-#else
-uniform sampler2D tex;
-#endif
 
 #ifdef GL_ES
 precision highp float;
 #endif
+
+uniform sampler2D tex;
 
 varying vec2 v_coords;
 uniform float alpha;
 uniform sampler2D u_lut_tex;
 uniform float u_grid;
 
-vec3 lut_sample_at(ivec3 cell) {
+vec3 lut_sample_at(vec3 cell) {
     float n = u_grid;
-    float ir = float(cell.x);
-    float ig = float(cell.y);
-    float ib = float(cell.z);
-    vec2 uv = vec2((ig * n + ir + 0.5) / (n * n), (ib + 0.5) / n);
+    // Explicitly clamp cell bounds to prevent NVIDIA hardware filtering artifacts at edges
+    vec3 clamped_cell = clamp(cell, 0.0, n - 1.0);
+    vec2 uv = vec2((clamped_cell.y * n + clamped_cell.x + 0.5) / (n * n), (clamped_cell.z + 0.5) / n);
     return texture2D(u_lut_tex, uv).rgb;
 }
 
 vec3 lut_lookup(vec3 c) {
     float n = u_grid;
     vec3 x = clamp(c, 0.0, 1.0) * (n - 1.0);
-    ivec3 i0 = ivec3(floor(x + 1e-5));
-    vec3 f = x - vec3(float(i0.x), float(i0.y), float(i0.z));
-    ivec3 i1 = min(i0 + ivec3(1), ivec3(int(n) - 1));
+    
+    // Improved rounding safety for NVIDIA compiler optimization passes
+    vec3 i0 = clamp(floor(x + 1e-5), 0.0, n - 1.0);
+    vec3 f = clamp(x - i0, 0.0, 1.0);
+    vec3 i1 = min(i0 + 1.0, vec3(n - 1.0));
 
-    vec3 c000 = lut_sample_at(ivec3(i0.x, i0.y, i0.z));
-    vec3 c100 = lut_sample_at(ivec3(i1.x, i0.y, i0.z));
-    vec3 c010 = lut_sample_at(ivec3(i0.x, i1.y, i0.z));
-    vec3 c110 = lut_sample_at(ivec3(i1.x, i1.y, i0.z));
-    vec3 c001 = lut_sample_at(ivec3(i0.x, i0.y, i1.z));
-    vec3 c101 = lut_sample_at(ivec3(i1.x, i0.y, i1.z));
-    vec3 c011 = lut_sample_at(ivec3(i0.x, i1.y, i1.z));
-    vec3 c111 = lut_sample_at(ivec3(i1.x, i1.y, i1.z));
+    vec3 c000 = lut_sample_at(vec3(i0.x, i0.y, i0.z));
+    vec3 c100 = lut_sample_at(vec3(i1.x, i0.y, i0.z));
+    vec3 c010 = lut_sample_at(vec3(i0.x, i1.y, i0.z));
+    vec3 c110 = lut_sample_at(vec3(i1.x, i1.y, i0.z));
+    vec3 c001 = lut_sample_at(vec3(i0.x, i0.y, i1.z));
+    vec3 c101 = lut_sample_at(vec3(i1.x, i0.y, i1.z));
+    vec3 c011 = lut_sample_at(vec3(i0.x, i1.y, i1.z));
+    vec3 c111 = lut_sample_at(vec3(i1.x, i1.y, i1.z));
 
     vec3 c00 = mix(c000, c100, f.x);
     vec3 c10 = mix(c010, c110, f.x);
@@ -1159,12 +1179,12 @@ void main() {
 #if defined(NO_ALPHA)
     src.a = 1.0;
 #endif
+    // Guard against division-by-zero or NaN injection 
     vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
     vec3 encoded = lut_lookup(straight);
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;
-
 /// Scene sRGB → linear scRGB extended (nits above reference white).
 const SDR_TO_LINEAR_SCRGB_FRAG: &str = r#"
 //_DEFINES_
@@ -1569,16 +1589,9 @@ float pulse(float t, float freq) {
 }
 
 void main() {
-    vec2 pos = v_coords * u_resolution;
-    vec2 local = pos - u_rect.xy;
+    // Pixel shader is drawn into the flow-field quad only; v_coords are local 0..1.
     vec2 size = max(u_rect.zw, vec2(1.0));
-
-    float inside_x = step(u_rect.x, pos.x) * step(pos.x, u_rect.x + u_rect.z);
-    float inside_y = step(u_rect.y, pos.y) * step(pos.y, u_rect.y + u_rect.w);
-    float mask = inside_x * inside_y;
-    if (mask <= 0.0) {
-        discard;
-    }
+    vec2 local = v_coords * size;
 
     float mode = floor(u_mode + 0.5);
     float energy = clamp(u_energy, 0.0, 1.0) * mode_energy(mode);
@@ -1644,8 +1657,8 @@ void main() {
             core_scale = 0.88;
         }
 
-        vec2 particle = u_rect.xy + vec2(x * size.x, y * size.y);
-        vec2 delta = local - (particle - u_rect.xy);
+        vec2 particle = vec2(x * size.x, y * size.y);
+        vec2 delta = local - particle;
         float dist = length(delta);
 
         float core = exp(-(dist * dist) / (mix(170.0, 56.0, energy) * core_scale));
@@ -1687,5 +1700,108 @@ void main() {
     float alpha = clamp(density * glow * 1.45 + edge * 0.18 + wave * ripple * 0.22, 0.0, 1.0) * u_color.a;
 
     gl_FragColor = vec4(tint * (alpha + wave * ripple * 0.18), alpha);
+}
+"#;
+
+const SCREENSAVER_FRAG: &str = r#"
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+
+float hash11(float p) {
+    return fract(sin(p) * 43758.5453123);
+}
+
+float hash21(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+vec2 hash22(vec2 p) {
+    float n = dot(p, vec2(127.1, 311.7));
+    return fract(sin(vec2(n, n + 19.19)) * 43758.5453123);
+}
+
+vec3 palette(float t) {
+    vec3 a = vec3(0.02, 0.04, 0.08);
+    vec3 b = vec3(0.12, 0.18, 0.34);
+    vec3 c = vec3(0.88, 0.72, 0.52);
+    vec3 d = vec3(0.18, 0.32, 0.56);
+    return a + b * cos(6.28318 * (c * t + d));
+}
+
+void main() {
+    vec2 uv = v_coords;
+    vec2 aspect = vec2(u_resolution.x / max(u_resolution.y, 1.0), 1.0);
+    vec2 p = (uv - 0.5) * aspect;
+
+    float t = u_time;
+    vec2 drift = vec2(
+        0.19 * sin(t * 0.17) + 0.05 * sin(t * 0.73),
+        0.14 * cos(t * 0.13) + 0.05 * cos(t * 0.61)
+    );
+    vec2 center = drift;
+    vec2 to_center = p - center;
+    float dist = length(to_center);
+    float angle = atan(to_center.y, to_center.x);
+
+    // Background nebula gradient.
+    float nebula = 0.18 + 0.14 * sin(t * 0.05 + uv.x * 4.0 + uv.y * 2.0);
+    vec3 color = vec3(0.01, 0.015, 0.03) + palette(nebula) * 0.12;
+
+    // Starfield: three parallax layers with different cell sizes and twinkle rates.
+    for (int layer = 0; layer < 3; ++layer) {
+        float lf = float(layer);
+        float cell = mix(0.085, 0.22, lf / 2.0);
+        vec2 grid = floor((uv + vec2(t * 0.0015 * (lf + 1.0), t * 0.0010 * (lf + 1.0))) / cell);
+        vec2 rnd = hash22(grid + lf * 31.7);
+        vec2 star_pos = (grid + rnd) * cell;
+        vec2 delta = uv - star_pos;
+        float twinkle = 0.55 + 0.45 * sin(t * (1.6 + lf * 0.7) + hash21(grid) * 6.28318);
+        float radius = mix(0.002, 0.0055, lf / 2.0);
+        float star = exp(-dot(delta, delta) / (radius * radius));
+        float hue = hash21(grid + 8.3);
+        vec3 star_color = mix(vec3(0.78, 0.88, 1.0), vec3(1.0, 0.84, 0.58), hue);
+        color += star_color * star * twinkle * (1.05 - 0.2 * lf);
+    }
+
+    // Gravitational lensing around the black hole.
+    float lens = 0.022 / max(dist * dist, 0.010);
+    vec2 warped = p + normalize(to_center + vec2(1e-4)) * lens * 0.06;
+    float warped_dist = length(warped - center);
+    float hole = smoothstep(0.030, 0.0, warped_dist);
+
+    // Accretion disk: tilted ring with turbulence.
+    float disk_r = 0.17 + 0.01 * sin(t * 0.33);
+    float disk_width = 0.035;
+    float ring = exp(-pow((warped_dist - disk_r) / disk_width, 2.0));
+    float spokes = 0.55 + 0.45 * sin(angle * 10.0 - t * 2.8 + warped_dist * 26.0);
+    float turbulence = 0.7 + 0.3 * sin(warped_dist * 64.0 + t * 6.0);
+    vec3 disk_color = mix(vec3(0.95, 0.62, 0.18), vec3(0.42, 0.18, 0.82), 0.32 + 0.68 * hash11(floor(t)));
+    color += disk_color * ring * spokes * turbulence * 1.15;
+
+    // A smaller trailing wake gives the whole thing some motion even when the ring is centered.
+    float wake = exp(-pow((warped_dist - 0.245) / 0.085, 2.0));
+    wake *= 0.5 + 0.5 * sin(angle * 6.0 + t * 1.4);
+    color += vec3(0.18, 0.35, 0.75) * wake * 0.20;
+
+    // Event horizon and vignette.
+    color *= 1.0 - hole * 0.94;
+    float vignette = smoothstep(1.12, 0.22, length(p));
+    color *= vignette;
+
+    // Tiny motion along the neighborhood path so the center never sits still.
+    vec2 neighborhood = vec2(
+        0.05 * sin(t * 0.47 + 1.4),
+        0.03 * cos(t * 0.39 + 0.6)
+    );
+    float neighborhood_pull = exp(-pow(length(p - neighborhood) / 0.28, 2.0));
+    color += vec3(0.10, 0.12, 0.18) * neighborhood_pull * 0.12;
+
+    gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }
 "#;

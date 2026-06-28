@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 fn dispatch_backend_events(
     state: &mut DesktopState,
     event_loop: &mut WinitEventLoop,
+    window_focused: &mut bool,
 ) -> anyhow::Result<bool> {
     let status = event_loop.dispatch_new_events(|event: WinitEvent| match event {
         WinitEvent::Resized { size, scale_factor } => {
@@ -69,6 +70,13 @@ fn dispatch_backend_events(
             ) {
                 state.handle_input(event);
             }
+        }
+
+        WinitEvent::Focus(focused) => {
+            if focused && !*window_focused {
+                state.on_resume();
+            }
+            *window_focused = focused;
         }
 
         WinitEvent::CloseRequested => {
@@ -144,6 +152,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut requested_focus_after_first_frame = false;
+    let mut window_focused = false;
     while nested.state.running {
         #[cfg(feature = "xwayland")]
         xwayland_event_loop.dispatch(Some(Duration::ZERO), &mut nested.state)?;
@@ -151,9 +160,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nested.state.process_settings_ipc_requests();
         nested.state.process_chrome_timers();
         nested.state.process_notification_timers();
+        nested.state.process_idle_timers();
+        nested.state.process_power_timers();
         nested.state.process_lock_timers();
 
-        if !dispatch_backend_events(&mut nested.state, &mut event_loop)? {
+        if !dispatch_backend_events(&mut nested.state, &mut event_loop, &mut window_focused)? {
             break;
         }
 

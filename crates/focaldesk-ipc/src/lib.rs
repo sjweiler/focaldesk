@@ -1,5 +1,6 @@
 // crates/focaldesk-ipc/src/lib.rs
 use focaldesk_config::FocalDeskConfig;
+use focaldesk_power::PowerSnapshot;
 use focaldesk_settings_core::{OutputConfig, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -42,6 +43,7 @@ pub enum IpcRequest {
         outputs: Vec<OutputConfig>,
     },
     GetDisplayRuntimeStatus,
+    GetPowerSnapshot,
     IdentifyDisplays,
     Reload,
     ReloadConfig,
@@ -57,6 +59,12 @@ pub enum IpcRequest {
         message: String,
         #[serde(default)]
         allow_persistent: bool,
+    },
+    PortalChooserPrompt {
+        request_id: u64,
+        title: String,
+        message: String,
+        choices: Vec<String>,
     },
 }
 
@@ -84,10 +92,17 @@ pub enum IpcResponse {
     DisplayRuntimeStatus {
         outputs: Vec<DisplayRuntimeOutputStatus>,
     },
+    PowerSnapshot {
+        snapshot: PowerSnapshot,
+    },
     AiPermissionDecision {
         request_id: u64,
         allow: bool,
         persistent: bool,
+    },
+    PortalChooserDecision {
+        request_id: u64,
+        selected: Option<String>,
     },
     Error {
         message: String,

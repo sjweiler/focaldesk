@@ -4380,8 +4380,9 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
                     continue;
                 }
 
-                let statuses = serde_json::from_value::<Vec<DisplayRuntimeOutputStatus>>(event.value)
-                    .unwrap_or_default();
+                let statuses =
+                    serde_json::from_value::<Vec<DisplayRuntimeOutputStatus>>(event.value)
+                        .unwrap_or_default();
                 apply_runtime_statuses(&displays, &statuses);
                 for display in displays.borrow().iter() {
                     if let Some(row) = row_registry.borrow().get(&display.name) {

@@ -74,9 +74,7 @@ impl AiProvider for OpenAICompatibleProvider {
     }
 
     async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
-        let mut builder = self
-            .client
-            .get(format!("{}/models", self.base_url));
+        let mut builder = self.client.get(format!("{}/models", self.base_url));
 
         if let Some(api_key) = &self.api_key {
             builder = builder.bearer_auth(api_key);
@@ -93,7 +91,12 @@ impl AiProvider for OpenAICompatibleProvider {
             .context("failed to read model list response body")?;
 
         if !status.is_success() {
-            bail!("{} returned HTTP {} while listing models: {}", self.id, status, body);
+            bail!(
+                "{} returned HTTP {} while listing models: {}",
+                self.id,
+                status,
+                body
+            );
         }
 
         let decoded: OpenAIModelsResponse = serde_json::from_str(&body)

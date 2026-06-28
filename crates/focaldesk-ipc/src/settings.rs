@@ -38,6 +38,10 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             IpcResponse::Settings { settings }
         }
 
+        Ok(IpcRequest::GetPowerSnapshot) => IpcResponse::Error {
+            message: "request is handled by focaldesk-desktop".to_string(),
+        },
+
         Ok(IpcRequest::SetDisplays { outputs }) => {
             let mut s = settings.lock().unwrap();
             s.displays.outputs = outputs;
@@ -90,6 +94,10 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
         },
 
         Ok(IpcRequest::AiPermissionPrompt { .. }) => IpcResponse::Error {
+            message: "request is handled by focaldesk-desktop".to_string(),
+        },
+
+        Ok(IpcRequest::PortalChooserPrompt { .. }) => IpcResponse::Error {
             message: "request is handled by focaldesk-desktop".to_string(),
         },
 

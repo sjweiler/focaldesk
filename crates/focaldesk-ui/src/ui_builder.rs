@@ -31,7 +31,8 @@ pub enum AiFlowMode {
 #[derive(Debug, Clone, Copy)]
 pub struct UiBuildOptions {
     pub hdr_supported: bool,
-    pub hdr_enabled: bool,
+    pub hdr_requested: bool,
+    pub hdr_kms_applied: bool,
     pub workspace_count: usize,
     pub active_workspace: u32,
     pub ai_flow_mode: AiFlowMode,
@@ -41,7 +42,8 @@ impl Default for UiBuildOptions {
     fn default() -> Self {
         Self {
             hdr_supported: false,
-            hdr_enabled: false,
+            hdr_requested: false,
+            hdr_kms_applied: false,
             workspace_count: 1,
             active_workspace: 1,
             ai_flow_mode: AiFlowMode::Idle,
@@ -49,13 +51,15 @@ impl Default for UiBuildOptions {
     }
 }
 
-fn hdr_tooltip(hdr_supported: bool, hdr_enabled: bool) -> &'static str {
-    if hdr_supported && hdr_enabled {
-        "HDR supported (enabled)"
-    } else if hdr_supported {
-        "HDR supported (inactive)"
-    } else {
+fn hdr_tooltip(hdr_supported: bool, hdr_requested: bool, hdr_kms_applied: bool) -> &'static str {
+    if !hdr_supported {
         "HDR not detected"
+    } else if hdr_kms_applied && hdr_requested {
+        "HDR active (KMS live)"
+    } else if hdr_requested {
+        "HDR requested (pending KMS)"
+    } else {
+        "HDR supported (off)"
     }
 }
 
@@ -221,12 +225,16 @@ pub fn build_ui_for_output_with_options(
             ),
             3 => (
                 IconId::HDR,
-                hdr_tooltip(options.hdr_supported, options.hdr_enabled),
+                hdr_tooltip(
+                    options.hdr_supported,
+                    options.hdr_requested,
+                    options.hdr_kms_applied,
+                ),
                 UiAction::OpenPanel(PanelKind::Display),
             ),
             4 => (
                 IconId::Power,
-                "Power",
+                "Power menu",
                 UiAction::OpenPanel(PanelKind::Power),
             ),
             _ => continue,
@@ -234,7 +242,8 @@ pub fn build_ui_for_output_with_options(
 
         let mut el = UiElement::topbar_indicator(100 + i as u32, icon, tooltip);
         if icon == IconId::HDR {
-            el.selected = options.hdr_enabled;
+            el.selected = options.hdr_kms_applied;
+            el.active = options.hdr_requested && !options.hdr_kms_applied;
         }
         el.action = Some(action);
         el.hover_scale = 1.08;
@@ -275,22 +284,28 @@ pub fn build_ui_for_output_with_options(
 mod tests {
     use super::hdr_tooltip;
     use crate::ui_builder::{
-        build_ui_for_output_with_options, UiAction, UiBuildOptions, TOPBAR_FLOW_FIELD_ID,
+        TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions, build_ui_for_output_with_options,
     };
     use crate::uitree::UiTree;
 
     #[test]
-    fn hdr_tooltip_only_reports_enabled_for_applied_supported_hdr() {
-        assert_eq!(hdr_tooltip(true, true), "HDR supported (enabled)");
-        assert_eq!(hdr_tooltip(true, false), "HDR supported (inactive)");
-        assert_eq!(hdr_tooltip(false, true), "HDR not detected");
-        assert_eq!(hdr_tooltip(false, false), "HDR not detected");
+    fn hdr_tooltip_reflects_request_vs_kms_state() {
+        assert_eq!(hdr_tooltip(true, true, true), "HDR active (KMS live)");
+        assert_eq!(
+            hdr_tooltip(true, true, false),
+            "HDR requested (pending KMS)"
+        );
+        assert_eq!(hdr_tooltip(true, false, false), "HDR supported (off)");
+        assert_eq!(hdr_tooltip(false, true, true), "HDR not detected");
     }
 
     #[test]
     fn topbar_flow_field_launches_ai_console_directly() {
         let action = build_flow_field_action();
-        assert!(matches!(action, UiAction::LaunchApp("focaldesk-ai-console")));
+        assert!(matches!(
+            action,
+            UiAction::LaunchApp("focaldesk-ai-console")
+        ));
     }
 
     fn build_flow_field_action() -> UiAction {

@@ -9,8 +9,8 @@ use crate::core::color::{
     hdr_render_runtime_enabled, kms_scanout_encode_description, linear_sdr_runtime_enabled,
     output_encode_scanout_needed, scene_to_output_matrix, RenderingIntent,
 };
-use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::desktop::DesktopState;
+use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
 };
@@ -128,7 +128,12 @@ impl LinearOffscreenTargets {
         renderer: &mut GlesRenderer,
         size: Size<i32, Physical>,
     ) -> Result<(), GlesError> {
-        ensure_offscreen_texture(renderer, &mut self.encode_scratch, size, SDR_OFFSCREEN_FORMAT)
+        ensure_offscreen_texture(
+            renderer,
+            &mut self.encode_scratch,
+            size,
+            SDR_OFFSCREEN_FORMAT,
+        )
     }
 
     pub fn ensure_hdr_offscreen(
@@ -232,7 +237,16 @@ pub fn apply_output_encode(
 ) -> Result<Option<SyncPoint>> {
     targets.encoded_hdr = false;
     let output_state = state.outputs.get(&output_id);
-    let hdr_active = output_state.map(|o| o.hdr_enabled).unwrap_or(false);
+    let hdr_active = output_state
+        .map(|o| {
+            o.hdr_enabled
+                || crate::core::color::output_hdr_pq_test_encode_active(
+                    o.hdr_requested,
+                    o.hdr_supported,
+                    o.hdr_kms_applied,
+                )
+        })
+        .unwrap_or(false);
     let hdr_max = output_state.and_then(|o| o.edid_hdr_max_luminance_nits);
     let hdr_fall = output_state.and_then(|o| o.edid_hdr_max_fall_nits);
     let sdr_white_nits = output_state
@@ -309,10 +323,7 @@ pub fn apply_output_encode(
                     }
                 }
             } else {
-                flog_warn!(
-                    "ICC LUT shader unavailable for {:?}; falling back to parametric encode",
-                    output_id
-                );
+                disable_output_icc_lut(state, output_id, "ICC LUT shader unavailable");
             }
         }
     }
@@ -386,9 +397,7 @@ fn blit_with_shader(
             uniforms,
         )
         .map_err(|e| anyhow!("render {label}: {e}"))?;
-    frame
-        .finish()
-        .map_err(|e| anyhow!("finish {label}: {e}"))
+    frame.finish().map_err(|e| anyhow!("finish {label}: {e}"))
 }
 
 fn apply_hdr_pq_encode(
@@ -506,8 +515,16 @@ fn apply_output_encode_lut(
         .with_context(|gl| unsafe {
             gl.ActiveTexture(ffi::TEXTURE1);
             gl.BindTexture(ffi::TEXTURE_2D, lut_tex_id);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::NEAREST as i32);
-            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::NEAREST as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                ffi::NEAREST as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                ffi::NEAREST as i32,
+            );
         })
         .map_err(|e| anyhow!("bind ICC LUT texture: {e}"))?;
 
@@ -565,21 +582,30 @@ fn apply_output_encode_parametric(
     let encode_tf = output_encode.transfer.encode_mode() as u32 as f32;
     let uniforms = vec![
         Uniform::new("u_encode_tf", encode_tf),
-        Uniform::new("u_m0", [
-            scene_to_output[0][0],
-            scene_to_output[0][1],
-            scene_to_output[0][2],
-        ]),
-        Uniform::new("u_m1", [
-            scene_to_output[1][0],
-            scene_to_output[1][1],
-            scene_to_output[1][2],
-        ]),
-        Uniform::new("u_m2", [
-            scene_to_output[2][0],
-            scene_to_output[2][1],
-            scene_to_output[2][2],
-        ]),
+        Uniform::new(
+            "u_m0",
+            [
+                scene_to_output[0][0],
+                scene_to_output[0][1],
+                scene_to_output[0][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m1",
+            [
+                scene_to_output[1][0],
+                scene_to_output[1][1],
+                scene_to_output[1][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m2",
+            [
+                scene_to_output[2][0],
+                scene_to_output[2][1],
+                scene_to_output[2][2],
+            ],
+        ),
     ];
 
     let mut target = renderer
@@ -608,7 +634,9 @@ fn apply_output_encode_parametric(
             &uniforms,
         )
         .map_err(|e| anyhow!("render output encode: {e}"))?;
-    let sync = frame.finish().map_err(|e| anyhow!("finish output encode: {e}"))?;
+    let sync = frame
+        .finish()
+        .map_err(|e| anyhow!("finish output encode: {e}"))?;
     targets.encoded_scanout = true;
     Ok(Some(sync))
 }
@@ -662,21 +690,30 @@ pub fn composite_linear_layer_onto_sdr(
     let damage = [Rectangle::from_loc_and_size((0, 0), size)];
     let uniforms = vec![
         Uniform::new("u_encode_tf", encode_tf),
-        Uniform::new("u_m0", [
-            scene_to_output[0][0],
-            scene_to_output[0][1],
-            scene_to_output[0][2],
-        ]),
-        Uniform::new("u_m1", [
-            scene_to_output[1][0],
-            scene_to_output[1][1],
-            scene_to_output[1][2],
-        ]),
-        Uniform::new("u_m2", [
-            scene_to_output[2][0],
-            scene_to_output[2][1],
-            scene_to_output[2][2],
-        ]),
+        Uniform::new(
+            "u_m0",
+            [
+                scene_to_output[0][0],
+                scene_to_output[0][1],
+                scene_to_output[0][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m1",
+            [
+                scene_to_output[1][0],
+                scene_to_output[1][1],
+                scene_to_output[1][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m2",
+            [
+                scene_to_output[2][0],
+                scene_to_output[2][1],
+                scene_to_output[2][2],
+            ],
+        ),
     ];
     frame
         .render_texture_from_to(
@@ -869,14 +906,7 @@ pub fn run_linear_staged_pass(
             .finish()
             .map_err(|e| anyhow!("finish SDR overlay frame: {e}"))?
     };
-    finish_with_output_encode(
-        state,
-        renderer,
-        targets,
-        output_id,
-        buffer_size,
-        sync,
-    )
+    finish_with_output_encode(state, renderer, targets, output_id, buffer_size, sync)
 }
 
 /// Render one output into the SDR offscreen target using the same linear/legacy path as scanout.

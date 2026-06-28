@@ -41,7 +41,9 @@ impl ColorPrimaries {
         }
     }
 
-    pub fn from_wp_named(primaries: wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::Primaries) -> Option<Self> {
+    pub fn from_wp_named(
+        primaries: wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::Primaries,
+    ) -> Option<Self> {
         use wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::Primaries;
         match primaries {
             Primaries::Srgb => Some(Self::Srgb),
@@ -71,6 +73,29 @@ impl PrimariesChromaticity {
         b: [0.131, 0.046],
         w: [0.3127, 0.3290],
     };
+}
+
+/// True when all CIE xy coordinates are finite and within [0, 1].
+pub fn chromaticity_is_valid(ch: &PrimariesChromaticity) -> bool {
+    let in_range = |xy: [f32; 2]| {
+        xy[0].is_finite()
+            && xy[1].is_finite()
+            && (0.0..=1.0).contains(&xy[0])
+            && (0.0..=1.0).contains(&xy[1])
+    };
+    in_range(ch.r) && in_range(ch.g) && in_range(ch.b) && in_range(ch.w)
+}
+
+/// Rejects coordinates that fit [0,1] but are far too small for any real display (Chrome wire bugs).
+pub fn primaries_plausible(ch: &PrimariesChromaticity) -> bool {
+    if !chromaticity_is_valid(ch) {
+        return false;
+    }
+    let peak = [ch.r, ch.g, ch.b, ch.w]
+        .into_iter()
+        .flatten()
+        .fold(0.0f32, f32::max);
+    peak >= 0.15
 }
 
 /// Electrical-to-optical transfer function attached to a client surface.
@@ -310,10 +335,7 @@ pub fn gamut_matrix_linear_rgb(
 }
 
 /// Row-major 3×3: scene-linear Rec.709 → linear output primaries.
-pub fn scene_to_output_matrix(
-    output: ColorDescription,
-    intent: RenderingIntent,
-) -> [[f32; 3]; 3] {
+pub fn scene_to_output_matrix(output: ColorDescription, intent: RenderingIntent) -> [[f32; 3]; 3] {
     gamut_matrix_linear_rgb(scene_working_primaries(), output.primaries, intent)
 }
 
@@ -420,17 +442,48 @@ pub fn hdr_render_runtime_enabled() -> bool {
 }
 
 /// When true, apply HDR connector properties and 10-bit scanout (C3c).
-pub fn hdr_kms_runtime_enabled() -> bool {
+pub fn hdr_kms_env_blocked() -> bool {
+    matches!(
+        std::env::var("FOCALDESK_HDR").ok().as_deref(),
+        Some("0") | Some("false") | Some("no") | Some("off")
+    )
+}
+
+/// Explicit env force for KMS HDR (optional; settings `hdr_requested` is sufficient).
+pub fn hdr_kms_env_forced() -> bool {
     matches!(
         std::env::var("FOCALDESK_HDR").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
 }
 
-pub fn output_hdr_render_active(hdr_requested: bool, hdr_supported: bool) -> bool {
-    (hdr_render_runtime_enabled() || hdr_kms_runtime_enabled())
-        && hdr_supported
-        && hdr_requested
+/// Whether the DRM loop may attempt live KMS HDR commits.
+pub fn hdr_runtime_may_apply_kms(any_output_hdr_requested: bool) -> bool {
+    if hdr_kms_env_blocked() {
+        return false;
+    }
+    hdr_kms_env_forced() || any_output_hdr_requested
+}
+
+/// HDR is live on this output: KMS connector/scanout matches PQ encode.
+pub fn output_hdr_render_active(
+    hdr_requested: bool,
+    hdr_supported: bool,
+    hdr_kms_applied: bool,
+) -> bool {
+    if hdr_kms_env_blocked() || !hdr_requested || !hdr_supported {
+        return false;
+    }
+    hdr_kms_applied
+}
+
+/// C3b lab mode: PQ encode without KMS (`FOCALDESK_HDR_RENDER=1` only). Image may look wrong.
+pub fn output_hdr_pq_test_encode_active(
+    hdr_requested: bool,
+    hdr_supported: bool,
+    hdr_kms_applied: bool,
+) -> bool {
+    hdr_requested && hdr_supported && hdr_render_runtime_enabled() && !hdr_kms_applied
 }
 
 /// When false, do not advertise `wp_color_management_v1`.
@@ -439,6 +492,16 @@ pub fn wp_color_management_enabled() -> bool {
         std::env::var("FOCALDESK_WP_COLOR").ok().as_deref(),
         Some("0") | Some("false") | Some("no") | Some("off")
     )
+}
+
+/// When false, `wp_color` advertises canonical sRGB instead of ICC/wide-gamut primaries.
+/// Defaults on when the ICC LUT shader is available; set `FOCALDESK_WP_COLOR_WIDE=0` to disable.
+pub fn wp_color_wide_gamut_enabled(lut_shader_available: bool) -> bool {
+    match std::env::var("FOCALDESK_WP_COLOR_WIDE").ok().as_deref() {
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        Some("1") | Some("true") | Some("yes") => true,
+        _ => lut_shader_available,
+    }
 }
 
 pub fn effective_surface_render_state(
@@ -515,10 +578,7 @@ mod tests {
     #[test]
     fn kms_scanout_encode_uses_output_description() {
         let p3 = ColorDescription::DISPLAY_P3_SRGB;
-        assert_eq!(
-            kms_scanout_encode_description(p3, false, None, None),
-            p3
-        );
+        assert_eq!(kms_scanout_encode_description(p3, false, None, None), p3);
     }
 
     #[test]
@@ -531,29 +591,53 @@ mod tests {
     }
 
     #[test]
-    fn hdr_render_active_requires_env_and_flags() {
+    fn hdr_render_active_follows_settings_and_kms() {
         std::env::remove_var("FOCALDESK_HDR_RENDER");
         std::env::remove_var("FOCALDESK_HDR");
-        assert!(!output_hdr_render_active(true, true));
+        assert!(!output_hdr_render_active(true, true, false));
+        assert!(output_hdr_render_active(true, true, true));
+        assert!(!output_hdr_pq_test_encode_active(true, true, true));
+
         std::env::set_var("FOCALDESK_HDR_RENDER", "1");
-        assert!(output_hdr_render_active(true, true));
+        assert!(output_hdr_pq_test_encode_active(true, true, false));
+        assert!(!output_hdr_pq_test_encode_active(true, true, true));
         std::env::remove_var("FOCALDESK_HDR_RENDER");
-        std::env::set_var("FOCALDESK_HDR", "1");
-        assert!(output_hdr_render_active(true, true));
-        assert!(!output_hdr_render_active(false, true));
-        assert!(!output_hdr_render_active(true, false));
+
+        std::env::set_var("FOCALDESK_HDR", "0");
+        assert!(!output_hdr_render_active(true, true, true));
+        assert!(!hdr_runtime_may_apply_kms(true));
         std::env::remove_var("FOCALDESK_HDR");
+
+        assert!(hdr_runtime_may_apply_kms(true));
+        assert!(!output_hdr_render_active(false, true, true));
+        assert!(!output_hdr_render_active(true, false, true));
+    }
+
+    #[test]
+    fn wp_color_wide_gamut_defaults_on_with_lut() {
+        std::env::remove_var("FOCALDESK_WP_COLOR_WIDE");
+        assert!(!wp_color_wide_gamut_enabled(false));
+        assert!(wp_color_wide_gamut_enabled(true));
+        std::env::set_var("FOCALDESK_WP_COLOR_WIDE", "0");
+        assert!(!wp_color_wide_gamut_enabled(true));
+        std::env::set_var("FOCALDESK_WP_COLOR_WIDE", "1");
+        assert!(wp_color_wide_gamut_enabled(false));
+        std::env::remove_var("FOCALDESK_WP_COLOR_WIDE");
     }
 
     #[test]
     fn display_p3_output_produces_non_identity_scene_matrix() {
-        let m = scene_to_output_matrix(
-            ColorDescription::DISPLAY_P3_SRGB,
-            RenderingIntent::Relative,
-        );
-        let identity = m[0][0] == 1.0 && m[0][1] == 0.0 && m[0][2] == 0.0
-            && m[1][0] == 0.0 && m[1][1] == 1.0 && m[1][2] == 0.0
-            && m[2][0] == 0.0 && m[2][1] == 0.0 && m[2][2] == 1.0;
+        let m =
+            scene_to_output_matrix(ColorDescription::DISPLAY_P3_SRGB, RenderingIntent::Relative);
+        let identity = m[0][0] == 1.0
+            && m[0][1] == 0.0
+            && m[0][2] == 0.0
+            && m[1][0] == 0.0
+            && m[1][1] == 1.0
+            && m[1][2] == 0.0
+            && m[2][0] == 0.0
+            && m[2][1] == 0.0
+            && m[2][2] == 1.0;
         assert!(!identity, "Display P3 output should remap scene primaries");
     }
 

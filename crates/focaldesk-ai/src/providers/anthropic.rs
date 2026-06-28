@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::provider::AiProvider;
-use crate::types::{ChatMessage, ChatRequest, ChatResponse, ChatRole, ProviderInfo, ProviderModelInfo};
+use crate::types::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ProviderInfo, ProviderModelInfo,
+};
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {

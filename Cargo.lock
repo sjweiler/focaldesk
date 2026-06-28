@@ -1651,6 +1651,7 @@ version = "0.1.0"
 dependencies = [
  "focaldesk-config",
  "focaldesk-logging",
+ "focaldesk-power",
  "focaldesk-settings-core",
  "serde",
  "serde_json",
@@ -1698,6 +1699,7 @@ name = "focaldesk-portal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "focaldesk-ipc",
  "serde",
  "serde_json",
  "wayland-client",
@@ -1706,6 +1708,9 @@ dependencies = [
 [[package]]
 name = "focaldesk-power"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "focaldesk-resources"
@@ -1803,8 +1808,11 @@ dependencies = [
  "egui_glow",
  "focaldesk-ai",
  "focaldesk-config",
+ "focaldesk-ipc",
  "focaldesk-logging",
  "focaldesk-permissions",
+ "focaldesk-power",
+ "focaldesk-settings-core",
  "focaldesk-themes",
  "focaldesk-types",
  "fontdb 0.16.2",

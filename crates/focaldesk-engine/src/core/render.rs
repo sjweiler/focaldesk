@@ -16,13 +16,13 @@ use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::{ImportMem, Texture};
-use std::collections::HashMap;
 use smithay::desktop::Window;
 use smithay::desktop::{PopupManager, Space};
 use smithay::output::Output;
 use smithay::utils::Buffer;
 use smithay::utils::Transform;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
 
@@ -137,8 +137,12 @@ pub enum ChromeGlassPass {
 pub enum ClientCompositingMode {
     Sdr,
     /// sRGB-encoded chrome/wallpaper assets → scene-linear Rec.709.
-    LinearUi { srgb_to_linear: GlesTexProgram },
-    Linear { client_to_scene: GlesTexProgram },
+    LinearUi {
+        srgb_to_linear: GlesTexProgram,
+    },
+    Linear {
+        client_to_scene: GlesTexProgram,
+    },
 }
 
 impl ClientCompositingMode {
@@ -614,8 +618,13 @@ impl RenderState {
                 Size::from((w as i32, h as i32)),
                 false,
             )?;
-            self.output_icc_lut_gpu
-                .insert(output_id, OutputIccLutGpu { lut: lut.clone(), texture });
+            self.output_icc_lut_gpu.insert(
+                output_id,
+                OutputIccLutGpu {
+                    lut: lut.clone(),
+                    texture,
+                },
+            );
         }
         Ok(&self.output_icc_lut_gpu.get(&output_id).unwrap().texture)
     }
@@ -1584,8 +1593,10 @@ impl RenderState {
     ) -> Result<(), GlesError> {
         let linear_theme_storage;
         let theme = if inputs.client_compositing.ui_textures_linear()
-            || matches!(inputs.chrome_glass_pass, ChromeGlassPass::LinearUnderClients)
-        {
+            || matches!(
+                inputs.chrome_glass_pass,
+                ChromeGlassPass::LinearUnderClients
+            ) {
             linear_theme_storage = linearize_flow_theme(inputs.theme);
             &linear_theme_storage
         } else {
@@ -1701,7 +1712,12 @@ impl RenderState {
         );
 
         // xdg popups are included in [`Window::render_elements`] when [`PopupManager::commit`] runs.
-        self.draw_popup_elements(frame, inputs.ctx, inputs.popup_elements, &inputs.client_compositing)?;
+        self.draw_popup_elements(
+            frame,
+            inputs.ctx,
+            inputs.popup_elements,
+            &inputs.client_compositing,
+        )?;
 
         if inputs.ctx.active_output == inputs.ctx.rendering_output {
             self.draw_notifications(frame, inputs.ctx, inputs.notifications, inputs.fonts, theme)?;
@@ -1876,6 +1892,7 @@ impl RenderState {
             &[full_physical],
             [0.005, 0.008, 0.014, 0.72],
         )?;
+        self.draw_screensaver_background(frame, ctx, full_physical)?;
 
         let logical_w = (f64::from(ctx.output_size.0) / ctx.output_scale.x).round() as i32;
         let logical_h = (f64::from(ctx.output_size.1) / ctx.output_scale.y).round() as i32;
@@ -2036,6 +2053,40 @@ impl RenderState {
         )?;
 
         Ok(())
+    }
+
+    fn draw_screensaver_background(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        dst: Rectangle<i32, Physical>,
+    ) -> Result<(), GlesError> {
+        let Some(program) = self.chrome_shaders.screensaver.as_ref() else {
+            return Ok(());
+        };
+
+        let src = Rectangle::<f64, Buffer>::from_size(
+            (f64::from(dst.size.w), f64::from(dst.size.h)).into(),
+        );
+        let buffer_size = Size::<i32, Buffer>::from((dst.size.w, dst.size.h));
+        let damage = std::slice::from_ref(&dst);
+        let elapsed = ctx.now.duration_since(self.start_time).as_secs_f32();
+
+        frame.render_pixel_shader_to(
+            program,
+            src,
+            dst,
+            buffer_size,
+            Some(damage),
+            1.0,
+            &[
+                Uniform::new(
+                    "u_resolution",
+                    [dst.size.w.max(1) as f32, dst.size.h.max(1) as f32],
+                ),
+                Uniform::new("u_time", elapsed),
+            ],
+        )
     }
 
     fn draw_active_output_glow(
@@ -3106,11 +3157,11 @@ impl RenderState {
         let _ = Self::draw_top_bar(
             frame,
             top_bar,
-                layout.topbar.outer,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.top_bar,
-            );
+            layout.topbar.outer,
+            ctx.output_scale,
+            damage,
+            &legacy_theme.top_bar,
+        );
 
         let _ = Self::draw_beveled_panel(
             frame,
@@ -3191,11 +3242,11 @@ impl RenderState {
         let _ = Self::draw_beveled_panel(
             frame,
             &beveled,
-                layout.topbar.flow_field,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.panel_inner,
-            );
+            layout.topbar.flow_field,
+            ctx.output_scale,
+            damage,
+            &legacy_theme.panel_inner,
+        );
 
         let _ = Self::draw_beveled_panel(
             frame,
@@ -3668,12 +3719,8 @@ impl RenderState {
                         if let (Some(pulse_shader), Some(pulse_frame)) =
                             (self.chrome_shaders.pulse.as_ref(), flow_field_pulse)
                         {
-                            let pulse_color = [
-                                color[0].max(0.6),
-                                color[1].max(0.7),
-                                color[2].max(0.9),
-                                1.0,
-                            ];
+                            let pulse_color =
+                                [color[0].max(0.6), color[1].max(0.7), color[2].max(0.9), 1.0];
                             let _ = Self::draw_pulse(
                                 frame,
                                 pulse_shader,

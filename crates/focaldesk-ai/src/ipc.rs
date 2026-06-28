@@ -85,7 +85,8 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
             default_provider: service.default_provider().to_string(),
             providers: service.providers(),
         },
-        Ok(AiIpcRequest::ListModels { provider }) => match service.provider_models(&provider).await {
+        Ok(AiIpcRequest::ListModels { provider }) => match service.provider_models(&provider).await
+        {
             Ok(models) => AiIpcResponse::Models { provider, models },
             Err(err) => AiIpcResponse::Error {
                 message: err.to_string(),

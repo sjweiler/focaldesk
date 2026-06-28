@@ -146,7 +146,8 @@ pub fn prepare_output(
         output_scale,
         buffer_scale,
         hdr_supported,
-        hdr_enabled,
+        hdr_requested,
+        hdr_kms_applied,
     ) = {
         let desk_output = state
             .outputs
@@ -159,7 +160,8 @@ pub fn prepare_output(
             desk_output.scale,
             desk_output.scale_factor.round().max(1.0) as i32,
             desk_output.hdr_supported,
-            desk_output.hdr_enabled,
+            desk_output.hdr_requested,
+            desk_output.hdr_kms_applied,
         )
     };
 
@@ -188,7 +190,8 @@ pub fn prepare_output(
         &layout,
         UiBuildOptions {
             hdr_supported,
-            hdr_enabled,
+            hdr_requested,
+            hdr_kms_applied,
             workspace_count,
             active_workspace,
             ai_flow_mode,
@@ -272,7 +275,14 @@ pub fn prepare_output(
         }
     };
 
+    let lut_shader_before = state.render.chrome_shaders.output_encode_lut.is_some();
     state.render.ensure_shader_programs(renderer)?;
+    if !lut_shader_before && state.render.chrome_shaders.output_encode_lut.is_some() {
+        focaldesk_logging::flog_info!(
+            "ICC LUT shader ready; refreshing wp_color preferred identities"
+        );
+        crate::core::wayland::color_management_protocol::notify_preferred_color_changed(state);
+    }
     // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
     state.render.ensure_wallpaper_loaded(renderer);
 

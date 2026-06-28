@@ -17,8 +17,8 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    effective_surface_render_state, force_linear_surfaces, ColorDescription,
-    RenderingIntent, SurfaceColorRenderState, SurfaceColorState,
+    effective_surface_render_state, force_linear_surfaces, ColorDescription, RenderingIntent,
+    SurfaceColorRenderState, SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
@@ -70,8 +70,10 @@ use focaldesk_logging::{
     flog, flog_error, flog_info, flog_warn, log_file_path_candidates, set_log_level, FLogLevel,
 };
 use focaldesk_notifications::NotificationManager;
+use focaldesk_power::{PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
-    load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings, OutputConfig,
+    load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings, LidCloseAction,
+    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings,
     PrivacySettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
@@ -132,8 +134,9 @@ use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
 use focaldesk_ui::ai_permission::AiPermissionDialog;
 use focaldesk_ui::dialog::DialogAction;
-use focaldesk_ui::dialog::{Dialog, DialogId};
+use focaldesk_ui::dialog::{Dialog, DialogButton, DialogId, DialogKind, DialogState};
 use focaldesk_ui::dialog_layout::layout_dialog;
+use focaldesk_ui::portalpermission::{PortalPermissionDialog, PortalPermissionKind, PortalTarget};
 use focaldesk_ui::ui_builder::{
     SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID,
     SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_1_ID, SIDEBAR_WORKSPACE_2_ID,
@@ -157,6 +160,10 @@ fn clamp_rect_to_bounds(
     geometry.loc.x = geometry.loc.x.clamp(bounds.loc.x, max_x);
     geometry.loc.y = geometry.loc.y.clamp(bounds.loc.y, max_y);
     geometry
+}
+
+fn should_wait_for_lid_open_on_resume(last_lid_state: Option<bool>) -> bool {
+    last_lid_state == Some(true)
 }
 
 pub(crate) const DND_CURSOR_ENDED: u8 = 0;
@@ -385,6 +392,8 @@ pub struct OutputState {
     pub scale: Scale<f64>,
     pub hdr_supported: bool,
     pub hdr_requested: bool,
+    /// KMS connector + 10-bit scanout HDR state is live on this output.
+    pub hdr_kms_applied: bool,
     pub hdr_enabled: bool,
     /// EDID Type-1 HDR static metadata (nits), when detected.
     pub edid_hdr_max_luminance_nits: Option<f32>,
@@ -472,6 +481,7 @@ pub struct DesktopInit {
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
     pub privacy: PrivacySettings,
+    pub power: PowerSettings,
     pub debug: DebugSettings,
 }
 
@@ -536,6 +546,7 @@ pub struct DesktopState {
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
     pending_ai_permission_responses: HashMap<DialogId, (u64, mpsc::Sender<IpcResponse>)>,
+    pending_portal_chooser_responses: HashMap<DialogId, (u64, mpsc::Sender<IpcResponse>)>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
     /// Latest DRM offscreen texture per output for portal/OBS capture.
     pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
@@ -560,6 +571,15 @@ pub struct DesktopState {
     pub seat_name: String,
     pub focused_window: Option<WindowId>,
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
+    last_user_activity_at: Instant,
+    idle_lock_triggered: bool,
+    idle_suspend_triggered: bool,
+    low_battery_triggered: bool,
+    lid_close_triggered: bool,
+    last_lid_state: Option<bool>,
+    lid_resume_waiting_for_open: bool,
+    last_power_poll_at: Instant,
+    last_power_snapshot: Option<PowerSnapshot>,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
     pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
@@ -578,6 +598,7 @@ pub struct DesktopState {
     pub client_wayland_display: String,
     pub apps: AppSettings,
     pub privacy: PrivacySettings,
+    pub power: PowerSettings,
     pub debug: DebugSettings,
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
     settings_ipc_watchers: Vec<DesktopIpcWatcher>,
@@ -616,6 +637,8 @@ pub struct DesktopState {
     pub theme: ThemeManager,
     /// Latest committed color state per Wayland surface render id.
     pub surface_colors: HashMap<Id, SurfaceColorRenderState>,
+    /// Last output used for `wp_color` surface feedback (detect cross-monitor moves).
+    wp_color_surface_outputs: HashMap<wayland_server::backend::ObjectId, OutputId>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
     pub sidebar_pulse: Option<SidebarPulse>,
@@ -624,6 +647,7 @@ pub struct DesktopState {
     pub clock_pulse: Option<ClockPulse>,
     ai_flow_mode_cache: AiFlowMode,
     ai_flow_mode_last_poll: Instant,
+    flow_field_anim_last_damage: Instant,
     pub ui_sound_player: UiSoundPlayer,
     last_sidebar_hover_sound_target: Option<(OutputId, ElementId)>,
     last_clock_text: String,
@@ -764,6 +788,176 @@ impl DesktopState {
         }
     }
 
+    pub fn process_idle_timers(&mut self) {
+        let now = Instant::now();
+        let idle_for = now.saturating_duration_since(self.last_user_activity_at);
+
+        if let Some(blank_timeout) = self.power.blank_screen_minutes {
+            let blank_timeout = Duration::from_secs(u64::from(blank_timeout) * 60);
+            if idle_for >= blank_timeout && !self.lock_screen.active && !self.idle_lock_triggered {
+                self.idle_lock_triggered = true;
+                self.lock_session();
+            }
+        }
+
+        if let Some(suspend_timeout) = self.power.suspend_minutes {
+            let suspend_timeout = Duration::from_secs(u64::from(suspend_timeout) * 60);
+            if idle_for >= suspend_timeout && !self.idle_suspend_triggered {
+                self.idle_suspend_triggered = true;
+                if let Err(err) = focaldesk_power::PowerManager::new().suspend() {
+                    flog_warn!("idle suspend failed: {err}");
+                }
+            }
+        }
+    }
+
+    pub fn process_power_timers(&mut self) {
+        let now = Instant::now();
+        let poll_interval = focaldesk_power::command_timeout();
+        if now.saturating_duration_since(self.last_power_poll_at) < poll_interval {
+            return;
+        }
+
+        self.last_power_poll_at = now;
+        let snapshot = PowerManager::new().snapshot();
+        let snapshot_changed = self.last_power_snapshot.as_ref() != Some(&snapshot);
+        self.last_power_snapshot = Some(snapshot.clone());
+
+        if snapshot_changed {
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+
+        let on_ac = snapshot.line_power_online.unwrap_or(false);
+        let low_battery = snapshot.is_low_battery(LOW_BATTERY_THRESHOLD_PERCENT);
+
+        if on_ac || !low_battery {
+            self.low_battery_triggered = false;
+            return;
+        }
+
+        if self.low_battery_triggered {
+            return;
+        }
+
+        self.low_battery_triggered = true;
+        self.handle_low_battery_action(&snapshot);
+    }
+
+    fn record_user_activity(&mut self) {
+        self.last_user_activity_at = Instant::now();
+        self.idle_lock_triggered = false;
+        self.idle_suspend_triggered = false;
+    }
+
+    pub(crate) fn on_resume(&mut self) {
+        self.last_user_activity_at = Instant::now();
+        self.idle_lock_triggered = false;
+        self.idle_suspend_triggered = false;
+        self.lid_close_triggered = false;
+        self.lid_resume_waiting_for_open = should_wait_for_lid_open_on_resume(self.last_lid_state);
+        self.last_power_snapshot = None;
+        // Force a fresh battery/AC snapshot on the next timer pass after wake.
+        self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
+        self.render.egui.refresh_power_status_now();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn handle_lid_switch(&mut self, closed: bool) {
+        if !closed {
+            self.lid_resume_waiting_for_open = false;
+        } else if self.lid_resume_waiting_for_open {
+            self.last_lid_state = Some(true);
+            return;
+        }
+
+        let state_changed = self.last_lid_state != Some(closed);
+        self.last_lid_state = Some(closed);
+
+        if !closed {
+            self.lid_close_triggered = false;
+            if state_changed {
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+            return;
+        }
+
+        if self.lid_close_triggered {
+            return;
+        }
+
+        self.lid_close_triggered = true;
+        self.handle_lid_close_action();
+    }
+
+    fn handle_low_battery_action(&mut self, snapshot: &PowerSnapshot) {
+        let message = snapshot
+            .lowest_battery_percentage()
+            .map(|value| format!("Battery low: {value}%"))
+            .unwrap_or_else(|| "Battery low".to_string());
+
+        match self.power.low_battery_action {
+            LowBatteryAction::NotifyOnly => {
+                self.notifications
+                    .push_persistent("Power", format!("{message}."));
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+            LowBatteryAction::Suspend => {
+                self.notifications
+                    .push_persistent("Power", format!("{message}. Suspending."));
+                self.lock_session();
+                if let Err(err) = PowerManager::new().suspend() {
+                    flog_warn!("low battery suspend failed: {err}");
+                }
+            }
+            LowBatteryAction::Hibernate => {
+                self.notifications
+                    .push_persistent("Power", format!("{message}. Hibernating."));
+                self.lock_session();
+                if let Err(err) = PowerManager::new().hibernate() {
+                    flog_warn!("low battery hibernate failed: {err}");
+                }
+            }
+            LowBatteryAction::PowerOff => {
+                self.notifications
+                    .push_persistent("Power", format!("{message}. Powering off."));
+                if let Err(err) = PowerManager::new().power_off() {
+                    flog_warn!("low battery poweroff failed: {err}");
+                }
+            }
+        }
+    }
+
+    fn handle_lid_close_action(&mut self) {
+        match self.power.lid_close_action {
+            LidCloseAction::Suspend => {
+                self.lock_session();
+                if let Err(err) = PowerManager::new().suspend() {
+                    flog_warn!("lid close suspend failed: {err}");
+                }
+            }
+            LidCloseAction::BlankScreen | LidCloseAction::LockScreen => {
+                self.lock_session();
+            }
+            LidCloseAction::DoNothing => {}
+        }
+    }
+
+    fn reload_settings_from_disk(&mut self) {
+        let old_config = self.settings_ipc_config.clone();
+        let config = load_config();
+        self.notify_config_changes(&old_config, &config);
+        self.settings_ipc_config = config.clone();
+        self.apply_config(config);
+
+        let settings = load_settings();
+        self.apps = settings.apps;
+        self.privacy = settings.privacy;
+        self.power = settings.power;
+        self.apply_power_settings();
+        self.apply_debug_settings(settings.debug);
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
     fn handle_settings_ipc_request(
         &mut self,
         request: IpcRequest,
@@ -771,8 +965,7 @@ impl DesktopState {
     ) -> Option<IpcResponse> {
         match request {
             IpcRequest::Get { key } => {
-                match get_config_key(&load_config(), &key).or_else(|| get_runtime_key(self, &key))
-                {
+                match get_config_key(&load_config(), &key).or_else(|| get_runtime_key(self, &key)) {
                     Some(value) => Some(IpcResponse::Value { key, value }),
                     None => Some(IpcResponse::Error {
                         message: format!("unknown config key: {key}"),
@@ -831,17 +1024,7 @@ impl DesktopState {
                 Some(IpcResponse::Ok)
             }
             IpcRequest::Reload => {
-                let old_config = self.settings_ipc_config.clone();
-                let config = load_config();
-                self.notify_config_changes(&old_config, &config);
-                self.settings_ipc_config = config.clone();
-                self.apply_config(config);
-
-                let settings = load_settings();
-                self.apps = settings.apps;
-                self.privacy = settings.privacy;
-                self.apply_debug_settings(settings.debug);
-                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                self.reload_settings_from_disk();
                 Some(IpcResponse::Ok)
             }
             IpcRequest::IdentifyDisplays => {
@@ -899,12 +1082,48 @@ impl DesktopState {
                 );
                 None
             }
+            IpcRequest::PortalChooserPrompt {
+                request_id,
+                title,
+                message,
+                choices,
+            } => {
+                if self.active_dialog.is_some()
+                    || !self.pending_ai_permission_responses.is_empty()
+                    || !self.pending_portal_chooser_responses.is_empty()
+                {
+                    return Some(IpcResponse::Error {
+                        message: "another modal dialog is already active".to_string(),
+                    });
+                }
+
+                if self.outputs.is_empty() {
+                    return Some(IpcResponse::Error {
+                        message: "no output available for portal chooser dialog".to_string(),
+                    });
+                }
+
+                if choices.is_empty() {
+                    return Some(IpcResponse::Error {
+                        message: "portal chooser dialog requires at least one choice".to_string(),
+                    });
+                }
+
+                self.open_portal_chooser_dialog(request_id, title, message, choices, response);
+                None
+            }
             IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),
             },
             IpcRequest::GetDisplayRuntimeStatus => Some(IpcResponse::DisplayRuntimeStatus {
                 outputs: self.runtime_display_statuses(),
+            }),
+            IpcRequest::GetPowerSnapshot => Some(IpcResponse::PowerSnapshot {
+                snapshot: self
+                    .last_power_snapshot
+                    .clone()
+                    .unwrap_or_else(|| PowerManager::new().snapshot()),
             }),
             IpcRequest::GetAll | IpcRequest::SetValue { .. } => Some(IpcResponse::Error {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
@@ -967,6 +1186,7 @@ impl DesktopState {
                 output.hdr_enabled = crate::core::color::output_hdr_render_active(
                     output.hdr_requested,
                     output.hdr_supported,
+                    output.hdr_kms_applied,
                 );
             }
             self.update_output_size(output_id, physical_size, scale_factor);
@@ -1143,6 +1363,18 @@ impl DesktopState {
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
+    fn apply_power_settings(&self) {
+        let profile = match self.power.performance_mode {
+            PerformanceMode::Balanced => "balanced",
+            PerformanceMode::Performance => "performance",
+            PerformanceMode::PowerSaver => "power-saver",
+        };
+
+        if let Err(err) = PowerManager::new().set_performance_profile(profile) {
+            flog_warn!("failed to apply performance mode {profile}: {err}");
+        }
+    }
+
     /// Clears and returns whether the host (nested) window should begin a platform move drag.
     pub fn output_at_logical_point(&self, p: Point<f64, Logical>) -> Option<OutputId> {
         self.outputs
@@ -1256,7 +1488,10 @@ impl DesktopState {
 
     fn refresh_ai_flow_mode(&mut self) {
         if !self.pending_ai_permission_responses.is_empty() {
-            self.ai_flow_mode_cache = AiFlowMode::PermissionWait;
+            if self.ai_flow_mode_cache != AiFlowMode::PermissionWait {
+                self.ai_flow_mode_cache = AiFlowMode::PermissionWait;
+                self.mark_flow_field_animation_damage(true);
+            }
             return;
         }
 
@@ -1266,12 +1501,42 @@ impl DesktopState {
         }
         self.ai_flow_mode_last_poll = now;
 
+        let previous = self.ai_flow_mode_cache;
         self.ai_flow_mode_cache = match send_ai_request(&AiIpcRequest::Status) {
             Ok(AiIpcResponse::Status { status }) => ai_flow_mode_from_status(&status),
             Ok(AiIpcResponse::Error { .. }) => AiFlowMode::Error,
             Ok(_) => AiFlowMode::Error,
             Err(_) => AiFlowMode::Error,
         };
+        if self.ai_flow_mode_cache != previous {
+            self.mark_flow_field_animation_damage(true);
+        }
+    }
+
+    fn mark_flow_field_animation_damage(&mut self, force: bool) {
+        const INTERVAL: Duration = Duration::from_millis(50);
+        let now = Instant::now();
+        if !force && now.saturating_duration_since(self.flow_field_anim_last_damage) < INTERVAL {
+            return;
+        }
+        self.flow_field_anim_last_damage = now;
+
+        let rects: Vec<(OutputId, Rectangle<i32, Logical>)> = self
+            .outputs
+            .iter()
+            .map(|(output_id, output)| {
+                let layout = build_chrome_layout(
+                    output.logical_size,
+                    self.chrome.metrics.topbar_h,
+                    self.chrome.metrics.sidebar_w,
+                );
+                (*output_id, layout.topbar.flow_field)
+            })
+            .collect();
+
+        for (output_id, rect) in rects {
+            self.mark_output_logical_damage(output_id, rect, 2, DamageSource::Unknown);
+        }
     }
 
     fn ui_element_at_pointer_for_output(&self, output_id: OutputId) -> Option<&UiElement> {
@@ -1296,7 +1561,8 @@ impl DesktopState {
             &layout,
             UiBuildOptions {
                 hdr_supported: output.hdr_supported,
-                hdr_enabled: output.hdr_enabled,
+                hdr_requested: output.hdr_requested,
+                hdr_kms_applied: output.hdr_kms_applied,
                 workspace_count: self.workspace_names.len(),
                 active_workspace: output.active_workspace.0,
                 ai_flow_mode,
@@ -2386,6 +2652,10 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
+            UiAction::ReloadSettings => {
+                self.reload_settings_from_disk();
+            }
+
             UiAction::CreateWorkspace(name) => {
                 self.create_workspace_from_dialog(name);
             }
@@ -2488,19 +2758,54 @@ impl DesktopState {
             focaldesk_ui::types::SystemCommand::Lock => {
                 self.lock_session();
             }
+            focaldesk_ui::types::SystemCommand::Suspend => {
+                self.lock_session();
+                if let Err(err) = PowerManager::new().suspend() {
+                    flog_error!("failed to start suspend: {err}");
+                }
+            }
+            focaldesk_ui::types::SystemCommand::Hibernate => {
+                self.lock_session();
+                if let Err(err) = PowerManager::new().hibernate() {
+                    flog_error!("failed to start hibernate: {err}");
+                }
+            }
             focaldesk_ui::types::SystemCommand::Logout => {
                 self.running = false;
             }
             focaldesk_ui::types::SystemCommand::Restart => {
-                if let Err(err) = focaldesk_power::PowerManager::new().reboot() {
+                if let Err(err) = PowerManager::new().reboot() {
                     flog_error!("failed to start reboot: {err}");
                 }
             }
             focaldesk_ui::types::SystemCommand::Shutdown => {
-                if let Err(err) = focaldesk_power::PowerManager::new().power_off() {
+                if let Err(err) = PowerManager::new().power_off() {
                     flog_error!("failed to start poweroff: {err}");
                 }
             }
+        }
+    }
+
+    fn dispatch_power_button_action(&mut self) {
+        match self.power.power_button_action {
+            PowerButtonAction::ShowPowerMenu => {
+                self.render
+                    .egui
+                    .open_panel(PanelKind::Power, self.focused_output);
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+            PowerButtonAction::Suspend => {
+                self.lock_session();
+                if let Err(err) = PowerManager::new().suspend() {
+                    flog_error!("failed to start suspend from power button: {err}");
+                }
+            }
+            PowerButtonAction::PowerOff => {
+                if let Err(err) = PowerManager::new().power_off() {
+                    flog_error!("failed to start poweroff from power button: {err}");
+                }
+            }
+            PowerButtonAction::DoNothing => {}
         }
     }
 
@@ -2543,6 +2848,7 @@ impl DesktopState {
         if authenticated {
             self.lock_screen.message = "Unlocked".to_string();
             self.lock_screen.pulse(LockPulseKind::Accepted);
+            self.record_user_activity();
         } else {
             self.lock_screen.message = "Wrong password".to_string();
             self.lock_screen.pulse(LockPulseKind::Rejected);
@@ -2732,6 +3038,7 @@ impl DesktopState {
                 scale: Scale::from((scale_factor, scale_factor)),
                 hdr_supported: false,
                 hdr_requested: false,
+                hdr_kms_applied: false,
                 hdr_enabled: false,
                 edid_hdr_max_luminance_nits: None,
                 edid_hdr_max_fall_nits: None,
@@ -3023,10 +3330,54 @@ impl DesktopState {
         x11_loc + (compositor_parent_loc - x11_parent_loc)
     }
 
-    fn output_id_for_space_output(&self, output: &Output) -> Option<OutputId> {
+    pub(crate) fn output_id_for_space_output(&self, output: &Output) -> Option<OutputId> {
         self.outputs
             .iter()
             .find_map(|(id, state)| (&state.handle == output).then_some(*id))
+    }
+
+    /// Output whose profile should be advertised via `wp_color` surface feedback.
+    pub(crate) fn preferred_output_id_for_surface(&self, surface: &WlSurface) -> OutputId {
+        if let Some(window) = self.window_for_wl_surface(surface) {
+            return self.preferred_output_id_for_window(&window);
+        }
+        self.focused_output
+    }
+
+    fn preferred_output_id_for_window(&self, window: &Window) -> OutputId {
+        let outputs = self.space.outputs_for_element(window);
+        if outputs.is_empty() {
+            return self.focused_output;
+        }
+        if outputs.len() == 1 {
+            return self
+                .output_id_for_space_output(&outputs[0])
+                .unwrap_or(self.focused_output);
+        }
+
+        let Some(window_geo) = self.space.element_geometry(window) else {
+            return self.focused_output;
+        };
+
+        let mut best = self.focused_output;
+        let mut best_area = 0i64;
+        for output in &outputs {
+            let Some(output_id) = self.output_id_for_space_output(output) else {
+                continue;
+            };
+            let Some(output_geo) = self.space.output_geometry(output) else {
+                continue;
+            };
+            let overlap = window_geo
+                .intersection(output_geo)
+                .map(|rect| i64::from(rect.size.w) * i64::from(rect.size.h))
+                .unwrap_or(0);
+            if overlap > best_area {
+                best_area = overlap;
+                best = output_id;
+            }
+        }
+        best
     }
 
     /// Default map location for a new toplevel: top-left of the work recess (global logical).
@@ -3161,11 +3512,7 @@ impl DesktopState {
         })
     }
 
-    pub fn output_has_active_flow_field_pulse(
-        &self,
-        output_id: OutputId,
-        now: Instant,
-    ) -> bool {
+    pub fn output_has_active_flow_field_pulse(&self, output_id: OutputId, now: Instant) -> bool {
         self.flow_field_pulse_for_output(output_id, now).is_some()
     }
 
@@ -3697,7 +4044,7 @@ impl DesktopState {
         let debug = init.debug.clone();
         apply_debug_log_level(debug.log_level);
 
-        Self {
+        let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
             active_dialog: None,
@@ -3744,6 +4091,7 @@ impl DesktopState {
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
             pending_ai_permission_responses: HashMap::new(),
+            pending_portal_chooser_responses: HashMap::new(),
             portal_frame_cache: HashMap::new(),
             portal_capture_source: HashMap::new(),
             portal_offscreen_targets: HashMap::new(),
@@ -3766,11 +4114,21 @@ impl DesktopState {
 
             notifications: init.notifications,
             lock_screen: LockScreenState::new(),
+            last_user_activity_at: Instant::now(),
+            idle_lock_triggered: false,
+            idle_suspend_triggered: false,
+            low_battery_triggered: false,
+            lid_close_triggered: false,
+            last_lid_state: None,
+            lid_resume_waiting_for_open: false,
+            last_power_poll_at: Instant::now(),
+            last_power_snapshot: None,
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
             privacy: init.privacy,
+            power: init.power,
             debug: debug.clone(),
             settings_ipc_rx: start_desktop_settings_ipc(),
             settings_ipc_watchers: Vec::new(),
@@ -3790,6 +4148,7 @@ impl DesktopState {
             screenshot_seq: 0,
             theme: init.theme_manager,
             surface_colors: HashMap::new(),
+            wp_color_surface_outputs: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
             sidebar_pulse: None,
@@ -3798,11 +4157,15 @@ impl DesktopState {
             clock_pulse: None,
             ai_flow_mode_cache: AiFlowMode::Idle,
             ai_flow_mode_last_poll: Instant::now(),
+            flow_field_anim_last_damage: Instant::now(),
             ui_sound_player: UiSoundPlayer::new(),
             last_sidebar_hover_sound_target: None,
             last_clock_text: String::new(),
             next_dialog_id: 1,
-        }
+        };
+
+        state.apply_power_settings();
+        state
     }
 
     pub fn alloc_window_id(&mut self) -> WindowId {
@@ -4065,6 +4428,55 @@ impl DesktopState {
         dialog_id
     }
 
+    fn open_portal_chooser_dialog(
+        &mut self,
+        request_id: u64,
+        title: String,
+        message: String,
+        choices: Vec<String>,
+        response: mpsc::Sender<IpcResponse>,
+    ) -> DialogId {
+        let dialog_id = self.alloc_dialog_id();
+        let owner_output = self.focused_output;
+        let output = self
+            .outputs
+            .get(&owner_output)
+            .expect("portal chooser dialog requires at least one output");
+        let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
+
+        let mut buttons = vec![DialogButton {
+            label: "Cancel".into(),
+            action: DialogAction::Cancel,
+        }];
+        buttons.extend(
+            choices
+                .iter()
+                .enumerate()
+                .map(|(idx, choice)| DialogButton {
+                    label: choice.clone(),
+                    action: DialogAction::Custom((idx + 1) as u32),
+                }),
+        );
+
+        let dialog = Dialog {
+            id: dialog_id,
+            kind: DialogKind::Permission,
+            title,
+            message,
+            buttons,
+            modal: true,
+            dismissible: false,
+            state: DialogState::Open,
+            owner_output,
+            bounds: screen,
+        };
+
+        self.pending_portal_chooser_responses
+            .insert(dialog_id, (request_id, response));
+        self.open_dialog(dialog);
+        dialog_id
+    }
+
     pub fn close_dialog(&mut self, id: DialogId) {
         self.dialogs.retain(|d| d.id != id);
 
@@ -4076,6 +4488,25 @@ impl DesktopState {
     }
 
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
+        if let Some((request_id, response)) = self.pending_portal_chooser_responses.remove(&id) {
+            let dialog = self.dialogs.iter().find(|dialog| dialog.id == id);
+            let selected = match action {
+                DialogAction::Cancel => None,
+                DialogAction::Confirm => None,
+                DialogAction::Custom(choice_idx) if choice_idx > 0 => dialog
+                    .and_then(|dialog| dialog.buttons.get(choice_idx as usize))
+                    .map(|button| button.label.clone()),
+                DialogAction::Custom(_) => None,
+            };
+
+            let _ = response.send(IpcResponse::PortalChooserDecision {
+                request_id,
+                selected,
+            });
+            self.close_dialog(id);
+            return;
+        }
+
         let maybe_ai_response =
             self.pending_ai_permission_responses
                 .remove(&id)
@@ -4338,6 +4769,21 @@ impl DesktopState {
 
             if !commit_damage_queued {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+        }
+
+        if let Some(window) = committed_window {
+            if let Some(toplevel) = window.wl_surface() {
+                let output_id = self.preferred_output_id_for_window(&window);
+                let prev = self
+                    .wp_color_surface_outputs
+                    .insert(toplevel.id(), output_id);
+                if prev != Some(output_id) {
+                    crate::core::wayland::color_management_protocol::notify_surface_feedback_preferred(
+                        self,
+                        &toplevel,
+                    );
+                }
             }
         }
     }
@@ -4782,6 +5228,13 @@ impl DesktopState {
                     return FilterResult::<()>::Intercept(());
                 }
 
+                if matches!(state, FlowKeyState::Pressed)
+                    && matches!(sym, keysyms::KEY_XF86PowerOff | keysyms::KEY_XF86Sleep)
+                {
+                    ds.dispatch_power_button_action();
+                    return FilterResult::<()>::Intercept(());
+                }
+
                 if matches!(state, FlowKeyState::Pressed) {
                     resolved_action = keybinds.resolve(sym, mask);
                     if resolved_action.is_some() {
@@ -5038,6 +5491,20 @@ impl DesktopState {
     pub fn handle_input(&mut self, event: FlowInputEvent) {
         if self.debug.show_input_events {
             focaldesk_logging::logging::flog(FLogLevel::Debug, format!("input event: {event:?}"));
+        }
+
+        if !self.lock_screen.active
+            && matches!(
+                event,
+                FlowInputEvent::Key { .. }
+                    | FlowInputEvent::PointerMoved { .. }
+                    | FlowInputEvent::PointerButton { .. }
+                    | FlowInputEvent::PointerScroll { .. }
+                    | FlowInputEvent::PointerEntered
+                    | FlowInputEvent::PointerLeft
+            )
+        {
+            self.record_user_activity();
         }
 
         if self.lock_screen.active {
@@ -5580,6 +6047,7 @@ impl DesktopState {
             || self.clock_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
             })
+            || self.lock_screen.active
             || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
 
@@ -5593,6 +6061,7 @@ impl DesktopState {
             || self.output_has_active_topbar_pulse(output_id, now)
             || self.output_has_active_flow_field_pulse(output_id, now)
             || self.output_has_active_clock_pulse(output_id, now)
+            || self.lock_screen.active
             || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
 
@@ -5820,6 +6289,7 @@ impl DesktopState {
                     scale: Scale::from((scale, scale)),
                     hdr_supported: false,
                     hdr_requested: false,
+                    hdr_kms_applied: false,
                     hdr_enabled: false,
                     edid_hdr_max_luminance_nits: None,
                     edid_hdr_max_fall_nits: None,
@@ -5853,6 +6323,7 @@ impl DesktopState {
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();
         self.refresh_ai_flow_mode();
+        self.mark_flow_field_animation_damage(false);
     }
 
     /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
@@ -5860,14 +6331,20 @@ impl DesktopState {
         self.space.refresh();
     }
 
-    pub fn output_color_description(&self, output_id: focaldesk_types::OutputId) -> ColorDescription {
+    pub fn output_color_description(
+        &self,
+        output_id: focaldesk_types::OutputId,
+    ) -> ColorDescription {
         self.outputs
             .get(&output_id)
             .map(|output| output.color_description)
             .unwrap_or_else(crate::core::color::default_output_color_description)
     }
 
-    pub fn output_color_description_for(&self, output: &smithay::output::Output) -> ColorDescription {
+    pub fn output_color_description_for(
+        &self,
+        output: &smithay::output::Output,
+    ) -> ColorDescription {
         self.outputs
             .values()
             .find(|state| &state.handle == output)
@@ -5955,11 +6432,11 @@ impl DesktopState {
         let id = Id::from_wayland_resource(surface);
         let previous = self.surface_colors.get(&id).copied();
         if previous != Some(color) {
-            focaldesk_logging::flog(format!(
+            focaldesk_logging::flog_warn!(
                 "surface color applied: surface={id:?} transfer={:?} primaries={:?}",
                 color.description.transfer,
                 color.description.primaries
-            ));
+            );
         }
         self.surface_colors.insert(id, color);
     }
@@ -6713,7 +7190,7 @@ fn is_obs_like(app_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_rect_to_bounds, is_browser_like};
+    use super::{clamp_rect_to_bounds, is_browser_like, should_wait_for_lid_open_on_resume};
     use smithay::utils::Rectangle;
 
     #[test]
@@ -6747,6 +7224,13 @@ mod tests {
 
         assert_eq!(clamped.loc, (10, 20).into());
         assert_eq!(clamped.size, (100, 80).into());
+    }
+
+    #[test]
+    fn lid_resume_waits_for_open_only_after_closed_sleep() {
+        assert!(should_wait_for_lid_open_on_resume(Some(true)));
+        assert!(!should_wait_for_lid_open_on_resume(Some(false)));
+        assert!(!should_wait_for_lid_open_on_resume(None));
     }
 }
 

@@ -467,8 +467,8 @@ pub fn draw_flow_field(
         Uniform::new(
             "u_rect",
             [
-                rect_physical.loc.x as f32,
-                rect_physical.loc.y as f32,
+                0.0f32,
+                0.0f32,
                 rect_physical.size.w as f32,
                 rect_physical.size.h as f32,
             ],

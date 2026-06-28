@@ -106,7 +106,10 @@ mod tests {
             grid_size: LUT_GRID_SIZE as u32,
             rgb: vec![0; LUT_GRID_SIZE.pow(3) * 3],
         };
-        assert_eq!(lut.rgb.len(), LUT_GRID_SIZE * LUT_GRID_SIZE * LUT_GRID_SIZE * 3);
+        assert_eq!(
+            lut.rgb.len(),
+            LUT_GRID_SIZE * LUT_GRID_SIZE * LUT_GRID_SIZE * 3
+        );
         assert_eq!(lut.atlas_size(), (33 * 33, 33));
     }
 

@@ -4,9 +4,7 @@ use crate::core::color::{
     ColorDescription, ColorPrimaries, PrimariesChromaticity, TransferFunction,
 };
 use crate::core::icc_lut::{self, OutputIccLut};
-use lcms2::{
-    ColorSpaceSignature, Profile, ProfileClassSignature, Tag, TagSignature, ToneCurveRef,
-};
+use lcms2::{ColorSpaceSignature, Profile, ProfileClassSignature, Tag, TagSignature, ToneCurveRef};
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -44,7 +42,11 @@ pub struct ParsedIccProfile {
 }
 
 /// Read `length` bytes at `offset` from a client-supplied seekable fd.
-pub fn read_icc_from_fd(icc_profile: OwnedFd, offset: u32, length: u32) -> Result<Vec<u8>, IccError> {
+pub fn read_icc_from_fd(
+    icc_profile: OwnedFd,
+    offset: u32,
+    length: u32,
+) -> Result<Vec<u8>, IccError> {
     let length = length as usize;
     if length == 0 || length > MAX_ICC_BYTES {
         return Err(IccError::Invalid("bad size"));
@@ -217,7 +219,8 @@ fn chromaticity_is_valid(ch: &PrimariesChromaticity) -> bool {
 
 /// Build an sRGB-ish description from EDID base-block chromaticities (fallback).
 pub fn color_description_from_edid(edid: &[u8]) -> Option<ColorDescription> {
-    if edid.len() < 128 || edid.get(0..8) != Some([0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0].as_slice())
+    if edid.len() < 128
+        || edid.get(0..8) != Some([0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0].as_slice())
     {
         return None;
     }
@@ -371,7 +374,8 @@ fn profile_matches_monitor(
 
 /// Copy ICC bytes into a sealed read-only memfd for `wp_image_description_info_v1.icc_file`.
 pub fn memfd_from_bytes(data: &[u8]) -> Result<OwnedFd, std::io::Error> {
-    let name = CString::new("focaldesk-icc").map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let name = CString::new("focaldesk-icc")
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let raw = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
@@ -406,9 +410,8 @@ mod tests {
 
     #[test]
     fn edid_generated_profile_parses_if_present() {
-        let path = std::path::Path::new(env!("HOME")).join(
-            ".local/share/icc/edid-80cab7f6884553b4890a7fa9c986c84d.icc",
-        );
+        let path = std::path::Path::new(env!("HOME"))
+            .join(".local/share/icc/edid-80cab7f6884553b4890a7fa9c986c84d.icc");
         if !path.exists() {
             return;
         }
@@ -431,7 +434,9 @@ mod tests {
     fn edid_md5_hex_is_lowercase_32_chars() {
         let hash = edid_md5_hex(b"edid-bytes");
         assert_eq!(hash.len(), 32);
-        assert!(hash.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(hash
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -452,8 +457,16 @@ mod tests {
         let desc = color_description_from_edid(&edid).expect("edid color");
         match desc.primaries {
             ColorPrimaries::Custom(ch) => {
-                assert!(ch.r[0] > 0.0 && ch.r[0] < 1.0, "red x out of range: {}", ch.r[0]);
-                assert!(ch.g[1] > 0.0 && ch.g[1] < 1.0, "green y out of range: {}", ch.g[1]);
+                assert!(
+                    ch.r[0] > 0.0 && ch.r[0] < 1.0,
+                    "red x out of range: {}",
+                    ch.r[0]
+                );
+                assert!(
+                    ch.g[1] > 0.0 && ch.g[1] < 1.0,
+                    "green y out of range: {}",
+                    ch.g[1]
+                );
             }
             other => panic!("expected custom primaries, got {other:?}"),
         }

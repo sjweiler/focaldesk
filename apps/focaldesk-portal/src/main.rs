@@ -1,56 +1,12 @@
 use anyhow::{Context, Result};
+use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
 use serde::Deserialize;
 use std::env;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 mod wayland_outputs;
-
-const DEFAULT_OUTPUT: &str = "focaldesk-nested";
-const MENU_COMMANDS: &[MenuCommand<'_>] = &[
-    MenuCommand {
-        program: "zenity",
-        args: &[
-            "--list",
-            "--width=520",
-            "--height=320",
-            "--title=Select a source to share",
-            "--text=Select a source to share",
-            "--column=Source",
-        ],
-    },
-    MenuCommand {
-        program: "fuzzel",
-        args: &["--dmenu"],
-    },
-    MenuCommand {
-        program: "wofi",
-        args: &["--dmenu"],
-    },
-    MenuCommand {
-        program: "wmenu",
-        args: &[],
-    },
-    MenuCommand {
-        program: "bemenu",
-        args: &[],
-    },
-    MenuCommand {
-        program: "rofi",
-        args: &["-dmenu"],
-    },
-    MenuCommand {
-        program: "dmenu",
-        args: &[],
-    },
-];
-
-#[derive(Debug, Clone, Copy)]
-struct MenuCommand<'a> {
-    program: &'a str,
-    args: &'a [&'a str],
-}
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -70,14 +26,17 @@ fn main() -> Result<()> {
 fn run_chooser() -> Result<()> {
     let choices = screencast_choices();
     if choices.is_empty() {
-        return Ok(());
+        return Err(anyhow::anyhow!(
+            "could not discover any screencast sources from stdin, config, or Wayland"
+        ));
     }
 
     let selected = select_choice(&choices)?;
-    if let Some(selected) = selected {
-        println!("{}", selected);
-    }
+    let Some(selected) = selected else {
+        return Err(anyhow::anyhow!("no screencast source was selected"));
+    };
 
+    println!("{}", selected);
     Ok(())
 }
 
@@ -110,7 +69,14 @@ fn screencast_choices() -> Vec<String> {
             .collect();
     }
 
-    vec![monitor_choice(DEFAULT_OUTPUT)]
+    if let Some(outputs) = desktop_runtime_outputs() {
+        return outputs
+            .into_iter()
+            .map(|output| monitor_choice(&output))
+            .collect();
+    }
+
+    Vec::new()
 }
 
 /// Read xdpw `dmenu`-style chooser input. Ignore empty stdin (`simple` chooser type).
@@ -172,80 +138,49 @@ fn monitor_choice(output: &str) -> String {
 }
 
 fn select_choice(choices: &[String]) -> Result<Option<String>> {
-    if choices.len() == 1 {
-        return Ok(Some(choices[0].clone()));
-    }
+    prompt_choice_from_desktop(choices)
+}
 
-    if let Some(command) = env::var("FOCALDESK_SCREENCAST_CHOOSER")
-        .ok()
-        .filter(|command| !command.trim().is_empty())
-    {
-        return run_menu_command(
-            MenuCommand {
-                program: command.as_str(),
-                args: &[],
-            },
-            choices,
-        );
-    }
+fn desktop_runtime_outputs() -> Option<Vec<String>> {
+    let response = send_desktop_request(&IpcRequest::GetDisplayRuntimeStatus).ok()?;
 
-    for menu in MENU_COMMANDS {
-        if command_exists(menu.program) {
-            match run_menu_command(*menu, choices)? {
-                Some(selected) => return Ok(Some(selected)),
-                None => continue,
+    match response {
+        IpcResponse::DisplayRuntimeStatus { outputs } => {
+            let outputs = outputs
+                .into_iter()
+                .map(|output| output.connector)
+                .filter(|connector| !connector.trim().is_empty())
+                .collect::<Vec<_>>();
+            if outputs.is_empty() {
+                None
+            } else {
+                Some(outputs)
             }
         }
+        _ => None,
     }
-
-    Ok(Some(choices[0].clone()))
 }
 
-fn command_exists(command: &str) -> bool {
-    let Some(paths) = env::var_os("PATH") else {
-        return false;
-    };
+fn prompt_choice_from_desktop(choices: &[String]) -> Result<Option<String>> {
+    let request_id = NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
+    let response = send_desktop_request(&IpcRequest::PortalChooserPrompt {
+        request_id,
+        title: "Select a source to share".to_string(),
+        message: "Choose the monitor or window that OBS should capture.".to_string(),
+        choices: choices.to_vec(),
+    });
 
-    env::split_paths(&paths).any(|path| path.join(command).is_file())
-}
-
-fn run_menu_command(command: MenuCommand<'_>, choices: &[String]) -> Result<Option<String>> {
-    let mut child = Command::new(command.program)
-        .args(command.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to start chooser command `{}`", command.program))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        for choice in choices {
-            writeln!(stdin, "{choice}")?;
-        }
+    match response {
+        Ok(IpcResponse::PortalChooserDecision {
+            request_id: response_id,
+            selected,
+        }) if response_id == request_id => Ok(selected),
+        Ok(IpcResponse::Error { message }) => Err(anyhow::anyhow!(message)),
+        Ok(other) => Err(anyhow::anyhow!(
+            "unexpected IPC response from desktop chooser: {other:?}"
+        )),
+        Err(err) => Err(anyhow::anyhow!(err)),
     }
-
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to read chooser command `{}`", command.program))?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let selected = String::from_utf8_lossy(&output.stdout);
-    let selected = selected.trim();
-    if selected.is_empty() {
-        return Ok(None);
-    }
-
-    if choices.iter().any(|choice| choice == selected) {
-        return Ok(Some(selected.to_owned()));
-    }
-
-    if selected.starts_with("Monitor: ") || selected.starts_with("Window: ") {
-        return Ok(Some(selected.to_owned()));
-    }
-
-    Ok(Some(monitor_choice(selected)))
 }
 
 fn print_xdpw_config() -> Result<()> {
@@ -285,8 +220,9 @@ fn print_help() {
     println!(
         "  FOCALDESK_SCREENCAST_OUTPUT   Output name to use when no chooser input is provided"
     );
-    println!("  FOCALDESK_SCREENCAST_CHOOSER  Menu command to use before built-in menu discovery");
 }
+
+static NEXT_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(test)]
 mod tests {
@@ -308,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn formats_monitor_choice_for_xdpw_simple_chooser() {
+    fn formats_monitor_choice_for_xdpw_dmenu_chooser() {
         assert_eq!(monitor_choice("HDMI-A-1"), "Monitor: HDMI-A-1");
     }
 

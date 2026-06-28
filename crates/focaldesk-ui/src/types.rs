@@ -24,6 +24,8 @@ pub enum SettingKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemCommand {
+    Suspend,
+    Hibernate,
     Shutdown,
     Restart,
     Logout,
@@ -36,6 +38,7 @@ pub enum UiAction {
     ToggleSetting(SettingKey),
     SetSetting(SettingKey, bool),
     OpenPanel(PanelKind),
+    ReloadSettings,
     CreateWorkspace(String),
     DeleteWorkspace,
     SetVolume(f32),
