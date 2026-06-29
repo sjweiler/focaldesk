@@ -18,8 +18,8 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    effective_surface_render_state, force_linear_surfaces, primaries_wider_than,
-    ColorDescription, RenderingIntent, SurfaceColorRenderState, SurfaceColorState,
+    effective_surface_render_state, force_linear_surfaces, primaries_wider_than, ColorDescription,
+    RenderingIntent, SurfaceColorRenderState, SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
@@ -29,8 +29,8 @@ use focaldesk_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton,
 use focaldesk_ui::element::UiElement;
 use focaldesk_ui::types::{ElementId, PanelKind, UiAction, UiElementKind};
 use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState};
-use smithay::backend::renderer::element::Id;
 use smithay::backend::renderer::element::Element;
+use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::{keysyms, xkb};
 use smithay::input::pointer::{
@@ -49,9 +49,9 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::core::input::FlowKeyState;
 use crate::core::input::FlowModifiers;
@@ -71,7 +71,6 @@ use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
 use focaldesk_ipc::{DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
 use focaldesk_logging::session_id;
-use focaldesk_spawn::SpawnMessage;
 use focaldesk_logging::{
     flog, flog_error, flog_info, flog_warn, log_file_path_candidates, set_log_level, FLogLevel,
 };
@@ -83,6 +82,7 @@ use focaldesk_settings_core::{
     PowerButtonAction, PowerSettings, PrivacySettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
+use focaldesk_spawn::SpawnMessage;
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
@@ -96,8 +96,8 @@ use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
+use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::path::{Path, PathBuf};
@@ -1240,7 +1240,10 @@ impl DesktopState {
                 outputs: self.runtime_display_statuses(),
             }),
             IpcRequest::GetPowerSnapshot => Some(IpcResponse::PowerSnapshot {
-                snapshot: self.last_power_snapshot.clone().unwrap_or_else(empty_power_snapshot),
+                snapshot: self
+                    .last_power_snapshot
+                    .clone()
+                    .unwrap_or_else(empty_power_snapshot),
             }),
             IpcRequest::GetAll | IpcRequest::SetValue { .. } => Some(IpcResponse::Error {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
@@ -2797,10 +2800,8 @@ impl DesktopState {
                 if panel == PanelKind::AppLauncher {
                     self.open_app_launcher_dialog();
                 } else {
-                    self.pending_egui_ops.push(PendingEguiOp::OpenPanel(
-                        panel,
-                        self.focused_output,
-                    ));
+                    self.pending_egui_ops
+                        .push(PendingEguiOp::OpenPanel(panel, self.focused_output));
                 }
             }
 
@@ -4583,11 +4584,7 @@ impl DesktopState {
                 &surface,
                 self.default_toplevel_map_location(output_id),
             );
-            (
-                location,
-                requested_geometry.size,
-                false,
-            )
+            (location, requested_geometry.size, false)
         } else {
             let work = self
                 .work_recess_for_output(output_id)
@@ -5661,11 +5658,11 @@ impl DesktopState {
                 FlowInputEvent::Key { keycode, state, .. } => {
                     self.handle_lock_key_event(keycode, state);
                 }
-            FlowInputEvent::PointerMoved { position, .. } => {
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-                self.cursor_manager.move_to(position.x, position.y);
-                self.clear_client_pointer_focus(position);
+                FlowInputEvent::PointerMoved { position, .. } => {
+                    self.input.pointer_pos = position;
+                    self.pointer_pos = position;
+                    self.cursor_manager.move_to(position.x, position.y);
+                    self.clear_client_pointer_focus(position);
                 }
                 FlowInputEvent::PointerButton {
                     button,
@@ -5798,11 +5795,7 @@ impl DesktopState {
                 if !self.compositor_pointer_grab_active() {
                     self.forward_pointer_to_clients(position);
                     if let Some(delta_unaccel) = delta_unaccel {
-                        self.forward_pointer_relative_motion(
-                            previous_pos,
-                            position,
-                            delta_unaccel,
-                        );
+                        self.forward_pointer_relative_motion(previous_pos, position, delta_unaccel);
                     }
                 }
                 let precise_cursor_damage =
@@ -6603,13 +6596,16 @@ impl DesktopState {
                 output.color_description.primaries,
                 output.color_description.transfer,
                 output.icc_profile.as_ref().map(|p| p.len()).unwrap_or(0),
-                output.output_icc_lut.as_ref().map(|l| l.rgb.len()).unwrap_or(0),
+                output
+                    .output_icc_lut
+                    .as_ref()
+                    .map(|l| l.rgb.len())
+                    .unwrap_or(0),
             );
         }
         self.notify_runtime_display_status_changes();
         crate::core::wayland::color_management_protocol::note_output_color_resolved(
-            self,
-            output_id,
+            self, output_id,
         );
     }
 
@@ -6639,25 +6635,35 @@ impl DesktopState {
                 Ok(parsed) => Some((parsed.description, Some(parsed.bytes), parsed.output_lut)),
                 Err(err) => {
                     flog_warn!("output color: failed to load ICC file {path}: {:?}", err);
-                    crate::core::colord::resolve_output_color_profile(&make, &model, &serial, edid.as_deref())
-                        .map(|parsed| {
-                            (
-                                parsed.description,
-                                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                                parsed.output_lut,
-                            )
-                        })
+                    crate::core::colord::resolve_output_color_profile(
+                        &make,
+                        &model,
+                        &serial,
+                        edid.as_deref(),
+                    )
+                    .map(|parsed| {
+                        (
+                            parsed.description,
+                            (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                            parsed.output_lut,
+                        )
+                    })
                 }
             }
         } else {
-            crate::core::colord::resolve_output_color_profile(&make, &model, &serial, edid.as_deref())
-                .map(|parsed| {
-                    (
-                        parsed.description,
-                        (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                        parsed.output_lut,
-                    )
-                })
+            crate::core::colord::resolve_output_color_profile(
+                &make,
+                &model,
+                &serial,
+                edid.as_deref(),
+            )
+            .map(|parsed| {
+                (
+                    parsed.description,
+                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                    parsed.output_lut,
+                )
+            })
         };
 
         if let Some((description, icc_profile, output_icc_lut)) = resolved {
@@ -6679,8 +6685,7 @@ impl DesktopState {
         }
         self.notify_runtime_display_status_changes();
         crate::core::wayland::color_management_protocol::note_output_color_resolved(
-            self,
-            output_id,
+            self, output_id,
         );
     }
 
@@ -7161,7 +7166,8 @@ impl DesktopState {
         self.render
             .upload_cursor_texture_for_desktop(renderer, &mut self.cursor_manager)?;
 
-        let need_sw = self.output_owns_cursor(output_id) && self.cursor_manager.software_cursor_needed();
+        let need_sw =
+            self.output_owns_cursor(output_id) && self.cursor_manager.software_cursor_needed();
         if need_sw {
             let rel = self
                 .pointer_relative_to_output_logical(output_id)
@@ -7370,9 +7376,8 @@ fn launch_app_worker(
     }
 
     if let Some((candidate, err)) = last_error {
-        let message = format!(
-            "failed to launch app {app_name} with last candidate {candidate}: {err}"
-        );
+        let message =
+            format!("failed to launch app {app_name} with last candidate {candidate}: {err}");
         flog_error!("{message}");
         chrome_launch_note(format!(
             "all launch candidates failed last_candidate={candidate} err={err}"
@@ -7380,7 +7385,9 @@ fn launch_app_worker(
         return Err(message);
     }
 
-    Err(format!("failed to launch app {app_name}: no launch candidates succeeded"))
+    Err(format!(
+        "failed to launch app {app_name}: no launch candidates succeeded"
+    ))
 }
 
 fn launch_app_notification_title(app_name: &str) -> &'static str {
