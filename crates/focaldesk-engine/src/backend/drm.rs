@@ -294,6 +294,12 @@ pub struct DrmSurfaceState {
     pub hdr_scanout_format: Option<Fourcc>,
     pub hdr_scanout_modifiers: Vec<DrmModifier>,
     pub frame_queued_at: Option<Instant>,
+    /// Deadline for a pending HDR-transition commit to resolve via vblank.
+    /// Only set when an HDR enable/disable transition was just queued; a
+    /// stall past this deadline means the driver never delivered the
+    /// completion event (see `apply_hdr_output_state` and the NONBLOCK
+    /// comment on HDR commits in the vendored Smithay atomic backend).
+    pub hdr_commit_deadline: Option<Instant>,
     pub hdr_dual_block_logged: bool,
 
     pub drm_output: DrmOutput<
@@ -423,6 +429,25 @@ fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> b
         .find(|display| display.name == name)
         .map(|display| display.hdr_requested || display.hdr_enabled)
         .unwrap_or(false)
+}
+
+/// Persist that `name` should not auto-request HDR again (used after a stalled HDR commit
+/// forces recovery). The user can still re-enable HDR explicitly through settings.
+fn disable_persisted_hdr_request(output_name: &str) {
+    let mut displays = load_display_config();
+    let mut changed = false;
+    for display in displays.iter_mut() {
+        if display.name == output_name && (display.hdr_requested || display.hdr_enabled) {
+            display.hdr_requested = false;
+            display.hdr_enabled = false;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(err) = write_display_config(&displays) {
+            flog_warn!("Failed to persist HDR auto-disable for {output_name}: {err}");
+        }
+    }
 }
 
 fn configured_display_color_profile(displays: &[DisplayConfig], name: &str) -> DisplayColorProfile {
@@ -956,6 +981,7 @@ mod hdr_tests {
         PCI_VENDOR_NVIDIA, configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
         hdr_driver_allows_output_with_override, intersect_modifiers,
     };
+    use focaldesk_settings_core::DisplayColorProfile;
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
         DisplayConfig {
@@ -2304,6 +2330,50 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             || screenshot_output.is_some()
             || data.core.state.screenshot_all_requested
             || portal_needs_composite;
+
+        // Watchdog for a stalled HDR connector commit: runs every tick regardless of
+        // `should_render`, since a frozen output produces no further damage to wake it up.
+        // Some drivers accept the TEST_ONLY commit that precedes an HDR transition but then
+        // never deliver the completion event for the real (NONBLOCK) commit, leaving
+        // `frame_queued_at` set forever and that CRTC skipped on every future tick. Recovering
+        // requires a fresh `DrmCompositor` for the device (Smithay has no public API to drop
+        // just the stuck one), so we fall back to the same full-device reinit already used
+        // after a failed session resume.
+        let mut stalled_hdr_nodes: Vec<DrmNode> = Vec::new();
+        for (node, device) in data.backend.devices.iter_mut() {
+            for surface in device.surfaces.values_mut() {
+                if surface.frame_queued_at.is_none() {
+                    continue;
+                }
+                let stalled = surface
+                    .hdr_commit_deadline
+                    .is_some_and(|deadline| now >= deadline);
+                if !stalled {
+                    continue;
+                }
+                flog_warn!(
+                    "HDR commit stalled on {} past {:?} with no vblank; disabling HDR and reinitializing the device to recover scanout",
+                    surface.output.name(),
+                    HDR_FRAME_TIMEOUT
+                );
+                disable_persisted_hdr_request(&surface.output.name());
+                if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
+                    output.hdr_requested = false;
+                    output.hdr_enabled = false;
+                }
+                surface.hdr_commit_deadline = None;
+                stalled_hdr_nodes.push(*node);
+            }
+        }
+        for node in stalled_hdr_nodes {
+            if let Err(err) = reinitialize_drm_device(&mut data, &loop_handle, node) {
+                flog_warn!(
+                    "Failed to reinitialize DRM device {:?} after stalled HDR commit: {err}",
+                    node
+                );
+            }
+        }
+
         if !should_render {
             if portal_pending {
                 if let Some(device) = data.backend.devices.values_mut().next() {
@@ -2390,6 +2460,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 );
                             }
                         } else {
+                            let previously_applied = surface.hdr_enabled_applied;
                             let _applied = hdr_output::apply_hdr_output_state(
                                 surface,
                                 device.drm_output_manager.device(),
@@ -2399,6 +2470,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 ),
                                 hdr_target,
                             );
+                            if surface.hdr_enabled_applied != previously_applied {
+                                // A connector HDR state change is now pending and will be
+                                // committed on the next queue_frame. Some drivers accept the
+                                // TEST_ONLY commit but then never deliver the completion event
+                                // for the real (NONBLOCK) commit; bound how long we wait.
+                                surface.hdr_commit_deadline = Some(now + HDR_FRAME_TIMEOUT);
+                            }
                         }
                     }
 
@@ -3248,6 +3326,7 @@ fn device_added(
                     hdr_scanout_format,
                     hdr_scanout_modifiers,
                     frame_queued_at: None,
+                    hdr_commit_deadline: None,
                     hdr_dual_block_logged: false,
                     drm_output,
                 },
@@ -3278,6 +3357,7 @@ fn device_added(
                             ));
                         }
                         surface.frame_queued_at = None;
+                        surface.hdr_commit_deadline = None;
                     }
                 }
             }

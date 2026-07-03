@@ -4,7 +4,6 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 
@@ -137,7 +136,6 @@ pub fn send_ai_request_at(path: impl AsRef<Path>, request: &AiIpcRequest) -> Res
     let path = path.as_ref();
     let mut stream = StdUnixStream::connect(path)
         .with_context(|| format!("could not connect to AI IPC socket {}", path.display()))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let json = serde_json::to_vec(request).context("failed to encode AI IPC request")?;
 
     stream
