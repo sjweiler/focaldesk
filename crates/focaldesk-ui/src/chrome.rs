@@ -104,6 +104,20 @@ impl Chrome {
         }
     }
 
+    /// Drop the cached icon atlas and any other GPU texture handles so
+    /// `ensure_gpu_resources` rebuilds them from scratch.
+    ///
+    /// Needed after resuming from suspend: the DRM backend recreates the
+    /// `EGLContext`, which invalidates the `GlesTexture` handles inside
+    /// `atlas`/`topbar_tex`/`sidebar_tex`. Without this, `ensure_gpu_resources`
+    /// sees `atlas.is_some()` and never rebuilds it, leaving sidebar/topbar
+    /// icons blank forever.
+    pub fn invalidate_gpu_state(&mut self) {
+        self.atlas = None;
+        self.topbar_tex = None;
+        self.sidebar_tex = None;
+    }
+
     /// Ensure icon textures exist for this scale.
     /// Call from App::render() before drawing.
     pub fn ensure_gpu_resources<R>(&mut self, renderer: &mut R, _scale: f64) -> Result<()>

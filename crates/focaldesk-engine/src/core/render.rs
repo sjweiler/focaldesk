@@ -1237,6 +1237,27 @@ impl RenderState {
         self.chrome_shaders.ensure_compiled(renderer)
     }
 
+    /// Drop every cached shader program and GPU texture handle.
+    ///
+    /// These are all "compile/upload once, reuse forever" caches, which is normally
+    /// correct — but the DRM backend recreates the `EGLContext` (and thus the
+    /// `GlesRenderer`) when resuming from suspend, which invalidates every GL object
+    /// handle compiled/uploaded against the old context. Without this, resume leaves
+    /// the renderer replaying draw calls against dead handles forever (blank screen,
+    /// GL_INVALID_* error flood) instead of recompiling/re-uploading them.
+    pub fn invalidate_gpu_state(&mut self) {
+        self.chrome_shaders = ChromeShaders::new();
+        self.wallpaper_texture = None;
+        self.sw_cursor_texture = None;
+        self.sw_cursor_cache_key = None;
+        self.font_atlas_texture = None;
+        self.fonts_prewarm_done = false;
+        self.output_icc_lut_gpu.clear();
+        self.icc_lut_fallback_logged.clear();
+        self.egui.invalidate_gpu_state();
+        self.redraw_all = true;
+    }
+
     fn draw_clock_text(
         &self,
         frame: &mut GlesFrame<'_, '_>,

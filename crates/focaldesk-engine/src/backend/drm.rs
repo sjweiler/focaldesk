@@ -2109,6 +2109,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 data.core.state.handle_session_resume();
+                // RenderState::invalidate_gpu_state() (called above via
+                // handle_session_resume) only covers caches owned by DesktopState.
+                // The icon atlas lives in the sibling `ui_state`, so it needs its
+                // own reset or the sidebar/topbar icons stay blank after resume.
+                data.core.ui_state.chrome.invalidate_gpu_state();
                 data.core.last_now = Instant::now();
                 data.core.state.mark_redraw();
                 // Only resume rendering once every device is actually back and holding

@@ -997,6 +997,7 @@ impl DesktopState {
         self.last_power_snapshot = None;
         // Force a fresh battery/AC snapshot on the next timer pass after wake.
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
+        self.render.invalidate_gpu_state();
         self.render.egui.refresh_power_status_now();
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }

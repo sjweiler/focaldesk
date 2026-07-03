@@ -763,6 +763,31 @@ impl EguiLayer {
         self.textures_delta.free.clear();
         Ok(())
     }
+
+    /// Drop everything tied to the current GL/EGL context (compiled shaders inside the
+    /// egui_glow painter, and any textures it has uploaded) and reset the egui `Context`
+    /// so the next frame re-uploads the font atlas from scratch.
+    ///
+    /// Needed after resuming from suspend: the DRM backend recreates the `EGLContext`,
+    /// which invalidates every GL object the old painter/context handed out.
+    pub fn invalidate_gpu_state(&mut self) {
+        if let Some(mut painter) = self.glow_painter.take() {
+            painter.destroy();
+        }
+        self.textures_delta = TexturesDelta::default();
+        self.primitives.clear();
+
+        let ctx = Context::default();
+        ctx.set_fonts(focaldesk_egui_fonts());
+        apply_focaldesk_egui_style(&ctx);
+        self.ctx = ctx;
+
+        self.logged_texture_delta = false;
+        self.logged_mesh_sample = false;
+        self.dumped_font_atlas = false;
+        self.dumped_font_mesh = false;
+        self.last_font_atlas_rgba = None;
+    }
 }
 
 impl Drop for EguiLayer {
