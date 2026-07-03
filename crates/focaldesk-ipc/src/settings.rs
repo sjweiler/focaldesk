@@ -1,4 +1,4 @@
-use focaldesk_ipc::{IpcRequest, IpcResponse, SOCKET_PATH};
+use crate::{IpcRequest, IpcResponse, SETTINGS_SOCKET_PATH};
 use focaldesk_settings_core::{
     BrowserLaunchBackend, DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode,
     PowerButtonAction, Settings, load_settings, save_settings,
@@ -10,11 +10,11 @@ use std::{
     thread,
 };
 
-pub fn start_settings_ipc(settings: Arc<Mutex<Settings>>) {
-    let _ = std::fs::remove_file(SOCKET_PATH);
+pub fn serve_settings_ipc(settings: Arc<Mutex<Settings>>) {
+    let _ = std::fs::remove_file(SETTINGS_SOCKET_PATH);
 
-    let listener =
-        UnixListener::bind(SOCKET_PATH).expect("failed to bind FocalDesk settings IPC socket");
+    let listener = UnixListener::bind(SETTINGS_SOCKET_PATH)
+        .expect("failed to bind FocalDesk settings IPC socket");
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -88,16 +88,9 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             | IpcRequest::Watch { .. }
             | IpcRequest::GetConfig
             | IpcRequest::SetConfig { .. }
+            | IpcRequest::GetDisplayRuntimeStatus
             | IpcRequest::Notify { .. },
         ) => IpcResponse::Error {
-            message: "request is handled by focaldesk-desktop".to_string(),
-        },
-
-        Ok(IpcRequest::AiPermissionPrompt { .. }) => IpcResponse::Error {
-            message: "request is handled by focaldesk-desktop".to_string(),
-        },
-
-        Ok(IpcRequest::PortalChooserPrompt { .. }) => IpcResponse::Error {
             message: "request is handled by focaldesk-desktop".to_string(),
         },
 
@@ -267,8 +260,9 @@ fn apply_setting_value(
         }
 
         "debug.verbose_protocol_logs" => {
-            settings.debug.verbose_protocol_logs =
-                value.as_bool().ok_or("verbose_protocol_logs must be bool")?;
+            settings.debug.verbose_protocol_logs = value
+                .as_bool()
+                .ok_or("verbose_protocol_logs must be bool")?;
         }
 
         _ => return Err(format!("unknown setting path: {path}")),

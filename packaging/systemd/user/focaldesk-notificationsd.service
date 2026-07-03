@@ -1,0 +1,13 @@
+[Unit]
+Description=FocalDesk notifications daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focaldesk-notificationsd
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

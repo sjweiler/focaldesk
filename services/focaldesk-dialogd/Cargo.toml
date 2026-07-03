@@ -1,0 +1,20 @@
+[package]
+name = "focaldesk-dialogd"
+version = "0.1.0"
+edition = "2024"
+description = "FocalDesk dialog broker daemon"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-dialogd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+focaldesk-permissions = { path = "../../crates/focaldesk-permissions" }
+glib = "0.20"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

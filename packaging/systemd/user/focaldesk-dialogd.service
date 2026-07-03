@@ -1,0 +1,14 @@
+[Unit]
+Description=FocalDesk dialog broker
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focaldesk-dialogd
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=graphical-session.target

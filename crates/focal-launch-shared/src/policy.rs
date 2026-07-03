@@ -11,9 +11,7 @@ pub fn is_chrome_like(app: &str) -> bool {
 
 pub fn is_browser_like(app: &str) -> bool {
     let lower = app.to_ascii_lowercase();
-    is_chrome_like(app)
-        || lower.contains("firefox")
-        || lower.contains("librewolf")
+    is_chrome_like(app) || lower.contains("firefox") || lower.contains("librewolf")
 }
 
 pub fn chrome_command_args(use_x11: bool, profile_dir: &str) -> Vec<String> {

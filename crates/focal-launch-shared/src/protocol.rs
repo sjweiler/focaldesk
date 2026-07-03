@@ -11,10 +11,6 @@ pub struct LaunchRequest {
     pub xwayland_display: Option<String>,
     pub browser_backend: BrowserBackend,
     pub source: LaunchSource,
-    #[serde(default)]
-    pub clear_chrome_profile: Option<String>,
-    #[serde(default)]
-    pub log_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

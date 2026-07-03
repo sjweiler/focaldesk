@@ -1,5 +1,8 @@
 use anyhow::{Context, Result};
-use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
+use focaldesk_ipc::{
+    DialogIpcRequest, DialogIpcResponse, IpcRequest, IpcResponse, send_desktop_request,
+    send_dialog_request,
+};
 use serde::Deserialize;
 use std::env;
 use std::io::{self, IsTerminal, Read};
@@ -163,7 +166,7 @@ fn desktop_runtime_outputs() -> Option<Vec<String>> {
 
 fn prompt_choice_from_desktop(choices: &[String]) -> Result<Option<String>> {
     let request_id = NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
-    let response = send_desktop_request(&IpcRequest::PortalChooserPrompt {
+    let response = send_dialog_request(&DialogIpcRequest::PortalChooserPrompt {
         request_id,
         title: "Select a source to share".to_string(),
         message: "Choose the monitor or window that OBS should capture.".to_string(),
@@ -171,11 +174,11 @@ fn prompt_choice_from_desktop(choices: &[String]) -> Result<Option<String>> {
     });
 
     match response {
-        Ok(IpcResponse::PortalChooserDecision {
+        Ok(DialogIpcResponse::PortalChooserDecision {
             request_id: response_id,
             selected,
         }) if response_id == request_id => Ok(selected),
-        Ok(IpcResponse::Error { message }) => Err(anyhow::anyhow!(message)),
+        Ok(DialogIpcResponse::Error { message }) => Err(anyhow::anyhow!(message)),
         Ok(other) => Err(anyhow::anyhow!(
             "unexpected IPC response from desktop chooser: {other:?}"
         )),

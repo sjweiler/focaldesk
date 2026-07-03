@@ -21,7 +21,7 @@ to debug Linux desktop, Wayland, graphics, and input issues.
 - `apps/focaldesk-files`: file app prototype
 - `apps/focaldesk-settings`: settings app prototype
 - `apps/focaldesk-portal`: portal-related app code
-- `services/focaldesk-server`: background server and IPC daemon
+- `services/`: background daemons and IPC services
 - `crates/`: shared FocalDesk libraries
 - `assets/`: bundled visual assets
 - `docs/`: design notes and architecture material
@@ -130,44 +130,41 @@ You can tighten or relax the permission gate with:
 - `FOCALDESK_AI_PERMISSION=allow-persistent` to persist the allow decision on disk across restarts
 - `FOCALDESK_AI_PERMISSION=deny` to block AI chat
 
-## Systemd Service
+## Systemd Services
 
-The repo includes a user service unit at
-[packaging/systemd/user/focaldesk-server.service](packaging/systemd/user/focaldesk-server.service).
+FocalDesk uses `systemd --user` for its background daemons. That is the
+supported install path for the current codebase.
 
-To build and install it with `just`:
-
-```sh
-just install-server-service
-```
-
-That recipe builds a release binary, installs it to `~/.local/bin`, copies the
-unit to `~/.config/systemd/user`, and enables the service.
-
-If you are packaging for Fedora, install the binary to `/usr/bin/focaldesk-server`
-and place the user unit in `/usr/lib/systemd/user/focaldesk-server.service`
-using [packaging/systemd/user/focaldesk-server-fedora.service](packaging/systemd/user/focaldesk-server-fedora.service).
-
-Use the Fedora recipe if you want the standard distro locations:
+For a local build, install and enable the full service set with:
 
 ```sh
-just install-server-service-fedora
+just install-services
 ```
 
-## Launch Daemon
+That installs and enables:
 
-App launches are routed through a separate user service,
-`focal-launchd`, instead of forking a private daemon inside the compositor.
+- `focaldesk-server`
+- `focal-launchd`
+- `focaldesk-powerd`
+- `focaldesk-notificationsd`
+- `focaldesk-dialogd`
+- `focaldesk-controlsd`
+- `focaldesk-settingsd`
 
-To install and enable it from a local build:
+Each unit lives under `packaging/systemd/user/` and is copied to
+`~/.config/systemd/user/` for a local install.
+
+If you are packaging for Fedora, use:
 
 ```sh
-just install-launch-service
+just install-services-fedora
 ```
 
-That installs [packaging/systemd/user/focal-launchd.service](packaging/systemd/user/focal-launchd.service),
-enables it for the current user, and keeps the compositor launch path on the
-shared socket in `focal-launch-shared`.
+That uses the Fedora unit variants under `packaging/systemd/user/*-fedora.service`
+and installs the binaries into `/usr/bin/`.
+
+If you only want one service, the per-daemon `just install-*-service` recipes
+still work.
 
 ## License
 

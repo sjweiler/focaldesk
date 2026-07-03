@@ -4,7 +4,7 @@
 
 FocalDesk uses IPC to separate the compositor from supporting desktop services.
 
-The goal is to keep the compositor focused on display, input, surfaces, rendering, and session behavior while moving process launching, automation, and future AI-assisted actions into separate services.
+The goal is to keep the compositor focused on display, input, surfaces, rendering, and session behavior while moving process launching, power management, notifications, dialog brokering, automation, and future AI-assisted actions into separate services.
 
 ## Goals
 
@@ -20,14 +20,20 @@ The goal is to keep the compositor focused on display, input, surfaces, renderin
 ```text
 FocalDesk Compositor / Shell UI
         │
-        ▼
-focal-launch-shared
-        │
-        ▼
-focal-launchd
-        │
-        ▼
-Applications
+        ├── focal-launch-shared
+        ├── focal-launchd
+        ├── focaldesk-powerd
+        ├── focaldesk-notificationsd
+        ├── focaldesk-dialogd
+        └── focaldesk-controlsd
+
+Services
+- launch requests
+- power snapshot / suspend / hibernate / reboot
+- notifications queue / visibility
+- AI permission prompts
+- portal chooser prompts
+- wifi, bluetooth, and audio controls
 ```
 
 ## Components
@@ -56,6 +62,47 @@ Responsibilities may include:
 `focal-launch-shared` contains shared IPC message types used by both the compositor and launcher daemon.
 
 This prevents duplicated request/response definitions.
+
+### focaldesk-powerd
+
+`focaldesk-powerd` owns power snapshot collection and system power actions.
+
+Responsibilities may include:
+
+- Reading battery and AC status
+- Reporting power snapshots to the compositor and settings UI
+- Executing suspend, hibernate, reboot, and power-off requests
+- Applying performance profiles
+
+### focaldesk-notificationsd
+
+`focaldesk-notificationsd` owns notification queueing and visibility state.
+
+Responsibilities may include:
+
+- Accepting notification requests
+- Expiring timed notifications
+- Returning visible notification snapshots to the compositor
+
+### focaldesk-dialogd
+
+`focaldesk-dialogd` owns permission-style dialogs that need a human response.
+
+Responsibilities may include:
+
+- Showing AI permission prompts
+- Showing portal chooser prompts
+- Returning typed allow/deny or selection responses
+
+### focaldesk-controlsd
+
+`focaldesk-controlsd` owns quick system controls that shell out to helper tools.
+
+Responsibilities include:
+
+- Toggling Wi-Fi
+- Toggling Bluetooth
+- Setting default output volume
 
 ## Message Flow
 
@@ -112,6 +159,7 @@ Compositor
     ├── AI assistant service
     ├── Voice command service
     ├── Plugin service
+    ├── Control service
     └── Session manager
 ```
 

@@ -169,7 +169,8 @@ pub fn prepare_output(
 
     let pointer_on_this_output = state.output_owns_cursor(output_id);
 
-    let draw_software_cursor = pointer_on_this_output && state.cursor_manager.software_cursor_needed();
+    let draw_software_cursor =
+        pointer_on_this_output && state.cursor_manager.software_cursor_needed();
 
     let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
 
@@ -481,11 +482,7 @@ pub fn import_output_client_surfaces(
             mapped
         );
     }
-    state.import_mapped_surfaces_for_output(
-        renderer,
-        output.logical_origin,
-        output.logical_size,
-    );
+    state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
 }
 
 /// Build client render elements for an output. Call after `GlesRenderer::bind` and before
@@ -510,11 +507,7 @@ pub fn build_output_client_elements(
     let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
 
     let output = state.outputs.get(&output_id).expect("output missing");
-    state.import_mapped_surfaces_for_output(
-        renderer,
-        output.logical_origin,
-        output.logical_size,
-    );
+    state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
 
     state.render.build_client_elements_for_output(
         &state.space,
@@ -625,9 +618,7 @@ pub fn draw_output_stage(
     {
         Vec::new()
     } else {
-        state
-            .notifications
-            .visible_snapshots(prepared.frame_ctx.now)
+        state.notification_snapshots.clone()
     };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
 

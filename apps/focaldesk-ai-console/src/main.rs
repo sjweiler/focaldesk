@@ -3,7 +3,10 @@ use focaldesk_ai::{
     AiDaemonStatus, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, ProviderInfo,
     ProviderModelInfo, send_ai_request,
 };
-use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
+use focaldesk_ipc::{
+    IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
+    send_notification_request,
+};
 use focaldesk_settings_core::load_settings;
 use glib::ControlFlow;
 use gtk4::prelude::*;
@@ -13,7 +16,13 @@ use gtk4::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell, collections::BTreeMap, fs, path::PathBuf, process::Command, rc::Rc, sync::mpsc,
+    cell::RefCell,
+    collections::BTreeMap,
+    fs,
+    path::PathBuf,
+    process::Command,
+    rc::Rc,
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -88,10 +97,20 @@ struct BackendBannerHandles {
     subtitle_label: Label,
     backend_combo: ComboBoxText,
     model_combo: ComboBoxText,
+    provider_combo_syncing: Rc<RefCell<bool>>,
+    model_combo_syncing: Rc<RefCell<bool>>,
 }
 
 impl BackendBannerHandles {
     fn refresh(&self, state: &PersistedState, runtime: &AiConsoleRuntime) {
+        // Repopulating the combos below fires GTK's "changed" signal
+        // synchronously. Without these guards that reenters the
+        // connect_changed handlers while callers of refresh() (e.g. the
+        // async runtime refresh) are still holding a borrow on `state`,
+        // which panics with "RefCell already borrowed" and aborts the
+        // process since the panic crosses a GTK callback boundary.
+        *self.provider_combo_syncing.borrow_mut() = true;
+        *self.model_combo_syncing.borrow_mut() = true;
         refresh_backend_banner(
             &self.title_label,
             &self.subtitle_label,
@@ -100,6 +119,8 @@ impl BackendBannerHandles {
             state,
             runtime,
         );
+        *self.provider_combo_syncing.borrow_mut() = false;
+        *self.model_combo_syncing.borrow_mut() = false;
     }
 }
 
@@ -338,11 +359,18 @@ fn main() {
         .application_id("dev.focaldesk.AiConsole")
         .build();
 
-    app.connect_activate(build_ui);
+    let main_window = Rc::new(RefCell::new(None));
+    let main_window_for_activate = main_window.clone();
+    app.connect_activate(move |app| build_ui(app, main_window_for_activate.clone()));
     app.run();
 }
 
-fn build_ui(app: &Application) {
+fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>>>) {
+    if let Some(window) = main_window.borrow().as_ref() {
+        window.present();
+        return;
+    }
+
     load_css();
 
     let state = Rc::new(RefCell::new(load_state()));
@@ -357,6 +385,14 @@ fn build_ui(app: &Application) {
         .default_width(950)
         .default_height(650)
         .build();
+    *main_window.borrow_mut() = Some(window.clone());
+    {
+        let main_window = main_window.clone();
+        window.connect_close_request(move |_| {
+            main_window.borrow_mut().take();
+            glib::Propagation::Proceed
+        });
+    }
 
     let root = Box::new(Orientation::Horizontal, 12);
     root.add_css_class("ai-root");
@@ -825,14 +861,16 @@ fn build_backend_banner(
     let subtitle_label_clone = subtitle_label.clone();
     let backend_combo_clone = backend_combo.clone();
     let model_combo_clone = model_combo.clone();
+    let provider_combo_syncing = Rc::new(RefCell::new(false));
+    let model_combo_syncing = Rc::new(RefCell::new(false));
     let banner_handles = Rc::new(BackendBannerHandles {
         title_label: title_label.clone(),
         subtitle_label: subtitle_label.clone(),
         backend_combo: backend_combo.clone(),
         model_combo: model_combo.clone(),
+        provider_combo_syncing: provider_combo_syncing.clone(),
+        model_combo_syncing: model_combo_syncing.clone(),
     });
-    let provider_combo_syncing = Rc::new(RefCell::new(false));
-    let model_combo_syncing = Rc::new(RefCell::new(false));
     let state_clone = state.clone();
     let log_buffer_clone = log_buffer.clone();
     let runtime_clone = runtime.clone();
@@ -946,10 +984,7 @@ fn build_backend_banner(
     });
     controls.append(&refresh_button);
 
-    (
-        banner,
-        banner_handles,
-    )
+    (banner, banner_handles)
 }
 
 fn refresh_backend_banner(
@@ -1450,17 +1485,21 @@ fn tools_page(
         let action_kind = action_kind.to_string();
         button.connect_clicked(move |_| {
             let result = match action_kind.as_str() {
-                "notify" => send_desktop_request(&IpcRequest::Notify {
+                "notify" => send_notification_request(&NotificationIpcRequest::Notify {
                     title: "FocalDesk AI Console".to_string(),
                     body: "Desktop action triggered from the AI console".to_string(),
                     timeout_ms: Some(3000),
                 })
                 .map_err(anyhow::Error::msg)
                 .and_then(|response| match response {
-                    IpcResponse::Notification { id } => Ok(format!("notification queued: {id}")),
-                    IpcResponse::Ok => Ok("notification sent".to_string()),
-                    IpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
-                    other => Err(anyhow::anyhow!("unexpected desktop response: {other:?}")),
+                    NotificationIpcResponse::NotificationQueued { id } => {
+                        Ok(format!("notification queued: {id}"))
+                    }
+                    NotificationIpcResponse::Ok => Ok("notification sent".to_string()),
+                    NotificationIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+                    other => Err(anyhow::anyhow!(
+                        "unexpected notification response: {other:?}"
+                    )),
                 }),
                 "identify" => send_desktop_request(&IpcRequest::IdentifyDisplays)
                     .map_err(anyhow::Error::msg)
@@ -1469,21 +1508,21 @@ fn tools_page(
                         IpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
                         other => Err(anyhow::anyhow!("unexpected desktop response: {other:?}")),
                     }),
-                "terminal" => launch_configured_app_async(
-                    log_buffer.clone(),
-                    "terminal",
-                    |settings| settings.apps.terminal.clone(),
-                ),
-                "browser" => launch_configured_app_async(
-                    log_buffer.clone(),
-                    "browser",
-                    |settings| settings.apps.browser.clone(),
-                ),
-                "files" => launch_configured_app_async(
-                    log_buffer.clone(),
-                    "file manager",
-                    |settings| settings.apps.file_manager.clone(),
-                ),
+                "terminal" => {
+                    launch_configured_app_async(log_buffer.clone(), "terminal", |settings| {
+                        settings.apps.terminal.clone()
+                    })
+                }
+                "browser" => {
+                    launch_configured_app_async(log_buffer.clone(), "browser", |settings| {
+                        settings.apps.browser.clone()
+                    })
+                }
+                "files" => {
+                    launch_configured_app_async(log_buffer.clone(), "file manager", |settings| {
+                        settings.apps.file_manager.clone()
+                    })
+                }
                 _ => Err(anyhow::anyhow!("unknown desktop action")),
             };
 
@@ -1549,7 +1588,10 @@ fn launch_configured_app_async(
     selector: impl FnOnce(&focaldesk_settings_core::Settings) -> String + Send + 'static,
 ) -> anyhow::Result<String> {
     let (tx, rx) = mpsc::channel();
-    append_log(&log_buffer, &format!("[action] queueing {label} launch on background thread"));
+    append_log(
+        &log_buffer,
+        &format!("[action] queueing {label} launch on background thread"),
+    );
 
     thread::spawn(move || {
         let result = launch_configured_app(selector);
@@ -1558,11 +1600,17 @@ fn launch_configured_app_async(
 
     glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
         Ok(Ok(command)) => {
-            append_log(&log_buffer, &format!("[action] launched {label}: {command}"));
+            append_log(
+                &log_buffer,
+                &format!("[action] launched {label}: {command}"),
+            );
             glib::ControlFlow::Break
         }
         Ok(Err(err)) => {
-            append_log(&log_buffer, &format!("[action] failed to launch {label}: {err}"));
+            append_log(
+                &log_buffer,
+                &format!("[action] failed to launch {label}: {err}"),
+            );
             glib::ControlFlow::Break
         }
         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,

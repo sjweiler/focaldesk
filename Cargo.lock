@@ -1489,6 +1489,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "focal-launch-shared",
+ "focaldesk-logging",
  "serde",
  "serde_json",
 ]
@@ -1582,6 +1583,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-controlsd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "focaldesk-cursor"
 version = "0.1.0"
 dependencies = [
@@ -1600,6 +1612,20 @@ dependencies = [
  "focaldesk-engine",
  "focaldesk-logging",
  "focaldesk-ui",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "focaldesk-dialogd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "focaldesk-permissions",
+ "glib",
+ "gtk4",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1683,6 +1709,7 @@ version = "0.1.0"
 dependencies = [
  "focaldesk-config",
  "focaldesk-logging",
+ "focaldesk-notifications",
  "focaldesk-power",
  "focaldesk-settings-core",
  "serde",
@@ -1721,6 +1748,21 @@ dependencies = [
 [[package]]
 name = "focaldesk-notifications"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "focaldesk-notificationsd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "focaldesk-notifications",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "focaldesk-permissions"
@@ -1745,6 +1787,18 @@ name = "focaldesk-power"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "focaldesk-powerd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "focaldesk-power",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

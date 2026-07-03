@@ -1,11 +1,11 @@
 use adw::prelude::*;
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys,
-    DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
+    send_settings_request, watch_desktop_keys, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    PowerIpcRequest, PowerIpcResponse,
 };
 use focaldesk_logging::{init_default_logging, session_id};
-use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
     load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile,
     LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
@@ -186,14 +186,14 @@ fn save_displays(displays: &[DisplayConfig]) {
 
     let outputs = displays.iter().map(output_config_from_display).collect();
 
-    match send_desktop_request(&IpcRequest::SetDisplays { outputs }) {
+    match send_settings_request(&IpcRequest::SetDisplays { outputs }) {
         Ok(IpcResponse::Ok) => {}
         Ok(IpcResponse::Error { message }) => {
             warn!(
                 target: "focaldesk",
                 session_id = session_id(),
                 message = %message,
-                "display IPC update rejected"
+                "settings IPC update rejected"
             );
         }
         Ok(other) => {
@@ -201,7 +201,7 @@ fn save_displays(displays: &[DisplayConfig]) {
                 target: "focaldesk",
                 session_id = session_id(),
                 response = ?other,
-                "unexpected display IPC response"
+                "unexpected settings IPC response"
             );
         }
         Err(err) => {
@@ -209,7 +209,7 @@ fn save_displays(displays: &[DisplayConfig]) {
                 target: "focaldesk",
                 session_id = session_id(),
                 error = %err,
-                "display IPC unavailable; saved display config directly"
+                "settings IPC unavailable; saved display config directly"
             );
         }
     }
@@ -1821,7 +1821,7 @@ fn persist_settings(settings: &Settings) {
         return;
     }
 
-    if let Err(err) = send_desktop_request(&IpcRequest::Reload) {
+    if let Err(err) = send_settings_request(&IpcRequest::Reload) {
         info!(
             target: "focaldesk",
             session_id = session_id(),
@@ -3934,8 +3934,7 @@ fn performance_profile_name(mode: PerformanceMode) -> &'static str {
     }
 }
 
-fn power_status_text(manager: &PowerManager) -> String {
-    let snapshot = manager.snapshot();
+fn power_status_text(snapshot: &focaldesk_power::PowerSnapshot) -> String {
     let battery = snapshot
         .batteries
         .first()
@@ -3962,9 +3961,27 @@ fn power_status_text(manager: &PowerManager) -> String {
     format!("{battery}; {line_power}; {profile}")
 }
 
-fn run_power_action(manager: &PowerManager, command: PowerCommand, status: &gtk::Label) {
-    match manager.execute(command) {
-        Ok(()) => status.set_text("Power action started"),
+fn run_power_action(request: PowerIpcRequest, status: &gtk::Label) {
+    match send_power_request(&request) {
+        Ok(PowerIpcResponse::Ok) => status.set_text("Power action started"),
+        Ok(PowerIpcResponse::Error { message }) => {
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                message = %message,
+                "power action failed"
+            );
+            status.set_text("Power action failed");
+        }
+        Ok(other) => {
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                response = ?other,
+                "unexpected power action response"
+            );
+            status.set_text("Power action failed");
+        }
         Err(err) => {
             error!(
                 target: "focaldesk",
@@ -3980,11 +3997,17 @@ fn run_power_action(manager: &PowerManager, command: PowerCommand, status: &gtk:
 fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Power");
-    let manager = PowerManager::new();
+    let snapshot = send_power_request(&PowerIpcRequest::GetSnapshot)
+        .ok()
+        .and_then(|response| match response {
+            PowerIpcResponse::PowerSnapshot { snapshot } => Some(snapshot),
+            _ => None,
+        })
+        .unwrap_or_else(|| focaldesk_power::PowerManager::new().snapshot());
 
     let status_group = adw::PreferencesGroup::new();
     status_group.set_title("Status");
-    let status_label = dim_label(&power_status_text(&manager));
+    let status_label = dim_label(&power_status_text(&snapshot));
     status_group.add(&status_label);
     page.add(&status_group);
 
@@ -4094,24 +4117,18 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     );
     {
         let settings = settings.clone();
-        let manager = manager.clone();
         let status_label = status_label.clone();
         performance_dropdown.connect_selected_notify(move |dropdown| {
             let mode = selected_performance_mode(dropdown.selected());
             settings.borrow_mut().power.performance_mode = mode;
             persist_settings(&settings.borrow());
 
-            if let Err(err) = manager.set_performance_profile(performance_profile_name(mode)) {
-                error!(
-                    target: "focaldesk",
-                    session_id = session_id(),
-                    error = %err,
-                    "failed to set performance profile"
-                );
-                status_label.set_text("Performance profile change failed");
-            } else {
-                status_label.set_text(&power_status_text(&manager));
-            }
+            run_power_action(
+                PowerIpcRequest::SetPerformanceProfile {
+                    profile: performance_profile_name(mode).to_string(),
+                },
+                &status_label,
+            );
         });
     }
     page.add(&actions_group);
@@ -4120,34 +4137,30 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     system_group.set_title("System");
     let suspend_button = add_button_row(&system_group, "Suspend now", None, "Suspend");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         suspend_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::Suspend, &status_label);
+            run_power_action(PowerIpcRequest::Suspend, &status_label);
         });
     }
     let hibernate_button = add_button_row(&system_group, "Hibernate now", None, "Hibernate");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         hibernate_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::Hibernate, &status_label);
+            run_power_action(PowerIpcRequest::Hibernate, &status_label);
         });
     }
     let restart_button = add_button_row(&system_group, "Restart", None, "Restart");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         restart_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::Reboot, &status_label);
+            run_power_action(PowerIpcRequest::Reboot, &status_label);
         });
     }
     let poweroff_button = add_button_row(&system_group, "Power off", None, "Power off");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         poweroff_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::PowerOff, &status_label);
+            run_power_action(PowerIpcRequest::PowerOff, &status_label);
         });
     }
     page.add(&system_group);
@@ -4591,6 +4604,7 @@ mod tests {
             hdr_requested: true,
             hdr_enabled: false,
             icc_lut_fallback_active: false,
+            wide_gamut_active: false,
         };
 
         let output = output_config_from_display(&display);

@@ -4,6 +4,8 @@
 
 use std::io;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 #[cfg(feature = "xwayland")]
 use std::process::Stdio;
 #[cfg(feature = "xwayland")]
@@ -13,7 +15,7 @@ use std::time::Instant;
 use focaldesk_cursor::CursorManager;
 use focaldesk_flow::Keybinds;
 use focaldesk_logging::{flog, flog_info, session_id};
-use focaldesk_notifications::NotificationManager;
+use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
 use focaldesk_ui::chrome::{Chrome, ChromeMetrics};
@@ -34,6 +36,8 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use zbus::blocking::{Connection, MessageIterator};
+use zbus::{MatchRule, MessageType};
 
 use crate::core::desktop::{DesktopInit, DesktopState};
 use crate::core::input::{
@@ -84,6 +88,83 @@ pub(crate) fn is_nonfatal_wayland_io_error(err: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::NotConnected
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionSleepEvent {
+    GoingToSleep,
+    WokeUp,
+}
+
+pub(crate) fn spawn_session_sleep_watch() -> io::Result<Receiver<SessionSleepEvent>> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("focaldesk-session-sleep".into())
+        .spawn(move || session_resume_watch_main(tx))?;
+    Ok(rx)
+}
+
+pub(crate) fn drain_session_sleep_notifications(
+    rx: &Receiver<SessionSleepEvent>,
+    state: &mut DesktopState,
+) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            SessionSleepEvent::GoingToSleep => state.handle_session_suspend(),
+            SessionSleepEvent::WokeUp => state.handle_session_resume(),
+        }
+    }
+}
+
+fn session_resume_watch_main(notify: Sender<SessionSleepEvent>) {
+    let Ok(conn) = Connection::system() else {
+        flog("session resume watch: no system D-Bus");
+        return;
+    };
+
+    let rule = match MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.login1")
+        .and_then(|builder| builder.interface("org.freedesktop.login1.Manager"))
+        .and_then(|builder| builder.member("PrepareForSleep"))
+        .and_then(|builder| builder.path("/org/freedesktop/login1"))
+    {
+        Ok(builder) => builder.build(),
+        Err(err) => {
+            flog(format!("session resume watch: failed to build match rule: {err}"));
+            return;
+        }
+    };
+
+    let Ok(mut iter) = MessageIterator::for_match_rule(rule, &conn, Some(8)) else {
+        flog("session resume watch: failed to subscribe to login1 PrepareForSleep");
+        return;
+    };
+
+    flog("session sleep watch: listening for login1 PrepareForSleep");
+
+    let mut last_sleeping: Option<bool> = None;
+    loop {
+        let Some(Ok(msg)) = iter.next() else {
+            continue;
+        };
+
+        let Ok((sleeping,)): Result<(bool,), _> = msg.body() else {
+            continue;
+        };
+
+        if last_sleeping == Some(sleeping) {
+            continue;
+        }
+        last_sleeping = Some(sleeping);
+
+        let event = if sleeping {
+            SessionSleepEvent::GoingToSleep
+        } else {
+            SessionSleepEvent::WokeUp
+        };
+        let _ = notify.send(event);
+    }
 }
 
 /// Spawn XWayland and register it on `handle`. Sets `DISPLAY` once the server is up.
@@ -693,7 +774,7 @@ pub(crate) fn bootstrap_compositor_core(
         .map(|output| output.scale_factor)
         .unwrap_or(1.0);
     let cursor_manager = CursorManager::new(24, scale_factor as f32);
-    let notifications = NotificationManager::new();
+    let notification_snapshots = Vec::<NotificationSnapshot>::new();
     let chrome = Chrome::new(ChromeMetrics::default());
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
 
@@ -754,7 +835,7 @@ pub(crate) fn bootstrap_compositor_core(
         backend_kind: backend,
         cursor_manager,
         seat,
-        notifications,
+        notification_snapshots,
         keybinds: Keybinds::default(),
         running: true,
         client_wayland_display: wayland_display.clone(),

@@ -1,0 +1,13 @@
+[Unit]
+Description=FocalDesk settings daemon
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/focaldesk-settingsd
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

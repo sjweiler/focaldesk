@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(5_000);
 pub const MAX_VISIBLE_NOTIFICATIONS: usize = 4;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notification {
     pub id: u64,
     pub title: String,
@@ -12,7 +12,7 @@ pub struct Notification {
     pub timeout: Option<Duration>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NotificationSnapshot {
     pub id: u64,
     pub title: String,

@@ -1,4 +1,4 @@
-use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
+use focaldesk_ipc::{DialogIpcRequest, DialogIpcResponse, send_dialog_request};
 use focaldesk_permissions::identity::{AppIdentity, AppMetadata};
 use focaldesk_permissions::manager::PermissionManager;
 use focaldesk_permissions::policy::DefaultPolicy;
@@ -439,7 +439,7 @@ fn prompt_from_desktop(
     allow_persistent: bool,
 ) -> Option<UserPromptResponse> {
     let request_id = NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed);
-    let response = send_desktop_request(&IpcRequest::AiPermissionPrompt {
+    let response = send_dialog_request(&DialogIpcRequest::AiPermissionPrompt {
         request_id,
         title: title.to_string(),
         message: message.to_string(),
@@ -451,10 +451,10 @@ fn prompt_from_desktop(
 
 fn desktop_response_to_user_prompt(
     request_id: u64,
-    response: Result<IpcResponse, String>,
+    response: Result<DialogIpcResponse, String>,
 ) -> Option<UserPromptResponse> {
     match response {
-        Ok(IpcResponse::AiPermissionDecision {
+        Ok(DialogIpcResponse::AiPermissionDecision {
             request_id: response_id,
             allow,
             persistent,
@@ -480,7 +480,7 @@ fn desktop_response_to_user_prompt(
                 request_id = response_id,
                 decision = ?response.decision,
                 scope = ?response.scope,
-                "AI permission prompt answered by compositor"
+                "AI permission prompt answered by dialog broker"
             );
 
             Some(response)
@@ -489,7 +489,7 @@ fn desktop_response_to_user_prompt(
             tracing::warn!(
                 target: "focaldesk.ai",
                 response = ?other,
-                "unexpected AI permission response from compositor"
+                "unexpected AI permission response from dialog broker"
             );
             Some(UserPromptResponse {
                 decision: PermissionDecision::Deny,
@@ -500,7 +500,7 @@ fn desktop_response_to_user_prompt(
             tracing::debug!(
                 target: "focaldesk.ai",
                 error = %err,
-                "AI compositor prompt unavailable"
+                "AI dialog broker prompt unavailable"
             );
             None
         }
@@ -673,7 +673,6 @@ pub(crate) fn authorize_ai_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use focaldesk_ipc::IpcResponse;
     use focaldesk_permissions::prompt::PermissionPrompter;
     use focaldesk_permissions::prompt::UserPromptResponse;
     use std::fs;
@@ -784,7 +783,7 @@ mod tests {
     fn desktop_allow_persistent_response_maps_to_persistent_prompt_response() {
         let response = desktop_response_to_user_prompt(
             7,
-            Ok(IpcResponse::AiPermissionDecision {
+            Ok(DialogIpcResponse::AiPermissionDecision {
                 request_id: 7,
                 allow: true,
                 persistent: true,

@@ -1,7 +1,10 @@
 use anyhow::{Context, bail};
 use focaldesk_ai::providers::OllamaProvider;
 use focaldesk_ai::{AiIpcRequest, AiIpcResponse, AiProvider, ChatRequest, send_ai_request};
-use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
+use focaldesk_ipc::{
+    IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
+    send_notification_request,
+};
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -25,7 +28,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let response = send_desktop_request(&IpcRequest::Notify {
+            let response = send_notification_request(&NotificationIpcRequest::Notify {
                 title,
                 body: body_parts.join(" "),
                 timeout_ms,
@@ -33,12 +36,12 @@ fn main() -> anyhow::Result<()> {
             .map_err(anyhow::Error::msg)?;
 
             match response {
-                IpcResponse::Notification { id } => {
+                NotificationIpcResponse::NotificationQueued { id } => {
                     println!("notification queued: {id}");
                     Ok(())
                 }
-                IpcResponse::Ok => Ok(()),
-                IpcResponse::Error { message } => bail!(message),
+                NotificationIpcResponse::Ok => Ok(()),
+                NotificationIpcResponse::Error { message } => bail!(message),
                 other => bail!("unexpected response: {other:?}"),
             }
         }

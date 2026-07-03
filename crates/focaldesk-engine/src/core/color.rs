@@ -4,9 +4,9 @@
 //! Phase C1: SDR scanout encode uses each output's ICC/EDID description.
 //! Phase C2: colord D-Bus hotplug/profile refresh (`core::colord`).
 
+use focaldesk_settings_core::DisplayColorProfile;
 use smithay::reexports::wayland_server::DisplayHandle;
 use smithay::wayland::compositor::{Cacheable, SurfaceData};
-use focaldesk_settings_core::DisplayColorProfile;
 
 /// CIE 1931 xy chromaticities for RGB primaries + D65 white.
 #[derive(Clone, Copy, Debug, PartialEq)]

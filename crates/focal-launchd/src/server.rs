@@ -2,13 +2,15 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
 use focal_launch_shared::{
-    chrome_command_args, is_browser_like, is_chrome_like, socket_path, BrowserBackend,
-    LaunchRequest, LaunchResponse,
+    BrowserBackend, LaunchRequest, LaunchResponse, chrome_command_args, is_browser_like,
+    is_chrome_like, socket_path,
 };
+use focaldesk_logging::log_file_path_candidates;
 
 pub fn run() -> anyhow::Result<()> {
     let socket = socket_path();
@@ -76,32 +78,29 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
         }
     }
 
-    if let Some(profile) = req.clear_chrome_profile.as_deref() {
-        clear_stale_chrome_singleton(std::path::Path::new(profile));
-    }
-
     if chrome_like {
-        let profile = req
-            .clear_chrome_profile
-            .as_deref()
-            .unwrap_or("/tmp/focaldesk-chrome-profile");
-        cmd.args(chrome_command_args(prefer_x11, profile));
+        let profile = chrome_profile_dir();
+        clear_stale_chrome_singleton(&profile);
+        let profile = profile.to_string_lossy();
+        cmd.args(chrome_command_args(prefer_x11, &profile));
     }
 
     cmd.args(req.args);
 
-    if let Some(log_path) = req.log_path.as_deref() {
-        if let Some(parent) = std::path::Path::new(log_path).parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)
-        {
-            if let Ok(stderr_file) = file.try_clone() {
-                cmd.stdout(std::process::Stdio::from(file));
-                cmd.stderr(std::process::Stdio::from(stderr_file));
+    if chrome_like || browser_like {
+        if let Some(log_path) = launch_trace_path() {
+            if let Some(parent) = Path::new(&log_path).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                if let Ok(stderr_file) = file.try_clone() {
+                    cmd.stdout(std::process::Stdio::from(file));
+                    cmd.stderr(std::process::Stdio::from(stderr_file));
+                }
             }
         }
     }
@@ -129,6 +128,23 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn chrome_profile_dir() -> PathBuf {
+    std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".config")
+        })
+        .join("focaldesk")
+        .join("chrome-profile")
+}
+
+fn launch_trace_path() -> Option<String> {
+    log_file_path_candidates()
+        .into_iter()
+        .next()
+        .map(|path| path.to_string_lossy().into_owned())
 }
 
 fn clear_stale_chrome_singleton(profile: &std::path::Path) {

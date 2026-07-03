@@ -8,6 +8,7 @@ FocalDesk is a Rust-based Wayland desktop environment and compositor for Linux. 
 - Build a functional Linux desktop environment around a custom Wayland compositor
 - Keep the compositor focused on display, input, surfaces, rendering, and session behavior
 - Move process launching and future automation into separate services
+- Move shell-based Wi-Fi, Bluetooth, and volume control out of the compositor
 - Support real-world applications, including GTK, X11/XWayland, Wine, browsers, OBS, and games
 - Provide a modular foundation for future AI-assisted workflows
 - Favor practical usability over a toy compositor demo
@@ -51,7 +52,10 @@ Platform / Backend Layer
 Desktop Services and Applications
 ├── focal-launchd
 ├── focal-launch-shared
+├── focaldesk-powerd
+├── focaldesk-notificationsd
+├── focaldesk-dialogd
+├── focaldesk-controlsd
 ├── focaldesk-settings
 ├── focaldesk-files
 └── future AI / agent services
-

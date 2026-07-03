@@ -3,7 +3,7 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::{socket_path, LaunchError, LaunchRequest, LaunchResponse, Result, DEFAULT_TIMEOUT_MS};
+use crate::{DEFAULT_TIMEOUT_MS, LaunchError, LaunchRequest, LaunchResponse, Result, socket_path};
 
 pub fn request_launch(req: &LaunchRequest) -> Result<LaunchResponse> {
     let socket = socket_path();

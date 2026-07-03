@@ -2,30 +2,29 @@
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
 use crate::backend::common::{
-    bootstrap_compositor_core, is_nonfatal_wayland_io_error, physical_size_mm_from_pixels,
-    refresh_portal_services,
+    bootstrap_compositor_core, drain_session_sleep_notifications,
+    is_nonfatal_wayland_io_error, physical_size_mm_from_pixels, refresh_portal_services,
+    spawn_session_sleep_watch,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
 use smithay::backend::allocator::Allocator;
 use smithay::backend::input::{InputEvent, SwitchState, SwitchToggleEvent};
-use smithay::backend::renderer::Offscreen;
 use smithay::reexports::drm::control::Device as _;
 use smithay::reexports::input::event::switch::Switch as InputSwitch;
 // `DrmOutput::render_frame` / `initialize_output` drive an internal [`smithay::backend::drm::compositor::DrmCompositor`].
 
 use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
-use crate::core::backend_render::{prepare_output};
+use crate::core::backend_render::prepare_output;
 use crate::core::linear_compositing::{
-    run_linear_staged_pass, run_sdr_pass, select_hdr_offscreen_format, supports_linear_sdr,
-    use_linear_sdr_path, LinearOffscreenTargets, OffscreenTexture,
+    LinearOffscreenTargets, OffscreenTexture, run_linear_staged_pass, run_sdr_pass,
+    select_hdr_offscreen_format, supports_linear_sdr, use_linear_sdr_path,
 };
 use smithay::backend::renderer::utils::DamageBag;
-use smithay::backend::renderer::Frame;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
-    render_elements, texture::TextureRenderElement, Id, Kind,
+    Id, Kind, render_elements, texture::TextureRenderElement,
 };
 
 use focaldesk_flow::keybinds::BackendKind;
@@ -43,7 +42,7 @@ use focaldesk_settings_core::DisplayColorProfile;
 // - device/output attach points are real
 // - many internals are still TODO so you can connect them to your existing FocalDesk code
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use smithay::backend::renderer::Bind;
 use smithay::utils::DeviceFd;
 
@@ -59,22 +58,22 @@ use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use focaldesk_logging::flog;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
-use smithay::backend::allocator::format::{get_opaque, FormatSet};
-use smithay::backend::renderer::{Renderer, Texture as SmithayTexture};
+use smithay::backend::allocator::format::{FormatSet, get_opaque};
+use smithay::backend::renderer::Renderer;
 
 use smithay::{
     backend::{
-        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
+        allocator::{Fourcc, Modifier, gbm::GbmAllocator, gbm::GbmBufferFlags},
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
-        egl::{self, context::ContextPriority, EGLContext},
+        egl::{self, EGLContext, context::ContextPriority},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
+            Color32F, ExportMem, ImportDma, ImportEgl,
             element::solid::SolidColorRenderElement,
             gles::{GlesRenderer, GlesTarget, GlesTexture},
-            Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
-        udev::{primary_gpu, UdevBackend, UdevEvent},
+        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
+        udev::{UdevBackend, UdevEvent, primary_gpu},
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
@@ -89,17 +88,17 @@ use smithay::{
 };
 
 use smithay::backend::drm::{
+    HdrState,
     compositor::FrameFlags,
     exporter::gbm::GbmFramebufferExporter,
     output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
-    HdrState,
 };
 
 use crate::core::chrome_layout::build_chrome_layout;
 use crate::core::{
+    OutputState, SceneState,
     desktop::{DamageSource, DesktopState},
     ui_state::UiState,
-    OutputState, SceneState,
 };
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -426,10 +425,7 @@ fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> b
         .unwrap_or(false)
 }
 
-fn configured_display_color_profile(
-    displays: &[DisplayConfig],
-    name: &str,
-) -> DisplayColorProfile {
+fn configured_display_color_profile(displays: &[DisplayConfig], name: &str) -> DisplayColorProfile {
     displays
         .iter()
         .find(|display| display.name == name)
@@ -956,9 +952,9 @@ fn sync_output_hdr_flags(
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
-        hdr_driver_allows_output_with_override, intersect_modifiers, DisplayConfig,
-        DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport, PCI_VENDOR_NVIDIA,
+        DisplayConfig, DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport,
+        PCI_VENDOR_NVIDIA, configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
+        hdr_driver_allows_output_with_override, intersect_modifiers,
     };
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -1587,8 +1583,8 @@ mod hdr_detection {
                 Ok(props) => props,
                 Err(err) => {
                     flog(&format!(
-                    "HDR KMS properties: output={output_name} connector={connector:?} phase={phase} read_error={err}"
-                ));
+                        "HDR KMS properties: output={output_name} connector={connector:?} phase={phase} read_error={err}"
+                    ));
                     return;
                 }
             };
@@ -1627,8 +1623,8 @@ mod hdr_detection {
             }
 
             flog(&format!(
-            "HDR KMS properties: output={output_name} connector={connector:?} phase={phase} colorspace={colorspace} max_bpc={max_bpc} metadata={metadata}"
-        ));
+                "HDR KMS properties: output={output_name} connector={connector:?} phase={phase} colorspace={colorspace} max_bpc={max_bpc} metadata={metadata}"
+            ));
         }
 
         fn hdr_point(x: u16, y: u16) -> drm_ffi::hdr_metadata_infoframe__bindgen_ty_1 {
@@ -2088,36 +2084,41 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
 
                 let drm_nodes: Vec<_> = data.backend.devices.keys().copied().collect();
+                // After suspend, some GPUs come back in a half-initialized state.
+                // Rebuild each DRM device so output activation does not depend on
+                // whatever state the kernel/seat backend happened to preserve.
+                std::thread::sleep(Duration::from_millis(100));
+                let mut all_devices_ready = true;
                 for node in drm_nodes {
-                    let activate_result = if let Some(device) = data.backend.devices.get_mut(&node)
-                    {
-                        device.drm_output_manager.lock().activate(false)
-                    } else {
-                        continue;
-                    };
-
-                    if let Err(err) = activate_result {
+                    if let Err(err) = reinitialize_drm_device(data, &session_handle, node) {
                         flog(&format!(
-                            "Failed to reactivate DRM device {:?}: {err}; rebuilding",
+                            "Failed to rebuild DRM device {:?} after resume: {err}; retrying",
                             node
                         ));
-                        if let Err(reinit_err) =
-                            reinitialize_drm_device(data, &session_handle, node)
+                        std::thread::sleep(Duration::from_millis(100));
+                        if let Err(retry_err) = reinitialize_drm_device(data, &session_handle, node)
                         {
                             flog(&format!(
-                                "Failed to rebuild DRM device {:?} after resume: {reinit_err}",
+                                "Failed to rebuild DRM device {:?} after resume retry: {retry_err}; \
+                                 leaving session paused rather than rendering against a broken device",
                                 node
                             ));
+                            all_devices_ready = false;
                         }
                     }
                 }
 
-                data.core.state.on_resume();
+                data.core.state.handle_session_resume();
                 data.core.last_now = Instant::now();
                 data.core.state.mark_redraw();
-                data.session_active = true;
+                // Only resume rendering once every device is actually back and holding
+                // DRM master; otherwise the next frame's page flip fails permission
+                // checks and takes the whole compositor down (session_active stays
+                // false, so a later ActivateSession/udev Changed event can retry).
+                data.session_active = all_devices_ready;
             }
         })?;
+    let sleep_notifications = spawn_session_sleep_watch().ok();
 
     for (device_id, path) in udev.device_list() {
         let node = DrmNode::from_dev_id(device_id)
@@ -2203,6 +2204,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // Main loop
     //
     while !data.should_stop && data.core.state.running {
+        if let Some(rx) = sleep_notifications.as_ref() {
+            drain_session_sleep_notifications(rx, &mut data.core.state);
+        }
+
         #[cfg(feature = "xwayland")]
         data.core
             .xwayland_event_loop
@@ -2623,12 +2628,28 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                     present_elements.push(DrmPresentElement::Texture(texture_elem));
 
-                    let frame_result = surface.drm_output.render_frame(
+                    // A page-flip/commit failure here (e.g. a transient
+                    // permission-denied race while DRM master is being handed
+                    // back after resume-from-suspend) must not bring down the
+                    // whole compositor: that kills the session and dumps the
+                    // user back to the GDM login screen. Skip this output for
+                    // one frame and let the next tick retry instead.
+                    let frame_result = match surface.drm_output.render_frame(
                         &mut device.renderer,
                         &present_elements,
                         Color32F::new(0.0, 0.0, 0.0, 1.0),
                         FrameFlags::DEFAULT,
-                    )?;
+                    ) {
+                        Ok(frame_result) => frame_result,
+                        Err(err) => {
+                            flog(&format!(
+                                "DRM render_frame failed for output {:?}: {err}",
+                                surface.output_id
+                            ));
+                            data.core.state.mark_redraw();
+                            continue;
+                        }
+                    };
 
                     data.core.state.update_cursor_policy_after_drm_present(
                         &frame_result.states,
@@ -2636,7 +2657,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     );
 
                     if !frame_result.is_empty {
-                        surface.drm_output.queue_frame(None)?;
+                        if let Err(err) = surface.drm_output.queue_frame(None) {
+                            flog(&format!(
+                                "DRM queue_frame failed for output {:?}: {err}",
+                                surface.output_id
+                            ));
+                            data.core.state.mark_redraw();
+                            continue;
+                        }
                         surface.frame_queued_at = Some(now);
                         data.core.state.compositor_ready = true;
                     }

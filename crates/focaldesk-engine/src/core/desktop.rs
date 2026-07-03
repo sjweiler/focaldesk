@@ -18,8 +18,8 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    force_linear_surfaces, primaries_wider_than, ColorDescription,
-    RenderingIntent, SurfaceColorRenderState, SurfaceColorState,
+    force_linear_surfaces, primaries_wider_than, ColorDescription, RenderingIntent,
+    SurfaceColorRenderState, SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
@@ -64,21 +64,22 @@ use crate::core::lock::{
 };
 use crate::core::shell::ManagedWindow;
 use crate::core::RenderState;
+use focal_launch_shared::{request_launch, BrowserBackend, LaunchRequest, LaunchSource};
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_flow::actions::KeyAction;
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
-use focaldesk_ipc::{DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, DESKTOP_SOCKET_PATH};
+use focaldesk_ipc::{
+    send_control_request, send_notification_request, send_power_request, ControlIpcRequest,
+    ControlIpcResponse, ControlSetting, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    NotificationIpcRequest, NotificationIpcResponse, PowerIpcRequest, PowerIpcResponse,
+    DESKTOP_SOCKET_PATH,
+};
 use focaldesk_logging::session_id;
-use focaldesk_logging::{
-    flog, flog_error, flog_info, flog_warn, log_file_path_candidates, set_log_level, FLogLevel,
-};
-use focaldesk_notifications::NotificationManager;
-use focal_launch_shared::{
-    request_launch, BrowserBackend, LaunchRequest, LaunchSource,
-};
-use focaldesk_power::{PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
+use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
+use focaldesk_notifications::NotificationSnapshot;
+use focaldesk_power::{PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
     load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
     DisplayColorProfile, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
@@ -104,7 +105,6 @@ use smithay::wayland::shell::xdg::PopupSurface;
 use smithay::wayland::shell::xdg::ToplevelSurface;
 use std::path::{Path, PathBuf};
 use std::process::id;
-use std::process::Command;
 use std::time::{Duration, Instant};
 use tracing::{debug, info_span, trace};
 use tracing_subscriber::fmt::time;
@@ -140,11 +140,9 @@ use focaldesk_ai::{send_ai_request, AiDaemonStatus, AiIpcRequest, AiIpcResponse}
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
-use focaldesk_ui::ai_permission::AiPermissionDialog;
 use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogButton, DialogId, DialogKind, DialogState};
 use focaldesk_ui::dialog_layout::layout_dialog;
-use focaldesk_ui::portalpermission::{PortalPermissionDialog, PortalPermissionKind, PortalTarget};
 use focaldesk_ui::ui_builder::{
     SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID,
     SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_1_ID, SIDEBAR_WORKSPACE_2_ID,
@@ -489,7 +487,7 @@ pub struct DesktopInit {
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
-    pub notifications: NotificationManager,
+    pub notification_snapshots: Vec<NotificationSnapshot>,
     pub chrome: focaldesk_ui::chrome::Chrome,
     pub keybinds: Keybinds,
     pub client_wayland_display: String,
@@ -562,8 +560,6 @@ pub struct DesktopState {
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
-    pending_ai_permission_responses: HashMap<DialogId, (u64, mpsc::Sender<IpcResponse>)>,
-    pending_portal_chooser_responses: HashMap<DialogId, (u64, mpsc::Sender<IpcResponse>)>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
     /// Latest DRM offscreen texture per output for portal/OBS capture.
     pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
@@ -597,6 +593,7 @@ pub struct DesktopState {
     lid_resume_waiting_for_open: bool,
     last_power_poll_at: Instant,
     last_power_snapshot: Option<PowerSnapshot>,
+    last_notification_poll_at: Instant,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
     pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
@@ -604,7 +601,7 @@ pub struct DesktopState {
     // shell/chrome
     //pub topbar: TopBarModel,
     //pub sidebar: SidebarModel,
-    pub notifications: NotificationManager,
+    pub notification_snapshots: Vec<NotificationSnapshot>,
     pub lock_screen: LockScreenState,
 
     // xwayland and special surfaces
@@ -894,10 +891,19 @@ impl DesktopState {
 
     pub fn process_notification_timers(&mut self) {
         let now = Instant::now();
-        let had_visible = self.notifications.has_visible(now);
-        let expired = self.notifications.expire(now);
+        let poll_interval = Duration::from_millis(250);
+        if now.saturating_duration_since(self.last_notification_poll_at) < poll_interval {
+            return;
+        }
 
-        if had_visible || expired {
+        self.last_notification_poll_at = now;
+
+        let snapshots = notification_service_snapshots().unwrap_or_default();
+        let had_visible = !self.notification_snapshots.is_empty();
+        let has_visible = !snapshots.is_empty();
+        self.notification_snapshots = snapshots;
+
+        if had_visible || has_visible {
             self.mark_focused_output_full_damage(DamageSource::Unknown);
         }
     }
@@ -938,9 +944,7 @@ impl DesktopState {
             let suspend_timeout = Duration::from_secs(u64::from(suspend_timeout) * 60);
             if idle_for >= suspend_timeout && !self.idle_suspend_triggered {
                 self.idle_suspend_triggered = true;
-                if let Err(err) = focaldesk_power::PowerManager::new().suspend() {
-                    flog_warn!("idle suspend failed: {err}");
-                }
+                power_service_command(PowerIpcRequest::Suspend, "idle suspend");
             }
         }
     }
@@ -953,7 +957,7 @@ impl DesktopState {
         }
 
         self.last_power_poll_at = now;
-        let snapshot = PowerManager::new().snapshot();
+        let snapshot = power_service_snapshot().unwrap_or_else(empty_power_snapshot);
         let snapshot_changed = self.last_power_snapshot.as_ref() != Some(&snapshot);
         self.last_power_snapshot = Some(snapshot.clone());
 
@@ -983,7 +987,8 @@ impl DesktopState {
         self.idle_suspend_triggered = false;
     }
 
-    pub(crate) fn on_resume(&mut self) {
+    /// Reset compositor-side state after the session comes back from suspend.
+    pub(crate) fn handle_session_resume(&mut self) {
         self.last_user_activity_at = Instant::now();
         self.idle_lock_triggered = false;
         self.idle_suspend_triggered = false;
@@ -994,6 +999,14 @@ impl DesktopState {
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
         self.render.egui.refresh_power_status_now();
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn handle_session_suspend(&mut self) {
+        self.lock_session();
+    }
+
+    pub(crate) fn on_resume(&mut self) {
+        self.handle_session_resume();
     }
 
     pub(crate) fn handle_lid_switch(&mut self, closed: bool) {
@@ -1031,32 +1044,22 @@ impl DesktopState {
 
         match self.power.low_battery_action {
             LowBatteryAction::NotifyOnly => {
-                self.notifications
-                    .push_persistent("Power", format!("{message}."));
+                notification_service_notify("Power", format!("{message}."), None);
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
             LowBatteryAction::Suspend => {
-                self.notifications
-                    .push_persistent("Power", format!("{message}. Suspending."));
+                notification_service_notify("Power", format!("{message}. Suspending."), None);
                 self.lock_session();
-                if let Err(err) = PowerManager::new().suspend() {
-                    flog_warn!("low battery suspend failed: {err}");
-                }
+                power_service_command(PowerIpcRequest::Suspend, "low battery suspend");
             }
             LowBatteryAction::Hibernate => {
-                self.notifications
-                    .push_persistent("Power", format!("{message}. Hibernating."));
+                notification_service_notify("Power", format!("{message}. Hibernating."), None);
                 self.lock_session();
-                if let Err(err) = PowerManager::new().hibernate() {
-                    flog_warn!("low battery hibernate failed: {err}");
-                }
+                power_service_command(PowerIpcRequest::Hibernate, "low battery hibernate");
             }
             LowBatteryAction::PowerOff => {
-                self.notifications
-                    .push_persistent("Power", format!("{message}. Powering off."));
-                if let Err(err) = PowerManager::new().power_off() {
-                    flog_warn!("low battery poweroff failed: {err}");
-                }
+                notification_service_notify("Power", format!("{message}. Powering off."), None);
+                power_service_command(PowerIpcRequest::PowerOff, "low battery poweroff");
             }
         }
     }
@@ -1065,9 +1068,7 @@ impl DesktopState {
         match self.power.lid_close_action {
             LidCloseAction::Suspend => {
                 self.lock_session();
-                if let Err(err) = PowerManager::new().suspend() {
-                    flog_warn!("lid close suspend failed: {err}");
-                }
+                power_service_command(PowerIpcRequest::Suspend, "lid close suspend");
             }
             LidCloseAction::BlankScreen | LidCloseAction::LockScreen => {
                 self.lock_session();
@@ -1177,74 +1178,13 @@ impl DesktopState {
                 timeout_ms,
             } => {
                 let timeout = timeout_ms.map(Duration::from_millis);
-                let id = if timeout == Some(Duration::ZERO) {
-                    self.notifications.push_persistent(title, body)
-                } else if let Some(timeout) = timeout {
-                    self.notifications
-                        .push_with_timeout(title, body, Some(timeout))
-                } else {
-                    self.notifications.push(title, body)
+                let Some(id) = notification_service_notify(title, body, timeout) else {
+                    return Some(IpcResponse::Error {
+                        message: "notification service unavailable".to_string(),
+                    });
                 };
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
                 Some(IpcResponse::Notification { id })
-            }
-            IpcRequest::AiPermissionPrompt {
-                request_id,
-                title,
-                message,
-                allow_persistent,
-            } => {
-                if self.active_dialog.is_some() || !self.pending_ai_permission_responses.is_empty()
-                {
-                    return Some(IpcResponse::Error {
-                        message: "another modal dialog is already active".to_string(),
-                    });
-                }
-
-                if self.outputs.is_empty() {
-                    return Some(IpcResponse::Error {
-                        message: "no output available for AI permission dialog".to_string(),
-                    });
-                }
-
-                self.open_ai_permission_dialog(
-                    request_id,
-                    title,
-                    message,
-                    allow_persistent,
-                    response,
-                );
-                None
-            }
-            IpcRequest::PortalChooserPrompt {
-                request_id,
-                title,
-                message,
-                choices,
-            } => {
-                if self.active_dialog.is_some()
-                    || !self.pending_ai_permission_responses.is_empty()
-                    || !self.pending_portal_chooser_responses.is_empty()
-                {
-                    return Some(IpcResponse::Error {
-                        message: "another modal dialog is already active".to_string(),
-                    });
-                }
-
-                if self.outputs.is_empty() {
-                    return Some(IpcResponse::Error {
-                        message: "no output available for portal chooser dialog".to_string(),
-                    });
-                }
-
-                if choices.is_empty() {
-                    return Some(IpcResponse::Error {
-                        message: "portal chooser dialog requires at least one choice".to_string(),
-                    });
-                }
-
-                self.open_portal_chooser_dialog(request_id, title, message, choices, response);
-                None
             }
             IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
                 Ok(()) => Some(IpcResponse::Ok),
@@ -1253,11 +1193,8 @@ impl DesktopState {
             IpcRequest::GetDisplayRuntimeStatus => Some(IpcResponse::DisplayRuntimeStatus {
                 outputs: self.runtime_display_statuses(),
             }),
-            IpcRequest::GetPowerSnapshot => Some(IpcResponse::PowerSnapshot {
-                snapshot: self
-                    .last_power_snapshot
-                    .clone()
-                    .unwrap_or_else(empty_power_snapshot),
+            IpcRequest::GetPowerSnapshot => Some(IpcResponse::Error {
+                message: "request is handled by focaldesk-powerd".to_string(),
             }),
             IpcRequest::GetAll | IpcRequest::SetValue { .. } => Some(IpcResponse::Error {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
@@ -1510,9 +1447,12 @@ impl DesktopState {
             PerformanceMode::PowerSaver => "power-saver",
         };
 
-        if let Err(err) = PowerManager::new().set_performance_profile(profile) {
-            flog_warn!("failed to apply performance mode {profile}: {err}");
-        }
+        power_service_command(
+            PowerIpcRequest::SetPerformanceProfile {
+                profile: profile.to_string(),
+            },
+            &format!("apply performance mode {profile}"),
+        );
     }
 
     /// Clears and returns whether the host (nested) window should begin a platform move drag.
@@ -1619,22 +1559,10 @@ impl DesktopState {
     }
 
     pub(crate) fn ai_flow_mode(&self) -> AiFlowMode {
-        if self.pending_ai_permission_responses.is_empty() {
-            self.ai_flow_mode_cache
-        } else {
-            AiFlowMode::PermissionWait
-        }
+        self.ai_flow_mode_cache
     }
 
     fn refresh_ai_flow_mode(&mut self) {
-        if !self.pending_ai_permission_responses.is_empty() {
-            if self.ai_flow_mode_cache != AiFlowMode::PermissionWait {
-                self.ai_flow_mode_cache = AiFlowMode::PermissionWait;
-                self.mark_flow_field_animation_damage(true);
-            }
-            return;
-        }
-
         let now = Instant::now();
         if now.saturating_duration_since(self.ai_flow_mode_last_poll) < Duration::from_millis(800) {
             return;
@@ -2821,7 +2749,10 @@ impl DesktopState {
         match action {
             UiAction::LaunchApp(cmd) => {
                 let launch_trace_id = self.launch_app(self.resolve_launch_command(cmd));
-                flog_info!("dispatch launch trace_id={} action=LaunchApp", launch_trace_id);
+                flog_info!(
+                    "dispatch launch trace_id={} action=LaunchApp",
+                    launch_trace_id
+                );
             }
 
             UiAction::OpenPanel(panel) => {
@@ -2890,15 +2821,24 @@ impl DesktopState {
                 }
                 SIDEBAR_BROWSER_ID => {
                     let launch_trace_id = self.launch_app(self.apps.browser.clone());
-                    flog_info!("dispatch launch trace_id={} action=sidebar-browser", launch_trace_id);
+                    flog_info!(
+                        "dispatch launch trace_id={} action=sidebar-browser",
+                        launch_trace_id
+                    );
                 }
                 SIDEBAR_TERMINAL_ID => {
                     let launch_trace_id = self.launch_app(self.apps.terminal.clone());
-                    flog_info!("dispatch launch trace_id={} action=sidebar-terminal", launch_trace_id);
+                    flog_info!(
+                        "dispatch launch trace_id={} action=sidebar-terminal",
+                        launch_trace_id
+                    );
                 }
                 SIDEBAR_FILES_ID => {
                     let launch_trace_id = self.launch_app(focaldesk_files_command());
-                    flog_info!("dispatch launch trace_id={} action=sidebar-files", launch_trace_id);
+                    flog_info!(
+                        "dispatch launch trace_id={} action=sidebar-files",
+                        launch_trace_id
+                    );
                 }
                 _ => flog_warn!("unhandled custom ui action: {id}"),
             },
@@ -2916,16 +2856,10 @@ impl DesktopState {
     fn set_system_setting(&self, setting: focaldesk_ui::types::SettingKey, enabled: bool) {
         match setting {
             focaldesk_ui::types::SettingKey::Wifi => {
-                let state = if enabled { "on" } else { "off" };
-                if let Err(err) = Command::new("nmcli").args(["radio", "wifi", state]).spawn() {
-                    flog_error!("failed to set wifi radio {state}: {err}");
-                }
+                self.control_service_set_system_setting(ControlSetting::Wifi, enabled);
             }
             focaldesk_ui::types::SettingKey::Bluetooth => {
-                let state = if enabled { "on" } else { "off" };
-                if let Err(err) = Command::new("bluetoothctl").args(["power", state]).spawn() {
-                    flog_error!("failed to set bluetooth power {state}: {err}");
-                }
+                self.control_service_set_system_setting(ControlSetting::Bluetooth, enabled);
             }
             focaldesk_ui::types::SettingKey::DoNotDisturb => {
                 flog_warn!("do-not-disturb setting is not implemented");
@@ -2934,16 +2868,30 @@ impl DesktopState {
     }
 
     fn set_default_audio_volume(&self, volume: f32) {
-        let percent = (volume.clamp(0.0, 1.0) * 100.0).round();
-        if let Err(err) = Command::new("wpctl")
-            .args([
-                "set-volume",
-                "@DEFAULT_AUDIO_SINK@",
-                &format!("{percent:.0}%"),
-            ])
-            .spawn()
-        {
-            flog_error!("failed to set default audio volume: {err}");
+        self.control_service_set_default_audio_volume(volume);
+    }
+
+    fn control_service_set_system_setting(&self, setting: ControlSetting, enabled: bool) {
+        match send_control_request(&ControlIpcRequest::SetSystemSetting { setting, enabled }) {
+            Ok(ControlIpcResponse::Ok) => {}
+            Ok(ControlIpcResponse::Error { message }) => {
+                flog_error!("control service rejected system setting change: {message}");
+            }
+            Err(err) => {
+                flog_error!("control service unavailable: {err}");
+            }
+        }
+    }
+
+    fn control_service_set_default_audio_volume(&self, volume: f32) {
+        match send_control_request(&ControlIpcRequest::SetVolume { volume }) {
+            Ok(ControlIpcResponse::Ok) => {}
+            Ok(ControlIpcResponse::Error { message }) => {
+                flog_error!("control service rejected volume change: {message}");
+            }
+            Err(err) => {
+                flog_error!("control service unavailable: {err}");
+            }
         }
     }
 
@@ -2954,28 +2902,20 @@ impl DesktopState {
             }
             focaldesk_ui::types::SystemCommand::Suspend => {
                 self.lock_session();
-                if let Err(err) = PowerManager::new().suspend() {
-                    flog_error!("failed to start suspend: {err}");
-                }
+                power_service_command(PowerIpcRequest::Suspend, "system suspend");
             }
             focaldesk_ui::types::SystemCommand::Hibernate => {
                 self.lock_session();
-                if let Err(err) = PowerManager::new().hibernate() {
-                    flog_error!("failed to start hibernate: {err}");
-                }
+                power_service_command(PowerIpcRequest::Hibernate, "system hibernate");
             }
             focaldesk_ui::types::SystemCommand::Logout => {
                 self.running = false;
             }
             focaldesk_ui::types::SystemCommand::Restart => {
-                if let Err(err) = PowerManager::new().reboot() {
-                    flog_error!("failed to start reboot: {err}");
-                }
+                power_service_command(PowerIpcRequest::Reboot, "system reboot");
             }
             focaldesk_ui::types::SystemCommand::Shutdown => {
-                if let Err(err) = PowerManager::new().power_off() {
-                    flog_error!("failed to start poweroff: {err}");
-                }
+                power_service_command(PowerIpcRequest::PowerOff, "system poweroff");
             }
         }
     }
@@ -2990,14 +2930,10 @@ impl DesktopState {
             }
             PowerButtonAction::Suspend => {
                 self.lock_session();
-                if let Err(err) = PowerManager::new().suspend() {
-                    flog_error!("failed to start suspend from power button: {err}");
-                }
+                power_service_command(PowerIpcRequest::Suspend, "power button suspend");
             }
             PowerButtonAction::PowerOff => {
-                if let Err(err) = PowerManager::new().power_off() {
-                    flog_error!("failed to start poweroff from power button: {err}");
-                }
+                power_service_command(PowerIpcRequest::PowerOff, "power button poweroff");
             }
             PowerButtonAction::DoNothing => {}
         }
@@ -4378,8 +4314,6 @@ impl DesktopState {
             cursor_shape_state: init.cursor_shape_state,
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
-            pending_ai_permission_responses: HashMap::new(),
-            pending_portal_chooser_responses: HashMap::new(),
             portal_frame_cache: HashMap::new(),
             portal_capture_source: HashMap::new(),
             portal_offscreen_targets: HashMap::new(),
@@ -4400,7 +4334,7 @@ impl DesktopState {
             toplevel_pointer: None,
             dnd_cursor_phase: None,
 
-            notifications: init.notifications,
+            notification_snapshots: init.notification_snapshots,
             lock_screen: LockScreenState::new(),
             last_user_activity_at: Instant::now(),
             idle_lock_triggered: false,
@@ -4411,6 +4345,7 @@ impl DesktopState {
             lid_resume_waiting_for_open: false,
             last_power_poll_at: Instant::now(),
             last_power_snapshot: None,
+            last_notification_poll_at: Instant::now(),
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
@@ -4704,79 +4639,6 @@ impl DesktopState {
         id
     }
 
-    fn open_ai_permission_dialog(
-        &mut self,
-        request_id: u64,
-        title: String,
-        message: String,
-        allow_persistent: bool,
-        response: mpsc::Sender<IpcResponse>,
-    ) -> DialogId {
-        let dialog_id = self.alloc_dialog_id();
-        let owner_output = self.focused_output;
-        let output = self
-            .outputs
-            .get(&owner_output)
-            .expect("AI permission dialog requires at least one output");
-        let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
-        let helper = AiPermissionDialog::new(request_id, title, message, allow_persistent);
-        let dialog = helper.to_dialog(dialog_id, owner_output, screen);
-
-        self.pending_ai_permission_responses
-            .insert(dialog_id, (request_id, response));
-        self.open_dialog(dialog);
-        dialog_id
-    }
-
-    fn open_portal_chooser_dialog(
-        &mut self,
-        request_id: u64,
-        title: String,
-        message: String,
-        choices: Vec<String>,
-        response: mpsc::Sender<IpcResponse>,
-    ) -> DialogId {
-        let dialog_id = self.alloc_dialog_id();
-        let owner_output = self.focused_output;
-        let output = self
-            .outputs
-            .get(&owner_output)
-            .expect("portal chooser dialog requires at least one output");
-        let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
-
-        let mut buttons = vec![DialogButton {
-            label: "Cancel".into(),
-            action: DialogAction::Cancel,
-        }];
-        buttons.extend(
-            choices
-                .iter()
-                .enumerate()
-                .map(|(idx, choice)| DialogButton {
-                    label: choice.clone(),
-                    action: DialogAction::Custom((idx + 1) as u32),
-                }),
-        );
-
-        let dialog = Dialog {
-            id: dialog_id,
-            kind: DialogKind::Permission,
-            title,
-            message,
-            buttons,
-            modal: true,
-            dismissible: false,
-            state: DialogState::Open,
-            owner_output,
-            bounds: screen,
-        };
-
-        self.pending_portal_chooser_responses
-            .insert(dialog_id, (request_id, response));
-        self.open_dialog(dialog);
-        dialog_id
-    }
-
     pub fn close_dialog(&mut self, id: DialogId) {
         self.dialogs.retain(|d| d.id != id);
 
@@ -4828,43 +4690,6 @@ impl DesktopState {
             return;
         }
 
-        if let Some((request_id, response)) = self.pending_portal_chooser_responses.remove(&id) {
-            let dialog = self.dialogs.iter().find(|dialog| dialog.id == id);
-            let selected = match action {
-                DialogAction::Cancel => None,
-                DialogAction::Confirm => None,
-                DialogAction::Custom(choice_idx) if choice_idx > 0 => dialog
-                    .and_then(|dialog| dialog.buttons.get(choice_idx as usize))
-                    .map(|button| button.label.clone()),
-                DialogAction::Custom(_) => None,
-            };
-
-            let _ = response.send(IpcResponse::PortalChooserDecision {
-                request_id,
-                selected,
-            });
-            self.close_dialog(id);
-            return;
-        }
-
-        let maybe_ai_response =
-            self.pending_ai_permission_responses
-                .remove(&id)
-                .map(|(request_id, response)| {
-                    let prompt = AiPermissionDialog::response_for_action(action);
-                    let _ = response.send(IpcResponse::AiPermissionDecision {
-                        request_id,
-                        allow: matches!(
-                            prompt.decision,
-                            focaldesk_permissions::PermissionDecision::Allow
-                        ),
-                        persistent: matches!(
-                            prompt.scope,
-                            focaldesk_permissions::PermissionScope::Persistent
-                        ),
-                    });
-                });
-
         match action {
             DialogAction::Confirm => {
                 tracing::info!(
@@ -4899,7 +4724,6 @@ impl DesktopState {
         }
 
         self.close_dialog(id);
-        let _ = maybe_ai_response;
     }
 
     /// Import the committed surface tree into the active renderer (during Wayland dispatch).
@@ -4921,10 +4745,7 @@ impl DesktopState {
 
     pub fn handle_commit(&mut self, surface: &WlSurface) {
         let handle_commit_started = Instant::now();
-        flog_info!(
-            "surface commit surface={:?}",
-            surface.id()
-        );
+        flog_info!("surface commit surface={:?}", surface.id());
         tracing::trace!(
             target: "focaldesk",
             session_id = session_id(),
@@ -7366,6 +7187,85 @@ fn empty_power_snapshot() -> PowerSnapshot {
     }
 }
 
+fn power_service_snapshot() -> Option<PowerSnapshot> {
+    match send_power_request(&PowerIpcRequest::GetSnapshot) {
+        Ok(PowerIpcResponse::PowerSnapshot { snapshot }) => Some(snapshot),
+        Ok(PowerIpcResponse::Error { message }) => {
+            flog_warn!("power snapshot request rejected: {message}");
+            None
+        }
+        Ok(other) => {
+            flog_warn!("unexpected power snapshot response: {other:?}");
+            None
+        }
+        Err(err) => {
+            flog_warn!("power snapshot unavailable: {err}");
+            None
+        }
+    }
+}
+
+fn power_service_command(action: PowerIpcRequest, context: &str) {
+    match send_power_request(&action) {
+        Ok(PowerIpcResponse::Ok) => {}
+        Ok(PowerIpcResponse::Error { message }) => {
+            flog_warn!("{context} rejected: {message}");
+        }
+        Ok(other) => {
+            flog_warn!("{context} returned unexpected response: {other:?}");
+        }
+        Err(err) => {
+            flog_warn!("{context} unavailable: {err}");
+        }
+    }
+}
+
+fn notification_service_snapshots() -> Option<Vec<NotificationSnapshot>> {
+    match send_notification_request(&NotificationIpcRequest::GetVisible) {
+        Ok(NotificationIpcResponse::VisibleNotifications { notifications }) => Some(notifications),
+        Ok(NotificationIpcResponse::Error { message }) => {
+            flog_warn!("notification snapshot request rejected: {message}");
+            None
+        }
+        Ok(other) => {
+            flog_warn!("unexpected notification snapshot response: {other:?}");
+            None
+        }
+        Err(err) => {
+            flog_warn!("notification snapshots unavailable: {err}");
+            None
+        }
+    }
+}
+
+fn notification_service_notify(
+    title: impl Into<String>,
+    body: impl Into<String>,
+    timeout: Option<Duration>,
+) -> Option<u64> {
+    let request = NotificationIpcRequest::Notify {
+        title: title.into(),
+        body: body.into(),
+        timeout_ms: timeout.map(|duration| duration.as_millis() as u64),
+    };
+
+    match send_notification_request(&request) {
+        Ok(NotificationIpcResponse::NotificationQueued { id }) => Some(id),
+        Ok(NotificationIpcResponse::Error { message }) => {
+            flog_warn!("notification request rejected: {message}");
+            None
+        }
+        Ok(other) => {
+            flog_warn!("unexpected notification response: {other:?}");
+            None
+        }
+        Err(err) => {
+            flog_warn!("notification service unavailable: {err}");
+            None
+        }
+    }
+}
+
 fn chrome_profile_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -7374,41 +7274,6 @@ fn chrome_profile_dir() -> PathBuf {
         })
         .join("focaldesk")
         .join("chrome-profile")
-}
-
-fn clear_stale_chrome_singleton(profile: &Path) {
-    let lock = profile.join("SingletonLock");
-    let Ok(target) = std::fs::read_link(&lock) else {
-        return;
-    };
-
-    let Some(pid) = target
-        .to_string_lossy()
-        .rsplit('-')
-        .next()
-        .and_then(|value| value.parse::<u32>().ok())
-    else {
-        return;
-    };
-
-    if PathBuf::from(format!("/proc/{pid}")).exists() {
-        return;
-    }
-
-    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-        let path = profile.join(name);
-        if let Err(err) = std::fs::remove_file(&path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                flog(format!(
-                    "failed to remove stale Chrome singleton {}: {err}",
-                    path.display()
-                ));
-            }
-        }
-    }
-    flog(format!(
-        "removed stale Chrome profile singleton for pid {pid}"
-    ));
 }
 
 fn ai_flow_mode_from_status(status: &AiDaemonStatus) -> AiFlowMode {
@@ -7565,19 +7430,6 @@ fn spawn_app_detached(ctx: LaunchContext, launch_trace_id: u64, app: String) {
             xwayland_display: xwayland_display.map(|display| display.to_string()),
             browser_backend: browser_backend_for_launch(browser_backend),
             source: LaunchSource::Ui,
-            clear_chrome_profile: if chrome_like {
-                Some(chrome_profile_dir().display().to_string())
-            } else {
-                None
-            },
-            log_path: if chrome_like || cursor_like {
-                log_file_path_candidates()
-                    .into_iter()
-                    .next()
-                    .map(|path| path.to_string_lossy().into_owned())
-            } else {
-                None
-            },
         };
 
         chrome_launch_note(format!(

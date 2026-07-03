@@ -2,7 +2,7 @@ use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
 use focaldesk_ai::{AiPermissionRecord, list_ai_permission_records, revoke_ai_permission};
 use focaldesk_config::{FocalDeskConfig, load_config, save_config};
-use focaldesk_ipc::{IpcRequest, IpcResponse, send_desktop_request};
+use focaldesk_ipc::{PowerIpcRequest, PowerIpcResponse, send_power_request};
 use focaldesk_permissions::request::PermissionTarget;
 use focaldesk_permissions::{PermissionDecision, PermissionScope};
 use focaldesk_power::{LOW_BATTERY_THRESHOLD_PERCENT, PowerSnapshot};
@@ -349,14 +349,20 @@ fn bluetooth_powered() -> Result<bool, String> {
 }
 
 fn fetch_power_snapshot() -> Result<PowerSnapshot, String> {
-    if running_in_desktop_process() {
-        return Ok(focaldesk_power::PowerManager::new().snapshot());
-    }
-
-    match send_desktop_request(&IpcRequest::GetPowerSnapshot)? {
-        IpcResponse::PowerSnapshot { snapshot } => Ok(snapshot),
-        IpcResponse::Error { message } => Err(message),
-        other => Err(format!("unexpected IPC response: {other:?}")),
+    match send_power_request(&PowerIpcRequest::GetSnapshot) {
+        Ok(PowerIpcResponse::PowerSnapshot { snapshot }) => Ok(snapshot),
+        Ok(PowerIpcResponse::Error { message }) => {
+            if running_in_desktop_process() {
+                Ok(focaldesk_power::PowerManager::new().snapshot())
+            } else {
+                Err(message)
+            }
+        }
+        Ok(other) => Err(format!("unexpected power IPC response: {other:?}")),
+        Err(_err) if running_in_desktop_process() => {
+            Ok(focaldesk_power::PowerManager::new().snapshot())
+        }
+        Err(err) => Err(err),
     }
 }
 

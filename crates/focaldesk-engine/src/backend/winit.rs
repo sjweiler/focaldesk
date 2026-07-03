@@ -4,7 +4,8 @@
 
 use crate::backend::common::client_state_from_stream;
 use crate::backend::common::{
-    bootstrap_compositor_core, is_nonfatal_wayland_io_error, translate_backend_input,
+    bootstrap_compositor_core, drain_session_sleep_notifications,
+    is_nonfatal_wayland_io_error, spawn_session_sleep_watch, translate_backend_input,
     BootstrapOutput,
 };
 #[cfg(feature = "xwayland")]
@@ -74,7 +75,7 @@ fn dispatch_backend_events(
 
         WinitEvent::Focus(focused) => {
             if focused && !*window_focused {
-                state.on_resume();
+                state.handle_session_resume();
             }
             *window_focused = focused;
         }
@@ -150,10 +151,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..LinearOffscreenTargets::default()
     };
+    let sleep_notifications = spawn_session_sleep_watch().ok();
 
     let mut requested_focus_after_first_frame = false;
     let mut window_focused = false;
     while nested.state.running {
+        if let Some(rx) = sleep_notifications.as_ref() {
+            drain_session_sleep_notifications(rx, &mut nested.state);
+        }
+
         #[cfg(feature = "xwayland")]
         xwayland_event_loop.dispatch(Some(Duration::ZERO), &mut nested.state)?;
 
