@@ -463,17 +463,42 @@ fn focus_pulse_value(elapsed: Duration) -> f32 {
     }
 }
 
-/// Import and build client surfaces for an output. Call after `GlesRenderer::bind` and before
-/// `GlesRenderer::render` on the same renderer.
+/// Import committed client buffers for mapped windows on this output.
+/// Call after `GlesRenderer::bind` and before `GlesRenderer::render`.
+pub fn import_output_client_surfaces(
+    state: &DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+) {
+    let Some(output) = state.outputs.get(&output_id) else {
+        return;
+    };
+    let mapped = state.space.elements().count();
+    if mapped > 0 {
+        focaldesk_logging::flog_info!(
+            "import client surfaces output={} mapped_windows={}",
+            output_id.0,
+            mapped
+        );
+    }
+    state.import_mapped_surfaces_for_output(
+        renderer,
+        output.logical_origin,
+        output.logical_size,
+    );
+}
+
+/// Build client render elements for an output. Call after `GlesRenderer::bind` and before
+/// `GlesRenderer::render` on the same offscreen target.
 pub fn build_output_client_elements(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     output_id: OutputId,
 ) -> Vec<FlowRenderElement> {
-    let (output_handle, output_origin, output_logical_size) = state
+    let output_handle = state
         .outputs
         .get(&output_id)
-        .map(|o| (o.handle.clone(), o.logical_origin, o.logical_size))
+        .map(|o| o.handle.clone())
         .expect("output missing");
 
     let active_workspace = state
@@ -484,7 +509,12 @@ pub fn build_output_client_elements(
 
     let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
 
-    state.import_mapped_surfaces_for_output(renderer, output_origin, output_logical_size);
+    let output = state.outputs.get(&output_id).expect("output missing");
+    state.import_mapped_surfaces_for_output(
+        renderer,
+        output.logical_origin,
+        output.logical_size,
+    );
 
     state.render.build_client_elements_for_output(
         &state.space,

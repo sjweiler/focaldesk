@@ -1,9 +1,12 @@
 //! colord D-Bus integration (Phase C2): live ICC profile updates.
 
-use crate::core::desktop::{DamageSource, DesktopState};
+use crate::core::color::ColorDescription;
+use crate::core::desktop::DesktopState;
 use crate::core::icc::{self, ParsedIccProfile};
+use crate::core::icc_lut::OutputIccLut;
 use crate::core::wayland::color_management_protocol;
 use focaldesk_logging::flog;
+use focaldesk_types::OutputId;
 use std::collections::HashMap;
 use std::thread;
 use zbus::blocking::{Connection, MessageIterator, Proxy};
@@ -107,80 +110,137 @@ pub fn ensure_colord_display_device(make: &str, model: &str, serial: &str) -> bo
 }
 
 /// Re-load ICC/EDID descriptions for every output and notify wp_color clients.
-pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
-    let snapshots: Vec<_> = state
+/// Snapshot of one output's color state for background refresh.
+pub struct OutputColorSnapshot {
+    pub output_id: OutputId,
+    pub make: String,
+    pub model: String,
+    pub serial: String,
+    pub edid: Option<Vec<u8>>,
+    pub custom_path: Option<String>,
+    pub old_description: ColorDescription,
+    pub old_icc: Option<Vec<u8>>,
+    pub old_lut: Option<OutputIccLut>,
+}
+
+/// Resolved color update to apply on the compositor thread.
+pub struct OutputColorUpdate {
+    pub output_id: OutputId,
+    pub description: ColorDescription,
+    pub icc: Option<Vec<u8>>,
+    pub lut: Option<OutputIccLut>,
+}
+
+pub fn collect_output_color_snapshots(state: &DesktopState) -> Vec<OutputColorSnapshot> {
+    state
         .outputs
         .iter()
-        .map(|(id, output)| {
+        .map(|(id, output)| OutputColorSnapshot {
+            output_id: *id,
+            make: output.monitor_make.clone(),
+            model: output.monitor_model.clone(),
+            serial: output.monitor_serial.clone(),
+            edid: output.monitor_edid.clone(),
+            custom_path: output.icc_profile_path.clone(),
+            old_description: output.base_color_description,
+            old_icc: output.icc_profile.clone(),
+            old_lut: output.output_icc_lut.clone(),
+        })
+        .collect()
+}
+
+fn resolve_snapshot_color(
+    make: &str,
+    model: &str,
+    serial: &str,
+    edid: Option<&[u8]>,
+    custom_path: Option<&str>,
+) -> Option<(ColorDescription, Option<Vec<u8>>, Option<OutputIccLut>)> {
+    if let Some(path) = custom_path {
+        match crate::core::icc::load_display_profile_from_path(std::path::Path::new(path)) {
+            Ok(parsed) => Some((
+                parsed.description,
+                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                parsed.output_lut,
+            )),
+            Err(err) => {
+                flog(format!(
+                    "output color: failed to load ICC file {path}: {err:?}"
+                ));
+                resolve_output_color_profile(make, model, serial, edid).map(|parsed| {
+                    (
+                        parsed.description,
+                        (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                        parsed.output_lut,
+                    )
+                })
+            }
+        }
+    } else {
+        resolve_output_color_profile(make, model, serial, edid).map(|parsed| {
             (
-                *id,
-                output.monitor_make.clone(),
-                output.monitor_model.clone(),
-                output.monitor_serial.clone(),
-                output.monitor_edid.clone(),
-                output.icc_profile_path.clone(),
-                output.base_color_description,
-                output.icc_profile.clone(),
-                output.output_icc_lut.clone(),
+                parsed.description,
+                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
+                parsed.output_lut,
             )
         })
-        .collect();
+    }
+}
 
-    let mut any_changed = false;
-    for (output_id, make, model, serial, edid, custom_path, old_desc, old_icc, old_lut) in
-        snapshots
-    {
-        let resolved = if let Some(path) = custom_path {
-            match crate::core::icc::load_display_profile_from_path(std::path::Path::new(&path)) {
-                Ok(parsed) => Some((
-                    parsed.description,
-                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                    parsed.output_lut,
-                )),
-                Err(err) => {
-                    flog(format!("output color: failed to load ICC file {path}: {err:?}"));
-                    resolve_output_color_profile(&make, &model, &serial, edid.as_deref()).map(
-                        |parsed| {
-                            (
-                                parsed.description,
-                                (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                                parsed.output_lut,
-                            )
-                        },
-                    )
-                }
-            }
-        } else {
-            resolve_output_color_profile(&make, &model, &serial, edid.as_deref()).map(|parsed| {
-                (
-                    parsed.description,
-                    (!parsed.bytes.is_empty()).then_some(parsed.bytes),
-                    parsed.output_lut,
-                )
-            })
-        };
-
-        let Some((new_desc, new_icc, new_lut)) = resolved else {
+/// Resolve output colors off the compositor thread (D-Bus / disk I/O).
+pub fn compute_output_color_updates(snapshots: Vec<OutputColorSnapshot>) -> Vec<OutputColorUpdate> {
+    let mut updates = Vec::new();
+    for snapshot in snapshots {
+        let Some((description, icc, lut)) = resolve_snapshot_color(
+            &snapshot.make,
+            &snapshot.model,
+            &snapshot.serial,
+            snapshot.edid.as_deref(),
+            snapshot.custom_path.as_deref(),
+        ) else {
             continue;
         };
 
-        if new_desc != old_desc || new_icc != old_icc || new_lut != old_lut {
-            state.set_output_color(output_id, new_desc, new_icc, new_lut);
-            any_changed = true;
-            flog(format!(
-                "output color refreshed: id={output_id:?} primaries={:?} transfer={:?}",
-                new_desc.primaries, new_desc.transfer
-            ));
+        if description != snapshot.old_description
+            || icc != snapshot.old_icc
+            || lut != snapshot.old_lut
+        {
+            updates.push(OutputColorUpdate {
+                output_id: snapshot.output_id,
+                description,
+                icc,
+                lut,
+            });
         }
     }
+    updates
+}
 
-    if any_changed {
-        color_management_protocol::notify_preferred_color_changed(state);
-        state.mark_all_outputs_full_damage(DamageSource::Unknown);
-        state.mark_redraw();
+pub fn apply_output_color_updates(
+    state: &mut DesktopState,
+    updates: Vec<OutputColorUpdate>,
+) -> bool {
+    if updates.is_empty() {
+        return false;
     }
 
-    any_changed
+    for update in updates {
+        flog(format!(
+            "output color refreshed: id={:?} primaries={:?} transfer={:?}",
+            update.output_id, update.description.primaries, update.description.transfer
+        ));
+        state.set_output_color(update.output_id, update.description, update.icc, update.lut);
+    }
+
+    color_management_protocol::notify_preferred_color_changed(state);
+    state.mark_all_outputs_full_damage(crate::core::desktop::DamageSource::Unknown);
+    state.mark_redraw();
+    true
+}
+
+pub fn refresh_all_output_colors(state: &mut DesktopState) -> bool {
+    let snapshots = collect_output_color_snapshots(state);
+    apply_output_color_updates(state, compute_output_color_updates(snapshots))
 }
 
 /// Background thread: listen for colord profile/device changes and ping the main loop.

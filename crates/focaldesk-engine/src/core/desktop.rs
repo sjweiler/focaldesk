@@ -18,7 +18,7 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    effective_surface_render_state, force_linear_surfaces, primaries_wider_than, ColorDescription,
+    force_linear_surfaces, primaries_wider_than, ColorDescription,
     RenderingIntent, SurfaceColorRenderState, SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
@@ -75,6 +75,9 @@ use focaldesk_logging::{
     flog, flog_error, flog_info, flog_warn, log_file_path_candidates, set_log_level, FLogLevel,
 };
 use focaldesk_notifications::NotificationManager;
+use focal_launch_shared::{
+    request_launch, BrowserBackend, LaunchRequest, LaunchSource,
+};
 use focaldesk_power::{PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
     load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
@@ -82,7 +85,6 @@ use focaldesk_settings_core::{
     PowerButtonAction, PowerSettings, PrivacySettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
-use focaldesk_spawn::SpawnMessage;
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
 use indexmap::IndexMap;
@@ -120,7 +122,6 @@ use smithay::xwayland::X11Wm;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::process::Stdio;
 use std::sync::mpsc;
 use std::thread;
 use wayland_server::DisplayHandle;
@@ -670,11 +671,22 @@ pub struct DesktopState {
     next_dialog_id: DialogId,
     pending_ui_actions: Vec<UiAction>,
     pending_egui_ops: Vec<PendingEguiOp>,
-    pending_app_launches: Vec<String>,
-    pending_app_launch_results_rx: mpsc::Receiver<AppLaunchResult>,
-    pending_app_launch_results_tx: mpsc::Sender<AppLaunchResult>,
     pending_sidebar_dialogs: HashMap<DialogId, SidebarDialogKind>,
+    pending_app_launches: Vec<(u64, String)>,
+    /// Map/focus deferred out of `handle_commit` so Wayland dispatch does not re-enter seat/xdg.
+    pending_window_maps: Vec<(WindowId, Point<i32, Logical>)>,
+    pending_focus_window: Option<WindowId>,
+    next_launch_trace_id: u64,
     //pub popups: Vec<PopupState>,
+}
+
+#[derive(Clone)]
+struct LaunchContext {
+    client_wayland_display: String,
+    #[cfg(feature = "xwayland")]
+    xwayland_display: Option<String>,
+    browser_launch_backend: BrowserLaunchBackend,
+    backend_kind: BackendKind,
 }
 
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
@@ -682,13 +694,12 @@ pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const FLOW_FIELD_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 
+#[derive(Debug)]
 enum PendingEguiOp {
     OpenPanel(PanelKind, OutputId),
     AddWorkspace { output: OutputId, name: String },
     DeleteWorkspace(OutputId),
 }
-
-type AppLaunchResult = (String, Result<(), String>);
 
 #[derive(Debug, Clone, Copy)]
 enum SidebarDialogKind {
@@ -819,53 +830,56 @@ impl DesktopState {
         }
     }
 
+    /// Drain deferred sidebar/topbar clicks, app launches, and egui panel opens.
+    /// Call from the backend main loop after input dispatch, before Wayland client dispatch.
+    pub fn process_deferred_ui_and_launches(&mut self) {
+        self.process_pending_ui_actions();
+        self.process_pending_app_launches();
+        self.process_pending_egui_ops();
+    }
+
+    /// Apply window map/focus queued during `handle_commit`.
+    pub fn process_deferred_window_ops(&mut self) {
+        let maps = std::mem::take(&mut self.pending_window_maps);
+        for (window_id, map_loc) in maps {
+            let Some(idx) = self.windows.iter().position(|w| w.id == window_id) else {
+                continue;
+            };
+            let window = self.windows[idx].window.clone();
+            self.map_window_bbox_location(window, map_loc, false);
+            self.windows[idx].mapped = true;
+            flog_info!(
+                "window mapped (deferred) window_id={} space_count={}",
+                window_id.0,
+                self.space.elements().count()
+            );
+        }
+        if let Some(window_id) = self.pending_focus_window.take() {
+            self.focus_window_id(window_id);
+        }
+    }
+
     pub fn process_pending_app_launches(&mut self) {
-        let apps = std::mem::take(&mut self.pending_app_launches);
-        if apps.is_empty() {
+        if self.pending_app_launches.is_empty() {
             return;
         }
-
-        let client_wayland_display = self.client_wayland_display.clone();
-        #[cfg(feature = "xwayland")]
-        let xwayland_display = self.xwayland_display.clone();
-        let browser_launch_backend = self.apps.browser_launch_backend;
-        let result_tx = self.pending_app_launch_results_tx.clone();
-
-        for app in apps {
-            let app_name = app.clone();
-            let result_tx = result_tx.clone();
-            let client_wayland_display = client_wayland_display.clone();
+        let ctx = LaunchContext {
+            client_wayland_display: self.client_wayland_display.clone(),
             #[cfg(feature = "xwayland")]
-            let xwayland_display = xwayland_display.clone();
-            thread::spawn(move || {
-                let result = launch_app_worker(
-                    app,
-                    client_wayland_display,
-                    #[cfg(feature = "xwayland")]
-                    xwayland_display,
-                    #[cfg(not(feature = "xwayland"))]
-                    None,
-                    browser_launch_backend,
-                );
-                let _ = result_tx.send((app_name, result));
-            });
+            xwayland_display: self.xwayland_display.clone(),
+            browser_launch_backend: self.apps.browser_launch_backend,
+            backend_kind: self.backend_kind,
+        };
+        let apps: Vec<(u64, String)> = self.pending_app_launches.drain(..).collect();
+        for (launch_trace_id, app) in apps {
+            flog_info!(
+                "dequeuing app launch trace_id={} app={}",
+                launch_trace_id,
+                app
+            );
+            let ctx = ctx.clone();
+            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app));
         }
-    }
-
-    pub fn process_pending_app_launch_results(&mut self) {
-        while let Ok((app, result)) = self.pending_app_launch_results_rx.try_recv() {
-            if let Err(err) = result {
-                let title = launch_app_notification_title(&app);
-                flog_error!("{err}");
-                self.notifications.push(title, err.as_str());
-                self.mark_focused_output_full_damage(DamageSource::Unknown);
-            }
-        }
-    }
-
-    pub fn queue_launch_app(&mut self, app: String) {
-        chrome_launch_note(format!("queue launch app={app}"));
-        self.pending_app_launches.push(app);
     }
 
     pub fn process_chrome_timers(&mut self) {
@@ -1705,15 +1719,28 @@ impl DesktopState {
         let Some(action) = self.peek_ui_action_at_pointer() else {
             return false;
         };
+        flog_info!(
+            "ui click queued output={} action={:?}",
+            self.focused_output.0,
+            action
+        );
+        if self
+            .ui_element_at_pointer_for_output(self.focused_output)
+            .is_some_and(|el| el.kind == UiElementKind::SidebarButton)
+        {
+            flog_info!(
+                "sidebar action queued output={} action={:?}",
+                self.focused_output.0,
+                action
+            );
+        }
         if self
             .ui_element_at_pointer_for_output(self.focused_output)
             .is_some_and(|el| el.kind == UiElementKind::TopbarFlowField)
         {
             let _ = self.trigger_flow_field_pulse_at_pointer(self.focused_output);
         }
-        self.dispatch_ui_action(action);
-        self.process_pending_egui_ops();
-        self.process_pending_app_launches();
+        self.queue_ui_action(action);
         true
     }
 
@@ -2793,7 +2820,8 @@ impl DesktopState {
     pub(crate) fn dispatch_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::LaunchApp(cmd) => {
-                self.queue_launch_app(self.resolve_launch_command(cmd));
+                let launch_trace_id = self.launch_app(self.resolve_launch_command(cmd));
+                flog_info!("dispatch launch trace_id={} action=LaunchApp", launch_trace_id);
             }
 
             UiAction::OpenPanel(panel) => {
@@ -2826,9 +2854,19 @@ impl DesktopState {
             }
 
             UiAction::Custom(id) => match id {
-                SIDEBAR_SETTINGS_ID => self.queue_launch_app(focaldesk_settings_command()),
+                SIDEBAR_SETTINGS_ID => {
+                    let launch_trace_id = self.launch_app(focaldesk_settings_command());
+                    flog_info!(
+                        "dispatch launch trace_id={} action=sidebar-settings",
+                        launch_trace_id
+                    );
+                }
                 focaldesk_ui::ui_builder::TOPBAR_FLOW_FIELD_ID => {
-                    self.queue_launch_app(focaldesk_ai_console_command())
+                    let launch_trace_id = self.launch_app(focaldesk_ai_console_command());
+                    flog_info!(
+                        "dispatch launch trace_id={} action=topbar-flow-field",
+                        launch_trace_id
+                    );
                 }
                 SIDEBAR_WORKSPACE_1_ID => self.set_focused_workspace(WorkspaceId(1)),
                 SIDEBAR_WORKSPACE_2_ID => {
@@ -2850,9 +2888,18 @@ impl DesktopState {
                         self.open_delete_workspace_dialog();
                     }
                 }
-                SIDEBAR_BROWSER_ID => self.queue_launch_app(self.apps.browser.clone()),
-                SIDEBAR_TERMINAL_ID => self.queue_launch_app(self.apps.terminal.clone()),
-                SIDEBAR_FILES_ID => self.queue_launch_app(focaldesk_files_command()),
+                SIDEBAR_BROWSER_ID => {
+                    let launch_trace_id = self.launch_app(self.apps.browser.clone());
+                    flog_info!("dispatch launch trace_id={} action=sidebar-browser", launch_trace_id);
+                }
+                SIDEBAR_TERMINAL_ID => {
+                    let launch_trace_id = self.launch_app(self.apps.terminal.clone());
+                    flog_info!("dispatch launch trace_id={} action=sidebar-terminal", launch_trace_id);
+                }
+                SIDEBAR_FILES_ID => {
+                    let launch_trace_id = self.launch_app(focaldesk_files_command());
+                    flog_info!("dispatch launch trace_id={} action=sidebar-files", launch_trace_id);
+                }
                 _ => flog_warn!("unhandled custom ui action: {id}"),
             },
 
@@ -4283,8 +4330,6 @@ impl DesktopState {
     pub fn new(init: DesktopInit) -> Self {
         let debug = init.debug.clone();
         apply_debug_log_level(debug.log_level);
-        let (pending_app_launch_results_tx, pending_app_launch_results_rx) = mpsc::channel();
-
         let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -4409,8 +4454,9 @@ impl DesktopState {
             pending_egui_ops: Vec::new(),
             pending_sidebar_dialogs: HashMap::new(),
             pending_app_launches: Vec::new(),
-            pending_app_launch_results_tx,
-            pending_app_launch_results_rx,
+            pending_window_maps: Vec::new(),
+            pending_focus_window: None,
+            next_launch_trace_id: 1,
         };
 
         state.apply_power_settings();
@@ -4425,6 +4471,11 @@ impl DesktopState {
 
     pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) {
         let id = self.alloc_window_id();
+        flog_info!(
+            "xdg toplevel created window_id={} surface={:?}",
+            id.0,
+            surface.wl_surface().id()
+        );
         let _span = info_span!(
             "add_xdg_toplevel",
             session_id = session_id(),
@@ -4743,13 +4794,25 @@ impl DesktopState {
                     if let DialogAction::Custom(choice) = action {
                         match choice {
                             LAUNCHER_DIALOG_TERMINAL => {
-                                self.queue_launch_app(self.apps.terminal.clone())
+                                let launch_trace_id = self.launch_app(self.apps.terminal.clone());
+                                flog_info!(
+                                    "dispatch launch trace_id={} action=launcher-terminal",
+                                    launch_trace_id
+                                );
                             }
                             LAUNCHER_DIALOG_BROWSER => {
-                                self.queue_launch_app(self.apps.browser.clone())
+                                let launch_trace_id = self.launch_app(self.apps.browser.clone());
+                                flog_info!(
+                                    "dispatch launch trace_id={} action=launcher-browser",
+                                    launch_trace_id
+                                );
                             }
                             LAUNCHER_DIALOG_FILES => {
-                                self.queue_launch_app(focaldesk_files_command())
+                                let launch_trace_id = self.launch_app(focaldesk_files_command());
+                                flog_info!(
+                                    "dispatch launch trace_id={} action=launcher-files",
+                                    launch_trace_id
+                                );
                             }
                             _ => {}
                         }
@@ -4857,6 +4920,11 @@ impl DesktopState {
     }
 
     pub fn handle_commit(&mut self, surface: &WlSurface) {
+        let handle_commit_started = Instant::now();
+        flog_info!(
+            "surface commit surface={:?}",
+            surface.id()
+        );
         tracing::trace!(
             target: "focaldesk",
             session_id = session_id(),
@@ -4947,7 +5015,7 @@ impl DesktopState {
                 if in_space && !self.windows[idx].mapped && !self.windows[idx].minimized {
                     self.windows[idx].mapped = true;
                     let window_id = self.windows[idx].id;
-                    self.focus_window_id(window_id);
+                    self.pending_focus_window = Some(window_id);
                     tracing::trace!(
                         target: "focaldesk",
                         session_id = session_id(),
@@ -4990,8 +5058,6 @@ impl DesktopState {
 
         let mut mapped_window = false;
         if let Some(idx) = to_map {
-            let window = self.windows[idx].window.clone();
-
             let output_id = self
                 .output_under_pointer(self.input.pointer_pos)
                 .unwrap_or(self.primary_output);
@@ -5001,18 +5067,11 @@ impl DesktopState {
                 .map(|rect| rect.loc)
                 .unwrap_or_else(|| self.default_toplevel_map_location(output_id));
 
-            self.map_window_bbox_location(window, map_loc, false);
-            self.windows[idx].mapped = true;
             let window_id = self.windows[idx].id;
-            self.focus_window_id(window_id);
-            tracing::trace!(
-                target: "focaldesk",
-                session_id = session_id(),
-                window_id = ?window_id,
-                space_count = self.space.elements().count(),
-                "window mapped from commit"
-            );
+            self.pending_window_maps.push((window_id, map_loc));
+            self.pending_focus_window = Some(window_id);
             mapped_window = true;
+            flog_info!("window map queued from commit window_id={}", window_id.0);
         }
 
         let resize_damage = handle_resize_surface_commit(&mut self.space, surface);
@@ -5063,9 +5122,29 @@ impl DesktopState {
                 }
             }
         }
+
+        flog_info!(
+            "handle_commit complete surface={:?} elapsed_ms={}",
+            surface.id(),
+            handle_commit_started.elapsed().as_millis()
+        );
     }
 
     pub(crate) fn window_for_wl_surface(&self, surface: &WlSurface) -> Option<Window> {
+        if let Some(id) = self.window_id_for_wl_surface(surface) {
+            return self.window(id).map(|managed| managed.window.clone());
+        }
+        for managed in &self.windows {
+            let mut belongs = false;
+            managed.window.with_surfaces(|s, _| {
+                if s == surface {
+                    belongs = true;
+                }
+            });
+            if belongs {
+                return Some(managed.window.clone());
+            }
+        }
         self.space
             .elements()
             .find(|w| w.wl_surface().as_deref() == Some(surface))
@@ -5169,7 +5248,11 @@ impl DesktopState {
             }
 
             KeyAction::LaunchTerminal => {
-                self.queue_launch_app(self.apps.terminal.clone());
+                let launch_trace_id = self.launch_app(self.apps.terminal.clone());
+                flog_info!(
+                    "dispatch launch trace_id={} action=keybind-terminal",
+                    launch_trace_id
+                );
             }
 
             KeyAction::LockScreen => {
@@ -5217,7 +5300,11 @@ impl DesktopState {
             }
 
             KeyAction::LaunchFiles => {
-                self.queue_launch_app(focaldesk_files_command());
+                let launch_trace_id = self.launch_app(focaldesk_files_command());
+                flog_info!(
+                    "dispatch launch trace_id={} action=keybind-files",
+                    launch_trace_id
+                );
             }
         }
     }
@@ -5254,7 +5341,11 @@ impl DesktopState {
     fn update_focus(&mut self) {}
 
     pub fn launch_terminal(&mut self) {
-        self.queue_launch_app(self.apps.terminal.clone());
+        let launch_trace_id = self.launch_app(self.apps.terminal.clone());
+        flog_info!(
+            "dispatch launch trace_id={} action=launch-terminal",
+            launch_trace_id
+        );
     }
 
     /// True when it is safe to run [`wayland_server::Display::dispatch_clients`].
@@ -5284,6 +5375,14 @@ impl DesktopState {
         self.xwm = None;
         self.xwayland_display = None;
         flog("XWayland disabled");
+    }
+
+    pub fn launch_app(&mut self, app: String) -> u64 {
+        let launch_trace_id = self.next_launch_trace_id;
+        self.next_launch_trace_id = self.next_launch_trace_id.saturating_add(1);
+        flog_info!("queue launch trace_id={} app={}", launch_trace_id, app);
+        self.pending_app_launches.push((launch_trace_id, app));
+        launch_trace_id
     }
 
     pub fn handle_key_event(&mut self, keycode: u32, state: FlowKeyState) {
@@ -5880,11 +5979,11 @@ impl DesktopState {
                         FlowKeyState::Released => {
                             self.input.pointer_left_down = false;
                             if let Some(pressed_id) = self.ui.pressed.take() {
-                                if self
+                                let clicked = self
                                     .ui_element_at_pointer_for_output(self.focused_output)
-                                    .is_some_and(|el| el.id == pressed_id && el.enabled)
-                                {
-                                    let _ = self.click_ui_at_pointer();
+                                    .is_some_and(|el| el.id == pressed_id && el.enabled);
+                                if clicked && self.click_ui_at_pointer() {
+                                    self.mark_focused_output_full_damage(DamageSource::Unknown);
                                 }
                             }
                             self.pending_compositor_move = None;
@@ -6692,14 +6791,20 @@ impl DesktopState {
     pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
         let force_linear = force_linear_surfaces();
         let mut color = with_states(surface, |states| {
-            let mut surface_color = states.cached_state.get::<SurfaceColorState>();
-            if let Some(desc) = surface_color.pending().description {
+            if force_linear {
                 return SurfaceColorRenderState::for_description(
-                    desc,
-                    surface_color.pending().intent,
+                    ColorDescription::LINEAR_SRGB,
+                    RenderingIntent::Perceptual,
                 );
             }
-            crate::core::color::effective_surface_render_state(states, force_linear)
+            let mut surface_color = states.cached_state.get::<SurfaceColorState>();
+            if let Some(desc) = surface_color.pending().description {
+                SurfaceColorRenderState::for_description(desc, surface_color.pending().intent)
+            } else {
+                // Do not call `effective_surface_render_state` here: it would re-lock the same
+                // `SurfaceColorState` mutex and deadlock the compositor on the first commit.
+                surface_color.current().render_state()
+            }
         });
         if let Some(widest) = self
             .color_management_state
@@ -7261,147 +7366,6 @@ fn empty_power_snapshot() -> PowerSnapshot {
     }
 }
 
-fn spawn_command_via_daemon(program: &str, command: &Command) -> std::io::Result<()> {
-    let args = command
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let mut env = Vec::new();
-    let mut unset_env = Vec::new();
-    for (key, value) in command.get_envs() {
-        let key = key.to_string_lossy().into_owned();
-        match value {
-            Some(value) => env.push((key, value.to_string_lossy().into_owned())),
-            None => unset_env.push(key),
-        }
-    }
-    focaldesk_spawn::request_spawn(&SpawnMessage {
-        program: program.to_string(),
-        args,
-        env,
-        unset_env,
-    })
-}
-
-fn launch_app_worker(
-    app_name: String,
-    client_wayland_display: String,
-    xwayland_display: Option<String>,
-    browser_launch_backend: BrowserLaunchBackend,
-) -> Result<(), String> {
-    let chrome_like = is_chrome_like(&app_name);
-    let browser_like = is_browser_like(&app_name);
-    let cursor_like = is_cursor_like(&app_name);
-
-    chrome_launch_note(format!(
-        "launch_app app={app_name} chrome_like={chrome_like} browser_like={browser_like} pid={} client_wayland_display={client_wayland_display} xwayland_display={xwayland_display:?}",
-        id(),
-    ));
-
-    let display_env = xwayland_display.clone();
-    let launch_candidates = if chrome_like {
-        chrome_exec_fallbacks(&app_name)
-    } else {
-        vec![app_name.clone()]
-    };
-    chrome_launch_note(format!(
-        "launch candidates for {app_name}: {:?}",
-        launch_candidates
-    ));
-
-    let mut last_error = None;
-    for candidate in launch_candidates {
-        chrome_launch_note(format!("trying candidate={candidate}"));
-        let mut command = Command::new(&candidate);
-
-        let prefer_x11 = match browser_launch_backend {
-            BrowserLaunchBackend::Auto => false,
-            BrowserLaunchBackend::Wayland => false,
-            BrowserLaunchBackend::Xwayland => true,
-        };
-        if chrome_like || browser_like {
-            if prefer_x11 && xwayland_display.is_some() {
-                command.env_remove("WAYLAND_DISPLAY");
-                if let Some(display) = &xwayland_display {
-                    command.env("DISPLAY", display);
-                }
-            } else {
-                command.env("WAYLAND_DISPLAY", &client_wayland_display);
-                command.env_remove("DISPLAY");
-            }
-            chrome_launch_note(format!(
-                "browser backend policy for {app_name}: {:?} prefer_x11={prefer_x11}",
-                browser_launch_backend
-            ));
-        } else {
-            command.env("WAYLAND_DISPLAY", &client_wayland_display);
-            command.env_remove("DISPLAY");
-            if let Some(display) = &xwayland_display {
-                command.env("DISPLAY", display);
-            }
-        }
-        if chrome_like || cursor_like {
-            configure_chrome_command(&mut command, prefer_x11);
-            if let Some(file) = open_session_log_file() {
-                if let Ok(stderr_file) = file.try_clone() {
-                    command.stdout(Stdio::from(file));
-                    command.stderr(Stdio::from(stderr_file));
-                }
-            }
-        }
-        if is_obs_like(&candidate) {
-            configure_obs_recording_dir();
-        }
-
-        match spawn_command_via_daemon(&candidate, &command) {
-            Ok(()) => {
-                chrome_launch_note(format!(
-                    "spawned candidate={candidate} via spawn daemon wayland_display={client_wayland_display} display={display_env:?}",
-                ));
-                if xwayland_display.is_none() && !(chrome_like || cursor_like) {
-                    tracing::warn!(
-                        target: "focaldesk",
-                        session_id = session_id(),
-                        candidate = %candidate,
-                        "launched without DISPLAY; X11 apps need XWayland"
-                    );
-                }
-                return Ok(());
-            }
-            Err(err) => {
-                chrome_launch_note(format!("spawn failed candidate={candidate} err={err}"));
-                last_error = Some((candidate, err));
-            }
-        }
-    }
-
-    if let Some((candidate, err)) = last_error {
-        let message =
-            format!("failed to launch app {app_name} with last candidate {candidate}: {err}");
-        flog_error!("{message}");
-        chrome_launch_note(format!(
-            "all launch candidates failed last_candidate={candidate} err={err}"
-        ));
-        return Err(message);
-    }
-
-    Err(format!(
-        "failed to launch app {app_name}: no launch candidates succeeded"
-    ))
-}
-
-fn launch_app_notification_title(app_name: &str) -> &'static str {
-    match app_name {
-        name if is_browser_like(name) => "Browser launch failed",
-        name if is_cursor_like(name) => "Pointer app launch failed",
-        name if is_chrome_like(name) => "Chromium app launch failed",
-        name if name.contains("terminal") => "Terminal launch failed",
-        name if name.contains("files") => "Files launch failed",
-        name if name.contains("settings") => "Settings launch failed",
-        _ => "App launch failed",
-    }
-}
-
 fn chrome_profile_dir() -> PathBuf {
     std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -7490,17 +7454,17 @@ fn focaldesk_ai_console_command() -> String {
         .unwrap_or_else(|| "focaldesk-ai-console".to_string())
 }
 
-fn configure_chrome_command(command: &mut Command, use_x11: bool) {
+fn chrome_command_args(use_x11: bool) -> Vec<String> {
     let profile = chrome_profile_dir();
-    clear_stale_chrome_singleton(&profile);
     let ozone_platform = if use_x11 { "x11" } else { "wayland" };
-    command
-        .arg(format!("--ozone-platform={ozone_platform}"))
-        .arg("--disable-features=Vulkan")
-        .arg(format!("--user-data-dir={}", profile.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check")
-        .arg("--new-window");
+    vec![
+        format!("--ozone-platform={ozone_platform}"),
+        "--disable-features=Vulkan".to_string(),
+        format!("--user-data-dir={}", profile.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--new-window".to_string(),
+    ]
 }
 
 fn chrome_launch_trace_path() -> PathBuf {
@@ -7520,17 +7484,132 @@ fn chrome_launch_trace(msg: impl AsRef<str>) {
 }
 
 fn chrome_launch_note(msg: impl AsRef<str>) {
-    chrome_launch_trace(msg);
+    let message = msg.as_ref();
+    chrome_launch_trace(message);
+    flog_warn!("[chrome-launch] {message}");
 }
 
-fn open_session_log_file() -> Option<std::fs::File> {
-    for path in log_file_path_candidates() {
-        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
-            return Some(file);
+#[cfg(feature = "xwayland")]
+fn launch_xwayland_display(ctx: &LaunchContext) -> Option<&str> {
+    ctx.xwayland_display.as_deref()
+}
+
+#[cfg(not(feature = "xwayland"))]
+fn launch_xwayland_display(_ctx: &LaunchContext) -> Option<&str> {
+    None
+}
+
+fn browser_backend_for_launch(backend: BrowserLaunchBackend) -> BrowserBackend {
+    match backend {
+        BrowserLaunchBackend::Auto => BrowserBackend::Auto,
+        BrowserLaunchBackend::Wayland => BrowserBackend::Wayland,
+        BrowserLaunchBackend::Xwayland => BrowserBackend::Xwayland,
+    }
+}
+
+fn spawn_app_detached(ctx: LaunchContext, launch_trace_id: u64, app: String) {
+    let app_name = app.clone();
+    let chrome_like = is_chrome_like(&app_name);
+    let browser_like = is_browser_like(&app_name);
+    let cursor_like = is_cursor_like(&app_name);
+    let xwayland_display = launch_xwayland_display(&ctx);
+    let browser_backend = ctx.browser_launch_backend;
+    let prefer_x11 = matches!(browser_backend, BrowserLaunchBackend::Xwayland);
+
+    let launch_span = tracing::info_span!(
+        "launch_app",
+        session_id = session_id(),
+        trace_id = launch_trace_id,
+        app = %app_name,
+        chrome_like,
+        browser_like,
+        cursor_like,
+        backend = ?ctx.backend_kind,
+        wayland_display = %ctx.client_wayland_display,
+        xwayland_display = ?xwayland_display
+    );
+    let _enter = launch_span.enter();
+    chrome_launch_note(format!(
+        "launch_app trace_id={} app={app_name} chrome_like={chrome_like} browser_like={browser_like} pid={} client_wayland_display={} xwayland_display={:?}",
+        launch_trace_id,
+        id(),
+        ctx.client_wayland_display,
+        xwayland_display
+    ));
+
+    let launch_candidates = if chrome_like {
+        chrome_exec_fallbacks(&app_name)
+    } else {
+        vec![app_name.clone()]
+    };
+    chrome_launch_note(format!(
+        "launch candidates for {app_name}: {:?}",
+        launch_candidates
+    ));
+
+    for candidate in launch_candidates {
+        chrome_launch_note(format!("trying candidate={candidate}"));
+        if is_obs_like(&candidate) {
+            configure_obs_recording_dir();
+        }
+
+        let request = LaunchRequest {
+            trace_id: launch_trace_id,
+            app: candidate.clone(),
+            args: if cursor_like {
+                chrome_command_args(prefer_x11)
+            } else {
+                Vec::new()
+            },
+            wayland_display: ctx.client_wayland_display.clone(),
+            xwayland_display: xwayland_display.map(|display| display.to_string()),
+            browser_backend: browser_backend_for_launch(browser_backend),
+            source: LaunchSource::Ui,
+            clear_chrome_profile: if chrome_like {
+                Some(chrome_profile_dir().display().to_string())
+            } else {
+                None
+            },
+            log_path: if chrome_like || cursor_like {
+                log_file_path_candidates()
+                    .into_iter()
+                    .next()
+                    .map(|path| path.to_string_lossy().into_owned())
+            } else {
+                None
+            },
+        };
+
+        chrome_launch_note(format!(
+            "browser backend policy for {app_name}: {:?} prefer_x11={prefer_x11}",
+            browser_backend
+        ));
+
+        match request_launch(&request) {
+            Ok(_) => {
+                if xwayland_display.is_none() && !(chrome_like || cursor_like) {
+                    tracing::warn!(
+                        target: "focaldesk",
+                        session_id = session_id(),
+                        trace_id = launch_trace_id,
+                        candidate = %candidate,
+                        "launched without DISPLAY; X11 apps need XWayland"
+                    );
+                }
+                chrome_launch_note(format!(
+                    "launch request sent trace_id={} candidate={candidate}",
+                    launch_trace_id
+                ));
+                return;
+            }
+            Err(err) => {
+                chrome_launch_note(format!(
+                    "launch request failed trace_id={} candidate={candidate} err={err:?}",
+                    launch_trace_id
+                ));
+            }
         }
     }
-
-    None
 }
 
 fn chrome_exec_fallbacks(app_name: &str) -> Vec<String> {

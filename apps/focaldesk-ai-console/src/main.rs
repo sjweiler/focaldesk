@@ -14,7 +14,8 @@ use gtk4::{
 use serde::{Deserialize, Serialize};
 use std::{
     cell::RefCell, collections::BTreeMap, fs, path::PathBuf, process::Command, rc::Rc, sync::mpsc,
-    thread, time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -79,6 +80,27 @@ struct QuickPromptsPage {
     activity_box: Box,
     detail_box: Box,
     state: Rc<RefCell<PromptActivity>>,
+}
+
+#[derive(Clone)]
+struct BackendBannerHandles {
+    title_label: Label,
+    subtitle_label: Label,
+    backend_combo: ComboBoxText,
+    model_combo: ComboBoxText,
+}
+
+impl BackendBannerHandles {
+    fn refresh(&self, state: &PersistedState, runtime: &AiConsoleRuntime) {
+        refresh_backend_banner(
+            &self.title_label,
+            &self.subtitle_label,
+            &self.backend_combo,
+            &self.model_combo,
+            state,
+            runtime,
+        );
+    }
 }
 
 impl Default for AppState {
@@ -324,8 +346,7 @@ fn build_ui(app: &Application) {
     load_css();
 
     let state = Rc::new(RefCell::new(load_state()));
-    let runtime = Rc::new(RefCell::new(load_ai_runtime()));
-    normalize_state_with_runtime(&mut state.borrow_mut(), &runtime.borrow());
+    let runtime = Rc::new(RefCell::new(AiConsoleRuntime::default()));
     let log_buffer = TextBuffer::new(None);
     let quick_prompts_page = build_quick_prompts_page();
     sync_quick_prompts_backend(&quick_prompts_page, &state.borrow(), &runtime.borrow());
@@ -510,7 +531,7 @@ fn build_ui(app: &Application) {
         composer_status_label.clone(),
         log_buffer.clone(),
     );
-    let mode_banner = build_backend_banner(
+    let (mode_banner, banner_handles) = build_backend_banner(
         state.clone(),
         runtime.clone(),
         log_buffer.clone(),
@@ -664,6 +685,24 @@ fn build_ui(app: &Application) {
 
     window.set_child(Some(&root));
     window.present();
+
+    append_log(
+        &log_buffer,
+        "[startup] window shown; scheduling async AI runtime refresh",
+    );
+
+    refresh_ai_runtime_async(
+        runtime.clone(),
+        state.clone(),
+        banner_handles.clone(),
+        providers_page.clone(),
+        quick_prompts_page.clone(),
+        composer_status_label.clone(),
+        log_buffer.clone(),
+        stack.clone(),
+        false,
+        "startup",
+    );
 }
 
 fn add_message(parent: &Box, text: &str, class_name: &str) {
@@ -704,7 +743,9 @@ fn render_conversation_panel(parent: &Box, conversation: &Conversation, heading:
 }
 
 fn load_log_buffer(buffer: &TextBuffer, store: &PersistedState) {
-    let mut text = String::from("[info] ai-console booted\n[info] sidebar nav ready\n");
+    let mut text = String::from(
+        "[info] ai-console booted\n[info] sidebar nav ready\n[info] runtime refresh queued asynchronously\n",
+    );
     text.push_str(&format!(
         "[debug] provider={}\n[debug] model={}\n[debug] active_conversation={}\n[debug] conversation_count={}\n[debug] auto_scroll={} verbose_output={}\n",
         store.app_state.active_provider,
@@ -725,7 +766,7 @@ fn build_backend_banner(
     providers_page: Rc<ProvidersPage>,
     quick_prompts_page: Rc<QuickPromptsPage>,
     composer_status_label: Label,
-) -> Box {
+) -> (Box, Rc<BackendBannerHandles>) {
     let banner = Box::new(Orientation::Vertical, 8);
     banner.add_css_class("mode-banner");
 
@@ -784,6 +825,12 @@ fn build_backend_banner(
     let subtitle_label_clone = subtitle_label.clone();
     let backend_combo_clone = backend_combo.clone();
     let model_combo_clone = model_combo.clone();
+    let banner_handles = Rc::new(BackendBannerHandles {
+        title_label: title_label.clone(),
+        subtitle_label: subtitle_label.clone(),
+        backend_combo: backend_combo.clone(),
+        model_combo: model_combo.clone(),
+    });
     let provider_combo_syncing = Rc::new(RefCell::new(false));
     let model_combo_syncing = Rc::new(RefCell::new(false));
     let state_clone = state.clone();
@@ -875,58 +922,34 @@ fn build_backend_banner(
 
     let refresh_button = Button::with_label("Refresh");
     refresh_button.add_css_class("sidebar-button");
-    let refresh_state = state.clone();
-    let refresh_runtime = runtime.clone();
-    let refresh_backend_combo = backend_combo.clone();
-    let refresh_model_combo = model_combo.clone();
-    let refresh_provider_combo_sync = provider_combo_syncing.clone();
-    let refresh_model_combo_sync = model_combo_syncing.clone();
-    let refresh_title_label = title_label.clone();
-    let refresh_subtitle_label = subtitle_label.clone();
     let refresh_log_buffer = log_buffer.clone();
     let refresh_providers_page = providers_page.clone();
     let refresh_quick_prompts_page = quick_prompts_page.clone();
     let refresh_composer_status = composer_status_label.clone();
+    let refresh_banner_handles = banner_handles.clone();
+    let refresh_state = state.clone();
+    let refresh_runtime = runtime.clone();
+    let refresh_stack = stack_clone.clone();
     refresh_button.connect_clicked(move |_| {
-        let runtime_snapshot = load_ai_runtime();
-        {
-            let mut runtime = refresh_runtime.borrow_mut();
-            *runtime = runtime_snapshot;
-        }
-        {
-            let mut state = refresh_state.borrow_mut();
-            normalize_state_with_runtime(&mut state, &refresh_runtime.borrow());
-            persist_state(&state);
-            *refresh_provider_combo_sync.borrow_mut() = true;
-            *refresh_model_combo_sync.borrow_mut() = true;
-            refresh_backend_banner(
-                &refresh_title_label,
-                &refresh_subtitle_label,
-                &refresh_backend_combo,
-                &refresh_model_combo,
-                &state,
-                &refresh_runtime.borrow(),
-            );
-            *refresh_model_combo_sync.borrow_mut() = false;
-            *refresh_provider_combo_sync.borrow_mut() = false;
-        }
-        refresh_composer_status_label(
-            &refresh_composer_status,
-            &refresh_state.borrow(),
-            &refresh_runtime.borrow(),
+        refresh_ai_runtime_async(
+            refresh_runtime.clone(),
+            refresh_state.clone(),
+            refresh_banner_handles.clone(),
+            refresh_providers_page.clone(),
+            refresh_quick_prompts_page.clone(),
+            refresh_composer_status.clone(),
+            refresh_log_buffer.clone(),
+            refresh_stack.clone(),
+            true,
+            "manual refresh",
         );
-        sync_quick_prompts_backend(
-            &refresh_quick_prompts_page,
-            &refresh_state.borrow(),
-            &refresh_runtime.borrow(),
-        );
-        refresh_providers_page_view(refresh_providers_page.clone());
-        append_log(&refresh_log_buffer, "[ai] refreshed providers and status");
-        stack_clone.set_visible_child_name("providers");
     });
     controls.append(&refresh_button);
 
-    banner
+    (
+        banner,
+        banner_handles,
+    )
 }
 
 fn refresh_backend_banner(
@@ -1446,12 +1469,21 @@ fn tools_page(
                         IpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
                         other => Err(anyhow::anyhow!("unexpected desktop response: {other:?}")),
                     }),
-                "terminal" => launch_configured_app(|settings| settings.apps.terminal.clone())
-                    .map(|name| format!("launched terminal: {name}")),
-                "browser" => launch_configured_app(|settings| settings.apps.browser.clone())
-                    .map(|name| format!("launched browser: {name}")),
-                "files" => launch_configured_app(|settings| settings.apps.file_manager.clone())
-                    .map(|name| format!("launched file manager: {name}")),
+                "terminal" => launch_configured_app_async(
+                    log_buffer.clone(),
+                    "terminal",
+                    |settings| settings.apps.terminal.clone(),
+                ),
+                "browser" => launch_configured_app_async(
+                    log_buffer.clone(),
+                    "browser",
+                    |settings| settings.apps.browser.clone(),
+                ),
+                "files" => launch_configured_app_async(
+                    log_buffer.clone(),
+                    "file manager",
+                    |settings| settings.apps.file_manager.clone(),
+                ),
                 _ => Err(anyhow::anyhow!("unknown desktop action")),
             };
 
@@ -1509,6 +1541,117 @@ fn launch_configured_app(
         .spawn()
         .with_context(|| format!("failed to launch {command}"))?;
     Ok(command)
+}
+
+fn launch_configured_app_async(
+    log_buffer: TextBuffer,
+    label: &'static str,
+    selector: impl FnOnce(&focaldesk_settings_core::Settings) -> String + Send + 'static,
+) -> anyhow::Result<String> {
+    let (tx, rx) = mpsc::channel();
+    append_log(&log_buffer, &format!("[action] queueing {label} launch on background thread"));
+
+    thread::spawn(move || {
+        let result = launch_configured_app(selector);
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(command)) => {
+            append_log(&log_buffer, &format!("[action] launched {label}: {command}"));
+            glib::ControlFlow::Break
+        }
+        Ok(Err(err)) => {
+            append_log(&log_buffer, &format!("[action] failed to launch {label}: {err}"));
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            append_log(
+                &log_buffer,
+                &format!("[action] failed to launch {label}: background task disconnected"),
+            );
+            glib::ControlFlow::Break
+        }
+    });
+
+    Ok(format!("queued {label} launch"))
+}
+
+fn refresh_ai_runtime_async(
+    runtime: Rc<RefCell<AiConsoleRuntime>>,
+    state: Rc<RefCell<PersistedState>>,
+    banner: Rc<BackendBannerHandles>,
+    providers_page: Rc<ProvidersPage>,
+    quick_prompts_page: Rc<QuickPromptsPage>,
+    composer_status_label: Label,
+    log_buffer: TextBuffer,
+    stack: gtk4::Stack,
+    show_providers_after_load: bool,
+    label: &'static str,
+) {
+    let (tx, rx) = mpsc::channel();
+    let started_at = Instant::now();
+    append_log(
+        &log_buffer,
+        &format!("[ai] queueing runtime {label} refresh on background thread"),
+    );
+
+    thread::spawn(move || {
+        let result = load_ai_runtime();
+        let _ = tx.send(result);
+    });
+
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(runtime_snapshot) => {
+            {
+                let mut runtime_state = runtime.borrow_mut();
+                *runtime_state = runtime_snapshot;
+            }
+
+            {
+                let runtime_snapshot = runtime.borrow();
+                let mut state_snapshot = state.borrow_mut();
+                normalize_state_with_runtime(&mut state_snapshot, &runtime_snapshot);
+                persist_state(&state_snapshot);
+            }
+
+            let state_snapshot = state.borrow();
+            let runtime_snapshot = runtime.borrow();
+            banner.refresh(&state_snapshot, &runtime_snapshot);
+            refresh_composer_status_label(
+                &composer_status_label,
+                &state_snapshot,
+                &runtime_snapshot,
+            );
+            sync_quick_prompts_backend(&quick_prompts_page, &state_snapshot, &runtime_snapshot);
+            refresh_providers_page_view(providers_page.clone());
+            append_log(
+                &log_buffer,
+                &format!(
+                    "[ai] runtime {label} refreshed in {} ms",
+                    started_at.elapsed().as_millis()
+                ),
+            );
+
+            if show_providers_after_load {
+                stack.set_visible_child_name("providers");
+            }
+
+            ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => {
+            append_log(
+                &log_buffer,
+                &format!(
+                    "[ai] runtime {label} refresh failed after {} ms: background task disconnected",
+                    started_at.elapsed().as_millis()
+                ),
+            );
+            ControlFlow::Break
+        }
+    });
 }
 
 fn dispatch_chat_request_async(
@@ -2369,11 +2512,13 @@ fn load_css() {
         "#,
     );
 
-    gtk4::style_context_add_provider_for_display(
-        &gtk4::gdk::Display::default().unwrap(),
-        &provider,
-        gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
+    if let Some(display) = gtk4::gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
 
 fn state_path() -> PathBuf {

@@ -7,9 +7,8 @@ use focaldesk_ipc::{
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
-    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, LidCloseAction,
-    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
-    DisplayColorProfile,
+    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 
@@ -1741,40 +1740,31 @@ fn connected_display_row(
         choose_icc.connect_clicked(move |_| {
             let dialog = gtk::FileDialog::new();
             dialog.set_title("Choose ICC Profile");
-            dialog.open(
-                Some(&parent),
-                None::<&gtk::gio::Cancellable>,
-                {
-                    let displays = displays.clone();
-                    let area = area.clone();
-                    let row = row.clone();
-                    let icc_row = icc_row.clone();
-                    move |result| {
-                        if let Ok(file) = result {
-                            if let Some(path) = file.path() {
-                                if let Some(display) = displays.borrow_mut().get_mut(index) {
-                                    display.icc_profile_path =
-                                        Some(path.to_string_lossy().into_owned());
-                                }
-                                if let Some(display) = displays.borrow().get(index) {
-                                    let subtitle = display
-                                        .icc_profile_path
-                                        .as_deref()
-                                        .map(|p| {
-                                            format!(
-                                                "Selected: {}",
-                                                display_icc_profile_label(p)
-                                            )
-                                        })
-                                        .unwrap_or_else(|| "No ICC file selected".to_string());
-                                    icc_row.set_subtitle(&subtitle);
-                                }
-                                save_display_change(&displays, &area, &row, index);
+            dialog.open(Some(&parent), None::<&gtk::gio::Cancellable>, {
+                let displays = displays.clone();
+                let area = area.clone();
+                let row = row.clone();
+                let icc_row = icc_row.clone();
+                move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = file.path() {
+                            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                                display.icc_profile_path =
+                                    Some(path.to_string_lossy().into_owned());
                             }
+                            if let Some(display) = displays.borrow().get(index) {
+                                let subtitle = display
+                                    .icc_profile_path
+                                    .as_deref()
+                                    .map(|p| format!("Selected: {}", display_icc_profile_label(p)))
+                                    .unwrap_or_else(|| "No ICC file selected".to_string());
+                                icc_row.set_subtitle(&subtitle);
+                            }
+                            save_display_change(&displays, &area, &row, index);
                         }
                     }
-                },
-            );
+                }
+            });
         });
     }
 

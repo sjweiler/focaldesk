@@ -113,6 +113,10 @@ fn client_is_browser_like(client: &Client) -> bool {
     is_browser_like(exe_name.as_ref())
 }
 
+fn browser_color_management_uses_canonical_sdr(client: &Client) -> bool {
+    client_is_browser_like(client)
+}
+
 fn send_image_description_ready(
     image: &wp_image_description_v1::WpImageDescriptionV1,
     identity: u64,
@@ -1533,13 +1537,22 @@ impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, OutputCo
                 wp_color_trace!("output get_image_description");
                 let description = state.output_color_description_for(&output_mgmt.output);
                 let icc_profile = state.output_icc_profile_for(&output_mgmt.output);
-                finish_output_image_description(
-                    state,
-                    data_init,
-                    image_description,
-                    description,
-                    icc_profile,
-                );
+                if browser_color_management_uses_canonical_sdr(client) {
+                    finish_canonical_sdr_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        ColorDescription::SRGB,
+                    );
+                } else {
+                    finish_output_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        description,
+                        icc_profile,
+                    );
+                }
             }
             _ => {}
         }
@@ -1609,14 +1622,23 @@ impl
                     description.transfer,
                     description.primaries
                 );
-                finish_preferred_output_image_description(
-                    state,
-                    data_init,
-                    image_description,
-                    output_id,
-                    description,
-                    icc_profile,
-                );
+                if browser_color_management_uses_canonical_sdr(client) {
+                    finish_canonical_sdr_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        ColorDescription::SRGB,
+                    );
+                } else {
+                    finish_preferred_output_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        output_id,
+                        description,
+                        icc_profile,
+                    );
+                }
             }
             _ => {
                 wp_color_trace!("surface feedback other request");

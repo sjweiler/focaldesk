@@ -168,6 +168,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
+        nested.state.process_deferred_ui_and_launches();
+
+        let accept_started = Instant::now();
         if let Some(stream) = nested.listener.accept()? {
             debug!(
                 target: "focaldesk",
@@ -180,6 +183,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .handle()
                 .insert_client(stream, Arc::new(client_state))?;
             nested.clients.push(client);
+            debug!(
+                target: "focaldesk",
+                session_id = session_id(),
+                elapsed_ms = accept_started.elapsed().as_millis(),
+                clients = nested.clients.len(),
+                "wayland accept complete"
+            );
         }
 
         let now = Instant::now();
@@ -196,6 +206,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dt,
             );
             if nested.state.wayland_clients_may_dispatch() {
+                let dispatch_started = Instant::now();
                 if let Err(err) = nested.display.dispatch_clients(&mut nested.state) {
                     if !is_nonfatal_wayland_io_error(&err) {
                         return Err(err.into());
@@ -210,7 +221,14 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
                     &mut nested.state,
                 );
+                debug!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    elapsed_ms = dispatch_started.elapsed().as_millis(),
+                    "wayland dispatch_clients complete"
+                );
             }
+            nested.state.process_deferred_window_ops();
             nested.state.end_portal_dispatch();
             std::mem::drop(framebuffer);
         }

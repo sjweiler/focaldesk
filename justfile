@@ -9,6 +9,9 @@ release-desktop:
 release-server:
     cargo build --release -p focaldesk-server
 
+release-launchd:
+    cargo build --release -p focal-launchd
+
 release-portal:
     cargo build --release -p focaldesk-portal
 
@@ -18,6 +21,13 @@ install-server-service:
     install -Dm644 packaging/systemd/user/focaldesk-server.service "$HOME/.config/systemd/user/focaldesk-server.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
+
+install-launch-service:
+    cargo build --release -p focal-launchd
+    install -Dm755 target/release/focal-launchd "$HOME/.local/bin/focal-launchd"
+    install -Dm644 packaging/systemd/user/focal-launchd.service "$HOME/.config/systemd/user/focal-launchd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focal-launchd.service || echo "Skipping systemd user enable: no user bus available"
 
 install-portal:
     cargo build --release -p focaldesk-portal
@@ -33,6 +43,10 @@ install-files:
 install-settings:
     cargo build --release -p focaldesk-settings
     sudo install -Dm755 target/release/focaldesk-settings /usr/local/bin/focaldesk-settings
+
+install-ai-console:
+    cargo build --release -p focaldesk-ai-console
+    sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
 
 install-desktop:
     cargo build --release -p focaldesk-desktop
@@ -54,6 +68,13 @@ install-server-service-fedora:
     sudo install -Dm644 packaging/systemd/user/focaldesk-server-fedora.service /usr/lib/systemd/user/focaldesk-server.service
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
+
+install-launch-service-fedora:
+    cargo build --release -p focal-launchd
+    sudo install -Dm755 target/release/focal-launchd /usr/bin/focal-launchd
+    sudo install -Dm644 packaging/systemd/user/focal-launchd-fedora.service /usr/lib/systemd/user/focal-launchd.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focal-launchd.service || echo "Skipping systemd user enable: no user bus available"
 
 run:
     cargo run

@@ -154,6 +154,21 @@ Use the Fedora recipe if you want the standard distro locations:
 just install-server-service-fedora
 ```
 
+## Launch Daemon
+
+App launches are routed through a separate user service,
+`focal-launchd`, instead of forking a private daemon inside the compositor.
+
+To install and enable it from a local build:
+
+```sh
+just install-launch-service
+```
+
+That installs [packaging/systemd/user/focal-launchd.service](packaging/systemd/user/focal-launchd.service),
+enables it for the current user, and keeps the compositor launch path on the
+shared socket in `focal-launch-shared`.
+
 ## License
 
 FocalDesk is licensed under the MIT License. See [LICENSE](LICENSE).

@@ -748,8 +748,6 @@ pub fn run_linear_staged_pass(
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     prepared: &mut PreparedOutput,
-    client_elements: &[FlowRenderElement],
-    popup_elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
@@ -766,6 +764,8 @@ pub fn run_linear_staged_pass(
     let bg = state.theme.active_theme().background.color;
     let clear_color = Color32F::new(bg[0], bg[1], bg[2], bg[3]);
     let transparent = Color32F::new(0.0, 0.0, 0.0, 0.0);
+    let empty_clients: [FlowRenderElement; 0] = [];
+    let empty_popups: [FlowRenderElement; 0] = [];
 
     {
         let sdr = targets
@@ -784,8 +784,8 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &empty_clients,
+            &empty_popups,
             ui_state,
             scene,
             output_state,
@@ -798,7 +798,7 @@ pub fn run_linear_staged_pass(
         let _sync = frame.finish()?;
     }
 
-    {
+    let (client_elements, popup_elements) = {
         let linear = targets
             .linear_offscreen
             .as_mut()
@@ -806,6 +806,8 @@ pub fn run_linear_staged_pass(
         let mut target = renderer
             .bind(&mut linear.texture)
             .map_err(|e| anyhow!("bind linear SDR target: {e}"))?;
+        let client_elements = build_output_client_elements(state, renderer, output_id);
+        let popup_elements = build_output_popup_elements(state, renderer, output_id);
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin linear SDR frame: {e}"))?;
@@ -815,8 +817,8 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -830,8 +832,8 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -844,7 +846,8 @@ pub fn run_linear_staged_pass(
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
-    }
+        (client_elements, popup_elements)
+    };
 
     {
         let linear_texture = targets.linear_offscreen.as_ref().unwrap().texture.clone();
@@ -876,8 +879,8 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -891,8 +894,8 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -937,8 +940,8 @@ pub fn render_output_offscreen(
         }
     }
 
-    let client_elements = build_output_client_elements(state, renderer, output_id);
-    let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    targets.ensure_offscreen(renderer, buffer_size)?;
+
     let mut prepared = prepare_output(
         state,
         renderer,
@@ -959,8 +962,6 @@ pub fn render_output_offscreen(
             output_id,
             buffer_size,
             &mut prepared,
-            &client_elements,
-            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -975,8 +976,6 @@ pub fn render_output_offscreen(
             output_id,
             buffer_size,
             &prepared,
-            &client_elements,
-            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -991,8 +990,6 @@ pub fn run_sdr_pass(
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     prepared: &PreparedOutput,
-    client_elements: &[FlowRenderElement],
-    popup_elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
@@ -1009,6 +1006,8 @@ pub fn run_sdr_pass(
         let mut target = renderer
             .bind(&mut sdr.texture)
             .map_err(|e| anyhow!("bind offscreen for draw: {e}"))?;
+        let client_elements = build_output_client_elements(state, renderer, output_id);
+        let popup_elements = build_output_popup_elements(state, renderer, output_id);
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin offscreen frame: {e}"))?;
@@ -1016,8 +1015,8 @@ pub fn run_sdr_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,

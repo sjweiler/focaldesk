@@ -16,9 +16,7 @@ use smithay::reexports::input::event::switch::Switch as InputSwitch;
 
 use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
-use crate::core::backend_render::{
-    build_output_client_elements, build_output_popup_elements, prepare_output,
-};
+use crate::core::backend_render::{prepare_output};
 use crate::core::linear_compositing::{
     run_linear_staged_pass, run_sdr_pass, select_hdr_offscreen_format, supports_linear_sdr,
     use_linear_sdr_path, LinearOffscreenTargets, OffscreenTexture,
@@ -2218,11 +2216,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.process_lock_timers();
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+        data.core.state.process_deferred_ui_and_launches();
 
         if !data.session_active {
             continue;
         }
 
+        let accept_started = Instant::now();
         if let Some(stream) = data.core.listener.accept()? {
             let client_state = client_state_from_stream(&stream);
             let client = data
@@ -2231,6 +2231,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 .handle()
                 .insert_client(stream, std::sync::Arc::new(client_state))?;
             data.core.clients.push(client);
+            flog(format!(
+                "wayland accept elapsed_ms={} clients={}",
+                accept_started.elapsed().as_millis(),
+                data.core.clients.len()
+            ));
         }
 
         let now = Instant::now();
@@ -2251,6 +2256,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         if data.core.state.wayland_clients_may_dispatch() {
+            let dispatch_started = Instant::now();
             if let Err(err) = data.core.display.dispatch_clients(&mut data.core.state) {
                 if !is_nonfatal_wayland_io_error(&err) {
                     return Err(err.into());
@@ -2260,7 +2266,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
                 &mut data.core.state,
             );
+            flog(format!(
+                "wayland dispatch_clients elapsed_ms={}",
+                dispatch_started.elapsed().as_millis()
+            ));
         }
+        data.core.state.process_deferred_window_ops();
         data.core.state.end_portal_dispatch();
 
         data.core.state.refresh_space();
@@ -2405,17 +2416,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         portal_needs_composite,
                     )?;
 
-                    let client_elements = build_output_client_elements(
-                        &mut data.core.state,
-                        &mut device.renderer,
-                        surface.output_id,
-                    );
-                    let popup_elements = build_output_popup_elements(
-                        &mut data.core.state,
-                        &mut device.renderer,
-                        surface.output_id,
-                    );
-
                     let client_to_scene = data
                         .core
                         .state
@@ -2453,8 +2453,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 surface.output_id,
                                 surface.size,
                                 &mut prepared,
-                                &client_elements,
-                                &popup_elements,
                                 &mut data.core.ui_state,
                                 &data.core.scene,
                                 &data.core.output_state,
@@ -2469,8 +2467,6 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 surface.output_id,
                                 surface.size,
                                 &prepared,
-                                &client_elements,
-                                &popup_elements,
                                 &mut data.core.ui_state,
                                 &data.core.scene,
                                 &data.core.output_state,

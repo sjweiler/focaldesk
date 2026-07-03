@@ -99,6 +99,19 @@ pub fn primaries_plausible(ch: &PrimariesChromaticity) -> bool {
     peak >= 0.15
 }
 
+/// True when `a` covers a wider gamut than `b` (named primaries ordering only).
+pub fn primaries_wider_than(a: ColorPrimaries, b: ColorPrimaries) -> bool {
+    fn rank(p: ColorPrimaries) -> u8 {
+        match p {
+            ColorPrimaries::Srgb => 0,
+            ColorPrimaries::DisplayP3 => 1,
+            ColorPrimaries::Bt2020 => 2,
+            ColorPrimaries::Custom(_) => 3,
+        }
+    }
+    rank(a) > rank(b)
+}
+
 /// Electrical-to-optical transfer function attached to a client surface.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TransferFunction {

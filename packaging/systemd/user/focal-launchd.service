@@ -1,0 +1,13 @@
+[Unit]
+Description=FocalDesk launch daemon
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focal-launchd
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

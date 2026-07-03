@@ -1475,6 +1475,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
+name = "focal-launch-shared"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "focal-launchd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focal-launch-shared",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "focaldesk-ai"
 version = "0.1.0"
 dependencies = [
@@ -1595,6 +1614,7 @@ dependencies = [
  "chrono",
  "drm-ffi",
  "egui",
+ "focal-launch-shared",
  "focaldesk-ai",
  "focaldesk-config",
  "focaldesk-cursor",
@@ -1792,10 +1812,6 @@ dependencies = [
 
 [[package]]
 name = "focaldesk-sounds"
-version = "0.1.0"
-
-[[package]]
-name = "focaldesk-spawn"
 version = "0.1.0"
 
 [[package]]

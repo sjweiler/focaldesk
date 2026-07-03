@@ -13,7 +13,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_default_logging();
     startup_banner(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), "drm");
     info!(target: "focaldesk", session_id = session_id(), backend = "drm", "starting FocalDesk");
-
     drm::run()
 }
 
@@ -22,6 +21,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_default_logging();
     startup_banner(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), "winit");
     info!(target: "focaldesk", session_id = session_id(), backend = "winit", "starting FocalDesk");
-
     winit::run()
 }

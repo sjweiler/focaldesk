@@ -513,6 +513,16 @@ impl Default for SettingsPanel {
 }
 
 impl SettingsPanel {
+    pub fn open_displays(&mut self) {
+        self.tab = SettingsPage::Displays;
+        self.open = true;
+    }
+
+    pub fn open_workspaces(&mut self) {
+        self.tab = SettingsPage::Workspaces;
+        self.open = true;
+    }
+
     fn reload_from_disk(&mut self) {
         self.config = load_config();
         self.power = load_settings().power;
