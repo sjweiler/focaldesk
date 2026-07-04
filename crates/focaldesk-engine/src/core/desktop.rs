@@ -3231,11 +3231,53 @@ impl DesktopState {
 
         let current = self.focused_workspace().0.max(1) as usize;
         let delete_index = current.min(self.workspace_names.len()) - 1;
+        let deleted_number = (delete_index + 1) as u32;
+
+        // Windows on the deleted workspace are promised to close (see the delete dialog's
+        // message); request that now, before the workspace numbers below shift.
+        for managed in &self.windows {
+            if managed.workspace.0 == deleted_number {
+                managed.request_close();
+            }
+        }
+
+        // Workspace numbers above the deleted one shift down by one below, so every window
+        // still referencing one of them needs to shift too, or it ends up parented to the
+        // wrong (renumbered) workspace instead of just disappearing.
+        for managed in &mut self.windows {
+            if managed.workspace.0 > deleted_number {
+                managed.workspace.0 -= 1;
+            }
+        }
+
         self.workspace_names.remove(delete_index);
 
-        let next_workspace = delete_index.min(self.workspace_names.len().saturating_sub(1)) + 1;
-        self.set_focused_workspace(WorkspaceId(next_workspace as u32));
-        self.mark_all_outputs_chrome_controls_damage(DamageSource::Unknown);
+        let fallback = (delete_index.min(self.workspace_names.len().saturating_sub(1)) + 1) as u32;
+
+        // Any output showing the deleted workspace — not just the focused one — needs to be
+        // re-pointed, and every other output's number needs the same shift as the windows above.
+        let output_ids: Vec<OutputId> = self.outputs.keys().copied().collect();
+        for output_id in &output_ids {
+            let Some(output) = self.outputs.get_mut(output_id) else {
+                continue;
+            };
+            if output.active_workspace.0 == deleted_number {
+                output.active_workspace = WorkspaceId(fallback);
+            } else if output.active_workspace.0 > deleted_number {
+                output.active_workspace.0 -= 1;
+            }
+        }
+        if self.active_workspace.0 == deleted_number {
+            self.active_workspace = WorkspaceId(fallback);
+        } else if self.active_workspace.0 > deleted_number {
+            self.active_workspace.0 -= 1;
+        }
+
+        self.set_focused_workspace(WorkspaceId(fallback));
+        for output_id in output_ids {
+            self.rebuild_ui_tree_for_output(output_id);
+        }
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
     pub fn register_output_entry(
@@ -5581,6 +5623,17 @@ impl DesktopState {
                             let window = w.window.clone();
                             self.map_window_bbox_location(window, bbox.loc, false);
                         }
+                    }
+                }
+                // Dropping a window onto a different output should hand it off to whatever
+                // workspace that output is currently showing; otherwise it keeps the source
+                // workspace number and becomes invisible on every output (including the one
+                // it was dragged from, since it no longer sits within that output's bounds).
+                let target_workspace = self.workspace_under_pointer(self.pointer_pos);
+                if let Some(managed) = self.window_mut(window_id) {
+                    if managed.workspace != target_workspace {
+                        managed.set_workspace(target_workspace);
+                        self.mark_all_outputs_full_damage(DamageSource::Unknown);
                     }
                 }
             }

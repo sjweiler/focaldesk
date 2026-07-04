@@ -11,29 +11,20 @@ use zbus_polkit::policykit1::{AuthorityProxy, Identity as WireIdentity, Subject}
 
 const AGENT_OBJECT_PATH: &str = "/org/freedesktop/PolicyKit1/AuthenticationAgent";
 
+/// `(session_id, uid, user_name, seat_id, session_path)`, as returned by `ListSessions`.
+type LoginSessionEntry = (String, u32, String, String, OwnedObjectPath);
+
 #[dbus_proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
     default_path = "/org/freedesktop/login1"
 )]
 trait Login1Manager {
-    // zbus's snake_case->CamelCase auto-derivation doesn't know "pid" is an
-    // acronym and produces "GetSessionByPid"; the real D-Bus method (and the
-    // dbus-daemon policy rule allowing it) is "GetSessionByPID". Getting this
-    // wrong doesn't fail to compile — it fails at runtime as a confusing
-    // AccessDenied, because the mismatched name just falls through to the
-    // policy's default deny rule instead of matching the intended allow rule.
-    #[dbus_proxy(name = "GetSessionByPID")]
-    fn get_session_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
-}
-
-#[dbus_proxy(
-    interface = "org.freedesktop.login1.Session",
-    default_service = "org.freedesktop.login1"
-)]
-trait Login1Session {
-    #[dbus_proxy(property)]
-    fn id(&self) -> zbus::Result<String>;
+    /// Deliberately *not* using `GetSessionByPID(our own pid)`: a `systemctl --user` service's
+    /// process lives under `user@<uid>.service`'s own cgroup slice, a sibling of login-session
+    /// scopes rather than nested inside one, so it doesn't resolve to any session — confirmed on
+    /// real hardware (see `session_subject`), not just this dev sandbox.
+    fn list_sessions(&self) -> zbus::Result<Vec<LoginSessionEntry>>;
 }
 
 /// Maps to `org.freedesktop.PolicyKit1.Error.*`; polkitd expects `Cancelled`
@@ -145,12 +136,16 @@ async fn run_agent_session(
     message: String,
     icon_name: String,
 ) -> Result<bool> {
-    glib::MainContext::default()
+    flog_info!("polkit agent session: dispatching to glib thread, identity={identity_str}");
+    let outcome = glib::MainContext::default()
         .spawn_from_within(move || async move {
+            flog_info!("polkit agent session: entered glib thread, identity={identity_str}");
+
             let Ok(Some(identity)) = polkit::Identity::from_string(&identity_str) else {
                 flog_error!("failed to parse polkit identity {identity_str}");
                 return false;
             };
+            flog_info!("polkit agent session: identity parsed, constructing Session");
 
             let session = polkit_agent::Session::new(&identity, &cookie);
             let (done_tx, done_rx) = futures_channel::oneshot::channel::<bool>();
@@ -163,6 +158,7 @@ async fn run_agent_session(
                 let message = message.clone();
                 let icon_name = icon_name.clone();
                 session.connect_request(move |session, prompt, echo_on| {
+                    flog_info!("polkit agent session: request signal fired, prompt={prompt:?} echo_on={echo_on}");
                     let request_id = next_request_id();
                     let response = focaldesk_ipc::dialog::send_dialog_request(
                         &DialogIpcRequest::PolkitAuthPrompt {
@@ -173,6 +169,7 @@ async fn run_agent_session(
                             echo_on,
                         },
                     );
+                    flog_info!("polkit agent session: dialog IPC returned {response:?}");
                     match response {
                         Ok(DialogIpcResponse::PolkitAuthAnswer {
                             answer: Some(text), ..
@@ -185,17 +182,24 @@ async fn run_agent_session(
             {
                 let done_tx = done_tx.clone();
                 session.connect_completed(move |_session, gained_authorization| {
+                    flog_info!("polkit agent session: completed signal fired, gained_authorization={gained_authorization}");
                     if let Some(tx) = done_tx.borrow_mut().take() {
                         let _ = tx.send(gained_authorization);
                     }
                 });
             }
 
+            flog_info!("polkit agent session: calling Session::initiate()");
             session.initiate();
-            done_rx.await.unwrap_or(false)
+            flog_info!("polkit agent session: initiate() returned, awaiting completion");
+            let result = done_rx.await.unwrap_or(false);
+            flog_info!("polkit agent session: done_rx resolved, gained_authorization={result}");
+            result
         })
         .await
-        .map_err(|err| anyhow::anyhow!("polkit agent session task failed: {err}"))
+        .map_err(|err| anyhow::anyhow!("polkit agent session task failed: {err}"));
+    flog_info!("polkit agent session: spawn_from_within returned {outcome:?}");
+    outcome
 }
 
 fn next_request_id() -> u64 {
@@ -203,25 +207,25 @@ fn next_request_id() -> u64 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Build the `unix-session` Subject for RegisterAuthenticationAgent/UnregisterAuthenticationAgent,
-/// looked up from logind rather than trusting `$XDG_SESSION_ID` (not guaranteed set everywhere).
+/// Build the `unix-session` Subject for RegisterAuthenticationAgent/UnregisterAuthenticationAgent.
+///
+/// Picks *our own uid's* session that has a non-empty seat, rather than the calling process's own
+/// session (which doesn't exist — see `Login1Manager::list_sessions`). Confirmed against a real
+/// logind on real hardware: a lingering/manager-class pseudo-session shows up with `seat=""`
+/// (e.g. `("1", 1000, "steve", "", ...)`) alongside the real graphical login on `seat0`
+/// (`("9", 1000, "steve", "seat0", ...)`) — the seat is what distinguishes them.
 async fn session_subject(connection: &Connection) -> Result<Subject> {
     let manager = Login1ManagerProxy::new(connection)
         .await
         .context("build login1 Manager proxy")?;
-    let pid = std::process::id();
-    let session_path = manager
-        .get_session_by_pid(pid)
-        .await
-        .context("GetSessionByPID")?;
+    let our_uid = nix::unistd::Uid::current().as_raw();
 
-    let session = Login1SessionProxy::builder(connection)
-        .path(session_path.as_ref())
-        .context("set login1 Session proxy path")?
-        .build()
-        .await
-        .context("build login1 Session proxy")?;
-    let session_id = session.id().await.context("read login1 session id")?;
+    let sessions = manager.list_sessions().await.context("ListSessions")?;
+    let session_id = sessions
+        .into_iter()
+        .find(|(_, uid, _, seat, _)| *uid == our_uid && !seat.is_empty())
+        .map(|(session_id, ..)| session_id)
+        .with_context(|| format!("no seat-bound logind session found for uid {our_uid}"))?;
 
     let mut subject_details = HashMap::new();
     subject_details.insert("session-id".to_string(), Value::from(session_id).into());

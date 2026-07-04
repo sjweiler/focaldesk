@@ -1,0 +1,21 @@
+[package]
+name = "focaldesk-greeter"
+version = "0.1.0"
+edition = "2021"
+description = "greetd-driven login greeter for FocalDesk"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-greeter"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = "1"
+tracing = { workspace = true }
+smithay.workspace = true
+focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+
+[dev-dependencies]
+image = { workspace = true }

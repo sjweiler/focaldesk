@@ -21,6 +21,7 @@ members = [
     "apps/focaldesk-color-tag-test",
     "apps/focaldesk-wp-color-test",
     "apps/focaldesk-desktop",
+    "apps/focaldesk-greeter",
     "apps/focaldesk-files",
     "apps/focaldesk-settings",
 

@@ -9,7 +9,7 @@ use crate::backend::common::{
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
 use smithay::backend::allocator::Allocator;
-use smithay::backend::input::{InputEvent, SwitchState, SwitchToggleEvent};
+use smithay::backend::input::{InputEvent, KeyState, SwitchState, SwitchToggleEvent};
 use smithay::reexports::drm::control::Device as _;
 use smithay::reexports::input::event::switch::Switch as InputSwitch;
 // `DrmOutput::render_frame` / `initialize_output` drive an internal [`smithay::backend::drm::compositor::DrmCompositor`].
@@ -1935,6 +1935,18 @@ fn edid_descriptor_text(descriptor: &[u8]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Maps an evdev `KEY_F1..KEY_F12` code (linux/input-event-codes.h) to a target VT number,
+/// for the Ctrl+Alt+F<n> "drop to console" shortcut. `key_code()` on smithay's
+/// `KeyboardKeyEvent` returns the raw evdev code, not the xkb `+8`-offset keycode.
+fn vt_switch_target(keycode: u32) -> Option<i32> {
+    match keycode {
+        59..=68 => Some((keycode - 59 + 1) as i32), // KEY_F1..KEY_F10 -> vt 1..10
+        87 => Some(11),                             // KEY_F11 -> vt 11
+        88 => Some(12),                             // KEY_F12 -> vt 12
+        _ => None,
+    }
+}
+
 fn dispatch_backend_input_event<B: smithay::backend::input::InputBackend>(
     state: &mut DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
@@ -2063,8 +2075,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let _libinput_token = loop_handle.insert_source(libinput_backend, |event, _, data| {
         if let InputEvent::Keyboard { event, .. } = &event {
             let keycode = event.key_code();
-            let state = event.state();
-            flog(&format!("key event: code={:?} state={:?}", keycode, state));
+            let key_state = event.state();
+            flog(&format!("key event: code={:?} state={:?}", keycode, key_state));
+
+            if key_state == KeyState::Pressed {
+                let mods = data.core.state.input.modifiers;
+                if mods.ctrl && mods.alt {
+                    if let Some(vt) = vt_switch_target(keycode.into()) {
+                        flog(&format!("VT switch requested: ctrl+alt+F -> vt{vt}"));
+                        if let Err(err) = data.backend.session.change_vt(vt) {
+                            flog(&format!("VT switch to {vt} failed: {err:?}"));
+                        }
+                        return;
+                    }
+                }
+            }
         }
 
         if let InputEvent::SwitchToggle { event, .. } = &event {

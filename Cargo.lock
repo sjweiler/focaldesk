@@ -1705,6 +1705,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-greeter"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-logging",
+ "image",
+ "serde",
+ "serde_json",
+ "smithay",
+ "tracing",
+]
+
+[[package]]
 name = "focaldesk-ipc"
 version = "0.1.0"
 dependencies = [
@@ -1781,6 +1794,7 @@ dependencies = [
  "focaldesk-logging",
  "futures-channel",
  "glib 0.19.9",
+ "nix 0.27.1",
  "polkit",
  "polkit-agent",
  "tokio",
