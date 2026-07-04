@@ -1,5 +1,6 @@
 [Unit]
 Description=FocalDesk power daemon
+After=graphical-session.target
 
 [Service]
 Type=simple
@@ -10,4 +11,4 @@ KillSignal=SIGINT
 TimeoutStopSec=10
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

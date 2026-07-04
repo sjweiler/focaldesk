@@ -553,6 +553,60 @@ fn ensure_xdpw_screencast_config() {
     }
 }
 
+/// Explicitly start `graphical-session.target` (best-effort) so the per-domain
+/// helper daemons (`WantedBy=graphical-session.target`) come up promptly. Some
+/// login-manager/logind configurations activate this target implicitly on a
+/// registered Wayland session, but not all — sway and other wlroots compositors
+/// do this explicitly for the same reason rather than relying on it.
+fn start_graphical_session_target(wayland_display: &str) {
+    let import_status = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "import-environment",
+            "WAYLAND_DISPLAY",
+            "XDG_CURRENT_DESKTOP",
+        ])
+        .status();
+    if let Err(err) = import_status {
+        flog(format!(
+            "failed to import session environment into systemd --user: systemctl: {err}"
+        ));
+    }
+
+    let start_status = std::process::Command::new("systemctl")
+        .args(["--user", "start", "--no-block", "graphical-session.target"])
+        .status();
+    match start_status {
+        Ok(status) if status.success() => flog(format!(
+            "started graphical-session.target for {wayland_display}"
+        )),
+        Ok(status) => flog(format!(
+            "failed to start graphical-session.target: systemctl exited with {status}"
+        )),
+        Err(err) => flog(format!(
+            "failed to start graphical-session.target: systemctl: {err}"
+        )),
+    }
+}
+
+/// Counterpart to [`start_graphical_session_target`], called once on clean compositor
+/// exit (real DRM session only) so the per-domain helper daemons stop with the session
+/// instead of being left running orphaned until the next login.
+pub(crate) fn stop_graphical_session_target() {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "--no-block", "graphical-session.target"])
+        .status();
+    match status {
+        Ok(status) if status.success() => flog("stopped graphical-session.target"),
+        Ok(status) => flog(format!(
+            "failed to stop graphical-session.target: systemctl exited with {status}"
+        )),
+        Err(err) => flog(format!(
+            "failed to stop graphical-session.target: systemctl: {err}"
+        )),
+    }
+}
+
 fn publish_portal_environment(wayland_display: &str) {
     ensure_standard_user_dirs();
     ensure_xdpw_screencast_config();
@@ -716,6 +770,12 @@ pub(crate) fn bootstrap_compositor_core(
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
     publish_portal_environment(&wayland_display);
+    if backend == BackendKind::Drm {
+        // Nested/winit dev sessions typically run inside an already-active desktop
+        // session; only the real DRM-backed session should touch the shared
+        // graphical-session.target (the matching stop lives in backend::drm::run).
+        start_graphical_session_target(&wayland_display);
+    }
     flog(format!("FocalDesk client socket is {}", wayland_display));
 
     let display = Display::<DesktopState>::new()?;

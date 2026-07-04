@@ -4,7 +4,7 @@
 use crate::backend::common::{
     bootstrap_compositor_core, drain_session_sleep_notifications,
     is_nonfatal_wayland_io_error, physical_size_mm_from_pixels, refresh_portal_services,
-    spawn_session_sleep_watch,
+    spawn_session_sleep_watch, stop_graphical_session_target,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
@@ -2795,6 +2795,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         let frame_time_ms = data.core.start.elapsed().as_millis() as u32;
         data.core.state.send_frame_callbacks(frame_time_ms);
     }
+
+    // The main loop above only exits while the machine stays up via Logout
+    // (`running = false`); Suspend/Hibernate keep the compositor alive across
+    // resume, and Restart/Shutdown take the whole machine down via powerd, so
+    // there's nothing to clean up in those cases. Stop the session target so
+    // the per-domain helper daemons (`WantedBy=graphical-session.target`) are
+    // torn down cleanly rather than left running orphaned until next login.
+    stop_graphical_session_target();
 
     Ok(())
 }
