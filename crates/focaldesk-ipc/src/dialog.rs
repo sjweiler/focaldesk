@@ -24,6 +24,15 @@ pub enum DialogIpcRequest {
         message: String,
         choices: Vec<String>,
     },
+    /// One prompt in a PolicyKit authentication conversation (`polkit_agent::Session`'s
+    /// `request` signal) — typically "Password: " but PAM can ask other things.
+    PolkitAuthPrompt {
+        request_id: u64,
+        message: String,
+        icon_name: String,
+        prompt: String,
+        echo_on: bool,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +46,11 @@ pub enum DialogIpcResponse {
     PortalChooserDecision {
         request_id: u64,
         selected: Option<String>,
+    },
+    /// `answer` is `None` when the user cancelled/dismissed the prompt.
+    PolkitAuthAnswer {
+        request_id: u64,
+        answer: Option<String>,
     },
     Error {
         message: String,

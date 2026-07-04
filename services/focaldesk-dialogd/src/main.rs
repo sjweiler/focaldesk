@@ -108,5 +108,49 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
 
             dialog.present();
         }
+        DialogIpcRequest::PolkitAuthPrompt {
+            request_id,
+            message,
+            icon_name,
+            prompt,
+            echo_on,
+        } => {
+            let dialog = gtk::MessageDialog::builder()
+                .modal(true)
+                .message_type(gtk::MessageType::Question)
+                .buttons(gtk::ButtonsType::None)
+                .text(message)
+                .build();
+            if !icon_name.is_empty() {
+                dialog.set_icon_name(Some(&icon_name));
+            }
+
+            let entry = gtk::Entry::builder()
+                .placeholder_text(prompt)
+                .visibility(echo_on)
+                .input_purpose(gtk::InputPurpose::Password)
+                .activates_default(true)
+                .build();
+            dialog.content_area().append(&entry);
+
+            let cancel_button = dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+            let ok_button = dialog.add_button("OK", gtk::ResponseType::Ok);
+            dialog.set_default_widget(Some(&ok_button));
+            let _ = cancel_button;
+
+            dialog.connect_response(move |dialog, response| {
+                let answer = match response {
+                    gtk::ResponseType::Ok => Some(entry.text().to_string()),
+                    _ => None,
+                };
+                let _ = tx.send(DialogIpcResponse::PolkitAuthAnswer {
+                    request_id,
+                    answer,
+                });
+                dialog.close();
+            });
+
+            dialog.present();
+        }
     }
 }

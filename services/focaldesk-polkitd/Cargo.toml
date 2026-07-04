@@ -1,0 +1,24 @@
+[package]
+name = "focaldesk-polkitd"
+version = "0.1.0"
+edition = "2024"
+description = "FocalDesk PolicyKit authentication agent"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-polkitd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zbus = "3"
+zbus_polkit = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+glib = "0.19"
+polkit = "0.19"
+polkit-agent = "0.19"
+futures-channel = "0.3"
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
