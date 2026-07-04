@@ -33,4 +33,5 @@ pub enum KeyAction {
     TakeScreenshotAll,
     LaunchBrowser,
     LaunchFiles,
+    ToggleClipboardHistory,
 }

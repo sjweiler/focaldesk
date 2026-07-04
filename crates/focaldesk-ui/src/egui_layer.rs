@@ -19,8 +19,8 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Size};
 use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_panels::{
-    AudioPanel, BluetoothPanel, CalendarPanel, DebugPanel, EguiPanelView, LauncherPanel,
-    NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog,
+    AudioPanel, BluetoothPanel, CalendarPanel, ClipboardEntryView, ClipboardPanel, DebugPanel,
+    EguiPanelView, LauncherPanel, NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog,
 };
 use crate::types::{PanelKind, UiAction};
 
@@ -37,6 +37,7 @@ pub struct EguiLayer {
     calendar: CalendarPanel,
     debug: DebugPanel,
     workspace_dialog: WorkspaceDialog,
+    clipboard: ClipboardPanel,
 
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
@@ -169,6 +170,7 @@ impl Default for EguiLayer {
             calendar: CalendarPanel::default(),
             debug: DebugPanel::default(),
             workspace_dialog: WorkspaceDialog::default(),
+            clipboard: ClipboardPanel::default(),
         }
     }
 }
@@ -279,6 +281,7 @@ impl EguiLayer {
             || self.calendar.open
             || self.debug.open
             || self.workspace_dialog.open
+            || self.clipboard.open
     }
 
     pub fn owner_output(&self) -> Option<OutputId> {
@@ -320,6 +323,10 @@ impl EguiLayer {
                 self.calendar.open = !self.calendar.open;
                 opened = self.calendar.open;
             }
+            PanelKind::ClipboardHistory => {
+                self.clipboard.open = !self.clipboard.open;
+                opened = self.clipboard.open;
+            }
             _ => {}
         }
 
@@ -346,6 +353,7 @@ impl EguiLayer {
             self.debug.show(ctx, frame_ctx, &mut self.actions);
             self.workspace_dialog
                 .show(ctx, frame_ctx, &mut self.actions);
+            self.clipboard.show(ctx, frame_ctx, &mut self.actions);
         });
 
         self.textures_delta.append(output.textures_delta);
@@ -435,7 +443,16 @@ impl EguiLayer {
         self.calendar.open = false;
         self.debug.open = false;
         self.workspace_dialog.open = false;
+        self.clipboard.open = false;
         self.owner_output = None;
+    }
+
+    pub fn close_clipboard_history(&mut self) {
+        self.clipboard.open = false;
+    }
+
+    pub fn set_clipboard_entries(&mut self, entries: Vec<ClipboardEntryView>) {
+        self.clipboard.entries = entries;
     }
 
     pub fn refresh_power_status_now(&mut self) {

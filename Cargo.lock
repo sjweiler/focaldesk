@@ -1638,6 +1638,7 @@ dependencies = [
  "bitflags 2.11.0",
  "calloop 0.12.4",
  "chrono",
+ "dirs 6.0.0",
  "drm-ffi",
  "egui",
  "focal-launch-shared",

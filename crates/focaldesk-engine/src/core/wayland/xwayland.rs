@@ -17,6 +17,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
+use crate::core::wayland::data_device::ClipboardSelectionOwner;
 use focaldesk_logging::session_id;
 use tracing::{debug, info_span, trace};
 
@@ -369,10 +370,20 @@ impl XwmHandler for DesktopState {
     fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         match selection {
             SelectionTarget::Clipboard => {
-                set_data_device_selection(&self.display_handle, &self.seat, mime_types, ());
+                set_data_device_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    mime_types,
+                    ClipboardSelectionOwner::XWayland,
+                );
             }
             SelectionTarget::Primary => {
-                set_primary_selection(&self.display_handle, &self.seat, mime_types, ());
+                set_primary_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    mime_types,
+                    ClipboardSelectionOwner::XWayland,
+                );
             }
         }
     }

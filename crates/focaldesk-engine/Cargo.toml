@@ -36,6 +36,7 @@ focal-launch-shared = { path = "../focal-launch-shared" }
 drm-ffi = { workspace = true }
 
 serde_json = "1"
+dirs = "6.0.0"
 zbus = "3"
 pipewire = "0.8"
 egui = "0.31"

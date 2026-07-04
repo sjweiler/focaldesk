@@ -2245,6 +2245,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .dispatch(Some(Duration::ZERO), &mut data.core.state)?;
 
         data.core.state.process_settings_ipc_requests();
+        data.core.state.process_clipboard_captures();
         data.core.state.process_chrome_timers();
         data.core.state.process_notification_timers();
         data.core.state.process_idle_timers();

@@ -13,6 +13,7 @@ pub enum PanelKind {
     Settings,
     Workspaces,
     AppLauncher,
+    ClipboardHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,6 +45,7 @@ pub enum UiAction {
     SetVolume(f32),
     SystemCommand(SystemCommand),
     Custom(ElementId),
+    SelectClipboardEntry(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

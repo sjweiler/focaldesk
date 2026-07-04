@@ -547,6 +547,10 @@ pub struct DesktopState {
     pub output_manager_state: smithay::wayland::output::OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub clipboard_history: crate::core::wayland::clipboard_history::ClipboardHistory,
+    pub(crate) clipboard_capture_tx: mpsc::Sender<(String, String)>,
+    clipboard_capture_rx: mpsc::Receiver<(String, String)>,
+    pub(crate) clipboard_pending_captures: Vec<String>,
     pub relative_pointer_state: RelativePointerManagerState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
@@ -793,6 +797,13 @@ impl DesktopState {
                     }
                 }
             }
+        }
+    }
+
+    pub fn process_clipboard_captures(&mut self) {
+        self.begin_pending_clipboard_captures();
+        while let Ok((mime_type, text)) = self.clipboard_capture_rx.try_recv() {
+            self.clipboard_history.push(mime_type, text);
         }
     }
 
@@ -1712,6 +1723,15 @@ impl DesktopState {
             self.render.egui.clear_paint();
             return;
         }
+        self.render.egui.set_clipboard_entries(
+            self.clipboard_history
+                .entries()
+                .map(|entry| focaldesk_ui::egui_panels::ClipboardEntryView {
+                    id: entry.id,
+                    preview: entry.text.clone(),
+                })
+                .collect(),
+        );
         self.render.egui.update_panels(frame_ctx);
         for action in self.render.egui.take_actions() {
             self.queue_ui_action(action);
@@ -2846,6 +2866,11 @@ impl DesktopState {
 
             UiAction::SystemCommand(cmd) => {
                 self.dispatch_system_command(cmd);
+            }
+
+            UiAction::SelectClipboardEntry(id) => {
+                self.restore_clipboard_entry(id);
+                self.render.egui.close_clipboard_history();
             }
 
             UiAction::ToggleSetting(setting) => {
@@ -4267,6 +4292,7 @@ impl DesktopState {
     pub fn new(init: DesktopInit) -> Self {
         let debug = init.debug.clone();
         apply_debug_log_level(debug.log_level);
+        let (clipboard_capture_tx, clipboard_capture_rx) = mpsc::channel();
         let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -4304,6 +4330,10 @@ impl DesktopState {
             output_manager_state: init.output_manager_state,
             data_device_state: init.data_device_state,
             primary_selection_state: init.primary_selection_state,
+            clipboard_history: crate::core::wayland::clipboard_history::ClipboardHistory::load(),
+            clipboard_capture_tx: clipboard_capture_tx.clone(),
+            clipboard_capture_rx,
+            clipboard_pending_captures: Vec::new(),
             relative_pointer_state: init.relative_pointer_state,
             layer_shell_state: init.layer_shell_state,
             image_capture_source_state: init.image_capture_source_state,
@@ -5127,6 +5157,10 @@ impl DesktopState {
                     "dispatch launch trace_id={} action=keybind-files",
                     launch_trace_id
                 );
+            }
+
+            KeyAction::ToggleClipboardHistory => {
+                self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::ClipboardHistory));
             }
         }
     }

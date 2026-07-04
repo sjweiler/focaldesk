@@ -164,6 +164,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         xwayland_event_loop.dispatch(Some(Duration::ZERO), &mut nested.state)?;
 
         nested.state.process_settings_ipc_requests();
+        nested.state.process_clipboard_captures();
         nested.state.process_chrome_timers();
         nested.state.process_notification_timers();
         nested.state.process_idle_timers();

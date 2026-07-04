@@ -78,6 +78,14 @@ impl Keybinds {
 
         self.map.insert(
             KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_v,
+            },
+            KeyAction::ToggleClipboardHistory,
+        );
+
+        self.map.insert(
+            KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
                 sym: keysyms::KEY_q,
             },
