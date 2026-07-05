@@ -29,6 +29,9 @@ jobs:
             libseat-dev \
             libpipewire-0.3-dev \
             libasound2-dev \
+            libpolkit-gobject-1-dev \
+            libpolkit-agent-1-dev \
+            libclang-dev \
             libegl1-mesa-dev \
             libgles2-mesa-dev \
             libgbm-dev \
