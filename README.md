@@ -1,5 +1,14 @@
 # FocalDesk
 
+# FocalDesk
+
+[![CI](https://github.com/sjweiler/focaldesk/actions/workflows/ci.yml/badge.svg)](https://github.com/sjweiler/focaldesk/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/sjweiler/focaldesk/actions/workflows/codeql.yml/badge.svg)](https://github.com/sjweiler/focaldesk/actions/workflows/codeql.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust](https://img.shields.io/badge/Rust-stable-orange)
+![Wayland](https://img.shields.io/badge/Wayland-native-blue)
+![Status](https://img.shields.io/badge/status-alpha-red)
+
 FocalDesk is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.
 
 The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop with structured workspaces, clear system feedback, and permissioned automation. See [docs/vision.md](docs/vision.md) for the broader project direction.
