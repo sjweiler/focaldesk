@@ -737,13 +737,8 @@ enum PendingEguiOp {
 
 #[derive(Debug, Clone, Copy)]
 enum SidebarDialogKind {
-    AppLauncher,
     DeleteWorkspace,
 }
-
-const LAUNCHER_DIALOG_TERMINAL: u32 = 1;
-const LAUNCHER_DIALOG_BROWSER: u32 = 2;
-const LAUNCHER_DIALOG_FILES: u32 = 3;
 
 fn apply_debug_log_level(level: DebugLogLevel) {
     let level = match level {
@@ -2796,6 +2791,7 @@ impl DesktopState {
             "google-chrome" | "@browser" => self.apps.browser.clone(),
             "nautilus" | "@files" => focaldesk_files_command(),
             "@settings" | "focaldesk-settings" => focaldesk_settings_command(),
+            "@launcher" | "focaldesk-launcher" => focaldesk_launcher_command(),
             other => other.to_string(),
         }
     }
@@ -2811,12 +2807,8 @@ impl DesktopState {
             }
 
             UiAction::OpenPanel(panel) => {
-                if panel == PanelKind::AppLauncher {
-                    self.open_app_launcher_dialog();
-                } else {
-                    self.pending_egui_ops
-                        .push(PendingEguiOp::OpenPanel(panel, self.focused_output));
-                }
+                self.pending_egui_ops
+                    .push(PendingEguiOp::OpenPanel(panel, self.focused_output));
             }
 
             UiAction::ReloadSettings => {
@@ -3172,43 +3164,6 @@ impl DesktopState {
             .get(&self.focused_output)
             .expect("sidebar dialog requires at least one output");
         Rectangle::from_loc_and_size((0, 0), output.logical_size)
-    }
-
-    fn open_app_launcher_dialog(&mut self) {
-        let dialog_id = self.alloc_dialog_id();
-        let owner_output = self.focused_output;
-        let dialog = Dialog {
-            id: dialog_id,
-            kind: DialogKind::Confirm,
-            title: "Launch".into(),
-            message: "Choose an application to open.".into(),
-            buttons: vec![
-                DialogButton {
-                    label: "Cancel".into(),
-                    action: DialogAction::Cancel,
-                },
-                DialogButton {
-                    label: "Terminal".into(),
-                    action: DialogAction::Custom(LAUNCHER_DIALOG_TERMINAL),
-                },
-                DialogButton {
-                    label: "Browser".into(),
-                    action: DialogAction::Custom(LAUNCHER_DIALOG_BROWSER),
-                },
-                DialogButton {
-                    label: "Files".into(),
-                    action: DialogAction::Custom(LAUNCHER_DIALOG_FILES),
-                },
-            ],
-            modal: true,
-            dismissible: false,
-            state: DialogState::Open,
-            owner_output,
-            bounds: self.focused_output_screen(),
-        };
-        self.pending_sidebar_dialogs
-            .insert(dialog_id, SidebarDialogKind::AppLauncher);
-        self.open_dialog(dialog);
     }
 
     fn open_delete_workspace_dialog(&mut self) {
@@ -4801,34 +4756,6 @@ impl DesktopState {
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
         if let Some(kind) = self.pending_sidebar_dialogs.remove(&id) {
             match kind {
-                SidebarDialogKind::AppLauncher => {
-                    if let DialogAction::Custom(choice) = action {
-                        match choice {
-                            LAUNCHER_DIALOG_TERMINAL => {
-                                let launch_trace_id = self.launch_app(self.apps.terminal.clone());
-                                flog_info!(
-                                    "dispatch launch trace_id={} action=launcher-terminal",
-                                    launch_trace_id
-                                );
-                            }
-                            LAUNCHER_DIALOG_BROWSER => {
-                                let launch_trace_id = self.launch_app(self.apps.browser.clone());
-                                flog_info!(
-                                    "dispatch launch trace_id={} action=launcher-browser",
-                                    launch_trace_id
-                                );
-                            }
-                            LAUNCHER_DIALOG_FILES => {
-                                let launch_trace_id = self.launch_app(focaldesk_files_command());
-                                flog_info!(
-                                    "dispatch launch trace_id={} action=launcher-files",
-                                    launch_trace_id
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 SidebarDialogKind::DeleteWorkspace => {
                     if matches!(action, DialogAction::Confirm) {
                         self.delete_focused_workspace();
@@ -5246,7 +5173,11 @@ impl DesktopState {
             }
 
             KeyAction::ToggleLauncher => {
-                self.open_app_launcher_dialog();
+                let launch_trace_id = self.launch_app(self.resolve_launch_command("@launcher"));
+                flog_info!(
+                    "dispatch launch trace_id={} action=keybind-launcher",
+                    launch_trace_id
+                );
             }
 
             KeyAction::ActivateSlot(n) => {
@@ -7485,6 +7416,18 @@ fn focaldesk_settings_command() -> String {
         .filter(|path| path.exists())
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| "focaldesk-settings".to_string())
+}
+
+fn focaldesk_launcher_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("focaldesk-launcher"))
+        })
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "focaldesk-launcher".to_string())
 }
 
 fn focaldesk_ai_console_command() -> String {

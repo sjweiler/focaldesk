@@ -1,6 +1,5 @@
 # FocalDesk
 
-# FocalDesk
 
 [![CI](https://github.com/sjweiler/focaldesk/actions/workflows/ci.yml/badge.svg)](https://github.com/sjweiler/focaldesk/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/sjweiler/focaldesk/actions/workflows/codeql.yml/badge.svg)](https://github.com/sjweiler/focaldesk/actions/workflows/codeql.yml)
@@ -12,6 +11,72 @@
 FocalDesk is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.
 
 The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop with structured workspaces, clear system feedback, and permissioned automation. See [docs/vision.md](docs/vision.md) for the broader project direction.
+
+## Screenshots
+
+## Desktop
+
+FocalDesk Desktop Environment
+
+FocalDesk is a modern Wayland desktop environment written in Rust, focused on performance, modularity, and AI integration. It combines a custom compositor, desktop shell, system services, and native applications into a cohesive Linux desktop designed for both everyday productivity and advanced workflows.
+
+![FocalDesk Desktop](docs/screenshots/desktop.png)
+
+## Launcher
+
+Native Application Launcher
+
+FocalDesk includes a lightweight native application launcher that provides quick access to desktop applications through a dedicated launcher service. The launcher communicates with the compositor through typed IPC, allowing application management without tightly coupling launcher logic to the rendering engine.
+
+![Launcher](docs/screenshots/launcher.png)
+
+## Settings
+
+Native Settings Application
+
+FocalDesk includes a dedicated settings application for configuring desktop appearance, displays, networking, Bluetooth, audio, printers, workspaces, keyboard shortcuts, privacy, power management, and other system features. The application communicates with desktop services through a modular IPC architecture, providing a centralized configuration experience.
+
+![Settings](docs/screenshots/settings.png)
+
+## File Manager
+
+Native File Manager
+
+FocalDesk includes a first-party file manager for browsing local storage with familiar desktop navigation. Features include sidebar navigation, address bar, search, list and grid views, file sorting, and integration with the FocalDesk desktop environment.
+
+![File Manager](docs/screenshots/files.png)
+
+## AI Console asking for permission
+
+AI Console & Permission Manager
+
+Demonstrates FocalDesk's built-in AI framework with provider management, model selection, conversation tracking, and runtime permission prompts. AI services communicate through dedicated background daemons, allowing local LLM integration without embedding AI functionality directly into the compositor.
+
+![File Manager](docs/screenshots/ai-console-permission-check.png)
+
+## AI Console processing query
+
+Integrated AI Console
+
+FocalDesk includes a native AI Console that connects to local language model providers through a modular service architecture. Users can select AI providers and models, manage conversations, maintain long-term memory, define reusable prompts, and interact with AI services without relying on cloud infrastructure.
+
+![File Manager](docs/screenshots/ai-console-processing-query.png)
+
+## Wine/DXVK rendering
+
+Compatibility Demonstration
+
+FocalDesk successfully runs complex graphics applications through DXVK/Wine, including World of Warcraft. This validates compositor compatibility with Vulkan translation layers, XWayland integration, GPU acceleration, input handling, and high-performance rendering.
+
+![Game](docs/screenshots/wow.png)
+
+## OBS (Open Broadcaster Software)
+
+OBS Studio (PipeWire Capture)
+
+OBS Studio capturing the FocalDesk desktop through PipeWire, demonstrating native Wayland screen recording, portal integration, and compatibility with professional streaming and recording applications.
+
+![OBS](docs/screenshots/obs.png)
 
 ## Status
 
