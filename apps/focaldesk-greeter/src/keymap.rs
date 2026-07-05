@@ -50,9 +50,10 @@ pub fn vt_switch_target(keycode: u32) -> Option<i32> {
 
 /// US-QWERTY keycode -> char, for unshifted and shifted layers.
 pub fn keycode_to_char(keycode: u32, shift: bool) -> Option<char> {
-    let (lower, upper) = ROWS.iter().find(|(code, _, _)| *code == keycode).map(
-        |(_, lower, upper)| (*lower, *upper),
-    )?;
+    let (lower, upper) = ROWS
+        .iter()
+        .find(|(code, _, _)| *code == keycode)
+        .map(|(_, lower, upper)| (*lower, *upper))?;
     Some(if shift { upper } else { lower })
 }
 

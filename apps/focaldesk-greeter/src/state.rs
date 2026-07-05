@@ -1,12 +1,17 @@
 #[derive(Debug, Clone)]
 pub enum LoginPhase {
     EnteringUsername,
-    EnteringResponse { secret: bool, prompt: String },
+    EnteringResponse {
+        secret: bool,
+        prompt: String,
+    },
     Authenticating,
     /// Escape was pressed mid-login; `CancelSession` is in flight and we're
     /// waiting for greetd to ack it before starting a fresh attempt.
     Cancelling,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
     Starting,
 }
 
@@ -40,7 +45,10 @@ impl LoginScreenState {
     /// True while a prompt is on screen and further keystrokes should be masked
     /// (the "secret" `AuthMessageType` greetd sent for the current prompt).
     pub fn is_secret_input(&self) -> bool {
-        matches!(self.phase, LoginPhase::EnteringResponse { secret: true, .. })
+        matches!(
+            self.phase,
+            LoginPhase::EnteringResponse { secret: true, .. }
+        )
     }
 
     pub fn prompt_text(&self) -> &str {

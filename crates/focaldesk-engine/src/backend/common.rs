@@ -4,10 +4,10 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
 #[cfg(feature = "xwayland")]
 use std::process::Stdio;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 #[cfg(feature = "xwayland")]
 use std::time::Duration;
 use std::time::Instant;
@@ -131,7 +131,9 @@ fn session_resume_watch_main(notify: Sender<SessionSleepEvent>) {
     {
         Ok(builder) => builder.build(),
         Err(err) => {
-            flog(format!("session resume watch: failed to build match rule: {err}"));
+            flog(format!(
+                "session resume watch: failed to build match rule: {err}"
+            ));
             return;
         }
     };

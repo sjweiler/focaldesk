@@ -103,7 +103,9 @@ impl SelectionHandler for DesktopState {
             ClipboardSelectionOwner::XWayland => {
                 if let Some(xwm) = self.xwm.as_mut() {
                     if let Err(err) = xwm.send_selection(ty, mime_type, fd) {
-                        focaldesk_logging::flog(&format!("failed to send XWayland selection: {err}"));
+                        focaldesk_logging::flog(&format!(
+                            "failed to send XWayland selection: {err}"
+                        ));
                     }
                 }
             }

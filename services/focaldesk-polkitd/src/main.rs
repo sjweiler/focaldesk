@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::{dbus_interface, dbus_proxy, Connection, DBusError};
+use zbus::{Connection, DBusError, dbus_interface, dbus_proxy};
 use zbus_polkit::policykit1::{AuthorityProxy, Identity as WireIdentity, Subject};
 
 const AGENT_OBJECT_PATH: &str = "/org/freedesktop/PolicyKit1/AuthenticationAgent";
@@ -236,7 +236,7 @@ async fn session_subject(connection: &Connection) -> Result<Subject> {
 }
 
 async fn wait_for_shutdown_signal() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let mut term = match signal(SignalKind::terminate()) {
         Ok(term) => term,

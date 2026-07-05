@@ -2,9 +2,9 @@
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
 use crate::backend::common::{
-    bootstrap_compositor_core, drain_session_sleep_notifications,
-    is_nonfatal_wayland_io_error, physical_size_mm_from_pixels, refresh_portal_services,
-    spawn_session_sleep_watch, stop_graphical_session_target,
+    bootstrap_compositor_core, drain_session_sleep_notifications, is_nonfatal_wayland_io_error,
+    physical_size_mm_from_pixels, refresh_portal_services, spawn_session_sleep_watch,
+    stop_graphical_session_target,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
@@ -18,13 +18,13 @@ use smithay::backend::input::KeyboardKeyEvent;
 //use smithay::backend::renderer::element::{Id, Kind};
 use crate::core::backend_render::prepare_output;
 use crate::core::linear_compositing::{
-    LinearOffscreenTargets, OffscreenTexture, run_linear_staged_pass, run_sdr_pass,
-    select_hdr_offscreen_format, supports_linear_sdr, use_linear_sdr_path,
+    run_linear_staged_pass, run_sdr_pass, select_hdr_offscreen_format, supports_linear_sdr,
+    use_linear_sdr_path, LinearOffscreenTargets, OffscreenTexture,
 };
 use smithay::backend::renderer::utils::DamageBag;
 //use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{
-    Id, Kind, render_elements, texture::TextureRenderElement,
+    render_elements, texture::TextureRenderElement, Id, Kind,
 };
 
 use focaldesk_flow::keybinds::BackendKind;
@@ -42,7 +42,7 @@ use focaldesk_settings_core::DisplayColorProfile;
 // - device/output attach points are real
 // - many internals are still TODO so you can connect them to your existing FocalDesk code
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use smithay::backend::renderer::Bind;
 use smithay::utils::DeviceFd;
 
@@ -58,22 +58,22 @@ use calloop::{EventLoop, LoopHandle, RegistrationToken};
 use focaldesk_logging::flog;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
-use smithay::backend::allocator::format::{FormatSet, get_opaque};
+use smithay::backend::allocator::format::{get_opaque, FormatSet};
 use smithay::backend::renderer::Renderer;
 
 use smithay::{
     backend::{
-        allocator::{Fourcc, Modifier, gbm::GbmAllocator, gbm::GbmBufferFlags},
+        allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
-        egl::{self, EGLContext, context::ContextPriority},
+        egl::{self, context::ContextPriority, EGLContext},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            Color32F, ExportMem, ImportDma, ImportEgl,
             element::solid::SolidColorRenderElement,
             gles::{GlesRenderer, GlesTarget, GlesTexture},
+            Color32F, ExportMem, ImportDma, ImportEgl,
         },
-        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
-        udev::{UdevBackend, UdevEvent, primary_gpu},
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+        udev::{primary_gpu, UdevBackend, UdevEvent},
     },
     desktop::utils::OutputPresentationFeedback,
     output::{Mode as WlMode, Output, PhysicalProperties, Subpixel},
@@ -88,17 +88,17 @@ use smithay::{
 };
 
 use smithay::backend::drm::{
-    HdrState,
     compositor::FrameFlags,
     exporter::gbm::GbmFramebufferExporter,
     output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
+    HdrState,
 };
 
 use crate::core::chrome_layout::build_chrome_layout;
 use crate::core::{
-    OutputState, SceneState,
     desktop::{DamageSource, DesktopState},
     ui_state::UiState,
+    OutputState, SceneState,
 };
 
 use smithay::backend::egl::{EGLDevice, EGLDisplay};
@@ -977,9 +977,9 @@ fn sync_output_hdr_flags(
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        DisplayConfig, DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport,
-        PCI_VENDOR_NVIDIA, configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
-        hdr_driver_allows_output_with_override, intersect_modifiers,
+        configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
+        hdr_driver_allows_output_with_override, intersect_modifiers, DisplayConfig,
+        DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::DisplayColorProfile;
 
@@ -2076,7 +2076,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if let InputEvent::Keyboard { event, .. } = &event {
             let keycode = event.key_code();
             let key_state = event.state();
-            flog(&format!("key event: code={:?} state={:?}", keycode, key_state));
+            flog(&format!(
+                "key event: code={:?} state={:?}",
+                keycode, key_state
+            ));
 
             if key_state == KeyState::Pressed {
                 let mods = data.core.state.input.modifiers;

@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use vosk::{DecodingState, Model, Recognizer};
@@ -138,7 +138,9 @@ fn run_recognition(model_dir: &Path, stop: &AtomicBool, events: &Sender<VoiceEve
     }
     .context("failed to open microphone stream")?;
 
-    stream.play().context("failed to start microphone capture")?;
+    stream
+        .play()
+        .context("failed to start microphone capture")?;
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {

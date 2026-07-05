@@ -15,14 +15,16 @@
 // - No xkbcommon layout composition; keycodes come from `crate::keymap`'s
 //   fixed US-QWERTY table.
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use smithay::backend::drm::DrmDeviceFd;
-use smithay::backend::session::{Session, libseat::LibSeatSession, libseat::LibSeatSessionNotifier};
+use smithay::backend::session::{
+    libseat::LibSeatSession, libseat::LibSeatSessionNotifier, Session,
+};
 use smithay::backend::udev::primary_gpu;
 use smithay::reexports::drm::buffer::{Buffer as DrmBuffer, DrmFourcc};
 use smithay::reexports::drm::control::{
-    Device as ControlDevice, Mode, ModeTypeFlags, connector, crtc, dumbbuffer::DumbBuffer,
-    framebuffer,
+    connector, crtc, dumbbuffer::DumbBuffer, framebuffer, Device as ControlDevice, Mode,
+    ModeTypeFlags,
 };
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
@@ -241,7 +243,15 @@ fn paint_login_box(buf: &mut [u8], pitch: u32, width: u32, height: u32, state: &
         let text_w = font::text_width(&shown, scale);
         let text_x = x0 + box_w.saturating_sub(text_w) / 2;
         let text_y = y0 + box_h.saturating_sub(glyph_h) / 2;
-        font::draw_text(buf, pitch, text_x, text_y, scale, (0xf0, 0xf0, 0xf0), &shown);
+        font::draw_text(
+            buf,
+            pitch,
+            text_x,
+            text_y,
+            scale,
+            (0xf0, 0xf0, 0xf0),
+            &shown,
+        );
     }
 }
 
@@ -300,7 +310,13 @@ mod tests {
             let y_off = frame_h * i as u32;
             let frame_start = (y_off * pitch) as usize;
             let frame_end = ((y_off + frame_h) * pitch) as usize;
-            paint_login_box(&mut buf[frame_start..frame_end], pitch, frame_w, frame_h, state);
+            paint_login_box(
+                &mut buf[frame_start..frame_end],
+                pitch,
+                frame_w,
+                frame_h,
+                state,
+            );
         }
 
         let mut rgba = vec![0u8; buf.len()];

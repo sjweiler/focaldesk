@@ -143,10 +143,7 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
                     gtk::ResponseType::Ok => Some(entry.text().to_string()),
                     _ => None,
                 };
-                let _ = tx.send(DialogIpcResponse::PolkitAuthAnswer {
-                    request_id,
-                    answer,
-                });
+                let _ = tx.send(DialogIpcResponse::PolkitAuthAnswer { request_id, answer });
                 dialog.close();
             });
 

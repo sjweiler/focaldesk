@@ -4,9 +4,8 @@
 
 use crate::backend::common::client_state_from_stream;
 use crate::backend::common::{
-    bootstrap_compositor_core, drain_session_sleep_notifications,
-    is_nonfatal_wayland_io_error, spawn_session_sleep_watch, translate_backend_input,
-    BootstrapOutput,
+    bootstrap_compositor_core, drain_session_sleep_notifications, is_nonfatal_wayland_io_error,
+    spawn_session_sleep_watch, translate_backend_input, BootstrapOutput,
 };
 #[cfg(feature = "xwayland")]
 use crate::backend::common::{finish_xwayland_startup, start_xwayland};

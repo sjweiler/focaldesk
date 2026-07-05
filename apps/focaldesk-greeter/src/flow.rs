@@ -8,7 +8,10 @@ const SESSION_CMD: &str = "/usr/local/bin/focaldesk-desktop";
 /// Called when the user hits Enter. Advances the state machine and, where
 /// applicable, sends the next greetd request. `state.input` is the line the
 /// user just finished typing (username or a response to the current prompt).
-pub fn submit(state: &mut LoginScreenState, req_tx: &Sender<greetd::Request>) -> anyhow::Result<()> {
+pub fn submit(
+    state: &mut LoginScreenState,
+    req_tx: &Sender<greetd::Request>,
+) -> anyhow::Result<()> {
     match &state.phase {
         LoginPhase::EnteringUsername => {
             state.username = std::mem::take(&mut state.input).trim().to_string();

@@ -3676,8 +3676,14 @@ impl DesktopState {
             return Rectangle::from_loc_and_size(Point::from((100, 100)), DEFAULT_SIZE);
         };
 
-        let width = DEFAULT_SIZE.0.min(work.size.w).max(MIN_SIZE.0.min(work.size.w));
-        let height = DEFAULT_SIZE.1.min(work.size.h).max(MIN_SIZE.1.min(work.size.h));
+        let width = DEFAULT_SIZE
+            .0
+            .min(work.size.w)
+            .max(MIN_SIZE.0.min(work.size.w));
+        let height = DEFAULT_SIZE
+            .1
+            .min(work.size.h)
+            .max(MIN_SIZE.1.min(work.size.h));
         let size = Size::from((width, height));
         let loc = Point::from((
             work.loc.x + (work.size.w - size.w) / 2,

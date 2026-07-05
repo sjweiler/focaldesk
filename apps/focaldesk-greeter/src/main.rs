@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use anyhow::anyhow;
 use focaldesk_logging::{flog, init_default_logging, startup_banner};
-use smithay::reexports::calloop::{self, EventLoop};
 use smithay::backend::input::{InputEvent, KeyState, KeyboardKeyEvent};
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::backend::session::Event as SessionEvent;
+use smithay::reexports::calloop::{self, EventLoop};
 
 use drm_backend::GreeterOutput;
 use keymap::Modifiers;

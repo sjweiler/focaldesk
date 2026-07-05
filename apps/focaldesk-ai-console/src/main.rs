@@ -722,30 +722,32 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
             let log_buffer_for_poll = log_buffer.clone();
             let button_for_poll = button.clone();
             let current_session_for_poll = current_session.clone();
-            glib::timeout_add_local(Duration::from_millis(80), move || loop {
-                match rx.try_recv() {
-                    Ok(VoiceEvent::Partial(partial)) => {
-                        entry_for_poll.set_text(&format!("{base_text}{accumulated}{partial}"));
-                        entry_for_poll.set_position(-1);
-                    }
-                    Ok(VoiceEvent::Final(text)) => {
-                        if !text.is_empty() {
-                            accumulated.push_str(&text);
-                            accumulated.push(' ');
+            glib::timeout_add_local(Duration::from_millis(80), move || {
+                loop {
+                    match rx.try_recv() {
+                        Ok(VoiceEvent::Partial(partial)) => {
+                            entry_for_poll.set_text(&format!("{base_text}{accumulated}{partial}"));
+                            entry_for_poll.set_position(-1);
                         }
-                        entry_for_poll.set_text(&format!("{base_text}{accumulated}"));
-                        entry_for_poll.set_position(-1);
-                    }
-                    Ok(VoiceEvent::Error(err)) => {
-                        append_log(&log_buffer_for_poll, &format!("[voice] {err}"));
-                        button_for_poll.set_label("Voice");
-                        *current_session_for_poll.borrow_mut() = None;
-                        return ControlFlow::Break;
-                    }
-                    Err(mpsc::TryRecvError::Empty) => return ControlFlow::Continue,
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        *current_session_for_poll.borrow_mut() = None;
-                        return ControlFlow::Break;
+                        Ok(VoiceEvent::Final(text)) => {
+                            if !text.is_empty() {
+                                accumulated.push_str(&text);
+                                accumulated.push(' ');
+                            }
+                            entry_for_poll.set_text(&format!("{base_text}{accumulated}"));
+                            entry_for_poll.set_position(-1);
+                        }
+                        Ok(VoiceEvent::Error(err)) => {
+                            append_log(&log_buffer_for_poll, &format!("[voice] {err}"));
+                            button_for_poll.set_label("Voice");
+                            *current_session_for_poll.borrow_mut() = None;
+                            return ControlFlow::Break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => return ControlFlow::Continue,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            *current_session_for_poll.borrow_mut() = None;
+                            return ControlFlow::Break;
+                        }
                     }
                 }
             });
