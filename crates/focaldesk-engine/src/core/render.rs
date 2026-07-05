@@ -1754,7 +1754,6 @@ impl RenderState {
             theme,
         );
 
-        // xdg popups are included in [`Window::render_elements`] when [`PopupManager::commit`] runs.
         self.draw_popup_elements(
             frame,
             inputs.ctx,
@@ -2878,11 +2877,19 @@ impl RenderState {
             let location = render_loc - region.loc;
             let render_pos = location.to_physical_precise_round(scale);
 
-            let elems = window.render_elements::<FlowRenderElement>(
+            // Render the window surface tree here, but keep xdg popups out of this pass.
+            // Popups are composited separately below so they can sit above the compositor chrome
+            // without being drawn twice.
+            let Some(surface) = window.wl_surface() else {
+                continue;
+            };
+            let elems = render_elements_from_surface_tree::<_, FlowRenderElement>(
                 renderer,
+                &surface,
                 render_pos,
                 Scale::from(scale),
                 1.0,
+                Kind::Unspecified,
             );
 
             #[cfg(feature = "xwayland")]
