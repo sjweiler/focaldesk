@@ -172,13 +172,27 @@ impl XwmHandler for DesktopState {
                     self.output_under_pointer(self.input.pointer_pos)
                         .unwrap_or(self.primary_output)
                 });
-            geometry = self.xwayland_clamp_override_redirect_geometry(output_id, geometry);
+            geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
             let _ = window.configure(geometry);
             return;
         }
 
         if let Some(id) = self.window_id_for_x11_surface(&window) {
             let output_id = self.xwayland_output_id_for_window(id);
+            if self
+                .window(id)
+                .is_some_and(|managed| managed.floating)
+            {
+                if let Some(x) = x {
+                    geometry.loc.x = x;
+                }
+                if let Some(y) = y {
+                    geometry.loc.y = y;
+                }
+                geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
+                let _ = window.configure(geometry);
+                return;
+            }
             if self.xwayland_request_fills_output(output_id, geometry.size) {
                 self.set_window_maximized(id, true);
                 return;

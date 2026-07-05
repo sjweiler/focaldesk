@@ -12,7 +12,6 @@ pub enum PanelKind {
     Calendar,
     Settings,
     Workspaces,
-    AppLauncher,
     ClipboardHistory,
 }
 

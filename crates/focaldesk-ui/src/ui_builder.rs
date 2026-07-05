@@ -95,7 +95,7 @@ pub fn build_ui_for_output_with_options(
             SIDEBAR_BASE,
             IconId::Launcher,
             "Launcher".to_string(),
-            UiAction::OpenPanel(PanelKind::AppLauncher),
+            UiAction::LaunchApp("@launcher"),
             false,
         ),
     ];

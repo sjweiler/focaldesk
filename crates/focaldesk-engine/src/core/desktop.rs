@@ -168,6 +168,37 @@ fn clamp_rect_to_bounds(
     geometry
 }
 
+fn rect_center_distance_sq(a: Rectangle<i32, Logical>, b: Rectangle<i32, Logical>) -> i64 {
+    let ax = i64::from(a.loc.x) * 2 + i64::from(a.size.w);
+    let ay = i64::from(a.loc.y) * 2 + i64::from(a.size.h);
+    let bx = i64::from(b.loc.x) * 2 + i64::from(b.size.w);
+    let by = i64::from(b.loc.y) * 2 + i64::from(b.size.h);
+    let dx = ax - bx;
+    let dy = ay - by;
+    dx * dx + dy * dy
+}
+
+fn rect_area(rect: Rectangle<i32, Logical>) -> i64 {
+    i64::from(rect.size.w.max(0)) * i64::from(rect.size.h.max(0))
+}
+
+fn clamp_rect_to_any_bounds(
+    geometry: Rectangle<i32, Logical>,
+    bounds: &[Rectangle<i32, Logical>],
+) -> Rectangle<i32, Logical> {
+    let Some(best_bounds) = bounds.iter().copied().max_by_key(|candidate| {
+        let overlap = geometry
+            .intersection(*candidate)
+            .map(rect_area)
+            .unwrap_or_default();
+        (overlap, std::cmp::Reverse(rect_center_distance_sq(geometry, *candidate)))
+    }) else {
+        return geometry;
+    };
+
+    clamp_rect_to_bounds(geometry, best_bounds)
+}
+
 fn should_wait_for_lid_open_on_resume(last_lid_state: Option<bool>) -> bool {
     last_lid_state == Some(true)
 }
@@ -706,13 +737,8 @@ enum PendingEguiOp {
 
 #[derive(Debug, Clone, Copy)]
 enum SidebarDialogKind {
-    AppLauncher,
     DeleteWorkspace,
 }
-
-const LAUNCHER_DIALOG_TERMINAL: u32 = 1;
-const LAUNCHER_DIALOG_BROWSER: u32 = 2;
-const LAUNCHER_DIALOG_FILES: u32 = 3;
 
 fn apply_debug_log_level(level: DebugLogLevel) {
     let level = match level {
@@ -2765,6 +2791,7 @@ impl DesktopState {
             "google-chrome" | "@browser" => self.apps.browser.clone(),
             "nautilus" | "@files" => focaldesk_files_command(),
             "@settings" | "focaldesk-settings" => focaldesk_settings_command(),
+            "@launcher" | "focaldesk-launcher" => focaldesk_launcher_command(),
             other => other.to_string(),
         }
     }
@@ -2780,12 +2807,8 @@ impl DesktopState {
             }
 
             UiAction::OpenPanel(panel) => {
-                if panel == PanelKind::AppLauncher {
-                    self.open_app_launcher_dialog();
-                } else {
-                    self.pending_egui_ops
-                        .push(PendingEguiOp::OpenPanel(panel, self.focused_output));
-                }
+                self.pending_egui_ops
+                    .push(PendingEguiOp::OpenPanel(panel, self.focused_output));
             }
 
             UiAction::ReloadSettings => {
@@ -3141,43 +3164,6 @@ impl DesktopState {
             .get(&self.focused_output)
             .expect("sidebar dialog requires at least one output");
         Rectangle::from_loc_and_size((0, 0), output.logical_size)
-    }
-
-    fn open_app_launcher_dialog(&mut self) {
-        let dialog_id = self.alloc_dialog_id();
-        let owner_output = self.focused_output;
-        let dialog = Dialog {
-            id: dialog_id,
-            kind: DialogKind::Confirm,
-            title: "Launch".into(),
-            message: "Choose an application to open.".into(),
-            buttons: vec![
-                DialogButton {
-                    label: "Cancel".into(),
-                    action: DialogAction::Cancel,
-                },
-                DialogButton {
-                    label: "Terminal".into(),
-                    action: DialogAction::Custom(LAUNCHER_DIALOG_TERMINAL),
-                },
-                DialogButton {
-                    label: "Browser".into(),
-                    action: DialogAction::Custom(LAUNCHER_DIALOG_BROWSER),
-                },
-                DialogButton {
-                    label: "Files".into(),
-                    action: DialogAction::Custom(LAUNCHER_DIALOG_FILES),
-                },
-            ],
-            modal: true,
-            dismissible: false,
-            state: DialogState::Open,
-            owner_output,
-            bounds: self.focused_output_screen(),
-        };
-        self.pending_sidebar_dialogs
-            .insert(dialog_id, SidebarDialogKind::AppLauncher);
-        self.open_dialog(dialog);
     }
 
     fn open_delete_workspace_dialog(&mut self) {
@@ -3567,10 +3553,16 @@ impl DesktopState {
         output_id: OutputId,
         geometry: Rectangle<i32, Logical>,
     ) -> Rectangle<i32, Logical> {
-        let Some(bounds) = self
-            .work_recess_for_output(output_id)
-            .or_else(|| self.output_logical_rect(output_id))
-        else {
+        self.xwayland_clamp_to_output_geometry(output_id, geometry)
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_clamp_to_output_geometry(
+        &self,
+        output_id: OutputId,
+        geometry: Rectangle<i32, Logical>,
+    ) -> Rectangle<i32, Logical> {
+        let Some(bounds) = self.output_logical_rect(output_id) else {
             return geometry;
         };
         clamp_rect_to_bounds(geometry, bounds)
@@ -4670,14 +4662,16 @@ impl DesktopState {
                 self.xwayland_or_compositor_loc(&surface, requested_geometry.loc),
                 requested_geometry.size,
             );
-            let geometry = self.xwayland_clamp_override_redirect_geometry(output_id, geometry);
+            let geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
             (geometry.loc, geometry.size, false)
         } else if should_float {
             let location = self.xwayland_or_compositor_loc(
                 &surface,
                 self.default_toplevel_map_location(output_id),
             );
-            (location, requested_geometry.size, false)
+            let geometry = Rectangle::from_loc_and_size(location, requested_geometry.size);
+            let geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
+            (geometry.loc, geometry.size, false)
         } else if self.workspaces.maximize_on_launch {
             let work = self
                 .work_recess_for_output(output_id)
@@ -4762,34 +4756,6 @@ impl DesktopState {
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
         if let Some(kind) = self.pending_sidebar_dialogs.remove(&id) {
             match kind {
-                SidebarDialogKind::AppLauncher => {
-                    if let DialogAction::Custom(choice) = action {
-                        match choice {
-                            LAUNCHER_DIALOG_TERMINAL => {
-                                let launch_trace_id = self.launch_app(self.apps.terminal.clone());
-                                flog_info!(
-                                    "dispatch launch trace_id={} action=launcher-terminal",
-                                    launch_trace_id
-                                );
-                            }
-                            LAUNCHER_DIALOG_BROWSER => {
-                                let launch_trace_id = self.launch_app(self.apps.browser.clone());
-                                flog_info!(
-                                    "dispatch launch trace_id={} action=launcher-browser",
-                                    launch_trace_id
-                                );
-                            }
-                            LAUNCHER_DIALOG_FILES => {
-                                let launch_trace_id = self.launch_app(focaldesk_files_command());
-                                flog_info!(
-                                    "dispatch launch trace_id={} action=launcher-files",
-                                    launch_trace_id
-                                );
-                            }
-                            _ => {}
-                        }
-                    }
-                }
                 SidebarDialogKind::DeleteWorkspace => {
                     if matches!(action, DialogAction::Confirm) {
                         self.delete_focused_workspace();
@@ -5082,7 +5048,7 @@ impl DesktopState {
             .cloned()
     }
 
-    /// Clamp pending popup geometry to the union of outputs that contain the parent window.
+    /// Clamp pending popup geometry to the parent outputs and keep it fully on screen.
     pub(crate) fn unconstrain_popup(&self, popup: &PopupSurface) {
         let popup_kind = PopupKind::from(popup.clone());
         let popup_toplevel_coords = get_popup_toplevel_coords(&popup_kind);
@@ -5108,10 +5074,18 @@ impl DesktopState {
         let window_geo = self.space.element_geometry(&window).unwrap();
 
         let mut target: Option<Rectangle<i32, Logical>> = None;
+        let mut output_bounds: Vec<Rectangle<i32, Logical>> = Vec::new();
         for output in &outputs_for_window {
             let Some(output_id) = self.output_id_for_space_output(output) else {
                 continue;
             };
+            let Some(output_geo) = self.space.output_geometry(output) else {
+                continue;
+            };
+            output_bounds.push(Rectangle::from_loc_and_size(
+                output_geo.loc - window_geo.loc,
+                output_geo.size,
+            ));
             let Some(work) = self.work_recess_for_output(output_id) else {
                 continue;
             };
@@ -5123,14 +5097,15 @@ impl DesktopState {
             });
         }
 
+        if output_bounds.is_empty() {
+            return;
+        }
+
         let target = target.unwrap_or_else(|| {
-            let mut outputs_geo = self.space.output_geometry(&outputs_for_window[0]).unwrap();
-            for output in outputs_for_window.iter().skip(1) {
-                outputs_geo = outputs_geo.merge(self.space.output_geometry(output).unwrap());
+            let mut fallback = output_bounds[0];
+            for output in output_bounds.iter().skip(1) {
+                fallback = fallback.merge(*output);
             }
-            let mut fallback = outputs_geo;
-            fallback.loc -= popup_toplevel_coords;
-            fallback.loc -= window_geo.loc;
             fallback
         });
         if target.size.w <= 0 || target.size.h <= 0 {
@@ -5138,7 +5113,14 @@ impl DesktopState {
         }
 
         popup.with_pending_state(|state| {
-            state.geometry = state.positioner.get_unconstrained_geometry(target);
+            let mut geometry = state.geometry;
+            geometry.loc += popup_toplevel_coords;
+            if popup_toplevel_coords == (0, 0).into() {
+                geometry = state.positioner.get_unconstrained_geometry(target);
+            }
+            geometry = clamp_rect_to_any_bounds(geometry, &output_bounds);
+            geometry.loc -= popup_toplevel_coords;
+            state.geometry = geometry;
         });
     }
 
@@ -5191,7 +5173,11 @@ impl DesktopState {
             }
 
             KeyAction::ToggleLauncher => {
-                self.open_app_launcher_dialog();
+                let launch_trace_id = self.launch_app(self.resolve_launch_command("@launcher"));
+                flog_info!(
+                    "dispatch launch trace_id={} action=keybind-launcher",
+                    launch_trace_id
+                );
             }
 
             KeyAction::ActivateSlot(n) => {
@@ -7432,6 +7418,18 @@ fn focaldesk_settings_command() -> String {
         .unwrap_or_else(|| "focaldesk-settings".to_string())
 }
 
+fn focaldesk_launcher_command() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.parent()
+                .map(|parent| parent.join("focaldesk-launcher"))
+        })
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "focaldesk-launcher".to_string())
+}
+
 fn focaldesk_ai_console_command() -> String {
     std::env::current_exe()
         .ok()
@@ -7702,6 +7700,18 @@ mod tests {
 
         assert_eq!(clamped.loc, (10, 20).into());
         assert_eq!(clamped.size, (100, 80).into());
+    }
+
+    #[test]
+    fn clamp_rect_to_any_bounds_picks_the_best_output() {
+        let rect = Rectangle::from_loc_and_size((120, 10), (50, 50));
+        let left = Rectangle::from_loc_and_size((0, 0), (100, 100));
+        let right = Rectangle::from_loc_and_size((200, 0), (100, 100));
+
+        let clamped = super::clamp_rect_to_any_bounds(rect, &[left, right]);
+
+        assert_eq!(clamped.loc, (50, 10).into());
+        assert_eq!(clamped.size, (50, 50).into());
     }
 
     #[test]

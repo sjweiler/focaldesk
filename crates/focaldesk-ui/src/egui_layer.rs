@@ -20,7 +20,7 @@ use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_panels::{
     AudioPanel, BluetoothPanel, CalendarPanel, ClipboardEntryView, ClipboardPanel, DebugPanel,
-    EguiPanelView, LauncherPanel, NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog,
+    EguiPanelView, NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog,
 };
 use crate::types::{PanelKind, UiAction};
 
@@ -29,7 +29,6 @@ pub struct EguiLayer {
     raw_input: RawInput,
     actions: Vec<UiAction>,
     settings: SettingsPanel,
-    launcher: LauncherPanel,
     network: NetworkPanel,
     bluetooth: BluetoothPanel,
     audio: AudioPanel,
@@ -162,7 +161,6 @@ impl Default for EguiLayer {
             screen_height_pts: 1.0,
             last_frame_ctx: None,
             settings: SettingsPanel::default(),
-            launcher: LauncherPanel::default(),
             network: NetworkPanel::default(),
             bluetooth: BluetoothPanel::default(),
             audio: AudioPanel::default(),
@@ -273,7 +271,6 @@ impl<'a, 'frame, 'buffer> EguiShaderBridge<'a, 'frame, 'buffer> {
 impl EguiLayer {
     pub fn has_open_panels(&self) -> bool {
         self.settings.open
-            || self.launcher.open
             || self.network.open
             || self.bluetooth.open
             || self.audio.open
@@ -298,10 +295,6 @@ impl EguiLayer {
             PanelKind::Settings => {
                 self.settings.open = !self.settings.open;
                 opened = self.settings.open;
-            }
-            PanelKind::AppLauncher => {
-                self.launcher.open = !self.launcher.open;
-                opened = self.launcher.open;
             }
             PanelKind::Network => {
                 self.network.open = !self.network.open;
@@ -344,7 +337,6 @@ impl EguiLayer {
 
         let output = self.ctx.run(self.raw_input.take(), |ctx| {
             self.settings.show(ctx, frame_ctx, &mut self.actions);
-            self.launcher.show(ctx, frame_ctx, &mut self.actions);
             self.network.show(ctx, frame_ctx, &mut self.actions);
             self.bluetooth.show(ctx, frame_ctx, &mut self.actions);
             self.audio.show(ctx, frame_ctx, &mut self.actions);
@@ -435,7 +427,6 @@ impl EguiLayer {
 
     pub fn close_all_panels(&mut self) {
         self.settings.open = false;
-        self.launcher.open = false;
         self.network.open = false;
         self.bluetooth.open = false;
         self.audio.open = false;

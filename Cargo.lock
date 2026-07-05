@@ -1805,6 +1805,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-launcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-logging",
+ "focaldesk-settings-core",
+ "gtk4",
+ "libadwaita",
+ "tracing",
+]
+
+[[package]]
 name = "focaldesk-logging"
 version = "0.1.0"
 dependencies = [

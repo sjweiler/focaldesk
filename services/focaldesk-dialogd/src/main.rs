@@ -115,38 +115,69 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
             prompt,
             echo_on,
         } => {
-            let dialog = gtk::MessageDialog::builder()
+            let dialog = gtk::Dialog::builder()
                 .modal(true)
-                .message_type(gtk::MessageType::Question)
-                .buttons(gtk::ButtonsType::None)
-                .text(message)
+                .title(&message)
                 .build();
             if !icon_name.is_empty() {
                 dialog.set_icon_name(Some(&icon_name));
             }
 
-            let entry = gtk::Entry::builder()
-                .placeholder_text(prompt)
-                .visibility(echo_on)
-                .input_purpose(gtk::InputPurpose::Password)
-                .activates_default(true)
-                .build();
-            dialog.content_area().append(&entry);
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+            content.set_margin_top(16);
+            content.set_margin_bottom(16);
+            content.set_margin_start(16);
+            content.set_margin_end(16);
 
-            let cancel_button = dialog.add_button("Cancel", gtk::ResponseType::Cancel);
-            let ok_button = dialog.add_button("OK", gtk::ResponseType::Ok);
-            dialog.set_default_widget(Some(&ok_button));
-            let _ = cancel_button;
+            let label = gtk::Label::new(Some(&prompt));
+            label.set_wrap(true);
+            label.set_xalign(0.0);
+            content.append(&label);
 
-            dialog.connect_response(move |dialog, response| {
-                let answer = match response {
-                    gtk::ResponseType::Ok => Some(entry.text().to_string()),
-                    _ => None,
-                };
-                let _ = tx.send(DialogIpcResponse::PolkitAuthAnswer { request_id, answer });
-                dialog.close();
-            });
+            if echo_on {
+                let entry = gtk::Entry::builder()
+                    .placeholder_text("Response")
+                    .activates_default(true)
+                    .build();
+                content.append(&entry);
 
+                let cancel_button = dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+                let ok_button = dialog.add_button("OK", gtk::ResponseType::Ok);
+                dialog.set_default_widget(Some(&ok_button));
+                let _ = cancel_button;
+
+                dialog.connect_response(move |dialog, response| {
+                    let answer = match response {
+                        gtk::ResponseType::Ok => Some(entry.text().to_string()),
+                        _ => None,
+                    };
+                    let _ = tx.send(DialogIpcResponse::PolkitAuthAnswer { request_id, answer });
+                    dialog.close();
+                });
+            } else {
+                let entry = gtk::PasswordEntry::builder()
+                    .placeholder_text("Password")
+                    .activates_default(true)
+                    .show_peek_icon(false)
+                    .build();
+                content.append(&entry);
+
+                let cancel_button = dialog.add_button("Cancel", gtk::ResponseType::Cancel);
+                let ok_button = dialog.add_button("OK", gtk::ResponseType::Ok);
+                dialog.set_default_widget(Some(&ok_button));
+                let _ = cancel_button;
+
+                dialog.connect_response(move |dialog, response| {
+                    let answer = match response {
+                        gtk::ResponseType::Ok => Some(entry.text().to_string()),
+                        _ => None,
+                    };
+                    let _ = tx.send(DialogIpcResponse::PolkitAuthAnswer { request_id, answer });
+                    dialog.close();
+                });
+            }
+
+            dialog.content_area().append(&content);
             dialog.present();
         }
     }

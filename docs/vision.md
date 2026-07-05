@@ -1,6 +1,6 @@
 # FlowOS Vision
 
-## What FlowOS is
+## What FocalDesk is
 FlowOS is a retro-futuristic, aerospace-inspired desktop environment built around a custom Wayland compositor and a cohesive “operating system experience” layer. The goal is a responsive, keyboard-first UI that remains visually distinctive while staying technically solid (latency, stability, security).
 
 ## Principles
