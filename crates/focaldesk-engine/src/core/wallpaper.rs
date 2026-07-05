@@ -86,8 +86,8 @@ pub fn compute_wallpaper_blit(src: SizeI, out: RectI, mode: WallpaperMode) -> Op
             // cover
             let s = (ow / sw).max(oh / sh);
             // crop in source pixels
-            let cw = (ow / s).round() as f32;
-            let ch = (oh / s).round() as f32;
+            let cw = (ow / s).round();
+            let ch = (oh / s).round();
             let cx = ((sw - cw) * 0.5).max(0.0);
             let cy = ((sh - ch) * 0.5).max(0.0);
 

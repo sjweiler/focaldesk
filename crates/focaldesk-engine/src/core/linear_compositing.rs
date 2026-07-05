@@ -1,32 +1,39 @@
-//! Shared linear-light compositing for SDR scanout (FP16 working space, sRGB KMS buffer).
+//! Shared linear-light compositing for SDR scanout (FP16 working space, sRGB KMS buffer)
+//! and HDR PQ scanout (C3b: scRGB working space, 10-bit PQ offscreen).
 
 use crate::core::backend_render::{
     build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
     prepare_output, PreparedOutput,
 };
-use crate::core::color::linear_sdr_runtime_enabled;
+use crate::core::color::{
+    hdr_render_runtime_enabled, kms_scanout_encode_description, linear_sdr_runtime_enabled,
+    output_encode_scanout_needed, scene_to_output_matrix, RenderingIntent,
+};
 use crate::core::desktop::DesktopState;
+use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
 };
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use anyhow::{anyhow, Context, Result};
-use focaldesk_logging::flog;
+use focaldesk_logging::{flog, flog_warn};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture,
+    ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Texture};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use std::time::{Duration, Instant};
 
-/// Opaque offscreen: avoids alpha=0 holes that the sRGB↔linear blit decodes as black.
+/// Opaque offscreen: wallpaper/chrome in sRGB, KMS scanout target.
 pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Xbgr8888;
-/// Alpha FP16 so unset pixels stay transparent for selective composite onto SDR.
+/// Alpha FP16 client layer composited onto the SDR base.
 pub const LINEAR_SDR_FORMAT: Fourcc = Fourcc::Abgr16161616f;
+/// PQ-encoded HDR scanout (C3b).
+pub const HDR_OFFSCREEN_FORMATS: [Fourcc; 2] = [Fourcc::Abgr2101010, Fourcc::Argb2101010];
 
 #[derive(Clone)]
 pub struct OffscreenTexture {
@@ -37,14 +44,36 @@ pub struct OffscreenTexture {
 #[derive(Default)]
 pub struct LinearOffscreenTargets {
     pub linear_supported: bool,
+    pub hdr_supported: bool,
+    pub hdr_format: Option<Fourcc>,
     pub offscreen: Option<OffscreenTexture>,
     pub linear_offscreen: Option<OffscreenTexture>,
+    /// Ping-pong target for full-frame output encode (C1b/C2c SDR).
+    pub encode_scratch: Option<OffscreenTexture>,
+    /// PQ-encoded HDR scanout buffer (C3b).
+    pub hdr_offscreen: Option<OffscreenTexture>,
+    pub encoded_scanout: bool,
+    pub encoded_hdr: bool,
 }
 
 pub fn supports_linear_sdr(renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> bool {
     let tex_size = Size::<i32, Buffer>::from((size.w, size.h));
     <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(renderer, LINEAR_SDR_FORMAT, tex_size)
         .is_ok()
+}
+
+pub fn select_hdr_offscreen_format(
+    renderer: &mut GlesRenderer,
+    size: Size<i32, Physical>,
+) -> Option<Fourcc> {
+    let tex_size = Size::<i32, Buffer>::from((size.w, size.h));
+    HDR_OFFSCREEN_FORMATS.iter().copied().find(|format| {
+        <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(renderer, *format, tex_size).is_ok()
+    })
+}
+
+pub fn supports_hdr_offscreen(renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> bool {
+    select_hdr_offscreen_format(renderer, size).is_some()
 }
 
 pub fn use_linear_sdr_path(
@@ -93,6 +122,50 @@ impl LinearOffscreenTargets {
             }
         }
     }
+
+    pub fn ensure_encode_scratch(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+    ) -> Result<(), GlesError> {
+        ensure_offscreen_texture(
+            renderer,
+            &mut self.encode_scratch,
+            size,
+            SDR_OFFSCREEN_FORMAT,
+        )
+    }
+
+    pub fn ensure_hdr_offscreen(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+    ) -> Result<(), GlesError> {
+        let format = match self.hdr_format {
+            Some(format) => format,
+            None => {
+                let Some(format) = select_hdr_offscreen_format(renderer, size) else {
+                    self.hdr_supported = false;
+                    return Ok(());
+                };
+                self.hdr_format = Some(format);
+                self.hdr_supported = true;
+                format
+            }
+        };
+        ensure_offscreen_texture(renderer, &mut self.hdr_offscreen, size, format)
+    }
+
+    /// Texture to present or capture after the render pass (HDR PQ or SDR encode scratch).
+    pub fn scanout_texture(&self) -> Option<&GlesTexture> {
+        if self.encoded_scanout {
+            if self.encoded_hdr {
+                return self.hdr_offscreen.as_ref().map(|t| &t.texture);
+            }
+            return self.encode_scratch.as_ref().map(|t| &t.texture);
+        }
+        self.offscreen.as_ref().map(|t| &t.texture)
+    }
 }
 
 pub fn ensure_offscreen_texture(
@@ -115,9 +188,9 @@ pub fn ensure_offscreen_texture(
     Ok(())
 }
 
-/// Composite a linear FP16 client layer onto an existing SDR offscreen.
-/// Pixels with alpha≈0 are discarded so wallpaper/chrome from the SDR base pass remain intact.
-pub fn composite_linear_layer_onto_sdr(
+/// Composite the FP16 client layer onto an existing SDR base using linear→sRGB only.
+/// Transparent pixels are discarded so the base pass remains visible.
+pub fn composite_linear_layer_onto_sdr_srgb(
     renderer: &mut GlesRenderer,
     linear: &GlesTexture,
     sdr: &mut GlesTexture,
@@ -136,7 +209,7 @@ pub fn composite_linear_layer_onto_sdr(
         (tex_size.w as f64, tex_size.h as f64),
     );
     let dst_rect = smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
-    let damage = [dst_rect];
+    let damage = [Rectangle::from_loc_and_size((0, 0), size)];
     frame
         .render_texture_from_to(
             linear,
@@ -148,6 +221,511 @@ pub fn composite_linear_layer_onto_sdr(
             1.0,
             Some(shader),
             &[],
+        )
+        .context("render linear composite")?;
+    let _sync = frame.finish().context("finish linear composite")?;
+    Ok(())
+}
+
+/// Full-frame scene sRGB → monitor encode (C1b parametric, C2c ICC LUT, or C3b HDR PQ).
+pub fn apply_output_encode(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+) -> Result<Option<SyncPoint>> {
+    targets.encoded_hdr = false;
+    let output_state = state.outputs.get(&output_id);
+    let hdr_active = output_state
+        .map(|o| {
+            o.hdr_enabled
+                || crate::core::color::output_hdr_pq_test_encode_active(
+                    o.hdr_requested,
+                    o.hdr_supported,
+                    o.hdr_kms_applied,
+                )
+        })
+        .unwrap_or(false);
+    let hdr_max = output_state.and_then(|o| o.edid_hdr_max_luminance_nits);
+    let hdr_fall = output_state.and_then(|o| o.edid_hdr_max_fall_nits);
+    let sdr_white_nits = output_state
+        .map(|o| o.color_description.reference_white_nits)
+        .unwrap_or(80.0);
+
+    if hdr_active && hdr_render_runtime_enabled() {
+        if let Some(max_nits) = hdr_max.filter(|n| *n > 0.0) {
+            if targets.hdr_supported {
+                match apply_hdr_pq_encode(
+                    state,
+                    renderer,
+                    targets,
+                    buffer_size,
+                    max_nits,
+                    sdr_white_nits,
+                ) {
+                    Ok(sync) => return Ok(sync),
+                    Err(err) => {
+                        flog_warn!(
+                            "HDR PQ encode failed for {:?}: {err}; falling back to SDR encode",
+                            output_id
+                        );
+                    }
+                }
+            } else {
+                flog_warn!(
+                    "HDR render requested for {:?} but 10-bit offscreen is unavailable; using SDR encode",
+                    output_id
+                );
+            }
+        } else {
+            flog_warn!(
+                "HDR render requested for {:?} but EDID max luminance is missing; using SDR encode",
+                output_id
+            );
+        }
+    }
+
+    let output_encode = kms_scanout_encode_description(
+        state.output_color_description(output_id),
+        false,
+        hdr_max,
+        hdr_fall,
+    );
+    let lut_owned = state
+        .outputs
+        .get(&output_id)
+        .and_then(|output| output.output_icc_lut.clone());
+    if !output_encode_scanout_needed(output_encode, lut_owned.as_ref()) {
+        return Ok(None);
+    }
+
+    let lut_shader = state.render.chrome_shaders.output_encode_lut.clone();
+    if let Some(lut) = lut_owned.as_ref() {
+        if icc_lut_shader_enabled() {
+            if let Some(shader) = lut_shader.as_ref() {
+                match apply_output_encode_lut(
+                    state,
+                    renderer,
+                    targets,
+                    output_id,
+                    buffer_size,
+                    lut,
+                    shader,
+                ) {
+                    Ok(sync) => return Ok(sync),
+                    Err(err) => {
+                        flog_warn!(
+                            "ICC LUT output encode failed for {:?}: {err}; falling back to parametric encode",
+                            output_id
+                        );
+                        disable_output_icc_lut(state, output_id, "ICC LUT encode failed");
+                    }
+                }
+            } else {
+                disable_output_icc_lut(state, output_id, "ICC LUT shader unavailable");
+            }
+        }
+    }
+
+    let parametric_shader = state
+        .render
+        .chrome_shaders
+        .output_encode_sdr
+        .clone()
+        .ok_or_else(|| anyhow!("output encode shader missing"))?;
+    apply_output_encode_parametric(
+        state,
+        renderer,
+        targets,
+        output_id,
+        buffer_size,
+        output_encode,
+        &parametric_shader,
+    )
+}
+
+fn disable_output_icc_lut(state: &mut DesktopState, output_id: OutputId, reason: &str) {
+    if let Some(output) = state.outputs.get_mut(&output_id) {
+        if output.output_icc_lut.take().is_some() {
+            output.icc_lut_fallback_active = true;
+            let first_notice = state.render.icc_lut_fallback_logged.insert(output_id);
+            if first_notice {
+                flog_warn!(
+                    "ICC LUT fallback active for {:?}: {}; using parametric SDR encode until restart",
+                    output_id,
+                    reason
+                );
+            }
+        }
+    }
+    state.notify_runtime_display_status_changes();
+}
+
+fn blit_with_shader(
+    renderer: &mut GlesRenderer,
+    src: &GlesTexture,
+    dst: &mut GlesTexture,
+    size: Size<i32, Physical>,
+    shader: &GlesTexProgram,
+    uniforms: &[Uniform<'_>],
+    label: &str,
+) -> Result<SyncPoint> {
+    let mut target = renderer
+        .bind(dst)
+        .map_err(|e| anyhow!("bind target for {label}: {e}"))?;
+    let mut frame = renderer
+        .render(&mut target, size, Transform::Normal)
+        .map_err(|e| anyhow!("begin {label} frame: {e}"))?;
+    let tex_size = src.size();
+    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (tex_size.w as f64, tex_size.h as f64),
+    );
+    let dst_rect = Rectangle::from_loc_and_size((0, 0), size);
+    let damage = [dst_rect];
+    frame
+        .render_texture_from_to(
+            src,
+            src_rect,
+            dst_rect,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(shader),
+            uniforms,
+        )
+        .map_err(|e| anyhow!("render {label}: {e}"))?;
+    frame.finish().map_err(|e| anyhow!("finish {label}: {e}"))
+}
+
+fn apply_hdr_pq_encode(
+    state: &DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    buffer_size: Size<i32, Physical>,
+    max_nits: f32,
+    sdr_white_nits: f32,
+) -> Result<Option<SyncPoint>> {
+    let sdr_to_scrgb = state
+        .render
+        .chrome_shaders
+        .sdr_to_linear_scrgb
+        .as_ref()
+        .ok_or_else(|| anyhow!("sdr_to_linear_scrgb shader missing"))?;
+    let scrgb_to_pq = state
+        .render
+        .chrome_shaders
+        .linear_scrgb_to_pq
+        .as_ref()
+        .ok_or_else(|| anyhow!("linear_scrgb_to_pq shader missing"))?;
+
+    let scene_texture = targets
+        .offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("SDR offscreen missing before HDR PQ encode"))?
+        .texture
+        .clone();
+
+    targets.ensure_linear_offscreen(renderer, buffer_size)?;
+    targets.ensure_hdr_offscreen(renderer, buffer_size)?;
+
+    let working_texture = targets
+        .linear_offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("FP16 working buffer missing for HDR PQ encode"))?
+        .texture
+        .clone();
+
+    let _sync = blit_with_shader(
+        renderer,
+        &scene_texture,
+        &mut targets
+            .linear_offscreen
+            .as_mut()
+            .expect("linear offscreen")
+            .texture,
+        buffer_size,
+        sdr_to_scrgb,
+        &[Uniform::new("u_sdr_white_nits", sdr_white_nits)],
+        "SDR-to-linear-scRGB",
+    )?;
+
+    let sync = blit_with_shader(
+        renderer,
+        &working_texture,
+        &mut targets
+            .hdr_offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("HDR offscreen missing after allocation"))?
+            .texture,
+        buffer_size,
+        scrgb_to_pq,
+        &[Uniform::new("u_max_nits", max_nits)],
+        "linear-scRGB-to-PQ",
+    )?;
+
+    targets.encoded_scanout = true;
+    targets.encoded_hdr = true;
+    Ok(Some(sync))
+}
+
+fn apply_output_encode_lut(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+    lut: &crate::core::icc_lut::OutputIccLut,
+    shader: &GlesTexProgram,
+) -> Result<Option<SyncPoint>> {
+    let lut_texture = state
+        .render
+        .ensure_output_icc_lut_texture(renderer, output_id, lut)
+        .map_err(|e| anyhow!("upload ICC LUT atlas: {e}"))?;
+
+    let scene_texture = targets
+        .offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("SDR offscreen missing before output encode"))?
+        .texture
+        .clone();
+    targets.ensure_encode_scratch(renderer, buffer_size)?;
+    let scratch = targets
+        .encode_scratch
+        .as_mut()
+        .ok_or_else(|| anyhow!("encode scratch missing after allocation"))?;
+
+    let grid = lut.grid_size as f32;
+    let uniforms = vec![
+        Uniform::new("u_lut_tex", 1i32),
+        Uniform::new("u_grid", grid),
+    ];
+
+    let mut target = renderer
+        .bind(&mut scratch.texture)
+        .map_err(|e| anyhow!("bind encode scratch: {e}"))?;
+    let mut frame = renderer
+        .render(&mut target, buffer_size, Transform::Normal)
+        .map_err(|e| anyhow!("begin output encode frame: {e}"))?;
+
+    let lut_tex_id = lut_texture.tex_id();
+    frame
+        .with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, lut_tex_id);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                ffi::NEAREST as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                ffi::NEAREST as i32,
+            );
+        })
+        .map_err(|e| anyhow!("bind ICC LUT texture: {e}"))?;
+
+    let tex_size = scene_texture.size();
+    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (tex_size.w as f64, tex_size.h as f64),
+    );
+    let dst_rect = Rectangle::from_loc_and_size((0, 0), buffer_size);
+    let damage = [dst_rect];
+    frame
+        .render_texture_from_to(
+            &scene_texture,
+            src_rect,
+            dst_rect,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(shader),
+            &uniforms,
+        )
+        .map_err(|e| anyhow!("render ICC LUT output encode: {e}"))?;
+    let sync = frame
+        .finish()
+        .map_err(|e| anyhow!("finish ICC LUT output encode: {e}"))?;
+    targets.encoded_scanout = true;
+    Ok(Some(sync))
+}
+
+fn apply_output_encode_parametric(
+    _state: &DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    _output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+    output_encode: crate::core::color::ColorDescription,
+    shader: &GlesTexProgram,
+) -> Result<Option<SyncPoint>> {
+    let scene_texture = targets
+        .offscreen
+        .as_ref()
+        .ok_or_else(|| anyhow!("SDR offscreen missing before output encode"))?
+        .texture
+        .clone();
+    targets.ensure_encode_scratch(renderer, buffer_size)?;
+    let scratch = targets
+        .encode_scratch
+        .as_mut()
+        .ok_or_else(|| anyhow!("encode scratch missing after allocation"))?;
+
+    use smithay::backend::renderer::gles::Uniform;
+
+    let scene_to_output = scene_to_output_matrix(output_encode, RenderingIntent::Relative);
+    let encode_tf = output_encode.transfer.encode_mode() as u32 as f32;
+    let uniforms = vec![
+        Uniform::new("u_encode_tf", encode_tf),
+        Uniform::new(
+            "u_m0",
+            [
+                scene_to_output[0][0],
+                scene_to_output[0][1],
+                scene_to_output[0][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m1",
+            [
+                scene_to_output[1][0],
+                scene_to_output[1][1],
+                scene_to_output[1][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m2",
+            [
+                scene_to_output[2][0],
+                scene_to_output[2][1],
+                scene_to_output[2][2],
+            ],
+        ),
+    ];
+
+    let mut target = renderer
+        .bind(&mut scratch.texture)
+        .map_err(|e| anyhow!("bind encode scratch: {e}"))?;
+    let mut frame = renderer
+        .render(&mut target, buffer_size, Transform::Normal)
+        .map_err(|e| anyhow!("begin output encode frame: {e}"))?;
+    let tex_size = scene_texture.size();
+    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (tex_size.w as f64, tex_size.h as f64),
+    );
+    let dst_rect = Rectangle::from_loc_and_size((0, 0), buffer_size);
+    let damage = [dst_rect];
+    frame
+        .render_texture_from_to(
+            &scene_texture,
+            src_rect,
+            dst_rect,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(shader),
+            &uniforms,
+        )
+        .map_err(|e| anyhow!("render output encode: {e}"))?;
+    let sync = frame
+        .finish()
+        .map_err(|e| anyhow!("finish output encode: {e}"))?;
+    targets.encoded_scanout = true;
+    Ok(Some(sync))
+}
+
+fn finish_with_output_encode(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
+    buffer_size: Size<i32, Physical>,
+    sync: SyncPoint,
+) -> Result<SyncPoint> {
+    match apply_output_encode(state, renderer, targets, output_id, buffer_size) {
+        Ok(Some(encode_sync)) => Ok(encode_sync),
+        Ok(None) => Ok(sync),
+        Err(err) => {
+            flog_warn!(
+                "output encode disabled for {:?} after encode failure: {err}",
+                output_id
+            );
+            Ok(sync)
+        }
+    }
+}
+
+/// Composite the FP16 client layer onto an existing SDR base (wallpaper/chrome).
+/// Transparent pixels are discarded so the base pass remains visible.
+pub fn composite_linear_layer_onto_sdr(
+    renderer: &mut GlesRenderer,
+    linear: &GlesTexture,
+    sdr: &mut GlesTexture,
+    size: Size<i32, Physical>,
+    shader: &GlesTexProgram,
+    scene_to_output: [[f32; 3]; 3],
+    encode_tf: f32,
+) -> Result<()> {
+    use smithay::backend::renderer::gles::Uniform;
+
+    let mut target = renderer
+        .bind(sdr)
+        .context("bind SDR target for linear composite")?;
+    let mut frame = renderer
+        .render(&mut target, size, Transform::Normal)
+        .context("begin linear composite frame")?;
+    let tex_size = linear.size();
+    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (tex_size.w as f64, tex_size.h as f64),
+    );
+    let dst_rect = smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
+    let damage = [Rectangle::from_loc_and_size((0, 0), size)];
+    let uniforms = vec![
+        Uniform::new("u_encode_tf", encode_tf),
+        Uniform::new(
+            "u_m0",
+            [
+                scene_to_output[0][0],
+                scene_to_output[0][1],
+                scene_to_output[0][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m1",
+            [
+                scene_to_output[1][0],
+                scene_to_output[1][1],
+                scene_to_output[1][2],
+            ],
+        ),
+        Uniform::new(
+            "u_m2",
+            [
+                scene_to_output[2][0],
+                scene_to_output[2][1],
+                scene_to_output[2][2],
+            ],
+        ),
+    ];
+    frame
+        .render_texture_from_to(
+            linear,
+            src_rect,
+            dst_rect,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(shader),
+            &uniforms,
         )
         .context("render linear composite")?;
     let _sync = frame.finish().context("finish linear composite")?;
@@ -167,18 +745,17 @@ pub fn run_linear_staged_pass(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     prepared: &mut PreparedOutput,
-    client_elements: &[FlowRenderElement],
-    popup_elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
-    srgb_to_linear: &GlesTexProgram,
-    composite_linear_layer: &GlesTexProgram,
+    client_to_scene: &GlesTexProgram,
+    linear_to_srgb: &GlesTexProgram,
 ) -> Result<SyncPoint> {
-    // Staged passes rewrite the full offscreen each frame; partial damage leaves
-    // unscissored regions black on scanout when KMS presents with damage clips.
+    targets.encoded_scanout = false;
+    targets.encoded_hdr = false;
     prepared.frame_ctx.damage = vec![Rectangle::from_loc_and_size((0, 0), buffer_size)];
 
     targets.ensure_offscreen(renderer, buffer_size)?;
@@ -187,6 +764,8 @@ pub fn run_linear_staged_pass(
     let bg = state.theme.active_theme().background.color;
     let clear_color = Color32F::new(bg[0], bg[1], bg[2], bg[3]);
     let transparent = Color32F::new(0.0, 0.0, 0.0, 0.0);
+    let empty_clients: [FlowRenderElement; 0] = [];
+    let empty_popups: [FlowRenderElement; 0] = [];
 
     {
         let sdr = targets
@@ -205,20 +784,21 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &empty_clients,
+            &empty_popups,
             ui_state,
             scene,
             output_state,
             OutputRenderStage::Base,
             ClientCompositingMode::Sdr,
-            ChromeGlassPass::InBaseSdr,
+            ChromeGlassPass::Skip,
+            false,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
     }
 
-    {
+    let (client_elements, popup_elements) = {
         let linear = targets
             .linear_offscreen
             .as_mut()
@@ -226,6 +806,8 @@ pub fn run_linear_staged_pass(
         let mut target = renderer
             .bind(&mut linear.texture)
             .map_err(|e| anyhow!("bind linear SDR target: {e}"))?;
+        let client_elements = build_output_client_elements(state, renderer, output_id);
+        let popup_elements = build_output_popup_elements(state, renderer, output_id);
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin linear SDR frame: {e}"))?;
@@ -235,20 +817,37 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
+            ui_state,
+            scene,
+            output_state,
+            OutputRenderStage::LinearGlassUnderClients,
+            ClientCompositingMode::Sdr,
+            ChromeGlassPass::LinearUnderClients,
+            true,
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        draw_output_stage(
+            state,
+            &mut frame,
+            prepared,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,
             OutputRenderStage::Clients,
             ClientCompositingMode::Linear {
-                srgb_to_linear: srgb_to_linear.clone(),
+                client_to_scene: client_to_scene.clone(),
             },
             ChromeGlassPass::Skip,
+            true,
         )
         .map_err(|err| anyhow!("{err}"))?;
         let _sync = frame.finish()?;
-    }
+        (client_elements, popup_elements)
+    };
 
     {
         let linear_texture = targets.linear_offscreen.as_ref().unwrap().texture.clone();
@@ -256,16 +855,16 @@ pub fn run_linear_staged_pass(
             .offscreen
             .as_mut()
             .ok_or_else(|| anyhow!("SDR offscreen missing before composite"))?;
-        composite_linear_layer_onto_sdr(
+        composite_linear_layer_onto_sdr_srgb(
             renderer,
             &linear_texture,
             &mut sdr.texture,
             buffer_size,
-            composite_linear_layer,
+            linear_to_srgb,
         )?;
     }
 
-    {
+    let sync = {
         let sdr = targets
             .offscreen
             .as_mut()
@@ -280,18 +879,37 @@ pub fn run_linear_staged_pass(
             state,
             &mut frame,
             prepared,
-            client_elements,
-            popup_elements,
+            &client_elements,
+            &popup_elements,
             ui_state,
             scene,
             output_state,
             OutputRenderStage::Overlay,
             ClientCompositingMode::Sdr,
             ChromeGlassPass::Skip,
+            true,
         )
         .map_err(|err| anyhow!("{err}"))?;
-        frame.finish().map_err(Into::into)
-    }
+        draw_output_stage(
+            state,
+            &mut frame,
+            prepared,
+            &client_elements,
+            &popup_elements,
+            ui_state,
+            scene,
+            output_state,
+            OutputRenderStage::EguiOverlay,
+            ClientCompositingMode::Sdr,
+            ChromeGlassPass::Skip,
+            false,
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        frame
+            .finish()
+            .map_err(|e| anyhow!("finish SDR overlay frame: {e}"))?
+    };
+    finish_with_output_encode(state, renderer, targets, output_id, buffer_size, sync)
 }
 
 /// Render one output into the SDR offscreen target using the same linear/legacy path as scanout.
@@ -308,22 +926,22 @@ pub fn render_output_offscreen(
     dt: Duration,
     portal_capture: bool,
 ) -> Result<SyncPoint> {
-    let srgb_to_linear = state.render.chrome_shaders.srgb_to_linear.clone();
-    let composite_linear_layer = state.render.chrome_shaders.composite_linear_layer.clone();
+    let client_to_scene = state.render.chrome_shaders.client_to_scene_linear.clone();
+    let linear_to_srgb = state.render.chrome_shaders.linear_to_srgb.clone();
     let use_linear = use_linear_sdr_path(renderer, targets, buffer_size)
-        && srgb_to_linear.is_some()
-        && composite_linear_layer.is_some();
+        && client_to_scene.is_some()
+        && linear_to_srgb.is_some();
 
     if use_linear {
         if let Err(err) = targets.ensure_linear_offscreen(renderer, buffer_size) {
-            flog(&format!(
+            flog(format!(
                 "Linear SDR disabled for offscreen render after FP16 allocation failed: {err}"
             ));
         }
     }
 
-    let client_elements = build_output_client_elements(state, renderer, output_id);
-    let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    targets.ensure_offscreen(renderer, buffer_size)?;
+
     let mut prepared = prepare_output(
         state,
         renderer,
@@ -341,25 +959,23 @@ pub fn render_output_offscreen(
             state,
             renderer,
             targets,
+            output_id,
             buffer_size,
             &mut prepared,
-            &client_elements,
-            &popup_elements,
             ui_state,
             scene,
             output_state,
-            srgb_to_linear.as_ref().unwrap(),
-            composite_linear_layer.as_ref().unwrap(),
+            client_to_scene.as_ref().unwrap(),
+            linear_to_srgb.as_ref().unwrap(),
         )
     } else {
         run_sdr_pass(
             state,
             renderer,
             targets,
+            output_id,
             buffer_size,
             &prepared,
-            &client_elements,
-            &popup_elements,
             ui_state,
             scene,
             output_state,
@@ -371,38 +987,46 @@ pub fn run_sdr_pass(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     prepared: &PreparedOutput,
-    client_elements: &[FlowRenderElement],
-    popup_elements: &[FlowRenderElement],
     ui_state: &mut UiState<GlesTexture>,
     scene: &SceneState,
     output_state: &OutputState,
 ) -> Result<SyncPoint> {
+    targets.encoded_scanout = false;
+    targets.encoded_hdr = false;
     targets.ensure_offscreen(renderer, buffer_size)?;
 
-    let sdr = targets
-        .offscreen
-        .as_mut()
-        .ok_or_else(|| anyhow!("offscreen texture missing before draw"))?;
-    let mut target = renderer
-        .bind(&mut sdr.texture)
-        .map_err(|e| anyhow!("bind offscreen for draw: {e}"))?;
-    let mut frame = renderer
-        .render(&mut target, buffer_size, Transform::Normal)
-        .map_err(|e| anyhow!("begin offscreen frame: {e}"))?;
-    draw_output(
-        state,
-        &mut frame,
-        prepared,
-        client_elements,
-        popup_elements,
-        ui_state,
-        scene,
-        output_state,
-    )
-    .map_err(|err| anyhow!("{err}"))?;
-    frame.finish().map_err(Into::into)
+    let sync = {
+        let sdr = targets
+            .offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("offscreen texture missing before draw"))?;
+        let mut target = renderer
+            .bind(&mut sdr.texture)
+            .map_err(|e| anyhow!("bind offscreen for draw: {e}"))?;
+        let client_elements = build_output_client_elements(state, renderer, output_id);
+        let popup_elements = build_output_popup_elements(state, renderer, output_id);
+        let mut frame = renderer
+            .render(&mut target, buffer_size, Transform::Normal)
+            .map_err(|e| anyhow!("begin offscreen frame: {e}"))?;
+        draw_output(
+            state,
+            &mut frame,
+            prepared,
+            &client_elements,
+            &popup_elements,
+            ui_state,
+            scene,
+            output_state,
+        )
+        .map_err(|err| anyhow!("{err}"))?;
+        frame
+            .finish()
+            .map_err(|e| anyhow!("finish offscreen frame: {e}"))?
+    };
+    finish_with_output_encode(state, renderer, targets, output_id, buffer_size, sync)
 }
 
 pub fn present_offscreen_texture(

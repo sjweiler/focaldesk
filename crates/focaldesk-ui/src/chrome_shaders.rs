@@ -18,10 +18,27 @@ pub struct ChromeShaders {
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
     pub srgb_to_linear: Option<GlesTexProgram>,
+    pub client_to_scene_linear: Option<GlesTexProgram>,
     pub linear_to_srgb: Option<GlesTexProgram>,
     pub composite_linear_layer: Option<GlesTexProgram>,
+    /// Full-frame scene sRGB → monitor encode (C1b).
+    pub output_encode_sdr: Option<GlesTexProgram>,
+    /// Full-frame scene sRGB → monitor ICC LUT encode (C2c).
+    pub output_encode_lut: Option<GlesTexProgram>,
+    /// Scene sRGB → linear scRGB (HDR working space, C3).
+    pub sdr_to_linear_scrgb: Option<GlesTexProgram>,
+    /// Linear scRGB (nits) → PQ-encoded HDR (C3).
+    pub linear_scrgb_to_pq: Option<GlesTexProgram>,
     pub pulse: Option<GlesPixelProgram>,
     pub accent: Option<GlesPixelProgram>,
+    pub flow_field: Option<GlesPixelProgram>,
+    pub screensaver: Option<GlesPixelProgram>,
+}
+
+impl Default for ChromeShaders {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ChromeShaders {
@@ -38,10 +55,17 @@ impl ChromeShaders {
             rounded_rect: None,
             wallpaper_tint: None,
             srgb_to_linear: None,
+            client_to_scene_linear: None,
             linear_to_srgb: None,
             composite_linear_layer: None,
+            output_encode_sdr: None,
+            output_encode_lut: None,
+            sdr_to_linear_scrgb: None,
+            linear_scrgb_to_pq: None,
             pulse: None,
             accent: None,
+            flow_field: None,
+            screensaver: None,
         }
     }
 
@@ -67,7 +91,7 @@ impl ChromeShaders {
                     self.beveled_panel = Some(program);
                 }
                 Err(e) => {
-                    flog(&format!("beveled_panel compile failed: {:?}", e));
+                    flog(format!("beveled_panel compile failed: {:?}", e));
                     flog("==== BEVELED_PANEL_FRAG V2 ====");
                     flog(BEVELED_PANEL_FRAG_V2);
                     return Err(e);
@@ -139,7 +163,10 @@ impl ChromeShaders {
         if self.wallpaper_tint.is_none() {
             self.wallpaper_tint = Some(renderer.compile_custom_texture_shader(
                 WALLPAPER_TINT_FRAG,
-                &[UniformName::new("u_tint", UniformType::_4f)],
+                &[
+                    UniformName::new("u_tint", UniformType::_4f),
+                    UniformName::new("u_decode_srgb", UniformType::_1f),
+                ],
             )?);
         }
 
@@ -148,14 +175,80 @@ impl ChromeShaders {
                 Some(renderer.compile_custom_texture_shader(SRGB_TO_LINEAR_FRAG, &[])?);
         }
 
+        if self.client_to_scene_linear.is_none() {
+            self.client_to_scene_linear = Some(renderer.compile_custom_texture_shader(
+                CLIENT_TO_SCENE_LINEAR_FRAG,
+                &[
+                    UniformName::new("u_decode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
+        }
+
         if self.linear_to_srgb.is_none() {
             self.linear_to_srgb =
                 Some(renderer.compile_custom_texture_shader(LINEAR_TO_SRGB_FRAG, &[])?);
         }
 
         if self.composite_linear_layer.is_none() {
-            self.composite_linear_layer =
-                Some(renderer.compile_custom_texture_shader(COMPOSITE_LINEAR_LAYER_FRAG, &[])?);
+            self.composite_linear_layer = Some(renderer.compile_custom_texture_shader(
+                COMPOSITE_LINEAR_LAYER_FRAG,
+                &[
+                    UniformName::new("u_encode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
+        }
+
+        if self.output_encode_sdr.is_none() {
+            self.output_encode_sdr = Some(renderer.compile_custom_texture_shader(
+                OUTPUT_ENCODE_SDR_FRAG,
+                &[
+                    UniformName::new("u_encode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
+        }
+
+        if self.output_encode_lut.is_none() {
+            match renderer.compile_custom_texture_shader(
+                OUTPUT_ENCODE_LUT_FRAG,
+                &[
+                    UniformName::new("u_lut_tex", UniformType::_1i),
+                    UniformName::new("u_grid", UniformType::_1f),
+                ],
+            ) {
+                Ok(program) => {
+                    focaldesk_logging::flog_info!("output_encode_lut shader compiled OK");
+                    self.output_encode_lut = Some(program);
+                }
+                Err(err) => {
+                    focaldesk_logging::flog_warn!(
+                        "startup: output_encode_lut shader compile failed; disabling ICC LUT output encode for this session and falling back to parametric encode: {:?}",
+                        err
+                    );
+                }
+            }
+        }
+
+        if self.sdr_to_linear_scrgb.is_none() {
+            self.sdr_to_linear_scrgb = Some(renderer.compile_custom_texture_shader(
+                SDR_TO_LINEAR_SCRGB_FRAG,
+                &[UniformName::new("u_sdr_white_nits", UniformType::_1f)],
+            )?);
+        }
+
+        if self.linear_scrgb_to_pq.is_none() {
+            self.linear_scrgb_to_pq = Some(renderer.compile_custom_texture_shader(
+                LINEAR_SCRGB_TO_PQ_FRAG,
+                &[UniformName::new("u_max_nits", UniformType::_1f)],
+            )?);
         }
 
         if self.amber_lightbar.is_none() {
@@ -223,12 +316,36 @@ impl ChromeShaders {
                     self.accent = Some(program);
                 }
                 Err(err) => {
-                    flog(&format!(
+                    flog(format!(
                         "accent shader compile failed; disabling active-output glow: {:?}",
                         err
                     ));
                 }
             }
+        }
+
+        if self.flow_field.is_none() {
+            self.flow_field = Some(renderer.compile_custom_pixel_shader(
+                FLOW_FIELD_FRAG,
+                &[
+                    UniformName::new("u_resolution", UniformType::_2f),
+                    UniformName::new("u_rect", UniformType::_4f),
+                    UniformName::new("u_time", UniformType::_1f),
+                    UniformName::new("u_mode", UniformType::_1f),
+                    UniformName::new("u_energy", UniformType::_1f),
+                    UniformName::new("u_color", UniformType::_4f),
+                ],
+            )?);
+        }
+
+        if self.screensaver.is_none() {
+            self.screensaver = Some(renderer.compile_custom_pixel_shader(
+                SCREENSAVER_FRAG,
+                &[
+                    UniformName::new("u_resolution", UniformType::_2f),
+                    UniformName::new("u_time", UniformType::_1f),
+                ],
+            )?);
         }
 
         Ok(())
@@ -773,6 +890,76 @@ void main() {
 }
 "#;
 
+const CLIENT_TO_SCENE_LINEAR_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : enable
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_decode_tf;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 gamma22_to_linear(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(2.2));
+}
+
+vec3 decode_color(vec3 c) {
+    if (u_decode_tf < 0.5) {
+        return srgb_to_linear(c);
+    }
+    if (u_decode_tf < 1.5) {
+        return c;
+    }
+    return gamma22_to_linear(c);
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    if (src.a < 0.0001) {
+        discard;
+    }
+    vec3 straight = src.rgb / src.a;
+    // ExtLinear (wp_color wide gamut): preserve scRGB headroom above 1.0 in the FP16 scene.
+    bool extended_linear = u_decode_tf >= 0.5 && u_decode_tf < 1.5;
+    if (extended_linear) {
+        straight = max(straight, vec3(0.0));
+    } else {
+        straight = clamp(straight, 0.0, 1.0);
+    }
+    vec3 linear = mul_mat3(decode_color(straight));
+    gl_FragColor = vec4(linear * src.a, src.a) * alpha;
+}
+"#;
+
 const SRGB_TO_LINEAR_FRAG: &str = r#"
 //_DEFINES_
 
@@ -825,12 +1012,34 @@ precision highp float;
 
 varying vec2 v_coords;
 uniform float alpha;
+uniform float u_encode_tf;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
 
 vec3 linear_to_srgb(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
     vec3 low = c * 12.92;
     vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
     return mix(high, low, vec3(cutoff));
+}
+
+vec3 linear_to_gamma22(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+vec3 encode_color(vec3 c) {
+    if (u_encode_tf < 0.5) {
+        return linear_to_srgb(c);
+    }
+    if (u_encode_tf < 1.5) {
+        return c;
+    }
+    return linear_to_gamma22(c);
 }
 
 void main() {
@@ -842,7 +1051,217 @@ void main() {
         discard;
     }
     vec3 straight = src.rgb / src.a;
-    gl_FragColor = vec4(linear_to_srgb(straight) * src.a, src.a) * alpha;
+    vec3 encoded = encode_color(mul_mat3(straight));
+    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+}
+"#;
+
+/// Scene-linear Rec.709 sRGB framebuffer → monitor primaries + transfer.
+const OUTPUT_ENCODE_SDR_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_encode_tf;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
+    vec3 low = c * 12.92;
+    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 linear_to_gamma22(vec3 c) {
+    return pow(max(c, vec3(0.0)), vec3(1.0 / 2.2));
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+vec3 encode_color(vec3 c) {
+    if (u_encode_tf < 0.5) {
+        return linear_to_srgb(c);
+    }
+    if (u_encode_tf < 1.5) {
+        return c;
+    }
+    return linear_to_gamma22(c);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
+    vec3 encoded = encode_color(mul_mat3(srgb_to_linear(straight)));
+    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+}
+"#;
+
+/// Scene sRGB framebuffer → monitor ICC LUT (2D atlas, trilinear).
+/// Always `sampler2D tex` — this pass only reads offscreen FBOs, never EGL external textures.
+/// Smithay may define EXTERNAL for custom texture shaders; using samplerExternalOES here breaks
+/// on NVIDIA GLES (C7531) when combined with the second sampler2D LUT atlas.
+const OUTPUT_ENCODE_LUT_FRAG: &str = r#"
+//_DEFINES_
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+uniform sampler2D tex;
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform sampler2D u_lut_tex;
+uniform float u_grid;
+
+vec3 lut_sample_at(vec3 cell) {
+    float n = u_grid;
+    // Explicitly clamp cell bounds to prevent NVIDIA hardware filtering artifacts at edges
+    vec3 clamped_cell = clamp(cell, 0.0, n - 1.0);
+    vec2 uv = vec2((clamped_cell.y * n + clamped_cell.x + 0.5) / (n * n), (clamped_cell.z + 0.5) / n);
+    return texture2D(u_lut_tex, uv).rgb;
+}
+
+vec3 lut_lookup(vec3 c) {
+    float n = u_grid;
+    vec3 x = clamp(c, 0.0, 1.0) * (n - 1.0);
+    
+    // Improved rounding safety for NVIDIA compiler optimization passes
+    vec3 i0 = clamp(floor(x + 1e-5), 0.0, n - 1.0);
+    vec3 f = clamp(x - i0, 0.0, 1.0);
+    vec3 i1 = min(i0 + 1.0, vec3(n - 1.0));
+
+    vec3 c000 = lut_sample_at(vec3(i0.x, i0.y, i0.z));
+    vec3 c100 = lut_sample_at(vec3(i1.x, i0.y, i0.z));
+    vec3 c010 = lut_sample_at(vec3(i0.x, i1.y, i0.z));
+    vec3 c110 = lut_sample_at(vec3(i1.x, i1.y, i0.z));
+    vec3 c001 = lut_sample_at(vec3(i0.x, i0.y, i1.z));
+    vec3 c101 = lut_sample_at(vec3(i1.x, i0.y, i1.z));
+    vec3 c011 = lut_sample_at(vec3(i0.x, i1.y, i1.z));
+    vec3 c111 = lut_sample_at(vec3(i1.x, i1.y, i1.z));
+
+    vec3 c00 = mix(c000, c100, f.x);
+    vec3 c10 = mix(c010, c110, f.x);
+    vec3 c01 = mix(c001, c101, f.x);
+    vec3 c11 = mix(c011, c111, f.x);
+    vec3 c0 = mix(c00, c10, f.y);
+    vec3 c1 = mix(c01, c11, f.y);
+    return mix(c0, c1, f.z);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    // Guard against division-by-zero or NaN injection 
+    vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
+    vec3 encoded = lut_lookup(straight);
+    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+}
+"#;
+/// Scene sRGB → linear scRGB extended (nits above reference white).
+const SDR_TO_LINEAR_SCRGB_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_sdr_white_nits;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
+    vec3 linear = srgb_to_linear(straight);
+    vec3 scrgb = linear * (u_sdr_white_nits / 80.0);
+    gl_FragColor = vec4(scrgb * src.a, src.a) * alpha;
+}
+"#;
+
+/// Linear scRGB (nits) → SMPTE ST 2084 PQ (0–1 electrical).
+const LINEAR_SCRGB_TO_PQ_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_max_nits;
+
+float pq_oetf(float nits) {
+    float L = max(nits, 0.0) / 10000.0;
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    float Lm = pow(L, m1);
+    return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 nits = src.a > 0.0001 ? max(src.rgb / src.a, vec3(0.0)) : max(src.rgb, vec3(0.0));
+    nits = min(nits, vec3(u_max_nits));
+    vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
+    gl_FragColor = vec4(pq * src.a, src.a) * alpha;
 }
 "#;
 
@@ -999,15 +1418,28 @@ precision mediump float;
 
 uniform sampler2D tex;
 uniform vec4 u_tint;
+uniform float u_decode_srgb;
 
 varying vec2 v_coords;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
 
 void main() {
     vec4 src = texture2D(tex, v_coords);
 
-    vec3 rgb = mix(src.rgb, u_tint.rgb, u_tint.a);
+    vec3 src_rgb = src.rgb;
+    if (u_decode_srgb > 0.5) {
+        src_rgb = srgb_to_linear(src.rgb);
+    }
 
-    gl_FragColor = vec4(rgb, src.a);
+    vec3 rgb = mix(src_rgb, u_tint.rgb, u_tint.a);
+
+    gl_FragColor = vec4(rgb * src.a, src.a);
 }
 "#;
 
@@ -1074,6 +1506,302 @@ void main() {
         );
 
     float out_alpha = alpha * u_accent.a;
-    gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
+gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
+}
+"#;
+
+const FLOW_FIELD_FRAG: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform vec2  u_resolution;
+uniform vec4  u_rect;
+uniform float u_time;
+uniform float u_mode;
+uniform float u_energy;
+uniform vec4  u_color;
+
+varying vec2 v_coords;
+
+float hash11(float n) {
+    return fract(sin(n) * 43758.5453123);
+}
+
+vec2 hash21(float n) {
+    return vec2(hash11(n), hash11(n + 19.19));
+}
+
+float mode_energy(float mode) {
+    if (mode < 0.5) {
+        return 0.30;
+    } else if (mode < 1.5) {
+        return 1.00;
+    } else if (mode < 2.5) {
+        return 0.90;
+    } else if (mode < 3.5) {
+        return 0.96;
+    }
+    return 1.00;
+}
+
+float motion_amp_for_mode(float mode) {
+    if (mode < 0.5) {
+        return 0.92;
+    } else if (mode < 1.5) {
+        return 1.42;
+    } else if (mode < 2.5) {
+        return 1.18;
+    } else if (mode < 3.5) {
+        return 1.48;
+    }
+    return 1.72;
+}
+
+float particle_count_for_mode(float mode) {
+    if (mode < 0.5) {
+        return 40.0;
+    } else if (mode < 1.5) {
+        return 72.0;
+    } else if (mode < 2.5) {
+        return 60.0;
+    } else if (mode < 3.5) {
+        return 54.0;
+    }
+    return 48.0;
+}
+
+vec3 mode_tint(float mode) {
+    if (mode < 0.5) {
+        return vec3(0.40, 0.62, 1.00);
+    } else if (mode < 1.5) {
+        return vec3(0.55, 0.95, 1.00);
+    } else if (mode < 2.5) {
+        return vec3(0.44, 1.00, 0.80);
+    } else if (mode < 3.5) {
+        return vec3(1.00, 0.74, 0.20);
+    }
+    return vec3(1.00, 0.30, 0.30);
+}
+
+float pulse(float t, float freq) {
+    return 0.5 + 0.5 * sin(t * freq);
+}
+
+void main() {
+    // Pixel shader is drawn into the flow-field quad only; v_coords are local 0..1.
+    vec2 size = max(u_rect.zw, vec2(1.0));
+    vec2 local = v_coords * size;
+
+    float mode = floor(u_mode + 0.5);
+    float energy = clamp(u_energy, 0.0, 1.0) * mode_energy(mode);
+    float count = particle_count_for_mode(mode);
+    float motion_amp = motion_amp_for_mode(mode);
+    float speed = mix(0.03, 0.20, energy);
+    float glow = mix(0.20, 0.94, energy) * mix(0.84, 1.18, motion_amp);
+    vec3 tint = mode_tint(mode) * u_color.rgb;
+
+    vec3 accum = vec3(0.0);
+    float center_y = size.y * 0.5;
+    float center_x = size.x * 0.5;
+
+    const int PARTICLES = 48;
+    for (int i = 0; i < PARTICLES; ++i) {
+        float fi = float(i);
+        float enabled = step(fi, count - 1.0);
+        vec2 seed = hash21(fi * 13.37 + mode * 61.7);
+        float phase = fract(seed.x + u_time * speed + fi * 0.013);
+
+        float x = 0.5;
+        float y = 0.5;
+        float core_scale = 1.0;
+        float trail = 0.0;
+        float bloom = 0.0;
+        float fracture = 0.0;
+
+        if (mode < 0.5) {
+            float orbit = u_time * 0.28 + fi * 0.37 + seed.x * 6.28318;
+            x = mix(0.10, 0.90, fract(seed.x + u_time * 0.018 + fi * 0.004))
+                + sin(orbit) * 0.020 * motion_amp;
+            y = 0.20 + 0.58 * seed.y + cos(orbit * 1.27) * 0.035 * motion_amp;
+            core_scale = 1.06;
+            bloom = pulse(u_time * 0.38 + seed.x * 2.0, 0.9) * 0.85;
+        } else if (mode < 1.5) {
+            x = mix(-0.14, 1.12, phase);
+            y = 0.24 + 0.54 * seed.y
+                + sin(u_time * (0.95 + seed.x * 0.55) + fi * 0.31) * 0.05 * motion_amp;
+            trail = smoothstep(-18.0, 14.0, (x - 0.5) * size.x)
+                * (1.0 - abs(seed.y - 0.5) * 1.4);
+            core_scale = 0.92;
+        } else if (mode < 2.5) {
+            float orbit = u_time * 1.55 + fi * 0.63 + seed.x * 5.2;
+            x = 0.5 + (seed.x - 0.5) * 0.18 + cos(orbit) * 0.035 * motion_amp;
+            y = 0.5 + (seed.y - 0.5) * 0.16 + sin(orbit * 1.2) * 0.045 * motion_amp;
+            bloom = 1.0 - smoothstep(0.0, 1.0, abs(y - 0.5) * 2.4);
+            core_scale = 1.10;
+        } else if (mode < 3.5) {
+            float rise = pulse(u_time * 2.4 + seed.x * 7.0, 1.0);
+            x = mix(0.18, 0.82, fract(seed.x + u_time * 0.06 + fi * 0.01));
+            y = 0.50 + (seed.y - 0.5) * 0.14 + (rise - 0.5) * 0.18 * motion_amp;
+            bloom = 1.0 - smoothstep(0.0, 1.0, abs((y - 0.5) / 0.18));
+            core_scale = 0.98;
+        } else {
+            float jitter = hash11(fi * 9.3 + floor(u_time * 18.0));
+            float shard = step(0.42, jitter);
+            x = mix(-0.08, 1.08, fract(seed.x + u_time * 0.10 + fi * 0.017));
+            y = 0.20 + 0.60 * seed.y
+                + sign(seed.x - 0.5) * 0.05
+                + sin(u_time * (2.6 + seed.y) + fi * 0.91) * 0.06 * motion_amp;
+            fracture = shard * (0.45 + 0.55 * step(0.68, hash11(fi * 5.7 + floor(u_time * 10.0))));
+            trail = step(0.12, fract(seed.y + u_time * 0.25)) * 0.5;
+            core_scale = 0.88;
+        }
+
+        vec2 particle = vec2(x * size.x, y * size.y);
+        vec2 delta = local - particle;
+        float dist = length(delta);
+
+        float core = exp(-(dist * dist) / (mix(170.0, 56.0, energy) * core_scale));
+        float streak = exp(-abs(delta.y) / mix(11.0, 3.8, energy))
+            * smoothstep(-18.0, 20.0, delta.x)
+            * trail;
+        float ring = exp(-pow((dist - size.y * 0.16) / max(size.y * 0.12, 1.0), 2.0));
+        float drift = (0.12 + 0.08 * sin(u_time * 0.18 + fi * 0.4)) * motion_amp;
+        float flicker = 0.70 + 0.30 * hash11(fi * 3.7 + floor(u_time * (10.0 + motion_amp * 4.0)));
+        float edge_shard = step(0.52, hash11(fi * 4.4 + floor(u_time * 14.0)));
+
+        if (mode < 0.5) {
+            float orbit_glow = 0.50 + 0.50 * sin(u_time * 0.65 + fi * 0.33);
+            accum += tint * enabled * vec3(core * 0.72 + ring * 0.14 + orbit_glow * 0.025 + bloom * 0.03);
+        } else if (mode < 1.5) {
+            accum += tint * enabled * vec3(core * 0.82 + streak * 1.85 + drift * 0.02);
+        } else if (mode < 2.5) {
+            accum += tint * enabled * vec3(core * 0.68 + ring * 0.98 + bloom * 0.20);
+        } else if (mode < 3.5) {
+            float pulse_ring = 1.0 - smoothstep(0.0, 0.12 * size.y, abs(dist - size.y * 0.10));
+            float pulse_flash = pulse(u_time * 2.2 + seed.x * 5.0, 1.0);
+            accum += tint * enabled * vec3(core * 0.34 + ring * 1.24 + pulse_ring * pulse_flash * 0.54);
+        } else {
+            accum += tint * enabled * vec3(
+                core * (0.62 + 0.64 * flicker) +
+                streak * (0.80 + 0.88 * edge_shard) +
+                fracture * 0.58 +
+                drift * 0.02
+            );
+        }
+    }
+
+    float density = clamp(dot(accum, vec3(0.3333)), 0.0, 1.0);
+    float normalized_x = local.x / max(size.x, 1.0);
+    float normalized_y = local.y / max(size.y, 1.0);
+    float wave = 0.5 + 0.5 * sin(normalized_x * 8.0 - u_time * 2.2 + normalized_y * 2.6);
+    float ripple = exp(-pow((normalized_y - 0.5 - 0.14 * sin(u_time * 0.85)) / 0.22, 2.0));
+    float edge = 1.0 - smoothstep(0.0, 10.0, min(min(local.x, local.y), min(size.x - local.x, size.y - local.y)));
+    float alpha = clamp(density * glow * 1.45 + edge * 0.18 + wave * ripple * 0.22, 0.0, 1.0) * u_color.a;
+
+    gl_FragColor = vec4(tint * (alpha + wave * ripple * 0.18), alpha);
+}
+"#;
+
+const SCREENSAVER_FRAG: &str = r#"
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+
+uniform vec2 u_resolution;
+uniform float u_time;
+
+float hash11(float p) {
+    return fract(sin(p) * 43758.5453123);
+}
+
+float hash21(vec2 p) {
+    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+vec2 hash22(vec2 p) {
+    float n = dot(p, vec2(127.1, 311.7));
+    return fract(sin(vec2(n, n + 19.19)) * 43758.5453123);
+}
+
+vec3 palette(float t) {
+    vec3 a = vec3(0.02, 0.04, 0.08);
+    vec3 b = vec3(0.12, 0.18, 0.34);
+    vec3 c = vec3(0.88, 0.72, 0.52);
+    vec3 d = vec3(0.18, 0.32, 0.56);
+    return a + b * cos(6.28318 * (c * t + d));
+}
+
+void main() {
+    vec2 uv = v_coords;
+    vec2 aspect = vec2(u_resolution.x / max(u_resolution.y, 1.0), 1.0);
+    vec2 p = (uv - 0.5) * aspect;
+
+    float t = u_time;
+    vec2 drift = vec2(
+        0.19 * sin(t * 0.17) + 0.05 * sin(t * 0.73),
+        0.14 * cos(t * 0.13) + 0.05 * cos(t * 0.61)
+    );
+    vec2 center = drift;
+    vec2 to_center = p - center;
+    float dist = length(to_center);
+    float angle = atan(to_center.y, to_center.x);
+
+    // Background nebula gradient.
+    float nebula = 0.18 + 0.14 * sin(t * 0.05 + uv.x * 4.0 + uv.y * 2.0);
+    vec3 color = vec3(0.01, 0.015, 0.03) + palette(nebula) * 0.12;
+
+    // Starfield: three parallax layers with different cell sizes and twinkle rates.
+    for (int layer = 0; layer < 3; ++layer) {
+        float lf = float(layer);
+        float cell = mix(0.085, 0.22, lf / 2.0);
+        vec2 grid = floor((uv + vec2(t * 0.0015 * (lf + 1.0), t * 0.0010 * (lf + 1.0))) / cell);
+        vec2 rnd = hash22(grid + lf * 31.7);
+        vec2 star_pos = (grid + rnd) * cell;
+        vec2 delta = uv - star_pos;
+        float twinkle = 0.55 + 0.45 * sin(t * (1.6 + lf * 0.7) + hash21(grid) * 6.28318);
+        float radius = mix(0.002, 0.0055, lf / 2.0);
+        float star = exp(-dot(delta, delta) / (radius * radius));
+        float hue = hash21(grid + 8.3);
+        vec3 star_color = mix(vec3(0.78, 0.88, 1.0), vec3(1.0, 0.84, 0.58), hue);
+        color += star_color * star * twinkle * (1.05 - 0.2 * lf);
+    }
+
+    // Gravitational lensing around the black hole.
+    float lens = 0.022 / max(dist * dist, 0.010);
+    vec2 warped = p + normalize(to_center + vec2(1e-4)) * lens * 0.06;
+    float warped_dist = length(warped - center);
+    float hole = smoothstep(0.030, 0.0, warped_dist);
+
+    // Accretion disk: tilted ring with turbulence.
+    float disk_r = 0.17 + 0.01 * sin(t * 0.33);
+    float disk_width = 0.035;
+    float ring = exp(-pow((warped_dist - disk_r) / disk_width, 2.0));
+    float spokes = 0.55 + 0.45 * sin(angle * 10.0 - t * 2.8 + warped_dist * 26.0);
+    float turbulence = 0.7 + 0.3 * sin(warped_dist * 64.0 + t * 6.0);
+    vec3 disk_color = mix(vec3(0.95, 0.62, 0.18), vec3(0.42, 0.18, 0.82), 0.32 + 0.68 * hash11(floor(t)));
+    color += disk_color * ring * spokes * turbulence * 1.15;
+
+    // A smaller trailing wake gives the whole thing some motion even when the ring is centered.
+    float wake = exp(-pow((warped_dist - 0.245) / 0.085, 2.0));
+    wake *= 0.5 + 0.5 * sin(angle * 6.0 + t * 1.4);
+    color += vec3(0.18, 0.35, 0.75) * wake * 0.20;
+
+    // Event horizon and vignette.
+    color *= 1.0 - hole * 0.94;
+    float vignette = smoothstep(1.12, 0.22, length(p));
+    color *= vignette;
+
+    // Tiny motion along the neighborhood path so the center never sits still.
+    vec2 neighborhood = vec2(
+        0.05 * sin(t * 0.47 + 1.4),
+        0.03 * cos(t * 0.39 + 0.6)
+    );
+    float neighborhood_pull = exp(-pow(length(p - neighborhood) / 0.28, 2.0));
+    color += vec3(0.10, 0.12, 0.18) * neighborhood_pull * 0.12;
+
+    gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }
 "#;

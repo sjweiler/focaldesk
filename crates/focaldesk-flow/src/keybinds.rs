@@ -78,6 +78,14 @@ impl Keybinds {
 
         self.map.insert(
             KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_v,
+            },
+            KeyAction::ToggleClipboardHistory,
+        );
+
+        self.map.insert(
+            KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
                 sym: keysyms::KEY_q,
             },
@@ -277,14 +285,6 @@ impl Keybinds {
                 sym: keysyms::KEY_space,
             },
             KeyAction::ToggleLauncher,
-        );
-
-        self.map.insert(
-            KeyCombo {
-                mods: ModMask::empty(),
-                sym: keysyms::KEY_Escape,
-            },
-            KeyAction::ForceExit,
         );
 
         self.map.insert(

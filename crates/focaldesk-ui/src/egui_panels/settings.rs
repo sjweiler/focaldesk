@@ -1,9 +1,19 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
-use focaldesk_config::{FocalDeskConfig, save_config};
+use focaldesk_ai::{AiPermissionRecord, list_ai_permission_records, revoke_ai_permission};
+use focaldesk_config::{FocalDeskConfig, load_config, save_config};
+use focaldesk_ipc::{PowerIpcRequest, PowerIpcResponse, send_power_request};
+use focaldesk_permissions::request::PermissionTarget;
+use focaldesk_permissions::{PermissionDecision, PermissionScope};
+use focaldesk_power::{LOW_BATTERY_THRESHOLD_PERCENT, PowerSnapshot};
+use focaldesk_settings_core::{
+    LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, PowerSettings,
+    load_settings, save_settings,
+};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn sidebar_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
     let fill = if selected {
@@ -338,6 +348,66 @@ fn bluetooth_powered() -> Result<bool, String> {
     Ok(bluetooth_info_value(&output, "Powered"))
 }
 
+fn fetch_power_snapshot() -> Result<PowerSnapshot, String> {
+    match send_power_request(&PowerIpcRequest::GetSnapshot) {
+        Ok(PowerIpcResponse::PowerSnapshot { snapshot }) => Ok(snapshot),
+        Ok(PowerIpcResponse::Error { message }) => {
+            if running_in_desktop_process() {
+                Ok(focaldesk_power::PowerManager::new().snapshot())
+            } else {
+                Err(message)
+            }
+        }
+        Ok(other) => Err(format!("unexpected power IPC response: {other:?}")),
+        Err(_err) if running_in_desktop_process() => {
+            Ok(focaldesk_power::PowerManager::new().snapshot())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn running_in_desktop_process() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| matches!(name, "focaldesk-desktop" | "focaldesk-server"))
+        })
+        .unwrap_or(false)
+}
+
+fn snapshot_age_label(snapshot: &PowerSnapshot) -> String {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(snapshot.captured_at_unix_ms);
+    let age_ms = now_ms.saturating_sub(snapshot.captured_at_unix_ms);
+
+    if age_ms < 1_000 {
+        format!("{age_ms} ms old")
+    } else {
+        let seconds = age_ms as f64 / 1_000.0;
+        format!("{seconds:.1} s old")
+    }
+}
+
+fn snapshot_age_color(snapshot: &PowerSnapshot) -> egui::Color32 {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(snapshot.captured_at_unix_ms);
+    let age_ms = now_ms.saturating_sub(snapshot.captured_at_unix_ms);
+
+    if age_ms < 3_000 {
+        egui::Color32::from_rgb(120, 200, 255)
+    } else if age_ms < 10_000 {
+        egui::Color32::from_rgb(230, 180, 80)
+    } else {
+        egui::Color32::from_rgb(230, 90, 90)
+    }
+}
+
 fn parse_bluetooth_devices(output: &str, paired: bool) -> Vec<BluetoothDevice> {
     output
         .lines()
@@ -398,13 +468,18 @@ fn load_bluetooth_devices() -> Result<Vec<BluetoothDevice>, String> {
 
 pub struct SettingsPanel {
     pub open: bool,
+    was_open: bool,
     tab: SettingsPage,
     config: FocalDeskConfig,
+    power: PowerSettings,
     wifi_passwords: HashMap<String, String>,
     network_status: String,
     bluetooth_status: String,
     bluetooth_scanning: bool,
+    ai_permissions_status: String,
     debug_status: String,
+    last_power_status_poll_at: Instant,
+    last_power_snapshot: Option<PowerSnapshot>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -416,6 +491,7 @@ enum SettingsPage {
     Workspaces,
     Keyboard,
     Privacy,
+    AiPermissions,
     Power,
     Debug,
     About,
@@ -423,20 +499,62 @@ enum SettingsPage {
 
 impl Default for SettingsPanel {
     fn default() -> Self {
+        let settings = load_settings();
         Self {
             tab: SettingsPage::Appearance,
-            config: FocalDeskConfig::default(),
+            was_open: false,
+            config: load_config(),
+            power: settings.power,
             wifi_passwords: HashMap::new(),
             network_status: String::new(),
             bluetooth_status: String::new(),
             bluetooth_scanning: false,
+            ai_permissions_status: String::new(),
             debug_status: "Diagnostics are generated locally".to_string(),
+            last_power_status_poll_at: Instant::now() - Duration::from_secs(2),
+            last_power_snapshot: None,
             open: false,
         }
     }
 }
 
 impl SettingsPanel {
+    pub fn open_displays(&mut self) {
+        self.tab = SettingsPage::Displays;
+        self.open = true;
+    }
+
+    pub fn open_workspaces(&mut self) {
+        self.tab = SettingsPage::Workspaces;
+        self.open = true;
+    }
+
+    fn reload_from_disk(&mut self) {
+        self.config = load_config();
+        self.power = load_settings().power;
+        self.network_status.clear();
+        self.bluetooth_status.clear();
+        self.ai_permissions_status.clear();
+        self.debug_status = "Diagnostics are generated locally".to_string();
+        self.last_power_status_poll_at = Instant::now() - Duration::from_secs(2);
+        self.last_power_snapshot = None;
+    }
+
+    fn refresh_power_status_if_needed(&mut self) {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_power_status_poll_at) < Duration::from_secs(2) {
+            return;
+        }
+
+        self.last_power_status_poll_at = now;
+        self.last_power_snapshot = fetch_power_snapshot().ok();
+    }
+
+    pub(crate) fn refresh_power_status_now(&mut self) {
+        self.last_power_status_poll_at = Instant::now();
+        self.last_power_snapshot = fetch_power_snapshot().ok();
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         ui.heading("Settings");
         ui.separator();
@@ -468,6 +586,16 @@ impl SettingsPanel {
 
         if sidebar_button(ui, "Privacy", self.tab == SettingsPage::Privacy).clicked() {
             self.tab = SettingsPage::Privacy;
+        }
+
+        if sidebar_button(
+            ui,
+            "AI Permissions",
+            self.tab == SettingsPage::AiPermissions,
+        )
+        .clicked()
+        {
+            self.tab = SettingsPage::AiPermissions;
         }
 
         if sidebar_button(ui, "Power", self.tab == SettingsPage::Power).clicked() {
@@ -790,6 +918,262 @@ impl SettingsPanel {
         }
     }
 
+    fn power_page(&mut self, ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
+        ui.heading("Power");
+        ui.add_space(8.0);
+
+        ui.label("Changes are saved immediately.");
+        ui.add_space(8.0);
+
+        ui.group(|ui| {
+            ui.heading("Status");
+            ui.add_space(4.0);
+            ui.label(format!(
+                "Configured performance mode: {}",
+                performance_mode_label(self.power.performance_mode)
+            ));
+            self.refresh_power_status_if_needed();
+            match self.last_power_snapshot.as_ref() {
+                Some(snapshot) => {
+                    let active_profile = snapshot
+                        .performance_profile
+                        .as_deref()
+                        .filter(|profile| !profile.is_empty());
+                    match active_profile {
+                        Some(profile) => {
+                            let active_label = match profile {
+                                "balanced" => "Balanced",
+                                "performance" => "Performance",
+                                "power-saver" | "powersaver" => "Power saver",
+                                other => other,
+                            };
+                            ui.label(format!("Active performance profile: {active_label}"));
+                            if profile != performance_mode_profile_name(self.power.performance_mode)
+                            {
+                                ui.label("System profile differs from the configured target.");
+                            }
+                        }
+                        None => {
+                            ui.label("Active performance profile: unknown");
+                        }
+                    }
+
+                    match snapshot.line_power_online {
+                        Some(true) => ui.label("AC power: connected"),
+                        Some(false) => ui.label("AC power: disconnected"),
+                        None => ui.label("AC power: unknown"),
+                    };
+                    ui.colored_label(
+                        snapshot_age_color(snapshot),
+                        format!("Snapshot age: {}", snapshot_age_label(snapshot)),
+                    );
+
+                    if snapshot.batteries.is_empty() {
+                        ui.label("Battery: none detected");
+                    } else {
+                        for battery in &snapshot.batteries {
+                            let is_low = battery
+                                .percentage
+                                .is_some_and(|value| value <= LOW_BATTERY_THRESHOLD_PERCENT);
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(&battery.name);
+                                    ui.add_space(8.0);
+                                    ui.colored_label(
+                                        if is_low {
+                                            egui::Color32::from_rgb(230, 90, 90)
+                                        } else {
+                                            battery_state_color(battery.state.as_deref())
+                                        },
+                                        battery_state_label(battery.state.as_deref()),
+                                    );
+                                    ui.add_space(8.0);
+                                    if is_low {
+                                        ui.colored_label(
+                                            egui::Color32::from_rgb(230, 90, 90),
+                                            "Low",
+                                        );
+                                        ui.add_space(4.0);
+                                    }
+                                    ui.label(
+                                        battery
+                                            .percentage
+                                            .map(|value| format!("{value}%"))
+                                            .unwrap_or_else(|| "unknown".to_string()),
+                                    );
+                                });
+
+                                if let Some(percentage) = battery.percentage {
+                                    let fill = (percentage as f32 / 100.0).clamp(0.0, 1.0);
+                                    ui.add(
+                                        egui::ProgressBar::new(fill)
+                                            .fill(if is_low {
+                                                egui::Color32::from_rgb(230, 90, 90)
+                                            } else {
+                                                battery_state_color(battery.state.as_deref())
+                                            })
+                                            .desired_width(220.0)
+                                            .show_percentage(),
+                                    );
+                                } else {
+                                    ui.label("No percentage reported");
+                                }
+                            });
+                        }
+                    }
+
+                    if snapshot.is_low_battery(LOW_BATTERY_THRESHOLD_PERCENT) {
+                        ui.label("Battery warning: low");
+                    }
+
+                    ui.add_space(4.0);
+                    ui.horizontal_wrapped(|ui| {
+                        status_legend_chip(ui, "Charging", battery_state_color(Some("charging")));
+                        status_legend_chip(
+                            ui,
+                            "Discharging",
+                            battery_state_color(Some("discharging")),
+                        );
+                        status_legend_chip(ui, "Low", egui::Color32::from_rgb(230, 90, 90));
+                    });
+                }
+                None => {
+                    ui.label("Active performance profile unavailable");
+                    ui.label("AC power: unknown");
+                    ui.label("Battery: unavailable");
+                }
+            }
+        });
+
+        ui.add_space(12.0);
+
+        let mut changed = false;
+
+        ui.group(|ui| {
+            ui.heading("Idle");
+            ui.add_space(8.0);
+
+            let mut blank_enabled = self.power.blank_screen_minutes.is_some();
+            if ui
+                .checkbox(&mut blank_enabled, "Blank screen after idle")
+                .changed()
+            {
+                self.power.blank_screen_minutes = if blank_enabled {
+                    Some(self.power.blank_screen_minutes.unwrap_or(10))
+                } else {
+                    None
+                };
+                changed = true;
+            }
+
+            if let Some(minutes) = &mut self.power.blank_screen_minutes {
+                ui.add_enabled_ui(blank_enabled, |ui| {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(minutes, 1..=120)
+                                .text("Blank after (minutes)")
+                                .clamping(egui::SliderClamping::Always),
+                        )
+                        .changed();
+                });
+            }
+
+            ui.add_space(8.0);
+
+            let mut suspend_enabled = self.power.suspend_minutes.is_some();
+            if ui
+                .checkbox(&mut suspend_enabled, "Suspend after idle")
+                .changed()
+            {
+                self.power.suspend_minutes = if suspend_enabled {
+                    Some(self.power.suspend_minutes.unwrap_or(15))
+                } else {
+                    None
+                };
+                changed = true;
+            }
+
+            if let Some(minutes) = &mut self.power.suspend_minutes {
+                ui.add_enabled_ui(suspend_enabled, |ui| {
+                    changed |= ui
+                        .add(
+                            egui::Slider::new(minutes, 1..=240)
+                                .text("Suspend after (minutes)")
+                                .clamping(egui::SliderClamping::Always),
+                        )
+                        .changed();
+                });
+            }
+        });
+
+        ui.add_space(12.0);
+
+        ui.group(|ui| {
+            ui.heading("Actions");
+            ui.add_space(8.0);
+
+            changed |= combo_box(
+                ui,
+                "Power button",
+                &mut self.power.power_button_action,
+                power_button_action_label,
+                &[
+                    PowerButtonAction::ShowPowerMenu,
+                    PowerButtonAction::Suspend,
+                    PowerButtonAction::PowerOff,
+                    PowerButtonAction::DoNothing,
+                ],
+            );
+
+            changed |= combo_box(
+                ui,
+                "Lid close",
+                &mut self.power.lid_close_action,
+                lid_close_action_label,
+                &[
+                    LidCloseAction::Suspend,
+                    LidCloseAction::BlankScreen,
+                    LidCloseAction::LockScreen,
+                    LidCloseAction::DoNothing,
+                ],
+            );
+
+            changed |= combo_box(
+                ui,
+                "Low battery",
+                &mut self.power.low_battery_action,
+                low_battery_action_label,
+                &[
+                    LowBatteryAction::NotifyOnly,
+                    LowBatteryAction::Suspend,
+                    LowBatteryAction::Hibernate,
+                    LowBatteryAction::PowerOff,
+                ],
+            );
+
+            changed |= combo_box(
+                ui,
+                "Performance mode",
+                &mut self.power.performance_mode,
+                performance_mode_label,
+                &[
+                    PerformanceMode::Balanced,
+                    PerformanceMode::Performance,
+                    PerformanceMode::PowerSaver,
+                ],
+            );
+        });
+
+        if changed {
+            let mut settings = load_settings();
+            settings.power = self.power.clone();
+            if save_settings(&settings).is_ok() {
+                actions.push(UiAction::ReloadSettings);
+                self.refresh_power_status_now();
+            }
+        }
+    }
+
     fn debug_page(&mut self, ui: &mut egui::Ui) {
         ui.heading("Debug");
         ui.add_space(8.0);
@@ -834,6 +1218,55 @@ impl SettingsPanel {
             ui.add_space(6.0);
             ui.label(&self.debug_status);
         });
+    }
+
+    fn ai_permissions_page(&mut self, ui: &mut egui::Ui) {
+        ui.heading("AI Permissions");
+        ui.add_space(8.0);
+        ui.label("Stored AI permissions live on disk and can be revoked here.");
+        ui.add_space(8.0);
+
+        match list_ai_permission_records() {
+            Ok(records) if records.is_empty() => {
+                ui.group(|ui| {
+                    ui.label("No saved AI permissions yet.");
+                });
+            }
+            Ok(records) => {
+                for record in records {
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.strong(ai_permission_heading(&record));
+                                ui.label(ai_permission_details(&record));
+                            });
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Revoke").clicked() {
+                                        self.ai_permissions_status = revoke_ai_permission(&record)
+                                            .map(|_| "AI permission revoked".to_string())
+                                            .unwrap_or_else(|err| err.to_string());
+                                    }
+                                },
+                            );
+                        });
+                    });
+                    ui.add_space(8.0);
+                }
+            }
+            Err(err) => {
+                ui.group(|ui| {
+                    ui.label(format!("Unable to load AI permissions: {err}"));
+                });
+            }
+        }
+
+        if !self.ai_permissions_status.is_empty() {
+            ui.add_space(8.0);
+            ui.label(&self.ai_permissions_status);
+        }
     }
 
     fn about_page(&mut self, ui: &mut egui::Ui) {
@@ -888,11 +1321,17 @@ impl SettingsPanel {
         &mut self,
         ctx: &egui::Context,
         frame_ctx: &DesktopFrameCtx,
-        _actions: &mut Vec<UiAction>,
+        actions: &mut Vec<UiAction>,
     ) {
         if !self.open {
+            self.was_open = false;
             return;
         }
+
+        if !self.was_open {
+            self.reload_from_disk();
+        }
+        self.was_open = true;
 
         let mut open = self.open;
         let mut close_requested = false;
@@ -938,7 +1377,8 @@ impl SettingsPanel {
                                 SettingsPage::Workspaces => self.show_placeholder(ui, "Workspaces"),
                                 SettingsPage::Keyboard => self.show_placeholder(ui, "Keyboard"),
                                 SettingsPage::Privacy => self.show_placeholder(ui, "Privacy"),
-                                SettingsPage::Power => self.show_placeholder(ui, "Power"),
+                                SettingsPage::AiPermissions => self.ai_permissions_page(ui),
+                                SettingsPage::Power => self.power_page(ui, actions),
                                 SettingsPage::Debug => self.debug_page(ui),
                                 SettingsPage::About => self.about_page(ui),
                             }
@@ -954,5 +1394,173 @@ impl SettingsPanel {
     fn show_placeholder(&mut self, ui: &mut egui::Ui, title: &str) {
         ui.heading(title);
         ui.label(format!("{title} settings"));
+    }
+}
+
+fn ai_permission_heading(record: &AiPermissionRecord) -> String {
+    format!(
+        "{} {}",
+        permission_decision_label(record.decision),
+        permission_resource_label(record.resource)
+    )
+}
+
+fn ai_permission_details(record: &AiPermissionRecord) -> String {
+    format!(
+        "App: {} | Target: {} | Scope: {} | Updated: {}",
+        record.app_identity,
+        permission_target_label(&record.target),
+        permission_scope_label(record.scope),
+        format_system_time(record.updated_at)
+    )
+}
+
+fn permission_decision_label(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "Allowed",
+        PermissionDecision::Deny => "Denied",
+        PermissionDecision::Ask => "Ask",
+    }
+}
+
+fn permission_scope_label(scope: PermissionScope) -> &'static str {
+    match scope {
+        PermissionScope::Once => "Once",
+        PermissionScope::Session => "Session",
+        PermissionScope::Persistent => "Persistent",
+    }
+}
+
+fn permission_target_label(target: &PermissionTarget) -> String {
+    match target {
+        PermissionTarget::Global => "Global".to_string(),
+        PermissionTarget::Named(name) => name.clone(),
+    }
+}
+
+fn permission_resource_label(resource: focaldesk_permissions::PermissionResource) -> &'static str {
+    match resource {
+        focaldesk_permissions::PermissionResource::Screenshot => "Screenshot",
+        focaldesk_permissions::PermissionResource::Screencast => "Screencast",
+        focaldesk_permissions::PermissionResource::ScreenShareWindow => "Window share",
+        focaldesk_permissions::PermissionResource::ScreenShareOutput => "Output share",
+        focaldesk_permissions::PermissionResource::AiChat => "AI chat",
+        focaldesk_permissions::PermissionResource::Microphone => "Microphone",
+        focaldesk_permissions::PermissionResource::Camera => "Camera",
+        focaldesk_permissions::PermissionResource::ClipboardRead => "Clipboard read",
+        focaldesk_permissions::PermissionResource::ClipboardWrite => "Clipboard write",
+        focaldesk_permissions::PermissionResource::RemoteInput => "Remote input",
+        focaldesk_permissions::PermissionResource::Notifications => "Notifications",
+        focaldesk_permissions::PermissionResource::FileOpen => "File open",
+        focaldesk_permissions::PermissionResource::FileSave => "File save",
+    }
+}
+
+fn combo_box<T: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut T,
+    label_fn: fn(T) -> &'static str,
+    options: &[T],
+) -> bool {
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.label(label);
+        egui::ComboBox::from_id_salt(label)
+            .selected_text(label_fn(*value))
+            .show_ui(ui, |ui| {
+                for option in options {
+                    changed |= ui
+                        .selectable_value(value, *option, label_fn(*option))
+                        .changed();
+                }
+            });
+    });
+    changed
+}
+
+fn power_button_action_label(action: PowerButtonAction) -> &'static str {
+    match action {
+        PowerButtonAction::ShowPowerMenu => "Show power menu",
+        PowerButtonAction::Suspend => "Suspend",
+        PowerButtonAction::PowerOff => "Power off",
+        PowerButtonAction::DoNothing => "Do nothing",
+    }
+}
+
+fn lid_close_action_label(action: LidCloseAction) -> &'static str {
+    match action {
+        LidCloseAction::Suspend => "Suspend",
+        LidCloseAction::BlankScreen => "Blank screen",
+        LidCloseAction::LockScreen => "Lock screen",
+        LidCloseAction::DoNothing => "Do nothing",
+    }
+}
+
+fn low_battery_action_label(action: LowBatteryAction) -> &'static str {
+    match action {
+        LowBatteryAction::NotifyOnly => "Notify only",
+        LowBatteryAction::Suspend => "Suspend",
+        LowBatteryAction::Hibernate => "Hibernate",
+        LowBatteryAction::PowerOff => "Power off",
+    }
+}
+
+fn performance_mode_label(mode: PerformanceMode) -> &'static str {
+    match mode {
+        PerformanceMode::Balanced => "Balanced",
+        PerformanceMode::Performance => "Performance",
+        PerformanceMode::PowerSaver => "Power saver",
+    }
+}
+
+fn performance_mode_profile_name(mode: PerformanceMode) -> &'static str {
+    match mode {
+        PerformanceMode::Balanced => "balanced",
+        PerformanceMode::Performance => "performance",
+        PerformanceMode::PowerSaver => "power-saver",
+    }
+}
+
+fn battery_state_label(state: Option<&str>) -> &'static str {
+    match state.map(|value| value.to_ascii_lowercase()) {
+        Some(ref value) if value == "charging" => "Charging",
+        Some(ref value) if value == "discharging" => "Discharging",
+        Some(ref value) if value == "full" => "Full",
+        Some(ref value) if value == "empty" => "Empty",
+        Some(ref value) if value == "pending-charge" => "Pending charge",
+        Some(ref value) if value == "pending-discharge" => "Pending discharge",
+        _ => "Unknown",
+    }
+}
+
+fn battery_state_color(state: Option<&str>) -> egui::Color32 {
+    match state.map(|value| value.to_ascii_lowercase()) {
+        Some(ref value) if value == "charging" => egui::Color32::from_rgb(80, 180, 120),
+        Some(ref value) if value == "discharging" => egui::Color32::from_rgb(220, 180, 80),
+        Some(ref value) if value == "full" => egui::Color32::from_rgb(100, 190, 255),
+        Some(ref value) if value == "empty" => egui::Color32::from_rgb(230, 90, 90),
+        Some(ref value) if value == "pending-charge" || value == "pending-discharge" => {
+            egui::Color32::from_rgb(180, 160, 255)
+        }
+        _ => egui::Color32::from_rgb(180, 180, 180),
+    }
+}
+
+fn status_legend_chip(ui: &mut egui::Ui, label: &str, color: egui::Color32) {
+    ui.horizontal(|ui| {
+        ui.colored_label(color, "■");
+        ui.label(label);
+    });
+}
+
+fn format_system_time(time: SystemTime) -> String {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let seconds = duration.as_secs();
+            let nanos = duration.subsec_nanos();
+            format!("{seconds}.{nanos:09}s since epoch")
+        }
+        Err(_) => "before epoch".to_string(),
     }
 }

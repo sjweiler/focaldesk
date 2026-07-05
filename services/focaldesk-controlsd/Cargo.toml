@@ -1,0 +1,17 @@
+[package]
+name = "focaldesk-controlsd"
+version = "0.1.0"
+edition = "2024"
+description = "FocalDesk control IPC daemon"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-controlsd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

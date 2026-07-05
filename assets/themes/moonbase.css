@@ -1,0 +1,41 @@
+/* Generated from focaldesk-themes built-in theme data. */
+:root {
+  --fd-theme-id: "moonbase";
+  --fd-theme-name: "Moonbase";
+  --fd-background-color: rgba(46, 48, 48, 1.000);
+  --fd-wallpaper-path: "assets/wallpaper/focaldesk_wallpaper.png";
+  --fd-wallpaper-tint: rgba(217, 230, 255, 0.150);
+  --fd-wallpaper-dim: 0.2;
+  --fd-chrome-bg-color: rgba(41, 43, 43, 1.000);
+  --fd-chrome-panel-color: rgba(46, 48, 51, 1.000);
+  --fd-chrome-accent-color: rgba(107, 173, 219, 1.000);
+  --fd-chrome-trim-color: rgba(158, 173, 184, 1.000);
+  --fd-chrome-glass-tint: rgba(191, 209, 224, 0.180);
+  --fd-chrome-corner-radius: 10px;
+  --fd-chrome-border-width: 1px;
+  --fd-chrome-glow-intensity: 0.08;
+  --fd-chrome-shadow-intensity: 0.35;
+  --fd-dialog-panel-color: rgba(255, 255, 255, 1.000);
+  --fd-dialog-title-color: rgba(51, 102, 204, 1.000);
+  --fd-dialog-text-color: rgba(26, 26, 26, 1.000);
+  --fd-dialog-button-color: rgba(224, 230, 242, 1.000);
+  --fd-dialog-overlay-dim: rgba(0, 0, 0, 0.300);
+  --fd-text-title: rgba(245, 252, 255, 1.000);
+  --fd-text-normal: rgba(230, 242, 255, 1.000);
+  --fd-text-dim: rgba(173, 194, 209, 1.000);
+  --fd-text-accent: rgba(148, 219, 255, 1.000);
+  --fd-text-meta-label: rgba(214, 232, 245, 1.000);
+  --fd-text-meta-value: rgba(255, 219, 107, 1.000);
+  --fd-text-clock: rgba(245, 252, 255, 1.000);
+  --fd-icon-inactive: rgba(230, 245, 255, 1.000);
+  --fd-icon-hover: rgba(255, 255, 255, 1.000);
+  --fd-icon-active: rgba(158, 230, 255, 1.000);
+  --fd-icon-disabled: rgba(117, 133, 143, 0.620);
+  --fd-icon-glow: rgba(179, 224, 255, 0.420);
+  --fd-spacing: 10px;
+  --fd-density: normal;
+  --fd-animation-speed: 1;
+  --fd-hover-scale: 1.05;
+  --fd-press-scale: 0.96;
+  --fd-per-output-ui: true;
+}

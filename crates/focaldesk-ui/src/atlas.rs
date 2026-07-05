@@ -216,6 +216,7 @@ fn rasterize_svg_bytes(svg_bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(img.into_raw())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn blit_rgba(
     atlas: &mut [u8],
     atlas_w: u32,
@@ -251,6 +252,7 @@ impl IconAtlas {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_atlas_icon(
     frame: &mut impl smithay::backend::renderer::Frame<TextureId = GlesTexture, Error = GlesError>,
     atlas: &GlesTexture,
@@ -264,6 +266,7 @@ pub fn render_atlas_icon(
     render_atlas_icon_with_alpha(frame, atlas, entry, x, y, w, h, output_size, 1.0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_atlas_icon_with_alpha(
     frame: &mut impl smithay::backend::renderer::Frame<TextureId = GlesTexture, Error = GlesError>,
     atlas: &GlesTexture,
@@ -639,10 +642,9 @@ where
     ];
 
     let mut rects = HashMap::new();
-    let mut cell_index: u32 = 0;
     let cells_per_row = ATLAS_W / CELL;
 
-    for &(icon_id, svg_bytes) in all_icons {
+    for (cell_index, &(icon_id, svg_bytes)) in (0_u32..).zip(all_icons.iter()) {
         //for state in STATES {
         let styled_svg = style_svg_white(svg_bytes)?;
         let rgba = rasterize_svg_bytes(&styled_svg, ICON, ICON)?;
@@ -676,8 +678,6 @@ where
                 h: ICON,
             },
         );
-
-        cell_index += 1;
         //}
     }
 

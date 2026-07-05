@@ -113,6 +113,7 @@ impl DesktopOutput {
         self.chrome_shaders.ensure_compiled(renderer)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
@@ -291,28 +292,28 @@ impl DesktopOutput {
     }
 
     pub fn hit_test(&self, point: Point<i32, Logical>) -> Option<UiHit> {
-        if let Some(dialog) = &self.dialog {
-            if let Some(hit) = dialog.hit_test(point) {
-                return Some(hit);
-            }
+        if let Some(dialog) = &self.dialog
+            && let Some(hit) = dialog.hit_test(point)
+        {
+            return Some(hit);
         }
 
-        if let Some(overlays) = &self.overlays {
-            if let Some(hit) = overlays.hit_test(point) {
-                return Some(hit);
-            }
+        if let Some(overlays) = &self.overlays
+            && let Some(hit) = overlays.hit_test(point)
+        {
+            return Some(hit);
         }
 
-        if let Some(topbar) = &self.topbar {
-            if let Some(hit) = topbar.hit_test(point) {
-                return Some(hit);
-            }
+        if let Some(topbar) = &self.topbar
+            && let Some(hit) = topbar.hit_test(point)
+        {
+            return Some(hit);
         }
 
-        if let Some(sidebar) = &self.sidebar {
-            if let Some(hit) = sidebar.hit_test(point) {
-                return Some(hit);
-            }
+        if let Some(sidebar) = &self.sidebar
+            && let Some(hit) = sidebar.hit_test(point)
+        {
+            return Some(hit);
         }
 
         self.workarea.hit_test(point)

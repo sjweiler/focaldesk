@@ -18,6 +18,8 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 focaldesk-ui = { path = "../focaldesk-ui" }
+focaldesk-ai = { path = "../focaldesk-ai" }
+focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-flow = { path = "../focaldesk-flow" }
 focaldesk-types = { path = "../focaldesk-types" }
 focaldesk-logging = { path = "../focaldesk-logging" }
@@ -30,8 +32,11 @@ focaldesk-themes = { path = "../focaldesk-themes" }
 focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-sounds = { path = "../focaldesk-sounds" }
 focaldesk-power = { path = "../focaldesk-power" }
+focal-launch-shared = { path = "../focal-launch-shared" }
+drm-ffi = { workspace = true }
 
 serde_json = "1"
+dirs = "6.0.0"
 zbus = "3"
 pipewire = "0.8"
 egui = "0.31"
@@ -43,6 +48,8 @@ chrono.workspace = true
 image.workspace = true
 glow.workspace = true
 libc = "0.2"
+lcms2 = "6.1.1"
+md5 = "0.7"
 #winit
 
 

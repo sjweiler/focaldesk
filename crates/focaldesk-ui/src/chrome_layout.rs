@@ -57,11 +57,12 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
         let h = (r.size.h as f64 * scale).round() as i32;
         Rectangle::from_loc_and_size((x, y), (w.max(1), h.max(1)))
     };
-    let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(|r| sc(r));
-    let sc_vec = |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(|r| sc(r)).collect();
+    let sc_opt = |o: Option<Rectangle<i32, Logical>>| o.map(&sc);
+    let sc_vec = |v: &[Rectangle<i32, Logical>]| v.iter().copied().map(&sc).collect();
     ChromeLayout {
         topbar: TopBarLayout {
             outer: sc(layout.topbar.outer),
+            flow_field: sc(layout.topbar.flow_field),
             inner: sc(layout.topbar.inner),
             title: sc(layout.topbar.title),
             trim: sc(layout.topbar.trim),
@@ -116,6 +117,7 @@ pub struct ChromeLayout<Kind = Logical> {
 #[derive(Debug, Clone)]
 pub struct TopBarLayout<Kind = Logical> {
     pub outer: Rectangle<i32, Kind>,
+    pub flow_field: Rectangle<i32, Kind>,
     pub inner: Rectangle<i32, Kind>,
     pub title: Rectangle<i32, Kind>,
     pub trim: Rectangle<i32, Kind>,
@@ -164,6 +166,7 @@ fn inset_rect<Kind>(rect: Rectangle<i32, Kind>, inset: i32) -> Rectangle<i32, Ki
     Rectangle::from_loc_and_size((x, y), (w, h))
 }
 
+#[allow(clippy::type_complexity)]
 fn build_status_cluster(
     topbar_inner: Rectangle<i32, Logical>,
     right_pad: i32,
@@ -247,7 +250,9 @@ pub fn build_chrome_layout(
 
     let work_inner_frame = inset_rect(work_outer, 2);
     let work_recess = inset_rect(work_inner_frame, 4);
-    let glass_rect = inset_rect(work_recess, 4);
+    // Keep the glass overlay aligned with the actual work recess so the
+    // client area and the visible glass backdrop describe the same region.
+    let glass_rect = work_recess;
 
     let work_trim = Some(Rectangle::from_loc_and_size(
         (work_inner_frame.loc.x + 6, work_inner_frame.loc.y + 4),
@@ -278,8 +283,26 @@ pub fn build_chrome_layout(
     let (status_cluster, status_wells, clock_well) =
         build_status_cluster(topbar_inner, 10, 6, 8, 5);
 
+    let flow_left = topbar_inner.loc.x + 6;
+    let flow_y = topbar_inner.loc.y + 4;
+    let flow_gap = 10;
+    let flow_available = (status_cluster.loc.x - flow_left - flow_gap).max(0);
+    let flow_preferred = 136;
+    let flow_min = 96;
+    let flow_w = if flow_available <= flow_min {
+        flow_available
+    } else {
+        flow_available.min(flow_preferred).max(flow_min)
+    }
+    .max(1);
+
+    let flow_field = Rectangle::from_loc_and_size(
+        (flow_left, flow_y),
+        (flow_w, (topbar_inner.size.h - 8).max(1)),
+    );
+
     // Title gets the remaining space to the left of the cluster
-    let title_left = topbar_inner.loc.x + 6;
+    let title_left = flow_field.loc.x + flow_field.size.w + 12;
     let title_right = (status_cluster.loc.x - 10).max(title_left + 24);
 
     let title_rect = Rectangle::from_loc_and_size(
@@ -384,6 +407,7 @@ pub fn build_chrome_layout(
         // Top bar
         topbar: TopBarLayout {
             outer: topbar_outer,
+            flow_field,
             inner: topbar_inner,
             title: title_rect,
             trim: topbar_trim,
@@ -412,5 +436,16 @@ pub fn build_chrome_layout(
             corner_caps,
             corner_joint_caps,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_area_glass_matches_work_recess() {
+        let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+        assert_eq!(layout.work_area.glass, layout.work_area.recess);
     }
 }

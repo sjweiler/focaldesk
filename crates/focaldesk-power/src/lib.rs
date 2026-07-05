@@ -1,9 +1,10 @@
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerCommand {
@@ -24,23 +25,47 @@ impl PowerCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BatteryStatus {
     pub name: String,
     pub percentage: Option<u8>,
     pub state: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PowerSnapshot {
     pub batteries: Vec<BatteryStatus>,
     pub line_power_online: Option<bool>,
     pub performance_profile: Option<String>,
+    pub captured_at_unix_ms: u64,
 }
+
+pub const LOW_BATTERY_THRESHOLD_PERCENT: u8 = 15;
 
 impl PowerSnapshot {
     pub fn has_battery(&self) -> bool {
         !self.batteries.is_empty()
+    }
+
+    pub fn lowest_battery_percentage(&self) -> Option<u8> {
+        self.batteries
+            .iter()
+            .filter_map(|battery| battery.percentage)
+            .min()
+    }
+
+    pub fn is_low_battery(&self, threshold: u8) -> bool {
+        self.lowest_battery_percentage()
+            .is_some_and(|percentage| percentage <= threshold)
+    }
+
+    pub fn is_charging(&self) -> bool {
+        self.batteries.iter().any(|battery| {
+            battery
+                .state
+                .as_deref()
+                .is_some_and(|state| state.eq_ignore_ascii_case("charging"))
+        })
     }
 }
 
@@ -130,6 +155,7 @@ impl PowerManager {
             batteries: self.batteries(),
             line_power_online: self.line_power_online(),
             performance_profile: current_performance_profile(),
+            captured_at_unix_ms: current_unix_time_ms(),
         }
     }
 
@@ -199,6 +225,13 @@ fn current_performance_profile() -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn current_unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn run_status(program: &'static str, args: &[&str]) -> Result<(), PowerError> {
     let status = Command::new(program).args(args).status()?;
     if status.success() {
@@ -250,5 +283,30 @@ mod tests {
         assert_eq!(snapshot.line_power_online, Some(false));
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detects_low_battery_and_charging() {
+        let snapshot = PowerSnapshot {
+            batteries: vec![
+                BatteryStatus {
+                    name: "BAT0".to_string(),
+                    percentage: Some(9),
+                    state: Some("Discharging".to_string()),
+                },
+                BatteryStatus {
+                    name: "BAT1".to_string(),
+                    percentage: Some(33),
+                    state: Some("Charging".to_string()),
+                },
+            ],
+            line_power_online: Some(false),
+            performance_profile: None,
+            captured_at_unix_ms: 0,
+        };
+
+        assert_eq!(snapshot.lowest_battery_percentage(), Some(9));
+        assert!(snapshot.is_low_battery(LOW_BATTERY_THRESHOLD_PERCENT));
+        assert!(snapshot.is_charging());
     }
 }

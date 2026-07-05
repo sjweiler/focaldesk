@@ -1,4 +1,5 @@
 pub mod client;
+pub mod clipboard_history;
 pub mod color_management_protocol;
 pub mod color_protocol;
 pub mod compositor;

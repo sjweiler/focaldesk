@@ -6,6 +6,12 @@ pub struct TextSystem {
     pub swash_cache: SwashCache,
 }
 
+impl Default for TextSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn rasterize_text_to_texture(
     _renderer: &mut GlesRenderer,
     _text: &str,

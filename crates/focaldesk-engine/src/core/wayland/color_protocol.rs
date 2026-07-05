@@ -152,10 +152,7 @@ impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, OrphanSurface
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            focaldesk_surface_color_v1::Request::Destroy => {}
-            _ => {}
-        }
+        if let focaldesk_surface_color_v1::Request::Destroy = request {}
     }
 }
 
@@ -188,9 +185,18 @@ impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorT
                 let description = match transfer {
                     TransferFunction::Srgb => ColorDescription::SRGB,
                     TransferFunction::Linear => ColorDescription::LINEAR_SRGB,
+                    TransferFunction::Bt1886 => ColorDescription {
+                        transfer: TransferFunction::Bt1886,
+                        ..ColorDescription::SRGB
+                    },
+                    TransferFunction::Gamma22 => ColorDescription {
+                        transfer: TransferFunction::Gamma22,
+                        ..ColorDescription::SRGB
+                    },
+                    TransferFunction::St2084Pq => return,
                 };
                 set_pending_description(&tag.surface, Some(description));
-                flog(&format!(
+                flog(format!(
                     "color tag pending: surface={:?} transfer={transfer:?}",
                     tag.surface.id()
                 ));

@@ -55,7 +55,7 @@ impl CompositorHandler for DesktopState {
         });
         add_destruction_hook::<DesktopState, _>(surface, |state, surface| {
             state
-                .surface_transfers
+                .surface_colors
                 .remove(&Id::from_wayland_resource(surface));
         });
         add_pre_commit_hook::<DesktopState, _>(surface, |state, _dh, surface| {

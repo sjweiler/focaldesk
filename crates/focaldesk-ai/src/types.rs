@@ -87,3 +87,15 @@ pub struct ProviderInfo {
     pub base_url: Option<String>,
     pub default_model: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelInfo {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AiDaemonStatus {
+    pub active_requests: u32,
+    pub default_provider: String,
+    pub provider_count: usize,
+}

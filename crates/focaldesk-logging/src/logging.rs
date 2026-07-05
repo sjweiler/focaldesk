@@ -90,11 +90,32 @@ fn make_writer() -> BoxMakeWriter {
     }
 }
 
+fn flog_level_filter_directive(level: FLogLevel) -> &'static str {
+    match level {
+        FLogLevel::Critical | FLogLevel::Error => "error",
+        FLogLevel::Warn => "warn",
+        FLogLevel::Info => "info",
+        FLogLevel::Debug => "debug",
+        FLogLevel::Trace => "trace",
+    }
+}
+
+fn build_env_filter() -> EnvFilter {
+    if let Ok(rust_log) = std::env::var("RUST_LOG") {
+        if let Ok(filter) = EnvFilter::try_new(rust_log) {
+            return filter;
+        }
+    }
+
+    let directive = flog_level_filter_directive(current_log_level());
+    EnvFilter::try_new(directive).unwrap_or_else(|_| EnvFilter::new("warn"))
+}
+
 #[cfg(target_os = "linux")]
 fn install_tracing_subscriber() {
     TRACING_INSTALLED.get_or_init(|| {
         let _ = LogTracer::init();
-        let filter = EnvFilter::new("trace");
+        let filter = build_env_filter();
         let writer = make_writer();
         match JournaldLayer::new() {
             Ok(layer) => {
@@ -128,7 +149,7 @@ fn install_tracing_subscriber() {
 fn install_tracing_subscriber() {
     TRACING_INSTALLED.get_or_init(|| {
         let _ = LogTracer::init();
-        let filter = EnvFilter::new("trace");
+        let filter = build_env_filter();
         let writer = make_writer();
         let subscriber = tracing_subscriber::registry()
             .with(filter)

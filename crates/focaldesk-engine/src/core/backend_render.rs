@@ -13,7 +13,7 @@ use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
     RenderInputsMut,
 };
-use crate::core::ui_builder::{build_ui_for_output_with_options, UiBuildOptions};
+use crate::core::ui_builder::{build_ui_for_output_with_options, AiFlowMode, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_flow::keybinds::BackendKind;
@@ -129,43 +129,6 @@ fn compact_damage(
     rects
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn compact_damage_merges_nearby_rects() {
-        let output_size = Size::<i32, Physical>::from((100, 100));
-        let damage = [
-            Rectangle::from_loc_and_size((10, 10), (10, 10)),
-            Rectangle::from_loc_and_size((23, 10), (10, 10)),
-        ];
-
-        let compacted = compact_damage(&damage, output_size);
-
-        assert_eq!(
-            compacted,
-            vec![Rectangle::from_loc_and_size((10, 10), (23, 10))]
-        );
-    }
-
-    #[test]
-    fn compact_damage_uses_full_output_for_large_area() {
-        let output_size = Size::<i32, Physical>::from((100, 100));
-        let damage = [Rectangle::from_loc_and_size((0, 0), (80, 60))];
-
-        let compacted = compact_damage(&damage, output_size);
-
-        assert_eq!(
-            compacted,
-            vec![Rectangle::<i32, Physical>::from_loc_and_size(
-                (0, 0),
-                output_size
-            )]
-        );
-    }
-}
-
 pub fn prepare_output(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -183,7 +146,8 @@ pub fn prepare_output(
         output_scale,
         buffer_scale,
         hdr_supported,
-        hdr_enabled,
+        hdr_requested,
+        hdr_kms_applied,
     ) = {
         let desk_output = state
             .outputs
@@ -196,7 +160,8 @@ pub fn prepare_output(
             desk_output.scale,
             desk_output.scale_factor.round().max(1.0) as i32,
             desk_output.hdr_supported,
-            desk_output.hdr_enabled,
+            desk_output.hdr_requested,
+            desk_output.hdr_kms_applied,
         )
     };
 
@@ -204,9 +169,8 @@ pub fn prepare_output(
 
     let pointer_on_this_output = state.output_owns_cursor(output_id);
 
-    let draw_software_cursor = pointer_on_this_output
-        && state.cursor_manager.software_cursor_needed()
-        && !state.drm_try_pass_cursor_this_frame;
+    let draw_software_cursor =
+        pointer_on_this_output && state.cursor_manager.software_cursor_needed();
 
     let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
 
@@ -215,6 +179,7 @@ pub fn prepare_output(
         state.chrome.metrics.topbar_h,
         state.chrome.metrics.sidebar_w,
     );
+    let ai_flow_mode = state.ai_flow_mode();
 
     let workspace_count = state.workspace_names.len();
     let active_workspace = state.focused_workspace().0;
@@ -224,9 +189,11 @@ pub fn prepare_output(
         &layout,
         UiBuildOptions {
             hdr_supported,
-            hdr_enabled,
+            hdr_requested,
+            hdr_kms_applied,
             workspace_count,
             active_workspace,
+            ai_flow_mode,
         },
     );
     state.refresh_ui_hover_for_output(output_id);
@@ -241,6 +208,15 @@ pub fn prepare_output(
     }
 
     if let Some(rect) = state.active_topbar_pulse_damage_rect(output_id, now) {
+        state.mark_output_logical_damage(
+            output_id,
+            rect,
+            0,
+            crate::core::desktop::DamageSource::Unknown,
+        );
+    }
+
+    if let Some(rect) = state.active_flow_field_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(
             output_id,
             rect,
@@ -298,7 +274,14 @@ pub fn prepare_output(
         }
     };
 
+    let lut_shader_before = state.render.chrome_shaders.output_encode_lut.is_some();
     state.render.ensure_shader_programs(renderer)?;
+    if !lut_shader_before && state.render.chrome_shaders.output_encode_lut.is_some() {
+        focaldesk_logging::flog_info!(
+            "ICC LUT shader ready; refreshing wp_color preferred identities"
+        );
+        crate::core::wayland::color_management_protocol::notify_preferred_color_changed(state);
+    }
     // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
     state.render.ensure_wallpaper_loaded(renderer);
 
@@ -331,7 +314,7 @@ pub fn prepare_output(
         portal_capture: force_full_damage,
     };
 
-    if state.debug.show_fps && state.render.frame_no % 120 == 0 {
+    if state.debug.show_fps && state.render.frame_no.is_multiple_of(120) {
         let frame_ms = dt.as_secs_f64() * 1000.0;
         let fps = if dt.is_zero() {
             0.0
@@ -481,17 +464,38 @@ fn focus_pulse_value(elapsed: Duration) -> f32 {
     }
 }
 
-/// Import and build client surfaces for an output. Call after `GlesRenderer::bind` and before
-/// `GlesRenderer::render` on the same renderer.
+/// Import committed client buffers for mapped windows on this output.
+/// Call after `GlesRenderer::bind` and before `GlesRenderer::render`.
+pub fn import_output_client_surfaces(
+    state: &DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+) {
+    let Some(output) = state.outputs.get(&output_id) else {
+        return;
+    };
+    let mapped = state.space.elements().count();
+    if mapped > 0 {
+        focaldesk_logging::flog_info!(
+            "import client surfaces output={} mapped_windows={}",
+            output_id.0,
+            mapped
+        );
+    }
+    state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
+}
+
+/// Build client render elements for an output. Call after `GlesRenderer::bind` and before
+/// `GlesRenderer::render` on the same offscreen target.
 pub fn build_output_client_elements(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
     output_id: OutputId,
 ) -> Vec<FlowRenderElement> {
-    let (output_handle, output_origin, output_logical_size) = state
+    let output_handle = state
         .outputs
         .get(&output_id)
-        .map(|o| (o.handle.clone(), o.logical_origin, o.logical_size))
+        .map(|o| o.handle.clone())
         .expect("output missing");
 
     let active_workspace = state
@@ -502,7 +506,8 @@ pub fn build_output_client_elements(
 
     let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
 
-    state.import_mapped_surfaces_for_output(renderer, output_origin, output_logical_size);
+    let output = state.outputs.get(&output_id).expect("output missing");
+    state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
 
     state.render.build_client_elements_for_output(
         &state.space,
@@ -562,6 +567,7 @@ pub fn draw_output(
         crate::core::render::OutputRenderStage::All,
         ClientCompositingMode::Sdr,
         ChromeGlassPass::InBaseSdr,
+        false,
     )
 }
 
@@ -577,6 +583,7 @@ pub fn draw_output_stage(
     stage: crate::core::render::OutputRenderStage,
     client_compositing: ClientCompositingMode,
     chrome_glass_pass: ChromeGlassPass,
+    defer_egui_to_sdr: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let egui_frame_ctx = DesktopFrameCtx {
         output_size: prepared.frame_ctx.output_size,
@@ -591,7 +598,9 @@ pub fn draw_output_stage(
     };
     if matches!(
         stage,
-        crate::core::render::OutputRenderStage::All | crate::core::render::OutputRenderStage::Base
+        crate::core::render::OutputRenderStage::All
+            | crate::core::render::OutputRenderStage::Base
+            | crate::core::render::OutputRenderStage::Overlay
     ) && state
         .render
         .egui
@@ -609,9 +618,7 @@ pub fn draw_output_stage(
     {
         Vec::new()
     } else {
-        state
-            .notifications
-            .visible_snapshots(prepared.frame_ctx.now)
+        state.notification_snapshots.clone()
     };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
 
@@ -621,13 +628,17 @@ pub fn draw_output_stage(
         scene,
         output: output_state,
         metrics: &state.chrome.metrics,
-        elements: &elements,
+        elements,
         popup_elements,
         sidebar_hover_slot: state.sidebar_hover_for_output(prepared.frame_ctx.active_output),
         sidebar_pulse: state
             .sidebar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         topbar_pulse: state
             .topbar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
+        flow_field_pulse: state.flow_field_pulse_for_output(
+            prepared.frame_ctx.rendering_output,
+            prepared.frame_ctx.now,
+        ),
         clock_pulse: state
             .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
@@ -637,17 +648,55 @@ pub fn draw_output_stage(
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,
         fonts: &state.fonts,
-        theme: &state.theme.active_theme(),
+        theme: state.theme.active_theme(),
         notifications: &notifications,
         lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         client_compositing,
         chrome_glass_pass,
-        surface_transfers: &state.surface_transfers,
+        defer_egui_to_sdr,
+        surface_colors: &state.surface_colors,
     };
 
     let muts = RenderInputsMut { ui: ui_state };
 
     state.render.render_stage(frame, inputs, muts, stage)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_damage_merges_nearby_rects() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let damage = [
+            Rectangle::from_loc_and_size((10, 10), (10, 10)),
+            Rectangle::from_loc_and_size((23, 10), (10, 10)),
+        ];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::from_loc_and_size((10, 10), (23, 10))]
+        );
+    }
+
+    #[test]
+    fn compact_damage_uses_full_output_for_large_area() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let damage = [Rectangle::from_loc_and_size((0, 0), (80, 60))];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::<i32, Physical>::from_loc_and_size(
+                (0, 0),
+                output_size
+            )]
+        );
+    }
 }

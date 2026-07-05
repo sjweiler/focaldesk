@@ -1,5 +1,214 @@
+desktop_bin := "/usr/local/bin/focaldesk-desktop"
+
 build:
     cargo build
+
+release-desktop:
+    cargo build --release -p focaldesk-desktop
+
+release-server:
+    cargo build --release -p focaldesk-server
+
+release-powerd:
+    cargo build --release -p focaldesk-powerd
+
+release-notificationsd:
+    cargo build --release -p focaldesk-notificationsd
+
+release-dialogd:
+    cargo build --release -p focaldesk-dialogd
+
+release-controlsd:
+    cargo build --release -p focaldesk-controlsd
+
+release-polkitd:
+    cargo build --release -p focaldesk-polkitd
+
+release-launchd:
+    cargo build --release -p focal-launchd
+
+release-portal:
+    cargo build --release -p focaldesk-portal
+
+release-automation:
+    cargo build --release -p focaldesk-automation
+
+install-server-service:
+    cargo build --release -p focaldesk-server
+    install -Dm755 target/release/focaldesk-server "$HOME/.local/bin/focaldesk-server"
+    install -Dm644 packaging/systemd/user/focaldesk-server.service "$HOME/.config/systemd/user/focaldesk-server.service"
+    # One-time migration: focaldesk-server.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-server.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
+
+install-services: install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service
+
+install-power-service:
+    cargo build --release -p focaldesk-powerd
+    install -Dm755 target/release/focaldesk-powerd "$HOME/.local/bin/focaldesk-powerd"
+    install -Dm644 packaging/systemd/user/focaldesk-powerd.service "$HOME/.config/systemd/user/focaldesk-powerd.service"
+    # One-time migration: focaldesk-powerd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-powerd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-powerd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-notifications-service:
+    cargo build --release -p focaldesk-notificationsd
+    install -Dm755 target/release/focaldesk-notificationsd "$HOME/.local/bin/focaldesk-notificationsd"
+    install -Dm644 packaging/systemd/user/focaldesk-notificationsd.service "$HOME/.config/systemd/user/focaldesk-notificationsd.service"
+    # One-time migration: focaldesk-notificationsd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-notificationsd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-notificationsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-dialog-service:
+    cargo build --release -p focaldesk-dialogd
+    install -Dm755 target/release/focaldesk-dialogd "$HOME/.local/bin/focaldesk-dialogd"
+    install -Dm644 packaging/systemd/user/focaldesk-dialogd.service "$HOME/.config/systemd/user/focaldesk-dialogd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-dialogd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-control-service:
+    cargo build --release -p focaldesk-controlsd
+    install -Dm755 target/release/focaldesk-controlsd "$HOME/.local/bin/focaldesk-controlsd"
+    install -Dm644 packaging/systemd/user/focaldesk-controlsd.service "$HOME/.config/systemd/user/focaldesk-controlsd.service"
+    # One-time migration: focaldesk-controlsd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-controlsd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-controlsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-launch-service:
+    cargo build --release -p focal-launchd
+    install -Dm755 target/release/focal-launchd "$HOME/.local/bin/focal-launchd"
+    install -Dm644 packaging/systemd/user/focal-launchd.service "$HOME/.config/systemd/user/focal-launchd.service"
+    # One-time migration: focal-launchd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focal-launchd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focal-launchd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-settings-service:
+    cargo build --release -p focaldesk-ipc
+    install -Dm755 target/release/focaldesk-settingsd "$HOME/.local/bin/focaldesk-settingsd"
+    install -Dm644 packaging/systemd/user/focaldesk-settingsd.service "$HOME/.config/systemd/user/focaldesk-settingsd.service"
+    # One-time migration: focaldesk-settingsd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-settingsd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-settingsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-polkit-service:
+    cargo build --release -p focaldesk-polkitd
+    install -Dm755 target/release/focaldesk-polkitd "$HOME/.local/bin/focaldesk-polkitd"
+    install -Dm644 packaging/systemd/user/focaldesk-polkitd.service "$HOME/.config/systemd/user/focaldesk-polkitd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-polkitd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-portal:
+    cargo build --release -p focaldesk-portal
+    install -Dm755 target/release/focaldesk-portal "$HOME/.local/bin/focaldesk-portal"
+    mkdir -p "$HOME/.config/xdg-desktop-portal-wlr"
+    target/release/focaldesk-portal --print-xdpw-config > "$HOME/.config/xdg-desktop-portal-wlr/config"
+    systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"
+
+install-automation:
+    cargo build --release -p focaldesk-automation
+    install -Dm755 target/release/focaldesk-automation "$HOME/.local/bin/focaldesk-automation"
+
+install-files:
+    cargo build --release -p focaldesk-files
+    sudo install -Dm755 target/release/focaldesk-files /usr/local/bin/focaldesk-files
+
+install-settings:
+    cargo build --release -p focaldesk-settings
+    sudo install -Dm755 target/release/focaldesk-settings /usr/local/bin/focaldesk-settings
+
+install-ai-console:
+    cargo build --release -p focaldesk-ai-console
+    sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
+
+install-desktop:
+    cargo build --release -p focaldesk-desktop
+    @echo "Build artifact:"
+    @md5sum target/release/focaldesk-desktop
+    # mv over the running binary: direct install/cp to the live path gets "Text file busy".
+    sudo install -Dm755 target/release/focaldesk-desktop "{{desktop_bin}}.new"
+    sudo mv -f "{{desktop_bin}}.new" "{{desktop_bin}}"
+    @echo "Installed to {{desktop_bin}}:"
+    @md5sum "{{desktop_bin}}"
+    @bash -c 'b=$(md5sum target/release/focaldesk-desktop | cut -d" " -f1); i=$(md5sum "{{desktop_bin}}" | cut -d" " -f1); test "$b" = "$i" && echo "md5 OK: $i" || { echo "md5 MISMATCH: build=$b installed=$i" >&2; exit 1; }'
+
+install-desktop-session:
+    sudo install -Dm644 packaging/wayland-sessions/focaldesk.desktop /usr/share/wayland-sessions/focaldesk.desktop
+
+install-server-service-fedora:
+    cargo build --release -p focaldesk-server
+    sudo install -Dm755 target/release/focaldesk-server /usr/bin/focaldesk-server
+    sudo install -Dm644 packaging/systemd/user/focaldesk-server-fedora.service /usr/lib/systemd/user/focaldesk-server.service
+    # One-time migration: focaldesk-server.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-server.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
+
+install-services-fedora: install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora
+
+install-power-service-fedora:
+    cargo build --release -p focaldesk-powerd
+    sudo install -Dm755 target/release/focaldesk-powerd /usr/bin/focaldesk-powerd
+    sudo install -Dm644 packaging/systemd/user/focaldesk-powerd-fedora.service /usr/lib/systemd/user/focaldesk-powerd.service
+    # One-time migration: focaldesk-powerd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-powerd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-powerd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-notifications-service-fedora:
+    cargo build --release -p focaldesk-notificationsd
+    sudo install -Dm755 target/release/focaldesk-notificationsd /usr/bin/focaldesk-notificationsd
+    sudo install -Dm644 packaging/systemd/user/focaldesk-notificationsd-fedora.service /usr/lib/systemd/user/focaldesk-notificationsd.service
+    # One-time migration: focaldesk-notificationsd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-notificationsd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-notificationsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-dialog-service-fedora:
+    cargo build --release -p focaldesk-dialogd
+    sudo install -Dm755 target/release/focaldesk-dialogd /usr/bin/focaldesk-dialogd
+    sudo install -Dm644 packaging/systemd/user/focaldesk-dialogd-fedora.service /usr/lib/systemd/user/focaldesk-dialogd.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-dialogd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-control-service-fedora:
+    cargo build --release -p focaldesk-controlsd
+    sudo install -Dm755 target/release/focaldesk-controlsd /usr/bin/focaldesk-controlsd
+    sudo install -Dm644 packaging/systemd/user/focaldesk-controlsd-fedora.service /usr/lib/systemd/user/focaldesk-controlsd.service
+    # One-time migration: focaldesk-controlsd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-controlsd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-controlsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-launch-service-fedora:
+    cargo build --release -p focal-launchd
+    sudo install -Dm755 target/release/focal-launchd /usr/bin/focal-launchd
+    sudo install -Dm644 packaging/systemd/user/focal-launchd-fedora.service /usr/lib/systemd/user/focal-launchd.service
+    # One-time migration: focal-launchd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focal-launchd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focal-launchd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-settings-service-fedora:
+    cargo build --release -p focaldesk-ipc
+    sudo install -Dm755 target/release/focaldesk-settingsd /usr/bin/focaldesk-settingsd
+    sudo install -Dm644 packaging/systemd/user/focaldesk-settingsd-fedora.service /usr/lib/systemd/user/focaldesk-settingsd.service
+    # One-time migration: focaldesk-settingsd.service moved from default.target to graphical-session.target.
+    rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-settingsd.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-settingsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-polkit-service-fedora:
+    cargo build --release -p focaldesk-polkitd
+    sudo install -Dm755 target/release/focaldesk-polkitd /usr/bin/focaldesk-polkitd
+    sudo install -Dm644 packaging/systemd/user/focaldesk-polkitd-fedora.service /usr/lib/systemd/user/focaldesk-polkitd.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-polkitd.service || echo "Skipping systemd user enable: no user bus available"
 
 run:
     cargo run

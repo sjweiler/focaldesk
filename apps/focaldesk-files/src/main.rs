@@ -1,5 +1,6 @@
 use adw::prelude::*;
 use focaldesk_logging::{init_default_logging, session_id};
+use glib::ControlFlow;
 use gtk::gio;
 use gtk::glib;
 use std::cell::RefCell;
@@ -51,9 +52,23 @@ enum ViewMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortMode {
+    Name,
+    Size,
+    Type,
+    Modified,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ClipboardOp {
     Copy,
     Cut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileJobOutcome {
+    Finished,
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +82,8 @@ const FILE_TRANSFER_MIME_TYPES: &[&str] = &["x-special/gnome-copied-files", "tex
 #[derive(Clone)]
 struct FileManager {
     window: adw::ApplicationWindow,
+    root: adw::ToolbarView,
+    tab_name: String,
     path_entry: gtk::Entry,
     list: gtk::ListBox,
     grid: gtk::FlowBox,
@@ -76,11 +93,307 @@ struct FileManager {
     hidden_toggle: gtk::ToggleButton,
     places: gtk::StringList,
     view_mode: Rc<RefCell<ViewMode>>,
+    sort_mode: Rc<RefCell<SortMode>>,
+    sort_descending: Rc<RefCell<bool>>,
+    search_query: Rc<RefCell<String>>,
     current_location: Rc<RefCell<Location>>,
     entries: Rc<RefCell<Vec<FileItem>>>,
+    visible_entries: Rc<RefCell<Vec<FileItem>>>,
     file_clipboard: Rc<RefCell<Option<FileClipboard>>>,
     back_stack: Rc<RefCell<Vec<Location>>>,
     forward_stack: Rc<RefCell<Vec<Location>>>,
+    context_menu_index: Rc<RefCell<Option<i32>>>,
+    tab_page: Rc<RefCell<Option<gtk::StackPage>>>,
+}
+
+#[derive(Clone)]
+struct TabManager {
+    window: adw::ApplicationWindow,
+    stack: gtk::Stack,
+    tabs: Rc<RefCell<Vec<FileManager>>>,
+    tab_counter: Rc<RefCell<u32>>,
+}
+
+impl TabManager {
+    fn new(window: &adw::ApplicationWindow, stack: &gtk::Stack) -> Self {
+        Self {
+            window: window.clone(),
+            stack: stack.clone(),
+            tabs: Rc::new(RefCell::new(Vec::new())),
+            tab_counter: Rc::new(RefCell::new(1)),
+        }
+    }
+
+    fn next_tab_name(&self) -> String {
+        let mut counter = self.tab_counter.borrow_mut();
+        let name = format!("tab-{}", *counter);
+        *counter += 1;
+        name
+    }
+
+    fn active_tab(&self) -> Option<FileManager> {
+        let active_name = self.stack.visible_child_name()?;
+        self.tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.tab_name == active_name.as_str())
+            .cloned()
+    }
+
+    fn with_active_tab(&self, mut callback: impl FnMut(&FileManager)) {
+        if let Some(tab) = self.active_tab() {
+            callback(&tab);
+        }
+    }
+
+    fn install_actions(&self) {
+        let open = gio::SimpleAction::new("sidebar-open", Some(&String::static_variant_type()));
+        let this = self.clone();
+        open.connect_activate(move |_, parameter| {
+            let Some(location) = sidebar_location_from_parameter(parameter) else {
+                return;
+            };
+            this.with_active_tab(|tab| tab.open_location(location.clone(), true));
+        });
+        self.window.add_action(&open);
+
+        let open_tab =
+            gio::SimpleAction::new("sidebar-open-tab", Some(&String::static_variant_type()));
+        let this = self.clone();
+        open_tab.connect_activate(move |_, parameter| {
+            let Some(location) = sidebar_location_from_parameter(parameter) else {
+                return;
+            };
+            this.add_location_tab(location);
+        });
+        self.window.add_action(&open_tab);
+
+        let open_window =
+            gio::SimpleAction::new("sidebar-open-window", Some(&String::static_variant_type()));
+        open_window.connect_activate(|_, parameter| {
+            let Some(location) = sidebar_location_from_parameter(parameter) else {
+                return;
+            };
+
+            if let Err(err) = open_sidebar_location_in_new_window(&location) {
+                info!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    action = "sidebar-open-window",
+                    error = %err,
+                    "open new window failed"
+                );
+            }
+        });
+        self.window.add_action(&open_window);
+
+        let empty_trash = gio::SimpleAction::new("empty-trash", None);
+        empty_trash.connect_activate(|_, _| {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "empty-trash",
+                "empty trash"
+            );
+        });
+        self.window.add_action(&empty_trash);
+
+        let properties =
+            gio::SimpleAction::new("sidebar-properties", Some(&String::static_variant_type()));
+        properties.connect_activate(|_, parameter| {
+            let Some(location) = sidebar_location_from_parameter(parameter) else {
+                return;
+            };
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "sidebar-properties",
+                location = %location.display_text(),
+                "sidebar properties"
+            );
+        });
+        self.window.add_action(&properties);
+
+        let tab_new = gio::SimpleAction::new("tab-new", None);
+        let this = self.clone();
+        tab_new.connect_activate(move |_, _| {
+            this.add_location_tab(Location::Path(home_dir()));
+        });
+        self.window.add_action(&tab_new);
+
+        let tab_close = gio::SimpleAction::new("tab-close", None);
+        let this = self.clone();
+        tab_close.connect_activate(move |_, _| {
+            this.close_active_tab();
+        });
+        self.window.add_action(&tab_close);
+
+        let file_open = gio::SimpleAction::new("file-open", None);
+        let this = self.clone();
+        file_open.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| {
+                let tab = tab.clone();
+                glib::idle_add_local_once(move || {
+                    if let Some(index) = tab.selected_index() {
+                        tab.activate_item(index);
+                    }
+                });
+            });
+        });
+        self.window.add_action(&file_open);
+
+        let file_cut = gio::SimpleAction::new("file-cut", None);
+        let this = self.clone();
+        file_cut.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.copy_selected_to_clipboard(ClipboardOp::Cut));
+        });
+        self.window.add_action(&file_cut);
+
+        let file_copy = gio::SimpleAction::new("file-copy", None);
+        let this = self.clone();
+        file_copy.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.copy_selected_to_clipboard(ClipboardOp::Copy));
+        });
+        self.window.add_action(&file_copy);
+
+        let file_paste = gio::SimpleAction::new("file-paste", None);
+        let this = self.clone();
+        file_paste.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.paste_files_to_current_folder());
+        });
+        self.window.add_action(&file_paste);
+
+        let file_move_to = gio::SimpleAction::new("file-move-to", None);
+        file_move_to.connect_activate(|_, _| {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-move-to",
+                "move file item to"
+            );
+        });
+        self.window.add_action(&file_move_to);
+
+        let file_copy_to = gio::SimpleAction::new("file-copy-to", None);
+        file_copy_to.connect_activate(|_, _| {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-copy-to",
+                "copy file item to"
+            );
+        });
+        self.window.add_action(&file_copy_to);
+
+        let file_open_tab = gio::SimpleAction::new("file-open-tab", None);
+        let this = self.clone();
+        file_open_tab.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| {
+                if let Some(index) = tab.selected_index_for_action() {
+                    if let Some(item) = tab.visible_entries.borrow().get(index as usize).cloned() {
+                        if item.is_dir {
+                            this.add_location_tab(item.location());
+                        }
+                    }
+                }
+            });
+        });
+        self.window.add_action(&file_open_tab);
+
+        let file_rename = gio::SimpleAction::new("file-rename", None);
+        let this = self.clone();
+        file_rename.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| {
+                let tab = tab.clone();
+                glib::idle_add_local_once(move || tab.show_rename_dialog());
+            });
+        });
+        self.window.add_action(&file_rename);
+
+        let file_select_all = gio::SimpleAction::new("file-select-all", None);
+        let this = self.clone();
+        file_select_all.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.select_all_visible_items());
+        });
+        self.window.add_action(&file_select_all);
+
+        let file_paste_into_folder = gio::SimpleAction::new("file-paste-into-folder", None);
+        let this = self.clone();
+        file_paste_into_folder.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.paste_files_into_selected_folder());
+        });
+        self.window.add_action(&file_paste_into_folder);
+
+        let file_compress = gio::SimpleAction::new("file-compress", None);
+        file_compress.connect_activate(|_, _| {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                action = "file-compress",
+                "compress file item"
+            );
+        });
+        self.window.add_action(&file_compress);
+
+        let file_move_to_trash = gio::SimpleAction::new("file-move-to-trash", None);
+        let this = self.clone();
+        file_move_to_trash.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.trash_selected());
+        });
+        self.window.add_action(&file_move_to_trash);
+
+        let file_properties = gio::SimpleAction::new("file-properties", None);
+        let this = self.clone();
+        file_properties.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.show_properties_dialog());
+        });
+        self.window.add_action(&file_properties);
+    }
+
+    fn close_active_tab(&self) {
+        let Some(active_name) = self.stack.visible_child_name() else {
+            return;
+        };
+
+        let mut tabs = self.tabs.borrow_mut();
+        if tabs.len() <= 1 {
+            self.window.close();
+            return;
+        }
+
+        let Some(index) = tabs
+            .iter()
+            .position(|tab| tab.tab_name == active_name.as_str())
+        else {
+            return;
+        };
+
+        let tab = tabs.remove(index);
+        self.stack.remove(&tab.root);
+
+        let next_index = if index > 0 { index - 1 } else { 0 };
+        if let Some(next_tab) = tabs.get(next_index) {
+            self.stack.set_visible_child_name(&next_tab.tab_name);
+        }
+    }
+
+    fn add_location_tab(&self, location: Location) {
+        let tab_name = self.next_tab_name();
+        let tab_name_for_stack = tab_name.clone();
+        let tab = create_file_manager_page(&self.window, tab_name);
+        let page = self.stack.add_titled(
+            &tab.root,
+            Some(&tab.tab_name),
+            &tab_title_for_location(&location),
+        );
+        tab.set_tab_page(page);
+        match location {
+            Location::Path(path) => tab.open_initial_path(path),
+            other => tab.open_location(other, false),
+        }
+        self.tabs.borrow_mut().push(tab);
+        self.stack.set_visible_child_name(&tab_name_for_stack);
+    }
 }
 
 fn main() {
@@ -98,6 +411,11 @@ fn main() {
     app.set_accels_for_action("win.file-copy", &["<Control>c"]);
     app.set_accels_for_action("win.file-paste", &["<Control>v"]);
     app.set_accels_for_action("win.file-move-to-trash", &["Delete"]);
+    app.set_accels_for_action("win.file-rename", &["F2"]);
+    app.set_accels_for_action("win.file-properties", &["<Alt>Return"]);
+    app.set_accels_for_action("win.file-select-all", &["<Control>a"]);
+    app.set_accels_for_action("win.tab-new", &["<Control>t"]);
+    app.set_accels_for_action("win.tab-close", &["<Control>w"]);
     app.run();
 }
 
@@ -106,6 +424,42 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     window.set_title(Some("FocalDesk Files"));
     window.set_default_size(1040, 680);
 
+    let stack = gtk::Stack::new();
+    stack.set_hexpand(true);
+    stack.set_vexpand(true);
+
+    let switcher = gtk::StackSwitcher::new();
+    switcher.set_stack(Some(&stack));
+    switcher.set_hexpand(true);
+
+    let new_tab_button = icon_button("tab-new-symbolic", "New Tab");
+    let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tab_bar.set_margin_top(8);
+    tab_bar.set_margin_bottom(8);
+    tab_bar.set_margin_start(12);
+    tab_bar.set_margin_end(12);
+    tab_bar.append(&switcher);
+    tab_bar.append(&new_tab_button);
+
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.append(&tab_bar);
+    outer.append(&stack);
+    window.set_content(Some(&outer));
+
+    let tabs = TabManager::new(&window, &stack);
+    tabs.install_actions();
+
+    let tabs_for_button = tabs.clone();
+    new_tab_button.connect_clicked(move |_| {
+        gtk::prelude::ActionGroupExt::activate_action(&tabs_for_button.window, "tab-new", None);
+    });
+
+    ensure_standard_user_dirs();
+    tabs.add_location_tab(Location::Path(initial_path.unwrap_or_else(home_dir)));
+    window.present();
+}
+
+fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -> FileManager {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_show_title(false);
@@ -144,7 +498,9 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     hidden_toggle.set_icon_name("view-hidden-symbolic");
     hidden_toggle.set_tooltip_text(Some("Show Hidden Files"));
     let window_for_close = window.clone();
-    close_button.connect_clicked(move |_| window_for_close.close());
+    close_button.connect_clicked(move |_| {
+        gtk::prelude::ActionGroupExt::activate_action(&window_for_close, "tab-close", None);
+    });
     header.pack_end(&close_button);
     header.pack_end(&hidden_toggle);
     header.pack_end(&grid_view_button);
@@ -171,12 +527,12 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     split.set_sidebar(Some(&adw::NavigationPage::new(&sidebar_box, "Places")));
 
     let list = gtk::ListBox::new();
-    list.set_selection_mode(gtk::SelectionMode::Single);
+    list.set_selection_mode(gtk::SelectionMode::Multiple);
     list.add_css_class("boxed-list");
     list.set_vexpand(true);
 
     let grid = gtk::FlowBox::new();
-    grid.set_selection_mode(gtk::SelectionMode::Single);
+    grid.set_selection_mode(gtk::SelectionMode::Multiple);
     grid.set_valign(gtk::Align::Start);
     grid.set_max_children_per_line(8);
     grid.set_min_children_per_line(2);
@@ -190,16 +546,34 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     scroller.set_vexpand(true);
     scroller.set_child(Some(&list));
 
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some("Search current folder"));
+
+    let sort_dropdown = gtk::DropDown::from_strings(&["Name", "Size", "Type", "Modified"]);
+    sort_dropdown.set_selected(0);
+
+    let sort_descending = gtk::ToggleButton::new();
+    sort_descending.set_icon_name("view-sort-descending-symbolic");
+    sort_descending.set_tooltip_text(Some("Toggle sort order"));
+
     let status = gtk::Label::new(None);
     status.set_xalign(0.0);
     status.add_css_class("dim-label");
     status.set_margin_top(8);
+
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    controls.set_margin_top(8);
+    controls.append(&search_entry);
+    controls.append(&sort_dropdown);
+    controls.append(&sort_descending);
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
     content.set_margin_top(12);
     content.set_margin_bottom(12);
     content.set_margin_start(12);
     content.set_margin_end(12);
+    content.append(&controls);
     let column_header = column_header();
     content.append(&column_header);
     content.append(&scroller);
@@ -207,10 +581,11 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     split.set_content(Some(&adw::NavigationPage::new(&content, "Files")));
 
     toolbar.set_content(Some(&split));
-    window.set_content(Some(&toolbar));
 
     let manager = FileManager {
-        window,
+        window: window.clone(),
+        root: toolbar,
+        tab_name,
         path_entry,
         list,
         grid,
@@ -220,18 +595,22 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         hidden_toggle,
         places,
         view_mode: Rc::new(RefCell::new(ViewMode::Details)),
+        sort_mode: Rc::new(RefCell::new(SortMode::Name)),
+        sort_descending: Rc::new(RefCell::new(false)),
+        search_query: Rc::new(RefCell::new(String::new())),
         current_location: Rc::new(RefCell::new(Location::Path(home_dir()))),
         entries: Rc::new(RefCell::new(Vec::new())),
+        visible_entries: Rc::new(RefCell::new(Vec::new())),
         file_clipboard: Rc::new(RefCell::new(None)),
         back_stack: Rc::new(RefCell::new(Vec::new())),
         forward_stack: Rc::new(RefCell::new(Vec::new())),
+        context_menu_index: Rc::new(RefCell::new(None)),
+        tab_page: Rc::new(RefCell::new(None)),
     };
 
     ensure_standard_user_dirs();
     manager.install_css();
     manager.load_places();
-    manager.install_sidebar_actions();
-    manager.install_file_context_actions();
     manager.connect_actions(
         back_button,
         forward_button,
@@ -245,177 +624,34 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
         grid_view_button,
         places_view,
     );
-    manager.open_initial_path(initial_path.unwrap_or_else(home_dir));
-    manager.window.present();
+    manager.connect_search_and_sort_actions(search_entry, sort_dropdown, sort_descending);
+    manager
 }
 
 impl FileManager {
-    fn install_sidebar_actions(&self) {
-        let open = gio::SimpleAction::new("sidebar-open", Some(&String::static_variant_type()));
+    fn connect_search_and_sort_actions(
+        &self,
+        search_entry: gtk::SearchEntry,
+        sort_dropdown: gtk::DropDown,
+        sort_descending: gtk::ToggleButton,
+    ) {
         let this = self.clone();
-        open.connect_activate(move |_, parameter| {
-            if let Some(location) = sidebar_location_from_parameter(parameter) {
-                this.open_location(location, true);
-            }
+        search_entry.connect_search_changed(move |entry| {
+            this.set_search_query(entry.text().to_string());
         });
-        self.window.add_action(&open);
 
-        let open_tab =
-            gio::SimpleAction::new("sidebar-open-tab", Some(&String::static_variant_type()));
-        open_tab.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "sidebar-open-tab",
-                "open in new tab"
-            );
-        });
-        self.window.add_action(&open_tab);
-
-        let open_window =
-            gio::SimpleAction::new("sidebar-open-window", Some(&String::static_variant_type()));
         let this = self.clone();
-        open_window.connect_activate(move |_, parameter| {
-            let Some(location) = sidebar_location_from_parameter(parameter) else {
-                return;
-            };
-
-            match open_sidebar_location_in_new_window(&location) {
-                Ok(()) => {}
-                Err(err) => this.set_status(&format!("Could not open new window: {err}")),
-            }
+        sort_dropdown.connect_selected_notify(move |dropdown| {
+            this.set_sort_mode(sort_mode_from_dropdown(dropdown.selected()));
         });
-        self.window.add_action(&open_window);
 
-        let empty_trash = gio::SimpleAction::new("empty-trash", None);
-        empty_trash.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "empty-trash",
-                "empty trash"
-            );
+        let this = self.clone();
+        sort_descending.connect_toggled(move |button| {
+            this.set_sort_descending(button.is_active());
         });
-        self.window.add_action(&empty_trash);
-
-        let properties =
-            gio::SimpleAction::new("sidebar-properties", Some(&String::static_variant_type()));
-        properties.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "sidebar-properties",
-                "show properties"
-            );
-        });
-        self.window.add_action(&properties);
     }
 
-    fn install_file_context_actions(&self) {
-        let open = gio::SimpleAction::new("file-open", None);
-        let this = self.clone();
-        open.connect_activate(move |_, _| {
-            let this = this.clone();
-            glib::idle_add_local_once(move || {
-                if let Some(index) = this.selected_index() {
-                    this.activate_item(index);
-                }
-            });
-        });
-        self.window.add_action(&open);
-
-        let cut = gio::SimpleAction::new("file-cut", None);
-        let this = self.clone();
-        cut.connect_activate(move |_, _| {
-            this.copy_selected_to_clipboard(ClipboardOp::Cut);
-        });
-        self.window.add_action(&cut);
-
-        let copy = gio::SimpleAction::new("file-copy", None);
-        let this = self.clone();
-        copy.connect_activate(move |_, _| {
-            this.copy_selected_to_clipboard(ClipboardOp::Copy);
-        });
-        self.window.add_action(&copy);
-
-        let paste = gio::SimpleAction::new("file-paste", None);
-        let this = self.clone();
-        paste.connect_activate(move |_, _| {
-            this.paste_files_to_current_folder();
-        });
-        self.window.add_action(&paste);
-
-        let move_to = gio::SimpleAction::new("file-move-to", None);
-        move_to.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-move-to",
-                "move file item to"
-            );
-        });
-        self.window.add_action(&move_to);
-
-        let copy_to = gio::SimpleAction::new("file-copy-to", None);
-        copy_to.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-copy-to",
-                "copy file item to"
-            );
-        });
-        self.window.add_action(&copy_to);
-
-        let rename = gio::SimpleAction::new("file-rename", None);
-        rename.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-rename",
-                "rename file item"
-            );
-        });
-        self.window.add_action(&rename);
-
-        let paste_into = gio::SimpleAction::new("file-paste-into-folder", None);
-        let this = self.clone();
-        paste_into.connect_activate(move |_, _| {
-            this.paste_files_into_selected_folder();
-        });
-        self.window.add_action(&paste_into);
-
-        let compress = gio::SimpleAction::new("file-compress", None);
-        compress.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-compress",
-                "compress file item"
-            );
-        });
-        self.window.add_action(&compress);
-
-        let move_to_trash = gio::SimpleAction::new("file-move-to-trash", None);
-        let this = self.clone();
-        move_to_trash.connect_activate(move |_, _| {
-            let this = this.clone();
-            glib::idle_add_local_once(move || this.trash_selected());
-        });
-        self.window.add_action(&move_to_trash);
-
-        let properties = gio::SimpleAction::new("file-properties", None);
-        properties.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-properties",
-                "show file properties"
-            );
-        });
-        self.window.add_action(&properties);
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn connect_actions(
         &self,
         back_button: gtk::Button,
@@ -636,6 +872,7 @@ impl FileManager {
                 *self.entries.borrow_mut() = items;
                 self.path_entry.set_text(&location.display_text());
                 self.render_entries();
+                self.update_tab_title();
             }
             Err(err) => {
                 self.set_status(&format!(
@@ -665,6 +902,20 @@ impl FileManager {
         self.open_dir(dir, false);
     }
 
+    fn set_tab_page(&self, page: gtk::StackPage) {
+        self.tab_page.borrow_mut().replace(page);
+        self.update_tab_title();
+    }
+
+    fn update_tab_title(&self) {
+        let tab_page = self.tab_page.borrow();
+        let Some(page) = tab_page.as_ref() else {
+            return;
+        };
+
+        page.set_title(&tab_title_for_location(&self.current_location.borrow()));
+    }
+
     fn reload(&self) {
         let location = self.current_location.borrow().clone();
         self.open_location(location, false);
@@ -686,13 +937,23 @@ impl FileManager {
         }
 
         let view_mode = *self.view_mode.borrow();
-        for item in self.entries.borrow().iter() {
+        let search_query = self.search_query.borrow().clone();
+        let sort_mode = *self.sort_mode.borrow();
+        let sort_descending = *self.sort_descending.borrow();
+        let mut visible_entries = self.entries.borrow().clone();
+        visible_entries.retain(|item| file_matches_search(item, &search_query));
+        sort_file_items(&mut visible_entries, sort_mode, sort_descending);
+        *self.visible_entries.borrow_mut() = visible_entries.clone();
+
+        for item in visible_entries.iter() {
             let row = file_row(item, view_mode);
             attach_file_drag_source(&row, item.clone());
             let list = self.list.clone();
             let row_for_context = row.clone();
+            let context_index = self.context_menu_index.clone();
             attach_file_context_menu(&row, file_context_target(item), move || {
                 list.select_row(Some(&row_for_context));
+                *context_index.borrow_mut() = Some(row_for_context.index());
             });
             self.list.append(&row);
 
@@ -700,22 +961,33 @@ impl FileManager {
             attach_file_drag_source(&child, item.clone());
             let grid = self.grid.clone();
             let child_for_context = child.clone();
+            let context_index = self.context_menu_index.clone();
             attach_file_context_menu(&child, file_context_target(item), move || {
                 grid.select_child(&child_for_context);
+                *context_index.borrow_mut() = Some(child_for_context.index());
             });
             self.grid.append(&child);
         }
 
         let entries = self.entries.borrow();
-        let folders = entries.iter().filter(|item| item.is_dir).count();
-        let files = entries.len().saturating_sub(folders);
-        self.set_status(&format!(
-            "{} folder{}, {} file{}",
-            folders,
-            plural(folders),
-            files,
-            plural(files)
-        ));
+        let total_folders = entries.iter().filter(|item| item.is_dir).count();
+        let total_files = entries.len().saturating_sub(total_folders);
+        if visible_entries.len() == entries.len() {
+            self.set_status(&format!(
+                "{} folder{}, {} file{}",
+                total_folders,
+                plural(total_folders),
+                total_files,
+                plural(total_files)
+            ));
+        } else {
+            self.set_status(&format!(
+                "Showing {} of {} item{}",
+                visible_entries.len(),
+                entries.len(),
+                plural(entries.len())
+            ));
+        }
     }
 
     fn show_new_folder_dialog(&self) {
@@ -781,13 +1053,117 @@ impl FileManager {
         dialog.present();
     }
 
-    fn trash_selected(&self) {
-        let Some(index) = self.selected_index() else {
-            self.set_status("Select an item to move to trash.");
+    fn show_rename_dialog(&self) {
+        let Some(index) = self.selected_index_for_action() else {
+            self.set_status("Select an item to rename.");
             return;
         };
 
+        if self.selected_indices().len() > 1 && self.context_menu_index.borrow().is_none() {
+            self.set_status("Select only one item to rename.");
+            return;
+        }
+
         let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
+            return;
+        };
+
+        let Some(source_path) = item.path.clone() else {
+            self.set_status("Only local files and folders can be renamed.");
+            return;
+        };
+
+        let Some(parent_dir) = source_path.parent().map(Path::to_path_buf) else {
+            self.set_status("Cannot rename this item.");
+            return;
+        };
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Rename")
+            .default_width(360)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let label = gtk::Label::new(Some("New name"));
+        label.set_xalign(0.0);
+        let entry = gtk::Entry::new();
+        entry.set_text(&item.name);
+        entry.select_region(0, item.name.chars().count() as i32);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let rename = gtk::Button::with_label("OK");
+        rename.add_css_class("suggested-action");
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+        actions.append(&rename);
+
+        content.append(&label);
+        content.append(&entry);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+        dialog.set_default_widget(Some(&rename));
+
+        let rename_for_enter = rename.clone();
+        entry.connect_activate(move |_| rename_for_enter.emit_clicked());
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+        let key_controller = gtk::EventControllerKey::new();
+        let dialog_for_escape = dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk::gdk::Key::Escape {
+                dialog_for_escape.close();
+                return glib::Propagation::Stop;
+            }
+
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(key_controller);
+
+        let this = self.clone();
+        let dialog_for_rename = dialog.clone();
+        rename.connect_clicked(move |_| {
+            let name = entry.text().trim().to_string();
+            if name.is_empty() || name.contains('/') {
+                this.set_status("Names cannot be empty or contain '/'.");
+                return;
+            }
+
+            let destination = parent_dir.join(&name);
+            if destination == source_path {
+                dialog_for_rename.close();
+                return;
+            }
+
+            match std::fs::rename(&source_path, &destination) {
+                Ok(()) => {
+                    this.reload();
+                    this.set_status(&format!("Renamed {} to {}.", item.name, name));
+                    dialog_for_rename.close();
+                }
+                Err(err) => {
+                    this.set_status(&format!("Could not rename {}: {err}", item.name));
+                }
+            }
+        });
+
+        dialog.present();
+    }
+
+    fn trash_selected(&self) {
+        let selected = self.selected_file_items();
+        if selected.is_empty() {
+            self.set_status("Select an item to move to trash.");
             return;
         };
 
@@ -796,26 +1172,54 @@ impl FileManager {
             return;
         }
 
-        match item.file.trash(gio::Cancellable::NONE) {
-            Ok(()) => {
-                self.set_status(&format!("Moved {} to trash.", item.name));
-                self.reload();
-            }
-            Err(err) => self.set_status(&format!("Could not move {} to trash: {err}", item.name)),
-        }
+        let items = selected;
+        self.run_progress_job(
+            "Moving to Trash",
+            items.len(),
+            move |index| match items.get(index) {
+                Some(item) => item
+                    .file
+                    .trash(gio::Cancellable::NONE)
+                    .map_err(|err| format!("Could not move {} to trash: {err}", item.name)),
+                None => Ok(()),
+            },
+            {
+                let this = self.clone();
+                move |outcome, completed, error| match outcome {
+                    FileJobOutcome::Finished => {
+                        this.reload();
+                        match (completed, error) {
+                            (0, Some(err)) => this.set_status(&err),
+                            (count, Some(err)) => this.set_status(&format!(
+                                "Moved {count} item{} to trash; some items failed: {err}",
+                                plural(count)
+                            )),
+                            (count, None) => this.set_status(&format!(
+                                "Moved {count} item{} to trash.",
+                                plural(count)
+                            )),
+                        }
+                    }
+                    FileJobOutcome::Cancelled => this.set_status(&format!(
+                        "Cancelled after moving {completed} item{} to trash.",
+                        plural(completed)
+                    )),
+                }
+            },
+        );
     }
 
     fn copy_selected_to_clipboard(&self, op: ClipboardOp) {
-        let Some(index) = self.selected_index() else {
+        let selected = self.selected_file_items();
+        if selected.is_empty() {
             self.set_status("Select an item to copy.");
             return;
         };
 
-        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
-            return;
-        };
-
-        let files = vec![item.file.clone()];
+        let files = selected
+            .iter()
+            .map(|item| item.file.clone())
+            .collect::<Vec<_>>();
         let provider = file_clipboard_provider(&files, op);
 
         let Some(display) = gtk::gdk::Display::default() else {
@@ -830,9 +1234,13 @@ impl FileManager {
                     ClipboardOp::Copy => "Copied",
                     ClipboardOp::Cut => "Cut",
                 };
-                self.set_status(&format!("{action} {} to clipboard.", item.name));
+                self.set_status(&format!(
+                    "{action} {} item{} to clipboard.",
+                    selected.len(),
+                    plural(selected.len())
+                ));
             }
-            Err(err) => self.set_status(&format!("Could not copy {}: {err}", item.name)),
+            Err(err) => self.set_status(&format!("Could not copy selection: {err}")),
         }
     }
 
@@ -846,7 +1254,7 @@ impl FileManager {
     }
 
     fn paste_files_into_selected_folder(&self) {
-        let Some(index) = self.selected_index() else {
+        let Some(index) = self.selected_index_for_action() else {
             self.set_status("Select a folder to paste into.");
             return;
         };
@@ -940,42 +1348,59 @@ impl FileManager {
             return;
         }
 
-        let mut completed = 0usize;
-        let mut last_error = None;
-
-        for file in files {
-            let result = match op {
-                ClipboardOp::Copy => copy_dropped_file(&file, target_dir),
-                ClipboardOp::Cut => move_clipboard_file(&file, target_dir),
-            };
-
-            match result {
-                Ok(()) => completed += 1,
-                Err(err) => last_error = Some(err),
-            }
-        }
-
-        self.reload();
-
-        if matches!(op, ClipboardOp::Cut) && last_error.is_none() {
-            self.file_clipboard.borrow_mut().take();
-        }
-
+        let target_dir = target_dir.to_path_buf();
         let verb = match op {
+            ClipboardOp::Copy => "Copying",
+            ClipboardOp::Cut => "Moving",
+        };
+        let done_verb = match op {
             ClipboardOp::Copy => "Copied",
             ClipboardOp::Cut => "Moved",
         };
+        self.run_progress_job(
+            verb,
+            files.len(),
+            move |index| match files.get(index) {
+                Some(file) => match op {
+                    ClipboardOp::Copy => {
+                        copy_dropped_file(file, &target_dir).map_err(|err| err.to_string())
+                    }
+                    ClipboardOp::Cut => {
+                        move_clipboard_file(file, &target_dir).map_err(|err| err.to_string())
+                    }
+                },
+                None => Ok(()),
+            },
+            {
+                let this = self.clone();
+                move |outcome, completed, error| match outcome {
+                    FileJobOutcome::Finished => {
+                        this.reload();
+                        if matches!(op, ClipboardOp::Cut) && error.is_none() {
+                            this.file_clipboard.borrow_mut().take();
+                        }
 
-        match (completed, last_error) {
-            (0, Some(err)) => self.set_status(&format!("Could not paste files: {err}")),
-            (count, Some(err)) => self.set_status(&format!(
-                "{verb} {count} item{}; some items failed: {err}",
-                plural(count)
-            )),
-            (count, None) => {
-                self.set_status(&format!("{verb} {count} pasted item{}.", plural(count)))
-            }
-        }
+                        match (completed, error) {
+                            (0, Some(err)) => {
+                                this.set_status(&format!("Could not paste files: {err}"))
+                            }
+                            (count, Some(err)) => this.set_status(&format!(
+                                "{done_verb} {count} item{}; some items failed: {err}",
+                                plural(count)
+                            )),
+                            (count, None) => this.set_status(&format!(
+                                "{done_verb} {count} pasted item{}.",
+                                plural(count)
+                            )),
+                        }
+                    }
+                    FileJobOutcome::Cancelled => this.set_status(&format!(
+                        "Cancelled after {done_verb} {completed} item{}.",
+                        plural(completed)
+                    )),
+                }
+            },
+        );
     }
 
     fn watch_file_clipboard_owner(&self) {
@@ -1004,7 +1429,7 @@ impl FileManager {
             return;
         };
 
-        if let Some(item) = self.entries.borrow().get(index as usize) {
+        if let Some(item) = self.visible_entries.borrow().get(index as usize) {
             self.path_entry.set_text(&item.display_path());
         }
     }
@@ -1014,7 +1439,7 @@ impl FileManager {
             return;
         }
 
-        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
+        let Some(item) = self.visible_entries.borrow().get(index as usize).cloned() else {
             return;
         };
 
@@ -1041,6 +1466,145 @@ impl FileManager {
         }
     }
 
+    fn selected_indices(&self) -> Vec<i32> {
+        let mut indices = match *self.view_mode.borrow() {
+            ViewMode::Grid => self
+                .grid
+                .selected_children()
+                .into_iter()
+                .map(|child| child.index())
+                .filter(|index| *index >= 0)
+                .collect::<Vec<_>>(),
+            ViewMode::Details | ViewMode::List => self
+                .list
+                .selected_rows()
+                .into_iter()
+                .map(|row| row.index())
+                .filter(|index| *index >= 0)
+                .collect::<Vec<_>>(),
+        };
+
+        indices.sort_unstable();
+        indices
+    }
+
+    fn selected_file_items(&self) -> Vec<FileItem> {
+        self.selected_indices()
+            .into_iter()
+            .filter_map(|index| self.visible_entries.borrow().get(index as usize).cloned())
+            .collect()
+    }
+
+    fn select_all_visible_items(&self) {
+        match *self.view_mode.borrow() {
+            ViewMode::Grid => self.grid.select_all(),
+            ViewMode::Details | ViewMode::List => self.list.select_all(),
+        }
+    }
+
+    fn run_progress_job(
+        &self,
+        title: &str,
+        total: usize,
+        mut step: impl FnMut(usize) -> Result<(), String> + 'static,
+        mut on_finish: impl FnMut(FileJobOutcome, usize, Option<String>) + 'static,
+    ) {
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title(title)
+            .default_width(420)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let label = gtk::Label::new(Some(title));
+        label.set_xalign(0.0);
+        label.add_css_class("title-3");
+
+        let progress = gtk::ProgressBar::new();
+        progress.set_show_text(true);
+        progress.set_fraction(0.0);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+
+        content.append(&label);
+        content.append(&progress);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+        dialog.present();
+
+        let cancelled = Rc::new(RefCell::new(false));
+        let cancelled_for_button = cancelled.clone();
+        cancel.connect_clicked(move |_| {
+            *cancelled_for_button.borrow_mut() = true;
+        });
+
+        let dialog_for_finish = dialog.clone();
+        let progress_for_finish = progress.clone();
+        let processed = Rc::new(RefCell::new(0usize));
+        let processed_for_tick = processed.clone();
+        let last_error = Rc::new(RefCell::new(None::<String>));
+        let last_error_for_tick = last_error.clone();
+
+        glib::timeout_add_local(std::time::Duration::from_millis(0), move || {
+            if *cancelled.borrow() {
+                let completed = *processed.borrow();
+                on_finish(
+                    FileJobOutcome::Cancelled,
+                    completed,
+                    last_error.borrow().clone(),
+                );
+                dialog_for_finish.close();
+                return ControlFlow::Break;
+            }
+
+            let index = *processed_for_tick.borrow();
+            if index >= total {
+                let completed = *processed_for_tick.borrow();
+                on_finish(
+                    FileJobOutcome::Finished,
+                    completed,
+                    last_error_for_tick.borrow().clone(),
+                );
+                dialog_for_finish.close();
+                return ControlFlow::Break;
+            }
+
+            if total > 0 {
+                progress_for_finish.set_fraction(index as f64 / total as f64);
+                progress_for_finish.set_text(Some(&format!("{index} of {total}")));
+            }
+
+            match step(index) {
+                Ok(()) => {}
+                Err(err) => {
+                    *last_error_for_tick.borrow_mut() = Some(err);
+                }
+            }
+
+            *processed_for_tick.borrow_mut() = index + 1;
+            ControlFlow::Continue
+        });
+    }
+
+    fn selected_index_for_action(&self) -> Option<i32> {
+        if let Some(index) = self.context_menu_index.borrow_mut().take() {
+            if index >= 0 {
+                return Some(index);
+            }
+        }
+
+        self.selected_index()
+    }
+
     fn set_view_mode(&self, view_mode: ViewMode) {
         if *self.view_mode.borrow() == view_mode {
             return;
@@ -1058,6 +1622,124 @@ impl FileManager {
         self.render_entries();
         self.path_entry
             .set_text(&self.current_location.borrow().display_text());
+    }
+
+    fn set_search_query(&self, query: String) {
+        let normalized = query.trim().to_string();
+        if *self.search_query.borrow() == normalized {
+            return;
+        }
+
+        *self.search_query.borrow_mut() = normalized;
+        self.context_menu_index.borrow_mut().take();
+        self.render_entries();
+    }
+
+    fn set_sort_mode(&self, sort_mode: SortMode) {
+        if *self.sort_mode.borrow() == sort_mode {
+            return;
+        }
+
+        *self.sort_mode.borrow_mut() = sort_mode;
+        self.render_entries();
+    }
+
+    fn set_sort_descending(&self, descending: bool) {
+        if *self.sort_descending.borrow() == descending {
+            return;
+        }
+
+        *self.sort_descending.borrow_mut() = descending;
+        self.render_entries();
+    }
+
+    fn show_properties_dialog(&self) {
+        let items = self.selected_file_items();
+        if items.is_empty() {
+            self.set_status("Select one or more items to view properties.");
+            return;
+        }
+
+        let is_multiple = items.len() > 1;
+        let folder_count = items.iter().filter(|item| item.is_dir).count();
+        let file_count = items.len().saturating_sub(folder_count);
+        let total_size = items.iter().map(|item| item.size).sum::<u64>();
+        let title = if is_multiple {
+            format!("Properties ({} items)", items.len())
+        } else {
+            "Properties".to_string()
+        };
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title(&title)
+            .default_width(460)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let header_text = if is_multiple {
+            format!("{} items selected", items.len())
+        } else {
+            items[0].name.clone()
+        };
+        let header = gtk::Label::new(Some(&header_text));
+        header.set_xalign(0.0);
+        header.add_css_class("title-3");
+        content.append(&header);
+
+        let grid = gtk::Grid::new();
+        grid.set_column_spacing(12);
+        grid.set_row_spacing(8);
+
+        let mut row = 0;
+        let type_text = if is_multiple {
+            format!("{folder_count} folders, {file_count} files")
+        } else if items[0].is_dir {
+            "Folder".to_string()
+        } else {
+            "File".to_string()
+        };
+        add_property_row(&grid, &mut row, "Type", type_text);
+        let location_text = property_location_text(&items);
+        add_property_row(&grid, &mut row, "Location", location_text);
+        let size_text = if is_multiple {
+            format_size(total_size)
+        } else {
+            format_size(items[0].size)
+        };
+        add_property_row(&grid, &mut row, "Size", size_text);
+        let modified_text = if is_multiple {
+            "Multiple items".to_string()
+        } else {
+            items[0].modified.clone()
+        };
+        add_property_row(&grid, &mut row, "Modified", modified_text);
+
+        if let Some(path) = &items[0].path {
+            add_property_row(&grid, &mut row, "Path", path.to_string_lossy().into_owned());
+        } else {
+            add_property_row(&grid, &mut row, "URI", items[0].uri.clone());
+        }
+
+        content.append(&grid);
+
+        let close = gtk::Button::with_label("Close");
+        close.add_css_class("suggested-action");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&close);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+
+        let dialog_for_close = dialog.clone();
+        close.connect_clicked(move |_| dialog_for_close.close());
+        dialog.present();
     }
 
     fn install_drop_target(&self, widget: &impl IsA<gtk::Widget>) {
@@ -1148,35 +1830,46 @@ impl FileManager {
         }
 
         let target_dir = target_dir.clone();
-        let mut copied = 0usize;
-        let mut last_error = None;
-
-        for file in files {
-            match copy_dropped_file(&file, &target_dir) {
-                Ok(()) => copied += 1,
-                Err(err) => last_error = Some(err),
-            }
-        }
-
-        self.reload();
-
-        match (copied, last_error) {
-            (0, Some(err)) => {
-                self.set_status(&format!("Could not copy dropped files: {err}"));
-                false
-            }
-            (count, Some(err)) => {
-                self.set_status(&format!(
-                    "Copied {count} item{}; some items failed: {err}",
-                    plural(count)
-                ));
-                true
-            }
-            (count, None) => {
-                self.set_status(&format!("Copied {count} dropped item{}.", plural(count)));
-                true
-            }
-        }
+        self.run_progress_job(
+            "Copying",
+            files.len(),
+            move |index| match files.get(index) {
+                Some(file) => copy_dropped_file(file, &target_dir).map_err(|err| err.to_string()),
+                None => Ok(()),
+            },
+            {
+                let this = self.clone();
+                move |outcome, completed, error| match outcome {
+                    FileJobOutcome::Finished => {
+                        this.reload();
+                        match (completed, error) {
+                            (0, Some(err)) => {
+                                this.set_status(&format!("Could not copy dropped files: {err}"));
+                            }
+                            (count, Some(err)) => {
+                                this.set_status(&format!(
+                                    "Copied {count} item{}; some items failed: {err}",
+                                    plural(count)
+                                ));
+                            }
+                            (count, None) => {
+                                this.set_status(&format!(
+                                    "Copied {count} dropped item{}.",
+                                    plural(count)
+                                ));
+                            }
+                        }
+                    }
+                    FileJobOutcome::Cancelled => {
+                        this.set_status(&format!(
+                            "Cancelled after copying {completed} item{}.",
+                            plural(completed)
+                        ));
+                    }
+                }
+            },
+        );
+        true
     }
 }
 
@@ -1399,6 +2092,9 @@ fn attach_file_context_menu(
     let menu = gio::Menu::new();
 
     menu.append(Some("Open"), Some("win.file-open"));
+    if matches!(target, FileContextTarget::Folder) {
+        menu.append(Some("Open in New Tab"), Some("win.file-open-tab"));
+    }
 
     menu.append_section(None, &{
         let section = gio::Menu::new();
@@ -1687,7 +2383,7 @@ fn copy_dropped_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
             gio::Cancellable::NONE,
             None,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+        .map_err(|err| io::Error::other(err.to_string()))
     }
 }
 
@@ -1722,7 +2418,7 @@ fn move_clipboard_file(file: &gio::File, target_dir: &Path) -> io::Result<()> {
             gio::Cancellable::NONE,
             None,
         )
-        .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))
+        .map_err(|err| io::Error::other(err.to_string()))
     }
 }
 
@@ -1815,12 +2511,9 @@ fn launch_desktop_entry(path: &Path) -> io::Result<()> {
         log_launch("unset WAYLAND_DISPLAY for .exe desktop entry (XWayland-only launch)");
     }
 
-    app_info.launch(&[], Some(&context)).map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("desktop entry launch failed: {err}"),
-        )
-    })?;
+    app_info
+        .launch(&[], Some(&context))
+        .map_err(|err| io::Error::other(format!("desktop entry launch failed: {err}")))?;
 
     log_launch(&format!(
         "desktop entry launched via GIO: {}",
@@ -1906,6 +2599,20 @@ fn normalize_location(location: Location) -> Location {
     }
 }
 
+fn tab_title_for_location(location: &Location) -> String {
+    match location {
+        Location::Path(path) if *path == home_dir() => "Home".to_string(),
+        Location::Path(path) => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        Location::Trash => "Trash".to_string(),
+        Location::Uri(uri) => uri.clone(),
+        Location::Separator => "-".to_string(),
+    }
+}
+
 fn sidebar_location_from_parameter(parameter: Option<&glib::Variant>) -> Option<Location> {
     parameter
         .and_then(|parameter| parameter.get::<String>())
@@ -1973,6 +2680,109 @@ fn plural(count: usize) -> &'static str {
     } else {
         "s"
     }
+}
+
+fn file_matches_search(item: &FileItem, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+
+    let query = query.to_ascii_lowercase();
+    item.name.to_ascii_lowercase().contains(&query)
+        || item.uri.to_ascii_lowercase().contains(&query)
+        || item
+            .path
+            .as_ref()
+            .is_some_and(|path| path.to_string_lossy().to_ascii_lowercase().contains(&query))
+}
+
+fn sort_mode_from_dropdown(index: u32) -> SortMode {
+    match index {
+        1 => SortMode::Size,
+        2 => SortMode::Type,
+        3 => SortMode::Modified,
+        _ => SortMode::Name,
+    }
+}
+
+fn sort_file_items(items: &mut [FileItem], mode: SortMode, descending: bool) {
+    items.sort_by(|a, b| {
+        let dir_cmp = b.is_dir.cmp(&a.is_dir);
+        if dir_cmp != std::cmp::Ordering::Equal {
+            return dir_cmp;
+        }
+
+        let ordering = match mode {
+            SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            SortMode::Size => a
+                .size
+                .cmp(&b.size)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            SortMode::Type => file_sort_key(a)
+                .cmp(&file_sort_key(b))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            SortMode::Modified => a
+                .modified
+                .cmp(&b.modified)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+        };
+
+        if descending {
+            ordering.reverse()
+        } else {
+            ordering
+        }
+    });
+}
+
+fn file_sort_key(item: &FileItem) -> String {
+    if item.is_dir {
+        "folder".to_string()
+    } else {
+        item.path
+            .as_ref()
+            .and_then(|path| path.extension())
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .unwrap_or_else(|| "file".to_string())
+    }
+}
+
+fn property_location_text(items: &[FileItem]) -> String {
+    let mut locations = items
+        .iter()
+        .map(|item| {
+            item.path
+                .as_ref()
+                .and_then(|path| {
+                    path.parent()
+                        .map(|parent| parent.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| item.uri.clone())
+        })
+        .collect::<Vec<_>>();
+    locations.sort();
+    locations.dedup();
+
+    match locations.as_slice() {
+        [single] => single.clone(),
+        _ => "Multiple locations".to_string(),
+    }
+}
+
+fn add_property_row(grid: &gtk::Grid, row: &mut i32, label: &str, value: impl AsRef<str>) {
+    let key = gtk::Label::new(Some(label));
+    key.set_xalign(0.0);
+    key.add_css_class("dim-label");
+
+    let value = gtk::Label::new(Some(value.as_ref()));
+    value.set_xalign(0.0);
+    value.set_wrap(true);
+    value.set_selectable(true);
+
+    grid.attach(&key, 0, *row, 1, 1);
+    grid.attach(&value, 1, *row, 1, 1);
+    *row += 1;
 }
 
 fn sidebar_kind_for_place(path: &str) -> SidebarKind {

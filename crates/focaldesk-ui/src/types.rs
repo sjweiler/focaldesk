@@ -13,6 +13,7 @@ pub enum PanelKind {
     Settings,
     Workspaces,
     AppLauncher,
+    ClipboardHistory,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -24,6 +25,8 @@ pub enum SettingKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SystemCommand {
+    Suspend,
+    Hibernate,
     Shutdown,
     Restart,
     Logout,
@@ -36,11 +39,13 @@ pub enum UiAction {
     ToggleSetting(SettingKey),
     SetSetting(SettingKey, bool),
     OpenPanel(PanelKind),
+    ReloadSettings,
     CreateWorkspace(String),
     DeleteWorkspace,
     SetVolume(f32),
     SystemCommand(SystemCommand),
     Custom(ElementId),
+    SelectClipboardEntry(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +69,7 @@ pub enum UiElementKind {
     SidebarButton,
     TopbarIndicator,
     TopbarButton,
+    TopbarFlowField,
     WorkspaceSlot,
     Clock,
     OutputLabel,

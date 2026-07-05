@@ -1,14 +1,14 @@
 use adw::prelude::*;
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, watch_desktop_keys, IpcRequest,
-    IpcResponse,
+    send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
+    send_settings_request, watch_desktop_keys, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    PowerIpcRequest, PowerIpcResponse,
 };
 use focaldesk_logging::{init_default_logging, session_id};
-use focaldesk_power::{PowerCommand, PowerManager};
 use focaldesk_settings_core::{
-    load_settings, save_settings, DebugLogLevel, LidCloseAction, LowBatteryAction, OutputConfig,
-    PerformanceMode, PowerButtonAction, Settings,
+    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 
@@ -57,6 +57,8 @@ const POWER_BUTTON_OPTIONS: &[&str] = &["Show power menu", "Suspend", "Power off
 const LID_CLOSE_OPTIONS: &[&str] = &["Suspend", "Blank screen", "Lock screen", "Do nothing"];
 const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "Power off"];
 const PERFORMANCE_MODE_OPTIONS: &[&str] = &["Balanced", "Performance", "Power saver"];
+const BROWSER_LAUNCH_BACKEND_OPTIONS: &[&str] = &["Auto", "Wayland", "XWayland"];
+const DISPLAY_COLOR_PROFILE_OPTIONS: &[&str] = &["Auto", "sRGB", "Display P3"];
 
 #[derive(Debug, Clone)]
 struct WifiNetwork {
@@ -161,6 +163,14 @@ struct DisplayConfig {
     hdr_requested: bool,
     #[serde(default)]
     hdr_enabled: bool,
+    #[serde(default)]
+    color_profile: DisplayColorProfile,
+    #[serde(default)]
+    icc_profile_path: Option<String>,
+    #[serde(skip)]
+    icc_lut_fallback_active: bool,
+    #[serde(skip)]
+    wide_gamut_active: bool,
 }
 
 fn save_displays(displays: &[DisplayConfig]) {
@@ -176,14 +186,14 @@ fn save_displays(displays: &[DisplayConfig]) {
 
     let outputs = displays.iter().map(output_config_from_display).collect();
 
-    match send_desktop_request(&IpcRequest::SetDisplays { outputs }) {
+    match send_settings_request(&IpcRequest::SetDisplays { outputs }) {
         Ok(IpcResponse::Ok) => {}
         Ok(IpcResponse::Error { message }) => {
             warn!(
                 target: "focaldesk",
                 session_id = session_id(),
                 message = %message,
-                "display IPC update rejected"
+                "settings IPC update rejected"
             );
         }
         Ok(other) => {
@@ -191,7 +201,7 @@ fn save_displays(displays: &[DisplayConfig]) {
                 target: "focaldesk",
                 session_id = session_id(),
                 response = ?other,
-                "unexpected display IPC response"
+                "unexpected settings IPC response"
             );
         }
         Err(err) => {
@@ -199,7 +209,7 @@ fn save_displays(displays: &[DisplayConfig]) {
                 target: "focaldesk",
                 session_id = session_id(),
                 error = %err,
-                "display IPC unavailable; saved display config directly"
+                "settings IPC unavailable; saved display config directly"
             );
         }
     }
@@ -216,6 +226,8 @@ fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
         refresh_mhz: display.refresh_mhz,
         scale: display.scale as f32,
         primary: display.primary,
+        color_profile: display.color_profile,
+        icc_profile_path: display.icc_profile_path.clone(),
         hdr_requested: display.hdr_requested,
         hdr_enabled: display.hdr_enabled,
     }
@@ -387,15 +399,32 @@ fn load_displays() -> Vec<DisplayConfig> {
 }
 
 fn display_summary(d: &DisplayConfig) -> String {
+    let profile = d
+        .icc_profile_path
+        .as_deref()
+        .map(display_icc_profile_label)
+        .unwrap_or_else(|| display_color_profile_label(d.color_profile));
+    let gamut = if d.wide_gamut_active {
+        "Wide-gamut active"
+    } else {
+        "sRGB advertised"
+    };
     format!(
-        "{}x{} @ {} Hz  |  {}  |  Scale {:.2}{}{}",
+        "{}x{} @ {} Hz  |  {}  |  {}  |  {}  |  Scale {:.2}{}{}{}",
         d.mode_width,
         d.mode_height,
         d.refresh_mhz / 1000,
         transform_label(&d.transform),
+        profile,
+        gamut,
         d.scale,
         if d.primary { "  |  Primary" } else { "" },
-        if d.enabled { "" } else { "  |  Disabled" }
+        if d.enabled { "" } else { "  |  Disabled" },
+        if d.icc_lut_fallback_active {
+            "  |  ICC LUT fallback active"
+        } else {
+            ""
+        }
     )
 }
 
@@ -407,6 +436,21 @@ fn hdr_status_subtitle(hdr_requested: bool, hdr_enabled: bool) -> &'static str {
     } else {
         "Off"
     }
+}
+
+fn display_color_profile_label(profile: DisplayColorProfile) -> &'static str {
+    match profile {
+        DisplayColorProfile::Auto => "Auto color profile",
+        DisplayColorProfile::Srgb => "sRGB output",
+        DisplayColorProfile::DisplayP3 => "Display P3 output",
+    }
+}
+
+fn display_icc_profile_label(path: &str) -> &str {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path)
 }
 
 fn transform_label(transform: &str) -> &'static str {
@@ -433,6 +477,22 @@ fn transform_from_index(index: u32) -> &'static str {
         2 => "Rotate180",
         3 => "Rotate270",
         _ => "Normal",
+    }
+}
+
+fn display_color_profile_index(profile: DisplayColorProfile) -> u32 {
+    match profile {
+        DisplayColorProfile::Auto => 0,
+        DisplayColorProfile::Srgb => 1,
+        DisplayColorProfile::DisplayP3 => 2,
+    }
+}
+
+fn selected_display_color_profile(index: u32) -> DisplayColorProfile {
+    match index {
+        1 => DisplayColorProfile::Srgb,
+        2 => DisplayColorProfile::DisplayP3,
+        _ => DisplayColorProfile::Auto,
     }
 }
 
@@ -1192,9 +1252,7 @@ fn sanitize_printer_name(name: &str) -> String {
     let mut last_was_separator = false;
 
     for ch in name.chars() {
-        let ch = if ch.is_ascii_alphanumeric() {
-            ch
-        } else if matches!(ch, '_' | '-' | '.') {
+        let ch = if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.') {
             ch
         } else if ch.is_whitespace() || matches!(ch, ':' | '/' | '%' | '?' | '&' | '=') {
             '_'
@@ -1251,10 +1309,7 @@ fn parse_installable_printers(
         let kind = kind.trim();
         let uri = uri.trim();
 
-        if kind.is_empty()
-            || uri.is_empty()
-            || configured_uris.iter().any(|configured| *configured == uri)
-        {
+        if kind.is_empty() || uri.is_empty() || configured_uris.contains(&uri) {
             continue;
         }
 
@@ -1443,12 +1498,17 @@ fn connected_display_row(
     index: usize,
     displays: Rc<RefCell<Vec<DisplayConfig>>>,
     area: gtk::DrawingArea,
+    row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>>,
+    parent: adw::ApplicationWindow,
 ) -> adw::ExpanderRow {
     let display = displays.borrow()[index].clone();
     let row = adw::ExpanderRow::new();
     row.set_title(&display.name);
     row.set_subtitle(&display_summary(&display));
     row.set_enable_expansion(true);
+    row_registry
+        .borrow_mut()
+        .insert(display.name.clone(), row.clone());
 
     let info = gtk::Image::from_icon_name("dialog-information-symbolic");
     info.set_tooltip_text(Some("Display details"));
@@ -1631,6 +1691,97 @@ fn connected_display_row(
         }
     }
 
+    let color_row = adw::ActionRow::new();
+    color_row.set_title("Color profile");
+    color_row.set_subtitle("Choose the output profile the compositor should advertise");
+    let color_dropdown = dropdown_from_strings(
+        DISPLAY_COLOR_PROFILE_OPTIONS,
+        display_color_profile_index(display.color_profile),
+    );
+    color_row.add_suffix(&color_dropdown);
+    color_row.set_activatable_widget(Some(&color_dropdown));
+    row.add_row(&color_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        color_dropdown.connect_selected_notify(move |dropdown| {
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.color_profile = selected_display_color_profile(dropdown.selected());
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let icc_row = adw::ActionRow::new();
+    icc_row.set_title("ICC profile file");
+    let icc_subtitle = display
+        .icc_profile_path
+        .as_deref()
+        .map(|path| format!("Selected: {}", display_icc_profile_label(path)))
+        .unwrap_or_else(|| "No ICC file selected".to_string());
+    icc_row.set_subtitle(&icc_subtitle);
+    let icc_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let choose_icc = gtk::Button::with_label("Choose ICC...");
+    let clear_icc = gtk::Button::with_label("Clear");
+    icc_buttons.append(&choose_icc);
+    icc_buttons.append(&clear_icc);
+    icc_row.add_suffix(&icc_buttons);
+    icc_row.set_activatable_widget(Some(&choose_icc));
+    row.add_row(&icc_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        let parent = parent.clone();
+        let icc_row = icc_row.clone();
+        choose_icc.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Choose ICC Profile");
+            dialog.open(Some(&parent), None::<&gtk::gio::Cancellable>, {
+                let displays = displays.clone();
+                let area = area.clone();
+                let row = row.clone();
+                let icc_row = icc_row.clone();
+                move |result| {
+                    if let Ok(file) = result {
+                        if let Some(path) = file.path() {
+                            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                                display.icc_profile_path =
+                                    Some(path.to_string_lossy().into_owned());
+                            }
+                            if let Some(display) = displays.borrow().get(index) {
+                                let subtitle = display
+                                    .icc_profile_path
+                                    .as_deref()
+                                    .map(|p| format!("Selected: {}", display_icc_profile_label(p)))
+                                    .unwrap_or_else(|| "No ICC file selected".to_string());
+                                icc_row.set_subtitle(&subtitle);
+                            }
+                            save_display_change(&displays, &area, &row, index);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        let icc_row = icc_row.clone();
+        clear_icc.connect_clicked(move |_| {
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.icc_profile_path = None;
+            }
+            icc_row.set_subtitle("No ICC file selected");
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
     row
 }
 
@@ -1670,7 +1821,7 @@ fn persist_settings(settings: &Settings) {
         return;
     }
 
-    if let Err(err) = send_desktop_request(&IpcRequest::Reload) {
+    if let Err(err) = send_settings_request(&IpcRequest::Reload) {
         info!(
             target: "focaldesk",
             session_id = session_id(),
@@ -1816,6 +1967,67 @@ fn start_config_watch(keys: &[&str]) -> mpsc::Receiver<ConfigEvent> {
     rx
 }
 
+fn load_display_runtime_statuses() -> Vec<DisplayRuntimeOutputStatus> {
+    match send_desktop_request(&IpcRequest::GetDisplayRuntimeStatus) {
+        Ok(IpcResponse::DisplayRuntimeStatus { outputs }) => outputs,
+        Ok(IpcResponse::Error { message }) => {
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                message = %message,
+                "display runtime status query rejected"
+            );
+            Vec::new()
+        }
+        Ok(other) => {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                response = ?other,
+                "unexpected display runtime status response"
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "display runtime status unavailable"
+            );
+            Vec::new()
+        }
+    }
+}
+
+fn apply_runtime_statuses(
+    displays: &Rc<RefCell<Vec<DisplayConfig>>>,
+    statuses: &[DisplayRuntimeOutputStatus],
+) {
+    let mut displays_ref = displays.borrow_mut();
+    for display in displays_ref.iter_mut() {
+        let status = statuses
+            .iter()
+            .find(|status| status.connector == display.name)
+            .cloned();
+        let fallback_active = status
+            .as_ref()
+            .map(|status| status.icc_lut_fallback_active)
+            .unwrap_or(false);
+        let wide_gamut_active = status
+            .as_ref()
+            .map(|status| status.wide_gamut_active)
+            .unwrap_or(false);
+
+        if display.icc_lut_fallback_active != fallback_active {
+            display.icc_lut_fallback_active = fallback_active;
+        }
+        if display.wide_gamut_active != wide_gamut_active {
+            display.wide_gamut_active = wide_gamut_active;
+        }
+    }
+}
+
 fn set_switch_if_changed(switch: &gtk::Switch, active: bool) {
     if switch.is_active() != active {
         switch.set_active(active);
@@ -1904,7 +2116,10 @@ fn build_ui(app: &adw::Application) {
     pages.insert("Network".to_string(), network_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Printers".to_string(), printers_page());
-    pages.insert("Displays".to_string(), displays_page(config.clone()));
+    pages.insert(
+        "Displays".to_string(),
+        displays_page(config.clone(), window.clone()),
+    );
     pages.insert("Sound".to_string(), sound_page());
     pages.insert(
         "Applications".to_string(),
@@ -3344,6 +3559,22 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
 
+    let browser_backend = add_dropdown_row(
+        &defaults_group,
+        "Browser backend",
+        Some("Auto launches browsers as Wayland clients; XWayland stays explicit"),
+        BROWSER_LAUNCH_BACKEND_OPTIONS,
+        browser_launch_backend_index(settings.borrow().apps.browser_launch_backend),
+    );
+    {
+        let settings = settings.clone();
+        browser_backend.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().apps.browser_launch_backend =
+                selected_browser_launch_backend(dropdown.selected());
+            persist_settings(&settings.borrow());
+        });
+    }
+
     let file_manager = add_entry_row(&defaults_group, "File manager", "focaldesk-files");
     file_manager.set_text(&settings.borrow().apps.file_manager);
     {
@@ -3368,12 +3599,14 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         let settings = settings.clone();
         let terminal = terminal.clone();
         let browser = browser.clone();
+        let browser_backend = browser_backend.clone();
         let file_manager = file_manager.clone();
         move |_| {
             settings.borrow_mut().apps = focaldesk_settings_core::default_settings().apps;
             let apps = settings.borrow().apps.clone();
             terminal.set_text(&apps.terminal);
             browser.set_text(&apps.browser);
+            browser_backend.set_selected(browser_launch_backend_index(apps.browser_launch_backend));
             file_manager.set_text(&apps.file_manager);
             persist_settings(&settings.borrow());
         }
@@ -3424,6 +3657,19 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         let settings = settings.clone();
         restore_session.connect_active_notify(move |switch| {
             settings.borrow_mut().workspaces.restore_session = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    let maximize_on_launch = add_switch_row(
+        &behavior_group,
+        "Maximize app on launch",
+        Some("Open new app windows filling the work area; turn off to open at a smaller default size"),
+        settings.borrow().workspaces.maximize_on_launch,
+    );
+    {
+        let settings = settings.clone();
+        maximize_on_launch.connect_active_notify(move |switch| {
+            settings.borrow_mut().workspaces.maximize_on_launch = switch.is_active();
             persist_settings(&settings.borrow());
         });
     }
@@ -3622,6 +3868,14 @@ fn performance_mode_index(mode: PerformanceMode) -> u32 {
     }
 }
 
+fn browser_launch_backend_index(backend: BrowserLaunchBackend) -> u32 {
+    match backend {
+        BrowserLaunchBackend::Auto => 0,
+        BrowserLaunchBackend::Wayland => 1,
+        BrowserLaunchBackend::Xwayland => 2,
+    }
+}
+
 fn debug_log_level_index(level: DebugLogLevel) -> u32 {
     match level {
         DebugLogLevel::Error => 0,
@@ -3659,6 +3913,14 @@ fn selected_low_battery_action(index: u32) -> LowBatteryAction {
     }
 }
 
+fn selected_browser_launch_backend(index: u32) -> BrowserLaunchBackend {
+    match index {
+        1 => BrowserLaunchBackend::Wayland,
+        2 => BrowserLaunchBackend::Xwayland,
+        _ => BrowserLaunchBackend::Auto,
+    }
+}
+
 fn selected_performance_mode(index: u32) -> PerformanceMode {
     match index {
         1 => PerformanceMode::Performance,
@@ -3685,8 +3947,7 @@ fn performance_profile_name(mode: PerformanceMode) -> &'static str {
     }
 }
 
-fn power_status_text(manager: &PowerManager) -> String {
-    let snapshot = manager.snapshot();
+fn power_status_text(snapshot: &focaldesk_power::PowerSnapshot) -> String {
     let battery = snapshot
         .batteries
         .first()
@@ -3713,9 +3974,27 @@ fn power_status_text(manager: &PowerManager) -> String {
     format!("{battery}; {line_power}; {profile}")
 }
 
-fn run_power_action(manager: &PowerManager, command: PowerCommand, status: &gtk::Label) {
-    match manager.execute(command) {
-        Ok(()) => status.set_text("Power action started"),
+fn run_power_action(request: PowerIpcRequest, status: &gtk::Label) {
+    match send_power_request(&request) {
+        Ok(PowerIpcResponse::Ok) => status.set_text("Power action started"),
+        Ok(PowerIpcResponse::Error { message }) => {
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                message = %message,
+                "power action failed"
+            );
+            status.set_text("Power action failed");
+        }
+        Ok(other) => {
+            error!(
+                target: "focaldesk",
+                session_id = session_id(),
+                response = ?other,
+                "unexpected power action response"
+            );
+            status.set_text("Power action failed");
+        }
         Err(err) => {
             error!(
                 target: "focaldesk",
@@ -3731,11 +4010,17 @@ fn run_power_action(manager: &PowerManager, command: PowerCommand, status: &gtk:
 fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Power");
-    let manager = PowerManager::new();
+    let snapshot = send_power_request(&PowerIpcRequest::GetSnapshot)
+        .ok()
+        .and_then(|response| match response {
+            PowerIpcResponse::PowerSnapshot { snapshot } => Some(snapshot),
+            _ => None,
+        })
+        .unwrap_or_else(|| focaldesk_power::PowerManager::new().snapshot());
 
     let status_group = adw::PreferencesGroup::new();
     status_group.set_title("Status");
-    let status_label = dim_label(&power_status_text(&manager));
+    let status_label = dim_label(&power_status_text(&snapshot));
     status_group.add(&status_label);
     page.add(&status_group);
 
@@ -3845,24 +4130,18 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     );
     {
         let settings = settings.clone();
-        let manager = manager.clone();
         let status_label = status_label.clone();
         performance_dropdown.connect_selected_notify(move |dropdown| {
             let mode = selected_performance_mode(dropdown.selected());
             settings.borrow_mut().power.performance_mode = mode;
             persist_settings(&settings.borrow());
 
-            if let Err(err) = manager.set_performance_profile(performance_profile_name(mode)) {
-                error!(
-                    target: "focaldesk",
-                    session_id = session_id(),
-                    error = %err,
-                    "failed to set performance profile"
-                );
-                status_label.set_text("Performance profile change failed");
-            } else {
-                status_label.set_text(&power_status_text(&manager));
-            }
+            run_power_action(
+                PowerIpcRequest::SetPerformanceProfile {
+                    profile: performance_profile_name(mode).to_string(),
+                },
+                &status_label,
+            );
         });
     }
     page.add(&actions_group);
@@ -3871,34 +4150,30 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     system_group.set_title("System");
     let suspend_button = add_button_row(&system_group, "Suspend now", None, "Suspend");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         suspend_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::Suspend, &status_label);
+            run_power_action(PowerIpcRequest::Suspend, &status_label);
         });
     }
     let hibernate_button = add_button_row(&system_group, "Hibernate now", None, "Hibernate");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         hibernate_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::Hibernate, &status_label);
+            run_power_action(PowerIpcRequest::Hibernate, &status_label);
         });
     }
     let restart_button = add_button_row(&system_group, "Restart", None, "Restart");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         restart_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::Reboot, &status_label);
+            run_power_action(PowerIpcRequest::Reboot, &status_label);
         });
     }
     let poweroff_button = add_button_row(&system_group, "Power off", None, "Power off");
     {
-        let manager = manager.clone();
         let status_label = status_label.clone();
         poweroff_button.connect_clicked(move |_| {
-            run_power_action(&manager, PowerCommand::PowerOff, &status_label);
+            run_power_action(PowerIpcRequest::PowerOff, &status_label);
         });
     }
     page.add(&system_group);
@@ -4104,11 +4379,16 @@ fn about_page() -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "About")
 }
 
-fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
+fn displays_page(
+    config: Rc<RefCell<FocalDeskConfig>>,
+    window: adw::ApplicationWindow,
+) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Displays");
 
     let detected_displays = Rc::new(RefCell::new(load_displays()));
+    let row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     let arrangement_group = adw::PreferencesGroup::new();
     arrangement_group.set_title("Arrangement");
     arrangement_group.set_description(Some(
@@ -4131,7 +4411,13 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         outputs_group.add(&row);
     } else {
         for index in 0..display_count {
-            let row = connected_display_row(index, detected_displays.clone(), area.clone());
+            let row = connected_display_row(
+                index,
+                detected_displays.clone(),
+                area.clone(),
+                row_registry.clone(),
+                window.clone(),
+            );
             outputs_group.add(&row);
         }
     }
@@ -4263,6 +4549,39 @@ fn displays_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
         });
     }
 
+    {
+        let runtime_statuses = load_display_runtime_statuses();
+        apply_runtime_statuses(&detected_displays, &runtime_statuses);
+        for display in detected_displays.borrow().iter() {
+            if let Some(row) = row_registry.borrow().get(&display.name) {
+                row.set_subtitle(&display_summary(display));
+            }
+        }
+
+        let displays = detected_displays.clone();
+        let row_registry = row_registry.clone();
+        let rx = start_config_watch(&["displays.runtime"]);
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            while let Ok(event) = rx.try_recv() {
+                if event.key.as_str() != "displays.runtime" {
+                    continue;
+                }
+
+                let statuses =
+                    serde_json::from_value::<Vec<DisplayRuntimeOutputStatus>>(event.value)
+                        .unwrap_or_default();
+                apply_runtime_statuses(&displays, &statuses);
+                for display in displays.borrow().iter() {
+                    if let Some(row) = row_registry.borrow().get(&display.name) {
+                        row.set_subtitle(&display_summary(display));
+                    }
+                }
+            }
+
+            glib::ControlFlow::Continue
+        });
+    }
+
     adw::NavigationPage::new(&page, "Displays")
 }
 
@@ -4292,9 +4611,13 @@ mod tests {
             physical_height_mm: None,
             primary: true,
             transform: "Normal".to_string(),
+            color_profile: DisplayColorProfile::Auto,
+            icc_profile_path: None,
             hdr_supported: true,
             hdr_requested: true,
             hdr_enabled: false,
+            icc_lut_fallback_active: false,
+            wide_gamut_active: false,
         };
 
         let output = output_config_from_display(&display);

@@ -56,6 +56,19 @@ pub struct CalendarPanel {
     pub open: bool,
 }
 
+/// UI-facing snapshot of a clipboard-history entry; the engine owns the real store.
+#[derive(Debug, Clone)]
+pub struct ClipboardEntryView {
+    pub id: u64,
+    pub preview: String,
+}
+
+#[derive(Default)]
+pub struct ClipboardPanel {
+    pub open: bool,
+    pub entries: Vec<ClipboardEntryView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceDialogMode {
     Add,
@@ -301,6 +314,14 @@ impl EguiPanelView for PowerPanel {
                     actions.push(UiAction::SystemCommand(SystemCommand::Lock));
                     close_requested = true;
                 }
+                if power_button(ui, "Suspend").clicked() {
+                    actions.push(UiAction::SystemCommand(SystemCommand::Suspend));
+                    close_requested = true;
+                }
+                if power_button(ui, "Hibernate").clicked() {
+                    actions.push(UiAction::SystemCommand(SystemCommand::Hibernate));
+                    close_requested = true;
+                }
                 if power_button(ui, "Logout").clicked() {
                     actions.push(UiAction::SystemCommand(SystemCommand::Logout));
                     close_requested = true;
@@ -379,6 +400,70 @@ impl EguiPanelView for AudioPanel {
                 if changed {
                     actions.push(UiAction::SetVolume(self.volume));
                 }
+            });
+
+        if close_requested || response.is_none() || !open {
+            self.open = false;
+        }
+    }
+}
+
+impl EguiPanelView for ClipboardPanel {
+    fn title(&self) -> &'static str {
+        "Clipboard"
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            return;
+        }
+
+        let panel_width = 320.0;
+        let x = (frame_ctx.work.loc.x + frame_ctx.work.size.w) as f32 - panel_width - 24.0;
+        let y = frame_ctx.work.loc.y as f32 + 24.0;
+        let mut open = self.open;
+        let mut close_requested = false;
+
+        let response = egui::Window::new("Clipboard")
+            .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
+            .default_width(panel_width)
+            .resizable(false)
+            .collapsible(false)
+            .title_bar(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Clipboard");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.small_button("X").clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
+                ui.separator();
+                ui.add_space(4.0);
+
+                if self.entries.is_empty() {
+                    ui.label("No clipboard history yet.");
+                    return;
+                }
+
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        for entry in &self.entries {
+                            let preview: String = entry.preview.chars().take(120).collect();
+                            if ui.button(preview).clicked() {
+                                actions.push(UiAction::SelectClipboardEntry(entry.id));
+                                close_requested = true;
+                            }
+                        }
+                    });
             });
 
         if close_requested || response.is_none() || !open {

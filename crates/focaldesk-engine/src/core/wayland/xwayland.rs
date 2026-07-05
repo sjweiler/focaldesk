@@ -17,7 +17,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
-use focaldesk_logging::flog;
+use crate::core::wayland::data_device::ClipboardSelectionOwner;
 use focaldesk_logging::session_id;
 use tracing::{debug, info_span, trace};
 
@@ -151,6 +151,13 @@ impl XwmHandler for DesktopState {
         _reorder: Option<Reorder>,
     ) {
         let mut geometry = window.geometry();
+        if let Some(w) = w {
+            geometry.size.w = w as i32;
+        }
+        if let Some(h) = h {
+            geometry.size.h = h as i32;
+        }
+
         if window.is_override_redirect() {
             if let Some(x) = x {
                 geometry.loc.x = x;
@@ -158,15 +165,39 @@ impl XwmHandler for DesktopState {
             if let Some(y) = y {
                 geometry.loc.y = y;
             }
-        } else {
-            let _ = (x, y);
+            let output_id = self
+                .window_id_for_x11_surface(&window)
+                .map(|window_id| self.xwayland_output_id_for_window(window_id))
+                .unwrap_or_else(|| {
+                    self.output_under_pointer(self.input.pointer_pos)
+                        .unwrap_or(self.primary_output)
+                });
+            geometry = self.xwayland_clamp_override_redirect_geometry(output_id, geometry);
+            let _ = window.configure(geometry);
+            return;
         }
-        if let Some(w) = w {
-            geometry.size.w = w as i32;
+
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            let output_id = self.xwayland_output_id_for_window(id);
+            if self.xwayland_request_fills_output(output_id, geometry.size) {
+                self.set_window_maximized(id, true);
+                return;
+            }
+            geometry = self.xwayland_clamp_toplevel_geometry(output_id, geometry, Some(id));
+            let _ = window.configure(geometry);
+            return;
         }
-        if let Some(h) = h {
-            geometry.size.h = h as i32;
+
+        let output_id = self
+            .output_under_pointer(self.input.pointer_pos)
+            .unwrap_or(self.primary_output);
+        if self.xwayland_request_fills_output(output_id, geometry.size) {
+            if let Some(work) = self.work_recess_for_output(output_id) {
+                let _ = window.configure(work);
+                return;
+            }
         }
+        geometry = self.xwayland_clamp_toplevel_geometry(output_id, geometry, None);
         let _ = window.configure(geometry);
     }
 
@@ -193,25 +224,41 @@ impl XwmHandler for DesktopState {
         };
         self.mark_window_id_damage(id, crate::core::desktop::DamageSource::WindowResize);
         if window.is_override_redirect() {
-            if let Some(state) = self.window_mut(id) {
-                state.float_rect = Some(geometry);
-            }
-            self.map_window_bbox_location(managed, geometry.loc, false);
-        } else {
-            let current_loc = self
-                .space
-                .element_bbox(&managed)
-                .map(|bbox| bbox.loc)
-                .or_else(|| {
-                    self.window(id)
-                        .and_then(|state| state.float_rect.map(|rect| rect.loc))
-                })
-                .unwrap_or(geometry.loc);
-            let rect = Rectangle::from_loc_and_size(current_loc, geometry.size);
+            let compositor_loc = self.xwayland_or_compositor_loc(&window, geometry.loc);
+            let rect = self.xwayland_clamp_override_redirect_geometry(
+                self.xwayland_output_id_for_window(id),
+                Rectangle::from_loc_and_size(compositor_loc, geometry.size),
+            );
             if let Some(state) = self.window_mut(id) {
                 state.float_rect = Some(rect);
             }
-            self.map_window_bbox_location(managed, current_loc, false);
+            self.map_window_bbox_location(managed, rect.loc, false);
+        } else {
+            let output_id = self.xwayland_output_id_for_window(id);
+            let fills_output = self.xwayland_request_fills_output(output_id, geometry.size);
+            let maximized = self
+                .window(id)
+                .map(|state| state.maximized)
+                .unwrap_or(false);
+
+            if fills_output && !maximized {
+                self.set_window_maximized(id, true);
+                return;
+            }
+
+            let rect = if maximized {
+                self.work_recess_for_output(output_id).unwrap_or(geometry)
+            } else {
+                let current_loc = self.xwayland_compositor_loc_for_window(id);
+                Rectangle::from_loc_and_size(current_loc, geometry.size)
+            };
+            if let Some(state) = self.window_mut(id) {
+                state.float_rect = Some(rect);
+            }
+            self.map_window_bbox_location(managed, rect.loc, false);
+            if maximized && geometry != rect {
+                let _ = window.configure(rect);
+            }
         }
         self.space.refresh();
         self.mark_window_id_damage(id, crate::core::desktop::DamageSource::WindowResize);
@@ -323,10 +370,20 @@ impl XwmHandler for DesktopState {
     fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
         match selection {
             SelectionTarget::Clipboard => {
-                set_data_device_selection(&self.display_handle, &self.seat, mime_types, ());
+                set_data_device_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    mime_types,
+                    ClipboardSelectionOwner::XWayland,
+                );
             }
             SelectionTarget::Primary => {
-                set_primary_selection(&self.display_handle, &self.seat, mime_types, ());
+                set_primary_selection(
+                    &self.display_handle,
+                    &self.seat,
+                    mime_types,
+                    ClipboardSelectionOwner::XWayland,
+                );
             }
         }
     }

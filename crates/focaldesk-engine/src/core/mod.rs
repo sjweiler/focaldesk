@@ -1,7 +1,10 @@
 pub mod app;
 pub mod color;
+pub mod colord;
 pub mod consts;
 pub mod desktop;
+pub mod icc;
+pub mod icc_lut;
 pub mod input;
 pub mod layout;
 pub mod linear_compositing;

@@ -154,9 +154,11 @@ impl App {
         let color_surface = manager.get_surface(&surface, qh, ());
         if matches!(self.mode, TestMode::ChromePath) {
             let feedback = manager.get_surface_feedback(&surface, qh, ());
+            // Issue get_preferred in the same flush as feedback creation so the server
+            // can answer without waiting for preferred_changed roundtrip latency.
             let preferred = feedback.get_preferred(qh, ());
-            self.preferred_image = Some(preferred);
             self.color_feedback = Some(feedback);
+            self.preferred_image = Some(preferred);
         }
         color_surface.set_image_description(image, wp_color_manager_v1::RenderIntent::Perceptual);
 
@@ -385,9 +387,14 @@ impl Dispatch<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceF
                 | wp_color_management_surface_feedback_v1::Event::PreferredChanged2 { .. }
         );
         if fetch_preferred {
-            let preferred = feedback.get_preferred(qh, ());
-            app.preferred_image = Some(preferred);
-            app.preferred_info_done = false;
+            if app.preferred_info_done {
+                let preferred = feedback.get_preferred(qh, ());
+                app.preferred_image = Some(preferred);
+                app.preferred_info_done = false;
+            } else if app.preferred_image.is_none() {
+                let preferred = feedback.get_preferred(qh, ());
+                app.preferred_image = Some(preferred);
+            }
         }
     }
 }
@@ -656,6 +663,10 @@ fn main() -> Result<()> {
         event_queue
             .roundtrip(&mut app)
             .context("output image description roundtrip failed")?;
+        // get_information is queued from the Ready handler; flush it before checking.
+        event_queue
+            .roundtrip(&mut app)
+            .context("output get_information roundtrip failed")?;
         if !app.chrome_output_ready {
             bail!("output wp_image_description_v1 path did not complete");
         }
@@ -670,9 +681,20 @@ fn main() -> Result<()> {
     }
 
     app.create_window(&qh)?;
-    event_queue
-        .roundtrip(&mut app)
-        .context("window roundtrip failed")?;
+    if matches!(mode, TestMode::ChromePath) {
+        for attempt in 0..6 {
+            event_queue
+                .roundtrip(&mut app)
+                .with_context(|| format!("surface feedback roundtrip {attempt} failed"))?;
+            if app.preferred_info_done {
+                break;
+            }
+        }
+    } else {
+        event_queue
+            .roundtrip(&mut app)
+            .context("window roundtrip failed")?;
+    }
 
     if matches!(mode, TestMode::ChromePath) && !app.preferred_info_done {
         bail!("surface feedback get_preferred path did not complete");

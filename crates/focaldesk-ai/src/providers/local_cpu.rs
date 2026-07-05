@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 
 use crate::provider::AiProvider;
-use crate::types::{ChatRequest, ChatResponse, ProviderInfo};
+use crate::types::{ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo};
 
 #[derive(Debug, Default, Clone)]
 pub struct LocalCpuProvider;
@@ -16,6 +16,10 @@ impl AiProvider for LocalCpuProvider {
             base_url: None,
             default_model: None,
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(Vec::new())
     }
 
     async fn chat(&self, _request: ChatRequest) -> Result<ChatResponse> {

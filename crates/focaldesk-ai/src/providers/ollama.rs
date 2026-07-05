@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::provider::AiProvider;
-use crate::types::{ChatMessage, ChatRequest, ChatResponse, ProviderInfo};
+use crate::types::{ChatMessage, ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo};
 
 #[derive(Debug, Clone)]
 pub struct OllamaProvider {
@@ -42,12 +42,40 @@ impl AiProvider for OllamaProvider {
         }
     }
 
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        let response = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+            .await
+            .context("Ollama model list request failed")?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .context("failed to read Ollama model list response body")?;
+
+        if !status.is_success() {
+            bail!(
+                "Ollama returned HTTP {} while listing models: {}",
+                status,
+                body
+            );
+        }
+
+        let decoded: OllamaTagsResponse =
+            serde_json::from_str(&body).context("failed to parse Ollama model list")?;
+
+        Ok(decoded
+            .models
+            .into_iter()
+            .map(|model| ProviderModelInfo { id: model.name })
+            .filter(|model| !model.id.trim().is_empty())
+            .collect())
+    }
+
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
-        let model = request
-            .model
-            .clone()
-            .or_else(|| self.default_model.clone())
-            .ok_or_else(|| anyhow!("no model configured for Ollama provider"))?;
+        let model = self.resolve_model(request.model.clone()).await?;
 
         if request.messages.is_empty() {
             bail!("chat request must include at least one message");
@@ -91,6 +119,21 @@ impl AiProvider for OllamaProvider {
     }
 }
 
+impl OllamaProvider {
+    async fn resolve_model(&self, request_model: Option<String>) -> Result<String> {
+        if let Some(model) = request_model.or_else(|| self.default_model.clone()) {
+            return Ok(model);
+        }
+
+        self.list_models()
+            .await?
+            .into_iter()
+            .map(|model| model.id)
+            .find(|name| !name.trim().is_empty())
+            .ok_or_else(|| anyhow!("no Ollama model configured and no installed models found"))
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct OllamaChatRequest {
     model: String,
@@ -130,4 +173,14 @@ struct OllamaChatResponse {
 #[derive(Debug, Deserialize)]
 struct OllamaResponseMessage {
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaTagsResponse {
+    models: Vec<OllamaModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaModelInfo {
+    name: String,
 }

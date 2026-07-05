@@ -1,33 +1,61 @@
 //! [`wp_color_management_v1`](https://wayland.app/protocols/color-management-v1) server.
 
-use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorState, TransferFunction};
+use crate::core::color::{
+    primaries_plausible, primaries_wider_than, ColorDescription, ColorPrimaries,
+    PrimariesChromaticity, RenderingIntent, SurfaceColorState,
+    TransferFunction as CoreTransferFunction,
+};
+use crate::core::desktop::is_browser_like;
 use crate::core::desktop::DesktopState;
+use crate::core::icc::{self, parse_icc_profile, read_icc_from_fd};
 use crate::core::wayland::client::ClientState;
-use focaldesk_logging::{flog, flog_critical};
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use focaldesk_logging::flog_warn;
+use focaldesk_types::OutputId;
+use smithay::output::Output;
 use smithay::wayland::compositor::{add_destruction_hook, with_states};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::os::fd::AsFd;
 use std::sync::Mutex;
 use wayland_protocols::wp::color_management::v1::server::{
     wp_color_management_output_v1, wp_color_management_surface_feedback_v1,
     wp_color_management_surface_v1, wp_color_manager_v1, wp_image_description_creator_icc_v1,
     wp_image_description_creator_params_v1, wp_image_description_info_v1, wp_image_description_v1,
 };
+use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{
     backend, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
 
-fn wp_color_trace(msg: impl AsRef<str>) {
+use std::sync::OnceLock;
+
+fn wp_color_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("FOCALDESK_WP_COLOR_TRACE").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+macro_rules! wp_color_trace {
+    ($($arg:tt)*) => {
+        if wp_color_trace_enabled() {
+            wp_color_trace_impl(format!($($arg)*));
+        }
+    };
+}
+
+fn wp_color_trace_impl(msg: String) {
     use std::io::Write;
 
-    let line = format!("[wp-color] {}", msg.as_ref());
+    let line = format!("[wp-color] {msg}");
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/tmp/focaldesk-wp-color.trace")
     {
         let _ = writeln!(file, "{line}");
-        let _ = file.flush();
     }
 }
 
@@ -42,6 +70,19 @@ fn is_cursor_executable_name(exe_name: &str) -> bool {
     matches!(exe_name, "cursor" | "cursor-bin")
 }
 
+fn client_exe_basename(
+    credentials: &crate::core::wayland::client::ClientCredentials,
+) -> Option<String> {
+    if let Ok(exe_path) = std::fs::read_link(format!("/proc/{}/exe", credentials.pid)) {
+        if let Some(name) = exe_path.file_name() {
+            return Some(name.to_string_lossy().into_owned());
+        }
+    }
+    std::fs::read_to_string(format!("/proc/{}/comm", credentials.pid))
+        .ok()
+        .map(|comm| comm.trim().to_string())
+}
+
 fn client_is_cursor(client: &Client) -> bool {
     let Some(client_state) = client.get_data::<ClientState>() else {
         return false;
@@ -50,16 +91,30 @@ fn client_is_cursor(client: &Client) -> bool {
         return false;
     };
 
-    let exe_path = std::fs::read_link(format!("/proc/{}/exe", credentials.pid)).ok();
-    let Some(exe_name) = exe_path
-        .as_ref()
-        .and_then(|path| path.file_name())
-        .map(|name| name.to_string_lossy())
-    else {
+    let Some(exe_name) = client_exe_basename(&credentials) else {
         return false;
     };
 
     is_cursor_executable_name(exe_name.as_ref())
+}
+
+fn client_is_browser_like(client: &Client) -> bool {
+    let Some(client_state) = client.get_data::<ClientState>() else {
+        return false;
+    };
+    let Some(credentials) = client_state.credentials else {
+        return false;
+    };
+
+    let Some(exe_name) = client_exe_basename(&credentials) else {
+        return false;
+    };
+
+    is_browser_like(exe_name.as_ref())
+}
+
+fn browser_color_management_uses_canonical_sdr(client: &Client) -> bool {
+    client_is_browser_like(client)
 }
 
 fn send_image_description_ready(
@@ -73,11 +128,172 @@ fn send_image_description_ready(
     }
 }
 
+fn send_surface_feedback_preferred_changed(
+    feedback: &wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
+    identity: u64,
+) {
+    if feedback.version() >= 2 {
+        feedback.preferred_changed2((identity >> 32) as u32, identity as u32);
+    } else {
+        feedback.preferred_changed(identity as u32);
+    }
+}
+
+fn should_advertise_output_profiles(state: &DesktopState) -> bool {
+    let any_wide_gamut_output = state
+        .outputs
+        .values()
+        .any(|output| output.color_description.primaries != ColorDescription::SRGB.primaries);
+    crate::core::color::wp_color_wide_gamut_enabled(
+        state.render.chrome_shaders.output_encode_lut.is_some() || any_wide_gamut_output,
+    )
+}
+
+fn output_uses_wide_gamut_description(state: &DesktopState, output_id: OutputId) -> bool {
+    state
+        .outputs
+        .get(&output_id)
+        .is_some_and(|output| output.color_description != ColorDescription::SRGB)
+}
+
+fn preferred_identity_for_output(state: &mut DesktopState, output_id: OutputId) -> u64 {
+    if !should_advertise_output_profiles(state) {
+        return state.color_management_state.canonical_sdr_identity();
+    }
+    if !output_uses_wide_gamut_description(state, output_id) {
+        return state.color_management_state.canonical_sdr_identity();
+    }
+    state
+        .color_management_state
+        .preferred_identity_for_output(output_id)
+}
+
+fn refresh_preferred_identities(state: &mut DesktopState) {
+    for output_id in state.outputs.keys().copied().collect::<Vec<_>>() {
+        if should_advertise_output_profiles(state)
+            && output_uses_wide_gamut_description(state, output_id)
+        {
+            state
+                .color_management_state
+                .refresh_preferred_identity(output_id);
+        }
+    }
+}
+
+fn send_preferred_changed_for_surface(state: &mut DesktopState, surface: &WlSurface) {
+    let output_id = state.preferred_output_id_for_surface(surface);
+    let identity = preferred_identity_for_output(state, output_id);
+    for feedback in &state.color_management_state.surface_feedbacks {
+        let Some(data) = feedback.data::<SurfaceColorFeedback>() else {
+            continue;
+        };
+        if data.surface.id() == surface.id() {
+            send_surface_feedback_preferred_changed(feedback, identity);
+        }
+    }
+}
+
+/// Notify surface feedback objects after an output profile change.
+pub fn notify_preferred_color_changed(state: &mut DesktopState) {
+    refresh_preferred_identities(state);
+    let surfaces: Vec<WlSurface> = state
+        .color_management_state
+        .surface_feedbacks
+        .iter()
+        .filter_map(|feedback| {
+            feedback
+                .data::<SurfaceColorFeedback>()
+                .map(|data| data.surface.clone())
+        })
+        .collect();
+    for surface in surfaces {
+        send_preferred_changed_for_surface(state, &surface);
+    }
+}
+
+/// Re-send `preferred_changed` when a window moves to a different monitor.
+pub fn notify_surface_feedback_preferred(state: &mut DesktopState, surface: &WlSurface) {
+    send_preferred_changed_for_surface(state, surface);
+}
+
+/// Keep the widest output description seen so `get_preferred` does not flicker to sRGB mid-session.
+pub fn note_output_color_resolved(state: &mut DesktopState, output_id: OutputId) {
+    use focaldesk_settings_core::DisplayColorProfile;
+
+    let description = state.output_color_description(output_id);
+    if state.output_color_profile_override_for(output_id) == DisplayColorProfile::Srgb {
+        state
+            .color_management_state
+            .preferred_output_descriptions
+            .remove(&output_id);
+        return;
+    }
+    if primaries_wider_than(description.primaries, ColorPrimaries::Srgb) {
+        state
+            .color_management_state
+            .preferred_output_descriptions
+            .insert(output_id, description);
+    }
+}
+
+fn resolve_preferred_output_description(
+    state: &mut DesktopState,
+    output_id: OutputId,
+) -> ColorDescription {
+    let description = state.output_color_description(output_id);
+    if primaries_wider_than(description.primaries, ColorPrimaries::Srgb) {
+        state
+            .color_management_state
+            .preferred_output_descriptions
+            .insert(output_id, description);
+        return description;
+    }
+    if let Some(&cached) = state
+        .color_management_state
+        .preferred_output_descriptions
+        .get(&output_id)
+    {
+        if primaries_wider_than(cached.primaries, description.primaries) {
+            wp_color_trace!(
+                "get_preferred: using cached {:?} over transient {:?}",
+                cached.primaries,
+                description.primaries
+            );
+            return cached;
+        }
+    }
+    description
+}
+
 #[derive(Default)]
 pub struct ColorManagementState {
     pub surface_objects: HashSet<backend::ObjectId>,
+    pub surface_feedbacks:
+        Vec<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1>,
     next_description_identity: u64,
     canonical_sdr_identity: Option<u64>,
+    output_preferred_identities: HashMap<OutputId, u64>,
+    /// Widest output description advertised this session; masks transient sRGB reload blips.
+    pub preferred_output_descriptions: HashMap<OutputId, ColorDescription>,
+    /// Widest client color tag per surface; Chrome may send sRGB after Display P3 before commit.
+    pub surface_widest_descriptions: HashMap<backend::ObjectId, ColorDescription>,
+    /// `wp_image_description_info_v1.done` is a destructor event; sending it inside
+    /// `get_information` destroys the object before wayland-backend assigns child userdata.
+    pending_info_done: Vec<wp_image_description_info_v1::WpImageDescriptionInfoV1>,
+}
+
+/// Send queued `wp_image_description_info_v1.done` events after `dispatch_clients` returns.
+pub fn flush_pending_image_description_info_done(state: &mut DesktopState) {
+    for info in state.color_management_state.pending_info_done.drain(..) {
+        info.done();
+    }
+}
+
+fn queue_image_description_info_done(
+    info: wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    state: &mut DesktopState,
+) {
+    state.color_management_state.pending_info_done.push(info);
 }
 
 impl ColorManagementState {
@@ -88,6 +304,9 @@ impl ColorManagementState {
             + Dispatch<
                 wp_color_management_output_v1::WpColorManagementOutputV1,
                 OutputColorManagement,
+            > + Dispatch<
+                wp_color_management_output_v1::WpColorManagementOutputV1,
+                OrphanOutputColorManagement,
             > + Dispatch<
                 wp_color_management_surface_feedback_v1::WpColorManagementSurfaceFeedbackV1,
                 SurfaceColorFeedback,
@@ -102,16 +321,22 @@ impl ColorManagementState {
             + Dispatch<
                 wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1,
                 ParametricCreatorState,
-            > + Dispatch<wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1, ()>
-            + 'static,
+            > + Dispatch<
+                wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1,
+                IccCreatorState,
+            > + 'static,
     {
-        wp_color_trace("binding wp_color_management_v1 global");
+        wp_color_trace!("binding wp_color_management_v1 global");
         display.create_global::<D, wp_color_manager_v1::WpColorManagerV1, _>(2, ());
     }
 
     fn next_identity(&mut self) -> u64 {
         self.next_description_identity = self.next_description_identity.wrapping_add(1).max(1);
         self.next_description_identity
+    }
+
+    pub(crate) fn next_description_identity(&mut self) -> u64 {
+        self.next_identity()
     }
 
     fn canonical_sdr_identity(&mut self) -> u64 {
@@ -122,6 +347,21 @@ impl ColorManagementState {
         self.canonical_sdr_identity = Some(id);
         id
     }
+
+    fn preferred_identity_for_output(&mut self, output_id: OutputId) -> u64 {
+        if let Some(id) = self.output_preferred_identities.get(&output_id) {
+            return *id;
+        }
+        let id = self.next_identity();
+        self.output_preferred_identities.insert(output_id, id);
+        id
+    }
+
+    fn refresh_preferred_identity(&mut self, output_id: OutputId) -> u64 {
+        let id = self.next_identity();
+        self.output_preferred_identities.insert(output_id, id);
+        id
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +370,19 @@ pub struct ImageDescriptionData {
     pub description: ColorDescription,
     pub ready: bool,
     pub allows_information: bool,
+    pub icc_profile: Option<Vec<u8>>,
+    /// When true, `get_information` always advertises canonical sRGB (KMS scanout path).
+    pub advertise_as_canonical_sdr: bool,
+}
+
+#[derive(Default)]
+pub struct IccCreatorState {
+    inner: Mutex<IccCreatorInner>,
+}
+
+#[derive(Default)]
+struct IccCreatorInner {
+    icc_bytes: Option<Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -140,7 +393,10 @@ pub struct ParametricCreatorState {
 #[derive(Debug, Default)]
 struct ParametricCreatorInner {
     tf: Option<ParametricTransfer>,
-    primaries: Option<wp_color_manager_v1::Primaries>,
+    primaries: Option<ColorPrimaries>,
+    min_luminance_mcd: Option<u32>,
+    max_luminance_mcd: Option<u32>,
+    reference_luminance_mcd: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -149,14 +405,20 @@ enum ParametricTransfer {
     Power(f32),
 }
 
-pub struct OutputColorManagement;
+pub struct OutputColorManagement {
+    pub output: Output,
+}
+
+/// Placeholder when `get_output` receives an invalid `wl_output` but Wayland still
+/// allocated the `NewId`.
+pub struct OrphanOutputColorManagement;
 
 /// Placeholder object when `get_surface` hits `surface_exists` but Wayland still
 /// allocates the `NewId`.
 pub struct OrphanSurfaceColorManagement;
 
 pub struct SurfaceColorFeedback {
-    surface: WlSurface,
+    pub(crate) surface: WlSurface,
 }
 
 impl SurfaceColorFeedback {
@@ -191,25 +453,39 @@ impl SurfaceColorManagement {
     }
 }
 
+fn windows_scrgb_supported() -> bool {
+    crate::core::color::linear_sdr_runtime_enabled()
+}
+
 fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     use wp_color_manager_v1::{Feature, Primaries, RenderIntent, TransferFunction};
 
     manager.supported_intent(RenderIntent::Perceptual);
     manager.supported_intent(RenderIntent::Relative);
 
+    manager.supported_feature(Feature::IccV2V4);
     manager.supported_feature(Feature::Parametric);
     manager.supported_feature(Feature::SetPrimaries);
     manager.supported_feature(Feature::SetTfPower);
     manager.supported_feature(Feature::SetLuminances);
+    manager.supported_feature(Feature::SetMasteringDisplayPrimaries);
+    manager.supported_feature(Feature::ExtendedTargetVolume);
+    if windows_scrgb_supported() {
+        manager.supported_feature(Feature::WindowsScrgb);
+    }
 
     manager.supported_tf_named(TransferFunction::Bt1886);
     manager.supported_tf_named(TransferFunction::Gamma22);
     manager.supported_tf_named(TransferFunction::ExtLinear);
+    // Chromium maps gfx::ColorSpace::SRGB → WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB.
+    manager.supported_tf_named(TransferFunction::Srgb);
     manager.supported_tf_named(TransferFunction::CompoundPower24);
 
     manager.supported_primaries_named(Primaries::Srgb);
+    manager.supported_primaries_named(Primaries::DisplayP3);
+    manager.supported_primaries_named(Primaries::Bt2020);
     manager.done();
-    wp_color_trace("manager advertisement sent");
+    wp_color_trace!("manager advertisement sent");
 }
 
 fn fail_image_description(
@@ -227,7 +503,7 @@ fn init_failed_image_description<D>(
     D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
 {
     let msg = msg.into();
-    wp_color_trace(format!("image description init failed: {msg}"));
+    wp_color_trace!("image description init failed: {msg}");
     let image = data_init.init(
         id,
         ImageDescriptionData {
@@ -235,6 +511,8 @@ fn init_failed_image_description<D>(
             description: ColorDescription::SRGB,
             ready: false,
             allows_information: false,
+            icc_profile: None,
+            advertise_as_canonical_sdr: false,
         },
     );
     fail_image_description(&image, msg);
@@ -246,14 +524,17 @@ fn finish_image_description<D>(
     id: New<wp_image_description_v1::WpImageDescriptionV1>,
     description: ColorDescription,
     allows_information: bool,
+    icc_profile: Option<Vec<u8>>,
+    advertise_as_canonical_sdr: bool,
+    identity: Option<u64>,
 ) where
     D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
 {
-    let identity = state.color_management_state.next_identity();
-    wp_color_trace(format!(
-        "image description finished: id={identity} ready=true allow_info={allows_information} desc={:?}",
+    let identity = identity.unwrap_or_else(|| state.color_management_state.next_identity());
+    wp_color_trace!(
+        "image description finished: id={identity} ready=true allow_info={allows_information} canonical_sdr={advertise_as_canonical_sdr} desc={:?}",
         description
-    ));
+    );
     let image = data_init.init(
         id,
         ImageDescriptionData {
@@ -261,6 +542,8 @@ fn finish_image_description<D>(
             description,
             ready: true,
             allows_information,
+            icc_profile,
+            advertise_as_canonical_sdr,
         },
     );
     send_image_description_ready(&image, identity);
@@ -270,43 +553,282 @@ fn finish_canonical_sdr_image_description<D>(
     state: &mut DesktopState,
     data_init: &mut DataInit<'_, D>,
     id: New<wp_image_description_v1::WpImageDescriptionV1>,
+    description: ColorDescription,
 ) where
     D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
 {
     let identity = state.color_management_state.canonical_sdr_identity();
-    wp_color_trace(format!(
-        "canonical sdr image description finished: id={identity}"
-    ));
+    wp_color_trace!(
+        "canonical output image description finished: id={identity} desc={description:?}"
+    );
     let image = data_init.init(
         id,
         ImageDescriptionData {
             identity,
-            description: ColorDescription::SRGB,
+            description,
             ready: true,
             allows_information: true,
+            icc_profile: None,
+            advertise_as_canonical_sdr: true,
         },
     );
     send_image_description_ready(&image, identity);
 }
 
+fn finish_output_image_description<D>(
+    state: &mut DesktopState,
+    data_init: &mut DataInit<'_, D>,
+    id: New<wp_image_description_v1::WpImageDescriptionV1>,
+    description: ColorDescription,
+    icc_profile: Option<Vec<u8>>,
+) where
+    D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
+{
+    let has_icc_profile = icc_profile.as_ref().is_some_and(|icc| !icc.is_empty());
+
+    if should_advertise_output_profiles(state) && has_icc_profile {
+        finish_image_description(
+            state,
+            data_init,
+            id,
+            output_advertised_description(description),
+            true,
+            icc_profile,
+            false,
+            None,
+        );
+    } else if should_advertise_output_profiles(state) && description != ColorDescription::SRGB {
+        finish_image_description(
+            state,
+            data_init,
+            id,
+            output_advertised_description(description),
+            true,
+            None,
+            false,
+            None,
+        );
+    } else {
+        finish_canonical_sdr_image_description(state, data_init, id, ColorDescription::SRGB);
+    }
+}
+
+fn finish_preferred_output_image_description<D>(
+    state: &mut DesktopState,
+    data_init: &mut DataInit<'_, D>,
+    id: New<wp_image_description_v1::WpImageDescriptionV1>,
+    output_id: OutputId,
+    description: ColorDescription,
+    icc_profile: Option<Vec<u8>>,
+) where
+    D: Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionData> + 'static,
+{
+    let identity = Some(preferred_identity_for_output(state, output_id));
+    let has_icc_profile = icc_profile.as_ref().is_some_and(|icc| !icc.is_empty());
+
+    if should_advertise_output_profiles(state) && has_icc_profile {
+        // Use the output ICC description as-is (primaries + transfer from colord).
+        finish_image_description(
+            state,
+            data_init,
+            id,
+            output_advertised_description(description),
+            true,
+            icc_profile,
+            false,
+            identity,
+        );
+    } else if should_advertise_output_profiles(state) && description != ColorDescription::SRGB {
+        finish_image_description(
+            state,
+            data_init,
+            id,
+            output_advertised_description(description),
+            true,
+            None,
+            false,
+            identity,
+        );
+    } else {
+        finish_canonical_sdr_image_description(state, data_init, id, ColorDescription::SRGB);
+    }
+}
+
 fn init_inert_image_description_info<D>(
+    state: &mut DesktopState,
     data_init: &mut DataInit<'_, D>,
     information: New<wp_image_description_info_v1::WpImageDescriptionInfoV1>,
 ) where
     D: Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, ()> + 'static,
 {
     let info = data_init.init(information, ());
-    info.done();
+    queue_image_description_info_done(info, state);
 }
 
-fn send_sdr_image_description_info(info: &wp_image_description_info_v1::WpImageDescriptionInfoV1) {
+fn primary_luminance_wire_values(description: &ColorDescription) -> (u32, u32, u32) {
+    // ICC sRGB defaults: min 0.2 cd/m² (wire ×10000), max/ref unscaled cd/m².
+    let min_lum = (0.2_f32 * 10_000.0).round() as u32;
+    let max_lum = description.max_luminance_nits.round().max(1.0) as u32;
+    let reference_lum = description.reference_white_nits.round().max(1.0) as u32;
+    (min_lum, max_lum, reference_lum)
+}
+
+fn primaries_from_wire(
+    r_x: i32,
+    r_y: i32,
+    g_x: i32,
+    g_y: i32,
+    b_x: i32,
+    b_y: i32,
+    w_x: i32,
+    w_y: i32,
+) -> Option<PrimariesChromaticity> {
+    let scale = 100_000.0f32;
+    let ch = PrimariesChromaticity {
+        r: [r_x as f32 / scale, r_y as f32 / scale],
+        g: [g_x as f32 / scale, g_y as f32 / scale],
+        b: [b_x as f32 / scale, b_y as f32 / scale],
+        w: [w_x as f32 / scale, w_y as f32 / scale],
+    };
+    primaries_plausible(&ch).then_some(ch)
+}
+
+fn client_primaries_trusted(
+    state: &DesktopState,
+    surface: &WlSurface,
+    description: &ColorDescription,
+) -> bool {
+    let ColorPrimaries::Custom(ch) = description.primaries else {
+        return true;
+    };
+    if !primaries_plausible(&ch) {
+        return false;
+    }
+    let output_id = state.preferred_output_id_for_surface(surface);
+    let Some(output) = state.outputs.get(&output_id) else {
+        return false;
+    };
+    if !output
+        .icc_profile
+        .as_ref()
+        .is_some_and(|icc| !icc.is_empty())
+    {
+        return true;
+    }
+    description.primaries == output.color_description.primaries
+}
+
+fn sanitize_client_color_description(
+    state: &DesktopState,
+    surface: &WlSurface,
+    description: ColorDescription,
+) -> ColorDescription {
+    let description = if client_primaries_trusted(state, surface, &description) {
+        description
+    } else {
+        let output_id = state.preferred_output_id_for_surface(surface);
+        let output_desc = state.output_color_description(output_id);
+        if let ColorPrimaries::Custom(ch) = description.primaries {
+            flog_warn!(
+                "surface color: ignoring client primaries {ch:?}; using output {output_id:?} primaries {:?}",
+                output_desc.primaries
+            );
+        }
+        ColorDescription {
+            primaries: output_desc.primaries,
+            ..description
+        }
+    };
+    description
+}
+
+/// Normalize output/preferred descriptions for client queries (ICC gamma → sRGB-class TF).
+fn output_advertised_description(description: ColorDescription) -> ColorDescription {
+    // Chrome rejects Bt1886/Gamma22/ExtLinear for internal BT709/sRGB paths ("non-power-curve").
+    // Advertise sRGB-class transfer to clients; ICC LUT scanout still uses the profile TRC.
+    ColorDescription {
+        transfer: CoreTransferFunction::Srgb,
+        ..description
+    }
+}
+
+fn send_canonical_sdr_image_description_info(
+    info: wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    state: &mut DesktopState,
+) {
     use wp_color_manager_v1::{Primaries, TransferFunction};
 
     info.primaries_named(Primaries::Srgb);
-    info.tf_named(TransferFunction::Bt1886);
-    // BT.1886 default luminances from the protocol appendix.
-    info.luminances(100, 100, 100);
-    info.done();
+    info.tf_named(TransferFunction::CompoundPower24);
+    let (min_lum, max_lum, reference_lum) = primary_luminance_wire_values(&ColorDescription::SRGB);
+    info.luminances(min_lum, max_lum, reference_lum);
+    if info.version() >= 2 {
+        info.target_luminance(min_lum, max_lum);
+    }
+    queue_image_description_info_done(info, state);
+}
+
+fn emit_image_description_info_events(
+    info: &wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    description: &ColorDescription,
+) {
+    use wp_color_manager_v1::{Primaries, TransferFunction};
+
+    let use_custom = match description.primaries {
+        ColorPrimaries::Custom(ch) => primaries_plausible(&ch),
+        _ => false,
+    };
+
+    match description.primaries {
+        ColorPrimaries::Srgb if !use_custom => info.primaries_named(Primaries::Srgb),
+        ColorPrimaries::DisplayP3 if !use_custom => info.primaries_named(Primaries::DisplayP3),
+        ColorPrimaries::Bt2020 if !use_custom => info.primaries_named(Primaries::Bt2020),
+        ColorPrimaries::Custom(ch) if use_custom => {
+            info.primaries(
+                (ch.r[0] * 100_000.0).round() as i32,
+                (ch.r[1] * 100_000.0).round() as i32,
+                (ch.g[0] * 100_000.0).round() as i32,
+                (ch.g[1] * 100_000.0).round() as i32,
+                (ch.b[0] * 100_000.0).round() as i32,
+                (ch.b[1] * 100_000.0).round() as i32,
+                (ch.w[0] * 100_000.0).round() as i32,
+                (ch.w[1] * 100_000.0).round() as i32,
+            );
+        }
+        _ => {
+            wp_color_trace!(
+                "get_information: invalid output primaries, falling back to sRGB advertisement",
+            );
+            info.primaries_named(Primaries::Srgb);
+        }
+    }
+
+    let tf_named = match description.transfer {
+        CoreTransferFunction::Srgb => TransferFunction::Srgb,
+        CoreTransferFunction::Bt1886 | CoreTransferFunction::Gamma22 => {
+            TransferFunction::CompoundPower24
+        }
+        CoreTransferFunction::Linear => TransferFunction::ExtLinear,
+        // C3d: advertise PQ named transfer when wp_color HDR is wired.
+        CoreTransferFunction::St2084Pq => TransferFunction::ExtLinear,
+    };
+    info.tf_named(tf_named);
+
+    let (min_lum, max_lum, reference_lum) = primary_luminance_wire_values(description);
+    info.luminances(min_lum, max_lum, reference_lum);
+    if info.version() >= 2 {
+        // SDR: target volume equals primary volume — omit target_primaries.
+        info.target_luminance(min_lum, max_lum);
+    }
+}
+
+fn send_image_description_info(
+    info: wp_image_description_info_v1::WpImageDescriptionInfoV1,
+    description: &ColorDescription,
+    state: &mut DesktopState,
+) {
+    emit_image_description_info_events(&info, description);
+    queue_image_description_info_done(info, state);
 }
 
 fn build_description_from_params(
@@ -315,29 +837,47 @@ fn build_description_from_params(
     let primaries = creator
         .primaries
         .ok_or_else(|| "missing primaries".to_string())?;
-    if primaries != wp_color_manager_v1::Primaries::Srgb {
-        return Err("unsupported primaries".into());
-    }
 
     let transfer = creator
         .tf
         .ok_or_else(|| "missing transfer function".to_string())?;
 
-    let mapped = match transfer {
+    let mapped_tf = match transfer {
         ParametricTransfer::Named(tf) => match tf {
-            wp_color_manager_v1::TransferFunction::Bt1886
-            | wp_color_manager_v1::TransferFunction::Gamma22
-            | wp_color_manager_v1::TransferFunction::CompoundPower24 => TransferFunction::Srgb,
-            wp_color_manager_v1::TransferFunction::ExtLinear => TransferFunction::Linear,
+            wp_color_manager_v1::TransferFunction::Bt1886 => CoreTransferFunction::Bt1886,
+            wp_color_manager_v1::TransferFunction::Gamma22 => CoreTransferFunction::Gamma22,
+            wp_color_manager_v1::TransferFunction::Srgb
+            | wp_color_manager_v1::TransferFunction::CompoundPower24 => CoreTransferFunction::Srgb,
+            wp_color_manager_v1::TransferFunction::ExtLinear => CoreTransferFunction::Linear,
             _ => return Err("unsupported named transfer function".into()),
         },
-        ParametricTransfer::Power(exp) if (exp - 2.4).abs() <= 0.0001 => TransferFunction::Srgb,
+        ParametricTransfer::Power(exp) if (exp - 2.4).abs() <= 0.0001 => CoreTransferFunction::Srgb,
+        ParametricTransfer::Power(exp) if (exp - 2.2).abs() <= 0.0001 => {
+            CoreTransferFunction::Gamma22
+        }
         ParametricTransfer::Power(_) => return Err("unsupported power transfer function".into()),
     };
 
-    Ok(match mapped {
-        TransferFunction::Srgb => ColorDescription::SRGB,
-        TransferFunction::Linear => ColorDescription::LINEAR_SRGB,
+    let ref_nits = creator
+        .reference_luminance_mcd
+        .map(|mcd| mcd as f32 / 10_000.0)
+        .unwrap_or(80.0);
+    let max_nits = creator
+        .max_luminance_mcd
+        .map(|mcd| mcd as f32 / 10_000.0)
+        .unwrap_or(ref_nits);
+    let _min_nits = creator
+        .min_luminance_mcd
+        .map(|mcd| mcd as f32 / 10_000.0)
+        .unwrap_or(0.0);
+
+    Ok(ColorDescription {
+        primaries,
+        transfer: mapped_tf,
+        reference_white_nits: ref_nits,
+        max_luminance_nits: max_nits,
+        max_cll_nits: None,
+        max_fall_nits: None,
     })
 }
 
@@ -362,11 +902,32 @@ fn apply_surface_description(
     description: Option<ColorDescription>,
     intent: RenderingIntent,
 ) {
-    wp_color_trace(format!(
+    let description =
+        description.map(|desc| sanitize_client_color_description(state, surface, desc));
+
+    if let Some(new_desc) = description {
+        if let Some(widest) = state
+            .color_management_state
+            .surface_widest_descriptions
+            .get(&surface.id())
+        {
+            if primaries_wider_than(widest.primaries, new_desc.primaries) {
+                wp_color_trace!(
+                    "apply surface description: ignored gamut downgrade on surface={:?} {:?} -> {:?}",
+                    surface.id(),
+                    widest.primaries,
+                    new_desc.primaries
+                );
+                return;
+            }
+        }
+    }
+
+    wp_color_trace!(
         "apply surface description: surface={:?} desc={:?} intent={intent:?}",
         surface.id(),
         description
-    ));
+    );
     with_states(surface, |states| {
         states
             .cached_state
@@ -379,6 +940,16 @@ fn apply_surface_description(
             .pending()
             .intent = intent;
     });
+    if let Some(desc) = description {
+        let entry = state
+            .color_management_state
+            .surface_widest_descriptions
+            .entry(surface.id())
+            .or_insert(desc);
+        if primaries_wider_than(desc.primaries, entry.primaries) {
+            *entry = desc;
+        }
+    }
     state.refresh_surface_color(surface);
 }
 
@@ -401,6 +972,7 @@ fn post_creator_error(
 
 impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
     fn can_view(client: Client, _global_data: &()) -> bool {
+        // Cursor still hits incomplete paths; browsers need wp_color (Chrome binds as `chrome`).
         !client_is_cursor(&client)
     }
 
@@ -413,10 +985,10 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState 
         data_init: &mut DataInit<'_, Self>,
     ) {
         let manager = data_init.init(resource, ());
-        wp_color_trace(format!(
+        wp_color_trace!(
             "wp_color_manager_v1 bound {}",
             client_trace_prefix(client, _handle)
-        ));
+        );
         send_manager_advertisement(&manager);
     }
 }
@@ -431,22 +1003,15 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
         dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color manager request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
-            "manager {} {request:?}",
-            client_trace_prefix(client, dh)
-        ));
+        wp_color_trace!("manager {} {request:?}", client_trace_prefix(client, dh));
         match request {
             wp_color_manager_v1::Request::Destroy => {}
             wp_color_manager_v1::Request::GetSurface { id, surface } => {
-                wp_color_trace(format!(
+                wp_color_trace!(
                     "manager get_surface: {} surface={:?}",
                     client_trace_prefix(client, dh),
                     surface.id()
-                ));
+                );
                 if state
                     .color_management_state
                     .surface_objects
@@ -465,65 +1030,95 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
                     .insert(surface.id());
                 data_init.init(id, SurfaceColorManagement::new(surface));
             }
-            wp_color_manager_v1::Request::GetOutput {
-                id,
-                output: _output,
-            } => {
-                wp_color_trace(format!(
-                    "manager get_output: {} output-requested",
-                    client_trace_prefix(client, dh)
-                ));
-                data_init.init(id, OutputColorManagement);
+            wp_color_manager_v1::Request::GetOutput { id, output } => {
+                wp_color_trace!(
+                    "manager get_output: {} output={:?}",
+                    client_trace_prefix(client, dh),
+                    output.id()
+                );
+                let Some(output_handle) = Output::from_resource(&output) else {
+                    wp_color_trace!(
+                        "manager get_output rejected: {} invalid wl_output={:?}",
+                        client_trace_prefix(client, dh),
+                        output.id()
+                    );
+                    data_init.init(id, OrphanOutputColorManagement);
+                    resource.post_error(
+                        wp_color_manager_v1::Error::UnsupportedFeature,
+                        "invalid wl_output",
+                    );
+                    return;
+                };
+                data_init.init(
+                    id,
+                    OutputColorManagement {
+                        output: output_handle,
+                    },
+                );
             }
             wp_color_manager_v1::Request::GetSurfaceFeedback { id, surface } => {
-                wp_color_trace(format!(
+                wp_color_trace!(
                     "manager get_surface_feedback: {} surface={:?}",
                     client_trace_prefix(client, dh),
                     surface.id()
-                ));
-                data_init.init(id, SurfaceColorFeedback::new(surface));
+                );
+                let feedback = data_init.init(id, SurfaceColorFeedback::new(surface.clone()));
+                send_preferred_changed_for_surface(state, &surface);
+                state
+                    .color_management_state
+                    .surface_feedbacks
+                    .push(feedback);
             }
             wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
-                wp_color_trace(format!(
+                wp_color_trace!(
                     "manager create_parametric_creator: {}",
                     client_trace_prefix(client, dh)
-                ));
+                );
                 data_init.init(obj, ParametricCreatorState::default());
             }
             wp_color_manager_v1::Request::CreateIccCreator { obj } => {
-                wp_color_trace(format!(
-                    "manager create_icc_creator rejected: {}",
+                wp_color_trace!(
+                    "manager create_icc_creator: {}",
                     client_trace_prefix(client, dh)
-                ));
-                data_init.init(obj, ());
-                resource.post_error(
-                    wp_color_manager_v1::Error::UnsupportedFeature,
-                    "request not supported",
                 );
+                data_init.init(obj, IccCreatorState::default());
             }
             wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
-                wp_color_trace(format!(
-                    "manager create_windows_scrgb rejected: {}",
+                wp_color_trace!(
+                    "manager create_windows_scrgb: {}",
                     client_trace_prefix(client, dh)
-                ));
-                init_failed_image_description(
+                );
+                if !windows_scrgb_supported() {
+                    init_failed_image_description(
+                        data_init,
+                        image_description,
+                        "Windows-scRGB requires linear compositing (FOCALDESK_LINEAR_SDR=0?)",
+                    );
+                    resource.post_error(
+                        wp_color_manager_v1::Error::UnsupportedFeature,
+                        "windows_scrgb not supported",
+                    );
+                    return;
+                }
+                finish_image_description(
+                    state,
                     data_init,
                     image_description,
-                    "Windows-scRGB is not supported",
-                );
-                resource.post_error(
-                    wp_color_manager_v1::Error::UnsupportedFeature,
-                    "request not supported",
+                    ColorDescription::WINDOWS_SCRGB,
+                    true,
+                    None,
+                    false,
+                    None,
                 );
             }
             wp_color_manager_v1::Request::GetImageDescription {
                 image_description,
                 reference: _,
             } => {
-                wp_color_trace(format!(
+                wp_color_trace!(
                     "manager get_image_description rejected: {}",
                     client_trace_prefix(client, dh)
-                ));
+                );
                 init_failed_image_description(
                     data_init,
                     image_description,
@@ -531,46 +1126,122 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
                 );
             }
             other => {
-                wp_color_trace(format!("manager unhandled: {other:?}"));
+                wp_color_trace!("manager unhandled: {other:?}");
             }
         }
     }
 }
 
-impl Dispatch<wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1, ()>
+fn post_icc_creator_error(
+    resource: &wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1,
+    error: wp_image_description_creator_icc_v1::Error,
+    msg: &str,
+) {
+    resource.post_error(error, msg);
+}
+
+impl Dispatch<wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1, IccCreatorState>
     for DesktopState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         client: &Client,
         resource: &wp_image_description_creator_icc_v1::WpImageDescriptionCreatorIccV1,
         request: wp_image_description_creator_icc_v1::Request,
-        _data: &(),
+        creator: &IccCreatorState,
         dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color icc creator request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
+        wp_color_trace!(
             "icc creator {} {request:?}",
             client_trace_prefix(client, dh)
-        ));
+        );
         match request {
+            wp_image_description_creator_icc_v1::Request::SetIccFile {
+                icc_profile,
+                offset,
+                length,
+            } => {
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.icc_bytes.is_some() {
+                    post_icc_creator_error(
+                        resource,
+                        wp_image_description_creator_icc_v1::Error::AlreadySet,
+                        "ICC file already set",
+                    );
+                    return;
+                }
+                match read_icc_from_fd(icc_profile, offset, length) {
+                    Ok(bytes) => {
+                        inner.icc_bytes = Some(bytes);
+                    }
+                    Err(crate::core::icc::IccError::Invalid("bad size")) => {
+                        post_icc_creator_error(
+                            resource,
+                            wp_image_description_creator_icc_v1::Error::BadSize,
+                            "invalid ICC size",
+                        );
+                    }
+                    Err(crate::core::icc::IccError::Invalid("out of file")) => {
+                        post_icc_creator_error(
+                            resource,
+                            wp_image_description_creator_icc_v1::Error::OutOfFile,
+                            "ICC range exceeds file size",
+                        );
+                    }
+                    Err(_) => {
+                        post_icc_creator_error(
+                            resource,
+                            wp_image_description_creator_icc_v1::Error::BadFd,
+                            "ICC fd not readable or seekable",
+                        );
+                    }
+                }
+            }
             wp_image_description_creator_icc_v1::Request::Create { image_description } => {
-                init_failed_image_description(
-                    data_init,
-                    image_description,
-                    "ICC image descriptions are not supported",
-                );
+                let bytes = {
+                    let inner = creator.inner.lock().unwrap();
+                    match inner.icc_bytes.clone() {
+                        Some(bytes) => bytes,
+                        None => {
+                            init_failed_image_description(
+                                data_init,
+                                image_description,
+                                "ICC file not set",
+                            );
+                            post_icc_creator_error(
+                                resource,
+                                wp_image_description_creator_icc_v1::Error::IncompleteSet,
+                                "ICC file not set",
+                            );
+                            return;
+                        }
+                    }
+                };
+                match parse_icc_profile(&bytes) {
+                    Ok(parsed) => {
+                        finish_image_description(
+                            state,
+                            data_init,
+                            image_description,
+                            parsed.description,
+                            false,
+                            None,
+                            false,
+                            None,
+                        );
+                    }
+                    Err(err) => {
+                        wp_color_trace!("ICC parse failed: {err:?}");
+                        init_failed_image_description(
+                            data_init,
+                            image_description,
+                            "unsupported ICC profile",
+                        );
+                    }
+                }
             }
-            _ => {
-                resource.post_error(
-                    wp_image_description_creator_icc_v1::Error::IncompleteSet,
-                    "ICC image descriptions are not supported",
-                );
-            }
+            _ => {}
         }
     }
 }
@@ -590,17 +1261,13 @@ impl
         dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color parametric creator request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
+        wp_color_trace!(
             "parametric creator {} {request:?}",
             client_trace_prefix(client, dh)
-        ));
+        );
         match request {
             wp_image_description_creator_params_v1::Request::SetTfNamed { tf } => {
-                wp_color_trace("parametric creator set_tf_named");
+                wp_color_trace!("parametric creator set_tf_named");
                 let Some(tf) = tf_into_named(tf) else {
                     post_creator_error(
                         resource,
@@ -621,7 +1288,7 @@ impl
                 inner.tf = Some(ParametricTransfer::Named(tf));
             }
             wp_image_description_creator_params_v1::Request::SetTfPower { eexp } => {
-                wp_color_trace(format!("parametric creator set_tf_power: eexp={eexp}"));
+                wp_color_trace!("parametric creator set_tf_power: eexp={eexp}");
                 let mut inner = creator.inner.lock().unwrap();
                 if inner.tf.is_some() {
                     post_creator_error(
@@ -643,16 +1310,72 @@ impl
                 inner.tf = Some(ParametricTransfer::Power(exp));
             }
             wp_image_description_creator_params_v1::Request::SetPrimariesNamed { primaries } => {
-                wp_color_trace(format!(
-                    "parametric creator set_primaries_named: primaries={primaries:?}"
-                ));
-                let WEnum::Value(primaries) = primaries else {
+                wp_color_trace!("parametric creator set_primaries_named: primaries={primaries:?}");
+                let mapped = match primaries {
+                    WEnum::Value(p) => ColorPrimaries::from_wp_named(p).unwrap_or_else(|| {
+                        wp_color_trace!(
+                            "parametric creator set_primaries_named: unsupported named primaries, falling back to sRGB",
+                        );
+                        ColorPrimaries::Srgb
+                    }),
+                    WEnum::Unknown(_) => {
+                        wp_color_trace!(
+                            "parametric creator set_primaries_named: unknown primaries enum, falling back to sRGB",
+                        );
+                        ColorPrimaries::Srgb
+                    }
+                };
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.primaries.is_some() {
                     post_creator_error(
                         resource,
-                        wp_image_description_creator_params_v1::Error::InvalidPrimariesNamed,
-                        "invalid primaries",
+                        wp_image_description_creator_params_v1::Error::AlreadySet,
+                        "primaries already set",
                     );
                     return;
+                }
+                inner.primaries = Some(mapped);
+            }
+            wp_image_description_creator_params_v1::Request::Create { image_description } => {
+                wp_color_trace!("parametric creator create");
+                let inner = creator.inner.lock().unwrap();
+                let description = match build_description_from_params(&inner) {
+                    Ok(description) => description,
+                    Err(msg) => {
+                        init_failed_image_description(data_init, image_description, msg);
+                        return;
+                    }
+                };
+                drop(inner);
+                finish_image_description(
+                    state,
+                    data_init,
+                    image_description,
+                    description,
+                    true,
+                    None,
+                    false,
+                    None,
+                );
+            }
+            wp_image_description_creator_params_v1::Request::SetPrimaries {
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
+            } => {
+                let primaries = match primaries_from_wire(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y) {
+                    Some(ch) => ColorPrimaries::Custom(ch),
+                    None => {
+                        wp_color_trace!(
+                            "parametric creator set_primaries: invalid wire values, falling back to sRGB",
+                        );
+                        ColorPrimaries::Srgb
+                    }
                 };
                 let mut inner = creator.inner.lock().unwrap();
                 if inner.primaries.is_some() {
@@ -665,22 +1388,25 @@ impl
                 }
                 inner.primaries = Some(primaries);
             }
-            wp_image_description_creator_params_v1::Request::Create { image_description } => {
-                wp_color_trace("parametric creator create");
-                let inner = creator.inner.lock().unwrap();
-                let description = match build_description_from_params(&inner) {
-                    Ok(description) => description,
-                    Err(msg) => {
-                        init_failed_image_description(data_init, image_description, msg);
-                        return;
-                    }
-                };
-                drop(inner);
-                finish_image_description(state, data_init, image_description, description, false);
+            wp_image_description_creator_params_v1::Request::SetLuminances {
+                min_lum,
+                max_lum,
+                reference_lum,
+            } => {
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.reference_luminance_mcd.is_some() {
+                    post_creator_error(
+                        resource,
+                        wp_image_description_creator_params_v1::Error::AlreadySet,
+                        "luminances already set",
+                    );
+                    return;
+                }
+                inner.min_luminance_mcd = Some(min_lum);
+                inner.max_luminance_mcd = Some(max_lum);
+                inner.reference_luminance_mcd = Some(reference_lum);
             }
-            wp_image_description_creator_params_v1::Request::SetPrimaries { .. }
-            | wp_image_description_creator_params_v1::Request::SetLuminances { .. }
-            | wp_image_description_creator_params_v1::Request::SetMasteringDisplayPrimaries {
+            wp_image_description_creator_params_v1::Request::SetMasteringDisplayPrimaries {
                 ..
             }
             | wp_image_description_creator_params_v1::Request::SetMasteringLuminance { .. }
@@ -701,7 +1427,7 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
     for DesktopState
 {
     fn request(
-        _state: &mut Self,
+        state: &mut Self,
         client: &Client,
         resource: &wp_image_description_v1::WpImageDescriptionV1,
         request: wp_image_description_v1::Request,
@@ -709,19 +1435,15 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
         dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color image description request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
+        wp_color_trace!(
             "image description {} {request:?}",
             client_trace_prefix(client, dh)
-        ));
+        );
         match request {
             wp_image_description_v1::Request::Destroy => {}
             wp_image_description_v1::Request::GetInformation { information } => {
                 if !data.ready {
-                    init_inert_image_description_info(data_init, information);
+                    init_inert_image_description_info(state, data_init, information);
                     resource.post_error(
                         wp_image_description_v1::Error::NotReady,
                         "image description not ready",
@@ -729,7 +1451,7 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
                     return;
                 }
                 if !data.allows_information {
-                    init_inert_image_description_info(data_init, information);
+                    init_inert_image_description_info(state, data_init, information);
                     resource.post_error(
                         wp_image_description_v1::Error::NoInformation,
                         "image description info unavailable",
@@ -737,24 +1459,32 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionDat
                     return;
                 }
                 let info = data_init.init(information, ());
-                send_sdr_image_description_info(&info);
+                if data.advertise_as_canonical_sdr {
+                    send_canonical_sdr_image_description_info(info, state);
+                } else if let Some(icc) = &data.icc_profile {
+                    // Chromium ignores icc_file (NOTIMPLEMENTED) and needs parametric
+                    // primaries/tf/luminances to learn output gamut.
+                    emit_image_description_info_events(&info, &data.description);
+                    match icc::memfd_from_bytes(icc) {
+                        Ok(fd) => {
+                            info.icc_file(fd.as_fd(), icc.len() as u32);
+                            queue_image_description_info_done(info, state);
+                        }
+                        Err(err) => {
+                            wp_color_trace!("icc memfd failed: {err}");
+                            queue_image_description_info_done(info, state);
+                            resource.post_error(
+                                wp_image_description_v1::Error::NotReady,
+                                "failed to export ICC profile",
+                            );
+                        }
+                    }
+                } else {
+                    send_image_description_info(info, &data.description, state);
+                }
             }
             _ => {}
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_cursor_executable_name;
-
-    #[test]
-    fn cursor_executable_name_filter_is_strict() {
-        assert!(is_cursor_executable_name("cursor"));
-        assert!(is_cursor_executable_name("cursor-bin"));
-        assert!(!is_cursor_executable_name("Cursor"));
-        assert!(!is_cursor_executable_name("cursor.exe"));
-        assert!(!is_cursor_executable_name("code"));
     }
 }
 
@@ -763,14 +1493,28 @@ impl Dispatch<wp_image_description_info_v1::WpImageDescriptionInfoV1, ()> for De
         _state: &mut Self,
         _client: &Client,
         _resource: &wp_image_description_info_v1::WpImageDescriptionInfoV1,
-        request: wp_image_description_info_v1::Request,
+        _request: wp_image_description_info_v1::Request,
         _data: &(),
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            _ => {}
-        }
+        {}
+    }
+}
+
+impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, OrphanOutputColorManagement>
+    for DesktopState
+{
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &wp_color_management_output_v1::WpColorManagementOutputV1,
+        request: wp_color_management_output_v1::Request,
+        _data: &OrphanOutputColorManagement,
+        _dh: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let wp_color_management_output_v1::Request::Destroy = request {}
     }
 }
 
@@ -782,23 +1526,33 @@ impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, OutputCo
         client: &Client,
         _resource: &wp_color_management_output_v1::WpColorManagementOutputV1,
         request: wp_color_management_output_v1::Request,
-        _data: &OutputColorManagement,
+        output_mgmt: &OutputColorManagement,
         dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color output request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
-            "output {} {request:?}",
-            client_trace_prefix(client, dh)
-        ));
+        wp_color_trace!("output {} {request:?}", client_trace_prefix(client, dh));
         match request {
             wp_color_management_output_v1::Request::Destroy => {}
             wp_color_management_output_v1::Request::GetImageDescription { image_description } => {
-                wp_color_trace("output get_image_description");
-                finish_canonical_sdr_image_description(state, data_init, image_description);
+                wp_color_trace!("output get_image_description");
+                let description = state.output_color_description_for(&output_mgmt.output);
+                let icc_profile = state.output_icc_profile_for(&output_mgmt.output);
+                if browser_color_management_uses_canonical_sdr(client) {
+                    finish_canonical_sdr_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        ColorDescription::SRGB,
+                    );
+                } else {
+                    finish_output_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        description,
+                        icc_profile,
+                    );
+                }
             }
             _ => {}
         }
@@ -820,17 +1574,17 @@ impl
         dh: &DisplayHandle,
         data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color surface feedback request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
+        wp_color_trace!(
             "surface feedback {} {request:?}",
             client_trace_prefix(client, dh)
-        ));
+        );
         match request {
             wp_color_management_surface_feedback_v1::Request::Destroy => {
-                wp_color_trace("surface feedback destroy");
+                wp_color_trace!("surface feedback destroy");
+                state
+                    .color_management_state
+                    .surface_feedbacks
+                    .retain(|f| f.id() != resource.id());
                 if feedback.is_inert() {
                     resource.post_error(
                         wp_color_management_surface_feedback_v1::Error::Inert,
@@ -844,7 +1598,7 @@ impl
             | wp_color_management_surface_feedback_v1::Request::GetPreferredParametric {
                 image_description,
             } => {
-                wp_color_trace("surface feedback get_preferred");
+                wp_color_trace!("surface feedback get_preferred");
                 if feedback.is_inert() {
                     init_failed_image_description(
                         data_init,
@@ -857,10 +1611,37 @@ impl
                     );
                     return;
                 }
-                finish_canonical_sdr_image_description(state, data_init, image_description);
+                let output_id = state.preferred_output_id_for_surface(&feedback.surface);
+                let description = resolve_preferred_output_description(state, output_id);
+                let icc_profile = state
+                    .outputs
+                    .get(&output_id)
+                    .and_then(|output| output.icc_profile.clone());
+                wp_color_trace!(
+                    "surface feedback get_preferred: output={output_id:?} transfer={:?} primaries={:?}",
+                    description.transfer,
+                    description.primaries
+                );
+                if browser_color_management_uses_canonical_sdr(client) {
+                    finish_canonical_sdr_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        ColorDescription::SRGB,
+                    );
+                } else {
+                    finish_preferred_output_image_description(
+                        state,
+                        data_init,
+                        image_description,
+                        output_id,
+                        description,
+                        icc_profile,
+                    );
+                }
             }
             _ => {
-                wp_color_trace("surface feedback other request");
+                wp_color_trace!("surface feedback other request");
                 if feedback.is_inert() {
                     resource.post_error(
                         wp_color_management_surface_feedback_v1::Error::Inert,
@@ -884,16 +1665,9 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
         dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        flog_critical!(
-            "wp color surface request: {} {request:?}",
-            client_trace_prefix(client, dh)
-        );
-        wp_color_trace(format!(
-            "surface {} {request:?}",
-            client_trace_prefix(client, dh)
-        ));
+        wp_color_trace!("surface {} {request:?}", client_trace_prefix(client, dh));
         if surface_mgmt.is_inert() {
-            wp_color_trace("surface request rejected: inert surface");
+            wp_color_trace!("surface request rejected: inert surface");
             resource.post_error(
                 wp_color_management_surface_v1::Error::Inert,
                 "wl_surface destroyed",
@@ -903,7 +1677,7 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
 
         match request {
             wp_color_management_surface_v1::Request::Destroy => {
-                wp_color_trace("surface destroy");
+                wp_color_trace!("surface destroy");
                 apply_surface_description(
                     state,
                     &surface_mgmt.surface,
@@ -915,9 +1689,7 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
                 image_description,
                 render_intent,
             } => {
-                wp_color_trace(format!(
-                    "surface set_image_description: intent={render_intent:?}"
-                ));
+                wp_color_trace!("surface set_image_description: intent={render_intent:?}");
                 let Some(intent) = intent_from_wire(render_intent) else {
                     resource.post_error(
                         wp_color_management_surface_v1::Error::RenderIntent,
@@ -934,24 +1706,27 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
                     return;
                 };
                 if !data.ready {
-                    wp_color_trace("surface set_image_description rejected: description not ready");
+                    wp_color_trace!(
+                        "surface set_image_description rejected: description not ready"
+                    );
                     resource.post_error(
                         wp_color_management_surface_v1::Error::ImageDescription,
                         "image description not ready",
                     );
                     return;
                 }
-                flog(&format!(
-                    "wp color pending: surface={:?} transfer={:?}",
+                flog_warn!(
+                    "wp color pending: surface={:?} transfer={:?} primaries={:?}",
                     surface_mgmt.surface.id(),
-                    data.description.transfer
-                ));
-                wp_color_trace(format!(
+                    data.description.transfer,
+                    data.description.primaries
+                );
+                wp_color_trace!(
                     "surface pending description accepted: surface={:?} transfer={:?} ready={}",
                     surface_mgmt.surface.id(),
                     data.description.transfer,
                     data.ready
-                ));
+                );
                 apply_surface_description(
                     state,
                     &surface_mgmt.surface,
@@ -960,7 +1735,7 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
                 );
             }
             wp_color_management_surface_v1::Request::UnsetImageDescription => {
-                wp_color_trace("surface unset_image_description");
+                wp_color_trace!("surface unset_image_description");
                 apply_surface_description(
                     state,
                     &surface_mgmt.surface,
@@ -982,10 +1757,14 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
             .color_management_state
             .surface_objects
             .remove(&surface_mgmt.surface.id());
-        wp_color_trace(format!(
+        state
+            .color_management_state
+            .surface_widest_descriptions
+            .remove(&surface_mgmt.surface.id());
+        wp_color_trace!(
             "surface management destroyed: surface={:?}",
             surface_mgmt.surface.id()
-        ));
+        );
     }
 }
 
@@ -1004,9 +1783,121 @@ impl
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {
-        match request {
-            wp_color_management_surface_v1::Request::Destroy => {}
-            _ => {}
-        }
+        if let wp_color_management_surface_v1::Request::Destroy = request {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_cursor_executable_name, primary_luminance_wire_values};
+    use crate::core::color::ColorDescription;
+    use wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::TransferFunction as WpTransferFunction;
+
+    #[test]
+    fn cursor_executable_name_filter_is_strict() {
+        assert!(is_cursor_executable_name("cursor"));
+        assert!(is_cursor_executable_name("cursor-bin"));
+        assert!(!is_cursor_executable_name("Cursor"));
+        assert!(!is_cursor_executable_name("cursor.exe"));
+        assert!(!is_cursor_executable_name("code"));
+    }
+
+    #[test]
+    fn luminance_wire_values_use_protocol_units() {
+        let (min_lum, max_lum, reference_lum) =
+            primary_luminance_wire_values(&ColorDescription::SRGB);
+        assert_eq!(min_lum, 2000);
+        assert_eq!(max_lum, 80);
+        assert_eq!(reference_lum, 80);
+    }
+
+    #[test]
+    fn primaries_from_wire_uses_protocol_scale_only() {
+        let ch = super::primaries_from_wire(64845, 33084, 23025, 70148, 15589, 6603, 34570, 35854)
+            .expect("1e5 scale");
+        assert!((ch.r[0] - 0.64845).abs() < 0.001);
+
+        // Chrome has sent 304229-style values; 1e7 wrongly accepts ~0.03 xy as "valid".
+        assert!(super::primaries_from_wire(
+            304229, 270282, 230029, 444840, 398100, 261034, 312700, 329000
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn primaries_plausible_rejects_tiny_coordinates() {
+        use crate::core::color::PrimariesChromaticity;
+        let tiny = PrimariesChromaticity {
+            r: [0.0304229, 0.0270282],
+            g: [0.0230029, 0.044484],
+            b: [0.03981, 0.0261034],
+            w: [0.03127, 0.0329],
+        };
+        assert!(!crate::core::color::primaries_plausible(&tiny));
+        assert!(crate::core::color::primaries_plausible(
+            &PrimariesChromaticity::SRGB
+        ));
+    }
+
+    #[test]
+    fn output_without_icc_uses_canonical_sdr_advertisement_flag() {
+        let data = super::ImageDescriptionData {
+            identity: 1,
+            description: ColorDescription::SRGB,
+            ready: true,
+            allows_information: true,
+            icc_profile: None,
+            advertise_as_canonical_sdr: true,
+        };
+        assert!(data.advertise_as_canonical_sdr);
+        assert!(data.icc_profile.is_none());
+    }
+
+    #[test]
+    fn non_srgb_output_without_icc_is_not_forced_to_canonical_sdr() {
+        let description = ColorDescription::DISPLAY_P3_SRGB;
+        let advertised = super::output_advertised_description(description);
+        assert_eq!(
+            advertised.primaries,
+            crate::core::color::ColorPrimaries::DisplayP3
+        );
+        assert_eq!(
+            advertised.transfer,
+            crate::core::color::TransferFunction::Srgb
+        );
+    }
+
+    #[test]
+    fn parametric_ext_linear_is_preserved_for_client_surfaces() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::Srgb),
+            tf: Some(super::ParametricTransfer::Named(
+                WpTransferFunction::ExtLinear,
+            )),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid params");
+        assert_eq!(
+            description.transfer,
+            crate::core::color::TransferFunction::Linear
+        );
+    }
+
+    #[test]
+    fn parametric_srgb_tf_maps_to_internal_srgb() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::DisplayP3),
+            tf: Some(super::ParametricTransfer::Named(WpTransferFunction::Srgb)),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid params");
+        assert_eq!(
+            description.primaries,
+            crate::core::color::ColorPrimaries::DisplayP3
+        );
+        assert_eq!(
+            description.transfer,
+            crate::core::color::TransferFunction::Srgb
+        );
     }
 }

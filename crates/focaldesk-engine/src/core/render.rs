@@ -15,14 +15,14 @@ use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
-use smithay::backend::renderer::ImportMem;
-use smithay::backend::renderer::Texture;
+use smithay::backend::renderer::{ImportMem, Texture};
 use smithay::desktop::Window;
 use smithay::desktop::{PopupManager, Space};
 use smithay::output::Output;
 use smithay::utils::Buffer;
 use smithay::utils::Transform;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
 
@@ -41,10 +41,13 @@ use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
+use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
-use crate::core::color::{srgb_to_linear, TransferFunction};
+use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
 use crate::core::desktop::DesktopState;
-use crate::core::desktop::{ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame};
+use crate::core::desktop::{
+    ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame,
+};
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
@@ -59,6 +62,7 @@ use focaldesk_themes::IconTheme;
 use focaldesk_themes::TextTheme;
 use focaldesk_themes::WallpaperTheme;
 use focaldesk_types::WorkspaceId;
+use focaldesk_ui::chrome_draw::draw_flow_field;
 use focaldesk_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical};
 use focaldesk_ui::chrome_shaders::ChromeShaders;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
@@ -114,6 +118,8 @@ pub enum OutputRenderStage {
     LinearGlassUnderClients,
     Clients,
     Overlay,
+    /// egui + software cursor only (sRGB), after linear scene → KMS encode.
+    EguiOverlay,
 }
 
 /// Where work-area glass is composited in the staged linear SDR path.
@@ -131,7 +137,19 @@ pub enum ChromeGlassPass {
 #[derive(Clone)]
 pub enum ClientCompositingMode {
     Sdr,
-    Linear { srgb_to_linear: GlesTexProgram },
+    /// sRGB-encoded chrome/wallpaper assets → scene-linear Rec.709.
+    LinearUi {
+        srgb_to_linear: GlesTexProgram,
+    },
+    Linear {
+        client_to_scene: GlesTexProgram,
+    },
+}
+
+impl ClientCompositingMode {
+    pub fn ui_textures_linear(&self) -> bool {
+        matches!(self, Self::LinearUi { .. })
+    }
 }
 
 impl FrameCtx {
@@ -173,6 +191,8 @@ pub struct RenderState {
     pub wallpaper_texture: Option<GlesTexture>,
     /// Software cursor: GPU texture + layout (physical pixels), when not on the DRM cursor plane.
     pub sw_cursor_texture: Option<GlesTexture>,
+    pub sw_cursor_surface: Option<WlSurface>,
+    pub sw_cursor_surface_elements: Vec<FlowRenderElement>,
     sw_cursor_cache_key: Option<(FlowCursorIcon, u32, u32)>,
     pub sw_cursor_hotspot: (i32, i32),
     pub sw_cursor_tex_size: (i32, i32),
@@ -188,6 +208,13 @@ pub struct RenderState {
     pub font_atlas_texture: Option<GlesTexture>,
     pub fonts_prewarm_done: bool,
     pub portal_capture_blit_id: Id,
+    output_icc_lut_gpu: HashMap<OutputId, OutputIccLutGpu>,
+    pub icc_lut_fallback_logged: std::collections::HashSet<OutputId>,
+}
+
+struct OutputIccLutGpu {
+    lut: crate::core::icc_lut::OutputIccLut,
+    texture: GlesTexture,
 }
 
 pub struct RenderInputs<'a> {
@@ -201,6 +228,7 @@ pub struct RenderInputs<'a> {
     pub sidebar_hover_slot: Option<usize>, // 👈 ADD THIS
     pub sidebar_pulse: Option<SidebarPulseFrame>,
     pub topbar_pulse: Option<TopbarPulseFrame>,
+    pub flow_field_pulse: Option<FlowFieldPulseFrame>,
     pub clock_pulse: Option<ClockPulseFrame>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
@@ -216,7 +244,9 @@ pub struct RenderInputs<'a> {
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
     pub chrome_glass_pass: ChromeGlassPass,
-    pub surface_transfers: &'a std::collections::HashMap<Id, TransferFunction>,
+    /// When true, egui/cursor are drawn in a follow-up SDR pass (egui_glow outputs sRGB).
+    pub defer_egui_to_sdr: bool,
+    pub surface_colors: &'a std::collections::HashMap<Id, SurfaceColorRenderState>,
 }
 
 pub struct RenderInputsMut<'a> {
@@ -232,12 +262,33 @@ fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
     ]
 }
 
-fn glass_style_linear(style: &GlassStyle) -> GlassStyle {
-    GlassStyle {
-        tint: linearize_rgba(style.tint),
-        edge_color: linearize_rgba(style.edge_color),
-        ..*style
-    }
+fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
+    let mut t = theme.clone();
+    t.background.color = linearize_rgba(t.background.color);
+    t.wallpaper.tint_color = linearize_rgba(t.wallpaper.tint_color);
+    t.chrome.bg_color = linearize_rgba(t.chrome.bg_color);
+    t.chrome.panel_color = linearize_rgba(t.chrome.panel_color);
+    t.chrome.accent_color = linearize_rgba(t.chrome.accent_color);
+    t.chrome.trim_color = linearize_rgba(t.chrome.trim_color);
+    t.chrome.glass_tint = linearize_rgba(t.chrome.glass_tint);
+    t.dialog.panel_color = linearize_rgba(t.dialog.panel_color);
+    t.dialog.title_color = linearize_rgba(t.dialog.title_color);
+    t.dialog.text_color = linearize_rgba(t.dialog.text_color);
+    t.dialog.button_color = linearize_rgba(t.dialog.button_color);
+    t.dialog.overlay_dim = linearize_rgba(t.dialog.overlay_dim);
+    t.text.title = linearize_rgba(t.text.title);
+    t.text.normal = linearize_rgba(t.text.normal);
+    t.text.dim = linearize_rgba(t.text.dim);
+    t.text.accent = linearize_rgba(t.text.accent);
+    t.text.meta_label = linearize_rgba(t.text.meta_label);
+    t.text.meta_value = linearize_rgba(t.text.meta_value);
+    t.text.clock = linearize_rgba(t.text.clock);
+    t.icons.inactive = linearize_rgba(t.icons.inactive);
+    t.icons.hover = linearize_rgba(t.icons.hover);
+    t.icons.active = linearize_rgba(t.icons.active);
+    t.icons.disabled = linearize_rgba(t.icons.disabled);
+    t.icons.glow = linearize_rgba(t.icons.glow);
+    t
 }
 
 fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> ChromeTheme {
@@ -348,6 +399,10 @@ fn tooltip_rect_for_element(
     let (x, y) = match el_kind {
         UiElementKind::TopbarIndicator | UiElementKind::TopbarButton => (
             (el_bounds.x + (el_bounds.w - width) / 2).clamp(6, max_x),
+            (el_bounds.y + el_bounds.h + gap).clamp(6, max_y),
+        ),
+        UiElementKind::TopbarFlowField => (
+            (el_bounds.x + 8).clamp(6, max_x),
             (el_bounds.y + el_bounds.h + gap).clamp(6, max_y),
         ),
         _ => (
@@ -508,6 +563,12 @@ fn icon_tint(state: IconState, alpha: f32) -> [f32; 4] {
     }
 }
 
+impl Default for RenderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RenderState {
     pub fn new() -> Self {
         let zero: Rectangle<i32, Physical> = Rectangle::from_size(Size::from((0, 0)));
@@ -518,6 +579,8 @@ impl RenderState {
             scratch_damage_len: 0,
             wallpaper_texture: None,
             sw_cursor_texture: None,
+            sw_cursor_surface: None,
+            sw_cursor_surface_elements: Vec::new(),
             sw_cursor_cache_key: None,
             sw_cursor_hotspot: (0, 0),
             sw_cursor_tex_size: (0, 0),
@@ -531,7 +594,44 @@ impl RenderState {
             font_atlas_texture: None,
             fonts_prewarm_done: false,
             portal_capture_blit_id: Id::new(),
+            output_icc_lut_gpu: HashMap::new(),
+            icc_lut_fallback_logged: std::collections::HashSet::new(),
         }
+    }
+
+    /// Upload or reuse the ICC LUT 2D atlas for an output.
+    pub fn ensure_output_icc_lut_texture(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        output_id: OutputId,
+        lut: &crate::core::icc_lut::OutputIccLut,
+    ) -> Result<&GlesTexture, smithay::backend::renderer::gles::GlesError> {
+        let needs_upload = self
+            .output_icc_lut_gpu
+            .get(&output_id)
+            .map(|cached| cached.lut != *lut)
+            .unwrap_or(true);
+        if needs_upload {
+            let (w, h) = lut.atlas_size();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for chunk in lut.rgb.chunks_exact(3) {
+                rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
+            }
+            let texture = renderer.import_memory(
+                &rgba,
+                Fourcc::Abgr8888,
+                Size::from((w as i32, h as i32)),
+                false,
+            )?;
+            self.output_icc_lut_gpu.insert(
+                output_id,
+                OutputIccLutGpu {
+                    lut: lut.clone(),
+                    texture,
+                },
+            );
+        }
+        Ok(&self.output_icc_lut_gpu.get(&output_id).unwrap().texture)
     }
 
     fn draw_topbar_meta(
@@ -699,7 +799,7 @@ impl RenderState {
                 Rectangle::<i32, Physical>::from_loc_and_size((0, 0), (dst.size.w, dst.size.h));
 
             if let Err(e) = frame.render_texture_from_to(
-                &tex,
+                tex,
                 src,
                 dst,
                 &[damage_local],
@@ -745,6 +845,7 @@ impl RenderState {
                         | UiElementKind::WorkspaceSlot
                         | UiElementKind::TopbarIndicator
                         | UiElementKind::TopbarButton
+                        | UiElementKind::TopbarFlowField
                 )
         }) else {
             return Ok(());
@@ -808,8 +909,14 @@ impl RenderState {
 
     pub fn clear_sw_cursor_texture(&mut self) {
         self.sw_cursor_texture = None;
+        self.sw_cursor_surface = None;
+        self.sw_cursor_surface_elements.clear();
         self.sw_cursor_cache_key = None;
         self.sw_cursor_dst_rect = None;
+    }
+
+    pub fn clear_sw_cursor_cache_key(&mut self) {
+        self.sw_cursor_cache_key = None;
     }
 
     /// Upload cursor RGBA for DRM scan-out and/or software overlay; cheap when the pixmap is unchanged.
@@ -852,6 +959,17 @@ impl RenderState {
         let Some((dx, dy, _w, _h)) = self.sw_cursor_dst_rect else {
             return Ok(());
         };
+        let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
+        if !self.sw_cursor_surface_elements.is_empty() {
+            draw_render_elements(
+                frame,
+                ctx.output_scale.x,
+                &self.sw_cursor_surface_elements,
+                std::slice::from_ref(&full),
+            )?;
+            return Ok(());
+        }
+
         let Some(tex) = self.sw_cursor_texture.as_ref() else {
             return Ok(());
         };
@@ -872,7 +990,7 @@ impl RenderState {
             frame,
             ctx.output_scale,
             std::slice::from_ref(&elem),
-            &ctx.damage,
+            std::slice::from_ref(&full),
         )?;
         Ok(())
     }
@@ -1117,6 +1235,27 @@ impl RenderState {
 
     pub fn ensure_shader_programs(&mut self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
         self.chrome_shaders.ensure_compiled(renderer)
+    }
+
+    /// Drop every cached shader program and GPU texture handle.
+    ///
+    /// These are all "compile/upload once, reuse forever" caches, which is normally
+    /// correct — but the DRM backend recreates the `EGLContext` (and thus the
+    /// `GlesRenderer`) when resuming from suspend, which invalidates every GL object
+    /// handle compiled/uploaded against the old context. Without this, resume leaves
+    /// the renderer replaying draw calls against dead handles forever (blank screen,
+    /// GL_INVALID_* error flood) instead of recompiling/re-uploading them.
+    pub fn invalidate_gpu_state(&mut self) {
+        self.chrome_shaders = ChromeShaders::new();
+        self.wallpaper_texture = None;
+        self.sw_cursor_texture = None;
+        self.sw_cursor_cache_key = None;
+        self.font_atlas_texture = None;
+        self.fonts_prewarm_done = false;
+        self.output_icc_lut_gpu.clear();
+        self.icc_lut_fallback_logged.clear();
+        self.egui.invalidate_gpu_state();
+        self.redraw_all = true;
     }
 
     fn draw_clock_text(
@@ -1424,11 +1563,18 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         elements: &[FlowRenderElement],
+        client_compositing: &ClientCompositingMode,
     ) -> Result<(), GlesError> {
         let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+        if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
+            frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
+            draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+            frame.clear_tex_program_override();
+        } else {
+            draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+        }
 
         Ok(())
     }
@@ -1488,7 +1634,17 @@ impl RenderState {
         muts: RenderInputsMut<'_>,
         stage: OutputRenderStage,
     ) -> Result<(), GlesError> {
-        let theme = inputs.theme;
+        let linear_theme_storage;
+        let theme = if inputs.client_compositing.ui_textures_linear()
+            || matches!(
+                inputs.chrome_glass_pass,
+                ChromeGlassPass::LinearUnderClients
+            ) {
+            linear_theme_storage = linearize_flow_theme(inputs.theme);
+            &linear_theme_storage
+        } else {
+            inputs.theme
+        };
 
         if matches!(stage, OutputRenderStage::All | OutputRenderStage::Base) {
             self.draw_background(frame, inputs.ctx, inputs.output, theme.background);
@@ -1515,6 +1671,7 @@ impl RenderState {
                 inputs.layout.work_area.recess,
                 inputs.ctx.output_scale,
                 theme.wallpaper.clone(),
+                &inputs.client_compositing,
             );
 
             // Work-area glass must sit under client surfaces (trim/icons stay above).
@@ -1533,8 +1690,8 @@ impl RenderState {
                 frame,
                 inputs.ctx,
                 inputs.elements,
-                inputs.client_compositing,
-                inputs.surface_transfers,
+                &inputs.client_compositing,
+                inputs.surface_colors,
             );
         }
 
@@ -1544,6 +1701,42 @@ impl RenderState {
                 | OutputRenderStage::Clients
                 | OutputRenderStage::LinearGlassUnderClients
         ) {
+            return Ok(());
+        }
+
+        if matches!(stage, OutputRenderStage::EguiOverlay) {
+            let egui_frame_ctx = DesktopFrameCtx {
+                output_size: inputs.ctx.output_size,
+                output_scale: inputs.ctx.output_scale,
+                work: inputs.layout.work_area.recess,
+                active_output: inputs.ctx.active_output,
+                rendering_output: inputs.ctx.rendering_output,
+                now: inputs.ctx.now,
+                start_time: self.start_time,
+                flip_egui_y: inputs.flip_egui_y,
+                portal_capture: inputs.ctx.portal_capture,
+            };
+            let full_output_damage = [Rectangle::<i32, Physical>::from_loc_and_size(
+                (0, 0),
+                Size::<i32, Physical>::from(inputs.ctx.output_size),
+            )];
+            let egui_damage = if self.egui.is_open_on_output(inputs.ctx.rendering_output)
+                || inputs.ctx.portal_capture
+            {
+                &full_output_damage[..]
+            } else {
+                &inputs.ctx.damage[..]
+            };
+            self.egui.render(
+                frame,
+                &egui_frame_ctx,
+                egui_damage,
+                &self.chrome_shaders,
+                inputs.theme,
+            )?;
+            if inputs.draw_software_cursor {
+                self.draw_software_cursor_overlay(frame, inputs.ctx)?;
+            }
             return Ok(());
         }
 
@@ -1557,11 +1750,17 @@ impl RenderState {
             inputs.ui_tree,
             inputs.current_workspace,
             inputs.fonts,
+            inputs.flow_field_pulse,
             theme,
         );
 
         // xdg popups are included in [`Window::render_elements`] when [`PopupManager::commit`] runs.
-        self.draw_popup_elements(frame, inputs.ctx, inputs.popup_elements)?;
+        self.draw_popup_elements(
+            frame,
+            inputs.ctx,
+            inputs.popup_elements,
+            &inputs.client_compositing,
+        )?;
 
         if inputs.ctx.active_output == inputs.ctx.rendering_output {
             self.draw_notifications(frame, inputs.ctx, inputs.notifications, inputs.fonts, theme)?;
@@ -1600,6 +1799,12 @@ impl RenderState {
             );
         }
 
+        self.draw_lock_screen(frame, inputs.ctx, inputs.lock_screen, inputs.fonts, theme)?;
+
+        if inputs.defer_egui_to_sdr {
+            return Ok(());
+        }
+
         let egui_frame_ctx = DesktopFrameCtx {
             output_size: inputs.ctx.output_size,
             output_scale: inputs.ctx.output_scale,
@@ -1629,10 +1834,6 @@ impl RenderState {
             &self.chrome_shaders,
             theme,
         )?;
-
-        self.draw_lock_screen(frame, inputs.ctx, inputs.lock_screen, inputs.fonts, theme)?;
-
-        //self.draw_text_test(frame, inputs.fonts)?;
 
         if inputs.draw_software_cursor {
             self.draw_software_cursor_overlay(frame, inputs.ctx)?;
@@ -1734,6 +1935,7 @@ impl RenderState {
             &[full_physical],
             [0.005, 0.008, 0.014, 0.72],
         )?;
+        self.draw_screensaver_background(frame, ctx, full_physical)?;
 
         let logical_w = (f64::from(ctx.output_size.0) / ctx.output_scale.x).round() as i32;
         let logical_h = (f64::from(ctx.output_size.1) / ctx.output_scale.y).round() as i32;
@@ -1896,6 +2098,40 @@ impl RenderState {
         Ok(())
     }
 
+    fn draw_screensaver_background(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        dst: Rectangle<i32, Physical>,
+    ) -> Result<(), GlesError> {
+        let Some(program) = self.chrome_shaders.screensaver.as_ref() else {
+            return Ok(());
+        };
+
+        let src = Rectangle::<f64, Buffer>::from_size(
+            (f64::from(dst.size.w), f64::from(dst.size.h)).into(),
+        );
+        let buffer_size = Size::<i32, Buffer>::from((dst.size.w, dst.size.h));
+        let damage = std::slice::from_ref(&dst);
+        let elapsed = ctx.now.duration_since(self.start_time).as_secs_f32();
+
+        frame.render_pixel_shader_to(
+            program,
+            src,
+            dst,
+            buffer_size,
+            Some(damage),
+            1.0,
+            &[
+                Uniform::new(
+                    "u_resolution",
+                    [dst.size.w.max(1) as f32, dst.size.h.max(1) as f32],
+                ),
+                Uniform::new("u_time", elapsed),
+            ],
+        )
+    }
+
     fn draw_active_output_glow(
         &self,
         frame: &mut GlesFrame<'_, '_>,
@@ -2034,7 +2270,7 @@ impl RenderState {
         let title_baseline = layout.title_rect.loc.y + layout.title_rect.size.h - 8;
         let mut y = layout.message_rect.loc.y + 20;
 
-        flog(&format!("DRAW REAL FONT TITLE: {}", dialog.title));
+        flog(format!("DRAW REAL FONT TITLE: {}", dialog.title));
         self.draw_text_cached(
             frame,
             fonts,
@@ -2229,14 +2465,7 @@ impl RenderState {
             return Ok(());
         };
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-        let style = if matches!(
-            inputs.chrome_glass_pass,
-            ChromeGlassPass::LinearUnderClients
-        ) {
-            glass_style_linear(&legacy_theme.glass)
-        } else {
-            legacy_theme.glass
-        };
+        let style = legacy_theme.glass;
         let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
             Point::<i32, Physical>::from((0, 0)),
             Size::<i32, Physical>::from(inputs.ctx.output_size),
@@ -2509,6 +2738,7 @@ impl RenderState {
         target_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
         theme: WallpaperTheme,
+        _client_compositing: &ClientCompositingMode,
     ) {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
@@ -2545,7 +2775,7 @@ impl RenderState {
         //    RenderState::rect_apply_flipped180(dst_world, (ctx.output_size.0, ctx.output_size.1));
         let dst = dst_world;
 
-        let dsts = [dst];
+        let damage_local = dest_local_damage(dst.size);
 
         let tw = src.w as f64;
         let th = src.h as f64;
@@ -2559,20 +2789,21 @@ impl RenderState {
                 .into(),
         );
 
-        let uniforms = [Uniform::new("u_tint", theme.tint_color)];
-
-        let wallpaper_tint = self.chrome_shaders.wallpaper_tint.as_ref();
+        let uniforms = [
+            Uniform::new("u_tint", theme.tint_color),
+            Uniform::new("u_decode_srgb", 0.0f32),
+        ];
 
         frame
             .render_texture_from_to(
                 tex,
                 src_rect,
                 dst,
-                &dsts,
+                &damage_local,
                 &[],
                 Transform::Normal,
                 1.0,
-                wallpaper_tint,
+                self.chrome_shaders.wallpaper_tint.as_ref(),
                 &uniforms,
             )
             .unwrap();
@@ -2727,15 +2958,20 @@ impl RenderState {
             };
 
             for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+                let geo = window.geometry();
+
+                let popup_loc = window_loc - geo.loc + popup_offset - popup.geometry().loc;
+
                 let mut popup_bbox = popup.geometry();
-                popup_bbox.loc += window_loc + popup_offset - popup.geometry().loc;
+                popup_bbox.loc += popup_loc;
+
                 if !region.overlaps(popup_bbox) {
                     continue;
                 }
 
-                let popup_loc = window_loc + popup_offset - popup.geometry().loc;
                 let output_loc = popup_loc - region.loc;
                 let render_pos = output_loc.to_physical_precise_round(scale);
+
                 out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
                     renderer,
                     popup.wl_surface(),
@@ -2857,40 +3093,53 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         elements: &[FlowRenderElement],
-        client_compositing: ClientCompositingMode,
-        surface_transfers: &std::collections::HashMap<Id, TransferFunction>,
+        client_compositing: &ClientCompositingMode,
+        surface_colors: &std::collections::HashMap<Id, SurfaceColorRenderState>,
     ) {
         use smithay::backend::renderer::element::Element;
+        use smithay::backend::renderer::gles::Uniform;
 
         let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        let ClientCompositingMode::Linear { srgb_to_linear } = client_compositing else {
-            draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+        let ClientCompositingMode::Linear { client_to_scene } = client_compositing else {
+            if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
+                frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
+                draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+                frame.clear_tex_program_override();
+            } else {
+                draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
+            }
             return;
         };
 
-        let mut srgb_batch = Vec::new();
-        let mut linear_batch = Vec::new();
+        let mut batches: Vec<(SurfaceColorRenderState, Vec<&FlowRenderElement>)> = Vec::new();
         for elem in elements {
-            let transfer = surface_transfers
+            let color = surface_colors
                 .get(elem.id())
                 .copied()
-                .unwrap_or(TransferFunction::Srgb);
-            if transfer == TransferFunction::Linear {
-                linear_batch.push(elem);
+                .unwrap_or_else(SurfaceColorRenderState::srgb_default);
+            if let Some((_, batch)) = batches.iter_mut().find(|(c, _)| *c == color) {
+                batch.push(elem);
             } else {
-                srgb_batch.push(elem);
+                batches.push((color, vec![elem]));
             }
         }
 
-        if !srgb_batch.is_empty() {
-            frame.override_default_tex_program(srgb_to_linear, Vec::new());
-            draw_render_elements(frame, ctx.output_scale.x, &srgb_batch, damage).unwrap();
+        for (color, batch) in batches {
+            let m = color.client_to_scene;
+            let uniforms = vec![
+                Uniform::new(
+                    "u_decode_tf",
+                    color.description.transfer.decode_mode() as u32 as f32,
+                ),
+                Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
+                Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
+                Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
+            ];
+            frame.override_default_tex_program(client_to_scene.clone(), uniforms);
+            draw_render_elements(frame, ctx.output_scale.x, &batch, damage).unwrap();
             frame.clear_tex_program_override();
-        }
-        if !linear_batch.is_empty() {
-            draw_render_elements(frame, ctx.output_scale.x, &linear_batch, damage).unwrap();
         }
     }
 
@@ -3028,6 +3277,15 @@ impl RenderState {
             frame,
             &beveled,
             layout.topbar.title,
+            ctx.output_scale,
+            damage,
+            &legacy_theme.panel_inner,
+        );
+
+        let _ = Self::draw_beveled_panel(
+            frame,
+            &beveled,
+            layout.topbar.flow_field,
             ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
@@ -3258,6 +3516,7 @@ impl RenderState {
         ui_tree: &UiTree,
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
+        flow_field_pulse: Option<FlowFieldPulseFrame>,
         theme: &FlowTheme,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
@@ -3310,7 +3569,7 @@ impl RenderState {
                 fonts,
                 layout,
                 "FOCALDESK",
-                &active_theme,
+                active_theme,
                 ctx.output_scale,
             );
 
@@ -3321,7 +3580,7 @@ impl RenderState {
                 "FOCALDESK",
                 output_number,
                 workspace_number,
-                &active_theme,
+                active_theme,
                 ctx.output_scale,
             );
 
@@ -3446,6 +3705,74 @@ impl RenderState {
                                 ctx.output_scale,
                                 style,
                                 &tinted_icon,
+                            );
+                        }
+                    }
+
+                    UiElementKind::TopbarFlowField => {
+                        let mode = if !el.enabled {
+                            4
+                        } else if el.active && el.selected {
+                            3
+                        } else if el.active {
+                            2
+                        } else if el.selected {
+                            1
+                        } else {
+                            0
+                        };
+
+                        let energy = if !el.enabled {
+                            0.96
+                        } else if el.active && el.selected {
+                            0.96
+                        } else if el.active {
+                            0.88
+                        } else if el.selected {
+                            0.94
+                        } else {
+                            0.40
+                        };
+
+                        let accent = active_theme.chrome.accent_color;
+                        let mut color = match mode {
+                            1 => [accent[0], accent[1], accent[2], 0.98],
+                            2 => [0.94, 0.97, 1.00, 0.92],
+                            3 => [1.00, 0.72, 0.18, 1.00],
+                            4 => [0.98, 0.30, 0.30, 1.00],
+                            _ => [accent[0] * 0.72, accent[1] * 0.90, accent[2], 0.70],
+                        };
+                        if el.hovered {
+                            color[3] = (color[3] + 0.12).min(1.0);
+                        }
+
+                        if let Some(program) = self.chrome_shaders.flow_field.as_ref() {
+                            let _ = draw_flow_field(
+                                frame,
+                                program,
+                                base_rect_logical,
+                                ctx.output_scale,
+                                damage,
+                                mode,
+                                energy,
+                                color,
+                            );
+                        }
+
+                        if let (Some(pulse_shader), Some(pulse_frame)) =
+                            (self.chrome_shaders.pulse.as_ref(), flow_field_pulse)
+                        {
+                            let pulse_color =
+                                [color[0].max(0.6), color[1].max(0.7), color[2].max(0.9), 1.0];
+                            let _ = Self::draw_pulse(
+                                frame,
+                                pulse_shader,
+                                base_rect_logical,
+                                pulse_frame.click_local,
+                                pulse_frame.elapsed,
+                                ctx.output_scale,
+                                damage,
+                                pulse_color,
                             );
                         }
                     }

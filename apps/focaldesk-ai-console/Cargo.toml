@@ -1,0 +1,16 @@
+[package]
+name = "focaldesk-ai-console"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gtk4 = "0.9"
+glib = "0.20"
+dirs = "6"
+focaldesk-ai = { path = "../../crates/focaldesk-ai" }
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }
+focaldesk-voice = { path = "../../crates/focaldesk-voice" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

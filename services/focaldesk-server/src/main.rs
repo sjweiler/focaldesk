@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
     let ai_service = Arc::new(AiService::from_env()?);
     flog_info!(
         "AI IPC listening on {}; default provider: {}; providers: {}",
-        focaldesk_ai::AI_SOCKET_PATH,
+        focaldesk_ai::ai_socket_path().display(),
         ai_service.default_provider(),
         ai_service
             .providers()

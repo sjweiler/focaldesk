@@ -306,7 +306,7 @@ impl ManagedWindow {
             }
             WindowSurface::X11(surface) => {
                 if let Err(err) = surface.close() {
-                    focaldesk_logging::flog(&format!(
+                    focaldesk_logging::flog(format!(
                         "failed to send XWayland close request: {err:?}"
                     ));
                 }

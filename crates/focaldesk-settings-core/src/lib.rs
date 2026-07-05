@@ -45,9 +45,22 @@ pub struct OutputConfig {
     pub scale: f32,
     pub primary: bool,
     #[serde(default)]
+    pub color_profile: DisplayColorProfile,
+    #[serde(default)]
+    pub icc_profile_path: Option<String>,
+    #[serde(default)]
     pub hdr_requested: bool,
     #[serde(default)]
     pub hdr_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayColorProfile {
+    #[default]
+    Auto,
+    Srgb,
+    DisplayP3,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,40 +73,49 @@ pub struct InputSettings {
 pub struct AppSettings {
     pub terminal: String,
     pub browser: String,
+    #[serde(default)]
+    pub browser_launch_backend: BrowserLaunchBackend,
     pub file_manager: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserLaunchBackend {
+    #[default]
+    Auto,
+    Wayland,
+    Xwayland,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceSettings {
     #[serde(default = "default_restore_session")]
     pub restore_session: bool,
+    #[serde(default = "default_maximize_on_launch")]
+    pub maximize_on_launch: bool,
 }
 
 impl Default for WorkspaceSettings {
     fn default() -> Self {
         Self {
             restore_session: default_restore_session(),
+            maximize_on_launch: default_maximize_on_launch(),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum DebugLogLevel {
     Error,
     Warn,
+    #[default]
     Info,
     Debug,
     Trace,
 }
 
-impl Default for DebugLogLevel {
-    fn default() -> Self {
-        Self::Info
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DebugSettings {
     #[serde(default)]
     pub log_level: DebugLogLevel,
@@ -105,18 +127,6 @@ pub struct DebugSettings {
     pub show_input_events: bool,
     #[serde(default)]
     pub verbose_protocol_logs: bool,
-}
-
-impl Default for DebugSettings {
-    fn default() -> Self {
-        Self {
-            log_level: DebugLogLevel::default(),
-            show_fps: false,
-            show_damage_regions: false,
-            show_input_events: false,
-            verbose_protocol_logs: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -168,63 +178,43 @@ impl Default for PowerSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PowerButtonAction {
+    #[default]
     ShowPowerMenu,
     Suspend,
     PowerOff,
     DoNothing,
 }
 
-impl Default for PowerButtonAction {
-    fn default() -> Self {
-        Self::ShowPowerMenu
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LidCloseAction {
+    #[default]
     Suspend,
     BlankScreen,
     LockScreen,
     DoNothing,
 }
 
-impl Default for LidCloseAction {
-    fn default() -> Self {
-        Self::Suspend
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum LowBatteryAction {
+    #[default]
     NotifyOnly,
     Suspend,
     Hibernate,
     PowerOff,
 }
 
-impl Default for LowBatteryAction {
-    fn default() -> Self {
-        Self::NotifyOnly
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PerformanceMode {
+    #[default]
     Balanced,
     Performance,
     PowerSaver,
-}
-
-impl Default for PerformanceMode {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 pub fn default_settings() -> Settings {
@@ -245,6 +235,7 @@ pub fn default_settings() -> Settings {
         apps: AppSettings {
             terminal: "alacritty".into(),
             browser: "google-chrome".into(),
+            browser_launch_backend: BrowserLaunchBackend::Auto,
             file_manager: "focaldesk-files".into(),
         },
         workspaces: WorkspaceSettings::default(),
@@ -259,6 +250,10 @@ fn default_recent_files() -> bool {
 }
 
 fn default_restore_session() -> bool {
+    true
+}
+
+fn default_maximize_on_launch() -> bool {
     true
 }
 
@@ -321,5 +316,20 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.restore_session);
+    }
+
+    #[test]
+    fn maximize_on_launch_defaults_true_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("workspaces");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.workspaces.maximize_on_launch);
+
+        let mut settings = settings;
+        settings.workspaces.maximize_on_launch = false;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!restored.workspaces.maximize_on_launch);
     }
 }

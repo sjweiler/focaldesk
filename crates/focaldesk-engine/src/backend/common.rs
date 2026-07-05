@@ -6,6 +6,8 @@ use std::io;
 use std::path::PathBuf;
 #[cfg(feature = "xwayland")]
 use std::process::Stdio;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 #[cfg(feature = "xwayland")]
 use std::time::Duration;
 use std::time::Instant;
@@ -13,7 +15,7 @@ use std::time::Instant;
 use focaldesk_cursor::CursorManager;
 use focaldesk_flow::Keybinds;
 use focaldesk_logging::{flog, flog_info, session_id};
-use focaldesk_notifications::NotificationManager;
+use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
 use focaldesk_ui::chrome::{Chrome, ChromeMetrics};
@@ -34,6 +36,8 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use zbus::blocking::{Connection, MessageIterator};
+use zbus::{MatchRule, MessageType};
 
 use crate::core::desktop::{DesktopInit, DesktopState};
 use crate::core::input::{
@@ -84,6 +88,85 @@ pub(crate) fn is_nonfatal_wayland_io_error(err: &io::Error) -> bool {
             | io::ErrorKind::ConnectionReset
             | io::ErrorKind::NotConnected
     )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionSleepEvent {
+    GoingToSleep,
+    WokeUp,
+}
+
+pub(crate) fn spawn_session_sleep_watch() -> io::Result<Receiver<SessionSleepEvent>> {
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("focaldesk-session-sleep".into())
+        .spawn(move || session_resume_watch_main(tx))?;
+    Ok(rx)
+}
+
+pub(crate) fn drain_session_sleep_notifications(
+    rx: &Receiver<SessionSleepEvent>,
+    state: &mut DesktopState,
+) {
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            SessionSleepEvent::GoingToSleep => state.handle_session_suspend(),
+            SessionSleepEvent::WokeUp => state.handle_session_resume(),
+        }
+    }
+}
+
+fn session_resume_watch_main(notify: Sender<SessionSleepEvent>) {
+    let Ok(conn) = Connection::system() else {
+        flog("session resume watch: no system D-Bus");
+        return;
+    };
+
+    let rule = match MatchRule::builder()
+        .msg_type(MessageType::Signal)
+        .sender("org.freedesktop.login1")
+        .and_then(|builder| builder.interface("org.freedesktop.login1.Manager"))
+        .and_then(|builder| builder.member("PrepareForSleep"))
+        .and_then(|builder| builder.path("/org/freedesktop/login1"))
+    {
+        Ok(builder) => builder.build(),
+        Err(err) => {
+            flog(format!(
+                "session resume watch: failed to build match rule: {err}"
+            ));
+            return;
+        }
+    };
+
+    let Ok(mut iter) = MessageIterator::for_match_rule(rule, &conn, Some(8)) else {
+        flog("session resume watch: failed to subscribe to login1 PrepareForSleep");
+        return;
+    };
+
+    flog("session sleep watch: listening for login1 PrepareForSleep");
+
+    let mut last_sleeping: Option<bool> = None;
+    loop {
+        let Some(Ok(msg)) = iter.next() else {
+            continue;
+        };
+
+        let Ok((sleeping,)): Result<(bool,), _> = msg.body() else {
+            continue;
+        };
+
+        if last_sleeping == Some(sleeping) {
+            continue;
+        }
+        last_sleeping = Some(sleeping);
+
+        let event = if sleeping {
+            SessionSleepEvent::GoingToSleep
+        } else {
+            SessionSleepEvent::WokeUp
+        };
+        let _ = notify.send(event);
+    }
 }
 
 /// Spawn XWayland and register it on `handle`. Sets `DISPLAY` once the server is up.
@@ -221,6 +304,9 @@ pub fn pump_xwayland_ready(
         }
         // XWayland cannot finish startup until its Wayland client roundtrips with the compositor.
         display.dispatch_clients(state)?;
+        crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
+            state,
+        );
         display.handle().flush_clients()?;
         event_loop.dispatch(Some(Duration::ZERO), state)?;
     }
@@ -270,6 +356,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
         }
         InputEvent::PointerMotion { event, .. } => {
             let pos = pointer_pos + event.delta();
+            let delta_unaccel = event.delta_unaccel();
             let min_x = clamp_rect.loc.x as f64;
             let min_y = clamp_rect.loc.y as f64;
             let max_x = (clamp_rect.loc.x + clamp_rect.size.w) as f64 - f64::EPSILON;
@@ -280,6 +367,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                     pos.x.clamp(min_x, max_x.max(min_x)),
                     pos.y.clamp(min_y, max_y.max(min_y)),
                 )),
+                delta_unaccel: Some(delta_unaccel),
             })
         }
         InputEvent::PointerMotionAbsolute { event, .. } => {
@@ -289,7 +377,10 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                 clamp_rect.loc.y as f64 + local.y,
             ));
 
-            Some(FlowInputEvent::PointerMoved { position: pos })
+            Some(FlowInputEvent::PointerMoved {
+                position: pos,
+                delta_unaccel: None,
+            })
         }
         InputEvent::PointerButton { event, .. } => {
             let button = match event.button_code() {
@@ -382,8 +473,145 @@ pub(crate) fn bind_wayland_socket() -> anyhow::Result<(ListeningSocket, String)>
     Ok((socket, name))
 }
 
+fn shell_quote_for_xdpw_config(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_string();
+    }
+
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_focaldesk_portal_executable() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let sibling = parent.join("focaldesk-portal");
+            if sibling.is_file() {
+                return Some(sibling);
+            }
+        }
+    }
+
+    for candidate in [
+        "/usr/local/bin/focaldesk-portal",
+        "/usr/bin/focaldesk-portal",
+    ] {
+        let path = PathBuf::from(candidate);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let local = PathBuf::from(home).join(".local/bin/focaldesk-portal");
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+
+    None
+}
+
+/// xdpw reads `~/.config/xdg-desktop-portal-wlr/config` once; stale chooser paths break OBS capture.
+fn ensure_xdpw_screencast_config() {
+    let Some(portal_exe) = resolve_focaldesk_portal_executable() else {
+        flog("focaldesk-portal not found; skipping xdpw screencast config update");
+        return;
+    };
+
+    let config_dir = xdg_config_dir().join("xdg-desktop-portal-wlr");
+    if let Err(err) = std::fs::create_dir_all(&config_dir) {
+        flog(format!(
+            "failed to create xdpw config directory {}: {err}",
+            config_dir.display()
+        ));
+        return;
+    }
+
+    let config_path = config_dir.join("config");
+    let chooser_cmd = shell_quote_for_xdpw_config(&portal_exe.to_string_lossy());
+    let desired = format!("[screencast]\nchooser_type=simple\nchooser_cmd={chooser_cmd}\n");
+
+    let current = std::fs::read_to_string(&config_path).unwrap_or_default();
+    if current == desired {
+        return;
+    }
+
+    match std::fs::write(&config_path, &desired) {
+        Ok(()) => flog(format!(
+            "updated xdpw screencast chooser to {}",
+            portal_exe.display()
+        )),
+        Err(err) => flog(format!(
+            "failed to write xdpw config {}: {err}",
+            config_path.display()
+        )),
+    }
+}
+
+/// Explicitly start `graphical-session.target` (best-effort) so the per-domain
+/// helper daemons (`WantedBy=graphical-session.target`) come up promptly. Some
+/// login-manager/logind configurations activate this target implicitly on a
+/// registered Wayland session, but not all — sway and other wlroots compositors
+/// do this explicitly for the same reason rather than relying on it.
+fn start_graphical_session_target(wayland_display: &str) {
+    let import_status = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "import-environment",
+            "WAYLAND_DISPLAY",
+            "XDG_CURRENT_DESKTOP",
+        ])
+        .status();
+    if let Err(err) = import_status {
+        flog(format!(
+            "failed to import session environment into systemd --user: systemctl: {err}"
+        ));
+    }
+
+    let start_status = std::process::Command::new("systemctl")
+        .args(["--user", "start", "--no-block", "graphical-session.target"])
+        .status();
+    match start_status {
+        Ok(status) if status.success() => flog(format!(
+            "started graphical-session.target for {wayland_display}"
+        )),
+        Ok(status) => flog(format!(
+            "failed to start graphical-session.target: systemctl exited with {status}"
+        )),
+        Err(err) => flog(format!(
+            "failed to start graphical-session.target: systemctl: {err}"
+        )),
+    }
+}
+
+/// Counterpart to [`start_graphical_session_target`], called once on clean compositor
+/// exit (real DRM session only) so the per-domain helper daemons stop with the session
+/// instead of being left running orphaned until the next login.
+pub(crate) fn stop_graphical_session_target() {
+    let status = std::process::Command::new("systemctl")
+        .args(["--user", "stop", "--no-block", "graphical-session.target"])
+        .status();
+    match status {
+        Ok(status) if status.success() => flog("stopped graphical-session.target"),
+        Ok(status) => flog(format!(
+            "failed to stop graphical-session.target: systemctl exited with {status}"
+        )),
+        Err(err) => flog(format!(
+            "failed to stop graphical-session.target: systemctl: {err}"
+        )),
+    }
+}
+
 fn publish_portal_environment(wayland_display: &str) {
     ensure_standard_user_dirs();
+    ensure_xdpw_screencast_config();
 
     std::env::set_var("WAYLAND_DISPLAY", wayland_display);
     std::env::set_var("XDG_CURRENT_DESKTOP", "wlroots");
@@ -393,13 +621,13 @@ fn publish_portal_environment(wayland_display: &str) {
         .status();
 
     match status {
-        Ok(status) if status.success() => flog(&format!(
+        Ok(status) if status.success() => flog(format!(
             "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=wlroots"
         )),
-        Ok(status) => flog(&format!(
+        Ok(status) => flog(format!(
             "failed to publish portal environment: dbus-update-activation-environment exited with {status}"
         )),
-        Err(err) => flog(&format!(
+        Err(err) => flog(format!(
             "failed to publish portal environment: dbus-update-activation-environment: {err}"
         )),
     }
@@ -424,7 +652,7 @@ fn ensure_standard_user_dirs() {
     for name in ["Desktop", "Downloads", "Music", "Pictures", "Videos"] {
         let path = home.join(name);
         if let Err(err) = std::fs::create_dir_all(&path) {
-            flog(&format!(
+            flog(format!(
                 "failed to create user directory {}: {err}",
                 path.display()
             ));
@@ -438,7 +666,7 @@ fn ensure_xdg_videos_dir() {
     let user_dirs_path = xdg_config_dir().join("user-dirs.dirs");
     if let Some(parent) = user_dirs_path.parent() {
         if let Err(err) = std::fs::create_dir_all(parent) {
-            flog(&format!(
+            flog(format!(
                 "failed to create XDG user dirs config directory {}: {err}",
                 parent.display()
             ));
@@ -478,7 +706,7 @@ fn ensure_xdg_videos_dir() {
     let mut output = lines.join("\n");
     output.push('\n');
     if let Err(err) = std::fs::write(&user_dirs_path, output) {
-        flog(&format!(
+        flog(format!(
             "failed to write XDG videos directory to {}: {err}",
             user_dirs_path.display()
         ));
@@ -496,10 +724,10 @@ fn restart_portal_services() {
         Ok(status) if status.success() => {
             flog("reset failed state for xdg-desktop-portal-wlr.service")
         }
-        Ok(status) => flog(&format!(
+        Ok(status) => flog(format!(
             "failed to reset xdg-desktop-portal-wlr.service state: systemctl exited with {status}"
         )),
-        Err(err) => flog(&format!(
+        Err(err) => flog(format!(
             "failed to reset xdg-desktop-portal-wlr.service state: systemctl: {err}"
         )),
     }
@@ -518,10 +746,10 @@ fn restart_portal_services() {
         Ok(status) if status.success() => {
             flog("requested async restart of xdg-desktop-portal and xdg-desktop-portal-wlr")
         }
-        Ok(status) => flog(&format!(
+        Ok(status) => flog(format!(
             "failed to restart xdg-desktop-portal services: systemctl exited with {status}"
         )),
-        Err(err) => flog(&format!(
+        Err(err) => flog(format!(
             "failed to restart xdg-desktop-portal services: systemctl: {err}"
         )),
     }
@@ -544,7 +772,13 @@ pub(crate) fn bootstrap_compositor_core(
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
     publish_portal_environment(&wayland_display);
-    flog(&format!("FocalDesk client socket is {}", wayland_display));
+    if backend == BackendKind::Drm {
+        // Nested/winit dev sessions typically run inside an already-active desktop
+        // session; only the real DRM-backed session should touch the shared
+        // graphical-session.target (the matching stop lives in backend::drm::run).
+        start_graphical_session_target(&wayland_display);
+    }
+    flog(format!("FocalDesk client socket is {}", wayland_display));
 
     let display = Display::<DesktopState>::new()?;
     let dh = display.handle();
@@ -602,7 +836,7 @@ pub(crate) fn bootstrap_compositor_core(
         .map(|output| output.scale_factor)
         .unwrap_or(1.0);
     let cursor_manager = CursorManager::new(24, scale_factor as f32);
-    let notifications = NotificationManager::new();
+    let notification_snapshots = Vec::<NotificationSnapshot>::new();
     let chrome = Chrome::new(ChromeMetrics::default());
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
 
@@ -647,22 +881,31 @@ pub(crate) fn bootstrap_compositor_core(
         output_manager_state,
         data_device_state,
         primary_selection_state,
+        relative_pointer_state:
+            smithay::wayland::relative_pointer::RelativePointerManagerState::new::<DesktopState>(
+                &dh,
+            ),
         layer_shell_state,
         image_capture_source_state,
         output_capture_source_state,
         image_copy_capture_state,
         color_tag_state: Default::default(),
         color_management_state: Default::default(),
+        cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<
+            DesktopState,
+        >(&dh),
         backend_kind: backend,
         cursor_manager,
         seat,
-        notifications,
+        notification_snapshots,
         keybinds: Keybinds::default(),
         running: true,
         client_wayland_display: wayland_display.clone(),
         theme_manager,
         apps: settings.apps,
+        workspaces: settings.workspaces,
         privacy: settings.privacy,
+        power: settings.power,
         debug: settings.debug,
     };
 

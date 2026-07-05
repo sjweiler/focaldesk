@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=FocalDesk
+Comment=FocalDesk Wayland Session
+Exec=/usr/local/bin/focaldesk-desktop
+TryExec=/usr/local/bin/focaldesk-desktop
+Type=Application
+DesktopNames=FocalDesk

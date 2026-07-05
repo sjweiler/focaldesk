@@ -18,6 +18,6 @@ pub mod types;
 
 pub use identity::AppIdentity;
 pub use manager::PermissionManager;
-pub use request::{PermissionRequest, PermissionResource};
+pub use request::{PermissionRequest, PermissionResource, PermissionTarget};
 pub use session::{ActiveGrant, GrantToken};
 pub use types::{PermissionDecision, PermissionScope, PermissionState};

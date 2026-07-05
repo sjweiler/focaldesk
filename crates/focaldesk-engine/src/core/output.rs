@@ -75,7 +75,7 @@ impl OutputState {
             Some((0, 0).into()),
         );
 
-        output.set_preferred(mode.clone());
+        output.set_preferred(mode);
 
         let mut outputs = IndexMap::new();
         outputs.insert(

@@ -93,6 +93,14 @@ pub fn draw_chrome_below_work_wallpaper(
     let _ = draw_beveled_panel(
         frame,
         &beveled,
+        layout.topbar.flow_field,
+        frame_ctx.output_scale,
+        damage,
+        &legacy_theme.panel_inner,
+    );
+    let _ = draw_beveled_panel(
+        frame,
+        &beveled,
         layout.topbar.trim,
         frame_ctx.output_scale,
         damage,
@@ -218,6 +226,7 @@ pub fn draw_chrome_below_work_wallpaper(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw_chrome_trim_glass_icons(
     frame: &mut GlesFrame<'_, '_>,
     shaders: &ChromeShaders,
@@ -357,6 +366,23 @@ pub fn draw_chrome_trim_glass_icons(
                     );
                 }
             }
+            UiElementKind::TopbarFlowField => {
+                let mode = flow_field_mode(el);
+                let energy = flow_field_energy(el);
+                let color = flow_field_color(el, theme, mode);
+                if let Some(program) = shaders.flow_field.as_ref() {
+                    let _ = draw_flow_field(
+                        frame,
+                        program,
+                        base_rect_logical,
+                        frame_ctx.output_scale,
+                        damage,
+                        mode,
+                        energy,
+                        color,
+                    );
+                }
+            }
             UiElementKind::Clock => {
                 use chrono::Local;
                 let now = Local::now();
@@ -369,6 +395,102 @@ pub fn draw_chrome_trim_glass_icons(
 
     let _ = sidebar_hover_slot;
     Ok(())
+}
+
+fn flow_field_mode(el: &crate::element::UiElement) -> i32 {
+    if !el.enabled {
+        4
+    } else if el.active && el.selected {
+        3
+    } else if el.active {
+        2
+    } else if el.selected {
+        1
+    } else {
+        0
+    }
+}
+
+fn flow_field_energy(el: &crate::element::UiElement) -> f32 {
+    if !el.enabled {
+        0.98
+    } else if el.active && el.selected {
+        0.92
+    } else if el.active {
+        0.84
+    } else if el.selected {
+        0.96
+    } else {
+        0.38
+    }
+}
+
+fn flow_field_color(el: &crate::element::UiElement, theme: &FlowTheme, mode: i32) -> [f32; 4] {
+    let accent = theme.chrome.accent_color;
+    let mut color = match mode {
+        1 => [0.58, 0.96, 1.00, 0.98],
+        2 => [0.48, 1.00, 0.82, 0.88],
+        3 => [1.00, 0.78, 0.24, 0.98],
+        4 => [1.00, 0.34, 0.34, 1.00],
+        _ => [accent[0] * 0.68, accent[1] * 0.88, accent[2], 0.68],
+    };
+
+    if el.hovered {
+        color[3] = (color[3] + 0.12).min(1.0);
+    }
+
+    color
+}
+
+pub fn draw_flow_field(
+    frame: &mut GlesFrame<'_, '_>,
+    program: &GlesPixelProgram,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    damage: &[Rectangle<i32, Physical>],
+    mode: i32,
+    energy: f32,
+    color: [f32; 4],
+) -> Result<(), GlesError> {
+    let rect_physical = rect_logical.to_physical_precise_round(scale);
+    let src_rect = Rectangle::from_loc_and_size(
+        (0.0, 0.0),
+        (rect_physical.size.w as f64, rect_physical.size.h as f64),
+    );
+    let size = Size::from((rect_physical.size.w, rect_physical.size.h));
+
+    let uniforms = [
+        Uniform::new(
+            "u_resolution",
+            [rect_physical.size.w as f32, rect_physical.size.h as f32],
+        ),
+        Uniform::new(
+            "u_rect",
+            [
+                0.0f32,
+                0.0f32,
+                rect_physical.size.w as f32,
+                rect_physical.size.h as f32,
+            ],
+        ),
+        Uniform::new(
+            "u_time",
+            (chrono::Local::now().timestamp_millis() as f32) / 1000.0,
+        ),
+        Uniform::new("u_mode", mode as f32),
+        Uniform::new("u_energy", energy),
+        Uniform::new("u_color", color),
+    ];
+
+    frame.render_pixel_shader_to(
+        program,
+        src_rect,
+        rect_physical,
+        size,
+        Some(damage),
+        1.0,
+        &uniforms,
+    )
 }
 
 fn draw_active_lightbar(

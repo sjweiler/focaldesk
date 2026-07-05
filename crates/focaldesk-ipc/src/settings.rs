@@ -1,7 +1,7 @@
-use focaldesk_ipc::{IpcRequest, IpcResponse, SOCKET_PATH};
+use crate::{IpcRequest, IpcResponse, SETTINGS_SOCKET_PATH};
 use focaldesk_settings_core::{
-    DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, Settings,
-    load_settings, save_settings,
+    BrowserLaunchBackend, DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode,
+    PowerButtonAction, Settings, load_settings, save_settings,
 };
 use std::{
     io::{Read, Write},
@@ -10,11 +10,11 @@ use std::{
     thread,
 };
 
-pub fn start_settings_ipc(settings: Arc<Mutex<Settings>>) {
-    let _ = std::fs::remove_file(SOCKET_PATH);
+pub fn serve_settings_ipc(settings: Arc<Mutex<Settings>>) {
+    let _ = std::fs::remove_file(SETTINGS_SOCKET_PATH);
 
-    let listener =
-        UnixListener::bind(SOCKET_PATH).expect("failed to bind FocalDesk settings IPC socket");
+    let listener = UnixListener::bind(SETTINGS_SOCKET_PATH)
+        .expect("failed to bind FocalDesk settings IPC socket");
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -37,6 +37,10 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             let settings = settings.lock().unwrap().clone();
             IpcResponse::Settings { settings }
         }
+
+        Ok(IpcRequest::GetPowerSnapshot) => IpcResponse::Error {
+            message: "request is handled by focaldesk-desktop".to_string(),
+        },
 
         Ok(IpcRequest::SetDisplays { outputs }) => {
             let mut s = settings.lock().unwrap();
@@ -84,6 +88,7 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             | IpcRequest::Watch { .. }
             | IpcRequest::GetConfig
             | IpcRequest::SetConfig { .. }
+            | IpcRequest::GetDisplayRuntimeStatus
             | IpcRequest::Notify { .. },
         ) => IpcResponse::Error {
             message: "request is handled by focaldesk-desktop".to_string(),
@@ -142,6 +147,18 @@ fn apply_setting_value(
 
         "apps.browser" => {
             settings.apps.browser = value.as_str().ok_or("browser must be string")?.to_string();
+        }
+
+        "apps.browser_launch_backend" => {
+            settings.apps.browser_launch_backend = match value
+                .as_str()
+                .ok_or("browser_launch_backend must be string")?
+            {
+                "auto" => BrowserLaunchBackend::Auto,
+                "wayland" => BrowserLaunchBackend::Wayland,
+                "xwayland" => BrowserLaunchBackend::Xwayland,
+                other => return Err(format!("unknown browser_launch_backend: {other}")),
+            };
         }
 
         "apps.file_manager" => {
@@ -217,6 +234,16 @@ fn apply_setting_value(
                 };
         }
 
+        "workspaces.restore_session" => {
+            settings.workspaces.restore_session =
+                value.as_bool().ok_or("restore_session must be bool")?;
+        }
+
+        "workspaces.maximize_on_launch" => {
+            settings.workspaces.maximize_on_launch =
+                value.as_bool().ok_or("maximize_on_launch must be bool")?;
+        }
+
         "debug.log_level" => {
             settings.debug.log_level = match value.as_str().ok_or("log_level must be string")? {
                 "error" => DebugLogLevel::Error,
@@ -243,8 +270,9 @@ fn apply_setting_value(
         }
 
         "debug.verbose_protocol_logs" => {
-            settings.debug.verbose_protocol_logs =
-                value.as_bool().ok_or("verbose_protocol_logs must be bool")?;
+            settings.debug.verbose_protocol_logs = value
+                .as_bool()
+                .ok_or("verbose_protocol_logs must be bool")?;
         }
 
         _ => return Err(format!("unknown setting path: {path}")),

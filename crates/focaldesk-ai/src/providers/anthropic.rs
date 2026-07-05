@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::provider::AiProvider;
-use crate::types::{ChatMessage, ChatRequest, ChatResponse, ChatRole, ProviderInfo};
+use crate::types::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ProviderInfo, ProviderModelInfo,
+};
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -38,6 +40,15 @@ impl AiProvider for AnthropicProvider {
             base_url: Some("https://api.anthropic.com".into()),
             default_model: self.default_model.clone(),
         }
+    }
+
+    async fn list_models(&self) -> Result<Vec<ProviderModelInfo>> {
+        Ok(self
+            .default_model
+            .iter()
+            .cloned()
+            .map(|id| ProviderModelInfo { id })
+            .collect())
     }
 
     async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {

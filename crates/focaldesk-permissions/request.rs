@@ -6,6 +6,7 @@ pub enum PermissionResource {
     Screencast,
     ScreenShareWindow,
     ScreenShareOutput,
+    AiChat,
     Microphone,
     Camera,
     ClipboardRead,

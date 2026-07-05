@@ -4,8 +4,8 @@
 
 use crate::backend::common::client_state_from_stream;
 use crate::backend::common::{
-    bootstrap_compositor_core, is_nonfatal_wayland_io_error, translate_backend_input,
-    BootstrapOutput,
+    bootstrap_compositor_core, drain_session_sleep_notifications, is_nonfatal_wayland_io_error,
+    spawn_session_sleep_watch, translate_backend_input, BootstrapOutput,
 };
 #[cfg(feature = "xwayland")]
 use crate::backend::common::{finish_xwayland_startup, start_xwayland};
@@ -42,6 +42,7 @@ use tracing::{debug, info, warn};
 fn dispatch_backend_events(
     state: &mut DesktopState,
     event_loop: &mut WinitEventLoop,
+    window_focused: &mut bool,
 ) -> anyhow::Result<bool> {
     let status = event_loop.dispatch_new_events(|event: WinitEvent| match event {
         WinitEvent::Resized { size, scale_factor } => {
@@ -69,6 +70,13 @@ fn dispatch_backend_events(
             ) {
                 state.handle_input(event);
             }
+        }
+
+        WinitEvent::Focus(focused) => {
+            if focused && !*window_focused {
+                state.handle_session_resume();
+            }
+            *window_focused = focused;
         }
 
         WinitEvent::CloseRequested => {
@@ -142,21 +150,33 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         ..LinearOffscreenTargets::default()
     };
+    let sleep_notifications = spawn_session_sleep_watch().ok();
 
     let mut requested_focus_after_first_frame = false;
+    let mut window_focused = false;
     while nested.state.running {
+        if let Some(rx) = sleep_notifications.as_ref() {
+            drain_session_sleep_notifications(rx, &mut nested.state);
+        }
+
         #[cfg(feature = "xwayland")]
         xwayland_event_loop.dispatch(Some(Duration::ZERO), &mut nested.state)?;
 
         nested.state.process_settings_ipc_requests();
+        nested.state.process_clipboard_captures();
         nested.state.process_chrome_timers();
         nested.state.process_notification_timers();
+        nested.state.process_idle_timers();
+        nested.state.process_power_timers();
         nested.state.process_lock_timers();
 
-        if !dispatch_backend_events(&mut nested.state, &mut event_loop)? {
+        if !dispatch_backend_events(&mut nested.state, &mut event_loop, &mut window_focused)? {
             break;
         }
 
+        nested.state.process_deferred_ui_and_launches();
+
+        let accept_started = Instant::now();
         if let Some(stream) = nested.listener.accept()? {
             debug!(
                 target: "focaldesk",
@@ -169,6 +189,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .handle()
                 .insert_client(stream, Arc::new(client_state))?;
             nested.clients.push(client);
+            debug!(
+                target: "focaldesk",
+                session_id = session_id(),
+                elapsed_ms = accept_started.elapsed().as_millis(),
+                clients = nested.clients.len(),
+                "wayland accept complete"
+            );
         }
 
         let now = Instant::now();
@@ -185,6 +212,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 dt,
             );
             if nested.state.wayland_clients_may_dispatch() {
+                let dispatch_started = Instant::now();
                 if let Err(err) = nested.display.dispatch_clients(&mut nested.state) {
                     if !is_nonfatal_wayland_io_error(&err) {
                         return Err(err.into());
@@ -196,7 +224,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "ignoring nonfatal Wayland dispatch error"
                     );
                 }
+                crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
+                    &mut nested.state,
+                );
+                debug!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    elapsed_ms = dispatch_started.elapsed().as_millis(),
+                    "wayland dispatch_clients complete"
+                );
             }
+            nested.state.process_deferred_window_ops();
             nested.state.end_portal_dispatch();
             std::mem::drop(framebuffer);
         }
@@ -220,12 +258,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             .state
             .image_copy_capture_sessions
             .retain(|session| session.alive());
-        let portal_active = !nested.state.image_copy_capture_sessions.is_empty()
-            && !nested.state.pending_portal_captures.is_empty();
-        let should_render = nested.state.needs_redraw() || portal_active;
+        let portal_pending = crate::core::portal::portal_capture_pending(&nested.state);
+        let portal_needs_composite = crate::core::portal::portal_needs_composite(&nested.state);
+        let should_render = nested.state.needs_redraw() || portal_needs_composite;
 
         if !should_render {
-            if portal_active {
+            if portal_pending {
                 let (renderer, _framebuffer) = backend.bind()?;
                 complete_pending_portal_captures(
                     &mut nested.state,
@@ -260,23 +298,22 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 )?;
 
                 let offscreen = render_targets
-                    .offscreen
-                    .as_ref()
+                    .scanout_texture()
                     .ok_or("winit offscreen missing after render")?;
                 let mut frame =
                     renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
-                present_offscreen_texture(&mut frame, &offscreen.texture, buffer_size_phys)?;
+                present_offscreen_texture(&mut frame, offscreen, buffer_size_phys)?;
                 let _ = frame.finish()?;
 
                 publish_portal_capture_source(
                     &mut nested.state,
                     OutputId(1),
-                    offscreen.texture.clone(),
+                    offscreen.clone(),
                     buffer_size_phys,
                     now,
                 );
 
-                if portal_active {
+                if portal_pending {
                     complete_pending_portal_captures_for_output(
                         &mut nested.state,
                         renderer,
