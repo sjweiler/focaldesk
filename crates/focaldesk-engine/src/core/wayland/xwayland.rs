@@ -179,10 +179,7 @@ impl XwmHandler for DesktopState {
 
         if let Some(id) = self.window_id_for_x11_surface(&window) {
             let output_id = self.xwayland_output_id_for_window(id);
-            if self
-                .window(id)
-                .is_some_and(|managed| managed.floating)
-            {
+            if self.window(id).is_some_and(|managed| managed.floating) {
                 if let Some(x) = x {
                     geometry.loc.x = x;
                 }

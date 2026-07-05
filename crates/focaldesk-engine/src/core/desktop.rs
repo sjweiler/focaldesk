@@ -191,7 +191,10 @@ fn clamp_rect_to_any_bounds(
             .intersection(*candidate)
             .map(rect_area)
             .unwrap_or_default();
-        (overlap, std::cmp::Reverse(rect_center_distance_sq(geometry, *candidate)))
+        (
+            overlap,
+            std::cmp::Reverse(rect_center_distance_sq(geometry, *candidate)),
+        )
     }) else {
         return geometry;
     };

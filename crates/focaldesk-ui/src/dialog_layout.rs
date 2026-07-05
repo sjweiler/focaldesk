@@ -109,9 +109,9 @@ mod tests {
         assert!(layout.bounds.loc.y >= 0);
         assert!(layout.bounds.loc.x + layout.bounds.size.w <= 300);
         assert!(layout.bounds.loc.y + layout.bounds.size.h <= 120);
-        assert!(layout
-            .button_rects
-            .iter()
-            .all(|(_, rect)| rect.loc.x >= 0 && rect.loc.y >= 0 && rect.loc.x + rect.size.w <= 300 && rect.loc.y + rect.size.h <= 120));
+        assert!(layout.button_rects.iter().all(|(_, rect)| rect.loc.x >= 0
+            && rect.loc.y >= 0
+            && rect.loc.x + rect.size.w <= 300
+            && rect.loc.y + rect.size.h <= 120));
     }
 }
