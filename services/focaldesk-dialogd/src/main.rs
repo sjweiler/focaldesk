@@ -115,10 +115,7 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
             prompt,
             echo_on,
         } => {
-            let dialog = gtk::Dialog::builder()
-                .modal(true)
-                .title(&message)
-                .build();
+            let dialog = gtk::Dialog::builder().modal(true).title(&message).build();
             if !icon_name.is_empty() {
                 dialog.set_icon_name(Some(&icon_name));
             }
