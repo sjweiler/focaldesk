@@ -17,15 +17,15 @@ FocalDesk is a Rust-based Wayland desktop environment and compositor for Linux. 
 
 ## System Architecture
 
-![FocalDesk Architecture](docs/diagrams/architecture-overview.png)
+![FocalDesk Architecture](diagrams/architecture-overview.png)
 
 ## Rendering Pipeline
 
-![Rendering Pipeline](docs/diagrams/rendering-pipeline.png)
+![Rendering Pipeline](diagrams/rendering-pipeline.png)
 
 ## IPC Architecture
 
-![IPC Architecture](docs/diagrams/ipc-architecture.png)
+![IPC Architecture](diagrams/ipc-architecture.png)
 
 ```text
 Applications
