@@ -28,6 +28,7 @@ jobs:
             libinput-dev \
             libseat-dev \
             libpipewire-0.3-dev \
+            libasound2-dev \
             libegl1-mesa-dev \
             libgles2-mesa-dev \
             libgbm-dev \
