@@ -901,6 +901,7 @@ pub(crate) fn bootstrap_compositor_core(
         client_wayland_display: wayland_display.clone(),
         theme_manager,
         apps: settings.apps,
+        workspaces: settings.workspaces,
         privacy: settings.privacy,
         power: settings.power,
         debug: settings.debug,

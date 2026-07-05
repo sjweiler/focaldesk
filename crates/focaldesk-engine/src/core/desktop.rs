@@ -83,7 +83,7 @@ use focaldesk_power::{PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
     load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
     DisplayColorProfile, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
-    PowerButtonAction, PowerSettings, PrivacySettings,
+    PowerButtonAction, PowerSettings, PrivacySettings, WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::chrome::Chrome;
@@ -493,6 +493,7 @@ pub struct DesktopInit {
     pub client_wayland_display: String,
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
+    pub workspaces: WorkspaceSettings,
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
     pub debug: DebugSettings,
@@ -615,6 +616,7 @@ pub struct DesktopState {
 
     pub client_wayland_display: String,
     pub apps: AppSettings,
+    pub workspaces: WorkspaceSettings,
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
     pub debug: DebugSettings,
@@ -1098,6 +1100,7 @@ impl DesktopState {
 
         let settings = load_settings();
         self.apps = settings.apps;
+        self.workspaces = settings.workspaces;
         self.privacy = settings.privacy;
         self.power = settings.power;
         self.apply_power_settings();
@@ -3660,6 +3663,29 @@ impl DesktopState {
         best
     }
 
+    /// Geometry for a newly launched window when "maximize on launch" is disabled: centered in
+    /// the work recess, sized generously but without filling the screen.
+    pub(crate) fn default_unmaximized_toplevel_geometry(
+        &self,
+        output_id: OutputId,
+    ) -> Rectangle<i32, Logical> {
+        const DEFAULT_SIZE: (i32, i32) = (1280, 800);
+        const MIN_SIZE: (i32, i32) = (640, 480);
+
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return Rectangle::from_loc_and_size(Point::from((100, 100)), DEFAULT_SIZE);
+        };
+
+        let width = DEFAULT_SIZE.0.min(work.size.w).max(MIN_SIZE.0.min(work.size.w));
+        let height = DEFAULT_SIZE.1.min(work.size.h).max(MIN_SIZE.1.min(work.size.h));
+        let size = Size::from((width, height));
+        let loc = Point::from((
+            work.loc.x + (work.size.w - size.w) / 2,
+            work.loc.y + (work.size.h - size.h) / 2,
+        ));
+        Rectangle::from_loc_and_size(loc, size)
+    }
+
     /// Default map location for a new toplevel: top-left of the work recess (global logical).
     fn default_toplevel_map_location(&self, output_id: OutputId) -> Point<i32, Logical> {
         self.work_recess_for_output(output_id)
@@ -4423,6 +4449,7 @@ impl DesktopState {
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
+            workspaces: init.workspaces,
             privacy: init.privacy,
             power: init.power,
             debug: debug.clone(),
@@ -4477,7 +4504,7 @@ impl DesktopState {
         WindowId(id)
     }
 
-    pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) {
+    pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) -> WindowId {
         let id = self.alloc_window_id();
         flog_info!(
             "xdg toplevel created window_id={} surface={:?}",
@@ -4511,6 +4538,7 @@ impl DesktopState {
         );
 
         self.mark_focused_output_full_damage(DamageSource::Unknown);
+        id
     }
 
     #[cfg(feature = "xwayland")]
@@ -4644,11 +4672,14 @@ impl DesktopState {
                 self.default_toplevel_map_location(output_id),
             );
             (location, requested_geometry.size, false)
-        } else {
+        } else if self.workspaces.maximize_on_launch {
             let work = self
                 .work_recess_for_output(output_id)
                 .unwrap_or(requested_geometry);
             (work.loc, work.size, true)
+        } else {
+            let geometry = self.default_unmaximized_toplevel_geometry(output_id);
+            (geometry.loc, geometry.size, false)
         };
 
         if maximize_on_map {

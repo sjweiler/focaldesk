@@ -91,12 +91,15 @@ pub enum BrowserLaunchBackend {
 pub struct WorkspaceSettings {
     #[serde(default = "default_restore_session")]
     pub restore_session: bool,
+    #[serde(default = "default_maximize_on_launch")]
+    pub maximize_on_launch: bool,
 }
 
 impl Default for WorkspaceSettings {
     fn default() -> Self {
         Self {
             restore_session: default_restore_session(),
+            maximize_on_launch: default_maximize_on_launch(),
         }
     }
 }
@@ -250,6 +253,10 @@ fn default_restore_session() -> bool {
     true
 }
 
+fn default_maximize_on_launch() -> bool {
+    true
+}
+
 fn default_location_services() -> bool {
     false
 }
@@ -309,5 +316,20 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.restore_session);
+    }
+
+    #[test]
+    fn maximize_on_launch_defaults_true_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("workspaces");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.workspaces.maximize_on_launch);
+
+        let mut settings = settings;
+        settings.workspaces.maximize_on_launch = false;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!restored.workspaces.maximize_on_launch);
     }
 }

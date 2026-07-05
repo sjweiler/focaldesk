@@ -24,19 +24,29 @@ impl XdgShellHandler for DesktopState {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        self.add_xdg_toplevel(surface.clone());
+        let window_id = self.add_xdg_toplevel(surface.clone());
         let output_id = self.focused_output;
-        let size = self
-            .work_recess_for_output(output_id)
-            .map(|work| work.size)
-            .unwrap_or_else(|| (1280, 720).into());
+        let maximize_on_launch = self.workspaces.maximize_on_launch;
+        let size = if maximize_on_launch {
+            self.work_recess_for_output(output_id)
+                .map(|work| work.size)
+                .unwrap_or_else(|| (1280, 720).into())
+        } else {
+            let geometry = self.default_unmaximized_toplevel_geometry(output_id);
+            if let Some(window) = self.windows.iter_mut().find(|w| w.id == window_id) {
+                window.float_rect = Some(geometry);
+            }
+            geometry.size
+        };
         surface.with_pending_state(|state| {
             state
                 .states
                 .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
-            state
-                .states
-                .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            if maximize_on_launch {
+                state
+                    .states
+                    .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            }
             state.size = Some(size);
         });
         surface.send_configure();

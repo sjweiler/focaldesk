@@ -250,7 +250,9 @@ pub fn build_chrome_layout(
 
     let work_inner_frame = inset_rect(work_outer, 2);
     let work_recess = inset_rect(work_inner_frame, 4);
-    let glass_rect = inset_rect(work_recess, 4);
+    // Keep the glass overlay aligned with the actual work recess so the
+    // client area and the visible glass backdrop describe the same region.
+    let glass_rect = work_recess;
 
     let work_trim = Some(Rectangle::from_loc_and_size(
         (work_inner_frame.loc.x + 6, work_inner_frame.loc.y + 4),
@@ -434,5 +436,16 @@ pub fn build_chrome_layout(
             corner_caps,
             corner_joint_caps,
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn work_area_glass_matches_work_recess() {
+        let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+        assert_eq!(layout.work_area.glass, layout.work_area.recess);
     }
 }

@@ -8,6 +8,7 @@ use focaldesk_ipc::{
     send_notification_request,
 };
 use focaldesk_settings_core::load_settings;
+use focaldesk_voice::{VoiceEvent, VoiceSession};
 use glib::ControlFlow;
 use gtk4::prelude::*;
 use gtk4::{
@@ -443,6 +444,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         .build();
 
     let send = Button::with_label("Send");
+    let voice_button = Button::with_label("Voice");
 
     let stack = gtk4::Stack::new();
     stack.set_hexpand(true);
@@ -674,8 +676,85 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         });
     }
 
+    {
+        let current_session: Rc<RefCell<Option<VoiceSession>>> = Rc::new(RefCell::new(None));
+        let entry = entry.clone();
+        let log_buffer = log_buffer.clone();
+        voice_button.connect_clicked(move |button| {
+            if let Some(session) = current_session.borrow().as_ref() {
+                session.stop();
+                button.set_label("Voice");
+                // current_session is cleared by the polling loop once it observes the
+                // channel disconnect, so the trailing final phrase still gets applied.
+                return;
+            }
+
+            let model_dir = match focaldesk_voice::find_model_dir() {
+                Some(dir) => dir,
+                None => {
+                    append_log(
+                        &log_buffer,
+                        &format!("[voice] {}", focaldesk_voice::install_instructions()),
+                    );
+                    return;
+                }
+            };
+
+            let (tx, rx) = mpsc::channel::<VoiceEvent>();
+            let session = match VoiceSession::start(model_dir, tx) {
+                Ok(session) => session,
+                Err(err) => {
+                    append_log(&log_buffer, &format!("[voice] failed to start: {err}"));
+                    return;
+                }
+            };
+            *current_session.borrow_mut() = Some(session);
+            button.set_label("Stop");
+
+            let base_text = entry.text().to_string();
+            let mut base_text = base_text.trim_end().to_string();
+            if !base_text.is_empty() {
+                base_text.push(' ');
+            }
+            let mut accumulated = String::new();
+
+            let entry_for_poll = entry.clone();
+            let log_buffer_for_poll = log_buffer.clone();
+            let button_for_poll = button.clone();
+            let current_session_for_poll = current_session.clone();
+            glib::timeout_add_local(Duration::from_millis(80), move || loop {
+                match rx.try_recv() {
+                    Ok(VoiceEvent::Partial(partial)) => {
+                        entry_for_poll.set_text(&format!("{base_text}{accumulated}{partial}"));
+                        entry_for_poll.set_position(-1);
+                    }
+                    Ok(VoiceEvent::Final(text)) => {
+                        if !text.is_empty() {
+                            accumulated.push_str(&text);
+                            accumulated.push(' ');
+                        }
+                        entry_for_poll.set_text(&format!("{base_text}{accumulated}"));
+                        entry_for_poll.set_position(-1);
+                    }
+                    Ok(VoiceEvent::Error(err)) => {
+                        append_log(&log_buffer_for_poll, &format!("[voice] {err}"));
+                        button_for_poll.set_label("Voice");
+                        *current_session_for_poll.borrow_mut() = None;
+                        return ControlFlow::Break;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        *current_session_for_poll.borrow_mut() = None;
+                        return ControlFlow::Break;
+                    }
+                }
+            });
+        });
+    }
+
     composer.append(&composer_status_label);
     composer.append(&entry);
+    composer.append(&voice_button);
     composer.append(&send);
 
     stack.add_titled(&new_chat_workspace, Some("new-chat"), "New Chat");

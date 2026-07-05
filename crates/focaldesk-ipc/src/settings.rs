@@ -234,6 +234,16 @@ fn apply_setting_value(
                 };
         }
 
+        "workspaces.restore_session" => {
+            settings.workspaces.restore_session =
+                value.as_bool().ok_or("restore_session must be bool")?;
+        }
+
+        "workspaces.maximize_on_launch" => {
+            settings.workspaces.maximize_on_launch =
+                value.as_bool().ok_or("maximize_on_launch must be bool")?;
+        }
+
         "debug.log_level" => {
             settings.debug.log_level = match value.as_str().ok_or("log_level must be string")? {
                 "error" => DebugLogLevel::Error,

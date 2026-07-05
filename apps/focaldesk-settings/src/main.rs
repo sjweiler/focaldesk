@@ -3660,6 +3660,19 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
+    let maximize_on_launch = add_switch_row(
+        &behavior_group,
+        "Maximize app on launch",
+        Some("Open new app windows filling the work area; turn off to open at a smaller default size"),
+        settings.borrow().workspaces.maximize_on_launch,
+    );
+    {
+        let settings = settings.clone();
+        maximize_on_launch.connect_active_notify(move |switch| {
+            settings.borrow_mut().workspaces.maximize_on_launch = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     add_switch_row(
         &behavior_group,
         "Wrap around when switching",
