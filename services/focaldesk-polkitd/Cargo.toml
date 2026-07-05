@@ -17,7 +17,7 @@ tracing-subscriber = { workspace = true }
 zbus = "3"
 zbus_polkit = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
-glib = "0.19"
+glib = "0.20"
 polkit = "0.19"
 polkit-agent = "0.19"
 futures-channel = "0.3"
