@@ -36,7 +36,8 @@ jobs:
             libgles2-mesa-dev \
             libgbm-dev \
             libgtk-4-dev \
-            libadwaita-1-dev
+            libadwaita-1-dev \
+            libpam0g-dev
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
