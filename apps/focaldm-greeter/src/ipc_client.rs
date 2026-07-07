@@ -32,7 +32,9 @@ pub enum Response {
         message: String,
     },
     SessionStarted,
-    AuthError { message: String },
+    AuthError {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -60,8 +62,8 @@ pub struct DaemonConnection {
 impl DaemonConnection {
     /// Connect to $FOCALDM_SOCKET (or an explicit path in tests).
     pub fn connect(path: &Path) -> anyhow::Result<Self> {
-        let stream = UnixStream::connect(path)
-            .with_context(|| format!("connect {}", path.display()))?;
+        let stream =
+            UnixStream::connect(path).with_context(|| format!("connect {}", path.display()))?;
         stream.set_nonblocking(true)?;
         Ok(Self {
             stream,

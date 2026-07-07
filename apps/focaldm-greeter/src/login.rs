@@ -10,7 +10,10 @@ use crate::ipc_client::{AuthMessageStyle, Request, Response};
 #[derive(Debug)]
 pub enum LoginState {
     /// Username field focused. `error` carries the previous failure, if any.
-    EnterUsername { username: String, error: Option<String> },
+    EnterUsername {
+        username: String,
+        error: Option<String>,
+    },
     /// A request is in flight; show a spinner, ignore typing.
     Waiting { username: String },
     /// PAM asked a question (usually the password prompt).
@@ -62,7 +65,12 @@ impl LoginState {
                 vec![Request::CreateSession { username }]
             }
 
-            (LoginState::Prompt { username, input, .. }, UiEvent::SubmitPrompt) => {
+            (
+                LoginState::Prompt {
+                    username, input, ..
+                },
+                UiEvent::SubmitPrompt,
+            ) => {
                 *self = LoginState::Waiting { username };
                 // String moves out of Zeroizing here and into the outbox,
                 // which zeroizes on drain. No lingering copy in the state.
@@ -92,28 +100,27 @@ impl LoginState {
     pub fn on_response(&mut self, resp: Response) {
         match (std::mem::take(self), resp) {
             // A prompt arrives while waiting: show it.
-            (
-                LoginState::Waiting { username },
-                Response::AuthMessage { style, message },
-            ) => match style {
-                AuthMessageStyle::Secret | AuthMessageStyle::Visible => {
-                    *self = LoginState::Prompt {
-                        username,
-                        style,
-                        message,
-                        input: Zeroizing::new(String::new()),
-                        notices: Vec::new(),
-                    };
+            (LoginState::Waiting { username }, Response::AuthMessage { style, message }) => {
+                match style {
+                    AuthMessageStyle::Secret | AuthMessageStyle::Visible => {
+                        *self = LoginState::Prompt {
+                            username,
+                            style,
+                            message,
+                            input: Zeroizing::new(String::new()),
+                            notices: Vec::new(),
+                        };
+                    }
+                    // Display-only message with no prompt yet: keep waiting,
+                    // but we have nowhere to pin it — stash as a prompt-less
+                    // notice by re-entering Waiting. (The UI shows the last
+                    // notice next to the spinner; see ui.rs.)
+                    AuthMessageStyle::Info | AuthMessageStyle::Error => {
+                        tracing::info!(%message, "pam notice");
+                        *self = LoginState::Waiting { username };
+                    }
                 }
-                // Display-only message with no prompt yet: keep waiting,
-                // but we have nowhere to pin it — stash as a prompt-less
-                // notice by re-entering Waiting. (The UI shows the last
-                // notice next to the spinner; see ui.rs.)
-                AuthMessageStyle::Info | AuthMessageStyle::Error => {
-                    tracing::info!(%message, "pam notice");
-                    *self = LoginState::Waiting { username };
-                }
-            },
+            }
 
             // Additional info/error while a prompt is already up.
             (
@@ -141,10 +148,7 @@ impl LoginState {
 
             // A second *prompt* while one is up replaces it (PAM stacks
             // can chain prompts; the previous input is already submitted).
-            (
-                LoginState::Prompt { username, .. },
-                Response::AuthMessage { style, message },
-            ) => {
+            (LoginState::Prompt { username, .. }, Response::AuthMessage { style, message }) => {
                 *self = LoginState::Prompt {
                     username,
                     style,
@@ -206,7 +210,12 @@ mod tests {
             style: AuthMessageStyle::Secret,
             message: "Password: ".into(),
         });
-        let LoginState::Prompt { ref mut input, style, .. } = s else {
+        let LoginState::Prompt {
+            ref mut input,
+            style,
+            ..
+        } = s
+        else {
             panic!("expected prompt");
         };
         assert_eq!(style, AuthMessageStyle::Secret);

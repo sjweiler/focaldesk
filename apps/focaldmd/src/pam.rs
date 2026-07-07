@@ -162,7 +162,8 @@ fn run_transaction(
         ctx.set_tty(Some(tty)).context("set tty")?;
 
         // Drives the conversation: prompts flow to the greeter and back.
-        ctx.authenticate(Flag::NONE).context("authentication failed")?;
+        ctx.authenticate(Flag::NONE)
+            .context("authentication failed")?;
         // Expired passwords, access restrictions, etc.
         ctx.acct_mgmt(Flag::NONE).context("account check failed")?;
         Ok(ctx)

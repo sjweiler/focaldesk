@@ -29,7 +29,10 @@ fn round_trip() {
     let mut conn = DaemonConnection::from_stream(greeter_side);
 
     // greeter -> daemon
-    conn.send(&Request::CreateSession { username: "steven".into() }).unwrap();
+    conn.send(&Request::CreateSession {
+        username: "steven".into(),
+    })
+    .unwrap();
     conn.flush().unwrap();
     let v = fake_daemon_recv(&mut daemon);
     assert_eq!(v["type"], "create_session");
@@ -48,7 +51,10 @@ fn round_trip() {
     assert_eq!(resps.len(), 2);
     assert!(matches!(
         resps[0],
-        Response::AuthMessage { style: AuthMessageStyle::Secret, .. }
+        Response::AuthMessage {
+            style: AuthMessageStyle::Secret,
+            ..
+        }
     ));
     assert!(matches!(resps[1], Response::SessionStarted));
 }

@@ -3,9 +3,9 @@
 //! drm_backend.rs paint routine, retargeted from that app's greetd-shaped
 //! `LoginPhase` onto focaldmd's `LoginState`.
 
+use crate::font;
 use crate::ipc_client::AuthMessageStyle;
 use crate::login::LoginState;
-use crate::font;
 
 fn put_pixel(buf: &mut [u8], pitch: u32, x: u32, y: u32, color: (u8, u8, u8)) {
     let offset = (y * pitch + x * 4) as usize;
@@ -56,7 +56,9 @@ fn accent_color(state: &LoginState) -> (u8, u8, u8) {
 
 fn prompt_line(state: &LoginState) -> String {
     match state {
-        LoginState::EnterUsername { error: Some(msg), .. } => msg.clone(),
+        LoginState::EnterUsername {
+            error: Some(msg), ..
+        } => msg.clone(),
         LoginState::EnterUsername { error: None, .. } => "login:".to_string(),
         LoginState::Waiting { .. } => "authenticating...".to_string(),
         LoginState::Prompt { message, .. } => message.clone(),

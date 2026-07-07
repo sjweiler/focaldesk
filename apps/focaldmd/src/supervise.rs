@@ -184,18 +184,14 @@ async fn drive_greeter(
 }
 
 /// select!-friendly helpers: resolve only while a transaction is in flight.
-async fn recv_prompt(
-    rx: &mut Option<tokio::sync::mpsc::Receiver<PamPrompt>>,
-) -> Option<PamPrompt> {
+async fn recv_prompt(rx: &mut Option<tokio::sync::mpsc::Receiver<PamPrompt>>) -> Option<PamPrompt> {
     match rx {
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
 }
 
-async fn recv_outcome(
-    rx: &mut Option<tokio::sync::oneshot::Receiver<Outcome>>,
-) -> Option<Outcome> {
+async fn recv_outcome(rx: &mut Option<tokio::sync::oneshot::Receiver<Outcome>>) -> Option<Outcome> {
     match rx {
         Some(rx) => rx.await.ok(),
         None => std::future::pending().await,

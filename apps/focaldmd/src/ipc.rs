@@ -108,11 +108,9 @@ impl Listener {
     pub async fn accept_greeter(&self) -> anyhow::Result<Connection> {
         loop {
             let (stream, _) = self.inner.accept().await?;
-            let cred = nix::sys::socket::getsockopt(
-                &stream,
-                nix::sys::socket::sockopt::PeerCredentials,
-            )
-            .context("SO_PEERCRED")?;
+            let cred =
+                nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)
+                    .context("SO_PEERCRED")?;
             if nix::unistd::Uid::from_raw(cred.uid()) == self.allowed_uid {
                 return Ok(Connection { stream });
             }
