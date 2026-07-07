@@ -15,47 +15,15 @@ FocalDesk is a Rust-based Wayland desktop environment and compositor for Linux. 
 
 ## High-Level Overview
 
-```text
-Applications
-├── Wayland clients
-├── XWayland clients
-├── GTK applications
-├── Wine / DXVK applications
-└── Desktop utilities
+## System Architecture
 
-        │
+![FocalDesk Architecture](diagrams/architecture-overview.png)
 
-FocalDesk Compositor
-├── Wayland protocol handling
-├── Output and monitor management
-├── Input handling
-├── Window and surface management
-├── Workspaces
-├── Damage tracking
-├── Rendering pipeline
-├── Shell UI / overlays
-├── Lock screen
-└── IPC integration
+## Rendering Pipeline
 
-        │
+![Rendering Pipeline](diagrams/rendering-pipeline.png)
 
-Platform / Backend Layer
-├── DRM/KMS backend
-├── Winit backend
-├── OpenGL ES rendering
-├── PipeWire capture support
-├── XWayland support
-└── Hardware cursor support
+## IPC Architecture
 
-        │
+![IPC Architecture](diagrams/ipc-architecture.png)
 
-Desktop Services and Applications
-├── focal-launchd
-├── focal-launch-shared
-├── focaldesk-powerd
-├── focaldesk-notificationsd
-├── focaldesk-dialogd
-├── focaldesk-controlsd
-├── focaldesk-settings
-├── focaldesk-files
-└── future AI / agent services
