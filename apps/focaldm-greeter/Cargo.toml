@@ -1,0 +1,16 @@
+[package]
+name = "focaldm-greeter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "=1.7.0"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+smithay.workspace = true
+
+[dev-dependencies]
+image = { workspace = true }
