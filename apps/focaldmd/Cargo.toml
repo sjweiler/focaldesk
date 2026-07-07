@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 tokio = { version = "=1.38.2", features = ["rt", "macros", "net", "process", "sync", "time", "signal", "io-util"] }
 nix = { version = "0.29", features = ["user", "signal", "socket", "fs"] }
-pam-client = "0.5"
+pam-client = { version = "0.5", default-features = false }
 zeroize = "=1.7.0"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
