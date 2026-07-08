@@ -2,6 +2,7 @@ use adw::prelude::*;
 use focaldesk_logging::{init_default_logging, session_id};
 use glib::ControlFlow;
 use gtk::gio;
+use gtk::gio::prelude::AppInfoExt;
 use gtk::glib;
 use std::cell::RefCell;
 use std::fs::OpenOptions;
@@ -21,6 +22,8 @@ struct FileItem {
     is_dir: bool,
     size: u64,
     modified: String,
+    content_type: String,
+    icon: gio::Icon,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +244,17 @@ impl TabManager {
             });
         });
         self.window.add_action(&file_open);
+
+        let file_open_with = gio::SimpleAction::new("file-open-with", None);
+        let this = self.clone();
+        file_open_with.connect_activate(move |_, _| {
+            info!(target: "focaldesk", "file-open-with activated");
+            this.with_active_tab(|tab| {
+                let tab = tab.clone();
+                glib::idle_add_local_once(move || tab.show_open_with_dialog());
+            });
+        });
+        self.window.add_action(&file_open_with);
 
         let file_cut = gio::SimpleAction::new("file-cut", None);
         let this = self.clone();
@@ -1742,6 +1756,181 @@ impl FileManager {
         dialog.present();
     }
 
+    fn show_open_with_dialog(&self) {
+        let Some(index) = self.selected_index_for_action() else {
+            info!(target: "focaldesk", "show_open_with_dialog: no selected index");
+            self.set_status("Select an item to choose an application.");
+            return;
+        };
+        let Some(item) = self.visible_entries.borrow().get(index as usize).cloned() else {
+            info!(target: "focaldesk", index, "show_open_with_dialog: no item at index");
+            return;
+        };
+        info!(
+            target: "focaldesk",
+            name = %item.name,
+            content_type = %item.content_type,
+            "show_open_with_dialog: building dialog"
+        );
+
+        let apps: Vec<gio::AppInfo> = gio::AppInfo::all_for_type(&item.content_type)
+            .into_iter()
+            .filter(gio::AppInfo::should_show)
+            .collect();
+        info!(target: "focaldesk", app_count = apps.len(), "show_open_with_dialog: apps found");
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title(format!("Open With - {}", item.name))
+            .default_width(380)
+            .default_height(420)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        content.set_vexpand(true);
+
+        let header = gtk::Label::new(Some(&format!(
+            "Choose an application to open \"{}\"",
+            item.name
+        )));
+        header.set_xalign(0.0);
+        header.set_wrap(true);
+        content.append(&header);
+
+        let list = gtk::ListBox::new();
+        list.set_selection_mode(gtk::SelectionMode::Single);
+        list.add_css_class("boxed-list");
+
+        if apps.is_empty() {
+            let empty = gtk::Label::new(Some("No applications are available for this file type."));
+            empty.add_css_class("dim-label");
+            empty.set_margin_top(8);
+            empty.set_margin_bottom(8);
+            content.append(&empty);
+        } else {
+            for app in &apps {
+                let row = gtk::ListBoxRow::new();
+                let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+                row_box.set_margin_top(6);
+                row_box.set_margin_bottom(6);
+                row_box.set_margin_start(8);
+                row_box.set_margin_end(8);
+
+                let icon = match app.icon() {
+                    Some(gicon) => gtk::Image::from_gicon(&gicon),
+                    None => gtk::Image::from_icon_name("application-x-executable-symbolic"),
+                };
+                icon.set_pixel_size(24);
+                row_box.append(&icon);
+
+                let name = gtk::Label::new(Some(&app.name()));
+                name.set_xalign(0.0);
+                name.set_hexpand(true);
+                row_box.append(&name);
+
+                row.set_child(Some(&row_box));
+                list.append(&row);
+            }
+            list.select_row(list.row_at_index(0).as_ref());
+        }
+
+        let scroller = gtk::ScrolledWindow::new();
+        scroller.set_min_content_height(200);
+        scroller.set_vexpand(true);
+        scroller.set_child(Some(&list));
+        content.append(&scroller);
+
+        let set_default =
+            gtk::CheckButton::with_label("Always use this application for this file type");
+        if !apps.is_empty() {
+            content.append(&set_default);
+        }
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        let cancel = gtk::Button::with_label("Cancel");
+        let open = gtk::Button::with_label("Open");
+        open.add_css_class("suggested-action");
+        open.set_sensitive(!apps.is_empty());
+        actions.append(&cancel);
+        actions.append(&open);
+        content.append(&actions);
+
+        dialog.set_child(Some(&content));
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+        let key_controller = gtk::EventControllerKey::new();
+        let dialog_for_escape = dialog.clone();
+        key_controller.connect_key_pressed(move |_, keyval, _, _| {
+            if keyval == gtk::gdk::Key::Escape {
+                dialog_for_escape.close();
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        dialog.add_controller(key_controller);
+
+        let launch = {
+            let dialog = dialog.clone();
+            let list = list.clone();
+            let apps = apps.clone();
+            let item = item.clone();
+            let set_default = set_default.clone();
+            let this = self.clone();
+            move || {
+                let Some(row) = list.selected_row() else {
+                    return;
+                };
+                let index = row.index();
+                if index < 0 {
+                    return;
+                }
+                let Some(app) = apps.get(index as usize) else {
+                    return;
+                };
+
+                if set_default.is_active() {
+                    if let Err(err) = app.set_as_default_for_type(&item.content_type) {
+                        this.set_status(&format!("Could not set default application: {err}"));
+                    }
+                }
+
+                let force_x11 = item
+                    .path
+                    .as_deref()
+                    .and_then(Path::extension)
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+                let result = if let Some(display) = gtk::gdk::Display::default() {
+                    let context = display.app_launch_context();
+                    apply_launch_environment(&context, force_x11);
+                    app.launch(std::slice::from_ref(&item.file), Some(&context))
+                } else {
+                    let context = gio::AppLaunchContext::new();
+                    apply_launch_environment(&context, force_x11);
+                    app.launch(std::slice::from_ref(&item.file), Some(&context))
+                };
+                if let Err(err) = result {
+                    this.set_status(&format!("Could not launch {}: {err}", app.name()));
+                }
+                dialog.close();
+            }
+        };
+
+        let launch_for_open = launch.clone();
+        open.connect_clicked(move |_| launch_for_open());
+        list.connect_row_activated(move |_, _| launch());
+
+        info!(target: "focaldesk", "show_open_with_dialog: presenting");
+        dialog.present();
+    }
+
     fn install_drop_target(&self, widget: &impl IsA<gtk::Widget>) {
         let target = gtk::DropTargetAsync::new(None, gtk::gdk::DragAction::COPY);
 
@@ -1922,7 +2111,8 @@ fn read_location_items(
 
 fn read_file_items(file: &gio::File, show_hidden: bool) -> Result<Vec<FileItem>, glib::Error> {
     let enumerator = file.enumerate_children(
-        "standard::name,standard::display-name,standard::type,standard::size,time::modified",
+        "standard::name,standard::display-name,standard::type,standard::size,time::modified,\
+         standard::icon,standard::symbolic-icon,standard::content-type",
         gio::FileQueryInfoFlags::NONE,
         gio::Cancellable::NONE,
     )?;
@@ -1937,6 +2127,20 @@ fn read_file_items(file: &gio::File, show_hidden: bool) -> Result<Vec<FileItem>,
 
         let is_dir = info.file_type() == gio::FileType::Directory;
         let child = enumerator.child(&info);
+        let content_type = info
+            .content_type()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| {
+                if is_dir {
+                    "inode/directory".to_string()
+                } else {
+                    "application/octet-stream".to_string()
+                }
+            });
+        let icon = info
+            .symbolic_icon()
+            .or_else(|| info.icon())
+            .unwrap_or_else(|| gio::Icon::from(gio::ThemedIcon::new("text-x-generic-symbolic")));
         items.push(FileItem {
             name,
             path: child.path(),
@@ -1945,6 +2149,8 @@ fn read_file_items(file: &gio::File, show_hidden: bool) -> Result<Vec<FileItem>,
             is_dir,
             size: info.size().max(0) as u64,
             modified: modified_text(&info),
+            content_type,
+            icon,
         });
     }
 
@@ -1972,7 +2178,7 @@ fn detail_file_row(item: &FileItem) -> gtk::ListBoxRow {
     grid.set_column_spacing(12);
     grid.set_hexpand(true);
 
-    let icon = gtk::Image::from_icon_name(file_icon_name(item));
+    let icon = gtk::Image::from_gicon(&item.icon);
     icon.set_pixel_size(22);
     grid.attach(&icon, 0, 0, 1, 1);
 
@@ -2013,7 +2219,7 @@ fn list_file_row(item: &FileItem) -> gtk::ListBoxRow {
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     content.set_hexpand(true);
 
-    let icon = gtk::Image::from_icon_name(file_icon_name(item));
+    let icon = gtk::Image::from_gicon(&item.icon);
     icon.set_pixel_size(28);
     content.append(&icon);
 
@@ -2050,7 +2256,7 @@ fn grid_file_child(item: &FileItem) -> gtk::FlowBoxChild {
     tile.add_css_class("file-grid-tile");
     tile.set_halign(gtk::Align::Center);
 
-    let icon = gtk::Image::from_icon_name(file_icon_name(item));
+    let icon = gtk::Image::from_gicon(&item.icon);
     icon.set_pixel_size(48);
     tile.append(&icon);
 
@@ -2066,14 +2272,6 @@ fn grid_file_child(item: &FileItem) -> gtk::FlowBoxChild {
 
     child.set_child(Some(&tile));
     child
-}
-
-fn file_icon_name(item: &FileItem) -> &'static str {
-    if item.is_dir {
-        "folder-symbolic"
-    } else {
-        "text-x-generic-symbolic"
-    }
 }
 
 fn file_context_target(item: &FileItem) -> FileContextTarget {
@@ -2095,6 +2293,7 @@ fn attach_file_context_menu(
     if matches!(target, FileContextTarget::Folder) {
         menu.append(Some("Open in New Tab"), Some("win.file-open-tab"));
     }
+    menu.append(Some("Open With..."), Some("win.file-open-with"));
 
     menu.append_section(None, &{
         let section = gio::Menu::new();

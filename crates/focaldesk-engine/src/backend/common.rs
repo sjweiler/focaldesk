@@ -25,6 +25,7 @@ use smithay::backend::input::{
     PointerMotionEvent,
 };
 use smithay::backend::renderer::gles::GlesTexture;
+use smithay::input::keyboard::XkbConfig;
 use smithay::output::{Output, PhysicalProperties, Subpixel};
 #[cfg(feature = "xwayland")]
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
@@ -825,10 +826,23 @@ pub(crate) fn bootstrap_compositor_core(
     #[cfg(feature = "xwayland")]
     let xwayland_shell_state = XWaylandShellState::new::<DesktopState>(&dh);
 
+    let settings = load_settings();
+
     let mut seat_state = smithay::input::SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "seat-0".to_string());
     seat.add_pointer();
-    seat.add_keyboard(Default::default(), 200, 25)?;
+    seat.add_keyboard(
+        XkbConfig {
+            layout: &settings.input.keyboard_layout,
+            variant: &settings.input.keyboard_variant,
+            model: &settings.input.keyboard_model,
+            options: (!settings.input.keyboard_options.is_empty())
+                .then(|| settings.input.keyboard_options.clone()),
+            ..Default::default()
+        },
+        200,
+        25,
+    )?;
 
     let render = RenderState::new();
     let scale_factor = bootstrap_output
@@ -841,7 +855,6 @@ pub(crate) fn bootstrap_compositor_core(
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
 
     let config = FocalDeskConfig::load().unwrap_or_default();
-    let settings = load_settings();
 
     let theme_id = if config.appearance.theme.is_empty() {
         "Eagle".to_string()

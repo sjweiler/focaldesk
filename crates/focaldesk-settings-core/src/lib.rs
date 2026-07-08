@@ -67,6 +67,22 @@ pub enum DisplayColorProfile {
 pub struct InputSettings {
     pub pointer_speed: f32,
     pub natural_scroll: bool,
+    /// XKB layout (e.g. "us", "de"). Fed to the compositor's XkbConfig.
+    #[serde(default = "default_keyboard_layout")]
+    pub keyboard_layout: String,
+    /// XKB variant (e.g. "dvorak"). Empty means none.
+    #[serde(default)]
+    pub keyboard_variant: String,
+    /// XKB model. Empty defers to xkbcommon's own default.
+    #[serde(default)]
+    pub keyboard_model: String,
+    /// XKB options (e.g. "ctrl:nocaps"). Empty means none.
+    #[serde(default)]
+    pub keyboard_options: String,
+}
+
+fn default_keyboard_layout() -> String {
+    "us".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +109,11 @@ pub struct WorkspaceSettings {
     pub restore_session: bool,
     #[serde(default = "default_maximize_on_launch")]
     pub maximize_on_launch: bool,
+    /// Max number of workspace buttons shown individually in the sidebar before
+    /// they collapse into an overflow button. Does not limit how many workspaces
+    /// can actually be created.
+    #[serde(default = "default_max_workspace_slots")]
+    pub max_workspace_slots: u32,
 }
 
 impl Default for WorkspaceSettings {
@@ -100,6 +121,7 @@ impl Default for WorkspaceSettings {
         Self {
             restore_session: default_restore_session(),
             maximize_on_launch: default_maximize_on_launch(),
+            max_workspace_slots: default_max_workspace_slots(),
         }
     }
 }
@@ -231,6 +253,10 @@ pub fn default_settings() -> Settings {
         input: InputSettings {
             pointer_speed: 1.0,
             natural_scroll: false,
+            keyboard_layout: default_keyboard_layout(),
+            keyboard_variant: String::new(),
+            keyboard_model: String::new(),
+            keyboard_options: String::new(),
         },
         apps: AppSettings {
             terminal: "alacritty".into(),
@@ -255,6 +281,10 @@ fn default_restore_session() -> bool {
 
 fn default_maximize_on_launch() -> bool {
     true
+}
+
+fn default_max_workspace_slots() -> u32 {
+    4
 }
 
 fn default_location_services() -> bool {
@@ -331,5 +361,20 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.maximize_on_launch);
+    }
+
+    #[test]
+    fn max_workspace_slots_defaults_to_four_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("workspaces");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.workspaces.max_workspace_slots, 4);
+
+        let mut settings = settings;
+        settings.workspaces.max_workspace_slots = 7;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(restored.workspaces.max_workspace_slots, 7);
     }
 }

@@ -144,9 +144,8 @@ use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogButton, DialogId, DialogKind, DialogState};
 use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::ui_builder::{
-    SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID,
-    SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_1_ID, SIDEBAR_WORKSPACE_2_ID,
-    SIDEBAR_WORKSPACE_3_ID,
+    sidebar_workspace_number, SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID,
+    SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID,
 };
 
 fn clamp_rect_to_bounds(
@@ -1676,6 +1675,7 @@ impl DesktopState {
                 hdr_requested: output.hdr_requested,
                 hdr_kms_applied: output.hdr_kms_applied,
                 workspace_count: self.workspace_names.len(),
+                max_workspace_slots: self.workspaces.max_workspace_slots as usize,
                 active_workspace: output.active_workspace.0,
                 ai_flow_mode,
             },
@@ -2849,17 +2849,6 @@ impl DesktopState {
                         launch_trace_id
                     );
                 }
-                SIDEBAR_WORKSPACE_1_ID => self.set_focused_workspace(WorkspaceId(1)),
-                SIDEBAR_WORKSPACE_2_ID => {
-                    if self.workspace_names.len() > 1 {
-                        self.set_focused_workspace(WorkspaceId(2));
-                    }
-                }
-                SIDEBAR_WORKSPACE_3_ID => {
-                    if self.workspace_names.len() > 2 {
-                        self.set_focused_workspace(WorkspaceId(3));
-                    }
-                }
                 SIDEBAR_ADD_WORKSPACE_ID => {
                     let name = format!("Workspace {}", self.workspace_names.len() + 1);
                     self.create_workspace_from_dialog(name);
@@ -2890,7 +2879,13 @@ impl DesktopState {
                         launch_trace_id
                     );
                 }
-                _ => flog_warn!("unhandled custom ui action: {id}"),
+                _ => {
+                    if let Some(workspace_number) = sidebar_workspace_number(id) {
+                        self.set_focused_workspace(WorkspaceId(workspace_number));
+                    } else {
+                        flog_warn!("unhandled custom ui action: {id}");
+                    }
+                }
             },
 
             UiAction::SystemCommand(cmd) => {
@@ -5337,6 +5332,13 @@ impl DesktopState {
             time,
             |ds, mods: &ModifiersState, handle| {
                 let sym = handle.modified_sym().raw();
+
+                ds.input.modifiers = FlowModifiers {
+                    shift: mods.shift,
+                    ctrl: mods.ctrl,
+                    alt: mods.alt,
+                    super_key: mods.logo,
+                };
 
                 let mut mask = ModMask::empty();
                 if mods.shift {

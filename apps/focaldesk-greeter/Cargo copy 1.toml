@@ -1,0 +1,23 @@
+[package]
+name = "focaldm-greeter"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = "=1.7.0"
+anyhow = "1"
+tracing = "0.1"
+
+# The graphics half (main.rs / ui.rs / render.rs) additionally needs, in
+# Steven's workspace:
+#   focal-backend (DRM/GBM/EGL + libinput, extracted from focaldesk)
+#   focal-ui      (egui-glow 0.31 painter + theme)
+#   smithay       (backend features only: backend_drm, backend_libinput,
+#                  backend_session, backend_egl)
+#   calloop, egui, egui-glow, glow
+
+[features]
+default = []
+graphics = []
