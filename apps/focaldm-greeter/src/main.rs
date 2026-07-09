@@ -199,7 +199,7 @@ fn handle_input_event(g: &mut Greeter, event: &InputEvent<LibinputInputBackend>)
             g.send_all(reqs);
         }
         code => {
-            if let Some(ch) = keymap::keycode_to_char(code, g.mods.shift) {
+            if let Some(ch) = keymap::keycode_to_char(code, g.mods.shift, g.mods.caps) {
                 match &mut g.login {
                     LoginState::EnterUsername { username, .. } => username.push(ch),
                     LoginState::Prompt { input, .. } => input.push(ch),

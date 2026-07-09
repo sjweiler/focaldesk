@@ -11,6 +11,7 @@ pub const KEY_LEFTCTRL: u32 = 29;
 pub const KEY_LEFTSHIFT: u32 = 42;
 pub const KEY_RIGHTSHIFT: u32 = 54;
 pub const KEY_LEFTALT: u32 = 56;
+pub const KEY_CAPSLOCK: u32 = 58;
 pub const KEY_RIGHTCTRL: u32 = 97;
 pub const KEY_RIGHTALT: u32 = 100;
 
@@ -19,6 +20,10 @@ pub struct Modifiers {
     pub ctrl: bool,
     pub alt: bool,
     pub shift: bool,
+    /// Toggled (not held) state of Caps Lock. Unlike the other fields, this
+    /// doesn't track key-down/key-up: it flips once per press and ignores
+    /// the matching release, same as every real keyboard driver treats it.
+    pub caps: bool,
 }
 
 impl Modifiers {
@@ -29,6 +34,11 @@ impl Modifiers {
             KEY_LEFTCTRL | KEY_RIGHTCTRL => self.ctrl = pressed,
             KEY_LEFTSHIFT | KEY_RIGHTSHIFT => self.shift = pressed,
             KEY_LEFTALT | KEY_RIGHTALT => self.alt = pressed,
+            KEY_CAPSLOCK => {
+                if pressed {
+                    self.caps = !self.caps;
+                }
+            }
             _ => return false,
         }
         true
@@ -48,13 +58,21 @@ pub fn vt_switch_target(keycode: u32) -> Option<i32> {
     }
 }
 
-/// US-QWERTY keycode -> char, for unshifted and shifted layers.
-pub fn keycode_to_char(keycode: u32, shift: bool) -> Option<char> {
+/// US-QWERTY keycode -> char, for unshifted and shifted layers. `caps`
+/// applies Caps Lock the way real keyboards do: it flips the case of
+/// letters, but has no effect on digits/symbols (where only `shift` picks
+/// the shifted glyph) — e.g. Caps Lock alone still types '1', not '!'.
+pub fn keycode_to_char(keycode: u32, shift: bool, caps: bool) -> Option<char> {
     let (lower, upper) = ROWS
         .iter()
         .find(|(code, _, _)| *code == keycode)
         .map(|(_, lower, upper)| (*lower, *upper))?;
-    Some(if shift { upper } else { lower })
+    let use_upper = if lower.is_ascii_alphabetic() {
+        shift ^ caps
+    } else {
+        shift
+    };
+    Some(if use_upper { upper } else { lower })
 }
 
 // (evdev keycode, unshifted, shifted)

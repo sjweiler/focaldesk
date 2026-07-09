@@ -129,7 +129,7 @@ fn handle_input_event(data: &mut GreeterLoopData, event: &InputEvent<LibinputInp
         keymap::KEY_BACKSPACE => data.state.backspace(),
         keymap::KEY_ESC => flow::cancel(&mut data.state, &data.req_tx),
         code => {
-            if let Some(ch) = keymap::keycode_to_char(code, data.mods.shift) {
+            if let Some(ch) = keymap::keycode_to_char(code, data.mods.shift, data.mods.caps) {
                 data.state.push_char(ch);
             }
         }
