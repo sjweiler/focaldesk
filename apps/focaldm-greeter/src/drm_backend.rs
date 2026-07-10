@@ -1,10 +1,13 @@
 // Standalone DRM/KMS scanout for the greeter, deliberately independent of
 // focaldesk-engine's backend::drm (which is 3000+ lines of GBM/EGL/GLES/
 // wayland-server machinery for the real compositor). The greeter only ever
-// needs to show a login box on one output, so it uses legacy dumb-buffer
-// modesetting instead: no GPU-accelerated rendering, no atomic KMS, no
-// wayland surfaces. Ported from focaldesk-greeter's drm_backend.rs, which
-// this mirrors closely — see drm-rs's own `examples/legacy_modeset.rs`.
+// needs to show a login box on one output, so it uses legacy (non-atomic)
+// modesetting with a single CPU-mapped GBM buffer for scanout: no GPU-
+// accelerated rendering, no wayland surfaces. Ported from focaldesk-greeter's
+// drm_backend.rs, which this mirrors closely — see drm-rs's own
+// `examples/legacy_modeset.rs`. Buffers come from GBM rather than the
+// simpler dumb-buffer ioctls because the proprietary NVIDIA driver doesn't
+// implement dumb buffers (ENOSYS) but does support GBM allocation.
 //
 // Known corners cut, deliberately, to keep this a first working pass:
 // - Text is drawn with the small hand-authored bitmap font in `crate::font`,
@@ -21,11 +24,12 @@ use smithay::backend::session::{
     libseat::LibSeatSession, libseat::LibSeatSessionNotifier, Session,
 };
 use smithay::backend::udev::primary_gpu;
-use smithay::reexports::drm::buffer::{Buffer as DrmBuffer, DrmFourcc};
+use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::drm::control::{
-    connector, crtc, dumbbuffer::DumbBuffer, framebuffer, Device as ControlDevice, Mode,
-    ModeTypeFlags,
+    connector, crtc, framebuffer, Device as ControlDevice, Event, Mode, ModeTypeFlags,
+    PageFlipFlags,
 };
+use smithay::reexports::gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
@@ -36,11 +40,23 @@ use crate::render;
 pub struct GreeterOutput {
     session: LibSeatSession,
     fd: DrmDeviceFd,
+    // Kept alive alongside `bos`: the C gbm_device must outlive any buffer
+    // objects allocated from it.
+    #[allow(dead_code)]
+    gbm: GbmDevice<DrmDeviceFd>,
     crtc: crtc::Handle,
     connector: connector::Handle,
     mode: Mode,
-    dumb: DumbBuffer,
-    fb: framebuffer::Handle,
+    // Two buffers so `render` never writes into the one currently on
+    // screen: mapping and mutating a GBM buffer object while it's pinned as
+    // the active CRTC framebuffer races the display controller's scanout of
+    // that same memory — on the proprietary NVIDIA driver in particular,
+    // that's not just tearing, it's a plausible hang. `front` is the index
+    // into `bos`/`fbs` currently on screen; `render` always writes the
+    // other one, then page-flips onto it.
+    bos: [BufferObject<()>; 2],
+    fbs: [framebuffer::Handle; 2],
+    front: usize,
 }
 
 impl GreeterOutput {
@@ -93,24 +109,46 @@ impl GreeterOutput {
             .ok_or_else(|| anyhow!("no CRTCs available on {}", gpu_path.display()))?
             .handle();
 
+        // Legacy dumb buffers aren't implemented by the proprietary NVIDIA
+        // DRM driver (ENOSYS on create_dumb_buffer); GBM buffer objects are
+        // the allocation path that works across i915/amdgpu/nouveau *and*
+        // nvidia-drm, so the greeter uses those instead even though it's
+        // still doing plain CPU-mapped software rendering, not GPU-accelerated.
+        let gbm = GbmDevice::new(fd.clone()).context("failed to create GBM device")?;
+
         let (width, height) = mode.size();
-        let mut dumb = fd
-            .create_dumb_buffer((width.into(), height.into()), DrmFourcc::Xrgb8888, 32)
-            .context("failed to create dumb buffer")?;
+        let make_buffer =
+            |gbm: &GbmDevice<DrmDeviceFd>| -> Result<(BufferObject<()>, framebuffer::Handle)> {
+                let mut bo = gbm
+                    .create_buffer_object::<()>(
+                        width.into(),
+                        height.into(),
+                        DrmFourcc::Xrgb8888,
+                        BufferObjectFlags::SCANOUT
+                            | BufferObjectFlags::WRITE
+                            | BufferObjectFlags::LINEAR,
+                    )
+                    .context("failed to create GBM buffer object")?;
+                let stride = bo.stride();
+                bo.map_mut(0, 0, width.into(), height.into(), |mapping| {
+                    render::fill_background(
+                        mapping.buffer_mut(),
+                        stride,
+                        width as u32,
+                        height as u32,
+                    );
+                })
+                .context("failed to map GBM buffer object")?;
+                let fb = fd
+                    .add_framebuffer(&bo, 24, 32)
+                    .context("failed to create framebuffer")?;
+                Ok((bo, fb))
+            };
 
-        {
-            let pitch = dumb.pitch();
-            let mut mapping = fd
-                .map_dumb_buffer(&mut dumb)
-                .context("failed to map dumb buffer")?;
-            render::fill_background(mapping.as_mut(), pitch, width as u32, height as u32);
-        }
+        let (bo0, fb0) = make_buffer(&gbm)?;
+        let (bo1, fb1) = make_buffer(&gbm)?;
 
-        let fb = fd
-            .add_framebuffer(&dumb, 24, 32)
-            .context("failed to create framebuffer")?;
-
-        fd.set_crtc(crtc_handle, Some(fb), (0, 0), &[con.handle()], Some(mode))
+        fd.set_crtc(crtc_handle, Some(fb0), (0, 0), &[con.handle()], Some(mode))
             .context("failed to set CRTC")?;
 
         let mut libinput = Libinput::new_with_udev::<
@@ -123,11 +161,13 @@ impl GreeterOutput {
         let output = Self {
             session,
             fd,
+            gbm,
             crtc: crtc_handle,
             connector: con.handle(),
             mode,
-            dumb,
-            fb,
+            bos: [bo0, bo1],
+            fbs: [fb0, fb1],
+            front: 0,
         };
 
         Ok((output, notifier, libinput))
@@ -142,12 +182,14 @@ impl GreeterOutput {
     /// Re-applies the CRTC after a `SessionEvent::ActivateSession`. Another
     /// process may have taken DRM master and scanned out something else
     /// while we were paused; this is a best-effort re-assertion, not a full
-    /// atomic-KMS resume path.
+    /// atomic-KMS resume path. Re-asserts whichever buffer is currently
+    /// `front` — its content is always our last completed frame, since
+    /// `render` only ever touches the other one.
     pub fn reassert_scanout(&mut self) -> Result<()> {
         self.fd
             .set_crtc(
                 self.crtc,
-                Some(self.fb),
+                Some(self.fbs[self.front]),
                 (0, 0),
                 &[self.connector],
                 Some(self.mode),
@@ -156,13 +198,42 @@ impl GreeterOutput {
     }
 
     pub fn render(&mut self, state: &LoginState) -> Result<()> {
+        let back = 1 - self.front;
         let (width, height) = self.mode.size();
-        let pitch = self.dumb.pitch();
-        let mut mapping = self
-            .fd
-            .map_dumb_buffer(&mut self.dumb)
-            .context("failed to map dumb buffer for render")?;
-        render::paint_login_box(mapping.as_mut(), pitch, width as u32, height as u32, state);
+        let stride = self.bos[back].stride();
+        self.bos[back]
+            .map_mut(0, 0, width.into(), height.into(), |mapping| {
+                render::paint_login_box(
+                    mapping.buffer_mut(),
+                    stride,
+                    width as u32,
+                    height as u32,
+                    state,
+                );
+            })
+            .context("failed to map GBM buffer object for render")?;
+
+        self.fd
+            .page_flip(self.crtc, self.fbs[back], PageFlipFlags::EVENT, None)
+            .context("failed to queue page flip")?;
+
+        // Block for flip completion: only once this lands is `front` (the
+        // buffer render just left) guaranteed off-screen and safe to map
+        // again on the next call. Renders happen at keystroke rate, not
+        // continuously, so one vblank (~16ms) of latency here doesn't matter
+        // — and it's strictly better than the alternative of writing into
+        // a buffer the display controller might still be scanning.
+        loop {
+            let events = self
+                .fd
+                .receive_events()
+                .context("failed to read DRM events")?;
+            if events.into_iter().any(|e| matches!(e, Event::PageFlip(_))) {
+                break;
+            }
+        }
+
+        self.front = back;
         Ok(())
     }
 }

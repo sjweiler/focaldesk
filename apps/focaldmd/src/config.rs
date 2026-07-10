@@ -20,8 +20,14 @@ pub struct Config {
     pub session_cmd: String,
     /// Unix socket the greeter connects to.
     pub socket_path: PathBuf,
-    /// PAM service name (an entry under /etc/pam.d/).
+    /// PAM service name (an entry under /etc/pam.d/) for authenticating a
+    /// human and launching their session.
     pub pam_service: String,
+    /// PAM service name for the greeter's own (non-interactive) session —
+    /// distinct from `pam_service` because it must never require a password:
+    /// auth/account are `pam_permit`, only the session stack (pam_systemd)
+    /// matters, giving the greeter user a real seat.
+    pub greeter_pam_service: String,
     /// TTY handed to PAM and the launched session (e.g. "tty1").
     pub tty_name: String,
     /// VT number, exported to the session as XDG_VTNR.
@@ -44,6 +50,7 @@ impl Default for Config {
             session_cmd: "/usr/bin/focaldesk".into(),
             socket_path: PathBuf::from("/run/focaldmd/greeter.sock"),
             pam_service: "focaldmd".into(),
+            greeter_pam_service: "focaldmd-greeter".into(),
             tty_name: "tty1".into(),
             vt: 1,
             keyboard_layout: "us".into(),

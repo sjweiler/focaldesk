@@ -30,7 +30,8 @@ pub fn sidebar_workspace_id(workspace_number: u32) -> u32 {
 /// Decodes a sidebar element id back into a 1-based workspace number, if it
 /// falls within the dynamic workspace id range.
 pub fn sidebar_workspace_number(id: u32) -> Option<u32> {
-    if id >= SIDEBAR_WORKSPACE_ID_BASE && id < SIDEBAR_WORKSPACE_ID_BASE + SIDEBAR_WORKSPACE_ID_SLOTS
+    if id >= SIDEBAR_WORKSPACE_ID_BASE
+        && id < SIDEBAR_WORKSPACE_ID_BASE + SIDEBAR_WORKSPACE_ID_SLOTS
     {
         Some(id - SIDEBAR_WORKSPACE_ID_BASE + 1)
     } else {
@@ -134,8 +135,7 @@ pub fn build_ui_for_output_with_options(
     let remove_slot = if workspace_count > 1 { 1 } else { 0 };
     let fixed_after = 3; // browser, terminal, files
     let reserved_no_overflow = fixed_before + add_slot + remove_slot + fixed_after;
-    let slots_for_workspaces_no_overflow =
-        total_slots.saturating_sub(reserved_no_overflow).max(1);
+    let slots_for_workspaces_no_overflow = total_slots.saturating_sub(reserved_no_overflow).max(1);
 
     // Clamp to 9: the icon atlas only defines Slot(1)..=Slot(9), regardless of
     // what the settings file says.
@@ -146,9 +146,8 @@ pub fn build_ui_for_output_with_options(
     {
         (workspace_count, false)
     } else {
-        let slots_for_workspaces_with_overflow = total_slots
-            .saturating_sub(reserved_no_overflow + 1)
-            .max(1);
+        let slots_for_workspaces_with_overflow =
+            total_slots.saturating_sub(reserved_no_overflow + 1).max(1);
         let cap = max_workspace_slots.min(slots_for_workspaces_with_overflow);
         (workspace_count.min(cap), true)
     };

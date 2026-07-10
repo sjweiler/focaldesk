@@ -1,17 +1,22 @@
-// Small embedded 5x7 bitmap font (uppercase only; lowercase input is
-// upper-cased before lookup). Hand-authored rather than transcribed from an
-// existing font table, since there's no way to view real DRM scanout output
-// from this environment to catch a transcription error. Verified instead by
-// rendering to a PNG in the `render_preview` test below and visually
-// inspecting it — see that test for how to regenerate the preview after
-// changing a glyph.
+// Small embedded 5x7 bitmap font. Hand-authored rather than transcribed from
+// an existing font table, since there's no way to view real DRM scanout
+// output from this environment to catch a transcription error. Verified
+// instead by rendering to a PNG in the `render_preview` test below and
+// visually inspecting it — see that test for how to regenerate the preview
+// after changing a glyph.
+//
+// Lowercase letters get their own glyphs rather than being upper-cased, so
+// the greeter's display reflects the actual case of what was typed (it's
+// what gets sent as the password). There's no room in a 7-row cell for true
+// descenders, so g/j/p/q/y are drawn within the x-height band like the rest
+// of the lowercase letters instead of dropping below the baseline.
 
 pub const GLYPH_WIDTH: u32 = 5;
 pub const GLYPH_HEIGHT: u32 = 7;
 
 // Each row is the low 5 bits of the byte, bit 4 = leftmost pixel.
 fn glyph(c: char) -> [u8; 7] {
-    match c.to_ascii_uppercase() {
+    match c {
         'A' => [
             0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
         ],
@@ -89,6 +94,84 @@ fn glyph(c: char) -> [u8; 7] {
         ],
         'Z' => [
             0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        'a' => [
+            0b00000, 0b00000, 0b01110, 0b00001, 0b01111, 0b10001, 0b01111,
+        ],
+        'b' => [
+            0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'c' => [
+            0b00000, 0b00000, 0b01111, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'd' => [
+            0b00001, 0b00001, 0b01111, 0b10001, 0b10001, 0b10001, 0b01111,
+        ],
+        'e' => [
+            0b00000, 0b00000, 0b01110, 0b10001, 0b11111, 0b10000, 0b01111,
+        ],
+        'f' => [
+            0b00111, 0b01000, 0b11110, 0b01000, 0b01000, 0b01000, 0b01000,
+        ],
+        'g' => [
+            0b00000, 0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00110,
+        ],
+        'h' => [
+            0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001,
+        ],
+        'i' => [
+            0b00100, 0b00000, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'j' => [
+            0b00010, 0b00000, 0b00010, 0b00010, 0b00010, 0b10010, 0b01100,
+        ],
+        'k' => [
+            0b10000, 0b10000, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010,
+        ],
+        'l' => [
+            0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b00110,
+        ],
+        'm' => [
+            0b00000, 0b00000, 0b11011, 0b10101, 0b10101, 0b10101, 0b10101,
+        ],
+        'n' => [
+            0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b10001, 0b10001,
+        ],
+        'o' => [
+            0b00000, 0b00000, 0b01110, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'p' => [
+            0b00000, 0b00000, 0b11110, 0b10001, 0b10001, 0b11110, 0b10000,
+        ],
+        'q' => [
+            0b00000, 0b00000, 0b01111, 0b10001, 0b10001, 0b01111, 0b00001,
+        ],
+        'r' => [
+            0b00000, 0b00000, 0b10110, 0b11001, 0b10000, 0b10000, 0b10000,
+        ],
+        's' => [
+            0b00000, 0b00000, 0b01111, 0b10000, 0b01110, 0b00001, 0b11110,
+        ],
+        't' => [
+            0b00100, 0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00011,
+        ],
+        'u' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b10011, 0b01101,
+        ],
+        'v' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'w' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b10101, 0b10101, 0b01010,
+        ],
+        'x' => [
+            0b00000, 0b00000, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001,
+        ],
+        'y' => [
+            0b00000, 0b00000, 0b10001, 0b10001, 0b01111, 0b00001, 0b01110,
+        ],
+        'z' => [
+            0b00000, 0b00000, 0b11111, 0b00010, 0b00100, 0b01000, 0b11111,
         ],
         '0' => [
             0b01110, 0b10011, 0b10011, 0b10101, 0b11001, 0b11001, 0b01110,
@@ -208,16 +291,17 @@ mod tests {
     #[ignore = "writes a preview PNG for manual visual inspection, not an assertion"]
     fn render_preview() {
         let scale = 4;
-        let width = text_width("ABCDEFGHIJKLM 0123456789 !*:.-_", scale) + 20;
-        let height = (GLYPH_HEIGHT * scale) * 3 + 40;
+        let width = text_width("ABCDEFGHIJKLMNOPQRSTUVWXYZ", scale) + 20;
+        let height = (GLYPH_HEIGHT * scale + 10) * 4 + 30;
         let pitch = width * 4;
         let mut buf = vec![0x20u8; (pitch * height) as usize];
+        let row = |n: u32| 10 + n * (GLYPH_HEIGHT * scale + 10);
 
         draw_text(
             &mut buf,
             pitch,
             10,
-            10,
+            row(0),
             scale,
             (255, 255, 255),
             "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
@@ -226,7 +310,16 @@ mod tests {
             &mut buf,
             pitch,
             10,
-            10 + (GLYPH_HEIGHT * scale) + 10,
+            row(1),
+            scale,
+            (255, 255, 255),
+            "abcdefghijklmnopqrstuvwxyz",
+        );
+        draw_text(
+            &mut buf,
+            pitch,
+            10,
+            row(2),
             scale,
             (255, 255, 255),
             "0123456789 !*:.-_",
@@ -235,10 +328,10 @@ mod tests {
             &mut buf,
             pitch,
             10,
-            10 + (GLYPH_HEIGHT * scale + 10) * 2,
+            row(3),
             scale,
             (100, 200, 255),
-            "Password:",
+            "Password: hunter2",
         );
 
         // buf is BGRX per pixel; image::Rgba wants RGBA, so swap R/B on the way out.

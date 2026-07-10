@@ -133,7 +133,7 @@ fn main() -> anyhow::Result<()> {
         output,
         mods: Modifiers::default(),
         session_active: true,
-        needs_redraw: true,
+        needs_redraw: false,
         signal: event_loop.get_signal(),
     };
     greeter.render();
@@ -209,6 +209,5 @@ fn handle_input_event(g: &mut Greeter, event: &InputEvent<LibinputInputBackend>)
         }
     }
 
-    g.needs_redraw = true;
     g.render();
 }
