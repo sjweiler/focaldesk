@@ -20,6 +20,13 @@
 
 use anyhow::{anyhow, Context, Result};
 use smithay::backend::drm::DrmDeviceFd;
+use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
+use smithay::backend::allocator::gbm::GbmBuffer;
+use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::renderer::gles::{
+    GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
+};
+use smithay::backend::renderer::{Bind, Frame, Renderer};
 use smithay::backend::session::{
     libseat::LibSeatSession, libseat::LibSeatSessionNotifier, Session,
 };
@@ -29,12 +36,51 @@ use smithay::reexports::drm::control::{
     connector, crtc, framebuffer, Device as ControlDevice, Event, Mode, ModeTypeFlags,
     PageFlipFlags,
 };
-use smithay::reexports::gbm::{BufferObject, BufferObjectFlags, Device as GbmDevice};
+use smithay::reexports::gbm::{BufferObjectFlags, Device as GbmDevice};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
-use smithay::utils::DeviceFd;
+use smithay::utils::{Buffer, DeviceFd, Physical, Rectangle, Size, Transform};
 
 use crate::render;
+
+const GREETER_BACKGROUND_FRAG: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform vec2 u_resolution;
+uniform float u_time;
+
+varying vec2 v_coords;
+
+void main() {
+    vec2 uv = v_coords;
+    vec2 center = vec2(0.5, 0.48);
+    vec2 c1 = vec2(0.32 + sin(u_time * 0.55) * 0.05, 0.28 + cos(u_time * 0.75) * 0.04);
+    vec2 c2 = vec2(0.72 + cos(u_time * 0.40) * 0.03, 0.74 + sin(u_time * 0.60) * 0.05);
+
+    float d1 = dot(uv - c1, uv - c1);
+    float d2 = dot(uv - c2, uv - c2);
+    float glow1 = pow(max(1.0 - d1 / 0.18, 0.0), 3.0);
+    float glow2 = pow(max(1.0 - d2 / 0.14, 0.0), 3.0);
+    float vignette = clamp(1.0 - dot(uv - center, uv - center) * 1.55, 0.0, 1.0);
+    float scan = sin((uv.y * u_resolution.y) * 0.04 + u_time * 6.0) * 0.018;
+
+    vec3 base = vec3(0.05, 0.07, 0.11);
+    vec3 blue = vec3(0.09, 0.24, 0.38);
+    vec3 teal = vec3(0.14, 0.46, 0.52);
+    vec3 amber = vec3(0.82, 0.56, 0.20);
+
+    vec3 color = base
+        + blue * glow1
+        + teal * glow2 * 0.7
+        + amber * (glow2 * 0.14)
+        + vec3(vignette * 0.08)
+        + vec3(scan);
+
+    gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+}
+"#;
 
 pub struct GreeterOutput {
     session: LibSeatSession,
@@ -53,9 +99,81 @@ pub struct GreeterOutput {
     // that's not just tearing, it's a plausible hang. `front` is the index
     // into `bos`/`fbs` currently on screen; `render` always writes the
     // other one, then page-flips onto it.
-    bos: [BufferObject<()>; 2],
+    bos: [GbmBuffer; 2],
     fbs: [framebuffer::Handle; 2],
     front: usize,
+    flip_pending: bool,
+    gpu: Option<GpuBackground>,
+}
+
+struct GpuBackground {
+    renderer: GlesRenderer,
+    program: GlesPixelProgram,
+}
+
+impl GpuBackground {
+    fn new(gbm: &GbmDevice<DrmDeviceFd>) -> Result<Self> {
+        let display = unsafe { EGLDisplay::new(gbm.clone()) }
+            .context("failed to create EGL display for greeter")?;
+        let context = EGLContext::new(&display)
+            .context("failed to create EGL context for greeter")?;
+        let mut renderer = unsafe { GlesRenderer::new(context) }
+            .context("failed to create GLES renderer for greeter")?;
+
+        let program = renderer
+            .compile_custom_pixel_shader(
+                GREETER_BACKGROUND_FRAG,
+                &[
+                    UniformName::new("u_resolution", UniformType::_2f),
+                    UniformName::new("u_time", UniformType::_1f),
+                ],
+            )
+            .context("failed to compile greeter background shader")?;
+
+        Ok(Self {
+            renderer,
+            program,
+        })
+    }
+
+    fn render_into(
+        &mut self,
+        dmabuf: &mut Dmabuf,
+        width: u32,
+        height: u32,
+        phase: f32,
+    ) -> Result<()> {
+        let rect_f = Rectangle::<f64, Buffer>::new((0.0, 0.0).into(), (width as f64, height as f64).into());
+        let rect_i = Rectangle::<i32, Physical>::new((0, 0).into(), (width as i32, height as i32).into());
+        let buffer_size = Size::<i32, Buffer>::from((width as i32, height as i32));
+        let physical_size = Size::<i32, Physical>::from((width as i32, height as i32));
+
+        let mut target = self.renderer.bind(dmabuf).context("failed to bind greeter scanout dmabuf")?;
+        let mut frame = self
+            .renderer
+            .render(&mut target, physical_size, Transform::Normal)
+            .context("failed to begin greeter shader frame")?;
+
+        let uniforms = [
+            Uniform::new("u_resolution", [width as f32, height as f32]),
+            Uniform::new("u_time", phase),
+        ];
+
+        frame
+            .render_pixel_shader_to(
+                &self.program,
+                rect_f,
+                rect_i,
+                buffer_size,
+                Some(std::slice::from_ref(&rect_i)),
+                1.0,
+                &uniforms,
+            )
+            .context("failed to draw greeter shader background")?;
+        let sync = frame.finish().context("failed to finish greeter shader frame")?;
+        self.renderer.wait(&sync).context("failed to wait for greeter shader frame")?;
+        Ok(())
+    }
 }
 
 impl GreeterOutput {
@@ -117,7 +235,7 @@ impl GreeterOutput {
 
         let (width, height) = mode.size();
         let make_buffer =
-            |gbm: &GbmDevice<DrmDeviceFd>| -> Result<(BufferObject<()>, framebuffer::Handle)> {
+            |gbm: &GbmDevice<DrmDeviceFd>| -> Result<(GbmBuffer, framebuffer::Handle)> {
                 let mut bo = gbm
                     .create_buffer_object::<()>(
                         width.into(),
@@ -138,14 +256,17 @@ impl GreeterOutput {
                     );
                 })
                 .context("failed to map GBM buffer object")?;
+                let gbm_bo = GbmBuffer::from_bo(bo, true);
                 let fb = fd
-                    .add_framebuffer(&bo, 24, 32)
+                    .add_framebuffer(&gbm_bo, 24, 32)
                     .context("failed to create framebuffer")?;
-                Ok((bo, fb))
+                Ok((gbm_bo, fb))
             };
 
         let (bo0, fb0) = make_buffer(&gbm)?;
         let (bo1, fb1) = make_buffer(&gbm)?;
+
+        let gpu = GpuBackground::new(&gbm).ok();
 
         fd.set_crtc(crtc_handle, Some(fb0), (0, 0), &[con.handle()], Some(mode))
             .context("failed to set CRTC")?;
@@ -167,6 +288,8 @@ impl GreeterOutput {
             bos: [bo0, bo1],
             fbs: [fb0, fb1],
             front: 0,
+            flip_pending: false,
+            gpu,
         };
 
         Ok((output, notifier, libinput))
@@ -181,6 +304,18 @@ impl GreeterOutput {
     pub fn mode_size(&self) -> (u32, u32) {
         let (w, h) = self.mode.size();
         (w as u32, h as u32)
+    }
+
+    pub fn drm_fd(&self) -> DrmDeviceFd {
+        self.fd.clone()
+    }
+
+    pub fn flip_pending(&self) -> bool {
+        self.flip_pending
+    }
+
+    pub fn gpu_background_enabled(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// Re-applies the CRTC after a `SessionEvent::ActivateSession`. Another
@@ -201,19 +336,73 @@ impl GreeterOutput {
             .context("failed to re-set CRTC on session resume")
     }
 
+    pub fn handle_drm_events(&mut self) -> Result<bool> {
+        let mut saw_page_flip = false;
+
+        loop {
+            let events = match self.fd.receive_events() {
+                Ok(events) => events,
+                Err(err) => {
+                    return Err(anyhow!("failed to read DRM events: {err}"));
+                }
+            };
+
+            let mut saw_event = false;
+            for event in events {
+                saw_event = true;
+                if matches!(event, Event::PageFlip(_)) {
+                    self.flip_pending = false;
+                    saw_page_flip = true;
+                }
+            }
+
+            if !saw_event || saw_page_flip {
+                break;
+            }
+        }
+
+        Ok(saw_page_flip)
+    }
+
     pub fn render(&mut self, state: &render::FrameState<'_>) -> Result<render::FrameHitTargets> {
+        if self.flip_pending {
+            return Ok(render::FrameHitTargets::default());
+        }
+
         let back = 1 - self.front;
         let (width, height) = self.mode.size();
         let stride = self.bos[back].stride();
+        let mut dmabuf = if self.gpu.is_some() {
+            Some(
+                self.bos[back]
+                    .export()
+                    .context("failed to export greeter scanout buffer")?,
+            )
+        } else {
+            None
+        };
+
+        let background_ok = if let (Some(gpu), Some(dmabuf)) = (self.gpu.as_mut(), dmabuf.as_mut())
+        {
+            gpu.render_into(dmabuf, width as u32, height as u32, state.pulse_phase)
+                .is_ok()
+        } else {
+            false
+        };
+        drop(dmabuf);
+
         let layout = self.bos[back]
             .map_mut(0, 0, width.into(), height.into(), |mapping| {
-                render::paint_frame(
-                    mapping.buffer_mut(),
-                    stride,
-                    width as u32,
-                    height as u32,
-                    state,
-                )
+                let buf = mapping.buffer_mut();
+                let frame_state = render::FrameState {
+                    login: state.login,
+                    pointer: state.pointer,
+                    power_menu_open: state.power_menu_open,
+                    pulse_phase: state.pulse_phase,
+                    paint_background: !background_ok,
+                };
+
+                render::paint_frame(buf, stride, width as u32, height as u32, &frame_state)
             })
             .context("failed to map GBM buffer object for render")?;
 
@@ -221,23 +410,8 @@ impl GreeterOutput {
             .page_flip(self.crtc, self.fbs[back], PageFlipFlags::EVENT, None)
             .context("failed to queue page flip")?;
 
-        // Block for flip completion: only once this lands is `front` (the
-        // buffer render just left) guaranteed off-screen and safe to map
-        // again on the next call. Renders happen at keystroke rate, not
-        // continuously, so one vblank (~16ms) of latency here doesn't matter
-        // — and it's strictly better than the alternative of writing into
-        // a buffer the display controller might still be scanning.
-        loop {
-            let events = self
-                .fd
-                .receive_events()
-                .context("failed to read DRM events")?;
-            if events.into_iter().any(|e| matches!(e, Event::PageFlip(_))) {
-                break;
-            }
-        }
-
         self.front = back;
+        self.flip_pending = true;
         Ok(layout)
     }
 }

@@ -51,6 +51,7 @@ impl Greeter {
             pointer: self.pointer,
             power_menu_open: self.power_menu_open,
             pulse_phase: self.started_at.elapsed().as_secs_f32(),
+            paint_background: self.output.gpu_background_enabled(),
         };
 
         match self.output.render(&frame) {
@@ -215,10 +216,30 @@ fn main() -> anyhow::Result<()> {
         started_at: Instant::now(),
         signal: event_loop.get_signal(),
     };
+
+    let drm_fd = greeter.output.drm_fd();
+    handle
+        .insert_source(Generic::new(drm_fd, Interest::READ, Mode::Level), |_, _, g: &mut Greeter| {
+            match g.output.handle_drm_events() {
+                Ok(_) => {
+                    if g.session_active && !g.output.flip_pending() {
+                        g.render();
+                    }
+                    Ok(PostAction::Continue)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "drm event handling failed");
+                    g.signal.stop();
+                    Ok(PostAction::Remove)
+                }
+            }
+        })
+        .map_err(|e| anyhow!("insert drm source: {e}"))?;
+
     greeter.render();
 
     event_loop.run(Duration::from_millis(16), &mut greeter, |g| {
-        if g.session_active {
+        if g.session_active && !g.output.flip_pending() {
             g.render();
         }
     })?;
@@ -289,12 +310,16 @@ fn handle_input_event(g: &mut Greeter, event: &InputEvent<LibinputInputBackend>)
                 }
             }
 
-            g.render();
+            if !g.output.flip_pending() {
+                g.render();
+            }
         }
         InputEvent::PointerMotion { event, .. } => {
             let delta = event.delta();
             g.handle_pointer_motion(delta.x, delta.y);
-            g.render();
+            if !g.output.flip_pending() {
+                g.render();
+            }
         }
         InputEvent::PointerMotionAbsolute { event, .. } => {
             let (w, h) = g.output.mode_size();
@@ -302,14 +327,18 @@ fn handle_input_event(g: &mut Greeter, event: &InputEvent<LibinputInputBackend>)
                 .position_transformed((w as i32, h as i32).into())
                 .to_f64();
             g.handle_pointer_absolute(pos.x.round() as i32, pos.y.round() as i32);
-            g.render();
+            if !g.output.flip_pending() {
+                g.render();
+            }
         }
         InputEvent::PointerButton { event, .. } => {
             let button = event.button_code();
             let pressed = event.state() == ButtonState::Pressed;
             if button == 0x110 && pressed {
                 g.handle_primary_click();
-                g.render();
+                if !g.output.flip_pending() {
+                    g.render();
+                }
             }
         }
         _ => {}

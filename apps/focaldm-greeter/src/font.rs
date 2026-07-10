@@ -213,7 +213,7 @@ pub fn draw_text(
     for ch in text.chars() {
         let (metrics, bitmap) = font.rasterize(ch, size);
         let gx = caret as i32 + metrics.xmin;
-        let gy = baseline_y + metrics.ymin;
+        let gy = baseline_y - metrics.ymin - metrics.height as i32;
 
         for row in 0..metrics.height {
             for col in 0..metrics.width {

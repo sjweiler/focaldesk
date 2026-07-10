@@ -55,6 +55,7 @@ pub struct FrameState<'a> {
     pub pointer: Option<(i32, i32)>,
     pub power_menu_open: bool,
     pub pulse_phase: f32,
+    pub paint_background: bool,
 }
 
 fn blend_channel(dst: u8, src: u8, alpha: u8) -> u8 {
@@ -79,6 +80,18 @@ fn blend_pixel(buf: &mut [u8], pitch: u32, x: i32, y: i32, color: (u8, u8, u8), 
     buf[offset + 1] = blend_channel(buf[offset + 1], color.1, alpha);
     buf[offset + 2] = blend_channel(buf[offset + 2], color.0, alpha);
     buf[offset + 3] = 0;
+}
+
+fn baseline_from_top(font: &font::FontFace, size: f32, top: i32) -> i32 {
+    let ascent = font
+        .horizontal_line_metrics(size)
+        .map(|metrics| metrics.ascent)
+        .unwrap_or(size);
+    top + ascent.round() as i32
+}
+
+fn line_step(font: &font::FontFace, size: f32) -> i32 {
+    font::line_height(font, size).ceil() as i32
 }
 
 fn fill_rect(buf: &mut [u8], pitch: u32, rect: Rect, color: (u8, u8, u8), alpha: u8) {
@@ -149,6 +162,74 @@ fn draw_border(
         color,
         alpha,
     );
+}
+
+// Classic arrow-pointer silhouette (tip + notch + tail flourish), traced as a
+// single non-self-intersecting polygon. The hotspot is the tip at (0, 0),
+// matching `hover()`'s use of the raw pointer coordinate as the click point.
+const CURSOR_POLY: &[(f32, f32)] = &[
+    (0.0, 0.0),
+    (0.0, 17.0),
+    (4.0, 13.0),
+    (7.0, 20.0),
+    (9.0, 19.0),
+    (6.0, 12.0),
+    (11.0, 12.0),
+];
+
+// Even-odd scanline fill so the arrow polygon can be reused both for the
+// white body and, offset by a pixel in every direction, as a dark outline
+// that keeps it legible over any background color.
+fn fill_polygon(
+    buf: &mut [u8],
+    pitch: u32,
+    points: &[(f32, f32)],
+    ox: i32,
+    oy: i32,
+    color: (u8, u8, u8),
+    alpha: u8,
+) {
+    let (Some(min_y), Some(max_y)) = (
+        points.iter().map(|p| p.1).reduce(f32::min),
+        points.iter().map(|p| p.1).reduce(f32::max),
+    ) else {
+        return;
+    };
+
+    for y in min_y.floor() as i32..=max_y.ceil() as i32 {
+        let yf = y as f32 + 0.5;
+        let mut xs: Vec<f32> = Vec::new();
+        for i in 0..points.len() {
+            let (x1, y1) = points[i];
+            let (x2, y2) = points[(i + 1) % points.len()];
+            if (y1 <= yf && y2 > yf) || (y2 <= yf && y1 > yf) {
+                xs.push(x1 + (yf - y1) / (y2 - y1) * (x2 - x1));
+            }
+        }
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        for pair in xs.chunks_exact(2) {
+            for x in pair[0].round() as i32..pair[1].round() as i32 {
+                blend_pixel(buf, pitch, ox + x, oy + y, color, alpha);
+            }
+        }
+    }
+}
+
+fn draw_cursor(buf: &mut [u8], pitch: u32, x: i32, y: i32) {
+    for (dx, dy) in [
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+        (-1, 0),
+        (1, 0),
+        (-1, 1),
+        (0, 1),
+        (1, 1),
+    ] {
+        fill_polygon(buf, pitch, CURSOR_POLY, x + dx, y + dy, (12, 14, 18), 235);
+    }
+    fill_polygon(buf, pitch, CURSOR_POLY, x, y, (255, 255, 255), 255);
 }
 
 fn draw_shadow(buf: &mut [u8], pitch: u32, rect: Rect) {
@@ -288,12 +369,14 @@ fn background_color(x: i32, y: i32, w: i32, h: i32, phase: f32) -> (u8, u8, u8) 
     let c2x = 0.72 + (phase * 0.8).cos() * 0.03;
     let c2y = 0.74 + (phase * 1.1).sin() * 0.05;
 
-    let d1 = (((fx - c1x).powi(2) + (fy - c1y).powi(2)).sqrt() / 0.42).clamp(0.0, 1.5);
-    let d2 = (((fx - c2x).powi(2) + (fy - c2y).powi(2)).sqrt() / 0.36).clamp(0.0, 1.5);
-    let glow1 = (1.0 - d1).max(0.0).powf(2.8);
-    let glow2 = (1.0 - d2).max(0.0).powf(2.2);
+    let d1 = ((fx - c1x).powi(2) + (fy - c1y).powi(2)) / (0.42 * 0.42);
+    let d2 = ((fx - c2x).powi(2) + (fy - c2y).powi(2)) / (0.36 * 0.36);
+    let glow1 = (1.0 - d1).clamp(0.0, 1.0);
+    let glow1 = glow1 * glow1 * (0.68 + glow1 * 0.32);
+    let glow2 = (1.0 - d2).clamp(0.0, 1.0);
+    let glow2 = glow2 * glow2 * (0.74 + glow2 * 0.26);
     let vignette = (1.0 - (((fx - 0.5).powi(2) + (fy - 0.48).powi(2)) * 1.55)).clamp(0.0, 1.0);
-    let scan = ((x + y) as f32 * 0.02 + phase * 6.0).sin() * 0.018;
+    let scan = (fy * 12.0 + phase * 6.0).sin() * 0.014;
 
     let base = [12.0, 17.0, 28.0];
     let blue = [24.0, 61.0, 97.0];
@@ -332,6 +415,8 @@ fn background_color(x: i32, y: i32, w: i32, h: i32, phase: f32) -> (u8, u8, u8) 
 }
 
 fn paint_background(buf: &mut [u8], pitch: u32, width: i32, height: i32, phase: f32) {
+    let _phase_sin = phase.sin();
+    let _phase_cos = phase.cos();
     for y in 0..height {
         for x in 0..width {
             let (r, g, b) = background_color(x, y, width, height, phase);
@@ -447,7 +532,9 @@ pub fn paint_frame(
 ) -> FrameHitTargets {
     let width = width as i32;
     let height = height as i32;
-    paint_background(buf, pitch, width, height, state.pulse_phase);
+    if state.paint_background {
+        paint_background(buf, pitch, width, height, state.pulse_phase);
+    }
 
     let panel_w = (width as f32 * 0.42).clamp(420.0, 700.0) as i32;
     let panel_h = (height as f32 * 0.34).clamp(270.0, 400.0) as i32;
@@ -529,7 +616,7 @@ pub fn paint_frame(
     );
 
     let title_x = panel.x + 96;
-    let title_y = panel.y + 48;
+    let title_y = baseline_from_top(medium, title_size, panel.y + 34);
     draw_text_block(
         buf,
         pitch,
@@ -542,7 +629,8 @@ pub fn paint_frame(
     );
 
     let subtitle = subtitle(state.login);
-    let subtitle_y = title_y + (title_size * 1.15) as i32;
+    let subtitle_top = panel.y + 34 + line_step(medium, title_size);
+    let subtitle_y = baseline_from_top(regular, body_size, subtitle_top);
     draw_text_block(
         buf,
         pitch,
@@ -567,7 +655,7 @@ pub fn paint_frame(
 
     let prompt = prompt_line(state.login);
     let prompt = font::ellipsize(regular, body_size, &prompt, panel.w - 64);
-    let prompt_baseline = panel.y + panel.h - 104;
+    let prompt_baseline = baseline_from_top(regular, body_size, panel.y + panel.h - 124);
     draw_text_block(
         buf,
         pitch,
@@ -586,17 +674,18 @@ pub fn paint_frame(
             _ => (155, 170, 182),
         };
         let msg = font::ellipsize(regular, small_size, msg, panel.w - 60);
+        let notice_baseline = baseline_from_top(regular, small_size, notice_y);
         draw_text_block(
             buf,
             pitch,
             panel.x + 30,
-            notice_y,
+            notice_baseline,
             small_size,
             color,
             regular,
             &msg,
         );
-        notice_y += (small_size * 1.25) as i32;
+        notice_y += line_step(regular, small_size);
     }
 
     let field = Rect {
@@ -631,7 +720,7 @@ pub fn paint_frame(
 
     let shown = field_text(state.login);
     let field_inner_x = field.x + 18;
-    let field_baseline = field.y + 31;
+    let field_baseline = baseline_from_top(medium, field_size, field.y + 10);
     if !shown.is_empty() {
         draw_text_block(
             buf,
@@ -688,11 +777,12 @@ pub fn paint_frame(
     {
         let msg = font::ellipsize(regular, body_size, msg, width - 64);
         let msg_x = center_x(width, font::measure_width(regular, body_size, &msg));
+        let msg_baseline = baseline_from_top(regular, body_size, note_y);
         draw_text_block(
             buf,
             pitch,
             msg_x,
-            note_y,
+            msg_baseline,
             body_size,
             (228, 92, 86),
             regular,
@@ -701,11 +791,12 @@ pub fn paint_frame(
     } else if matches!(state.login, LoginState::Done) {
         let msg = "Handing off to the session...";
         let msg_x = center_x(width, font::measure_width(regular, body_size, msg));
+        let msg_baseline = baseline_from_top(regular, body_size, note_y);
         draw_text_block(
             buf,
             pitch,
             msg_x,
-            note_y,
+            msg_baseline,
             body_size,
             (160, 174, 187),
             regular,
@@ -714,11 +805,12 @@ pub fn paint_frame(
     } else {
         let msg = "Esc cancels. Click the power icon for power options.";
         let msg_x = center_x(width, font::measure_width(regular, small_size, msg));
+        let msg_baseline = baseline_from_top(regular, small_size, note_y);
         draw_text_block(
             buf,
             pitch,
             msg_x,
-            note_y,
+            msg_baseline,
             small_size,
             (152, 166, 178),
             regular,
@@ -826,6 +918,10 @@ pub fn paint_frame(
         }
     }
 
+    if let Some((px, py)) = state.pointer {
+        draw_cursor(buf, pitch, px, py);
+    }
+
     FrameHitTargets {
         power_button,
         power_menu_items,
@@ -864,18 +960,21 @@ mod tests {
                 pointer: Some((0, 0)),
                 power_menu_open: false,
                 pulse_phase: 0.0,
+                paint_background: true,
             },
             FrameState {
                 login: &state1,
                 pointer: Some((0, 0)),
                 power_menu_open: false,
                 pulse_phase: 0.8,
+                paint_background: true,
             },
             FrameState {
                 login: &state2,
                 pointer: Some((0, 0)),
                 power_menu_open: true,
                 pulse_phase: 1.2,
+                paint_background: true,
             },
         ];
 
