@@ -2088,6 +2088,7 @@ name = "focaldm-greeter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fontdue",
  "image",
  "serde",
  "serde_json",

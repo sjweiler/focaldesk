@@ -10,8 +10,8 @@
 // implement dumb buffers (ENOSYS) but does support GBM allocation.
 //
 // Known corners cut, deliberately, to keep this a first working pass:
-// - Text is drawn with the small hand-authored bitmap font in `crate::font`,
-//   not a real rasterizer (no hinting/antialiasing/proportional spacing).
+// - Text is drawn with the real IBM Plex Sans rasterizer in `crate::font`,
+//   but still via CPU software rendering rather than GPU acceleration.
 // - CRTC selection takes resource_handles().crtcs()[0] rather than checking
 //   the connector's encoder `possible_crtcs` bitmask. Fine for one GPU/one
 //   output; would misbehave on more exotic multi-GPU setups.
@@ -34,7 +34,6 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
 
-use crate::login::LoginState;
 use crate::render;
 
 pub struct GreeterOutput {
@@ -179,6 +178,11 @@ impl GreeterOutput {
             .map_err(|e| anyhow!("VT switch to {vt} failed: {e:?}"))
     }
 
+    pub fn mode_size(&self) -> (u32, u32) {
+        let (w, h) = self.mode.size();
+        (w as u32, h as u32)
+    }
+
     /// Re-applies the CRTC after a `SessionEvent::ActivateSession`. Another
     /// process may have taken DRM master and scanned out something else
     /// while we were paused; this is a best-effort re-assertion, not a full
@@ -197,19 +201,19 @@ impl GreeterOutput {
             .context("failed to re-set CRTC on session resume")
     }
 
-    pub fn render(&mut self, state: &LoginState) -> Result<()> {
+    pub fn render(&mut self, state: &render::FrameState<'_>) -> Result<render::FrameHitTargets> {
         let back = 1 - self.front;
         let (width, height) = self.mode.size();
         let stride = self.bos[back].stride();
-        self.bos[back]
+        let layout = self.bos[back]
             .map_mut(0, 0, width.into(), height.into(), |mapping| {
-                render::paint_login_box(
+                render::paint_frame(
                     mapping.buffer_mut(),
                     stride,
                     width as u32,
                     height as u32,
                     state,
-                );
+                )
             })
             .context("failed to map GBM buffer object for render")?;
 
@@ -234,6 +238,6 @@ impl GreeterOutput {
         }
 
         self.front = back;
-        Ok(())
+        Ok(layout)
     }
 }

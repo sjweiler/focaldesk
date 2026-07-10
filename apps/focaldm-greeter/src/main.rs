@@ -1,23 +1,20 @@
 //! focaldm-greeter entry point.
 //!
 //! NOT a Wayland compositor: no listening socket, no protocol globals, no
-//! clients. Just DRM output (dumb-buffer scanout, see `drm_backend`) +
-//! libinput + the bitmap-font login box in `render`, plus the daemon socket.
+//! clients. Just DRM output + libinput + a socket to focaldmd.
 //!
-//! Event loop (calloop, same idiom as focaldesk-greeter and focaldesk
-//! itself):
-//!   - libseat session source   (VT/device management via smithay)
-//!   - libinput source          -> keycodes -> LoginState mutation/events
-//!   - daemon socket source     -> LoginState::on_response
-//!
-//! Render policy: damage-driven. Repaint on input and on IPC traffic. Idle
-//! greeter = zero GPU/CPU work beyond waiting on fds.
+//! The greeter now behaves more like a lock screen: animated background,
+//! centered panel, readable font, and a clickable power menu.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
-use smithay::backend::input::{InputEvent, KeyState, KeyboardKeyEvent};
+use smithay::backend::input::{
+    AbsolutePositionEvent, ButtonState, InputEvent, KeyState, KeyboardKeyEvent, PointerButtonEvent,
+    PointerMotionEvent,
+};
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::backend::session::Event as SessionEvent;
 use smithay::reexports::calloop::{
@@ -28,6 +25,7 @@ use focaldm_greeter::drm_backend::GreeterOutput;
 use focaldm_greeter::ipc_client::{DaemonConnection, Request};
 use focaldm_greeter::keymap::{self, Modifiers};
 use focaldm_greeter::login::{LoginState, UiEvent};
+use focaldm_greeter::render::{self, FrameHitTargets, PowerAction};
 
 struct Greeter {
     login: LoginState,
@@ -35,7 +33,10 @@ struct Greeter {
     output: GreeterOutput,
     mods: Modifiers,
     session_active: bool,
-    needs_redraw: bool,
+    power_menu_open: bool,
+    pointer: Option<(i32, i32)>,
+    frame: FrameHitTargets,
+    started_at: Instant,
     signal: LoopSignal,
 }
 
@@ -44,8 +45,17 @@ impl Greeter {
         if !self.session_active {
             return;
         }
-        if let Err(e) = self.output.render(&self.login) {
-            tracing::error!(error = ?e, "render failed");
+
+        let frame = render::FrameState {
+            login: &self.login,
+            pointer: self.pointer,
+            power_menu_open: self.power_menu_open,
+            pulse_phase: self.started_at.elapsed().as_secs_f32(),
+        };
+
+        match self.output.render(&frame) {
+            Ok(layout) => self.frame = layout,
+            Err(e) => tracing::error!(error = ?e, "render failed"),
         }
     }
 
@@ -59,6 +69,74 @@ impl Greeter {
             tracing::error!(error = %e, "flush failed");
             self.signal.stop();
         }
+    }
+
+    fn submit_ui_event(&mut self, ev: UiEvent) {
+        let reqs = self.login.on_ui_event(ev);
+        self.send_all(reqs);
+    }
+
+    fn close_power_menu(&mut self) {
+        self.power_menu_open = false;
+    }
+
+    fn launch_power_action(action: PowerAction) {
+        std::thread::spawn(move || {
+            let mut command = Command::new("systemctl");
+            command.arg("--no-block");
+            match action {
+                PowerAction::Suspend => {
+                    command.arg("suspend");
+                }
+                PowerAction::Hibernate => {
+                    command.arg("hibernate");
+                }
+                PowerAction::Restart => {
+                    command.arg("reboot");
+                }
+                PowerAction::PowerOff => {
+                    command.arg("poweroff");
+                }
+            }
+            if let Err(e) = command.status() {
+                tracing::error!(error = %e, action = ?action, "failed to launch power action");
+            }
+        });
+    }
+
+    fn handle_primary_click(&mut self) {
+        let Some((px, py)) = self.pointer else {
+            return;
+        };
+
+        if self.power_menu_open {
+            for (action, rect) in &self.frame.power_menu_items {
+                if rect.contains(px, py) {
+                    Self::launch_power_action(*action);
+                    self.close_power_menu();
+                    return;
+                }
+            }
+            if !self.frame.power_button.contains(px, py) {
+                self.close_power_menu();
+            }
+            return;
+        }
+
+        if self.frame.power_button.contains(px, py) {
+            self.power_menu_open = true;
+        }
+    }
+
+    fn handle_pointer_motion(&mut self, dx: f64, dy: f64) {
+        let (mut x, mut y) = self.pointer.unwrap_or((0, 0));
+        x += dx.round() as i32;
+        y += dy.round() as i32;
+        self.pointer = Some((x, y));
+    }
+
+    fn handle_pointer_absolute(&mut self, x: i32, y: i32) {
+        self.pointer = Some((x, y));
     }
 }
 
@@ -103,25 +181,23 @@ fn main() -> anyhow::Result<()> {
     handle
         .insert_source(
             Generic::new(sock_fd, Interest::READ, Mode::Level),
-            |_, _, g: &mut Greeter| {
-                match g.conn.read_responses() {
-                    Ok(resps) => {
-                        for r in resps {
-                            g.login.on_response(r);
-                        }
-                        g.render();
-                        if g.login.is_done() {
-                            // Daemon will SIGTERM us; leave the loop now so
-                            // DRM master is released as fast as possible.
-                            g.signal.stop();
-                        }
-                        Ok(PostAction::Continue)
+            |_, _, g: &mut Greeter| match g.conn.read_responses() {
+                Ok(resps) => {
+                    for r in resps {
+                        g.login.on_response(r);
                     }
-                    Err(e) => {
-                        tracing::error!(error = %e, "daemon connection lost");
+                    if g.login.is_done() {
+                        // Daemon will SIGTERM us; leave the loop now so
+                        // DRM master is released as fast as possible.
                         g.signal.stop();
-                        Ok(PostAction::Remove)
                     }
+                    g.render();
+                    Ok(PostAction::Continue)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "daemon connection lost");
+                    g.signal.stop();
+                    Ok(PostAction::Remove)
                 }
             },
         )
@@ -133,81 +209,109 @@ fn main() -> anyhow::Result<()> {
         output,
         mods: Modifiers::default(),
         session_active: true,
-        needs_redraw: false,
+        power_menu_open: false,
+        pointer: None,
+        frame: FrameHitTargets::default(),
+        started_at: Instant::now(),
         signal: event_loop.get_signal(),
     };
     greeter.render();
 
     event_loop.run(Duration::from_millis(16), &mut greeter, |g| {
-        if !g.needs_redraw {
-            return;
+        if g.session_active {
+            g.render();
         }
-        g.needs_redraw = false;
-        g.render();
     })?;
 
     Ok(())
 }
 
 fn handle_input_event(g: &mut Greeter, event: &InputEvent<LibinputInputBackend>) {
-    let InputEvent::Keyboard { event, .. } = event else {
-        return;
-    };
+    match event {
+        InputEvent::Keyboard { event, .. } => {
+            let keycode: u32 = event.key_code().into();
+            let pressed = event.state() == KeyState::Pressed;
 
-    let keycode: u32 = event.key_code().into();
-    let pressed = event.state() == KeyState::Pressed;
+            if g.mods.track(keycode, pressed) {
+                return;
+            }
+            if !pressed {
+                return;
+            }
 
-    if g.mods.track(keycode, pressed) {
-        return;
-    }
-    if !pressed {
-        return;
-    }
+            if g.power_menu_open && keycode == keymap::KEY_ESC {
+                g.close_power_menu();
+                g.render();
+                return;
+            }
 
-    if g.mods.ctrl && g.mods.alt {
-        if let Some(vt) = keymap::vt_switch_target(keycode) {
-            if let Err(e) = g.output.change_vt(vt) {
-                tracing::error!(error = ?e, "VT switch failed");
-            }
-            return;
-        }
-    }
-
-    match keycode {
-        keymap::KEY_ENTER => {
-            let ev = match &g.login {
-                LoginState::EnterUsername { .. } => Some(UiEvent::SubmitUsername),
-                LoginState::Prompt { .. } => Some(UiEvent::SubmitPrompt),
-                LoginState::Waiting { .. } | LoginState::Done => None,
-            };
-            if let Some(ev) = ev {
-                let reqs = g.login.on_ui_event(ev);
-                g.send_all(reqs);
-            }
-        }
-        keymap::KEY_BACKSPACE => match &mut g.login {
-            LoginState::EnterUsername { username, .. } => {
-                username.pop();
-            }
-            LoginState::Prompt { input, .. } => {
-                input.pop();
-            }
-            LoginState::Waiting { .. } | LoginState::Done => {}
-        },
-        keymap::KEY_ESC => {
-            let reqs = g.login.on_ui_event(UiEvent::Cancel);
-            g.send_all(reqs);
-        }
-        code => {
-            if let Some(ch) = keymap::keycode_to_char(code, g.mods.shift, g.mods.caps) {
-                match &mut g.login {
-                    LoginState::EnterUsername { username, .. } => username.push(ch),
-                    LoginState::Prompt { input, .. } => input.push(ch),
-                    LoginState::Waiting { .. } | LoginState::Done => {}
+            if g.mods.ctrl && g.mods.alt {
+                if let Some(vt) = keymap::vt_switch_target(keycode) {
+                    if let Err(e) = g.output.change_vt(vt) {
+                        tracing::error!(error = ?e, "VT switch failed");
+                    }
+                    return;
                 }
             }
-        }
-    }
 
-    g.render();
+            match keycode {
+                keymap::KEY_ENTER => {
+                    let ev = match &g.login {
+                        LoginState::EnterUsername { .. } => Some(UiEvent::SubmitUsername),
+                        LoginState::Prompt { .. } => Some(UiEvent::SubmitPrompt),
+                        LoginState::Waiting { .. } | LoginState::Done => None,
+                    };
+                    if let Some(ev) = ev {
+                        g.submit_ui_event(ev);
+                    }
+                }
+                keymap::KEY_BACKSPACE => match &mut g.login {
+                    LoginState::EnterUsername { username, .. } => {
+                        username.pop();
+                    }
+                    LoginState::Prompt { input, .. } => {
+                        input.pop();
+                    }
+                    LoginState::Waiting { .. } | LoginState::Done => {}
+                },
+                keymap::KEY_ESC => {
+                    let reqs = g.login.on_ui_event(UiEvent::Cancel);
+                    g.send_all(reqs);
+                }
+                code => {
+                    if let Some(ch) = keymap::keycode_to_char(code, g.mods.shift, g.mods.caps) {
+                        match &mut g.login {
+                            LoginState::EnterUsername { username, .. } => username.push(ch),
+                            LoginState::Prompt { input, .. } => input.push(ch),
+                            LoginState::Waiting { .. } | LoginState::Done => {}
+                        }
+                    }
+                }
+            }
+
+            g.render();
+        }
+        InputEvent::PointerMotion { event, .. } => {
+            let delta = event.delta();
+            g.handle_pointer_motion(delta.x, delta.y);
+            g.render();
+        }
+        InputEvent::PointerMotionAbsolute { event, .. } => {
+            let (w, h) = g.output.mode_size();
+            let pos = event
+                .position_transformed((w as i32, h as i32).into())
+                .to_f64();
+            g.handle_pointer_absolute(pos.x.round() as i32, pos.y.round() as i32);
+            g.render();
+        }
+        InputEvent::PointerButton { event, .. } => {
+            let button = event.button_code();
+            let pressed = event.state() == ButtonState::Pressed;
+            if button == 0x110 && pressed {
+                g.handle_primary_click();
+                g.render();
+            }
+        }
+        _ => {}
+    }
 }
