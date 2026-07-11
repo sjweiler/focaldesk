@@ -18,7 +18,18 @@ The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop w
 
 FocalDesk Desktop Environment
 
-FocalDesk is a modern Wayland desktop environment written in Rust, focused on performance, modularity, and AI integration. It combines a custom compositor, desktop shell, system services, and native applications into a cohesive Linux desktop designed for both everyday productivity and advanced workflows.
+FocalDesk is a modern Wayland desktop environment written in Rust, focused on performance, modularity, and AI integration.
+
+The project now includes a complete desktop stack featuring:
+
+- Native Wayland compositor
+- Desktop shell
+- Display manager (focaldmd)
+- Login greeter
+- Session manager
+- System services and IPC framework
+- First-party desktop applications
+- Integrated local AI framework
 
 ![FocalDesk Desktop](docs/screenshots/desktop.png)
 
