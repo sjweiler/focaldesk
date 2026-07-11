@@ -2088,6 +2088,7 @@ name = "focaldm-greeter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fontdue",
  "image",
  "serde",
  "serde_json",
@@ -2102,6 +2103,7 @@ name = "focaldmd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "nix 0.29.0",
  "pam-client",
  "serde",

@@ -3630,10 +3630,17 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     count_row.set_title("Number of workspaces");
     count_row.set_subtitle("Static workspace slots shown by the desktop shell");
     let count = gtk::SpinButton::with_range(1.0, 9.0, 1.0);
-    count.set_value(4.0);
+    count.set_value(settings.borrow().workspaces.max_workspace_slots as f64);
     count.set_numeric(true);
     count_row.add_suffix(&count);
     behavior_group.add(&count_row);
+    {
+        let settings = settings.clone();
+        count.connect_value_changed(move |spin| {
+            settings.borrow_mut().workspaces.max_workspace_slots = spin.value() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
 
     add_switch_row(
         &behavior_group,

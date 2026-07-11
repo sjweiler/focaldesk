@@ -1,16 +1,13 @@
 //! The supervision loop: greeter -> auth -> handoff -> session -> greeter.
 
-use std::ffi::CString;
-use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use tokio::process::{Child, Command};
 use zeroize::Zeroizing;
 
 use crate::config::Config;
 use crate::ipc::{Listener, Request, Response};
-use crate::pam::{self, AuthedUser, Outcome, PamPrompt, PamTask};
+use crate::pam::{self, ExecSpec, Outcome, PamPrompt, PamTask, PendingSession, SessionProcess};
 
 /// Exponential backoff for greeter respawn so a crashing greeter can't
 /// spin tty1 at 100% CPU.
@@ -50,41 +47,104 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     loop {
         // ---- Greeter phase -------------------------------------------------
         tokio::time::sleep(backoff.next_delay()).await;
-        let greeter = spawn_greeter(&cfg, &greeter_user)?;
-        tracing::info!(pid = greeter.id(), "greeter started");
 
-        let authed = match drive_greeter(&cfg, &listener, greeter).await? {
-            GreeterPhase::Crashed => continue,
-            GreeterPhase::Authenticated { greeter, authed } => {
+        // greetd-equivalent of `[terminal] switch = true`: make the greeter
+        // VT the foreground console *before* opening its logind session so
+        // libseat TakeDevice returns a DRM-master FD. Without this, the
+        // greeter opens card nodes unprivileged and NVIDIA scanout fails.
+        if let Err(e) = crate::vt::switch_to(cfg.vt) {
+            tracing::error!(error = %e, vt = cfg.vt, "failed to switch to greeter VT");
+            continue;
+        }
+
+        let exec = ExecSpec {
+            program: cfg.greeter_cmd.clone(),
+            env: vec![
+                (
+                    "FOCALDM_SOCKET".to_string(),
+                    cfg.socket_path.to_string_lossy().into_owned(),
+                ),
+                // Fallback only — overridden by the greeter's own PAM
+                // session env whenever pam_systemd set XDG_RUNTIME_DIR
+                // itself.
+                (
+                    "XDG_RUNTIME_DIR".to_string(),
+                    format!("/run/user/{}", greeter_user.uid),
+                ),
+                ("FOCALDM_VT".to_string(), cfg.vt.to_string()),
+                ("XDG_VTNR".to_string(), cfg.vt.to_string()),
+            ],
+            current_dir: None,
+            uid: greeter_user.uid,
+            gid: greeter_user.gid,
+            username: greeter_user.name.clone(),
+        };
+
+        // The greeter is just a setuid child with no seat of its own unless
+        // it has a real logind session: this is what lets it (via libseat)
+        // get DRM/input device access on the greeter's VT. Opened fresh for
+        // each greeter spawn and torn down with it. The session is opened
+        // and the greeter exec'd from a forked holder, not from this
+        // daemon, so pam_systemd's cgroup migration lands on the greeter's
+        // own process tree instead of on focaldmd itself.
+        let greeter = pam::open_service_session(
+            &cfg.greeter_pam_service,
+            &cfg.greeter_user,
+            &cfg.tty_name,
+            exec,
+        )
+        .context("open greeter PAM session")?;
+        tracing::info!(pid = greeter.pid, vt = cfg.vt, "greeter started");
+
+        let pending = match drive_greeter(&cfg, &listener, greeter).await? {
+            GreeterPhase::Crashed { greeter } => {
+                // Wait for the holder to close the session before
+                // retrying, so a fresh greeter never overlaps the crashed
+                // one's session on the same VT.
+                greeter.closed().await;
+                continue;
+            }
+            GreeterPhase::Authenticated { greeter, pending } => {
                 // ---- Critical handoff --------------------------------------
                 // Greeter and session share the VT. The greeter must be
-                // fully reaped (DRM master released) before focaldesk runs.
+                // fully reaped (DRM master released) and its own logind
+                // session fully closed *before* the user's session opens on
+                // the same VT — otherwise the two can briefly coexist.
                 terminate_and_reap(greeter).await?;
-                authed
+                pending
+            }
+        };
+
+        // Only now — with the greeter's seat confirmed released — does the
+        // PAM thread actually call open_session for the authenticating user.
+        let mut authed = match pending.open(cfg.clone()).await {
+            Ok(authed) => authed,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to open user session");
+                continue;
             }
         };
 
         // ---- Session phase -------------------------------------------------
-        tracing::info!(user = %authed.username, "launching session");
-        match spawn_user_session(&cfg, &authed) {
-            Ok(mut session) => {
-                let status = session.wait().await?;
-                tracing::info!(?status, "session exited");
-            }
-            Err(e) => tracing::error!(error = %e, "failed to launch session"),
+        tracing::info!(user = %authed.username, pid = authed.process.pid, "launching session");
+        match authed.process.wait().await {
+            Ok(status) => tracing::info!(?status, "session exited"),
+            Err(e) => tracing::error!(error = %e, "session process error"),
         }
 
-        // AuthedUser drops here: SessionGuard signals the parked PAM
-        // thread, pam_close_session runs, logind tears the session down.
-        drop(authed);
+        // Waits for pam_close_session to finish before the loop repeats and
+        // a fresh greeter session gets opened on the same VT.
+        authed.process.closed().await;
     }
 }
 
 enum GreeterPhase {
-    Crashed,
+    Crashed {
+        greeter: SessionProcess,
+    },
     Authenticated {
-        greeter: Child,
-        authed: Box<AuthedUser>,
+        greeter: SessionProcess,
+        pending: PendingSession,
     },
 }
 
@@ -95,7 +155,7 @@ enum GreeterPhase {
 async fn drive_greeter(
     cfg: &Config,
     listener: &Listener,
-    mut greeter: Child,
+    mut greeter: SessionProcess,
 ) -> anyhow::Result<GreeterPhase> {
     // Accept the greeter's connection, but keep watching the process:
     // if it dies before connecting we'd otherwise hang in accept.
@@ -103,7 +163,7 @@ async fn drive_greeter(
         conn = listener.accept_greeter() => conn?,
         status = greeter.wait() => {
             tracing::warn!(?status, "greeter exited before connecting");
-            return Ok(GreeterPhase::Crashed);
+            return Ok(GreeterPhase::Crashed { greeter });
         }
     };
 
@@ -119,7 +179,7 @@ async fn drive_greeter(
             // Greeter process died (crash, or we're mid-shutdown elsewhere).
             status = greeter.wait() => {
                 tracing::warn!(?status, "greeter exited unexpectedly");
-                return Ok(GreeterPhase::Crashed);
+                return Ok(GreeterPhase::Crashed { greeter });
             }
 
             // Message from the greeter.
@@ -167,9 +227,9 @@ async fn drive_greeter(
 
             // PAM transaction finished.
             Some(outcome) = recv_outcome(&mut outcome_rx) => match outcome {
-                Outcome::Success(authed) => {
+                Outcome::Success(pending) => {
                     conn.send(&Response::SessionStarted).await?;
-                    return Ok(GreeterPhase::Authenticated { greeter, authed });
+                    return Ok(GreeterPhase::Authenticated { greeter, pending });
                 }
                 Outcome::Failure { message } => {
                     tracing::info!(%message, "authentication failed");
@@ -199,86 +259,19 @@ async fn recv_outcome(rx: &mut Option<tokio::sync::oneshot::Receiver<Outcome>>) 
 }
 
 /// SIGTERM -> bounded wait -> SIGKILL. Returning from this function is the
-/// invariant that the VT and DRM master are free for the next compositor.
-async fn terminate_and_reap(mut child: Child) -> anyhow::Result<()> {
-    if let Some(pid) = child.id() {
-        let _ = nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(pid as i32),
-            nix::sys::signal::Signal::SIGTERM,
-        );
-    }
-    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+/// invariant that the VT and DRM master are free for the next compositor,
+/// *and* that the greeter's PAM/logind session has actually closed.
+async fn terminate_and_reap(mut greeter: SessionProcess) -> anyhow::Result<()> {
+    let pid = nix::unistd::Pid::from_raw(greeter.pid);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGTERM);
+    match tokio::time::timeout(Duration::from_secs(3), greeter.wait()).await {
         Ok(status) => tracing::debug!(?status, "greeter reaped"),
         Err(_) => {
             tracing::warn!("greeter ignored SIGTERM; killing");
-            child.kill().await?; // SIGKILL + reap
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+            let _ = greeter.wait().await;
         }
     }
+    greeter.closed().await;
     Ok(())
-}
-
-fn spawn_greeter(cfg: &Config, user: &nix::unistd::User) -> anyhow::Result<Child> {
-    let mut cmd = Command::new(&cfg.greeter_cmd);
-    cmd.env_clear()
-        .env("FOCALDM_SOCKET", &cfg.socket_path)
-        // Greeter user gets a static runtime dir created by systemd-tmpfiles
-        // or the unit (RuntimeDirectory=); it has no logind session.
-        .env("XDG_RUNTIME_DIR", format!("/run/user/{}", user.uid))
-        .stdin(Stdio::null())
-        .kill_on_drop(true);
-
-    drop_privileges(&mut cmd, user.uid, user.gid, &user.name);
-    Ok(cmd.spawn().context("spawn greeter")?)
-}
-
-fn spawn_user_session(cfg: &Config, s: &AuthedUser) -> anyhow::Result<Child> {
-    let mut cmd = Command::new(&cfg.session_cmd); // from config — NEVER from IPC
-    cmd.env_clear()
-        .env("HOME", &s.home)
-        .env("USER", &s.username)
-        .env("LOGNAME", &s.username)
-        .env("SHELL", &s.shell)
-        .env("XDG_SESSION_TYPE", "wayland")
-        .env("XDG_CURRENT_DESKTOP", "focaldesk")
-        .env("XDG_SEAT", "seat0")
-        .env("XDG_VTNR", cfg.vt.to_string())
-        .env("XKB_DEFAULT_LAYOUT", &cfg.keyboard_layout)
-        .current_dir(&s.home)
-        .stdin(Stdio::null());
-
-    // Empty means "no override" — xkbcommon falls back to its own default
-    // when these are unset, which an empty env var would not reliably do.
-    if !cfg.keyboard_variant.is_empty() {
-        cmd.env("XKB_DEFAULT_VARIANT", &cfg.keyboard_variant);
-    }
-    if !cfg.keyboard_model.is_empty() {
-        cmd.env("XKB_DEFAULT_MODEL", &cfg.keyboard_model);
-    }
-    if !cfg.keyboard_options.is_empty() {
-        cmd.env("XKB_DEFAULT_OPTIONS", &cfg.keyboard_options);
-    }
-
-    // PAM env wins over our defaults: XDG_RUNTIME_DIR / XDG_SESSION_ID
-    // come from pam_systemd, which is the authoritative source.
-    for (k, v) in &s.pam_env {
-        cmd.env(k, v);
-    }
-
-    drop_privileges(&mut cmd, s.uid, s.gid, &s.username);
-    Ok(cmd.spawn().context("spawn session")?)
-}
-
-/// pre_exec runs in the forked child before exec. Only async-signal-safe
-/// calls allowed: setgid/initgroups/setuid qualify. ORDER MATTERS —
-/// setuid last, or we lose the privilege to do the rest.
-fn drop_privileges(cmd: &mut Command, uid: nix::unistd::Uid, gid: nix::unistd::Gid, name: &str) {
-    let name = CString::new(name).expect("username with NUL");
-    unsafe {
-        cmd.pre_exec(move || {
-            nix::unistd::setgid(gid)?;
-            nix::unistd::initgroups(&name, gid)?;
-            nix::unistd::setuid(uid)?;
-            Ok(())
-        });
-    }
 }

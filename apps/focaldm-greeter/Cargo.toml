@@ -11,6 +11,7 @@ anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 smithay.workspace = true
+fontdue = "0.9"
 
 [dev-dependencies]
 image = { workspace = true }

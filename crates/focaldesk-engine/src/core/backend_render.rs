@@ -192,6 +192,7 @@ pub fn prepare_output(
             hdr_requested,
             hdr_kms_applied,
             workspace_count,
+            max_workspace_slots: state.workspaces.max_workspace_slots as usize,
             active_workspace,
             ai_flow_mode,
         },

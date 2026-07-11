@@ -1935,14 +1935,17 @@ fn edid_descriptor_text(descriptor: &[u8]) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Maps an evdev `KEY_F1..KEY_F12` code (linux/input-event-codes.h) to a target VT number,
-/// for the Ctrl+Alt+F<n> "drop to console" shortcut. `key_code()` on smithay's
-/// `KeyboardKeyEvent` returns the raw evdev code, not the xkb `+8`-offset keycode.
+/// Maps an xkb-offset `KEY_F1..KEY_F12` code to a target VT number, for the
+/// Ctrl+Alt+F<n> "drop to console" shortcut. `key_code()` on smithay's
+/// `KeyboardKeyEvent` (libinput backend) returns the raw evdev code `+8`
+/// (see `smithay::backend::libinput`'s `KeyboardKeyEvent::key_code` impl),
+/// not the raw evdev code itself, so the evdev F1..F12 values (59..=68, 87, 88)
+/// must be shifted by 8 here (67..=76, 95, 96).
 fn vt_switch_target(keycode: u32) -> Option<i32> {
     match keycode {
-        59..=68 => Some((keycode - 59 + 1) as i32), // KEY_F1..KEY_F10 -> vt 1..10
-        87 => Some(11),                             // KEY_F11 -> vt 11
-        88 => Some(12),                             // KEY_F12 -> vt 12
+        67..=76 => Some((keycode - 67 + 1) as i32), // KEY_F1..KEY_F10 -> vt 1..10
+        95 => Some(11),                             // KEY_F11 -> vt 11
+        96 => Some(12),                             // KEY_F12 -> vt 12
         _ => None,
     }
 }
@@ -2087,7 +2090,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     if let Some(vt) = vt_switch_target(keycode.into()) {
                         flog(&format!("VT switch requested: ctrl+alt+F -> vt{vt}"));
                         if let Err(err) = data.backend.session.change_vt(vt) {
-                            flog(&format!("VT switch to {vt} failed: {err:?}"));
+                            flog_warn!("VT switch to {vt} failed: {err:?}");
                         }
                         return;
                     }

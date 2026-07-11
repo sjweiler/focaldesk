@@ -1,176 +1,200 @@
-// Small embedded 5x7 bitmap font (uppercase only; lowercase input is
-// upper-cased before lookup). Hand-authored rather than transcribed from an
-// existing font table, since there's no way to view real DRM scanout output
-// from this environment to catch a transcription error. Verified instead by
-// rendering to a PNG in the `render_preview` test below and visually
-// inspecting it — see that test for how to regenerate the preview after
-// changing a glyph.
+use std::sync::OnceLock;
 
-pub const GLYPH_WIDTH: u32 = 5;
-pub const GLYPH_HEIGHT: u32 = 7;
+use fontdue::{Font, FontSettings};
 
-// Each row is the low 5 bits of the byte, bit 4 = leftmost pixel.
-fn glyph(c: char) -> [u8; 7] {
-    match c.to_ascii_uppercase() {
-        'A' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'B' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
-        ],
-        'C' => [
-            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
-        ],
-        'D' => [
-            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
-        ],
-        'E' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
-        ],
-        'F' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'G' => [
-            0b01111, 0b10000, 0b10000, 0b10011, 0b10001, 0b10001, 0b01111,
-        ],
-        'H' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'I' => [
-            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        'J' => [
-            0b00001, 0b00001, 0b00001, 0b00001, 0b10001, 0b10001, 0b01110,
-        ],
-        'K' => [
-            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
-        ],
-        'L' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
-        ],
-        'M' => [
-            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
-        ],
-        'N' => [
-            0b10001, 0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001,
-        ],
-        'O' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'P' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'Q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
-        ],
-        'R' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        'S' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        'T' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'U' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'V' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
-        ],
-        'W' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
-        ],
-        'X' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
-        ],
-        'Y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'Z' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
-        ],
-        '0' => [
-            0b01110, 0b10011, 0b10011, 0b10101, 0b11001, 0b11001, 0b01110,
-        ],
-        '1' => [
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        '2' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        '3' => [
-            0b11111, 0b00010, 0b00100, 0b00010, 0b00001, 0b10001, 0b01110,
-        ],
-        '4' => [
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        '5' => [
-            0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110,
-        ],
-        '6' => [
-            0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
-        ],
-        '7' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        '8' => [
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        '9' => [
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100,
-        ],
-        ':' => [
-            0b00000, 0b00100, 0b00000, 0b00000, 0b00100, 0b00000, 0b00000,
-        ],
-        '.' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
-        ],
-        '-' | '_' => [
-            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
-        ],
-        '*' => [
-            0b00000, 0b10101, 0b01110, 0b11111, 0b01110, 0b10101, 0b00000,
-        ],
-        '!' => [
-            0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100,
-        ],
-        _ => [0; 7], // space and anything unsupported render blank
-    }
+pub type Color = (u8, u8, u8);
+pub type FontFace = Font;
+
+static REGULAR: OnceLock<Font> = OnceLock::new();
+static MEDIUM: OnceLock<Font> = OnceLock::new();
+
+fn load_font(bytes: &'static [u8], label: &'static str) -> Font {
+    Font::from_bytes(bytes, FontSettings::default())
+        .unwrap_or_else(|err| panic!("failed to load {label}: {err:?}"))
 }
 
-fn put_pixel(buf: &mut [u8], pitch: u32, x: u32, y: u32, color: (u8, u8, u8)) {
+pub fn regular() -> &'static FontFace {
+    REGULAR.get_or_init(|| {
+        load_font(
+            include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf"),
+            "IBM Plex Sans Regular",
+        )
+    })
+}
+
+pub fn medium() -> &'static FontFace {
+    MEDIUM.get_or_init(|| {
+        load_font(
+            include_bytes!("../../../assets/fonts/IBMPlexSans-Medium.ttf"),
+            "IBM Plex Sans Medium",
+        )
+    })
+}
+
+pub fn measure_width(font: &FontFace, size: f32, text: &str) -> f32 {
+    let mut width = 0.0;
+    for ch in text.chars() {
+        let metrics = font.rasterize(ch, size).0;
+        width += metrics.advance_width;
+    }
+    width
+}
+
+pub fn line_height(font: &FontFace, size: f32) -> f32 {
+    font.horizontal_line_metrics(size)
+        .map(|metrics| metrics.ascent - metrics.descent + metrics.line_gap)
+        .unwrap_or(size * 1.25)
+}
+
+fn blend_channel(dst: u8, src: u8, alpha: u8) -> u8 {
+    let alpha = alpha as u16;
+    let inv = 255u16.saturating_sub(alpha);
+    (((dst as u16 * inv) + (src as u16 * alpha)) / 255) as u8
+}
+
+fn blend_pixel(buf: &mut [u8], pitch: u32, x: i32, y: i32, color: Color, alpha: u8) {
+    if alpha == 0 || x < 0 || y < 0 {
+        return;
+    }
+    let x = x as u32;
+    let y = y as u32;
     let offset = (y * pitch + x * 4) as usize;
-    if offset + 4 <= buf.len() {
-        buf[offset] = color.2;
-        buf[offset + 1] = color.1;
-        buf[offset + 2] = color.0;
-        buf[offset + 3] = 0;
+    if offset + 4 > buf.len() {
+        return;
     }
+
+    let b = color.2;
+    let g = color.1;
+    let r = color.0;
+    buf[offset] = blend_channel(buf[offset], b, alpha);
+    buf[offset + 1] = blend_channel(buf[offset + 1], g, alpha);
+    buf[offset + 2] = blend_channel(buf[offset + 2], r, alpha);
+    buf[offset + 3] = 0;
 }
 
-pub fn draw_char(
+pub fn fill_rect(
     buf: &mut [u8],
     pitch: u32,
-    x: u32,
-    y: u32,
-    scale: u32,
-    color: (u8, u8, u8),
-    c: char,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    color: Color,
+    alpha: u8,
 ) {
-    let bits = glyph(c);
-    for (row, bits_row) in bits.iter().enumerate() {
-        for col in 0..GLYPH_WIDTH {
-            if (bits_row >> (GLYPH_WIDTH - 1 - col)) & 1 == 0 {
-                continue;
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    for yy in y..y + h {
+        for xx in x..x + w {
+            blend_pixel(buf, pitch, xx, yy, color, alpha);
+        }
+    }
+}
+
+pub fn draw_border(
+    buf: &mut [u8],
+    pitch: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    thickness: i32,
+    color: Color,
+    alpha: u8,
+) {
+    if thickness <= 0 || w <= 0 || h <= 0 {
+        return;
+    }
+    fill_rect(buf, pitch, x, y, w, thickness.min(h), color, alpha);
+    fill_rect(
+        buf,
+        pitch,
+        x,
+        y + h - thickness,
+        w,
+        thickness.min(h),
+        color,
+        alpha,
+    );
+    fill_rect(buf, pitch, x, y, thickness.min(w), h, color, alpha);
+    fill_rect(
+        buf,
+        pitch,
+        x + w - thickness,
+        y,
+        thickness.min(w),
+        h,
+        color,
+        alpha,
+    );
+}
+
+pub fn draw_circle_ring(
+    buf: &mut [u8],
+    pitch: u32,
+    cx: i32,
+    cy: i32,
+    outer_r: i32,
+    inner_r: i32,
+    color: Color,
+    alpha: u8,
+) {
+    if outer_r <= 0 {
+        return;
+    }
+    let outer_sq = outer_r * outer_r;
+    let inner_sq = inner_r.max(0) * inner_r.max(0);
+    for y in cy - outer_r..=cy + outer_r {
+        for x in cx - outer_r..=cx + outer_r {
+            let dx = x - cx;
+            let dy = y - cy;
+            let dist_sq = dx * dx + dy * dy;
+            if dist_sq <= outer_sq && dist_sq >= inner_sq {
+                blend_pixel(buf, pitch, x, y, color, alpha);
             }
-            let px = x + col * scale;
-            let py = y + row as u32 * scale;
-            for dy in 0..scale {
-                for dx in 0..scale {
-                    put_pixel(buf, pitch, px + dx, py + dy, color);
-                }
-            }
+        }
+    }
+}
+
+pub fn draw_line(
+    buf: &mut [u8],
+    pitch: u32,
+    mut x0: i32,
+    mut y0: i32,
+    x1: i32,
+    y1: i32,
+    thickness: i32,
+    color: Color,
+    alpha: u8,
+) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    loop {
+        fill_rect(
+            buf,
+            pitch,
+            x0 - thickness / 2,
+            y0 - thickness / 2,
+            thickness,
+            thickness,
+            color,
+            alpha,
+        );
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x0 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y0 += sy;
         }
     }
 }
@@ -178,81 +202,80 @@ pub fn draw_char(
 pub fn draw_text(
     buf: &mut [u8],
     pitch: u32,
-    x: u32,
-    y: u32,
-    scale: u32,
-    color: (u8, u8, u8),
+    x: i32,
+    baseline_y: i32,
+    size: f32,
+    color: Color,
+    font: &FontFace,
     text: &str,
 ) {
-    let advance = (GLYPH_WIDTH + 1) * scale;
-    for (i, c) in text.chars().enumerate() {
-        draw_char(buf, pitch, x + i as u32 * advance, y, scale, color, c);
+    let mut caret = x as f32;
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, size);
+        let gx = caret as i32 + metrics.xmin;
+        let gy = baseline_y - metrics.ymin - metrics.height as i32;
+
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let alpha = bitmap[row * metrics.width + col];
+                if alpha != 0 {
+                    blend_pixel(buf, pitch, gx + col as i32, gy + row as i32, color, alpha);
+                }
+            }
+        }
+
+        caret += metrics.advance_width;
     }
 }
 
-pub fn text_width(text: &str, scale: u32) -> u32 {
-    let advance = (GLYPH_WIDTH + 1) * scale;
-    text.chars().count() as u32 * advance
+pub fn draw_text_centered(
+    buf: &mut [u8],
+    pitch: u32,
+    center_x: i32,
+    baseline_y: i32,
+    size: f32,
+    color: Color,
+    font: &FontFace,
+    text: &str,
+) {
+    let width = measure_width(font, size, text);
+    let x = center_x - (width / 2.0).round() as i32;
+    draw_text(buf, pitch, x, baseline_y, size, color, font, text);
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub fn wrap_to_width(font: &FontFace, size: f32, text: &str, max_width: i32) -> String {
+    if max_width <= 0 {
+        return String::new();
+    }
 
-    /// Not a pass/fail assertion — there's no way to view real DRM scanout
-    /// output from this environment, so glyph correctness is checked by
-    /// rendering to a PNG and looking at it. Run explicitly with:
-    ///   cargo test -p focaldesk-greeter --test-threads=1 -- --ignored render_preview
-    /// then view the PNG written to the path printed on stdout.
-    #[test]
-    #[ignore = "writes a preview PNG for manual visual inspection, not an assertion"]
-    fn render_preview() {
-        let scale = 4;
-        let width = text_width("ABCDEFGHIJKLM 0123456789 !*:.-_", scale) + 20;
-        let height = (GLYPH_HEIGHT * scale) * 3 + 40;
-        let pitch = width * 4;
-        let mut buf = vec![0x20u8; (pitch * height) as usize];
-
-        draw_text(
-            &mut buf,
-            pitch,
-            10,
-            10,
-            scale,
-            (255, 255, 255),
-            "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-        );
-        draw_text(
-            &mut buf,
-            pitch,
-            10,
-            10 + (GLYPH_HEIGHT * scale) + 10,
-            scale,
-            (255, 255, 255),
-            "0123456789 !*:.-_",
-        );
-        draw_text(
-            &mut buf,
-            pitch,
-            10,
-            10 + (GLYPH_HEIGHT * scale + 10) * 2,
-            scale,
-            (100, 200, 255),
-            "Password:",
-        );
-
-        // buf is BGRX per pixel; image::Rgba wants RGBA, so swap R/B on the way out.
-        let mut rgba = vec![0u8; buf.len()];
-        for px in 0..(width * height) as usize {
-            rgba[px * 4] = buf[px * 4 + 2];
-            rgba[px * 4 + 1] = buf[px * 4 + 1];
-            rgba[px * 4 + 2] = buf[px * 4];
-            rgba[px * 4 + 3] = 255;
+    let mut out = String::new();
+    let mut width = 0.0;
+    for ch in text.chars() {
+        let advance = font.rasterize(ch, size).0.advance_width;
+        if !out.is_empty() && width + advance > max_width as f32 {
+            break;
         }
+        out.push(ch);
+        width += advance;
+    }
+    out
+}
 
-        let path = std::env::temp_dir().join("focaldesk_greeter_font_preview.png");
-        image::save_buffer(&path, &rgba, width, height, image::ColorType::Rgba8)
-            .expect("failed to save preview PNG");
-        println!("wrote font preview to {}", path.display());
+pub fn ellipsize(font: &FontFace, size: f32, text: &str, max_width: i32) -> String {
+    if measure_width(font, size, text) <= max_width as f32 {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    for ch in text.chars() {
+        let candidate = format!("{out}{ch}");
+        if measure_width(font, size, &candidate) > max_width as f32 {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.is_empty() {
+        "...".to_string()
+    } else {
+        format!("{out}…")
     }
 }

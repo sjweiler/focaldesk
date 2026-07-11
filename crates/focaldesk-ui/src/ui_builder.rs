@@ -9,15 +9,35 @@ const SIDEBAR_BASE: u32 = 1_000;
 const CLOCK_ID: u32 = 100_000;
 pub const TOPBAR_FLOW_FIELD_ID: u32 = 100_001;
 pub const SIDEBAR_SETTINGS_ID: u32 = SIDEBAR_BASE + 1;
-pub const SIDEBAR_WORKSPACE_1_ID: u32 = SIDEBAR_BASE + 2;
 pub const SIDEBAR_ADD_WORKSPACE_ID: u32 = SIDEBAR_BASE + 3;
 pub const SIDEBAR_DELETE_WORKSPACE_ID: u32 = SIDEBAR_BASE + 4;
 pub const SIDEBAR_BROWSER_ID: u32 = SIDEBAR_BASE + 5;
 pub const SIDEBAR_TERMINAL_ID: u32 = SIDEBAR_BASE + 6;
 pub const SIDEBAR_FILES_ID: u32 = SIDEBAR_BASE + 7;
-pub const SIDEBAR_WORKSPACE_2_ID: u32 = SIDEBAR_BASE + 8;
-pub const SIDEBAR_WORKSPACE_3_ID: u32 = SIDEBAR_BASE + 9;
 pub const SIDEBAR_WORKSPACE_OVERFLOW_ID: u32 = SIDEBAR_BASE + 10;
+
+// Workspace buttons get dynamically assigned IDs instead of fixed per-slot
+// consts, since the number of individually displayed workspace buttons is
+// configurable (see UiBuildOptions::max_workspace_slots) rather than fixed at 3.
+pub const SIDEBAR_WORKSPACE_ID_BASE: u32 = SIDEBAR_BASE + 100;
+const SIDEBAR_WORKSPACE_ID_SLOTS: u32 = 32;
+
+pub fn sidebar_workspace_id(workspace_number: u32) -> u32 {
+    debug_assert!(workspace_number >= 1);
+    SIDEBAR_WORKSPACE_ID_BASE + (workspace_number - 1)
+}
+
+/// Decodes a sidebar element id back into a 1-based workspace number, if it
+/// falls within the dynamic workspace id range.
+pub fn sidebar_workspace_number(id: u32) -> Option<u32> {
+    if id >= SIDEBAR_WORKSPACE_ID_BASE
+        && id < SIDEBAR_WORKSPACE_ID_BASE + SIDEBAR_WORKSPACE_ID_SLOTS
+    {
+        Some(id - SIDEBAR_WORKSPACE_ID_BASE + 1)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AiFlowMode {
@@ -34,6 +54,10 @@ pub struct UiBuildOptions {
     pub hdr_requested: bool,
     pub hdr_kms_applied: bool,
     pub workspace_count: usize,
+    /// Max number of workspace buttons shown individually before they
+    /// collapse into an overflow button. Mirrors
+    /// `WorkspaceSettings::max_workspace_slots`.
+    pub max_workspace_slots: usize,
     pub active_workspace: u32,
     pub ai_flow_mode: AiFlowMode,
 }
@@ -45,6 +69,7 @@ impl Default for UiBuildOptions {
             hdr_requested: false,
             hdr_kms_applied: false,
             workspace_count: 1,
+            max_workspace_slots: 4,
             active_workspace: 1,
             ai_flow_mode: AiFlowMode::Idle,
         }
@@ -100,13 +125,35 @@ pub fn build_ui_for_output_with_options(
         ),
     ];
 
-    for workspace in 1..=workspace_count.min(3) {
-        let id = match workspace {
-            1 => SIDEBAR_WORKSPACE_1_ID,
-            2 => SIDEBAR_WORKSPACE_2_ID,
-            3 => SIDEBAR_WORKSPACE_3_ID,
-            _ => unreachable!(),
-        };
+    // Reserve one sidebar slot each for the buttons that always surround the
+    // workspace buttons, so Browser/Terminal/Files can never be pushed off
+    // the bottom of the sidebar by a high max_workspace_slots setting on a
+    // short screen.
+    let total_slots = layout.sidebar.slots.len();
+    let fixed_before = 2; // settings, launcher
+    let add_slot = 1;
+    let remove_slot = if workspace_count > 1 { 1 } else { 0 };
+    let fixed_after = 3; // browser, terminal, files
+    let reserved_no_overflow = fixed_before + add_slot + remove_slot + fixed_after;
+    let slots_for_workspaces_no_overflow = total_slots.saturating_sub(reserved_no_overflow).max(1);
+
+    // Clamp to 9: the icon atlas only defines Slot(1)..=Slot(9), regardless of
+    // what the settings file says.
+    let max_workspace_slots = options.max_workspace_slots.clamp(1, 9);
+    let workspace_cap_no_overflow = max_workspace_slots.min(slots_for_workspaces_no_overflow);
+
+    let (displayed_workspace_count, show_overflow) = if workspace_count <= workspace_cap_no_overflow
+    {
+        (workspace_count, false)
+    } else {
+        let slots_for_workspaces_with_overflow =
+            total_slots.saturating_sub(reserved_no_overflow + 1).max(1);
+        let cap = max_workspace_slots.min(slots_for_workspaces_with_overflow);
+        (workspace_count.min(cap), true)
+    };
+
+    for workspace in 1..=displayed_workspace_count {
+        let id = sidebar_workspace_id(workspace as u32);
         sidebar_entries.push((
             id,
             IconId::Slot(workspace as u8),
@@ -134,13 +181,13 @@ pub fn build_ui_for_output_with_options(
         ));
     }
 
-    if workspace_count > 3 {
+    if show_overflow {
         sidebar_entries.push((
             SIDEBAR_WORKSPACE_OVERFLOW_ID,
             IconId::Overflow,
             "More workspaces".to_string(),
             UiAction::OpenPanel(PanelKind::Workspaces),
-            options.active_workspace > 3,
+            options.active_workspace > displayed_workspace_count as u32,
         ));
     }
 
@@ -284,9 +331,81 @@ pub fn build_ui_for_output_with_options(
 mod tests {
     use super::hdr_tooltip;
     use crate::ui_builder::{
-        TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions, build_ui_for_output_with_options,
+        SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID,
+        SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions,
+        build_ui_for_output_with_options, sidebar_workspace_id, sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
+
+    fn build(workspace_count: usize, max_workspace_slots: usize) -> UiTree {
+        let output_size = smithay::utils::Size::from((1920, 1080));
+        let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(
+            &mut ui,
+            &layout,
+            UiBuildOptions {
+                workspace_count,
+                max_workspace_slots,
+                ..UiBuildOptions::default()
+            },
+        );
+        ui
+    }
+
+    #[test]
+    fn workspace_id_round_trips() {
+        for n in 1..=9u32 {
+            assert_eq!(sidebar_workspace_number(sidebar_workspace_id(n)), Some(n));
+        }
+        assert_eq!(sidebar_workspace_number(SIDEBAR_BROWSER_ID), None);
+    }
+
+    #[test]
+    fn sidebar_shows_all_workspaces_within_slot_cap_without_overflow() {
+        let ui = build(2, 4);
+
+        let workspace_ids: Vec<u32> = ui
+            .elements
+            .iter()
+            .filter_map(|el| sidebar_workspace_number(el.id))
+            .collect();
+        assert_eq!(workspace_ids, vec![1, 2]);
+        assert!(
+            ui.elements
+                .iter()
+                .any(|el| el.id == SIDEBAR_DELETE_WORKSPACE_ID)
+        );
+        assert!(
+            !ui.elements
+                .iter()
+                .any(|el| el.id == SIDEBAR_WORKSPACE_OVERFLOW_ID)
+        );
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_BROWSER_ID));
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_TERMINAL_ID));
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_FILES_ID));
+    }
+
+    #[test]
+    fn sidebar_collapses_to_overflow_once_workspace_count_exceeds_slot_setting() {
+        let ui = build(5, 3);
+
+        let workspace_ids: Vec<u32> = ui
+            .elements
+            .iter()
+            .filter_map(|el| sidebar_workspace_number(el.id))
+            .collect();
+        assert_eq!(workspace_ids, vec![1, 2, 3]);
+        assert!(
+            ui.elements
+                .iter()
+                .any(|el| el.id == SIDEBAR_WORKSPACE_OVERFLOW_ID)
+        );
+        // Fixed buttons must never be pushed out even when workspaces overflow.
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_BROWSER_ID));
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_TERMINAL_ID));
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_FILES_ID));
+    }
 
     #[test]
     fn hdr_tooltip_reflects_request_vs_kms_state() {

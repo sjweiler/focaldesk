@@ -8,6 +8,7 @@ mod config;
 mod ipc;
 mod pam;
 mod supervise;
+mod vt;
 
 use anyhow::Context as _;
 
