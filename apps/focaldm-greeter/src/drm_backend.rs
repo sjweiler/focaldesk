@@ -2,26 +2,27 @@
 // focaldesk-engine's backend::drm (which is 3000+ lines of GBM/EGL/GLES/
 // wayland-server machinery for the real compositor). The greeter only ever
 // needs to show a login box on one output, so it uses legacy (non-atomic)
-// modesetting with a single CPU-mapped GBM buffer for scanout: no GPU-
-// accelerated rendering, no wayland surfaces. Ported from focaldesk-greeter's
-// drm_backend.rs, which this mirrors closely — see drm-rs's own
-// `examples/legacy_modeset.rs`. Buffers come from GBM rather than the
-// simpler dumb-buffer ioctls because the proprietary NVIDIA driver doesn't
-// implement dumb buffers (ENOSYS) but does support GBM allocation.
+// modesetting. Buffer allocation and FB creation follow the same rules as
+// the compositor: `GbmAllocator` with `RENDERING|SCANOUT`, plane∩EGL
+// modifiers, and `framebuffer_from_bo` (AddFB2 + modifiers).
 //
-// Known corners cut, deliberately, to keep this a first working pass:
-// - Text is drawn with the real IBM Plex Sans rasterizer in `crate::font`,
-//   but still via CPU software rendering rather than GPU acceleration.
-// - CRTC selection takes resource_handles().crtcs()[0] rather than checking
-//   the connector's encoder `possible_crtcs` bitmask. Fine for one GPU/one
-//   output; would misbehave on more exotic multi-GPU setups.
-// - No xkbcommon layout composition; keycodes come from `crate::keymap`'s
-//   fixed US-QWERTY table.
+// Rendering is GPU-accelerated when that path can bind a scanout dmabuf as a
+// GLES FBO. The background shader and UI (`render::paint_frame_gpu` + glyph
+// atlas) draw straight into the back-buffer dmabuf. LINEAR|WRITE|SCANOUT
+// buffers cannot be GLES FBOs on NVIDIA; those remain the CPU fallback
+// (`render::paint_frame`).
+//
+// Known corners cut, deliberately:
+// - Legacy `set_crtc` / `page_flip` present (no atomic DrmOutput / fencing).
+// - No xkbcommon; keycodes come from `crate::keymap`'s fixed US-QWERTY table.
 
 use anyhow::{anyhow, Context, Result};
-use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
-use smithay::backend::allocator::gbm::GbmBuffer;
+use smithay::backend::allocator::format::FormatSet;
+use smithay::backend::allocator::gbm::{GbmAllocator, GbmBuffer, GbmBufferFlags};
+use smithay::backend::allocator::{Fourcc, Modifier};
+use smithay::backend::drm::gbm::{framebuffer_from_bo, GbmFramebuffer};
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::{
     GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
@@ -31,16 +32,16 @@ use smithay::backend::session::{
     libseat::LibSeatSession, libseat::LibSeatSessionNotifier, Session,
 };
 use smithay::backend::udev::primary_gpu;
-use smithay::reexports::drm::buffer::DrmFourcc;
 use smithay::reexports::drm::control::{
-    connector, crtc, framebuffer, Device as ControlDevice, Event, Mode, ModeTypeFlags,
-    PageFlipFlags,
+    connector, crtc, Device as ControlDevice, Event, Mode, ModeTypeFlags, PageFlipFlags,
 };
-use smithay::reexports::gbm::{BufferObjectFlags, Device as GbmDevice};
+use smithay::reexports::gbm::Device as GbmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{Buffer, DeviceFd, Physical, Rectangle, Size, Transform};
+use std::time::Duration;
 
+use crate::glyph_atlas::GlyphAtlas;
 use crate::render;
 
 const GREETER_BACKGROUND_FRAG: &str = r#"
@@ -82,6 +83,8 @@ void main() {
 }
 "#;
 
+const GPU_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb8888, Fourcc::Argb8888];
+
 pub struct GreeterOutput {
     session: LibSeatSession,
     fd: DrmDeviceFd,
@@ -100,27 +103,28 @@ pub struct GreeterOutput {
     // into `bos`/`fbs` currently on screen; `render` always writes the
     // other one, then page-flips onto it.
     bos: [GbmBuffer; 2],
-    fbs: [framebuffer::Handle; 2],
+    fbs: [GbmFramebuffer; 2],
     front: usize,
     flip_pending: bool,
-    gpu: Option<GpuBackground>,
+    gpu: Option<GpuRenderer>,
 }
 
-struct GpuBackground {
+struct GpuRenderer {
     renderer: GlesRenderer,
-    program: GlesPixelProgram,
+    background_program: GlesPixelProgram,
+    atlas: GlyphAtlas,
 }
 
-impl GpuBackground {
-    fn new(gbm: &GbmDevice<DrmDeviceFd>) -> Result<Self> {
+impl GpuRenderer {
+    fn new(gbm: &GbmDevice<DrmDeviceFd>, sizes: render::FontSizes) -> Result<Self> {
         let display = unsafe { EGLDisplay::new(gbm.clone()) }
             .context("failed to create EGL display for greeter")?;
-        let context = EGLContext::new(&display)
-            .context("failed to create EGL context for greeter")?;
+        let context =
+            EGLContext::new(&display).context("failed to create EGL context for greeter")?;
         let mut renderer = unsafe { GlesRenderer::new(context) }
             .context("failed to create GLES renderer for greeter")?;
 
-        let program = renderer
+        let background_program = renderer
             .compile_custom_pixel_shader(
                 GREETER_BACKGROUND_FRAG,
                 &[
@@ -130,38 +134,61 @@ impl GpuBackground {
             )
             .context("failed to compile greeter background shader")?;
 
+        let atlas = GlyphAtlas::build(&mut renderer, sizes)
+            .context("failed to build greeter glyph atlas")?;
+
         Ok(Self {
             renderer,
-            program,
+            background_program,
+            atlas,
         })
     }
 
-    fn render_into(
+    fn egl_render_formats(&self) -> &FormatSet {
+        self.renderer.egl_context().dmabuf_render_formats()
+    }
+
+    /// Confirms this dmabuf can be used as a GLES framebuffer before we commit
+    /// to the GPU present path (LINEAR scanout buffers fail here on NVIDIA).
+    fn probe_bind(&mut self, dmabuf: &mut Dmabuf) -> Result<()> {
+        let _target = self
+            .renderer
+            .bind(dmabuf)
+            .context("failed to bind greeter scanout dmabuf during GPU probe")?;
+        Ok(())
+    }
+
+    fn render_to(
         &mut self,
         dmabuf: &mut Dmabuf,
+        state: &render::FrameState,
         width: u32,
         height: u32,
-        phase: f32,
-    ) -> Result<()> {
-        let rect_f = Rectangle::<f64, Buffer>::new((0.0, 0.0).into(), (width as f64, height as f64).into());
-        let rect_i = Rectangle::<i32, Physical>::new((0, 0).into(), (width as i32, height as i32).into());
+    ) -> Result<render::FrameHitTargets> {
+        let rect_f =
+            Rectangle::<f64, Buffer>::new((0.0, 0.0).into(), (width as f64, height as f64).into());
+        let rect_i =
+            Rectangle::<i32, Physical>::new((0, 0).into(), (width as i32, height as i32).into());
         let buffer_size = Size::<i32, Buffer>::from((width as i32, height as i32));
         let physical_size = Size::<i32, Physical>::from((width as i32, height as i32));
 
-        let mut target = self.renderer.bind(dmabuf).context("failed to bind greeter scanout dmabuf")?;
+        let mut target = self
+            .renderer
+            .bind(dmabuf)
+            .context("failed to bind greeter scanout dmabuf")?;
         let mut frame = self
             .renderer
             .render(&mut target, physical_size, Transform::Normal)
-            .context("failed to begin greeter shader frame")?;
+            .context("failed to begin greeter GLES frame")?;
 
         let uniforms = [
             Uniform::new("u_resolution", [width as f32, height as f32]),
-            Uniform::new("u_time", phase),
+            Uniform::new("u_time", state.pulse_phase),
         ];
 
         frame
             .render_pixel_shader_to(
-                &self.program,
+                &self.background_program,
                 rect_f,
                 rect_i,
                 buffer_size,
@@ -170,9 +197,18 @@ impl GpuBackground {
                 &uniforms,
             )
             .context("failed to draw greeter shader background")?;
-        let sync = frame.finish().context("failed to finish greeter shader frame")?;
-        self.renderer.wait(&sync).context("failed to wait for greeter shader frame")?;
-        Ok(())
+
+        let hit_targets = render::paint_frame_gpu(&mut frame, &self.atlas, width, height, state)
+            .context("failed to draw greeter UI")?;
+
+        let sync = frame
+            .finish()
+            .context("failed to finish greeter GLES frame")?;
+        self.renderer
+            .wait(&sync)
+            .context("failed to wait for greeter GLES frame")?;
+
+        Ok(hit_targets)
     }
 }
 
@@ -181,13 +217,27 @@ impl GreeterOutput {
     /// output at its preferred mode, and hands back the pieces the caller
     /// needs to register with calloop: the session notifier (Pause/Activate
     /// events) and a libinput context (keyboard/pointer events).
+    ///
+    /// Expects the greeter VT to already be the foreground console (focaldmd
+    /// switches with `VT_ACTIVATE` before spawn). Without an active seat
+    /// session, libseat opens the card without DRM master and NVIDIA scanout
+    /// buffer allocation fails.
     pub fn open() -> Result<(Self, LibSeatSessionNotifier, Libinput)> {
         let (mut session, notifier) = LibSeatSession::new()
             .map_err(|e| anyhow!("could not initialize libseat session: {e}"))?;
 
+        ensure_session_active(&mut session)?;
+
         let gpu_path = primary_gpu(session.seat())
             .context("failed to enumerate GPUs for seat")?
             .ok_or_else(|| anyhow!("no primary GPU found for seat {}", session.seat()))?;
+
+        tracing::info!(
+            seat = %session.seat(),
+            gpu = %gpu_path.display(),
+            active = session.is_active(),
+            "opening greeter DRM device"
+        );
 
         let raw_fd = session
             .open(&gpu_path, OFlags::RDWR | OFlags::CLOEXEC)
@@ -203,11 +253,6 @@ impl GreeterOutput {
             .iter()
             .flat_map(|handle| fd.get_connector(*handle, false))
             .collect();
-        let crtc_info: Vec<crtc::Info> = res
-            .crtcs()
-            .iter()
-            .flat_map(|handle| fd.get_crtc(*handle))
-            .collect();
 
         let con = connector_info
             .iter()
@@ -221,55 +266,43 @@ impl GreeterOutput {
             .or_else(|| con.modes().first())
             .ok_or_else(|| anyhow!("connector {:?} has no modes", con.handle()))?;
 
-        let crtc_handle = crtc_info
-            .first()
-            .ok_or_else(|| anyhow!("no CRTCs available on {}", gpu_path.display()))?
-            .handle();
+        let crtc_handle = pick_crtc(&fd, &res, con)
+            .ok_or_else(|| anyhow!("no CRTC available for connector {:?}", con.handle()))?;
 
-        // Legacy dumb buffers aren't implemented by the proprietary NVIDIA
-        // DRM driver (ENOSYS on create_dumb_buffer); GBM buffer objects are
-        // the allocation path that works across i915/amdgpu/nouveau *and*
-        // nvidia-drm, so the greeter uses those instead even though it's
-        // still doing plain CPU-mapped software rendering, not GPU-accelerated.
+        // Query primary-plane formats the same way the compositor does, then
+        // drop the DrmDevice — we still present with legacy set_crtc/page_flip.
+        let plane_formats = primary_plane_formats(&fd, crtc_handle)?;
+
         let gbm = GbmDevice::new(fd.clone()).context("failed to create GBM device")?;
-
         let (width, height) = mode.size();
-        let make_buffer =
-            |gbm: &GbmDevice<DrmDeviceFd>| -> Result<(GbmBuffer, framebuffer::Handle)> {
-                let mut bo = gbm
-                    .create_buffer_object::<()>(
-                        width.into(),
-                        height.into(),
-                        DrmFourcc::Xrgb8888,
-                        BufferObjectFlags::SCANOUT
-                            | BufferObjectFlags::WRITE
-                            | BufferObjectFlags::LINEAR,
-                    )
-                    .context("failed to create GBM buffer object")?;
-                let stride = bo.stride();
-                bo.map_mut(0, 0, width.into(), height.into(), |mapping| {
-                    render::fill_background(
-                        mapping.buffer_mut(),
-                        stride,
-                        width as u32,
-                        height as u32,
+        let sizes = render::font_sizes(height as u32);
+
+        let (bos, fbs, gpu) =
+            match try_open_gpu_scanout(&gbm, &fd, &plane_formats, width, height, sizes) {
+                Ok(gpu_path) => {
+                    tracing::info!(
+                        "greeter using GPU scanout path (GbmAllocator + framebuffer_from_bo)"
                     );
-                })
-                .context("failed to map GBM buffer object")?;
-                let gbm_bo = GbmBuffer::from_bo(bo, true);
-                let fb = fd
-                    .add_framebuffer(&gbm_bo, 24, 32)
-                    .context("failed to create framebuffer")?;
-                Ok((gbm_bo, fb))
+                    gpu_path
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "GPU greeter scanout unavailable, falling back to CPU-mapped LINEAR buffers"
+                    );
+                    let (bos, fbs) = make_cpu_buffers(&gbm, &fd, width, height)?;
+                    (bos, fbs, None)
+                }
             };
 
-        let (bo0, fb0) = make_buffer(&gbm)?;
-        let (bo1, fb1) = make_buffer(&gbm)?;
-
-        let gpu = GpuBackground::new(&gbm).ok();
-
-        fd.set_crtc(crtc_handle, Some(fb0), (0, 0), &[con.handle()], Some(mode))
-            .context("failed to set CRTC")?;
+        fd.set_crtc(
+            crtc_handle,
+            Some(*fbs[0].as_ref()),
+            (0, 0),
+            &[con.handle()],
+            Some(mode),
+        )
+        .context("failed to set CRTC")?;
 
         let mut libinput = Libinput::new_with_udev::<
             smithay::backend::libinput::LibinputSessionInterface<LibSeatSession>,
@@ -285,14 +318,18 @@ impl GreeterOutput {
             crtc: crtc_handle,
             connector: con.handle(),
             mode,
-            bos: [bo0, bo1],
-            fbs: [fb0, fb1],
+            bos,
+            fbs,
             front: 0,
             flip_pending: false,
             gpu,
         };
 
         Ok((output, notifier, libinput))
+    }
+
+    pub fn is_session_active(&self) -> bool {
+        self.session.is_active()
     }
 
     pub fn change_vt(&mut self, vt: i32) -> Result<()> {
@@ -314,10 +351,6 @@ impl GreeterOutput {
         self.flip_pending
     }
 
-    pub fn gpu_background_enabled(&self) -> bool {
-        self.gpu.is_some()
-    }
-
     /// Re-applies the CRTC after a `SessionEvent::ActivateSession`. Another
     /// process may have taken DRM master and scanned out something else
     /// while we were paused; this is a best-effort re-assertion, not a full
@@ -328,7 +361,7 @@ impl GreeterOutput {
         self.fd
             .set_crtc(
                 self.crtc,
-                Some(self.fbs[self.front]),
+                Some(*self.fbs[self.front].as_ref()),
                 (0, 0),
                 &[self.connector],
                 Some(self.mode),
@@ -371,47 +404,269 @@ impl GreeterOutput {
 
         let back = 1 - self.front;
         let (width, height) = self.mode.size();
-        let stride = self.bos[back].stride();
-        let mut dmabuf = if self.gpu.is_some() {
-            Some(
-                self.bos[back]
-                    .export()
-                    .context("failed to export greeter scanout buffer")?,
-            )
+
+        let layout = if self.gpu.is_some() {
+            let mut dmabuf = self.bos[back]
+                .export()
+                .context("failed to export greeter scanout buffer")?;
+            match self.gpu.as_mut().unwrap().render_to(
+                &mut dmabuf,
+                state,
+                width as u32,
+                height as u32,
+            ) {
+                Ok(layout) => layout,
+                Err(e) => {
+                    return Err(e).context("GPU greeter frame failed");
+                }
+            }
         } else {
-            None
+            let stride = self.bos[back].stride();
+            self.bos[back]
+                .map_mut(0, 0, width.into(), height.into(), |mapping| {
+                    let buf = mapping.buffer_mut();
+                    let frame_state = render::FrameState {
+                        login: state.login,
+                        pointer: state.pointer,
+                        power_menu_open: state.power_menu_open,
+                        pulse_phase: state.pulse_phase,
+                        paint_background: true,
+                    };
+
+                    render::paint_frame(buf, stride, width as u32, height as u32, &frame_state)
+                })
+                .context("failed to map GBM buffer object for render")?
         };
-
-        let background_ok = if let (Some(gpu), Some(dmabuf)) = (self.gpu.as_mut(), dmabuf.as_mut())
-        {
-            gpu.render_into(dmabuf, width as u32, height as u32, state.pulse_phase)
-                .is_ok()
-        } else {
-            false
-        };
-        drop(dmabuf);
-
-        let layout = self.bos[back]
-            .map_mut(0, 0, width.into(), height.into(), |mapping| {
-                let buf = mapping.buffer_mut();
-                let frame_state = render::FrameState {
-                    login: state.login,
-                    pointer: state.pointer,
-                    power_menu_open: state.power_menu_open,
-                    pulse_phase: state.pulse_phase,
-                    paint_background: !background_ok,
-                };
-
-                render::paint_frame(buf, stride, width as u32, height as u32, &frame_state)
-            })
-            .context("failed to map GBM buffer object for render")?;
 
         self.fd
-            .page_flip(self.crtc, self.fbs[back], PageFlipFlags::EVENT, None)
+            .page_flip(
+                self.crtc,
+                *self.fbs[back].as_ref(),
+                PageFlipFlags::EVENT,
+                None,
+            )
             .context("failed to queue page flip")?;
 
         self.front = back;
         self.flip_pending = true;
         Ok(layout)
     }
+}
+
+fn pick_crtc(
+    fd: &DrmDeviceFd,
+    res: &smithay::reexports::drm::control::ResourceHandles,
+    con: &connector::Info,
+) -> Option<crtc::Handle> {
+    con.encoders().iter().find_map(|enc| {
+        let enc_info = fd.get_encoder(*enc).ok()?;
+        res.filter_crtcs(enc_info.possible_crtcs())
+            .into_iter()
+            .next()
+    })
+}
+
+fn primary_plane_formats(fd: &DrmDeviceFd, crtc: crtc::Handle) -> Result<FormatSet> {
+    let (drm, _notifier) =
+        DrmDevice::new(fd.clone(), false).context("failed to open DrmDevice for plane query")?;
+    let planes = drm
+        .planes(&crtc)
+        .context("failed to query planes for greeter CRTC")?;
+    let primary = planes
+        .primary
+        .first()
+        .ok_or_else(|| anyhow!("no primary plane for greeter CRTC {:?}", crtc))?;
+    Ok(primary.formats.clone())
+}
+
+fn modifiers_for_format(formats: &FormatSet, code: Fourcc) -> Vec<Modifier> {
+    formats
+        .iter()
+        .filter(|format| format.code == code)
+        .map(|format| format.modifier)
+        .collect()
+}
+
+fn intersect_modifiers(plane: &[Modifier], egl: &[Modifier]) -> Vec<Modifier> {
+    if plane.is_empty() {
+        return egl.to_vec();
+    }
+    if egl.is_empty() {
+        return plane.to_vec();
+    }
+    let plane_set: std::collections::HashSet<_> = plane.iter().copied().collect();
+    egl.iter()
+        .copied()
+        .filter(|m| plane_set.contains(m))
+        .collect()
+}
+
+fn make_fb(fd: &DrmDeviceFd, bo: &GbmBuffer) -> Result<GbmFramebuffer> {
+    // Prefer opaque FB when possible (matches compositor scanout habit).
+    framebuffer_from_bo(fd, bo, true).context("framebuffer_from_bo failed for greeter buffer")
+}
+
+fn make_cpu_buffers(
+    gbm: &GbmDevice<DrmDeviceFd>,
+    fd: &DrmDeviceFd,
+    width: u16,
+    height: u16,
+) -> Result<([GbmBuffer; 2], [GbmFramebuffer; 2])> {
+    let mut allocator = GbmAllocator::new(
+        gbm.clone(),
+        GbmBufferFlags::SCANOUT | GbmBufferFlags::WRITE | GbmBufferFlags::LINEAR,
+    );
+    let flags = GbmBufferFlags::SCANOUT | GbmBufferFlags::WRITE | GbmBufferFlags::LINEAR;
+    let modifiers = [Modifier::Linear, Modifier::Invalid];
+
+    let mut make_one = || -> Result<(GbmBuffer, GbmFramebuffer)> {
+        let mut bo = allocator
+            .create_buffer_with_flags(
+                width as u32,
+                height as u32,
+                Fourcc::Xrgb8888,
+                &modifiers,
+                flags,
+            )
+            .context(
+                "failed to create LINEAR GBM buffer object (often means no DRM master — is the greeter VT active?)",
+            )?;
+        let stride = bo.stride();
+        bo.map_mut(0, 0, width.into(), height.into(), |mapping| {
+            render::fill_background(mapping.buffer_mut(), stride, width as u32, height as u32);
+        })
+        .context("failed to map GBM buffer object")?;
+        let fb = make_fb(fd, &bo)?;
+        Ok((bo, fb))
+    };
+
+    let (bo0, fb0) = make_one()?;
+    let (bo1, fb1) = make_one()?;
+    Ok(([bo0, bo1], [fb0, fb1]))
+}
+
+fn try_open_gpu_scanout(
+    gbm: &GbmDevice<DrmDeviceFd>,
+    fd: &DrmDeviceFd,
+    plane_formats: &FormatSet,
+    width: u16,
+    height: u16,
+    sizes: render::FontSizes,
+) -> Result<([GbmBuffer; 2], [GbmFramebuffer; 2], Option<GpuRenderer>)> {
+    let mut gpu = GpuRenderer::new(gbm, sizes)?;
+    let egl_formats = gpu.egl_render_formats().clone();
+    let mut allocator = GbmAllocator::new(
+        gbm.clone(),
+        GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
+    );
+    let flags = GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT;
+
+    let mut last_err = anyhow!("no GPU color format worked for greeter scanout");
+    for &format in &GPU_COLOR_FORMATS {
+        let plane_mods = modifiers_for_format(plane_formats, format);
+        let egl_mods = modifiers_for_format(&egl_formats, format);
+        let mut modifiers = intersect_modifiers(&plane_mods, &egl_mods);
+        if modifiers.is_empty() {
+            // Last-ditch: allow the driver to pick (Invalid) or force Linear.
+            modifiers = vec![Modifier::Invalid, Modifier::Linear];
+        }
+
+        tracing::info!(
+            ?format,
+            plane_mods = plane_mods.len(),
+            egl_mods = egl_mods.len(),
+            chosen_mods = modifiers.len(),
+            "trying greeter GPU scanout format"
+        );
+
+        let make_one =
+            |allocator: &mut GbmAllocator<DrmDeviceFd>| -> Result<(GbmBuffer, GbmFramebuffer)> {
+                let bo = allocator
+                    .create_buffer_with_flags(
+                        width as u32,
+                        height as u32,
+                        format,
+                        &modifiers,
+                        flags,
+                    )
+                    .with_context(|| {
+                        format!("failed to allocate greeter GBM buffer for {format:?}")
+                    })?;
+                let fb = make_fb(fd, &bo)?;
+                Ok((bo, fb))
+            };
+
+        let pair = (|| -> Result<_> {
+            let (bo0, fb0) = make_one(&mut allocator)?;
+            let (bo1, fb1) = make_one(&mut allocator)?;
+            let mut probe = bo0
+                .export()
+                .context("failed to export GPU scanout buffer for bind probe")?;
+            gpu.probe_bind(&mut probe)
+                .context("GPU scanout dmabuf cannot be bound as a GLES framebuffer")?;
+            Ok(([bo0, bo1], [fb0, fb1]))
+        })();
+
+        match pair {
+            Ok((bos, fbs)) => {
+                tracing::info!(?format, "greeter GPU scanout format selected");
+                return Ok((bos, fbs, Some(gpu)));
+            }
+            Err(e) => {
+                tracing::warn!(?format, error = ?e, "greeter GPU scanout format failed");
+                last_err = e;
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
+fn configured_vt() -> Option<i32> {
+    for key in ["FOCALDM_VT", "XDG_VTNR"] {
+        if let Ok(raw) = std::env::var(key) {
+            if let Ok(vt) = raw.parse::<i32>() {
+                if vt > 0 {
+                    return Some(vt);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If libseat did not already receive Enable (session not on the active VT),
+/// request a switch to the configured greeter VT. focaldmd should have done
+/// this already; this is a backup for respawn races.
+fn ensure_session_active(session: &mut LibSeatSession) -> Result<()> {
+    if session.is_active() {
+        tracing::info!("libseat session already active");
+        return Ok(());
+    }
+
+    let Some(vt) = configured_vt() else {
+        tracing::warn!(
+            "libseat session inactive and FOCALDM_VT/XDG_VTNR unset — DRM master may fail"
+        );
+        return Ok(());
+    };
+
+    tracing::warn!(
+        vt,
+        "libseat session inactive at start; requesting VT switch"
+    );
+    session
+        .change_vt(vt)
+        .map_err(|e| anyhow!("VT switch to {vt} failed: {e:?}"))?;
+
+    // Give logind/libseat a moment to complete the switch. Enable is normally
+    // observed via the session notifier once it is in the event loop; for
+    // TakeDevice during open() we rely on focaldmd's prior VT_ACTIVATE.
+    std::thread::sleep(Duration::from_millis(150));
+    tracing::info!(
+        active = session.is_active(),
+        vt,
+        "after greeter VT switch request"
+    );
+    Ok(())
 }

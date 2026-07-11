@@ -48,6 +48,15 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         // ---- Greeter phase -------------------------------------------------
         tokio::time::sleep(backoff.next_delay()).await;
 
+        // greetd-equivalent of `[terminal] switch = true`: make the greeter
+        // VT the foreground console *before* opening its logind session so
+        // libseat TakeDevice returns a DRM-master FD. Without this, the
+        // greeter opens card nodes unprivileged and NVIDIA scanout fails.
+        if let Err(e) = crate::vt::switch_to(cfg.vt) {
+            tracing::error!(error = %e, vt = cfg.vt, "failed to switch to greeter VT");
+            continue;
+        }
+
         let exec = ExecSpec {
             program: cfg.greeter_cmd.clone(),
             env: vec![
@@ -62,6 +71,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                     "XDG_RUNTIME_DIR".to_string(),
                     format!("/run/user/{}", greeter_user.uid),
                 ),
+                ("FOCALDM_VT".to_string(), cfg.vt.to_string()),
+                ("XDG_VTNR".to_string(), cfg.vt.to_string()),
             ],
             current_dir: None,
             uid: greeter_user.uid,
@@ -83,7 +94,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
             exec,
         )
         .context("open greeter PAM session")?;
-        tracing::info!(pid = greeter.pid, "greeter started");
+        tracing::info!(pid = greeter.pid, vt = cfg.vt, "greeter started");
 
         let pending = match drive_greeter(&cfg, &listener, greeter).await? {
             GreeterPhase::Crashed { greeter } => {

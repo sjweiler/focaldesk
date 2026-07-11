@@ -51,13 +51,22 @@ impl Greeter {
             pointer: self.pointer,
             power_menu_open: self.power_menu_open,
             pulse_phase: self.started_at.elapsed().as_secs_f32(),
-            paint_background: self.output.gpu_background_enabled(),
+            // Ignored by `GreeterOutput::render`, which decides for itself
+            // whether the CPU fallback path needs to paint its own
+            // background this frame; kept only because `FrameState` is
+            // also `paint_frame`'s standalone public contract.
+            paint_background: false,
         };
 
+        let started = Instant::now();
         match self.output.render(&frame) {
             Ok(layout) => self.frame = layout,
             Err(e) => tracing::error!(error = ?e, "render failed"),
         }
+        tracing::debug!(
+            elapsed_us = started.elapsed().as_micros(),
+            "greeter frame rendered"
+        );
     }
 
     fn send_all(&mut self, reqs: Vec<Request>) {
@@ -153,6 +162,7 @@ fn main() -> anyhow::Result<()> {
 
     let (output, session_notifier, libinput) = GreeterOutput::open()?;
     let libinput_backend = LibinputInputBackend::new(libinput);
+    let initially_active = output.is_session_active();
 
     handle
         .insert_source(session_notifier, |event, _, g: &mut Greeter| match event {
@@ -204,14 +214,20 @@ fn main() -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow!("insert socket source: {e}"))?;
 
+    // Start the cursor at screen center rather than leaving it `None`
+    // (invisible) until the first physical mouse-motion event arrives —
+    // a lock screen should show a pointer immediately.
+    let (mode_w, mode_h) = output.mode_size();
+    let initial_pointer = Some((mode_w as i32 / 2, mode_h as i32 / 2));
+
     let mut greeter = Greeter {
         login: LoginState::default(),
         conn,
         output,
         mods: Modifiers::default(),
-        session_active: true,
+        session_active: initially_active,
         power_menu_open: false,
-        pointer: None,
+        pointer: initial_pointer,
         frame: FrameHitTargets::default(),
         started_at: Instant::now(),
         signal: event_loop.get_signal(),
@@ -219,8 +235,9 @@ fn main() -> anyhow::Result<()> {
 
     let drm_fd = greeter.output.drm_fd();
     handle
-        .insert_source(Generic::new(drm_fd, Interest::READ, Mode::Level), |_, _, g: &mut Greeter| {
-            match g.output.handle_drm_events() {
+        .insert_source(
+            Generic::new(drm_fd, Interest::READ, Mode::Level),
+            |_, _, g: &mut Greeter| match g.output.handle_drm_events() {
                 Ok(_) => {
                     if g.session_active && !g.output.flip_pending() {
                         g.render();
@@ -232,11 +249,17 @@ fn main() -> anyhow::Result<()> {
                     g.signal.stop();
                     Ok(PostAction::Remove)
                 }
-            }
-        })
+            },
+        )
         .map_err(|e| anyhow!("insert drm source: {e}"))?;
 
-    greeter.render();
+    if greeter.session_active {
+        greeter.render();
+    } else {
+        tracing::warn!(
+            "greeter started while seat inactive; waiting for ActivateSession before first frame"
+        );
+    }
 
     event_loop.run(Duration::from_millis(16), &mut greeter, |g| {
         if g.session_active && !g.output.flip_pending() {

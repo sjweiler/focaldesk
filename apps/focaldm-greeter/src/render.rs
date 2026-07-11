@@ -6,7 +6,12 @@
 
 use std::f32::consts::TAU;
 
+use smithay::backend::renderer::gles::{GlesError, GlesFrame, Uniform};
+use smithay::backend::renderer::Color32F;
+use smithay::utils::{Physical, Rectangle, Transform};
+
 use crate::font;
+use crate::glyph_atlas::{FontId, GlyphAtlas, IconId};
 use crate::ipc_client::AuthMessageStyle;
 use crate::login::LoginState;
 
@@ -167,7 +172,7 @@ fn draw_border(
 // Classic arrow-pointer silhouette (tip + notch + tail flourish), traced as a
 // single non-self-intersecting polygon. The hotspot is the tip at (0, 0),
 // matching `hover()`'s use of the raw pointer coordinate as the click point.
-const CURSOR_POLY: &[(f32, f32)] = &[
+pub(crate) const CURSOR_POLY: &[(f32, f32)] = &[
     (0.0, 0.0),
     (0.0, 17.0),
     (4.0, 13.0),
@@ -234,7 +239,7 @@ fn draw_cursor(buf: &mut [u8], pitch: u32, x: i32, y: i32) {
 
 fn draw_shadow(buf: &mut [u8], pitch: u32, rect: Rect) {
     for layer in 0..4 {
-        let inset = layer as i32 * 2;
+        let inset = layer * 2;
         let alpha = 40u8.saturating_sub(layer as u8 * 8);
         fill_rect(
             buf,
@@ -523,6 +528,34 @@ fn hover(pointer: Option<(i32, i32)>, rect: Rect) -> bool {
     pointer.is_some_and(|(x, y)| rect.contains(x, y))
 }
 
+/// The set of (font, size) combinations `paint_frame` ever draws text at.
+/// Derived purely from the fixed output height, so — since the DRM mode
+/// never changes for the life of the process — this is the exact, complete
+/// set of glyph sizes the greeter will ever need. `glyph_atlas` bakes
+/// exactly these sizes; keeping the computation here as the single source
+/// of truth means the atlas can never drift out of sync with what
+/// `paint_frame` actually asks for.
+#[derive(Clone, Copy, Debug)]
+pub struct FontSizes {
+    pub title: f32,
+    pub avatar: f32,
+    pub body: f32,
+    pub field: f32,
+    pub small: f32,
+}
+
+pub fn font_sizes(height: u32) -> FontSizes {
+    let height = height as f32;
+    let title = (height * 0.043).clamp(24.0, 38.0);
+    FontSizes {
+        title,
+        avatar: title * 0.95,
+        body: (height * 0.023).clamp(15.0, 20.0),
+        field: (height * 0.031).clamp(18.0, 28.0),
+        small: (height * 0.018).clamp(12.0, 16.0),
+    }
+}
+
 pub fn paint_frame(
     buf: &mut [u8],
     pitch: u32,
@@ -582,10 +615,11 @@ pub fn paint_frame(
 
     let regular = font::regular();
     let medium = font::medium();
-    let title_size = (height as f32 * 0.043).clamp(24.0, 38.0);
-    let body_size = (height as f32 * 0.023).clamp(15.0, 20.0);
-    let field_size = (height as f32 * 0.031).clamp(18.0, 28.0);
-    let small_size = (height as f32 * 0.018).clamp(12.0, 16.0);
+    let sizes = font_sizes(height as u32);
+    let title_size = sizes.title;
+    let body_size = sizes.body;
+    let field_size = sizes.field;
+    let small_size = sizes.small;
 
     let avatar_x = panel.x + 46;
     let avatar_y = panel.y + 52;
@@ -927,6 +961,651 @@ pub fn paint_frame(
         power_menu_items,
         field,
     }
+}
+
+fn to_unit(color: (u8, u8, u8)) -> [f32; 3] {
+    [
+        color.0 as f32 / 255.0,
+        color.1 as f32 / 255.0,
+        color.2 as f32 / 255.0,
+    ]
+}
+
+fn premultiplied(color: (u8, u8, u8), alpha: u8) -> Color32F {
+    let a = alpha as f32 / 255.0;
+    let [r, g, b] = to_unit(color);
+    Color32F::new(r * a, g * a, b * a, a)
+}
+
+fn physical(rect: Rect) -> Rectangle<i32, Physical> {
+    Rectangle::new(
+        (rect.x, rect.y).into(),
+        (rect.w.max(0), rect.h.max(0)).into(),
+    )
+}
+
+fn gpu_solid(
+    frame: &mut GlesFrame,
+    rect: Rect,
+    color: (u8, u8, u8),
+    alpha: u8,
+) -> Result<(), GlesError> {
+    if rect.w <= 0 || rect.h <= 0 || alpha == 0 {
+        return Ok(());
+    }
+    let dst = physical(rect);
+    // Smithay treats damage as dest-local (origin at `dst.loc`), not absolute
+    // screen coords. Passing `dst` itself clips any non-origin rect to empty.
+    let damage = Rectangle::from_size(dst.size);
+    frame.draw_solid(dst, &[damage], premultiplied(color, alpha))
+}
+
+fn gpu_border(
+    frame: &mut GlesFrame,
+    rect: Rect,
+    thickness: i32,
+    color: (u8, u8, u8),
+    alpha: u8,
+) -> Result<(), GlesError> {
+    let t = thickness.max(1).min(rect.w.max(1)).min(rect.h.max(1));
+    gpu_solid(
+        frame,
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: rect.w,
+            h: t,
+        },
+        color,
+        alpha,
+    )?;
+    gpu_solid(
+        frame,
+        Rect {
+            x: rect.x,
+            y: rect.y + rect.h - t,
+            w: rect.w,
+            h: t,
+        },
+        color,
+        alpha,
+    )?;
+    gpu_solid(
+        frame,
+        Rect {
+            x: rect.x,
+            y: rect.y,
+            w: t,
+            h: rect.h,
+        },
+        color,
+        alpha,
+    )?;
+    gpu_solid(
+        frame,
+        Rect {
+            x: rect.x + rect.w - t,
+            y: rect.y,
+            w: t,
+            h: rect.h,
+        },
+        color,
+        alpha,
+    )?;
+    Ok(())
+}
+
+fn gpu_shadow(frame: &mut GlesFrame, rect: Rect) -> Result<(), GlesError> {
+    for layer in 0..4i32 {
+        let inset = layer * 2;
+        let alpha = 40u8.saturating_sub(layer as u8 * 8);
+        gpu_solid(
+            frame,
+            Rect {
+                x: rect.x - 8 + inset,
+                y: rect.y - 8 + inset,
+                w: rect.w + 16 - inset * 2,
+                h: rect.h + 16 - inset * 2,
+            },
+            (0, 0, 0),
+            alpha,
+        )?;
+    }
+    Ok(())
+}
+
+fn gpu_icon(
+    frame: &mut GlesFrame,
+    atlas: &GlyphAtlas,
+    id: IconId,
+    dst: Rect,
+    color: (u8, u8, u8),
+    alpha: u8,
+) -> Result<(), GlesError> {
+    let atlas_rect = atlas.icon_rect(id);
+    if atlas_rect.w == 0 || atlas_rect.h == 0 || alpha == 0 {
+        return Ok(());
+    }
+    let src = atlas.icon_src(id);
+    let dst_rect = physical(dst);
+    let damage = Rectangle::from_size(dst_rect.size);
+    let uniforms = [Uniform::new("u_color", to_unit(color))];
+    frame.render_texture_from_to(
+        atlas.texture(),
+        src,
+        dst_rect,
+        &[damage],
+        &[],
+        Transform::Normal,
+        alpha as f32 / 255.0,
+        Some(atlas.program()),
+        &uniforms,
+    )
+}
+
+fn gpu_text(
+    frame: &mut GlesFrame,
+    atlas: &GlyphAtlas,
+    font_id: FontId,
+    size: f32,
+    x: i32,
+    baseline_y: i32,
+    color: (u8, u8, u8),
+    text: &str,
+) -> Result<(), GlesError> {
+    let uniforms = [Uniform::new("u_color", to_unit(color))];
+    let mut caret = x as f32;
+    for ch in text.chars() {
+        let Some(info) = atlas.glyph(font_id, size, ch) else {
+            // Only reachable for text the atlas didn't bake for (PAM
+            // messages aren't guaranteed ASCII/Latin-1 the way user-typed
+            // input is, see `glyph_atlas::baked_chars`). Drop the glyph
+            // rather than the whole frame; log so a systematically missing
+            // character is diagnosable instead of silently invisible.
+            tracing::debug!(char = ?ch, "greeter glyph atlas miss, skipping glyph");
+            continue;
+        };
+        if let (Some(rect), Some(src)) = (info.rect, atlas.glyph_src(info)) {
+            let gx = caret as i32 + info.xmin;
+            let gy = baseline_y - info.ymin - rect.h as i32;
+            let dst = physical(Rect {
+                x: gx,
+                y: gy,
+                w: rect.w as i32,
+                h: rect.h as i32,
+            });
+            let damage = Rectangle::from_size(dst.size);
+            frame.render_texture_from_to(
+                atlas.texture(),
+                src,
+                dst,
+                &[damage],
+                &[],
+                Transform::Normal,
+                1.0,
+                Some(atlas.program()),
+                &uniforms,
+            )?;
+        }
+        caret += info.advance;
+    }
+    Ok(())
+}
+
+/// GPU-drawing counterpart to [`paint_frame`]: same visual layout (panel,
+/// avatar, text, field, power menu, cursor), but every element is drawn via
+/// `Frame::draw_solid`/`Frame::render_texture_from_to` against a pre-baked
+/// [`GlyphAtlas`] instead of CPU pixel blending. The background gradient is
+/// expected to already have been drawn into `frame` (via the pixel shader)
+/// before this is called — it composites the UI on top within the same
+/// GLES frame, so the caller never needs to CPU-map the scanout buffer.
+///
+/// Layout math (panel/field/power-button geometry, notice stepping, etc.)
+/// is intentionally duplicated from `paint_frame` rather than shared: it's
+/// small, stable arithmetic, and keeping the two paint functions fully
+/// independent means a bug in the GPU path can never affect the CPU
+/// fallback that unsupported hardware relies on.
+pub fn paint_frame_gpu(
+    frame: &mut GlesFrame,
+    atlas: &GlyphAtlas,
+    width: u32,
+    height: u32,
+    state: &FrameState,
+) -> Result<FrameHitTargets, GlesError> {
+    let width = width as i32;
+    let height = height as i32;
+
+    let panel_w = (width as f32 * 0.42).clamp(420.0, 700.0) as i32;
+    let panel_h = (height as f32 * 0.34).clamp(270.0, 400.0) as i32;
+    let panel = Rect {
+        x: ((width - panel_w) / 2).max(32),
+        y: ((height - panel_h) / 2 + 22).max(48),
+        w: panel_w.min(width - 48),
+        h: panel_h,
+    };
+
+    let power_button = Rect {
+        x: width - 92,
+        y: 28,
+        w: 56,
+        h: 56,
+    };
+
+    gpu_shadow(frame, panel)?;
+    gpu_solid(frame, panel, (11, 16, 25), 232)?;
+    gpu_border(frame, panel, 2, (147, 172, 193), 84)?;
+    gpu_solid(
+        frame,
+        Rect {
+            x: panel.x,
+            y: panel.y,
+            w: 5,
+            h: panel.h,
+        },
+        (77, 152, 218),
+        140,
+    )?;
+    gpu_solid(
+        frame,
+        Rect {
+            x: panel.x,
+            y: panel.y,
+            w: panel.w,
+            h: 1,
+        },
+        (255, 255, 255),
+        24,
+    )?;
+
+    let regular = font::regular();
+    let medium = font::medium();
+    let sizes = font_sizes(height as u32);
+    let title_size = sizes.title;
+    let body_size = sizes.body;
+    let field_size = sizes.field;
+    let small_size = sizes.small;
+
+    let avatar_x = panel.x + 46;
+    let avatar_y = panel.y + 52;
+    let avatar_color = match state.login {
+        LoginState::EnterUsername { error: None, .. } => (72, 152, 220),
+        LoginState::EnterUsername { error: Some(_), .. } => (220, 92, 80),
+        LoginState::Waiting { .. } => (220, 180, 64),
+        LoginState::Prompt { .. } => (74, 170, 150),
+        LoginState::Done => (80, 196, 116),
+    };
+    gpu_icon(
+        frame,
+        atlas,
+        IconId::AvatarDisc,
+        Rect {
+            x: avatar_x - 27,
+            y: avatar_y - 27,
+            w: 55,
+            h: 55,
+        },
+        avatar_color,
+        200,
+    )?;
+    gpu_icon(
+        frame,
+        atlas,
+        IconId::AvatarRing,
+        Rect {
+            x: avatar_x - 30,
+            y: avatar_y - 30,
+            w: 61,
+            h: 61,
+        },
+        (255, 255, 255),
+        80,
+    )?;
+    let avatar_char = subtitle(state.login)
+        .chars()
+        .find(|c| c.is_ascii_alphanumeric())
+        .unwrap_or('f')
+        .to_ascii_uppercase()
+        .to_string();
+    gpu_text(
+        frame,
+        atlas,
+        FontId::Medium,
+        sizes.avatar,
+        avatar_x - 9,
+        avatar_y + 12,
+        (255, 255, 255),
+        &avatar_char,
+    )?;
+
+    let title_x = panel.x + 96;
+    let title_y = baseline_from_top(medium, title_size, panel.y + 34);
+    gpu_text(
+        frame,
+        atlas,
+        FontId::Medium,
+        title_size,
+        title_x,
+        title_y,
+        (238, 243, 248),
+        headline(state.login),
+    )?;
+
+    let subtitle_text = subtitle(state.login);
+    let subtitle_top = panel.y + 34 + line_step(medium, title_size);
+    let subtitle_y = baseline_from_top(regular, body_size, subtitle_top);
+    gpu_text(
+        frame,
+        atlas,
+        FontId::Regular,
+        body_size,
+        title_x,
+        subtitle_y,
+        (170, 182, 194),
+        &font::ellipsize(regular, body_size, &subtitle_text, panel.w - 130),
+    )?;
+
+    if matches!(state.login, LoginState::Waiting { .. }) {
+        let cx = panel.x + panel.w - 58;
+        let cy = panel.y + 62;
+        for i in 0..8 {
+            let angle = state.pulse_phase * 1.6 + i as f32 * TAU / 8.0;
+            let px = cx as f32 + angle.cos() * 12.0;
+            let py = cy as f32 + angle.sin() * 12.0;
+            let alpha = 70 + ((i as f32 + state.pulse_phase * 4.0).sin().max(0.0) * 185.0) as u8;
+            gpu_icon(
+                frame,
+                atlas,
+                IconId::SpinnerDot,
+                Rect {
+                    x: px.round() as i32 - 3,
+                    y: py.round() as i32 - 3,
+                    w: 7,
+                    h: 7,
+                },
+                (220, 180, 64),
+                alpha,
+            )?;
+        }
+    }
+
+    let prompt = prompt_line(state.login);
+    let prompt = font::ellipsize(regular, body_size, &prompt, panel.w - 64);
+    let prompt_baseline = baseline_from_top(regular, body_size, panel.y + panel.h - 124);
+    gpu_text(
+        frame,
+        atlas,
+        FontId::Regular,
+        body_size,
+        panel.x + 30,
+        prompt_baseline,
+        (197, 207, 218),
+        &prompt,
+    )?;
+
+    let mut notice_y = prompt_baseline + 24;
+    for (style, msg) in notices(state.login) {
+        let color = match style {
+            AuthMessageStyle::Error => (230, 110, 100),
+            _ => (155, 170, 182),
+        };
+        let msg = font::ellipsize(regular, small_size, msg, panel.w - 60);
+        let notice_baseline = baseline_from_top(regular, small_size, notice_y);
+        gpu_text(
+            frame,
+            atlas,
+            FontId::Regular,
+            small_size,
+            panel.x + 30,
+            notice_baseline,
+            color,
+            &msg,
+        )?;
+        notice_y += line_step(regular, small_size);
+    }
+
+    let field = Rect {
+        x: panel.x + 28,
+        y: panel.y + panel.h - 82,
+        w: panel.w - 56,
+        h: 48,
+    };
+    let field_active = matches!(
+        state.login,
+        LoginState::EnterUsername { .. } | LoginState::Prompt { .. }
+    );
+    let field_hover = hover(state.pointer, field);
+    let field_fill = if field_active || field_hover {
+        204
+    } else {
+        180
+    };
+    gpu_solid(frame, field, (19, 26, 39), field_fill)?;
+    gpu_border(
+        frame,
+        field,
+        2,
+        if field_active {
+            (94, 156, 221)
+        } else {
+            (118, 132, 149)
+        },
+        if field_hover { 150 } else { 96 },
+    )?;
+
+    let shown = field_text(state.login);
+    let field_inner_x = field.x + 18;
+    let field_baseline = baseline_from_top(medium, field_size, field.y + 10);
+    if !shown.is_empty() {
+        gpu_text(
+            frame,
+            atlas,
+            FontId::Medium,
+            field_size,
+            field_inner_x,
+            field_baseline,
+            (245, 247, 250),
+            &shown,
+        )?;
+    } else {
+        let placeholder = match state.login {
+            LoginState::EnterUsername { .. } => "Username".to_string(),
+            LoginState::Prompt { style, .. } => match style {
+                AuthMessageStyle::Secret => "Password".to_string(),
+                _ => "Response".to_string(),
+            },
+            _ => String::new(),
+        };
+        gpu_text(
+            frame,
+            atlas,
+            FontId::Regular,
+            field_size,
+            field_inner_x,
+            field_baseline,
+            (113, 130, 146),
+            &placeholder,
+        )?;
+    }
+
+    if field_active && state.pulse_phase.fract() < 0.55 {
+        let caret_x =
+            field_inner_x + font::measure_width(medium, field_size, &shown).round() as i32 + 2;
+        gpu_solid(
+            frame,
+            Rect {
+                x: caret_x,
+                y: field.y + 11,
+                w: 2,
+                h: 26,
+            },
+            (245, 247, 250),
+            220,
+        )?;
+    }
+
+    let note_y = panel.y + panel.h + 24;
+    if let LoginState::EnterUsername {
+        error: Some(msg), ..
+    } = state.login
+    {
+        let msg = font::ellipsize(regular, body_size, msg, width - 64);
+        let msg_x = center_x(width, font::measure_width(regular, body_size, &msg));
+        let msg_baseline = baseline_from_top(regular, body_size, note_y);
+        gpu_text(
+            frame,
+            atlas,
+            FontId::Regular,
+            body_size,
+            msg_x,
+            msg_baseline,
+            (228, 92, 86),
+            &msg,
+        )?;
+    } else if matches!(state.login, LoginState::Done) {
+        let msg = "Handing off to the session...";
+        let msg_x = center_x(width, font::measure_width(regular, body_size, msg));
+        let msg_baseline = baseline_from_top(regular, body_size, note_y);
+        gpu_text(
+            frame,
+            atlas,
+            FontId::Regular,
+            body_size,
+            msg_x,
+            msg_baseline,
+            (160, 174, 187),
+            msg,
+        )?;
+    } else {
+        let msg = "Esc cancels. Click the power icon for power options.";
+        let msg_x = center_x(width, font::measure_width(regular, small_size, msg));
+        let msg_baseline = baseline_from_top(regular, small_size, note_y);
+        gpu_text(
+            frame,
+            atlas,
+            FontId::Regular,
+            small_size,
+            msg_x,
+            msg_baseline,
+            (152, 166, 178),
+            msg,
+        )?;
+    }
+
+    let power_hover = hover(state.pointer, power_button);
+    gpu_shadow(frame, power_button)?;
+    gpu_solid(
+        frame,
+        power_button,
+        if state.power_menu_open {
+            (26, 35, 48)
+        } else {
+            (14, 20, 31)
+        },
+        238,
+    )?;
+    gpu_border(
+        frame,
+        power_button,
+        2,
+        if power_hover || state.power_menu_open {
+            (233, 240, 247)
+        } else {
+            (149, 166, 183)
+        },
+        if power_hover || state.power_menu_open {
+            160
+        } else {
+            96
+        },
+    )?;
+    gpu_icon(
+        frame,
+        atlas,
+        IconId::PowerIcon,
+        power_button,
+        if power_hover || state.power_menu_open {
+            (237, 243, 249)
+        } else {
+            (168, 184, 199)
+        },
+        215,
+    )?;
+
+    let mut power_menu_items = Vec::new();
+    if state.power_menu_open {
+        let actions = [
+            PowerAction::Suspend,
+            PowerAction::Hibernate,
+            PowerAction::Restart,
+            PowerAction::PowerOff,
+        ];
+        let item_h = 40;
+        let item_gap = 4;
+        let menu_w = 220;
+        let menu_h = 16 + actions.len() as i32 * item_h + (actions.len() as i32 - 1) * item_gap;
+        let menu_x = (power_button.x + power_button.w - menu_w).max(24);
+        let mut menu_y = power_button.y + power_button.h + 12;
+        if menu_y + menu_h > height - 24 {
+            menu_y = power_button.y - menu_h - 12;
+        }
+        let menu = Rect {
+            x: menu_x,
+            y: menu_y,
+            w: menu_w,
+            h: menu_h,
+        };
+        gpu_shadow(frame, menu)?;
+        gpu_solid(frame, menu, (10, 15, 24), 244)?;
+        gpu_border(frame, menu, 2, (116, 134, 153), 108)?;
+
+        let mut y = menu.y + 8;
+        for action in actions {
+            let item = Rect {
+                x: menu.x + 8,
+                y,
+                w: menu.w - 16,
+                h: item_h,
+            };
+            let item_hover = hover(state.pointer, item);
+            if item_hover {
+                gpu_solid(frame, item, (33, 44, 60), 230)?;
+                gpu_border(frame, item, 1, (97, 154, 221), 120)?;
+            }
+            gpu_text(
+                frame,
+                atlas,
+                FontId::Regular,
+                body_size,
+                item.x + 16,
+                item.y + 27,
+                if item_hover {
+                    (245, 247, 250)
+                } else {
+                    (211, 219, 227)
+                },
+                action.label(),
+            )?;
+            power_menu_items.push((action, item));
+            y += item_h + item_gap;
+        }
+    }
+
+    if let Some((px, py)) = state.pointer {
+        let dst = Rect {
+            x: px - 1,
+            y: py - 1,
+            w: 13,
+            h: 22,
+        };
+        gpu_icon(frame, atlas, IconId::CursorOutline, dst, (12, 14, 18), 235)?;
+        gpu_icon(frame, atlas, IconId::CursorBody, dst, (255, 255, 255), 255)?;
+    }
+
+    Ok(FrameHitTargets {
+        power_button,
+        power_menu_items,
+        field,
+    })
 }
 
 #[cfg(test)]
