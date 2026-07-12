@@ -126,6 +126,10 @@ install-ai-console:
     cargo build --release -p focaldesk-ai-console
     sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
 
+install-polkit:
+    cargo build --release -p focaldesk-polkitd
+    sudo install -Dm755 target/release/focaldesk-polkitd /usr/libexec/focaldesk/focaldesk-polkitd
+
 install-launcher:
     cargo build --release -p focaldesk-launcher
     sudo install -Dm755 target/release/focaldesk-launcher /usr/local/bin/focaldesk-launcher
