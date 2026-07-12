@@ -71,30 +71,16 @@ fn handle_power_client(stream: &mut UnixStream, manager: &Arc<PowerManager>) {
         Ok(PowerIpcRequest::GetSnapshot) => PowerIpcResponse::PowerSnapshot {
             snapshot: manager.snapshot(),
         },
-        Ok(PowerIpcRequest::Suspend) => match manager.suspend() {
-            Ok(()) => PowerIpcResponse::Ok,
-            Err(err) => PowerIpcResponse::Error {
-                message: err.to_string(),
-            },
-        },
-        Ok(PowerIpcRequest::Hibernate) => match manager.hibernate() {
-            Ok(()) => PowerIpcResponse::Ok,
-            Err(err) => PowerIpcResponse::Error {
-                message: err.to_string(),
-            },
-        },
-        Ok(PowerIpcRequest::Reboot) => match manager.reboot() {
-            Ok(()) => PowerIpcResponse::Ok,
-            Err(err) => PowerIpcResponse::Error {
-                message: err.to_string(),
-            },
-        },
-        Ok(PowerIpcRequest::PowerOff) => match manager.power_off() {
-            Ok(()) => PowerIpcResponse::Ok,
-            Err(err) => PowerIpcResponse::Error {
-                message: err.to_string(),
-            },
-        },
+        Ok(PowerIpcRequest::Suspend) => {
+            dispatch_power_command(manager, |manager| manager.suspend())
+        }
+        Ok(PowerIpcRequest::Hibernate) => {
+            dispatch_power_command(manager, |manager| manager.hibernate())
+        }
+        Ok(PowerIpcRequest::Reboot) => dispatch_power_command(manager, |manager| manager.reboot()),
+        Ok(PowerIpcRequest::PowerOff) => {
+            dispatch_power_command(manager, |manager| manager.power_off())
+        }
         Ok(PowerIpcRequest::SetPerformanceProfile { profile }) => {
             match manager.set_performance_profile(&profile) {
                 Ok(()) => PowerIpcResponse::Ok,
@@ -110,4 +96,23 @@ fn handle_power_client(stream: &mut UnixStream, manager: &Arc<PowerManager>) {
 
     let json = serde_json::to_string(&response).unwrap();
     let _ = stream.write_all(json.as_bytes());
+}
+
+fn dispatch_power_command(
+    manager: &Arc<PowerManager>,
+    command: impl FnOnce(&PowerManager) -> Result<(), focaldesk_power::PowerError> + Send + 'static,
+) -> PowerIpcResponse {
+    let manager = Arc::clone(manager);
+    match thread::Builder::new()
+        .name("focaldesk-power-action".to_string())
+        .spawn(move || {
+            if let Err(err) = command(&manager) {
+                eprintln!("power action failed: {err}");
+            }
+        }) {
+        Ok(_) => PowerIpcResponse::Ok,
+        Err(err) => PowerIpcResponse::Error {
+            message: format!("could not dispatch power action: {err}"),
+        },
+    }
 }

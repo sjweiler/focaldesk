@@ -115,7 +115,13 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
             prompt,
             echo_on,
         } => {
-            let dialog = gtk::Dialog::builder().modal(true).title(&message).build();
+            let dialog = gtk::Dialog::builder()
+                .modal(true)
+                .title(&message)
+                .default_width(420)
+                .default_height(180)
+                .resizable(false)
+                .build();
             if !icon_name.is_empty() {
                 dialog.set_icon_name(Some(&icon_name));
             }
@@ -128,6 +134,7 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
 
             let label = gtk::Label::new(Some(&prompt));
             label.set_wrap(true);
+            label.set_max_width_chars(48);
             label.set_xalign(0.0);
             content.append(&label);
 

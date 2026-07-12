@@ -7,11 +7,10 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 use zbus::{Connection, DBusError, dbus_interface, dbus_proxy};
-use zbus_polkit::policykit1::{AuthorityProxy, Identity as WireIdentity, Subject};
+use zbus_polkit::policykit1::{AuthorityProxy, Subject};
 
 const AGENT_OBJECT_PATH: &str = "/org/freedesktop/PolicyKit1/AuthenticationAgent";
 
-/// `(session_id, uid, user_name, seat_id, session_path)`, as returned by `ListSessions`.
 type LoginSessionEntry = (String, u32, String, String, OwnedObjectPath);
 
 #[dbus_proxy(
@@ -20,10 +19,6 @@ type LoginSessionEntry = (String, u32, String, String, OwnedObjectPath);
     default_path = "/org/freedesktop/login1"
 )]
 trait Login1Manager {
-    /// Deliberately *not* using `GetSessionByPID(our own pid)`: a `systemctl --user` service's
-    /// process lives under `user@<uid>.service`'s own cgroup slice, a sibling of login-session
-    /// scopes rather than nested inside one, so it doesn't resolve to any session — confirmed on
-    /// real hardware (see `session_subject`), not just this dev sandbox.
     fn list_sessions(&self) -> zbus::Result<Vec<LoginSessionEntry>>;
 }
 
@@ -38,9 +33,7 @@ enum AgentError {
     Failed(String),
 }
 
-struct AuthenticationAgent {
-    connection: Connection,
-}
+struct AuthenticationAgent;
 
 #[dbus_interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl AuthenticationAgent {
@@ -67,7 +60,7 @@ impl AuthenticationAgent {
         // identity offered: the requesting user). Actions that legitimately offer
         // a choice of identities (e.g. any wheel-group member, or explicitly root)
         // would need a chooser UI; not needed for the common password-prompt path.
-        let Some((uid, identity_str)) = identities
+        let Some((_uid, identity_str)) = identities
             .iter()
             .find(|(kind, _)| kind == "unix-user")
             .and_then(|(_, details)| unix_user_uid(details))
@@ -91,20 +84,10 @@ impl AuthenticationAgent {
             ));
         }
 
-        let authority = AuthorityProxy::new(&self.connection)
-            .await
-            .map_err(AgentError::ZBus)?;
-        let mut identity_details = HashMap::new();
-        identity_details.insert("uid", Value::from(uid));
-        let identity = WireIdentity {
-            identity_kind: "unix-user",
-            identity_details: &identity_details,
-        };
-        authority
-            .authentication_agent_response2(uid, &cookie, &identity)
-            .await
-            .map_err(AgentError::ZBus)?;
-
+        // PolkitAgentSession's helper reports the successful authentication to
+        // polkitd as part of the conversation. Sending AuthenticationAgentResponse2
+        // again here duplicates that handoff and causes the original request to be
+        // rejected even though PAM accepted the password.
         Ok(())
     }
 
@@ -169,7 +152,18 @@ async fn run_agent_session(
                             echo_on,
                         },
                     );
-                    flog_info!("polkit agent session: dialog IPC returned {response:?}");
+                    flog_info!(
+                        "polkit agent session: dialog IPC returned an {}",
+                        match &response {
+                            Ok(DialogIpcResponse::PolkitAuthAnswer {
+                                answer: Some(_), ..
+                            }) => "answer",
+                            Ok(DialogIpcResponse::PolkitAuthAnswer { answer: None, .. }) =>
+                                "empty answer",
+                            Ok(_) => "unexpected response",
+                            Err(_) => "error",
+                        }
+                    );
                     match response {
                         Ok(DialogIpcResponse::PolkitAuthAnswer {
                             answer: Some(text), ..
@@ -209,24 +203,31 @@ fn next_request_id() -> u64 {
 
 /// Build the `unix-session` Subject for RegisterAuthenticationAgent/UnregisterAuthenticationAgent.
 ///
-/// Picks *our own uid's* session that has a non-empty seat, rather than the calling process's own
-/// session (which doesn't exist — see `Login1Manager::list_sessions`). Confirmed against a real
-/// logind on real hardware: a lingering/manager-class pseudo-session shows up with `seat=""`
-/// (e.g. `("1", 1000, "steve", "", ...)`) alongside the real graphical login on `seat0`
-/// (`("9", 1000, "steve", "seat0", ...)`) — the seat is what distinguishes them.
+/// Resolve the exact logind session containing this process. The compositor launches the agent
+/// directly, so it inherits the graphical session's cgroup. Selecting a session by uid/seat is
+/// unsafe because logind can retain an older closing session on the same seat.
 async fn session_subject(connection: &Connection) -> Result<Subject> {
-    let manager = Login1ManagerProxy::new(connection)
-        .await
-        .context("build login1 Manager proxy")?;
-    let our_uid = nix::unistd::Uid::current().as_raw();
-
-    let sessions = manager.list_sessions().await.context("ListSessions")?;
-    let session_id = sessions
-        .into_iter()
-        .find(|(_, uid, _, seat, _)| *uid == our_uid && !seat.is_empty())
-        .map(|(session_id, ..)| session_id)
-        .with_context(|| format!("no seat-bound logind session found for uid {our_uid}"))?;
-
+    // Prefer the exact ID inherited from the graphical session. pam_systemd
+    // does not always export it (notably when a user manager already exists),
+    // so fall back to logind's seat-bound session for our uid. Do not use
+    // GetSessionByPID: Fedora's system-bus policy denies it to this process.
+    let session_id = match std::env::var("XDG_SESSION_ID") {
+        Ok(session_id) if !session_id.is_empty() => session_id,
+        _ => {
+            let manager = Login1ManagerProxy::new(connection)
+                .await
+                .context("build login1 Manager proxy")?;
+            let uid = nix::unistd::Uid::current().as_raw();
+            manager
+                .list_sessions()
+                .await
+                .context("list login sessions")?
+                .into_iter()
+                .find(|(_, session_uid, _, seat, _)| *session_uid == uid && !seat.is_empty())
+                .map(|(session_id, ..)| session_id)
+                .with_context(|| format!("no seat-bound logind session found for uid {uid}"))?
+        }
+    };
     let mut subject_details = HashMap::new();
     subject_details.insert("session-id".to_string(), Value::from(session_id).into());
     Ok(Subject {
@@ -278,12 +279,7 @@ async fn main() -> Result<()> {
         .context("connect to system bus")?;
     connection
         .object_server()
-        .at(
-            AGENT_OBJECT_PATH,
-            AuthenticationAgent {
-                connection: connection.clone(),
-            },
-        )
+        .at(AGENT_OBJECT_PATH, AuthenticationAgent)
         .await
         .context("export AuthenticationAgent object")?;
 

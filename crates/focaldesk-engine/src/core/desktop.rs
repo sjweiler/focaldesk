@@ -7322,17 +7322,25 @@ fn power_service_snapshot() -> Option<PowerSnapshot> {
 }
 
 fn power_service_command(action: PowerIpcRequest, context: &str) {
-    match send_power_request(&action) {
-        Ok(PowerIpcResponse::Ok) => {}
-        Ok(PowerIpcResponse::Error { message }) => {
-            flog_warn!("{context} rejected: {message}");
-        }
-        Ok(other) => {
-            flog_warn!("{context} returned unexpected response: {other:?}");
-        }
-        Err(err) => {
-            flog_warn!("{context} unavailable: {err}");
-        }
+    let context = context.to_string();
+    let command_context = context.clone();
+    let spawn_result = thread::Builder::new()
+        .name("focaldesk-power-command".to_string())
+        .spawn(move || match send_power_request(&action) {
+            Ok(PowerIpcResponse::Ok) => {}
+            Ok(PowerIpcResponse::Error { message }) => {
+                flog_warn!("{command_context} rejected: {message}");
+            }
+            Ok(other) => {
+                flog_warn!("{command_context} returned unexpected response: {other:?}");
+            }
+            Err(err) => {
+                flog_warn!("{command_context} unavailable: {err}");
+            }
+        });
+
+    if let Err(err) = spawn_result {
+        flog_warn!("could not dispatch {context} asynchronously: {err}");
     }
 }
 
