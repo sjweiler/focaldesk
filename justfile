@@ -1,4 +1,5 @@
 desktop_bin := "/usr/local/bin/focaldesk-desktop"
+focaldm_greeter_bin := "/usr/libexec/focaldm-greeter"
 
 build:
     cargo build
@@ -32,6 +33,9 @@ release-portal:
 
 release-automation:
     cargo build --release -p focaldesk-automation
+
+release-focaldm-greeter:
+    cargo build --release -p focaldm-greeter
 
 install-server-service:
     cargo build --release -p focaldesk-server
@@ -138,6 +142,9 @@ install-polkit:
 install-launcher:
     cargo build --release -p focaldesk-launcher
     sudo install -Dm755 target/release/focaldesk-launcher /usr/local/bin/focaldesk-launcher
+
+install-focaldm-greeter: release-focaldm-greeter
+    sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"
 
 install-desktop:
     cargo build --release -p focaldesk-desktop
