@@ -146,7 +146,7 @@ install-launcher:
 install-focaldm-greeter: release-focaldm-greeter
     sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"
 
-install-desktop:
+install-desktop: install-polkit
     cargo build --release -p focaldesk-desktop
     @echo "Build artifact:"
     @md5sum target/release/focaldesk-desktop

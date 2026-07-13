@@ -79,7 +79,7 @@ use focaldesk_ipc::{
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
 use focaldesk_notifications::NotificationSnapshot;
-use focaldesk_power::{PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
+use focaldesk_power::{PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
     load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
     DisplayColorProfile, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
@@ -7326,21 +7326,44 @@ fn power_service_command(action: PowerIpcRequest, context: &str) {
     let command_context = context.clone();
     let spawn_result = thread::Builder::new()
         .name("focaldesk-power-command".to_string())
-        .spawn(move || match send_power_request(&action) {
-            Ok(PowerIpcResponse::Ok) => {}
-            Ok(PowerIpcResponse::Error { message }) => {
-                flog_warn!("{command_context} rejected: {message}");
+        .spawn(move || {
+            if let Some(command) = session_power_command(&action) {
+                // Run logind actions from the compositor's graphical session.  A
+                // systemd --user service is not part of that login session, so
+                // PolicyKit cannot associate its authorization request with the
+                // agent registered by focaldesk-desktop.
+                if let Err(err) = PowerManager::new().execute(command) {
+                    flog_warn!("{command_context} failed: {err}");
+                }
+                return;
             }
-            Ok(other) => {
-                flog_warn!("{command_context} returned unexpected response: {other:?}");
-            }
-            Err(err) => {
-                flog_warn!("{command_context} unavailable: {err}");
+
+            match send_power_request(&action) {
+                Ok(PowerIpcResponse::Ok) => {}
+                Ok(PowerIpcResponse::Error { message }) => {
+                    flog_warn!("{command_context} rejected: {message}");
+                }
+                Ok(other) => {
+                    flog_warn!("{command_context} returned unexpected response: {other:?}");
+                }
+                Err(err) => {
+                    flog_warn!("{command_context} unavailable: {err}");
+                }
             }
         });
 
     if let Err(err) = spawn_result {
         flog_warn!("could not dispatch {context} asynchronously: {err}");
+    }
+}
+
+fn session_power_command(action: &PowerIpcRequest) -> Option<PowerCommand> {
+    match action {
+        PowerIpcRequest::Suspend => Some(PowerCommand::Suspend),
+        PowerIpcRequest::Hibernate => Some(PowerCommand::Hibernate),
+        PowerIpcRequest::Reboot => Some(PowerCommand::Reboot),
+        PowerIpcRequest::PowerOff => Some(PowerCommand::PowerOff),
+        PowerIpcRequest::GetSnapshot | PowerIpcRequest::SetPerformanceProfile { .. } => None,
     }
 }
 
@@ -7679,7 +7702,12 @@ fn is_obs_like(app_name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_rect_to_bounds, is_browser_like, should_wait_for_lid_open_on_resume};
+    use super::{
+        clamp_rect_to_bounds, is_browser_like, session_power_command,
+        should_wait_for_lid_open_on_resume,
+    };
+    use focaldesk_ipc::PowerIpcRequest;
+    use focaldesk_power::PowerCommand;
     use smithay::utils::Rectangle;
 
     #[test]
@@ -7732,6 +7760,33 @@ mod tests {
         assert!(should_wait_for_lid_open_on_resume(Some(true)));
         assert!(!should_wait_for_lid_open_on_resume(Some(false)));
         assert!(!should_wait_for_lid_open_on_resume(None));
+    }
+
+    #[test]
+    fn privileged_power_actions_run_in_the_graphical_session() {
+        assert_eq!(
+            session_power_command(&PowerIpcRequest::Suspend),
+            Some(PowerCommand::Suspend)
+        );
+        assert_eq!(
+            session_power_command(&PowerIpcRequest::Hibernate),
+            Some(PowerCommand::Hibernate)
+        );
+        assert_eq!(
+            session_power_command(&PowerIpcRequest::Reboot),
+            Some(PowerCommand::Reboot)
+        );
+        assert_eq!(
+            session_power_command(&PowerIpcRequest::PowerOff),
+            Some(PowerCommand::PowerOff)
+        );
+        assert_eq!(session_power_command(&PowerIpcRequest::GetSnapshot), None);
+        assert_eq!(
+            session_power_command(&PowerIpcRequest::SetPerformanceProfile {
+                profile: "balanced".to_string(),
+            }),
+            None
+        );
     }
 }
 
