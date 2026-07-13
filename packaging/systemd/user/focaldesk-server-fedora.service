@@ -1,6 +1,7 @@
 [Unit]
 Description=FocalDesk server
-After=graphical-session.target
+PartOf=focaldesk-session.target
+After=focaldesk-session.target
 
 [Service]
 Type=simple
@@ -14,4 +15,4 @@ KillSignal=SIGINT
 TimeoutStopSec=10
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=focaldesk-session.target

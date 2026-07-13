@@ -15,12 +15,12 @@ pub enum PowerCommand {
 }
 
 impl PowerCommand {
-    fn systemctl_arg(self) -> &'static str {
+    fn login1_method(self) -> &'static str {
         match self {
-            Self::Suspend => "suspend",
-            Self::Hibernate => "hibernate",
-            Self::Reboot => "reboot",
-            Self::PowerOff => "poweroff",
+            Self::Suspend => "Suspend",
+            Self::Hibernate => "Hibernate",
+            Self::Reboot => "Reboot",
+            Self::PowerOff => "PowerOff",
         }
     }
 }
@@ -127,7 +127,24 @@ impl PowerManager {
     }
 
     pub fn execute(&self, command: PowerCommand) -> Result<(), PowerError> {
-        run_status("systemctl", &["--no-block", command.systemctl_arg()])
+        // systemctl disables interactive authorization when it has no controlling
+        // terminal, which is always the case in focaldesk-powerd. Call logind
+        // directly and opt in so the desktop PolicyKit agent can show its prompt.
+        run_status(
+            "busctl",
+            &[
+                "--system",
+                "--allow-interactive-authorization=yes",
+                "--timeout=120",
+                "call",
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+                command.login1_method(),
+                "b",
+                "true",
+            ],
+        )
     }
 
     pub fn suspend(&self) -> Result<(), PowerError> {
@@ -257,6 +274,14 @@ mod tests {
     fn reports_a_rejected_command() {
         let err = run_status("sh", &["-c", "exit 7"]).unwrap_err();
         assert!(matches!(err, PowerError::CommandFailed { .. }));
+    }
+
+    #[test]
+    fn maps_power_commands_to_login1_methods() {
+        assert_eq!(PowerCommand::Suspend.login1_method(), "Suspend");
+        assert_eq!(PowerCommand::Hibernate.login1_method(), "Hibernate");
+        assert_eq!(PowerCommand::Reboot.login1_method(), "Reboot");
+        assert_eq!(PowerCommand::PowerOff.login1_method(), "PowerOff");
     }
 
     #[test]

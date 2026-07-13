@@ -1,4 +1,5 @@
 desktop_bin := "/usr/local/bin/focaldesk-desktop"
+focaldm_greeter_bin := "/usr/libexec/focaldm-greeter"
 
 build:
     cargo build
@@ -33,6 +34,9 @@ release-portal:
 release-automation:
     cargo build --release -p focaldesk-automation
 
+release-focaldm-greeter:
+    cargo build --release -p focaldm-greeter
+
 install-server-service:
     cargo build --release -p focaldesk-server
     install -Dm755 target/release/focaldesk-server "$HOME/.local/bin/focaldesk-server"
@@ -42,7 +46,14 @@ install-server-service:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services: install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service
+install-session-target:
+    install -Dm644 packaging/systemd/user/focaldesk-session.target "$HOME/.config/systemd/user/focaldesk-session.target"
+    # Migrate services formerly enabled directly under the shared desktop target.
+    rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/"focaldesk-*.service
+    rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
+
+install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service
 
 install-power-service:
     cargo build --release -p focaldesk-powerd
@@ -99,9 +110,7 @@ install-settings-service:
 install-polkit-service:
     cargo build --release -p focaldesk-polkitd
     install -Dm755 target/release/focaldesk-polkitd "$HOME/.local/bin/focaldesk-polkitd"
-    install -Dm644 packaging/systemd/user/focaldesk-polkitd.service "$HOME/.config/systemd/user/focaldesk-polkitd.service"
-    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-polkitd.service || echo "Skipping systemd user enable: no user bus available"
+    systemctl --user disable --now focaldesk-polkitd.service || echo "Skipping stale polkit service cleanup: no user bus available"
 
 install-portal:
     cargo build --release -p focaldesk-portal
@@ -126,11 +135,18 @@ install-ai-console:
     cargo build --release -p focaldesk-ai-console
     sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
 
+install-polkit:
+    cargo build --release -p focaldesk-polkitd
+    sudo install -Dm755 target/release/focaldesk-polkitd /usr/libexec/focaldesk/focaldesk-polkitd
+
 install-launcher:
     cargo build --release -p focaldesk-launcher
     sudo install -Dm755 target/release/focaldesk-launcher /usr/local/bin/focaldesk-launcher
 
-install-desktop:
+install-focaldm-greeter: release-focaldm-greeter
+    sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"
+
+install-desktop: install-polkit
     cargo build --release -p focaldesk-desktop
     @echo "Build artifact:"
     @md5sum target/release/focaldesk-desktop
@@ -143,6 +159,7 @@ install-desktop:
 
 install-desktop-session:
     sudo install -Dm644 packaging/wayland-sessions/focaldesk.desktop /usr/share/wayland-sessions/focaldesk.desktop
+    sudo install -Dm644 packaging/systemd/user/focaldesk-session.target /usr/lib/systemd/user/focaldesk-session.target
 
 install-server-service-fedora:
     cargo build --release -p focaldesk-server
@@ -153,7 +170,14 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services-fedora: install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora
+install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora
+
+install-session-target-fedora:
+    sudo install -Dm644 packaging/systemd/user/focaldesk-session.target /usr/lib/systemd/user/focaldesk-session.target
+    # Migrate services formerly enabled directly under the shared desktop target.
+    rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/"focaldesk-*.service
+    rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
 
 install-power-service-fedora:
     cargo build --release -p focaldesk-powerd
@@ -210,9 +234,7 @@ install-settings-service-fedora:
 install-polkit-service-fedora:
     cargo build --release -p focaldesk-polkitd
     sudo install -Dm755 target/release/focaldesk-polkitd /usr/bin/focaldesk-polkitd
-    sudo install -Dm644 packaging/systemd/user/focaldesk-polkitd-fedora.service /usr/lib/systemd/user/focaldesk-polkitd.service
-    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-polkitd.service || echo "Skipping systemd user enable: no user bus available"
+    systemctl --user disable --now focaldesk-polkitd.service || echo "Skipping stale polkit service cleanup: no user bus available"
 
 run:
     cargo run

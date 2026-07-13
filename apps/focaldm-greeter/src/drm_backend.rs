@@ -25,9 +25,9 @@ use smithay::backend::drm::gbm::{framebuffer_from_bo, GbmFramebuffer};
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::{
-    GlesPixelProgram, GlesRenderer, Uniform, UniformName, UniformType,
+    ffi, GlesPixelProgram, GlesRenderer, GlesTexture, Uniform, UniformName, UniformType,
 };
-use smithay::backend::renderer::{Bind, Frame, Renderer};
+use smithay::backend::renderer::{Bind, ExportMem, Frame, Offscreen, Renderer, Texture};
 use smithay::backend::session::{
     libseat::LibSeatSession, libseat::LibSeatSessionNotifier, Session,
 };
@@ -39,10 +39,74 @@ use smithay::reexports::gbm::Device as GbmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{Buffer, DeviceFd, Physical, Rectangle, Size, Transform};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::glyph_atlas::GlyphAtlas;
 use crate::render;
+
+const GREETER_BACKGROUND2_FRAG: &str = r#"
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+uniform vec2 u_resolution;
+uniform float u_time;
+
+out vec4 frag_color;
+
+mat2 rotate_2d(float angle)
+{
+    float c = cos(angle);
+    float s = sin(angle);
+
+    return mat2(c, -s, s, c);
+}
+
+void main()
+{
+    vec2 uv = (
+        gl_FragCoord.xy - 0.5 * u_resolution
+    ) / u_resolution.y;
+
+    float rotation =
+        sin(u_time * 1.25) * 2.4;
+
+    uv = rotate_2d(rotation) * uv;
+
+    float radius = length(uv);
+    float angle = atan(uv.y, uv.x);
+
+    float tunnel = log(radius + 0.025);
+
+    float rings =
+        sin(tunnel * 18.0 - u_time * 4.0);
+
+    float spiral =
+        sin(angle * 7.0 + tunnel * 11.0 + u_time * 2.0);
+
+    float pattern =
+        rings * 0.6 + spiral * 0.4;
+
+    float bands =
+        smoothstep(0.1, 0.9, pattern);
+
+    vec3 orange = vec3(1.0, 0.12, 0.02);
+    vec3 violet = vec3(0.18, 0.02, 0.75);
+
+    float phase =
+        0.5 + 0.5 * sin(angle * 3.0 + tunnel * 6.0);
+
+    vec3 color = mix(orange, violet, phase);
+    color *= bands;
+
+    float center_glow =
+        0.045 / (radius + 0.04);
+
+    color += center_glow * vec3(1.0, 0.5, 0.2);
+
+    frag_color = vec4(color, 1.0);
+}
+"#;
 
 const GREETER_BACKGROUND_FRAG: &str = r#"
 #ifdef GL_ES
@@ -106,17 +170,24 @@ pub struct GreeterOutput {
     fbs: [GbmFramebuffer; 2],
     front: usize,
     flip_pending: bool,
+    background_style: render::BackgroundStyle,
     gpu: Option<GpuRenderer>,
+    direct_gpu_scanout: bool,
 }
 
 struct GpuRenderer {
     renderer: GlesRenderer,
     background_program: GlesPixelProgram,
     atlas: GlyphAtlas,
+    offscreen: Option<GlesTexture>,
 }
 
 impl GpuRenderer {
-    fn new(gbm: &GbmDevice<DrmDeviceFd>, sizes: render::FontSizes) -> Result<Self> {
+    fn new(
+        gbm: &GbmDevice<DrmDeviceFd>,
+        sizes: render::FontSizes,
+        background_style: render::BackgroundStyle,
+    ) -> Result<Self> {
         let display = unsafe { EGLDisplay::new(gbm.clone()) }
             .context("failed to create EGL display for greeter")?;
         let context =
@@ -124,9 +195,13 @@ impl GpuRenderer {
         let mut renderer = unsafe { GlesRenderer::new(context) }
             .context("failed to create GLES renderer for greeter")?;
 
+        let shader = match background_style {
+            render::BackgroundStyle::Aurora => GREETER_BACKGROUND_FRAG,
+            render::BackgroundStyle::SpiralTunnel => GREETER_BACKGROUND2_FRAG,
+        };
         let background_program = renderer
             .compile_custom_pixel_shader(
-                GREETER_BACKGROUND_FRAG,
+                shader,
                 &[
                     UniformName::new("u_resolution", UniformType::_2f),
                     UniformName::new("u_time", UniformType::_1f),
@@ -141,6 +216,7 @@ impl GpuRenderer {
             renderer,
             background_program,
             atlas,
+            offscreen: None,
         })
     }
 
@@ -210,6 +286,71 @@ impl GpuRenderer {
 
         Ok(hit_targets)
     }
+
+    /// Render on the GPU when the KMS scanout buffer itself cannot be bound as
+    /// an EGL framebuffer, then read the completed frame back for the final
+    /// copy into a CPU-mappable linear scanout buffer.
+    fn render_offscreen(
+        &mut self,
+        state: &render::FrameState,
+        width: u32,
+        height: u32,
+    ) -> Result<(render::FrameHitTargets, Vec<u8>)> {
+        let size = Size::<i32, Buffer>::from((width as i32, height as i32));
+        let recreate = self
+            .offscreen
+            .as_ref()
+            .is_none_or(|texture| texture.size() != size);
+        if recreate {
+            self.offscreen = Some(
+                <GlesRenderer as Offscreen<GlesTexture>>::create_buffer(
+                    &mut self.renderer,
+                    Fourcc::Xbgr8888,
+                    size,
+                )
+                .context("failed to create greeter GPU offscreen target")?,
+            );
+        }
+
+        let texture = self.offscreen.as_mut().expect("offscreen created");
+        let rect_f =
+            Rectangle::<f64, Buffer>::new((0.0, 0.0).into(), (width as f64, height as f64).into());
+        let rect_i =
+            Rectangle::<i32, Physical>::new((0, 0).into(), (width as i32, height as i32).into());
+        let physical_size = Size::<i32, Physical>::from((width as i32, height as i32));
+        let mut target = self.renderer.bind(texture)?;
+        let mut frame = self
+            .renderer
+            .render(&mut target, physical_size, Transform::Normal)?;
+        frame.render_pixel_shader_to(
+            &self.background_program,
+            rect_f,
+            rect_i,
+            size,
+            Some(std::slice::from_ref(&rect_i)),
+            1.0,
+            &[
+                Uniform::new("u_resolution", [width as f32, height as f32]),
+                Uniform::new("u_time", state.pulse_phase),
+            ],
+        )?;
+        let hit_targets = render::paint_frame_gpu(&mut frame, &self.atlas, width, height, state)?;
+        let sync = frame.finish()?;
+        self.renderer.wait(&sync)?;
+
+        self.renderer.with_context(|gl| unsafe {
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+        })?;
+        let region = Rectangle::<i32, Buffer>::new((0, 0).into(), size);
+        // ARGB8888 readback is BGRA byte order on little-endian systems, which
+        // is exactly the memory layout required by the XRGB8888 KMS buffer.
+        let mapping = self
+            .renderer
+            .copy_framebuffer(&target, region, Fourcc::Argb8888)?;
+        self.renderer.with_context(|gl| unsafe { gl.Finish() })?;
+        let pixels = self.renderer.map_texture(&mapping)?.to_vec();
+        Ok((hit_targets, pixels))
+    }
 }
 
 impl GreeterOutput {
@@ -276,24 +417,51 @@ impl GreeterOutput {
         let gbm = GbmDevice::new(fd.clone()).context("failed to create GBM device")?;
         let (width, height) = mode.size();
         let sizes = render::font_sizes(height as u32);
+        let background_style = select_background_style();
+        tracing::info!(
+            style = background_style.as_str(),
+            "selected greeter background"
+        );
 
-        let (bos, fbs, gpu) =
-            match try_open_gpu_scanout(&gbm, &fd, &plane_formats, width, height, sizes) {
-                Ok(gpu_path) => {
-                    tracing::info!(
-                        "greeter using GPU scanout path (GbmAllocator + framebuffer_from_bo)"
-                    );
-                    gpu_path
+        let (bos, fbs, gpu, direct_gpu_scanout) = match try_open_gpu_scanout(
+            &gbm,
+            &fd,
+            &plane_formats,
+            width,
+            height,
+            sizes,
+            background_style,
+        ) {
+            Ok(gpu_path) => {
+                tracing::info!(
+                    "greeter using GPU scanout path (GbmAllocator + framebuffer_from_bo)"
+                );
+                let (bos, fbs, gpu) = gpu_path;
+                (bos, fbs, gpu, true)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "direct GPU greeter scanout unavailable, trying GPU offscreen rendering"
+                );
+                let (bos, fbs) = make_cpu_buffers(&gbm, &fd, width, height)?;
+                match GpuRenderer::new(&gbm, sizes, background_style) {
+                    Ok(gpu) => {
+                        tracing::info!(
+                            "greeter using GPU offscreen rendering with linear KMS transfer"
+                        );
+                        (bos, fbs, Some(gpu), false)
+                    }
+                    Err(gpu_err) => {
+                        tracing::warn!(
+                            error = ?gpu_err,
+                            "GPU offscreen greeter unavailable, using CPU rendering"
+                        );
+                        (bos, fbs, None, false)
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = ?e,
-                        "GPU greeter scanout unavailable, falling back to CPU-mapped LINEAR buffers"
-                    );
-                    let (bos, fbs) = make_cpu_buffers(&gbm, &fd, width, height)?;
-                    (bos, fbs, None)
-                }
-            };
+            }
+        };
 
         fd.set_crtc(
             crtc_handle,
@@ -322,7 +490,9 @@ impl GreeterOutput {
             fbs,
             front: 0,
             flip_pending: false,
+            background_style,
             gpu,
+            direct_gpu_scanout,
         };
 
         Ok((output, notifier, libinput))
@@ -349,6 +519,10 @@ impl GreeterOutput {
 
     pub fn flip_pending(&self) -> bool {
         self.flip_pending
+    }
+
+    pub fn background_style(&self) -> render::BackgroundStyle {
+        self.background_style
     }
 
     /// Re-applies the CRTC after a `SessionEvent::ActivateSession`. Another
@@ -405,21 +579,34 @@ impl GreeterOutput {
         let back = 1 - self.front;
         let (width, height) = self.mode.size();
 
-        let layout = if self.gpu.is_some() {
+        let layout = if self.direct_gpu_scanout {
             let mut dmabuf = self.bos[back]
                 .export()
                 .context("failed to export greeter scanout buffer")?;
-            match self.gpu.as_mut().unwrap().render_to(
-                &mut dmabuf,
-                state,
-                width as u32,
-                height as u32,
-            ) {
-                Ok(layout) => layout,
-                Err(e) => {
-                    return Err(e).context("GPU greeter frame failed");
-                }
-            }
+            self.gpu
+                .as_mut()
+                .unwrap()
+                .render_to(&mut dmabuf, state, width as u32, height as u32)?
+        } else if let Some(gpu) = self.gpu.as_mut() {
+            let (layout, pixels) = gpu
+                .render_offscreen(state, width as u32, height as u32)
+                .context("GPU offscreen greeter frame failed")?;
+            let stride = self.bos[back].stride() as usize;
+            let row_bytes = width as usize * 4;
+            self.bos[back]
+                .map_mut(0, 0, width.into(), height.into(), |mapping| {
+                    let dst = mapping.buffer_mut();
+                    // OpenGL readback starts at the bottom row; KMS linear
+                    // buffers start at the top row.
+                    for y in 0..height as usize {
+                        let src_y = height as usize - 1 - y;
+                        let src = &pixels[src_y * row_bytes..(src_y + 1) * row_bytes];
+                        let dst_row = &mut dst[y * stride..y * stride + row_bytes];
+                        dst_row.copy_from_slice(src);
+                    }
+                })
+                .context("failed to transfer GPU frame into KMS buffer")?;
+            layout
         } else {
             let stride = self.bos[back].stride();
             self.bos[back]
@@ -430,6 +617,7 @@ impl GreeterOutput {
                         pointer: state.pointer,
                         power_menu_open: state.power_menu_open,
                         pulse_phase: state.pulse_phase,
+                        background_style: self.background_style,
                         paint_background: true,
                     };
 
@@ -552,8 +740,9 @@ fn try_open_gpu_scanout(
     width: u16,
     height: u16,
     sizes: render::FontSizes,
+    background_style: render::BackgroundStyle,
 ) -> Result<([GbmBuffer; 2], [GbmFramebuffer; 2], Option<GpuRenderer>)> {
-    let mut gpu = GpuRenderer::new(gbm, sizes)?;
+    let mut gpu = GpuRenderer::new(gbm, sizes, background_style)?;
     let egl_formats = gpu.egl_render_formats().clone();
     let mut allocator = GbmAllocator::new(
         gbm.clone(),
@@ -620,6 +809,33 @@ fn try_open_gpu_scanout(
     }
 
     Err(last_err)
+}
+
+fn select_background_style() -> render::BackgroundStyle {
+    match std::env::var("FOCALDM_BACKGROUND") {
+        Ok(value) if value.eq_ignore_ascii_case("aurora") => {
+            return render::BackgroundStyle::Aurora;
+        }
+        Ok(value) if value.eq_ignore_ascii_case("spiral") => {
+            return render::BackgroundStyle::SpiralTunnel;
+        }
+        Ok(value) if value.eq_ignore_ascii_case("random") => {}
+        Ok(value) => tracing::warn!(
+            value,
+            "unknown FOCALDM_BACKGROUND; expected aurora, spiral, or random"
+        ),
+        Err(_) => {}
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    if (nanos ^ u128::from(std::process::id())) & 1 == 0 {
+        render::BackgroundStyle::Aurora
+    } else {
+        render::BackgroundStyle::SpiralTunnel
+    }
 }
 
 fn configured_vt() -> Option<i32> {

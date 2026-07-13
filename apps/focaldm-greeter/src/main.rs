@@ -51,6 +51,7 @@ impl Greeter {
             pointer: self.pointer,
             power_menu_open: self.power_menu_open,
             pulse_phase: self.started_at.elapsed().as_secs_f32(),
+            background_style: self.output.background_style(),
             // Ignored by `GreeterOutput::render`, which decides for itself
             // whether the CPU fallback path needs to paint its own
             // background this frame; kept only because `FrameState` is

@@ -1,8 +1,8 @@
 //! High-level greeter frame composition.
 //!
-//! The greeter is deliberately software-rendered, so this module owns the
-//! whole visual language: background pulse, centered lock panel, readable
-//! text, and a clickable power menu.
+//! This module owns both the GLES and software implementations of the greeter's
+//! visual language: background pulse, centered lock panel, readable text, and
+//! a clickable power menu.
 
 use std::f32::consts::TAU;
 
@@ -14,6 +14,21 @@ use crate::font;
 use crate::glyph_atlas::{FontId, GlyphAtlas, IconId};
 use crate::ipc_client::AuthMessageStyle;
 use crate::login::LoginState;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackgroundStyle {
+    Aurora,
+    SpiralTunnel,
+}
+
+impl BackgroundStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Aurora => "aurora",
+            Self::SpiralTunnel => "spiral",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
@@ -60,6 +75,7 @@ pub struct FrameState<'a> {
     pub pointer: Option<(i32, i32)>,
     pub power_menu_open: bool,
     pub pulse_phase: f32,
+    pub background_style: BackgroundStyle,
     pub paint_background: bool,
 }
 
@@ -365,7 +381,7 @@ fn draw_power_icon(buf: &mut [u8], pitch: u32, rect: Rect, color: (u8, u8, u8), 
     );
 }
 
-fn background_color(x: i32, y: i32, w: i32, h: i32, phase: f32) -> (u8, u8, u8) {
+fn aurora_background_color(x: i32, y: i32, w: i32, h: i32, phase: f32) -> (u8, u8, u8) {
     let fx = x as f32 / w.max(1) as f32;
     let fy = y as f32 / h.max(1) as f32;
 
@@ -419,19 +435,76 @@ fn background_color(x: i32, y: i32, w: i32, h: i32, phase: f32) -> (u8, u8, u8) 
     )
 }
 
-fn paint_background(buf: &mut [u8], pitch: u32, width: i32, height: i32, phase: f32) {
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn spiral_background_color(x: i32, y: i32, w: i32, h: i32, time: f32) -> (u8, u8, u8) {
+    // Match the fragment shader's pixel-centre coordinates and bottom-left
+    // `gl_FragCoord` origin.
+    let resolution_y = h.max(1) as f32;
+    let mut uv_x = (x as f32 + 0.5 - w as f32 * 0.5) / resolution_y;
+    let mut uv_y = (h as f32 - y as f32 - 0.5 - h as f32 * 0.5) / resolution_y;
+
+    let rotation = (time * 1.25).sin() * 2.4;
+    let (sin_rotation, cos_rotation) = rotation.sin_cos();
+    (uv_x, uv_y) = (
+        cos_rotation * uv_x - sin_rotation * uv_y,
+        sin_rotation * uv_x + cos_rotation * uv_y,
+    );
+
+    let radius = uv_x.hypot(uv_y);
+    let angle = uv_y.atan2(uv_x);
+    let tunnel = (radius + 0.025).ln();
+    let rings = (tunnel * 18.0 - time * 4.0).sin();
+    let spiral = (angle * 7.0 + tunnel * 11.0 + time * 2.0).sin();
+    let bands = smoothstep(0.1, 0.9, rings * 0.6 + spiral * 0.4);
+    let color_phase = 0.5 + 0.5 * (angle * 3.0 + tunnel * 6.0).sin();
+    let orange = [1.0, 0.12, 0.02];
+    let violet = [0.18, 0.02, 0.75];
+    let center_glow = 0.045 / (radius + 0.04);
+
+    let channel = |index: usize, glow_scale: f32| {
+        let mixed = orange[index] * (1.0 - color_phase) + violet[index] * color_phase;
+        ((mixed * bands + center_glow * glow_scale).clamp(0.0, 1.0) * 255.0) as u8
+    };
+
+    (channel(0, 1.0), channel(1, 0.5), channel(2, 0.2))
+}
+
+fn paint_background(
+    buf: &mut [u8],
+    pitch: u32,
+    width: i32,
+    height: i32,
+    phase: f32,
+    style: BackgroundStyle,
+) {
     let _phase_sin = phase.sin();
     let _phase_cos = phase.cos();
     for y in 0..height {
         for x in 0..width {
-            let (r, g, b) = background_color(x, y, width, height, phase);
+            let (r, g, b) = match style {
+                BackgroundStyle::Aurora => aurora_background_color(x, y, width, height, phase),
+                BackgroundStyle::SpiralTunnel => {
+                    spiral_background_color(x, y, width, height, phase)
+                }
+            };
             blend_pixel(buf, pitch, x, y, (r, g, b), 255);
         }
     }
 }
 
 pub fn fill_background(buf: &mut [u8], pitch: u32, width: u32, height: u32) {
-    paint_background(buf, pitch, width as i32, height as i32, 0.0);
+    paint_background(
+        buf,
+        pitch,
+        width as i32,
+        height as i32,
+        0.0,
+        BackgroundStyle::Aurora,
+    );
 }
 
 fn prompt_line(state: &LoginState) -> String {
@@ -566,7 +639,14 @@ pub fn paint_frame(
     let width = width as i32;
     let height = height as i32;
     if state.paint_background {
-        paint_background(buf, pitch, width, height, state.pulse_phase);
+        paint_background(
+            buf,
+            pitch,
+            width,
+            height,
+            state.pulse_phase,
+            state.background_style,
+        );
     }
 
     let panel_w = (width as f32 * 0.42).clamp(420.0, 700.0) as i32;
@@ -1639,6 +1719,7 @@ mod tests {
                 pointer: Some((0, 0)),
                 power_menu_open: false,
                 pulse_phase: 0.0,
+                background_style: BackgroundStyle::Aurora,
                 paint_background: true,
             },
             FrameState {
@@ -1646,6 +1727,7 @@ mod tests {
                 pointer: Some((0, 0)),
                 power_menu_open: false,
                 pulse_phase: 0.8,
+                background_style: BackgroundStyle::Aurora,
                 paint_background: true,
             },
             FrameState {
@@ -1653,6 +1735,7 @@ mod tests {
                 pointer: Some((0, 0)),
                 power_menu_open: true,
                 pulse_phase: 1.2,
+                background_style: BackgroundStyle::SpiralTunnel,
                 paint_background: true,
             },
         ];

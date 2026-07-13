@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="760" viewBox="0 0 1200 760"
+     role="img" aria-label="FocalDesk logo">
+  <defs>
+    <linearGradient id="orangeTop" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#ff5d0b"/>
+      <stop offset="72%" stop-color="#ff6b08"/>
+      <stop offset="100%" stop-color="#ffb92e"/>
+    </linearGradient>
+    <linearGradient id="orangeBottom" x1="0%" y1="50%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#ff650d"/>
+      <stop offset="72%" stop-color="#ff6b08"/>
+      <stop offset="100%" stop-color="#ffb92e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Corner brackets -->
+  <path fill="#ffb92e" d="M279 114H361V126H291V196H279Z"/>
+  <path fill="#ffb92e" d="M839 114H921V196H909V126H839Z"/>
+  <path fill="#ffb92e" d="M279 394H291V464H361V476H279Z"/>
+  <path fill="#ffb92e" d="M909 394H921V476H839V464H909Z"/>
+
+  <!-- Upper arcs -->
+  <path d="M329 250
+           C383 131 493 105 612 105
+           C738 105 831 143 875 220"
+        fill="none" stroke="url(#orangeTop)" stroke-width="11"
+        stroke-linecap="round"/>
+
+  <path d="M369 270
+           C431 167 531 130 649 130
+           C771 130 854 168 900 245"
+        fill="none" stroke="#26b7ef" stroke-width="8"
+        stroke-linecap="round"/>
+
+  <!-- Lower arcs -->
+  <path d="M335 335
+           C389 431 495 470 617 470
+           C741 470 830 430 875 350"
+        fill="none" stroke="url(#orangeBottom)" stroke-width="9"
+        stroke-linecap="round"/>
+
+  <path d="M365 325
+           C419 414 516 457 637 457
+           C764 457 856 417 900 345"
+        fill="none" stroke="#26b7ef" stroke-width="8"
+        stroke-linecap="round"/>
+
+  <!-- Orange focus point -->
+  <circle cx="892" cy="274" r="7" fill="#ff650d"/>
+</svg>

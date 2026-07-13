@@ -556,12 +556,10 @@ fn ensure_xdpw_screencast_config() {
     }
 }
 
-/// Explicitly start `graphical-session.target` (best-effort) so the per-domain
-/// helper daemons (`WantedBy=graphical-session.target`) come up promptly. Some
-/// login-manager/logind configurations activate this target implicitly on a
-/// registered Wayland session, but not all — sway and other wlroots compositors
-/// do this explicitly for the same reason rather than relying on it.
-fn start_graphical_session_target(wayland_display: &str) {
+/// Start FocalDesk's session target after publishing the compositor environment.
+/// The dedicated target owns the helper-service lifecycle without making
+/// FocalDesk responsible for the shared `graphical-session.target`.
+fn start_focaldesk_session_target(wayland_display: &str) {
     let import_status = std::process::Command::new("systemctl")
         .args([
             "--user",
@@ -577,35 +575,35 @@ fn start_graphical_session_target(wayland_display: &str) {
     }
 
     let start_status = std::process::Command::new("systemctl")
-        .args(["--user", "start", "--no-block", "graphical-session.target"])
+        .args(["--user", "start", "--no-block", "focaldesk-session.target"])
         .status();
     match start_status {
         Ok(status) if status.success() => flog(format!(
-            "started graphical-session.target for {wayland_display}"
+            "started focaldesk-session.target for {wayland_display}"
         )),
         Ok(status) => flog(format!(
-            "failed to start graphical-session.target: systemctl exited with {status}"
+            "failed to start focaldesk-session.target: systemctl exited with {status}"
         )),
         Err(err) => flog(format!(
-            "failed to start graphical-session.target: systemctl: {err}"
+            "failed to start focaldesk-session.target: systemctl: {err}"
         )),
     }
 }
 
-/// Counterpart to [`start_graphical_session_target`], called once on clean compositor
+/// Counterpart to [`start_focaldesk_session_target`], called once on clean compositor
 /// exit (real DRM session only) so the per-domain helper daemons stop with the session
 /// instead of being left running orphaned until the next login.
-pub(crate) fn stop_graphical_session_target() {
+pub(crate) fn stop_focaldesk_session_target() {
     let status = std::process::Command::new("systemctl")
-        .args(["--user", "stop", "--no-block", "graphical-session.target"])
+        .args(["--user", "stop", "--no-block", "focaldesk-session.target"])
         .status();
     match status {
-        Ok(status) if status.success() => flog("stopped graphical-session.target"),
+        Ok(status) if status.success() => flog("stopped focaldesk-session.target"),
         Ok(status) => flog(format!(
-            "failed to stop graphical-session.target: systemctl exited with {status}"
+            "failed to stop focaldesk-session.target: systemctl exited with {status}"
         )),
         Err(err) => flog(format!(
-            "failed to stop graphical-session.target: systemctl: {err}"
+            "failed to stop focaldesk-session.target: systemctl: {err}"
         )),
     }
 }
@@ -776,8 +774,8 @@ pub(crate) fn bootstrap_compositor_core(
     if backend == BackendKind::Drm {
         // Nested/winit dev sessions typically run inside an already-active desktop
         // session; only the real DRM-backed session should touch the shared
-        // graphical-session.target (the matching stop lives in backend::drm::run).
-        start_graphical_session_target(&wayland_display);
+        // FocalDesk session target (the matching stop lives in backend::drm::run).
+        start_focaldesk_session_target(&wayland_display);
     }
     flog(format!("FocalDesk client socket is {}", wayland_display));
 
