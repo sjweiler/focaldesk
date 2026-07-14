@@ -235,7 +235,7 @@ pub fn build_ui_for_output_with_options(
 
     let mut flow_field = UiElement::topbar_indicator(
         TOPBAR_FLOW_FIELD_ID,
-        IconId::Launcher,
+        IconId::AiConsole,
         "Launch FocalDesk AI Console",
     );
     flow_field.kind = UiElementKind::TopbarFlowField;
@@ -330,6 +330,8 @@ pub fn build_ui_for_output_with_options(
 #[cfg(test)]
 mod tests {
     use super::hdr_tooltip;
+    use crate::atlas::IconId;
+    use crate::element::UiElement;
     use crate::ui_builder::{
         SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID,
         SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions,
@@ -420,14 +422,15 @@ mod tests {
 
     #[test]
     fn topbar_flow_field_launches_ai_console_directly() {
-        let action = build_flow_field_action();
+        let flow_field = build_flow_field();
         assert!(matches!(
-            action,
-            UiAction::LaunchApp("focaldesk-ai-console")
+            flow_field.action.as_ref(),
+            Some(UiAction::LaunchApp("focaldesk-ai-console"))
         ));
+        assert_eq!(flow_field.icon, Some(IconId::AiConsole));
     }
 
-    fn build_flow_field_action() -> UiAction {
+    fn build_flow_field() -> UiElement {
         let output_size = smithay::utils::Size::from((1920, 1080));
         let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
         let mut ui = UiTree::default();
@@ -435,7 +438,7 @@ mod tests {
         ui.elements
             .iter()
             .find(|el| el.id == TOPBAR_FLOW_FIELD_ID)
-            .and_then(|el| el.action.clone())
-            .expect("flow field action")
+            .cloned()
+            .expect("flow field")
     }
 }

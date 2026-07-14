@@ -6,7 +6,7 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::atlas::{IconAtlas, IconId};
+use crate::atlas::{IconAtlas, IconId, render_atlas_icon_with_alpha};
 use crate::chrome::ChromeMetrics;
 use crate::chrome_layout::ChromeLayoutLogical;
 use crate::chrome_shaders::ChromeShaders;
@@ -381,6 +381,26 @@ pub fn draw_chrome_trim_glass_icons(
                         energy,
                         color,
                     );
+                }
+
+                if let Some(icon_id) = el.icon {
+                    if let Some(entry) = atlas.get(icon_id) {
+                        let icon_px = base_rect_logical.size.h.min(28).max(1);
+                        let icon_rect = icon_rect_in_module(base_rect_logical, icon_px);
+                        let icon_rect = to_physical_rect(icon_rect, frame_ctx.output_scale);
+                        let output_size = Size::<i32, Physical>::from(frame_ctx.output_size);
+                        let _ = render_atlas_icon_with_alpha(
+                            frame,
+                            &atlas.texture,
+                            *entry,
+                            icon_rect.loc.x,
+                            icon_rect.loc.y,
+                            icon_rect.size.w,
+                            icon_rect.size.h,
+                            output_size,
+                            style.alpha,
+                        );
+                    }
                 }
             }
             UiElementKind::Clock => {
