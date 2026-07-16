@@ -191,6 +191,8 @@ pub fn prepare_output(
             hdr_supported,
             hdr_requested,
             hdr_kms_applied,
+            microphone_detected: state.microphone_detected,
+            voice_capture_status: state.voice_capture_status,
             workspace_count,
             max_workspace_slots: state.workspaces.max_workspace_slots as usize,
             active_workspace,

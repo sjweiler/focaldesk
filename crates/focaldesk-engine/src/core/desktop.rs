@@ -72,14 +72,16 @@ use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
 use focaldesk_ipc::{
     send_control_request, send_notification_request, send_power_request, ControlIpcRequest,
-    ControlIpcResponse, ControlSetting, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
-    NotificationIpcRequest, NotificationIpcResponse, PowerIpcRequest, PowerIpcResponse,
-    DESKTOP_SOCKET_PATH,
+    ControlIpcResponse, ControlSetting, DesktopAction, DesktopDirection,
+    DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, NotificationIpcRequest,
+    NotificationIpcResponse, PowerIpcRequest, PowerIpcResponse, DESKTOP_SOCKET_PATH,
 };
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
 use focaldesk_notifications::NotificationSnapshot;
-use focaldesk_power::{PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
+use focaldesk_power::{
+    PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
+};
 use focaldesk_settings_core::{
     load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
     DisplayColorProfile, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
@@ -99,6 +101,9 @@ use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
+use smithay::wayland::pointer_constraints::{
+    with_pointer_constraint, PointerConstraint, PointerConstraintsState,
+};
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::PopupSurface;
@@ -135,7 +140,9 @@ use crate::core::toplevel_interaction::{
     cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
     ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
-use crate::core::ui_builder::{build_ui_for_output_with_options, AiFlowMode, UiBuildOptions};
+use crate::core::ui_builder::{
+    build_ui_for_output_with_options, AiFlowMode, UiBuildOptions, VoiceCaptureStatus,
+};
 use focaldesk_ai::{send_ai_request, AiDaemonStatus, AiIpcRequest, AiIpcResponse};
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
@@ -147,6 +154,52 @@ use focaldesk_ui::ui_builder::{
     sidebar_workspace_number, SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID,
     SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID,
 };
+
+fn mic_command(command: &str) -> io::Result<String> {
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    let mut stream = UnixStream::connect(runtime.join("focald-mic.sock"))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    write!(stream, r#"{{"command":"{command}"}}"#)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn voice_capture_status(response: &str) -> Option<VoiceCaptureStatus> {
+    let status = serde_json::from_str::<serde_json::Value>(response)
+        .ok()?
+        .get("status")?
+        .as_str()?
+        .to_owned();
+    match status.as_str() {
+        "idle" => Some(VoiceCaptureStatus::Idle),
+        "starting" => Some(VoiceCaptureStatus::Starting),
+        "listening" => Some(VoiceCaptureStatus::Listening),
+        "stopping" => Some(VoiceCaptureStatus::Stopping),
+        _ => None,
+    }
+}
+
+fn toggle_voice_capture(status_tx: mpsc::Sender<VoiceCaptureStatus>) {
+    let _ = thread::Builder::new()
+        .name("focaldesk-voice-toggle".into())
+        .spawn(move || match mic_command("toggle") {
+            Ok(response) => {
+                flog_info!("voice capture: {}", response.trim());
+                let status =
+                    voice_capture_status(&response).unwrap_or(VoiceCaptureStatus::Unavailable);
+                let _ = status_tx.send(status);
+            }
+            Err(err) => {
+                flog_warn!("voice capture toggle failed: {err}");
+                let _ = status_tx.send(VoiceCaptureStatus::Unavailable);
+            }
+        });
+}
 
 fn clamp_rect_to_bounds(
     mut geometry: Rectangle<i32, Logical>,
@@ -507,6 +560,7 @@ pub struct DesktopInit {
     pub output_manager_state: OutputManagerState,
     pub data_device_state: DataDeviceState,
     pub primary_selection_state: PrimarySelectionState,
+    pub pointer_constraints_state: PointerConstraintsState,
     pub relative_pointer_state: RelativePointerManagerState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
@@ -585,6 +639,7 @@ pub struct DesktopState {
     pub(crate) clipboard_capture_tx: mpsc::Sender<(String, String)>,
     clipboard_capture_rx: mpsc::Receiver<(String, String)>,
     pub(crate) clipboard_pending_captures: Vec<String>,
+    pub pointer_constraints_state: PointerConstraintsState,
     pub relative_pointer_state: RelativePointerManagerState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
     pub image_capture_source_state: smithay::wayland::image_capture_source::ImageCaptureSourceState,
@@ -625,6 +680,7 @@ pub struct DesktopState {
     last_user_activity_at: Instant,
     idle_lock_triggered: bool,
     idle_suspend_triggered: bool,
+    deferred_power_action: Option<(PowerIpcRequest, &'static str)>,
     low_battery_triggered: bool,
     lid_close_triggered: bool,
     last_lid_state: Option<bool>,
@@ -632,6 +688,16 @@ pub struct DesktopState {
     last_power_poll_at: Instant,
     last_power_snapshot: Option<PowerSnapshot>,
     last_notification_poll_at: Instant,
+    pub(crate) microphone_detected: bool,
+    microphone_detection_tx: mpsc::Sender<bool>,
+    microphone_detection_rx: mpsc::Receiver<bool>,
+    microphone_detection_in_flight: bool,
+    last_microphone_detection_at: Instant,
+    pub(crate) voice_capture_status: VoiceCaptureStatus,
+    voice_capture_status_tx: mpsc::Sender<VoiceCaptureStatus>,
+    voice_capture_status_rx: mpsc::Receiver<VoiceCaptureStatus>,
+    voice_capture_status_in_flight: bool,
+    last_voice_capture_status_at: Instant,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
     pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
@@ -714,6 +780,12 @@ pub struct DesktopState {
     pending_focus_window: Option<WindowId>,
     next_launch_trace_id: u64,
     //pub popups: Vec<PopupState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerActionInteraction {
+    Interactive,
+    NonInteractive,
 }
 
 #[derive(Clone)]
@@ -959,6 +1031,9 @@ impl DesktopState {
             let elapsed = now.saturating_duration_since(pulse.started_at);
             if pulse.kind == LockPulseKind::Accepted && elapsed >= LOCK_PULSE_DURATION {
                 self.lock_screen.unlock();
+                if let Some((action, context)) = self.deferred_power_action.take() {
+                    power_service_command(action, context, PowerActionInteraction::Interactive);
+                }
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 return;
             }
@@ -985,7 +1060,11 @@ impl DesktopState {
             let suspend_timeout = Duration::from_secs(u64::from(suspend_timeout) * 60);
             if idle_for >= suspend_timeout && !self.idle_suspend_triggered {
                 self.idle_suspend_triggered = true;
-                power_service_command(PowerIpcRequest::Suspend, "idle suspend");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Suspend,
+                    "idle suspend",
+                    PowerActionInteraction::NonInteractive,
+                );
             }
         }
     }
@@ -1020,6 +1099,65 @@ impl DesktopState {
 
         self.low_battery_triggered = true;
         self.handle_low_battery_action(&snapshot);
+    }
+
+    pub fn process_audio_device_timers(&mut self) {
+        while let Ok(detected) = self.microphone_detection_rx.try_recv() {
+            self.microphone_detection_in_flight = false;
+            if self.microphone_detected != detected {
+                self.microphone_detected = detected;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+        }
+
+        while let Ok(status) = self.voice_capture_status_rx.try_recv() {
+            self.voice_capture_status_in_flight = false;
+            if self.voice_capture_status != status {
+                self.voice_capture_status = status;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+        }
+
+        let now = Instant::now();
+        if !self.microphone_detection_in_flight
+            && now.saturating_duration_since(self.last_microphone_detection_at)
+                >= Duration::from_secs(2)
+        {
+            self.last_microphone_detection_at = now;
+            self.microphone_detection_in_flight = true;
+            let result_tx = self.microphone_detection_tx.clone();
+            if thread::Builder::new()
+                .name("focaldesk-microphone-detection".to_string())
+                .spawn(move || {
+                    let _ = result_tx.send(focaldesk_audio::microphone_detected());
+                })
+                .is_err()
+            {
+                self.microphone_detection_in_flight = false;
+            }
+        }
+
+        if !self.voice_capture_status_in_flight
+            && now.saturating_duration_since(self.last_voice_capture_status_at)
+                >= Duration::from_millis(500)
+        {
+            self.last_voice_capture_status_at = now;
+            self.voice_capture_status_in_flight = true;
+            let result_tx = self.voice_capture_status_tx.clone();
+            if thread::Builder::new()
+                .name("focaldesk-voice-capture-status".to_string())
+                .spawn(move || {
+                    let status = mic_command("status")
+                        .ok()
+                        .and_then(|response| voice_capture_status(&response))
+                        .unwrap_or(VoiceCaptureStatus::Unavailable);
+                    let _ = result_tx.send(status);
+                })
+                .is_err()
+            {
+                self.voice_capture_status_in_flight = false;
+            }
+        }
     }
 
     fn record_user_activity(&mut self) {
@@ -1092,16 +1230,28 @@ impl DesktopState {
             LowBatteryAction::Suspend => {
                 notification_service_notify("Power", format!("{message}. Suspending."), None);
                 self.lock_session();
-                power_service_command(PowerIpcRequest::Suspend, "low battery suspend");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Suspend,
+                    "low battery suspend",
+                    PowerActionInteraction::NonInteractive,
+                );
             }
             LowBatteryAction::Hibernate => {
                 notification_service_notify("Power", format!("{message}. Hibernating."), None);
                 self.lock_session();
-                power_service_command(PowerIpcRequest::Hibernate, "low battery hibernate");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Hibernate,
+                    "low battery hibernate",
+                    PowerActionInteraction::NonInteractive,
+                );
             }
             LowBatteryAction::PowerOff => {
                 notification_service_notify("Power", format!("{message}. Powering off."), None);
-                power_service_command(PowerIpcRequest::PowerOff, "low battery poweroff");
+                self.dispatch_power_action(
+                    PowerIpcRequest::PowerOff,
+                    "low battery poweroff",
+                    PowerActionInteraction::NonInteractive,
+                );
             }
         }
     }
@@ -1110,7 +1260,11 @@ impl DesktopState {
         match self.power.lid_close_action {
             LidCloseAction::Suspend => {
                 self.lock_session();
-                power_service_command(PowerIpcRequest::Suspend, "lid close suspend");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Suspend,
+                    "lid close suspend",
+                    PowerActionInteraction::NonInteractive,
+                );
             }
             LidCloseAction::BlankScreen | LidCloseAction::LockScreen => {
                 self.lock_session();
@@ -1229,6 +1383,12 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
                 Some(IpcResponse::Notification { id })
             }
+            IpcRequest::ExecuteDesktopAction { action } => {
+                Some(match self.execute_desktop_action(action) {
+                    Ok(()) => IpcResponse::Ok,
+                    Err(message) => IpcResponse::Error { message },
+                })
+            }
             IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),
@@ -1243,6 +1403,76 @@ impl DesktopState {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
             }),
         }
+    }
+
+    fn execute_desktop_action(&mut self, action: DesktopAction) -> Result<(), String> {
+        match action {
+            DesktopAction::LaunchApp { app } => {
+                self.launch_app(app);
+            }
+            DesktopAction::FocusWorkspace { workspace } => {
+                if workspace == 0 || workspace as usize > self.workspace_names.len() {
+                    return Err(format!("workspace {workspace} does not exist"));
+                }
+                self.set_focused_workspace(WorkspaceId(workspace));
+            }
+            DesktopAction::MoveFocusedToOutput { output } => {
+                let mut output_ids: Vec<_> = self.outputs.keys().copied().collect();
+                output_ids.sort_by_key(|id| id.0);
+                let target = output_ids
+                    .get(output as usize)
+                    .copied()
+                    .ok_or_else(|| format!("output {output} does not exist"))?;
+                let focused = self.focused_window.ok_or("no focused window")?;
+                let window = self
+                    .window(focused)
+                    .map(|managed| managed.window.clone())
+                    .ok_or("focused window no longer exists")?;
+                let location = self.default_toplevel_map_location(target);
+                self.space.map_element(window, location, true);
+                if let Some(managed) = self.window_mut(focused) {
+                    managed.output = Some(target);
+                }
+                self.set_focused_output(target);
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+            DesktopAction::MoveFocused { direction } => {
+                const STEP: i32 = 80;
+                let focused = self.focused_window.ok_or("no focused window")?;
+                let window = self
+                    .window(focused)
+                    .map(|managed| managed.window.clone())
+                    .ok_or("focused window no longer exists")?;
+                let mut location = self
+                    .space
+                    .element_location(&window)
+                    .ok_or("focused window is not mapped")?;
+                match direction {
+                    DesktopDirection::Left => location.x -= STEP,
+                    DesktopDirection::Right => location.x += STEP,
+                    DesktopDirection::Up => location.y -= STEP,
+                    DesktopDirection::Down => location.y += STEP,
+                }
+                let location =
+                    self.clamp_window_location_to_work_recess(&window, location, self.pointer_pos);
+                self.space.map_element(window, location, true);
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+            DesktopAction::CloseFocused => self.close_focused(),
+            DesktopAction::SetVolume { percent } => {
+                if percent > 100 {
+                    return Err(format!("volume {percent}% is out of range"));
+                }
+                match send_control_request(&ControlIpcRequest::SetVolume {
+                    volume: f32::from(percent) / 100.0,
+                }) {
+                    Ok(ControlIpcResponse::Ok) => {}
+                    Ok(ControlIpcResponse::Error { message }) => return Err(message),
+                    Err(err) => return Err(format!("control service unavailable: {err}")),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn apply_debug_settings(&mut self, debug: DebugSettings) {
@@ -1495,6 +1725,7 @@ impl DesktopState {
                 profile: profile.to_string(),
             },
             &format!("apply performance mode {profile}"),
+            PowerActionInteraction::NonInteractive,
         );
     }
 
@@ -1674,6 +1905,8 @@ impl DesktopState {
                 hdr_supported: output.hdr_supported,
                 hdr_requested: output.hdr_requested,
                 hdr_kms_applied: output.hdr_kms_applied,
+                microphone_detected: self.microphone_detected,
+                voice_capture_status: self.voice_capture_status,
                 workspace_count: self.workspace_names.len(),
                 max_workspace_slots: self.workspaces.max_workspace_slots as usize,
                 active_workspace: output.active_workspace.0,
@@ -2661,15 +2894,14 @@ impl DesktopState {
 
     fn forward_pointer_relative_motion(
         &mut self,
-        previous_pos: Point<f64, Logical>,
         pos: Point<f64, Logical>,
+        delta: Point<f64, Logical>,
         delta_unaccel: Point<f64, Logical>,
     ) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        let delta = pos - previous_pos;
-        if delta.x == 0.0 && delta.y == 0.0 {
+        if delta.x == 0.0 && delta.y == 0.0 && delta_unaccel.x == 0.0 && delta_unaccel.y == 0.0 {
             return;
         }
         let under = self.pointer_surface_under(pos);
@@ -2682,6 +2914,101 @@ impl DesktopState {
                 utime: u64::from(Self::wl_pointer_time_ms()) * 1000,
             },
         );
+    }
+
+    /// Apply an active pointer lock or confinement to an absolute cursor
+    /// proposal. Relative motion is still delivered separately using the raw
+    /// device delta.
+    fn constrained_pointer_position(
+        &self,
+        previous: Point<f64, Logical>,
+        proposed: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return proposed;
+        };
+        let Some((current_target, current_surface_loc)) = self.pointer_surface_under(previous)
+        else {
+            return proposed;
+        };
+        let Some(current_surface) = current_target.wl_surface() else {
+            return proposed;
+        };
+
+        with_pointer_constraint(current_surface.as_ref(), &pointer, |constraint| {
+            let Some(constraint) = constraint.filter(|constraint| constraint.is_active()) else {
+                return proposed;
+            };
+
+            match &*constraint {
+                PointerConstraint::Locked(_) => previous,
+                PointerConstraint::Confined(_) => {
+                    let Some((proposed_target, proposed_surface_loc)) =
+                        self.pointer_surface_under(proposed)
+                    else {
+                        return previous;
+                    };
+                    let same_surface = proposed_target
+                        .wl_surface()
+                        .is_some_and(|surface| surface.as_ref() == current_surface.as_ref());
+                    let inside_region = constraint.region().is_none_or(|region| {
+                        region.contains((proposed - proposed_surface_loc).to_i32_round())
+                    });
+                    if same_surface && inside_region {
+                        proposed
+                    } else {
+                        // Keep the cursor at the last valid location rather than
+                        // clipping a raw delta and feeding that distortion back
+                        // into the client.
+                        let _ = current_surface_loc;
+                        previous
+                    }
+                }
+            }
+        })
+    }
+
+    fn activate_pointer_constraint_at(&self, position: Point<f64, Logical>) {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let Some((target, surface_loc)) = self.pointer_surface_under(position) else {
+            return;
+        };
+        let Some(surface) = target.wl_surface() else {
+            return;
+        };
+
+        with_pointer_constraint(surface.as_ref(), &pointer, |constraint| {
+            let Some(constraint) = constraint.filter(|constraint| !constraint.is_active()) else {
+                return;
+            };
+            let local = (position - surface_loc).to_i32_round();
+            if constraint
+                .region()
+                .is_none_or(|region| region.contains(local))
+            {
+                constraint.activate();
+            }
+        });
+    }
+
+    fn pointer_lock_active_at(&self, position: Point<f64, Logical>) -> bool {
+        let Some(pointer) = self.seat.get_pointer() else {
+            return false;
+        };
+        let Some((target, _)) = self.pointer_surface_under(position) else {
+            return false;
+        };
+        let Some(surface) = target.wl_surface() else {
+            return false;
+        };
+
+        with_pointer_constraint(surface.as_ref(), &pointer, |constraint| {
+            constraint.is_some_and(|constraint| {
+                constraint.is_active() && matches!(&*constraint, PointerConstraint::Locked(_))
+            })
+        })
     }
 
     fn forward_pointer_button(
@@ -2952,20 +3279,36 @@ impl DesktopState {
             }
             focaldesk_ui::types::SystemCommand::Suspend => {
                 self.lock_session();
-                power_service_command(PowerIpcRequest::Suspend, "system suspend");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Suspend,
+                    "system suspend",
+                    PowerActionInteraction::Interactive,
+                );
             }
             focaldesk_ui::types::SystemCommand::Hibernate => {
                 self.lock_session();
-                power_service_command(PowerIpcRequest::Hibernate, "system hibernate");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Hibernate,
+                    "system hibernate",
+                    PowerActionInteraction::Interactive,
+                );
             }
             focaldesk_ui::types::SystemCommand::Logout => {
                 self.running = false;
             }
             focaldesk_ui::types::SystemCommand::Restart => {
-                power_service_command(PowerIpcRequest::Reboot, "system reboot");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Reboot,
+                    "system reboot",
+                    PowerActionInteraction::Interactive,
+                );
             }
             focaldesk_ui::types::SystemCommand::Shutdown => {
-                power_service_command(PowerIpcRequest::PowerOff, "system poweroff");
+                self.dispatch_power_action(
+                    PowerIpcRequest::PowerOff,
+                    "system poweroff",
+                    PowerActionInteraction::Interactive,
+                );
             }
         }
     }
@@ -2980,10 +3323,18 @@ impl DesktopState {
             }
             PowerButtonAction::Suspend => {
                 self.lock_session();
-                power_service_command(PowerIpcRequest::Suspend, "power button suspend");
+                self.dispatch_power_action(
+                    PowerIpcRequest::Suspend,
+                    "power button suspend",
+                    PowerActionInteraction::Interactive,
+                );
             }
             PowerButtonAction::PowerOff => {
-                power_service_command(PowerIpcRequest::PowerOff, "power button poweroff");
+                self.dispatch_power_action(
+                    PowerIpcRequest::PowerOff,
+                    "power button poweroff",
+                    PowerActionInteraction::Interactive,
+                );
             }
             PowerButtonAction::DoNothing => {}
         }
@@ -2995,6 +3346,61 @@ impl DesktopState {
         self.clear_client_pointer_focus(self.pointer_pos);
         self.lock_screen.lock();
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    /// A PolicyKit dialog cannot safely receive input underneath the lock
+    /// screen. Ask logind first and defer challenge-requiring actions until
+    /// the user has successfully unlocked the session.
+    fn dispatch_power_action(
+        &mut self,
+        action: PowerIpcRequest,
+        context: &'static str,
+        interaction: PowerActionInteraction,
+    ) {
+        let interaction = power_action_interaction(&action, self.lock_screen.active, interaction);
+        let Some(command) = session_power_command(&action) else {
+            power_service_command(action, context, interaction);
+            return;
+        };
+
+        // Policy-driven actions must never create an authentication prompt.
+        // logind will perform them if already authorized and reject them
+        // otherwise, leaving the configured policy as the source of authority.
+        if interaction == PowerActionInteraction::NonInteractive {
+            power_service_command(action, context, interaction);
+            return;
+        }
+
+        // A newer power request supersedes anything previously waiting for
+        // unlock, preventing a stale action from firing after resume.
+        self.deferred_power_action = None;
+
+        if self.lock_screen.active {
+            match PowerManager::new().authorization(command) {
+                Ok(PowerAuthorization::Challenge) => {
+                    self.lock_screen.message =
+                        format!("Unlock to {}", power_action_description(command));
+                    self.lock_screen.clear_password();
+                    self.deferred_power_action = Some((action, context));
+                    self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    return;
+                }
+                Err(err) => {
+                    // Fail closed while locked: never launch an interactive
+                    // authorization prompt that the overlay makes unreachable.
+                    flog_warn!("could not check {context} authorization; deferring: {err}");
+                    self.lock_screen.message =
+                        format!("Unlock to {}", power_action_description(command));
+                    self.lock_screen.clear_password();
+                    self.deferred_power_action = Some((action, context));
+                    self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    return;
+                }
+                Ok(PowerAuthorization::Allowed | PowerAuthorization::Unavailable) => {}
+            }
+        }
+
+        power_service_command(action, context, interaction);
     }
 
     fn submit_lock_password(&mut self) {
@@ -4357,6 +4763,8 @@ impl DesktopState {
         let debug = init.debug.clone();
         apply_debug_log_level(debug.log_level);
         let (clipboard_capture_tx, clipboard_capture_rx) = mpsc::channel();
+        let (microphone_detection_tx, microphone_detection_rx) = mpsc::channel();
+        let (voice_capture_status_tx, voice_capture_status_rx) = mpsc::channel();
         let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -4398,6 +4806,7 @@ impl DesktopState {
             clipboard_capture_tx: clipboard_capture_tx.clone(),
             clipboard_capture_rx,
             clipboard_pending_captures: Vec::new(),
+            pointer_constraints_state: init.pointer_constraints_state,
             relative_pointer_state: init.relative_pointer_state,
             layer_shell_state: init.layer_shell_state,
             image_capture_source_state: init.image_capture_source_state,
@@ -4434,6 +4843,7 @@ impl DesktopState {
             last_user_activity_at: Instant::now(),
             idle_lock_triggered: false,
             idle_suspend_triggered: false,
+            deferred_power_action: None,
             low_battery_triggered: false,
             lid_close_triggered: false,
             last_lid_state: None,
@@ -4441,6 +4851,16 @@ impl DesktopState {
             last_power_poll_at: Instant::now(),
             last_power_snapshot: None,
             last_notification_poll_at: Instant::now(),
+            microphone_detected: false,
+            microphone_detection_tx,
+            microphone_detection_rx,
+            microphone_detection_in_flight: false,
+            last_microphone_detection_at: Instant::now() - Duration::from_secs(2),
+            voice_capture_status: VoiceCaptureStatus::Unavailable,
+            voice_capture_status_tx,
+            voice_capture_status_rx,
+            voice_capture_status_in_flight: false,
+            last_voice_capture_status_at: Instant::now() - Duration::from_millis(500),
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
@@ -5225,6 +5645,19 @@ impl DesktopState {
             KeyAction::ToggleClipboardHistory => {
                 self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::ClipboardHistory));
             }
+            KeyAction::ToggleVoiceCapture => {
+                self.voice_capture_status = match self.voice_capture_status {
+                    VoiceCaptureStatus::Unavailable | VoiceCaptureStatus::Idle => {
+                        VoiceCaptureStatus::Starting
+                    }
+                    VoiceCaptureStatus::Starting | VoiceCaptureStatus::Listening => {
+                        VoiceCaptureStatus::Stopping
+                    }
+                    VoiceCaptureStatus::Stopping => VoiceCaptureStatus::Stopping,
+                };
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                toggle_voice_capture(self.voice_capture_status_tx.clone());
+            }
         }
     }
 
@@ -5771,9 +6204,12 @@ impl DesktopState {
 
             FlowInputEvent::PointerMoved {
                 position,
+                delta,
                 delta_unaccel,
             } => {
                 let previous_pos = self.pointer_pos;
+                let pointer_locked = self.pointer_lock_active_at(previous_pos);
+                let position = self.constrained_pointer_position(previous_pos, position);
                 self.input.pointer_pos = position;
                 self.pointer_pos = position;
                 if let Some(id) = self.output_under_pointer(position) {
@@ -5829,9 +6265,18 @@ impl DesktopState {
                 let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
                 self.update_pointer_cursor(position);
                 if !self.compositor_pointer_grab_active() {
-                    self.forward_pointer_to_clients(position);
-                    if let Some(delta_unaccel) = delta_unaccel {
-                        self.forward_pointer_relative_motion(previous_pos, position, delta_unaccel);
+                    if let (Some(delta), Some(delta_unaccel)) = (delta, delta_unaccel) {
+                        self.forward_pointer_relative_motion(position, delta, delta_unaccel);
+                    }
+                    if pointer_locked {
+                        if let Some(pointer) = self.seat.get_pointer() {
+                            pointer.frame(self);
+                        }
+                    } else {
+                        // Relative motion belongs to the same logical event and
+                        // must precede the wl_pointer frame emitted here.
+                        self.forward_pointer_to_clients(position);
+                        self.activate_pointer_constraint_at(position);
                     }
                 }
                 let precise_cursor_damage =
@@ -7321,7 +7766,11 @@ fn power_service_snapshot() -> Option<PowerSnapshot> {
     }
 }
 
-fn power_service_command(action: PowerIpcRequest, context: &str) {
+fn power_service_command(
+    action: PowerIpcRequest,
+    context: &str,
+    interaction: PowerActionInteraction,
+) {
     let context = context.to_string();
     let command_context = context.clone();
     let spawn_result = thread::Builder::new()
@@ -7332,7 +7781,14 @@ fn power_service_command(action: PowerIpcRequest, context: &str) {
                 // systemd --user service is not part of that login session, so
                 // PolicyKit cannot associate its authorization request with the
                 // agent registered by focaldesk-desktop.
-                if let Err(err) = PowerManager::new().execute(command) {
+                let manager = PowerManager::new();
+                let result = match interaction {
+                    PowerActionInteraction::Interactive => manager.execute(command),
+                    PowerActionInteraction::NonInteractive => {
+                        manager.execute_noninteractive(command)
+                    }
+                };
+                if let Err(err) = result {
                     flog_warn!("{command_context} failed: {err}");
                 }
                 return;
@@ -7364,6 +7820,31 @@ fn session_power_command(action: &PowerIpcRequest) -> Option<PowerCommand> {
         PowerIpcRequest::Reboot => Some(PowerCommand::Reboot),
         PowerIpcRequest::PowerOff => Some(PowerCommand::PowerOff),
         PowerIpcRequest::GetSnapshot | PowerIpcRequest::SetPerformanceProfile { .. } => None,
+    }
+}
+
+fn power_action_interaction(
+    action: &PowerIpcRequest,
+    lock_screen_active: bool,
+    requested: PowerActionInteraction,
+) -> PowerActionInteraction {
+    // Suspending is safe to request without unlocking the session. In
+    // particular, the explicit Suspend actions lock the desktop before they
+    // reach this function, so allowing an interactive PolicyKit challenge here
+    // would turn a suspend request into an unexpected password prompt.
+    if lock_screen_active && matches!(action, PowerIpcRequest::Suspend) {
+        PowerActionInteraction::NonInteractive
+    } else {
+        requested
+    }
+}
+
+fn power_action_description(command: PowerCommand) -> &'static str {
+    match command {
+        PowerCommand::Suspend => "suspend",
+        PowerCommand::Hibernate => "hibernate",
+        PowerCommand::Reboot => "restart",
+        PowerCommand::PowerOff => "power off",
     }
 }
 
@@ -7703,8 +8184,8 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_rect_to_bounds, is_browser_like, session_power_command,
-        should_wait_for_lid_open_on_resume,
+        clamp_rect_to_bounds, is_browser_like, power_action_interaction, session_power_command,
+        should_wait_for_lid_open_on_resume, PowerActionInteraction,
     };
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
@@ -7786,6 +8267,26 @@ mod tests {
                 profile: "balanced".to_string(),
             }),
             None
+        );
+    }
+
+    #[test]
+    fn suspend_at_lock_screen_never_requests_authorization_input() {
+        assert_eq!(
+            power_action_interaction(
+                &PowerIpcRequest::Suspend,
+                true,
+                PowerActionInteraction::Interactive,
+            ),
+            PowerActionInteraction::NonInteractive
+        );
+        assert_eq!(
+            power_action_interaction(
+                &PowerIpcRequest::Suspend,
+                false,
+                PowerActionInteraction::Interactive,
+            ),
+            PowerActionInteraction::Interactive
         );
     }
 }

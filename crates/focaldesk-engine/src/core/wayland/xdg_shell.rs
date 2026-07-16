@@ -52,6 +52,31 @@ impl XdgShellHandler for DesktopState {
         surface.send_configure();
     }
 
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        if surface.parent().is_none() {
+            return;
+        }
+
+        if let Some(window) = self
+            .windows
+            .iter_mut()
+            .find(|window| window.matches_toplevel(&surface))
+        {
+            window.floating = true;
+        }
+
+        // Transient toplevels are dialogs, not newly launched application windows. GTK sets the
+        // parent immediately after creating the xdg_toplevel, so replace the compositor's initial
+        // maximized configure with an unconstrained one and let the client use its natural size.
+        surface.with_pending_state(|state| {
+            state
+                .states
+                .unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            state.size = None;
+        });
+        surface.send_pending_configure();
+    }
+
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         use wayland_server::Resource;
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=FocalDesk text-to-speech daemon
+PartOf=focaldesk-session.target
+Wants=pipewire.service wireplumber.service
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/focald-speech
+Restart=on-failure
+RestartSec=2
+Environment=FOCALD_SPEECH_SOCKET=%t/focald-speech.sock
+
+[Install]
+WantedBy=focaldesk-session.target

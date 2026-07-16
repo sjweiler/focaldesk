@@ -217,6 +217,9 @@ async fn drive_greeter(
                     outcome_rx = None;
                     pending_reply = None;
                 }
+                Request::Power { action } => {
+                    launch_power_action(action);
+                }
             },
 
             // PAM wants to show something / ask something.
@@ -240,6 +243,43 @@ async fn drive_greeter(
                 }
             },
         }
+    }
+}
+
+/// Power controls are shown before a desktop user exists, so there is no
+/// session PolicyKit agent that could display an authentication prompt. The
+/// greeter socket is restricted by SO_PEERCRED; perform the request here in
+/// the privileged display-manager daemon instead.
+fn launch_power_action(action: crate::ipc::PowerAction) {
+    let verb = power_verb(action);
+
+    tokio::spawn(async move {
+        match tokio::process::Command::new("systemctl")
+            .args(["--no-block", verb])
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                tracing::info!(?action, "launched greeter power action");
+            }
+            Ok(status) => {
+                tracing::error!(?action, %status, "greeter power action failed");
+            }
+            Err(error) => {
+                tracing::error!(?action, %error, "failed to launch greeter power action");
+            }
+        }
+    });
+}
+
+fn power_verb(action: crate::ipc::PowerAction) -> &'static str {
+    use crate::ipc::PowerAction;
+
+    match action {
+        PowerAction::Suspend => "suspend",
+        PowerAction::Hibernate => "hibernate",
+        PowerAction::Restart => "reboot",
+        PowerAction::PowerOff => "poweroff",
     }
 }
 

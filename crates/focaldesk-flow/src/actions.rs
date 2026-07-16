@@ -34,4 +34,5 @@ pub enum KeyAction {
     LaunchBrowser,
     LaunchFiles,
     ToggleClipboardHistory,
+    ToggleVoiceCapture,
 }

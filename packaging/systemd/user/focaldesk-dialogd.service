@@ -1,7 +1,6 @@
 [Unit]
 Description=FocalDesk dialog broker
 PartOf=focaldesk-session.target
-After=focaldesk-session.target
 
 [Service]
 Type=simple
