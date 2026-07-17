@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use focaldesk_memory::{MemoryId, SearchHit};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -13,13 +14,31 @@ use crate::types::{AiDaemonStatus, ChatRequest, ChatResponse, ProviderInfo, Prov
 pub const AI_SOCKET_NAME: &str = "focaldesk-ai.sock";
 pub const AI_SOCKET_ENV: &str = "FOCALDESK_AI_SOCKET";
 
+fn default_recall_top_k() -> usize {
+    5
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AiIpcRequest {
     ListProviders,
-    ListModels { provider: String },
-    Chat { request: ChatRequest },
+    ListModels {
+        provider: String,
+    },
+    Chat {
+        request: ChatRequest,
+    },
     Status,
+    Remember {
+        text: String,
+        #[serde(default)]
+        metadata: serde_json::Value,
+    },
+    Recall {
+        query: String,
+        #[serde(default = "default_recall_top_k")]
+        top_k: usize,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +57,12 @@ pub enum AiIpcResponse {
     },
     Status {
         status: AiDaemonStatus,
+    },
+    Remembered {
+        id: MemoryId,
+    },
+    Recalled {
+        hits: Vec<SearchHit>,
     },
     Error {
         message: String,
@@ -100,6 +125,20 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
         },
         Ok(AiIpcRequest::Status) => AiIpcResponse::Status {
             status: service.status(),
+        },
+        Ok(AiIpcRequest::Remember { text, metadata }) => {
+            match service.remember(text, metadata).await {
+                Ok(id) => AiIpcResponse::Remembered { id },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            }
+        }
+        Ok(AiIpcRequest::Recall { query, top_k }) => match service.recall(query, top_k).await {
+            Ok(hits) => AiIpcResponse::Recalled { hits },
+            Err(err) => AiIpcResponse::Error {
+                message: err.to_string(),
+            },
         },
         Err(err) => AiIpcResponse::Error {
             message: format!("invalid AI IPC request: {err}"),

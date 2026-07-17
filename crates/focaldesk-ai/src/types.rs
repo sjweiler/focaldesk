@@ -12,6 +12,11 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    /// When true, the latest user message is used to recall similar entries
+    /// from the AI memory store and prepend them as context before the
+    /// provider is called. No-op if no memory store is configured.
+    #[serde(default)]
+    pub use_memory: bool,
 }
 
 impl ChatRequest {
@@ -22,6 +27,7 @@ impl ChatRequest {
             messages: vec![ChatMessage::user(prompt)],
             temperature: None,
             max_tokens: None,
+            use_memory: false,
         }
     }
 }
