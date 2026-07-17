@@ -2006,6 +2006,7 @@ fn build_chat_request(
         messages,
         temperature: None,
         max_tokens: None,
+        use_memory: false,
     }
 }
 

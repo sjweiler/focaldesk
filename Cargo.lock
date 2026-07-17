@@ -1647,6 +1647,7 @@ dependencies = [
  "async-trait",
  "dirs 6.0.0",
  "focaldesk-ipc",
+ "focaldesk-memory",
  "focaldesk-permissions",
  "reqwest",
  "serde",
@@ -1904,6 +1905,19 @@ dependencies = [
 [[package]]
 name = "focaldesk-memory"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dirs 6.0.0",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sqlite-vec",
+ "tokio",
+ "tracing",
+ "zerocopy",
+]
 
 [[package]]
 name = "focaldesk-network"
@@ -5932,6 +5946,15 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

@@ -1,4 +1,7 @@
 use anyhow::{Context, Result, anyhow};
+use focaldesk_memory::{
+    EmbeddingProvider, MemoryId, MemoryService, MemoryStore, OllamaEmbeddingProvider, SearchHit,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -11,7 +14,13 @@ use crate::provider::AiProvider;
 use crate::providers::{
     AnthropicProvider, LocalCpuProvider, OllamaProvider, OpenAICompatibleProvider,
 };
-use crate::types::{ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo};
+use crate::types::{
+    ChatMessage, ChatRequest, ChatResponse, ChatRole, ProviderInfo, ProviderModelInfo,
+};
+
+/// Memories relevant to a chat prompt are capped here so the recalled
+/// context doesn't dwarf the actual conversation.
+const CHAT_RECALL_TOP_K: usize = 5;
 
 pub struct AiService {
     providers: BTreeMap<String, Arc<dyn AiProvider>>,
@@ -19,6 +28,7 @@ pub struct AiService {
     request_timeout: Duration,
     concurrency: Arc<Semaphore>,
     active_requests: Arc<AtomicUsize>,
+    memory: Option<MemoryService>,
 }
 
 impl AiService {
@@ -29,6 +39,7 @@ impl AiService {
             request_timeout: Duration::from_secs(120),
             concurrency: Arc::new(Semaphore::new(2)),
             active_requests: Arc::new(AtomicUsize::new(0)),
+            memory: None,
         }
     }
 
@@ -40,7 +51,10 @@ impl AiService {
         let ollama_base = std::env::var("FOCALDESK_OLLAMA_BASE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:11434".into());
         let ollama_model = std::env::var("FOCALDESK_OLLAMA_MODEL").ok();
-        service.register(Arc::new(OllamaProvider::new(ollama_base, ollama_model)?));
+        service.register(Arc::new(OllamaProvider::new(
+            ollama_base.clone(),
+            ollama_model,
+        )?));
 
         if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
             service.register(Arc::new(OpenAICompatibleProvider::openai(
@@ -66,7 +80,45 @@ impl AiService {
 
         service.register(Arc::new(LocalCpuProvider));
 
+        if std::env::var("FOCALDESK_MEMORY_ENABLED").as_deref() != Ok("0") {
+            match build_memory_service(&ollama_base) {
+                Ok(memory) => service.memory = Some(memory),
+                Err(err) => warn!(
+                    target: "focaldesk.ai",
+                    error = %err,
+                    "AI memory store disabled: failed to initialize"
+                ),
+            }
+        }
+
         Ok(service)
+    }
+
+    /// Attaches a memory store built elsewhere (tests, alternate embedding
+    /// backends) instead of the one `from_env` would construct.
+    pub fn with_memory(mut self, memory: MemoryService) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    pub fn has_memory(&self) -> bool {
+        self.memory.is_some()
+    }
+
+    pub async fn remember(&self, text: String, metadata: serde_json::Value) -> Result<MemoryId> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow!("AI memory store is not configured"))?;
+        memory.remember_text(text, metadata).await
+    }
+
+    pub async fn recall(&self, query: String, top_k: usize) -> Result<Vec<SearchHit>> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow!("AI memory store is not configured"))?;
+        memory.recall_similar(&query, top_k).await
     }
 
     pub fn register(&mut self, provider: Arc<dyn AiProvider>) {
@@ -102,7 +154,7 @@ impl AiService {
         }
     }
 
-    pub async fn chat(&self, request: ChatRequest) -> Result<ChatResponse> {
+    pub async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse> {
         let provider_id = request
             .provider
             .clone()
@@ -112,6 +164,10 @@ impl AiService {
             .get(&provider_id)
             .cloned()
             .ok_or_else(|| anyhow!("unknown AI provider: {provider_id}"))?;
+
+        if request.use_memory {
+            self.augment_with_memory(&mut request).await;
+        }
 
         info!(
             target: "focaldesk.ai",
@@ -169,6 +225,82 @@ impl AiService {
 
         Ok(response)
     }
+
+    /// Recalls memories relevant to the latest user turn and prepends them
+    /// as a system message. Recall failures are logged and swallowed rather
+    /// than failing the chat request — memory is a best-effort enhancement,
+    /// not a hard dependency for chatting.
+    async fn augment_with_memory(&self, request: &mut ChatRequest) {
+        let Some(memory) = &self.memory else {
+            warn!(
+                target: "focaldesk.ai",
+                "chat requested use_memory but no memory store is configured"
+            );
+            return;
+        };
+
+        let Some(latest_user) = request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| matches!(message.role, ChatRole::User))
+        else {
+            return;
+        };
+
+        match memory
+            .recall_similar(&latest_user.content, CHAT_RECALL_TOP_K)
+            .await
+        {
+            Ok(hits) if !hits.is_empty() => {
+                let context = hits
+                    .iter()
+                    .map(|hit| format!("- {}", hit.record.text))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                request.messages.insert(
+                    0,
+                    ChatMessage::system(format!(
+                        "Relevant memory from prior conversations:\n{context}"
+                    )),
+                );
+            }
+            Ok(_) => {}
+            Err(err) => warn!(
+                target: "focaldesk.ai",
+                error = %err,
+                "memory recall failed, continuing chat without it"
+            ),
+        }
+    }
+}
+
+/// Builds the default memory backend: a local sqlite-vec file embedding text
+/// via the same Ollama instance used for chat, at
+/// `$FOCALDESK_OLLAMA_EMBED_MODEL` (default `nomic-embed-text`, 768 dims).
+fn build_memory_service(ollama_base: &str) -> Result<MemoryService> {
+    let model =
+        std::env::var("FOCALDESK_OLLAMA_EMBED_MODEL").unwrap_or_else(|_| "nomic-embed-text".into());
+    let dimension: usize = std::env::var("FOCALDESK_OLLAMA_EMBED_DIM")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(768);
+
+    let store =
+        MemoryStore::open_default(dimension).context("failed to open default AI memory store")?;
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(
+        OllamaEmbeddingProvider::new(ollama_base.to_string(), model.clone(), dimension)
+            .context("failed to build Ollama embedding provider")?,
+    );
+
+    info!(
+        target: "focaldesk.ai",
+        model = %model,
+        dimension,
+        "AI memory store enabled"
+    );
+
+    Ok(MemoryService::new(store, embedder))
 }
 
 fn build_prompt_message(request: &ChatRequest, provider_id: &str) -> String {
@@ -177,7 +309,7 @@ fn build_prompt_message(request: &ChatRequest, provider_id: &str) -> String {
         .messages
         .iter()
         .rev()
-        .find(|message| matches!(message.role, crate::types::ChatRole::User))
+        .find(|message| matches!(message.role, ChatRole::User))
         .map(|message| truncate_preview(&message.content, 160))
         .unwrap_or_else(|| "no user message preview available".to_string());
 
