@@ -168,6 +168,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nested.state.process_notification_timers();
         nested.state.process_idle_timers();
         nested.state.process_power_timers();
+        nested.state.process_audio_device_timers();
         nested.state.process_lock_timers();
 
         if !dispatch_backend_events(&mut nested.state, &mut event_loop, &mut window_focused)? {

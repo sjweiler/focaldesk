@@ -72,6 +72,9 @@ pub enum FlowInputEvent {
 
     PointerMoved {
         position: Point<f64, Logical>,
+        /// Raw accelerated device delta. Unlike `position`, this is not
+        /// clamped to the desktop or divided by an output scale.
+        delta: Option<Point<f64, Logical>>,
         delta_unaccel: Option<Point<f64, Logical>>,
     },
 

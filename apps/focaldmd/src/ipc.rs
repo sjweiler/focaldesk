@@ -22,6 +22,35 @@ pub enum Request {
     PostAuthResponse { response: Option<String> },
     /// Abort the in-flight PAM transaction.
     CancelSession,
+    /// Ask the privileged display-manager daemon to perform a power action.
+    /// The peer-credential check on the socket limits this to the greeter user.
+    Power { action: PowerAction },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerAction {
+    Suspend,
+    Hibernate,
+    Restart,
+    PowerOff,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_greeter_power_request() {
+        let request: Request =
+            serde_json::from_str(r#"{"type":"power","action":"suspend"}"#).unwrap();
+        assert!(matches!(
+            request,
+            Request::Power {
+                action: PowerAction::Suspend
+            }
+        ));
+    }
 }
 
 /// Daemon -> greeter.

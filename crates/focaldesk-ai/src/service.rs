@@ -176,6 +176,7 @@ fn build_prompt_message(request: &ChatRequest, provider_id: &str) -> String {
     let preview = request
         .messages
         .iter()
+        .rev()
         .find(|message| matches!(message.role, crate::types::ChatRole::User))
         .map(|message| truncate_preview(&message.content, 160))
         .unwrap_or_else(|| "no user message preview available".to_string());
@@ -192,4 +193,24 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
         preview.push_str("...");
     }
     preview
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ChatMessage;
+
+    #[test]
+    fn permission_preview_uses_latest_user_turn() {
+        let mut request = ChatRequest::from_prompt("historical prompt");
+        request
+            .messages
+            .push(ChatMessage::assistant("historical reply"));
+        request.messages.push(ChatMessage::user("current prompt"));
+
+        let message = build_prompt_message(&request, "test-provider");
+
+        assert!(message.contains("Preview: current prompt"));
+        assert!(!message.contains("Preview: historical prompt"));
+    }
 }

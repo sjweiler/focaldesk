@@ -21,6 +21,16 @@ pub enum Request {
     CreateSession { username: String },
     PostAuthResponse { response: Option<String> },
     CancelSession,
+    Power { action: PowerAction },
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerAction {
+    Suspend,
+    Hibernate,
+    Restart,
+    PowerOff,
 }
 
 /// Daemon -> greeter. Must match focaldmd's `Response` exactly.
@@ -167,5 +177,20 @@ impl Drop for DaemonConnection {
     fn drop(&mut self) {
         self.inbox.zeroize();
         self.outbox.make_contiguous().zeroize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_power_request_for_daemon() {
+        let value = serde_json::to_value(Request::Power {
+            action: PowerAction::Suspend,
+        })
+        .unwrap();
+        assert_eq!(value["type"], "power");
+        assert_eq!(value["action"], "suspend");
     }
 }

@@ -11,6 +11,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::rc::Rc;
+use std::sync::mpsc;
+use std::thread;
 use tracing::info;
 
 #[derive(Debug, Clone)]
@@ -237,7 +239,7 @@ impl TabManager {
             this.with_active_tab(|tab| {
                 let tab = tab.clone();
                 glib::idle_add_local_once(move || {
-                    if let Some(index) = tab.selected_index() {
+                    if let Some(index) = tab.selected_index_for_action() {
                         tab.activate_item(index);
                     }
                 });
@@ -339,13 +341,12 @@ impl TabManager {
         self.window.add_action(&file_paste_into_folder);
 
         let file_compress = gio::SimpleAction::new("file-compress", None);
-        file_compress.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-compress",
-                "compress file item"
-            );
+        let this = self.clone();
+        file_compress.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| {
+                let tab = tab.clone();
+                glib::idle_add_local_once(move || tab.show_compress_dialog());
+            });
         });
         self.window.add_action(&file_compress);
 
@@ -542,11 +543,13 @@ fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -
 
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Multiple);
+    list.set_activate_on_single_click(false);
     list.add_css_class("boxed-list");
     list.set_vexpand(true);
 
     let grid = gtk::FlowBox::new();
     grid.set_selection_mode(gtk::SelectionMode::Multiple);
+    grid.set_activate_on_single_click(false);
     grid.set_valign(gtk::Align::Start);
     grid.set_max_children_per_line(8);
     grid.set_min_children_per_line(2);
@@ -965,10 +968,22 @@ impl FileManager {
             let list = self.list.clone();
             let row_for_context = row.clone();
             let context_index = self.context_menu_index.clone();
-            attach_file_context_menu(&row, file_context_target(item), move || {
-                list.select_row(Some(&row_for_context));
-                *context_index.borrow_mut() = Some(row_for_context.index());
-            });
+            let this = self.clone();
+            let item_for_rename = item.clone();
+            attach_file_context_menu(
+                &row,
+                file_context_target(item),
+                move || {
+                    list.unselect_all();
+                    list.select_row(Some(&row_for_context));
+                    *context_index.borrow_mut() = Some(row_for_context.index());
+                },
+                move || {
+                    let this = this.clone();
+                    let item = item_for_rename.clone();
+                    glib::idle_add_local_once(move || this.show_rename_dialog_for_item(item));
+                },
+            );
             self.list.append(&row);
 
             let child = grid_file_child(item);
@@ -976,10 +991,22 @@ impl FileManager {
             let grid = self.grid.clone();
             let child_for_context = child.clone();
             let context_index = self.context_menu_index.clone();
-            attach_file_context_menu(&child, file_context_target(item), move || {
-                grid.select_child(&child_for_context);
-                *context_index.borrow_mut() = Some(child_for_context.index());
-            });
+            let this = self.clone();
+            let item_for_rename = item.clone();
+            attach_file_context_menu(
+                &child,
+                file_context_target(item),
+                move || {
+                    grid.unselect_all();
+                    grid.select_child(&child_for_context);
+                    *context_index.borrow_mut() = Some(child_for_context.index());
+                },
+                move || {
+                    let this = this.clone();
+                    let item = item_for_rename.clone();
+                    glib::idle_add_local_once(move || this.show_rename_dialog_for_item(item));
+                },
+            );
             self.grid.append(&child);
         }
 
@@ -1068,20 +1095,34 @@ impl FileManager {
     }
 
     fn show_rename_dialog(&self) {
-        let Some(index) = self.selected_index_for_action() else {
-            self.set_status("Select an item to rename.");
+        let context_index = self
+            .context_menu_index
+            .borrow_mut()
+            .take()
+            .filter(|index| *index >= 0);
+        let index = if let Some(index) = context_index {
+            index
+        } else {
+            if self.selected_indices().len() > 1 {
+                self.set_status("Select only one item to rename.");
+                return;
+            }
+
+            let Some(index) = self.selected_index() else {
+                self.set_status("Select an item to rename.");
+                return;
+            };
+            index
+        };
+
+        let Some(item) = self.visible_entries.borrow().get(index as usize).cloned() else {
             return;
         };
 
-        if self.selected_indices().len() > 1 && self.context_menu_index.borrow().is_none() {
-            self.set_status("Select only one item to rename.");
-            return;
-        }
+        self.show_rename_dialog_for_item(item);
+    }
 
-        let Some(item) = self.entries.borrow().get(index as usize).cloned() else {
-            return;
-        };
-
+    fn show_rename_dialog_for_item(&self, item: FileItem) {
         let Some(source_path) = item.path.clone() else {
             self.set_status("Only local files and folders can be renamed.");
             return;
@@ -1097,6 +1138,7 @@ impl FileManager {
             .modal(true)
             .title("Rename")
             .default_width(360)
+            .resizable(false)
             .build();
 
         let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
@@ -1169,6 +1211,139 @@ impl FileManager {
                     this.set_status(&format!("Could not rename {}: {err}", item.name));
                 }
             }
+        });
+
+        dialog.present();
+    }
+
+    fn show_compress_dialog(&self) {
+        let items = self.selected_file_items();
+        if items.is_empty() {
+            self.set_status("Select one or more items to compress.");
+            return;
+        }
+
+        let current_dir = match &*self.current_location.borrow() {
+            Location::Path(path) => path.clone(),
+            Location::Trash | Location::Uri(_) | Location::Separator => {
+                self.set_status("Only local files and folders can be compressed.");
+                return;
+            }
+        };
+
+        let mut sources = Vec::with_capacity(items.len());
+        for item in &items {
+            let Some(path) = item.path.clone() else {
+                self.set_status("Only local files and folders can be compressed.");
+                return;
+            };
+            sources.push(path);
+        }
+
+        let default_name = if items.len() == 1 {
+            format!("{}.tar.gz", items[0].name)
+        } else {
+            "Archive.tar.gz".to_string()
+        };
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Compress")
+            .default_width(420)
+            .resizable(false)
+            .build();
+
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let label = gtk::Label::new(Some("Archive name"));
+        label.set_xalign(0.0);
+        let entry = gtk::Entry::new();
+        entry.set_text(&default_name);
+        entry.select_region(0, default_name.chars().count() as i32);
+
+        let format = gtk::Label::new(Some("Format: gzip-compressed tar archive (.tar.gz)"));
+        format.set_xalign(0.0);
+        format.add_css_class("dim-label");
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let compress = gtk::Button::with_label("Compress");
+        compress.add_css_class("suggested-action");
+
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+        actions.append(&compress);
+
+        content.append(&label);
+        content.append(&entry);
+        content.append(&format);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+        dialog.set_default_widget(Some(&compress));
+
+        let compress_for_enter = compress.clone();
+        entry.connect_activate(move |_| compress_for_enter.emit_clicked());
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+
+        let this = self.clone();
+        let dialog_for_compress = dialog.clone();
+        compress.connect_clicked(move |_| {
+            let mut name = entry.text().trim().to_string();
+            if name.is_empty() || name.contains('/') {
+                this.set_status("Archive names cannot be empty or contain '/'.");
+                return;
+            }
+            if !name.ends_with(".tar.gz") {
+                name.push_str(".tar.gz");
+            }
+
+            let destination = current_dir.join(&name);
+            if destination.exists() {
+                this.set_status(&format!("An archive named {name} already exists."));
+                return;
+            }
+
+            dialog_for_compress.close();
+            this.set_status(&format!(
+                "Compressing {} item{} into {name}...",
+                sources.len(),
+                plural(sources.len())
+            ));
+
+            let (tx, rx) = mpsc::channel();
+            let sources = sources.clone();
+            thread::spawn(move || {
+                let result = create_tar_gz_archive(&sources, &destination);
+                let _ = tx.send(result);
+            });
+
+            let this = this.clone();
+            let name = name.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(50), move || {
+                match rx.try_recv() {
+                    Ok(Ok(())) => {
+                        this.reload();
+                        this.set_status(&format!("Created {name}."));
+                        ControlFlow::Break
+                    }
+                    Ok(Err(err)) => {
+                        this.set_status(&format!("Could not create {name}: {err}"));
+                        ControlFlow::Break
+                    }
+                    Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        this.set_status("Compression task ended unexpectedly.");
+                        ControlFlow::Break
+                    }
+                }
+            });
         });
 
         dialog.present();
@@ -1773,10 +1948,22 @@ impl FileManager {
             "show_open_with_dialog: building dialog"
         );
 
-        let apps: Vec<gio::AppInfo> = gio::AppInfo::all_for_type(&item.content_type)
+        let is_windows_executable = item
+            .path
+            .as_deref()
+            .and_then(Path::extension)
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"));
+        let mut apps: Vec<gio::AppInfo> = gio::AppInfo::all_for_type(&item.content_type)
             .into_iter()
-            .filter(gio::AppInfo::should_show)
+            // Wine's standard desktop entry is intentionally NoDisplay=true, but it is still
+            // the registered handler that belongs in an explicit Open With chooser.
+            .filter(|app| is_windows_executable || app.should_show())
             .collect();
+        if is_windows_executable && apps.is_empty() {
+            if let Some(wine) = gio::DesktopAppInfo::new("wine.desktop") {
+                apps.push(wine.upcast());
+            }
+        }
         info!(target: "focaldesk", app_count = apps.len(), "show_open_with_dialog: apps found");
 
         let dialog = gtk::Window::builder()
@@ -1845,20 +2032,17 @@ impl FileManager {
         scroller.set_child(Some(&list));
         content.append(&scroller);
 
-        let set_default =
-            gtk::CheckButton::with_label("Always use this application for this file type");
-        if !apps.is_empty() {
-            content.append(&set_default);
-        }
-
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         actions.set_halign(gtk::Align::End);
         let cancel = gtk::Button::with_label("Cancel");
-        let open = gtk::Button::with_label("Open");
-        open.add_css_class("suggested-action");
-        open.set_sensitive(!apps.is_empty());
+        let set_default = gtk::Button::with_label("Set as Default");
+        let open_once = gtk::Button::with_label("Open Once");
+        open_once.add_css_class("suggested-action");
+        set_default.set_sensitive(!apps.is_empty());
+        open_once.set_sensitive(!apps.is_empty());
         actions.append(&cancel);
-        actions.append(&open);
+        actions.append(&set_default);
+        actions.append(&open_once);
         content.append(&actions);
 
         dialog.set_child(Some(&content));
@@ -1882,9 +2066,8 @@ impl FileManager {
             let list = list.clone();
             let apps = apps.clone();
             let item = item.clone();
-            let set_default = set_default.clone();
             let this = self.clone();
-            move || {
+            move |make_default: bool| {
                 let Some(row) = list.selected_row() else {
                     return;
                 };
@@ -1896,17 +2079,23 @@ impl FileManager {
                     return;
                 };
 
-                if set_default.is_active() {
-                    if let Err(err) = app.set_as_default_for_type(&item.content_type) {
-                        this.set_status(&format!("Could not set default application: {err}"));
-                    }
-                }
-
                 let force_x11 = item
                     .path
                     .as_deref()
                     .and_then(Path::extension)
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+                if make_default {
+                    let association_type = if force_x11 {
+                        "application/x-ms-dos-executable"
+                    } else {
+                        &item.content_type
+                    };
+                    if let Err(err) = app.set_as_default_for_type(association_type) {
+                        this.set_status(&format!("Could not set default application: {err}"));
+                        return;
+                    }
+                }
+
                 let result = if let Some(display) = gtk::gdk::Display::default() {
                     let context = display.app_launch_context();
                     apply_launch_environment(&context, force_x11);
@@ -1923,9 +2112,11 @@ impl FileManager {
             }
         };
 
-        let launch_for_open = launch.clone();
-        open.connect_clicked(move |_| launch_for_open());
-        list.connect_row_activated(move |_, _| launch());
+        let launch_once = launch.clone();
+        open_once.connect_clicked(move |_| launch_once(false));
+        let launch_default = launch.clone();
+        set_default.connect_clicked(move |_| launch_default(true));
+        list.connect_row_activated(move |_, _| launch(false));
 
         info!(target: "focaldesk", "show_open_with_dialog: presenting");
         dialog.present();
@@ -2286,54 +2477,78 @@ fn attach_file_context_menu(
     widget: &impl IsA<gtk::Widget>,
     target: FileContextTarget,
     select_item: impl Fn() + 'static,
+    rename_item: impl Fn() + 'static,
 ) {
-    let menu = gio::Menu::new();
-
-    menu.append(Some("Open"), Some("win.file-open"));
-    if matches!(target, FileContextTarget::Folder) {
-        menu.append(Some("Open in New Tab"), Some("win.file-open-tab"));
-    }
-    menu.append(Some("Open With..."), Some("win.file-open-with"));
-
-    menu.append_section(None, &{
-        let section = gio::Menu::new();
-        section.append(Some("Cut\tCtrl+X"), Some("win.file-cut"));
-        section.append(Some("Copy\tCtrl+C"), Some("win.file-copy"));
-        section.append(Some("Move to..."), Some("win.file-move-to"));
-        section.append(Some("Copy to..."), Some("win.file-copy-to"));
-        section
-    });
-
-    menu.append_section(None, &{
-        let section = gio::Menu::new();
-        section.append(Some("Rename...\tF2"), Some("win.file-rename"));
-        if matches!(target, FileContextTarget::Folder) {
-            section.append(
-                Some("Paste Into Folder"),
-                Some("win.file-paste-into-folder"),
-            );
-        }
-        section.append(Some("Compress..."), Some("win.file-compress"));
-        section.append(
-            Some("Move to Trash\tDelete"),
-            Some("win.file-move-to-trash"),
-        );
-        section
-    });
-
-    menu.append_section(None, &{
-        let section = gio::Menu::new();
-        section.append(Some("Properties\tAlt+Return"), Some("win.file-properties"));
-        section
-    });
-
+    let rename_item: Rc<dyn Fn()> = Rc::new(rename_item);
     let click = gtk::GestureClick::new();
     click.set_button(3);
 
     click.connect_pressed(move |gesture, _, x, y| {
         select_item();
         if let Some(parent) = gesture.widget() {
-            let popover = gtk::PopoverMenu::from_model(Some(&menu));
+            let popover = gtk::Popover::new();
+            let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+            menu.set_margin_top(6);
+            menu.set_margin_bottom(6);
+            menu.set_margin_start(6);
+            menu.set_margin_end(6);
+
+            menu.append(&file_context_action_button("Open", "win.file-open"));
+            if matches!(target, FileContextTarget::Folder) {
+                menu.append(&file_context_action_button(
+                    "Open in New Tab",
+                    "win.file-open-tab",
+                ));
+            }
+            menu.append(&file_context_action_button(
+                "Open With...",
+                "win.file-open-with",
+            ));
+            menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            menu.append(&file_context_action_button("Cut\tCtrl+X", "win.file-cut"));
+            menu.append(&file_context_action_button("Copy\tCtrl+C", "win.file-copy"));
+            menu.append(&file_context_action_button(
+                "Move to...",
+                "win.file-move-to",
+            ));
+            menu.append(&file_context_action_button(
+                "Copy to...",
+                "win.file-copy-to",
+            ));
+            menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
+            let rename = gtk::Button::with_label("Rename...\tF2");
+            rename.add_css_class("flat");
+            rename.set_halign(gtk::Align::Fill);
+            let rename_item = rename_item.clone();
+            let popover_for_rename = popover.clone();
+            rename.connect_clicked(move |_| {
+                popover_for_rename.popdown();
+                rename_item();
+            });
+            menu.append(&rename);
+
+            if matches!(target, FileContextTarget::Folder) {
+                menu.append(&file_context_action_button(
+                    "Paste Into Folder",
+                    "win.file-paste-into-folder",
+                ));
+            }
+            menu.append(&file_context_action_button(
+                "Compress...",
+                "win.file-compress",
+            ));
+            menu.append(&file_context_action_button(
+                "Move to Trash\tDelete",
+                "win.file-move-to-trash",
+            ));
+            menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            menu.append(&file_context_action_button(
+                "Properties\tAlt+Return",
+                "win.file-properties",
+            ));
+
+            popover.set_child(Some(&menu));
             popover.set_has_arrow(false);
             popover.set_parent(&parent);
             popover.connect_closed(|popover| popover.unparent());
@@ -2345,6 +2560,31 @@ fn attach_file_context_menu(
     });
 
     widget.add_controller(click);
+}
+
+fn file_context_action_button(label: &str, action: &str) -> gtk::Button {
+    let button = gtk::Button::with_label(label);
+    button.add_css_class("flat");
+    button.set_halign(gtk::Align::Fill);
+    button.set_action_name(Some(action));
+    button.connect_clicked(|button| {
+        // GtkPopoverMenu closes itself after activating a menu item, but these
+        // custom action buttons live in a plain GtkPopover. Close it on the next
+        // main-loop turn so the action resolves through the current widget tree
+        // first and any modal dialog it opens can receive input normally.
+        let button = button.clone();
+        glib::idle_add_local_once(move || {
+            let mut ancestor = button.parent();
+            while let Some(widget) = ancestor {
+                if let Ok(popover) = widget.clone().downcast::<gtk::Popover>() {
+                    popover.popdown();
+                    break;
+                }
+                ancestor = widget.parent();
+            }
+        });
+    });
+    button
 }
 
 fn attach_file_drag_source(widget: &impl IsA<gtk::Widget>, item: FileItem) {
@@ -2675,6 +2915,65 @@ fn available_destination(target_dir: &Path, basename: &Path) -> PathBuf {
     }
 
     unreachable!("unbounded destination search should always return")
+}
+
+fn create_tar_gz_archive(sources: &[PathBuf], destination: &Path) -> io::Result<()> {
+    if sources.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "no files were selected",
+        ));
+    }
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "the destination archive already exists",
+        ));
+    }
+
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the archive has no parent folder",
+        )
+    })?;
+    let archive_name = destination.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "the archive has no file name")
+    })?;
+
+    let mut source_names = Vec::with_capacity(sources.len());
+    for source in sources {
+        if source.parent() != Some(parent) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "selected items must be in the archive's folder",
+            ));
+        }
+        source_names.push(source.file_name().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "a selected item has no name")
+        })?);
+    }
+
+    let output = Command::new("tar")
+        .current_dir(parent)
+        .arg("--create")
+        .arg("--gzip")
+        .arg("--file")
+        .arg(archive_name)
+        .arg("--")
+        .args(source_names)
+        .output()?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(io::Error::other(if stderr.is_empty() {
+        format!("tar exited with {}", output.status)
+    } else {
+        stderr
+    }))
 }
 
 fn location_from_entry(text: &str) -> Location {
@@ -3058,4 +3357,43 @@ fn sidebar_menu_item(label: &str, action: &str, target: &glib::Variant) -> gio::
     let item = gio::MenuItem::new(Some(label), None);
     item.set_action_and_target_value(Some(action), Some(target));
     item
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn creates_tar_gz_archive_with_selected_items() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after Unix epoch")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "focaldesk-files-archive-test-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("folder")).expect("create test folder");
+        std::fs::write(root.join("note.txt"), "archive me").expect("write test file");
+        std::fs::write(root.join("folder/nested.txt"), "nested").expect("write nested file");
+
+        let destination = root.join("selection.tar.gz");
+        create_tar_gz_archive(&[root.join("note.txt"), root.join("folder")], &destination)
+            .expect("create archive");
+
+        let listing = Command::new("tar")
+            .arg("--list")
+            .arg("--gzip")
+            .arg("--file")
+            .arg(&destination)
+            .output()
+            .expect("list archive");
+        assert!(listing.status.success());
+        let listing = String::from_utf8_lossy(&listing.stdout);
+        assert!(listing.lines().any(|line| line == "note.txt"));
+        assert!(listing.lines().any(|line| line == "folder/nested.txt"));
+
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
 }

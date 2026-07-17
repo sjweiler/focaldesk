@@ -34,8 +34,7 @@ use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use focaldesk_logging::{flog, flog_error, flog_info, session_id};
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_types::OutputId;
-use focaldesk_ui::atlas::IconId;
-use focaldesk_ui::atlas::IconState;
+use focaldesk_ui::atlas::{render_atlas_icon_with_alpha, IconId, IconState};
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -3781,6 +3780,28 @@ impl RenderState {
                                 damage,
                                 pulse_color,
                             );
+                        }
+
+                        if let Some(icon_id) = el.icon {
+                            if let Some(entry) = atlas.get(icon_id) {
+                                let icon_px = base_rect_logical.size.h.min(28).max(1);
+                                let icon_rect_logical =
+                                    center_rect_in(base_rect_logical, icon_px, icon_px);
+                                let icon_rect =
+                                    to_physical_rect(icon_rect_logical, ctx.output_scale);
+                                let output_size = Size::<i32, Physical>::from(ctx.output_size);
+                                let _ = render_atlas_icon_with_alpha(
+                                    frame,
+                                    &atlas.texture,
+                                    *entry,
+                                    icon_rect.loc.x,
+                                    icon_rect.loc.y,
+                                    icon_rect.size.w,
+                                    icon_rect.size.h,
+                                    output_size,
+                                    style.alpha,
+                                );
+                            }
                         }
                     }
 

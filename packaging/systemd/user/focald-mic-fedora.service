@@ -1,0 +1,17 @@
+[Unit]
+Description=FocalDesk push-to-talk microphone daemon
+PartOf=focaldesk-session.target
+Wants=pipewire.service wireplumber.service focald-voice.service focald-speech.service
+After=pipewire.service wireplumber.service focald-voice.service focald-speech.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/focald-mic
+Restart=on-failure
+RestartSec=2
+Environment=FOCALD_MIC_SOCKET=%t/focald-mic.sock
+Environment=FOCALD_VOICE_SOCKET=%t/focald-voice.sock
+Environment=FOCALD_SPEECH_SOCKET=%t/focald-speech.sock
+
+[Install]
+WantedBy=focaldesk-session.target

@@ -67,6 +67,30 @@ pub enum IpcRequest {
         #[serde(default)]
         timeout_ms: Option<u64>,
     },
+    ExecuteDesktopAction {
+        action: DesktopAction,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Actions that trusted desktop helpers may ask the compositor to perform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum DesktopAction {
+    LaunchApp { app: String },
+    FocusWorkspace { workspace: u32 },
+    MoveFocusedToOutput { output: u32 },
+    MoveFocused { direction: DesktopDirection },
+    CloseFocused,
+    SetVolume { percent: u8 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]

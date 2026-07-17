@@ -2281,6 +2281,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.process_notification_timers();
         data.core.state.process_idle_timers();
         data.core.state.process_power_timers();
+        data.core.state.process_audio_device_timers();
         data.core.state.process_lock_timers();
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;

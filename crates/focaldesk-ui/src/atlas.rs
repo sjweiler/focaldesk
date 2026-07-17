@@ -38,6 +38,7 @@ pub enum IconState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IconId {
     Launcher,
+    AiConsole,
     Overflow,
     Settings,
     Battery,
@@ -373,6 +374,10 @@ where
         (
             IconId::Launcher,
             include_bytes!("../../../assets/svg/launcher.svg"),
+        ),
+        (
+            IconId::AiConsole,
+            include_bytes!("../../../assets/icons/focal-ai-console.svg"),
         ),
         (
             IconId::Overflow,
