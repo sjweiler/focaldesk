@@ -725,6 +725,9 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
             glib::timeout_add_local(Duration::from_millis(80), move || {
                 loop {
                     match rx.try_recv() {
+                        Ok(VoiceEvent::Ready) => {
+                            append_log(&log_buffer_for_poll, "[voice] microphone ready");
+                        }
                         Ok(VoiceEvent::Partial(partial)) => {
                             entry_for_poll.set_text(&format!("{base_text}{accumulated}{partial}"));
                             entry_for_poll.set_position(-1);
@@ -1811,7 +1814,7 @@ fn dispatch_chat_request_async(
             .min(store.conversations.len().saturating_sub(1));
         provider = store.app_state.active_provider.clone();
         model = store.app_state.active_model.clone();
-        request = build_chat_request(&store, &prompt_text);
+        request = build_chat_request(&store, active_idx, &prompt_text);
 
         if let Some(conversation) = store.conversations.get_mut(active_idx) {
             conversation.messages.push(format!("User: {}", prompt_text));
@@ -1962,49 +1965,48 @@ fn apply_ai_reply(store: &mut PersistedState, active_idx: usize, reply: &str, su
     }
 }
 
-fn build_chat_request(store: &PersistedState, prompt: &str) -> ChatRequest {
-    let mut request = ChatRequest {
+fn build_chat_request(
+    store: &PersistedState,
+    conversation_idx: usize,
+    prompt: &str,
+) -> ChatRequest {
+    let mut messages = vec![ChatMessage::system(
+        "You are the FocalDesk AI Console. Keep responses concise.",
+    )];
+
+    if let Some(conversation) = store.conversations.get(conversation_idx) {
+        messages.push(ChatMessage::system(format!(
+            "Conversation: {}",
+            conversation.title
+        )));
+
+        let history_start = conversation.messages.len().saturating_sub(8);
+        for message in &conversation.messages[history_start..] {
+            if let Some(user_content) = message.strip_prefix("User: ") {
+                messages.push(ChatMessage::user(user_content.to_string()));
+            } else if let Some(ai_content) = message.strip_prefix("AI: ") {
+                messages.push(ChatMessage::assistant(ai_content.to_string()));
+            } else if message.starts_with("AI (") {
+                messages.push(ChatMessage::assistant(message.clone()));
+            }
+        }
+    }
+
+    // The new prompt must remain the final turn so providers see a coherent,
+    // chronological conversation ending with the request they should answer.
+    messages.push(ChatMessage::user(prompt.to_string()));
+
+    ChatRequest {
         provider: if store.app_state.active_provider.is_empty() {
             None
         } else {
             Some(store.app_state.active_provider.clone())
         },
         model: effective_request_model(store),
-        messages: vec![
-            ChatMessage::system("You are the FocalDesk AI Console. Keep responses concise."),
-            ChatMessage::user(prompt.to_string()),
-        ],
+        messages,
         temperature: None,
         max_tokens: None,
-    };
-
-    if let Some(conversation) = store
-        .conversations
-        .get(store.app_state.active_conversation)
-        .or_else(|| store.conversations.first())
-    {
-        request.messages.insert(
-            1,
-            ChatMessage::system(format!("Conversation: {}", conversation.title)),
-        );
-        for message in conversation.messages.iter().rev().take(8).rev() {
-            if let Some(user_content) = message.strip_prefix("User: ") {
-                request
-                    .messages
-                    .insert(2, ChatMessage::user(user_content.to_string()));
-            } else if let Some(ai_content) = message.strip_prefix("AI: ") {
-                request
-                    .messages
-                    .insert(2, ChatMessage::assistant(ai_content.to_string()));
-            } else if message.starts_with("AI (") {
-                request
-                    .messages
-                    .insert(2, ChatMessage::assistant(message.clone()));
-            }
-        }
     }
-
-    request
 }
 
 fn create_new_conversation(
@@ -2721,5 +2723,81 @@ fn persist_state(state: &PersistedState) {
     }
     if let Ok(text) = serde_json::to_string_pretty(state) {
         let _ = fs::write(path, text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conversation(title: &str, messages: &[&str]) -> Conversation {
+        Conversation {
+            title: title.to_string(),
+            summary: String::new(),
+            messages: messages.iter().map(|message| message.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn chat_request_preserves_history_order_and_ends_with_current_prompt() {
+        let store = PersistedState {
+            conversations: vec![conversation(
+                "Current thread",
+                &[
+                    "User: first",
+                    "AI: first reply",
+                    "User: second",
+                    "AI: second reply",
+                ],
+            )],
+            app_state: AppState::default(),
+        };
+
+        let request = build_chat_request(&store, 0, "current");
+        let turns = request
+            .messages
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            turns,
+            vec![
+                (
+                    "system",
+                    "You are the FocalDesk AI Console. Keep responses concise."
+                ),
+                ("system", "Conversation: Current thread"),
+                ("user", "first"),
+                ("assistant", "first reply"),
+                ("user", "second"),
+                ("assistant", "second reply"),
+                ("user", "current"),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_request_uses_only_the_resolved_conversation() {
+        let mut app_state = AppState::default();
+        app_state.active_conversation = 0;
+        let store = PersistedState {
+            conversations: vec![
+                conversation("Wrong thread", &["User: contaminated"]),
+                conversation("Resolved thread", &["User: isolated"]),
+            ],
+            app_state,
+        };
+
+        let request = build_chat_request(&store, 1, "current");
+        let contents = request
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(contents.contains(&"Conversation: Resolved thread"));
+        assert!(contents.contains(&"isolated"));
+        assert!(!contents.contains(&"contaminated"));
     }
 }

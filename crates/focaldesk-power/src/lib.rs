@@ -23,6 +23,22 @@ impl PowerCommand {
             Self::PowerOff => "PowerOff",
         }
     }
+
+    fn login1_capability_method(self) -> &'static str {
+        match self {
+            Self::Suspend => "CanSuspend",
+            Self::Hibernate => "CanHibernate",
+            Self::Reboot => "CanReboot",
+            Self::PowerOff => "CanPowerOff",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerAuthorization {
+    Allowed,
+    Challenge,
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +93,7 @@ pub enum PowerError {
         args: Vec<String>,
         status: ExitStatus,
     },
+    InvalidResponse(String),
 }
 
 impl fmt::Display for PowerError {
@@ -89,6 +106,9 @@ impl fmt::Display for PowerError {
                 status,
             } => {
                 write!(f, "{program} {} exited with {status}", args.join(" "))
+            }
+            Self::InvalidResponse(response) => {
+                write!(f, "unexpected login1 capability response: {response}")
             }
         }
     }
@@ -127,14 +147,32 @@ impl PowerManager {
     }
 
     pub fn execute(&self, command: PowerCommand) -> Result<(), PowerError> {
-        // systemctl disables interactive authorization when it has no controlling
-        // terminal, which is always the case in focaldesk-powerd. Call logind
-        // directly and opt in so the desktop PolicyKit agent can show its prompt.
+        self.execute_with_interactive_authorization(command, true)
+    }
+
+    /// Execute a policy-driven action without allowing PolicyKit to start an
+    /// authentication conversation. This is required for unattended actions
+    /// such as idle suspend, where no user may be available to answer a prompt.
+    pub fn execute_noninteractive(&self, command: PowerCommand) -> Result<(), PowerError> {
+        self.execute_with_interactive_authorization(command, false)
+    }
+
+    fn execute_with_interactive_authorization(
+        &self,
+        command: PowerCommand,
+        allow_interactive: bool,
+    ) -> Result<(), PowerError> {
+        let authorization_option = if allow_interactive {
+            "--allow-interactive-authorization=yes"
+        } else {
+            "--allow-interactive-authorization=no"
+        };
+        let interactive_argument = if allow_interactive { "true" } else { "false" };
         run_status(
             "busctl",
             &[
                 "--system",
-                "--allow-interactive-authorization=yes",
+                authorization_option,
                 "--timeout=120",
                 "call",
                 "org.freedesktop.login1",
@@ -142,9 +180,32 @@ impl PowerManager {
                 "org.freedesktop.login1.Manager",
                 command.login1_method(),
                 "b",
-                "true",
+                interactive_argument,
             ],
         )
+    }
+
+    /// Report whether logind will allow this session's action directly or
+    /// require an interactive PolicyKit challenge.
+    pub fn authorization(&self, command: PowerCommand) -> Result<PowerAuthorization, PowerError> {
+        let args = [
+            "--system",
+            "call",
+            "org.freedesktop.login1",
+            "/org/freedesktop/login1",
+            "org.freedesktop.login1.Manager",
+            command.login1_capability_method(),
+        ];
+        let output = Command::new("busctl").args(args).output()?;
+        if !output.status.success() {
+            return Err(PowerError::CommandFailed {
+                program: "busctl",
+                args: args.iter().map(|value| (*value).to_string()).collect(),
+                status: output.status,
+            });
+        }
+
+        parse_login1_capability(&String::from_utf8_lossy(&output.stdout))
     }
 
     pub fn suspend(&self) -> Result<(), PowerError> {
@@ -262,6 +323,19 @@ fn run_status(program: &'static str, args: &[&str]) -> Result<(), PowerError> {
     })
 }
 
+fn parse_login1_capability(response: &str) -> Result<PowerAuthorization, PowerError> {
+    let value = response
+        .trim()
+        .strip_prefix("s ")
+        .unwrap_or(response.trim());
+    match value.trim_matches('"') {
+        "yes" => Ok(PowerAuthorization::Allowed),
+        "challenge" => Ok(PowerAuthorization::Challenge),
+        "no" | "na" => Ok(PowerAuthorization::Unavailable),
+        _ => Err(PowerError::InvalidResponse(response.trim().to_string())),
+    }
+}
+
 pub fn command_timeout() -> Duration {
     Duration::from_secs(2)
 }
@@ -282,6 +356,22 @@ mod tests {
         assert_eq!(PowerCommand::Hibernate.login1_method(), "Hibernate");
         assert_eq!(PowerCommand::Reboot.login1_method(), "Reboot");
         assert_eq!(PowerCommand::PowerOff.login1_method(), "PowerOff");
+    }
+
+    #[test]
+    fn parses_login1_capability_responses() {
+        assert_eq!(
+            parse_login1_capability("s \"yes\"\n").unwrap(),
+            PowerAuthorization::Allowed
+        );
+        assert_eq!(
+            parse_login1_capability("s \"challenge\"\n").unwrap(),
+            PowerAuthorization::Challenge
+        );
+        assert_eq!(
+            parse_login1_capability("s \"no\"\n").unwrap(),
+            PowerAuthorization::Unavailable
+        );
     }
 
     #[test]

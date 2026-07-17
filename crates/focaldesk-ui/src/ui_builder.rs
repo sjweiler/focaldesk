@@ -48,11 +48,23 @@ pub enum AiFlowMode {
     Error,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceCaptureStatus {
+    #[default]
+    Unavailable,
+    Idle,
+    Starting,
+    Listening,
+    Stopping,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct UiBuildOptions {
     pub hdr_supported: bool,
     pub hdr_requested: bool,
     pub hdr_kms_applied: bool,
+    pub microphone_detected: bool,
+    pub voice_capture_status: VoiceCaptureStatus,
     pub workspace_count: usize,
     /// Max number of workspace buttons shown individually before they
     /// collapse into an overflow button. Mirrors
@@ -68,6 +80,8 @@ impl Default for UiBuildOptions {
             hdr_supported: false,
             hdr_requested: false,
             hdr_kms_applied: false,
+            microphone_detected: false,
+            voice_capture_status: VoiceCaptureStatus::Unavailable,
             workspace_count: 1,
             max_workspace_slots: 4,
             active_workspace: 1,
@@ -235,7 +249,7 @@ pub fn build_ui_for_output_with_options(
 
     let mut flow_field = UiElement::topbar_indicator(
         TOPBAR_FLOW_FIELD_ID,
-        IconId::Launcher,
+        IconId::AiConsole,
         "Launch FocalDesk AI Console",
     );
     flow_field.kind = UiElementKind::TopbarFlowField;
@@ -265,11 +279,38 @@ pub fn build_ui_for_output_with_options(
                 "Bluetooth",
                 UiAction::OpenPanel(PanelKind::Bluetooth),
             ),
-            2 => (
-                IconId::Speaker,
-                "Audio",
-                UiAction::OpenPanel(PanelKind::Audio),
-            ),
+            2 => match (options.microphone_detected, options.voice_capture_status) {
+                (_, VoiceCaptureStatus::Starting) => (
+                    IconId::Microphone,
+                    "Voice input: starting",
+                    UiAction::OpenPanel(PanelKind::Audio),
+                ),
+                (_, VoiceCaptureStatus::Listening) => (
+                    IconId::Microphone,
+                    "Voice input: listening — Super+Shift+V to stop",
+                    UiAction::OpenPanel(PanelKind::Audio),
+                ),
+                (_, VoiceCaptureStatus::Stopping) => (
+                    IconId::Microphone,
+                    "Voice input: stopping",
+                    UiAction::OpenPanel(PanelKind::Audio),
+                ),
+                (true, VoiceCaptureStatus::Idle) => (
+                    IconId::MicrophoneOff,
+                    "Voice input: not listening — Super+Shift+V to start",
+                    UiAction::OpenPanel(PanelKind::Audio),
+                ),
+                (true, VoiceCaptureStatus::Unavailable) => (
+                    IconId::MicrophoneOff,
+                    "Voice input unavailable",
+                    UiAction::OpenPanel(PanelKind::Audio),
+                ),
+                (false, VoiceCaptureStatus::Idle | VoiceCaptureStatus::Unavailable) => (
+                    IconId::Speaker,
+                    "Audio",
+                    UiAction::OpenPanel(PanelKind::Audio),
+                ),
+            },
             3 => (
                 IconId::HDR,
                 hdr_tooltip(
@@ -291,6 +332,13 @@ pub fn build_ui_for_output_with_options(
         if icon == IconId::HDR {
             el.selected = options.hdr_kms_applied;
             el.active = options.hdr_requested && !options.hdr_kms_applied;
+        }
+        if icon == IconId::Microphone {
+            el.selected = matches!(
+                options.voice_capture_status,
+                VoiceCaptureStatus::Starting | VoiceCaptureStatus::Listening
+            );
+            el.active = options.voice_capture_status == VoiceCaptureStatus::Listening;
         }
         el.action = Some(action);
         el.hover_scale = 1.08;
@@ -330,10 +378,13 @@ pub fn build_ui_for_output_with_options(
 #[cfg(test)]
 mod tests {
     use super::hdr_tooltip;
+    use crate::atlas::IconId;
+    use crate::element::UiElement;
     use crate::ui_builder::{
         SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID,
         SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions,
-        build_ui_for_output_with_options, sidebar_workspace_id, sidebar_workspace_number,
+        VoiceCaptureStatus, build_ui_for_output_with_options, sidebar_workspace_id,
+        sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
 
@@ -420,14 +471,68 @@ mod tests {
 
     #[test]
     fn topbar_flow_field_launches_ai_console_directly() {
-        let action = build_flow_field_action();
+        let flow_field = build_flow_field();
         assert!(matches!(
-            action,
-            UiAction::LaunchApp("focaldesk-ai-console")
+            flow_field.action.as_ref(),
+            Some(UiAction::LaunchApp("focaldesk-ai-console"))
         ));
+        assert_eq!(flow_field.icon, Some(IconId::AiConsole));
     }
 
-    fn build_flow_field_action() -> UiAction {
+    #[test]
+    fn audio_well_shows_voice_capture_state() {
+        let output_size = smithay::utils::Size::from((1920, 1080));
+        let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(
+            &mut ui,
+            &layout,
+            UiBuildOptions {
+                microphone_detected: true,
+                voice_capture_status: VoiceCaptureStatus::Listening,
+                ..UiBuildOptions::default()
+            },
+        );
+
+        let microphone = ui
+            .elements
+            .iter()
+            .find(|element| element.icon == Some(IconId::Microphone))
+            .expect("microphone indicator");
+        assert_eq!(
+            microphone.tooltip.as_deref(),
+            Some("Voice input: listening — Super+Shift+V to stop")
+        );
+        assert!(microphone.selected);
+        assert!(microphone.active);
+        assert!(matches!(
+            microphone.action,
+            Some(UiAction::OpenPanel(crate::types::PanelKind::Audio))
+        ));
+
+        build_ui_for_output_with_options(
+            &mut ui,
+            &layout,
+            UiBuildOptions {
+                microphone_detected: true,
+                voice_capture_status: VoiceCaptureStatus::Idle,
+                ..UiBuildOptions::default()
+            },
+        );
+        let microphone_off = ui
+            .elements
+            .iter()
+            .find(|element| element.icon == Some(IconId::MicrophoneOff))
+            .expect("idle microphone indicator");
+        assert_eq!(
+            microphone_off.tooltip.as_deref(),
+            Some("Voice input: not listening — Super+Shift+V to start")
+        );
+        assert!(!microphone_off.selected);
+        assert!(!microphone_off.active);
+    }
+
+    fn build_flow_field() -> UiElement {
         let output_size = smithay::utils::Size::from((1920, 1080));
         let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
         let mut ui = UiTree::default();
@@ -435,7 +540,7 @@ mod tests {
         ui.elements
             .iter()
             .find(|el| el.id == TOPBAR_FLOW_FIELD_ID)
-            .and_then(|el| el.action.clone())
-            .expect("flow field action")
+            .cloned()
+            .expect("flow field")
     }
 }

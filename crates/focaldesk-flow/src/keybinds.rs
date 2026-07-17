@@ -87,6 +87,14 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
+                sym: keysyms::KEY_v,
+            },
+            KeyAction::ToggleVoiceCapture,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER | ModMask::SHIFT,
                 sym: keysyms::KEY_q,
             },
             KeyAction::QuitCompositor,

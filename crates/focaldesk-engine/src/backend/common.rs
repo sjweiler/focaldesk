@@ -368,6 +368,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                     pos.x.clamp(min_x, max_x.max(min_x)),
                     pos.y.clamp(min_y, max_y.max(min_y)),
                 )),
+                delta: Some(event.delta()),
                 delta_unaccel: Some(delta_unaccel),
             })
         }
@@ -380,6 +381,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
 
             Some(FlowInputEvent::PointerMoved {
                 position: pos,
+                delta: None,
                 delta_unaccel: None,
             })
         }
@@ -892,6 +894,8 @@ pub(crate) fn bootstrap_compositor_core(
         output_manager_state,
         data_device_state,
         primary_selection_state,
+        pointer_constraints_state:
+            smithay::wayland::pointer_constraints::PointerConstraintsState::new::<DesktopState>(&dh),
         relative_pointer_state:
             smithay::wayland::relative_pointer::RelativePointerManagerState::new::<DesktopState>(
                 &dh,

@@ -1,0 +1,12 @@
+[Unit]
+Description=FocalDesk voice intent daemon
+PartOf=focaldesk-session.target
+After=focaldesk-controlsd.service
+
+[Service]
+ExecStart=%h/.local/bin/focald-voice
+Restart=on-failure
+Environment=FOCALD_VOICE_SOCKET=%t/focald-voice.sock
+
+[Install]
+WantedBy=focaldesk-session.target

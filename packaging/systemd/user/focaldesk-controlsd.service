@@ -1,7 +1,6 @@
 [Unit]
 Description=FocalDesk control daemon
 PartOf=focaldesk-session.target
-After=focaldesk-session.target
 
 [Service]
 Type=simple

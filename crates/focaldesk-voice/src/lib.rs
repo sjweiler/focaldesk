@@ -13,6 +13,8 @@ pub const DEFAULT_MODEL_DIR_NAME: &str = "vosk-model-small-en-us-0.15";
 /// An event streamed from a running [`VoiceSession`] as speech is recognized.
 #[derive(Debug, Clone)]
 pub enum VoiceEvent {
+    /// The input stream is open and microphone samples are being captured.
+    Ready,
     /// In-progress recognition of the current phrase. Replaces the previous `Partial`.
     Partial(String),
     /// A finalized phrase (silence was detected after it). Should be appended permanently.
@@ -141,6 +143,7 @@ fn run_recognition(model_dir: &Path, stop: &AtomicBool, events: &Sender<VoiceEve
     stream
         .play()
         .context("failed to start microphone capture")?;
+    let _ = events.send(VoiceEvent::Ready);
 
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_millis(100)) {

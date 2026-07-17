@@ -7,7 +7,6 @@
 //! centered panel, readable font, and a clickable power menu.
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context as _};
@@ -22,7 +21,7 @@ use smithay::reexports::calloop::{
 };
 
 use focaldm_greeter::drm_backend::GreeterOutput;
-use focaldm_greeter::ipc_client::{DaemonConnection, Request};
+use focaldm_greeter::ipc_client::{DaemonConnection, PowerAction as IpcPowerAction, Request};
 use focaldm_greeter::keymap::{self, Modifiers};
 use focaldm_greeter::login::{LoginState, UiEvent};
 use focaldm_greeter::render::{self, FrameHitTargets, PowerAction};
@@ -91,28 +90,14 @@ impl Greeter {
         self.power_menu_open = false;
     }
 
-    fn launch_power_action(action: PowerAction) {
-        std::thread::spawn(move || {
-            let mut command = Command::new("systemctl");
-            command.arg("--no-block");
-            match action {
-                PowerAction::Suspend => {
-                    command.arg("suspend");
-                }
-                PowerAction::Hibernate => {
-                    command.arg("hibernate");
-                }
-                PowerAction::Restart => {
-                    command.arg("reboot");
-                }
-                PowerAction::PowerOff => {
-                    command.arg("poweroff");
-                }
-            }
-            if let Err(e) = command.status() {
-                tracing::error!(error = %e, action = ?action, "failed to launch power action");
-            }
-        });
+    fn launch_power_action(&mut self, action: PowerAction) {
+        let action = match action {
+            PowerAction::Suspend => IpcPowerAction::Suspend,
+            PowerAction::Hibernate => IpcPowerAction::Hibernate,
+            PowerAction::Restart => IpcPowerAction::Restart,
+            PowerAction::PowerOff => IpcPowerAction::PowerOff,
+        };
+        self.send_all(vec![Request::Power { action }]);
     }
 
     fn handle_primary_click(&mut self) {
@@ -123,7 +108,7 @@ impl Greeter {
         if self.power_menu_open {
             for (action, rect) in &self.frame.power_menu_items {
                 if rect.contains(px, py) {
-                    Self::launch_power_action(*action);
+                    self.launch_power_action(*action);
                     self.close_power_menu();
                     return;
                 }

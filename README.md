@@ -251,6 +251,36 @@ and installs the binaries into `/usr/bin/`.
 If you only want one service, the per-daemon `just install-*-service` recipes
 still work.
 
+### Text-to-speech backends
+
+`focald-speech` uses eSpeak NG by default. It can instead synthesize with Piper
+and send Piper's raw PCM stream directly to PipeWire. Create a user-service
+drop-in directly:
+
+```sh
+mkdir -p ~/.config/systemd/user/focald-speech.service.d
+$EDITOR ~/.config/systemd/user/focald-speech.service.d/override.conf
+```
+
+Add the following override with the path to a downloaded `.onnx` voice model
+(the matching `.onnx.json` file must be alongside it):
+
+```ini
+[Service]
+Environment=FOCALD_SPEECH_BACKEND=piper
+Environment=FOCALD_SPEECH_PIPER_MODEL=/path/to/en_US-lessac-medium.onnx
+# Set this when Piper is installed outside systemd's PATH.
+Environment=FOCALD_SPEECH_PROGRAM=/absolute/path/to/piper
+# Match the sample rate in the model's adjacent JSON configuration.
+Environment=FOCALD_SPEECH_PIPER_SAMPLE_RATE=22050
+```
+
+Then run `systemctl --user daemon-reload` and restart the daemon with
+`systemctl --user restart focald-speech.service`. Piper and `pw-play` must be
+installed. `FOCALD_SPEECH_PLAYER` can override the player executable. Set
+`FOCALD_SPEECH_BACKEND=espeak-ng` (or remove the override) to return to eSpeak
+NG.
+
 ## License
 
 FocalDesk is licensed under the MIT License. See [LICENSE](LICENSE).

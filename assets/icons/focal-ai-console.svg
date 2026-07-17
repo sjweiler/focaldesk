@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="24" height="24" viewBox="0 0 24 24"
+     fill="none" role="img" aria-labelledby="title desc">
+  <title id="title">Focal AI Console</title>
+  <desc id="desc">A compact focus frame surrounding orange and blue AI signal arcs</desc>
+
+  <!-- Focus frame: simplified from the full FocalDesk mark for small UI sizes. -->
+  <path d="M8 3H3V8 M16 3H21V8 M3 16V21H8 M21 16V21H16"
+        stroke="#FFB52A" stroke-width="1.8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Paired signal arcs preserve the motion and color of the primary logo. -->
+  <path d="M5.4 10.1C7.5 6.5 12.2 5.2 16 6.8C17.3 7.3 18.4 8.1 19.1 9.1"
+        stroke="#FF650D" stroke-width="1.9" stroke-linecap="round"/>
+  <path d="M4.9 13C7.3 16.9 12.1 18.4 16.1 16.8C17.5 16.3 18.5 15.5 19.2 14.4"
+        stroke="#26B7EF" stroke-width="1.9" stroke-linecap="round"/>
+
+  <!-- A four-point spark makes the AI destination legible without adding text. -->
+  <path d="M12 8.7C12.3 10.5 13.5 11.7 15.3 12C13.5 12.3 12.3 13.5 12 15.3C11.7 13.5 10.5 12.3 8.7 12C10.5 11.7 11.7 10.5 12 8.7Z"
+        fill="#FFF7E8"/>
+  <circle cx="19.25" cy="11.65" r="1.15" fill="#FF650D"/>
+</svg>
