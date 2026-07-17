@@ -1,7 +1,7 @@
 use anyhow::Context;
 use focaldesk_ai::{
-    AiDaemonStatus, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, ProviderInfo,
-    ProviderModelInfo, send_ai_request,
+    AiDaemonStatus, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, MemoryId, ProviderInfo,
+    ProviderModelInfo, SearchHit, send_ai_request,
 };
 use focaldesk_ipc::{
     IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
@@ -1655,6 +1655,24 @@ fn send_chat_request(request: ChatRequest) -> anyhow::Result<String> {
     }
 }
 
+const MEMORY_RECALL_TOP_K: usize = 5;
+
+fn send_remember_request(text: String, metadata: serde_json::Value) -> anyhow::Result<MemoryId> {
+    match send_ai_request(&AiIpcRequest::Remember { text, metadata })? {
+        AiIpcResponse::Remembered { id } => Ok(id),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
+fn send_recall_request(query: String, top_k: usize) -> anyhow::Result<Vec<SearchHit>> {
+    match send_ai_request(&AiIpcRequest::Recall { query, top_k })? {
+        AiIpcResponse::Recalled { hits } => Ok(hits),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
 fn launch_configured_app(
     selector: impl FnOnce(&focaldesk_settings_core::Settings) -> String,
 ) -> anyhow::Result<String> {
@@ -2279,41 +2297,168 @@ fn memory_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Bo
     let snapshot = store.borrow();
     page.append(&info_card(&[
         format!("{} notes pinned", snapshot.app_state.memory_notes.len()),
-        "Add short facts here; they are persisted across launches.".to_string(),
+        "Add short facts here; they are persisted locally and sent to the AI memory store for recall.".to_string(),
     ]));
+    drop(snapshot);
 
-    for note in snapshot.app_state.memory_notes.clone() {
-        page.append(&note_card(&note));
+    let notes_box = Box::new(Orientation::Vertical, 6);
+    {
+        let snapshot = store.borrow();
+        for note in snapshot.app_state.memory_notes.clone() {
+            notes_box.append(&note_card(&note));
+        }
     }
+    page.append(&notes_box);
 
     let entry = Entry::builder()
         .placeholder_text("Add memory note")
         .hexpand(true)
         .build();
     let button = Button::with_label("Add note");
-    let store = store.clone();
-    let page_clone = page.clone();
-    let entry_clone = entry.clone();
-    let log_buffer = log_buffer.clone();
-    button.connect_clicked(move |_| {
-        let text = entry_clone.text().to_string();
-        if text.trim().is_empty() {
-            return;
-        }
-        {
-            let mut state = store.borrow_mut();
-            state.app_state.memory_notes.push(text.clone());
-            persist_state(&state);
-        }
-        page_clone.append(&note_card(&text));
-        append_log(&log_buffer, "[memory] added a note");
-        entry_clone.set_text("");
-    });
+    {
+        let store = store.clone();
+        let notes_box = notes_box.clone();
+        let entry_clone = entry.clone();
+        let log_buffer = log_buffer.clone();
+        button.connect_clicked(move |_| {
+            let text = entry_clone.text().to_string();
+            if text.trim().is_empty() {
+                return;
+            }
+            {
+                let mut state = store.borrow_mut();
+                state.app_state.memory_notes.push(text.clone());
+                persist_state(&state);
+            }
+            notes_box.append(&note_card(&text));
+            append_log(&log_buffer, "[memory] added a note");
+            entry_clone.set_text("");
+
+            let (tx, rx) = mpsc::channel();
+            let remember_text = text.clone();
+            thread::spawn(move || {
+                let result = send_remember_request(
+                    remember_text,
+                    serde_json::json!({ "source": "ai-console" }),
+                );
+                let _ = tx.send(result);
+            });
+
+            let log_buffer_for_result = log_buffer.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(id)) => {
+                    append_log(
+                        &log_buffer_for_result,
+                        &format!("[memory] stored note in AI memory store (id {id})"),
+                    );
+                    ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    append_log(
+                        &log_buffer_for_result,
+                        &format!("[memory] AI memory store unavailable: {err}"),
+                    );
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    append_log(
+                        &log_buffer_for_result,
+                        "[memory] remember channel disconnected before completion",
+                    );
+                    ControlFlow::Break
+                }
+            });
+        });
+    }
 
     let row = Box::new(Orientation::Horizontal, 8);
     row.append(&entry);
     row.append(&button);
     page.append(&row);
+
+    let recall_heading = Label::new(Some("Search memory"));
+    recall_heading.set_xalign(0.0);
+    recall_heading.add_css_class("pane-heading");
+    page.append(&recall_heading);
+
+    let recall_entry = Entry::builder()
+        .placeholder_text("Search memory (e.g. \"garage code\")")
+        .hexpand(true)
+        .build();
+    let recall_button = Button::with_label("Recall");
+    let recall_results = Box::new(Orientation::Vertical, 6);
+
+    {
+        let recall_entry_clone = recall_entry.clone();
+        let recall_results = recall_results.clone();
+        let recall_button_clone = recall_button.clone();
+        let log_buffer = log_buffer.clone();
+        recall_button.connect_clicked(move |_| {
+            let query = recall_entry_clone.text().to_string();
+            if query.trim().is_empty() {
+                return;
+            }
+
+            clear_box(&recall_results);
+            recall_results.append(&note_card("Searching..."));
+            recall_button_clone.set_sensitive(false);
+            append_log(&log_buffer, &format!("[memory] recall query: {query}"));
+
+            let (tx, rx) = mpsc::channel();
+            let recall_query = query.clone();
+            thread::spawn(move || {
+                let result = send_recall_request(recall_query, MEMORY_RECALL_TOP_K);
+                let _ = tx.send(result);
+            });
+
+            let recall_results_for_result = recall_results.clone();
+            let recall_button_for_result = recall_button_clone.clone();
+            let log_buffer_for_result = log_buffer.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(hits)) => {
+                    clear_box(&recall_results_for_result);
+                    if hits.is_empty() {
+                        recall_results_for_result.append(&note_card("No matching memories found."));
+                    } else {
+                        for hit in &hits {
+                            recall_results_for_result.append(&recall_hit_card(hit));
+                        }
+                    }
+                    append_log(
+                        &log_buffer_for_result,
+                        &format!("[memory] recall returned {} hit(s)", hits.len()),
+                    );
+                    recall_button_for_result.set_sensitive(true);
+                    ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    clear_box(&recall_results_for_result);
+                    recall_results_for_result.append(&note_card(&format!("Recall failed: {err}")));
+                    append_log(
+                        &log_buffer_for_result,
+                        &format!("[memory] recall failed: {err}"),
+                    );
+                    recall_button_for_result.set_sensitive(true);
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    clear_box(&recall_results_for_result);
+                    recall_results_for_result
+                        .append(&note_card("Recall channel disconnected before completion."));
+                    recall_button_for_result.set_sensitive(true);
+                    ControlFlow::Break
+                }
+            });
+        });
+    }
+
+    let recall_row = Box::new(Orientation::Horizontal, 8);
+    recall_row.append(&recall_entry);
+    recall_row.append(&recall_button);
+    page.append(&recall_row);
+    page.append(&recall_results);
 
     page
 }
@@ -2379,6 +2524,24 @@ fn note_card(text: &str) -> Box {
     label.add_css_class("item-body");
 
     card.append(&label);
+    card
+}
+
+fn recall_hit_card(hit: &SearchHit) -> Box {
+    let card = Box::new(Orientation::Vertical, 4);
+    card.add_css_class("item-card");
+
+    let text_label = Label::new(Some(&hit.record.text));
+    text_label.set_xalign(0.0);
+    text_label.set_wrap(true);
+    text_label.add_css_class("item-body");
+    card.append(&text_label);
+
+    let meta_label = Label::new(Some(&format!("distance {:.3}", hit.distance)));
+    meta_label.set_xalign(0.0);
+    meta_label.add_css_class("item-meta");
+    card.append(&meta_label);
+
     card
 }
 
@@ -2597,6 +2760,11 @@ fn load_css() {
 
         .item-body {
             color: #d1d9e8;
+        }
+
+        .item-meta {
+            color: #97a2c0;
+            font-size: 11px;
         }
 
         .info-card {
