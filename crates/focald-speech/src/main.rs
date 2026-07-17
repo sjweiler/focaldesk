@@ -5,7 +5,7 @@ use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::Duration;
 
@@ -65,27 +65,87 @@ enum WorkerCommand {
     Stop,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendKind {
+    Espeak,
+    Piper,
+}
+
+impl BackendKind {
+    fn from_env() -> Result<Self> {
+        Self::parse(
+            &std::env::var("FOCALD_SPEECH_BACKEND").unwrap_or_else(|_| "espeak-ng".to_string()),
+        )
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "espeak" | "espeak-ng" => Ok(Self::Espeak),
+            "piper" => Ok(Self::Piper),
+            backend => anyhow::bail!(
+                "unsupported FOCALD_SPEECH_BACKEND {backend:?}; expected espeak-ng or piper"
+            ),
+        }
+    }
+
+    fn default_program(self) -> &'static str {
+        match self {
+            Self::Espeak => "espeak-ng",
+            Self::Piper => "piper",
+        }
+    }
+}
+
 struct SpeechBackend {
+    kind: BackendKind,
     program: String,
     voice: Option<String>,
+    piper_model: Option<String>,
+    piper_sample_rate: u32,
+    player: String,
     rate: u16,
     amplitude: u16,
 }
 
 impl SpeechBackend {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        let kind = BackendKind::from_env()?;
+        let backend = Self {
+            kind,
             program: std::env::var("FOCALD_SPEECH_PROGRAM")
-                .unwrap_or_else(|_| "espeak-ng".to_string()),
+                .unwrap_or_else(|_| kind.default_program().to_string()),
             voice: std::env::var("FOCALD_SPEECH_VOICE")
                 .ok()
                 .filter(|voice| !voice.trim().is_empty()),
+            piper_model: std::env::var("FOCALD_SPEECH_PIPER_MODEL")
+                .ok()
+                .filter(|model| !model.trim().is_empty()),
+            piper_sample_rate: env_number_u32(
+                "FOCALD_SPEECH_PIPER_SAMPLE_RATE",
+                22_050,
+                8_000,
+                192_000,
+            ),
+            player: std::env::var("FOCALD_SPEECH_PLAYER").unwrap_or_else(|_| "pw-play".to_string()),
             rate: env_number("FOCALD_SPEECH_RATE", 175, 80, 450),
             amplitude: env_number("FOCALD_SPEECH_AMPLITUDE", 100, 0, 200),
+        };
+        if backend.kind == BackendKind::Piper && backend.piper_model.is_none() {
+            anyhow::bail!(
+                "FOCALD_SPEECH_PIPER_MODEL must name a Piper voice or .onnx model when using Piper"
+            );
+        }
+        Ok(backend)
+    }
+
+    fn spawn(&self, text: &str) -> Result<BackendProcess> {
+        match self.kind {
+            BackendKind::Espeak => self.spawn_espeak(text),
+            BackendKind::Piper => self.spawn_piper(text),
         }
     }
 
-    fn spawn(&self, text: &str) -> Result<Child> {
+    fn spawn_espeak(&self, text: &str) -> Result<BackendProcess> {
         let mut command = Command::new(&self.program);
         command
             .args([
@@ -111,11 +171,153 @@ impl SpeechBackend {
             .context("TTS backend stdin was unavailable")?
             .write_all(text.as_bytes())
             .context("write text to TTS backend")?;
-        Ok(child)
+        Ok(BackendProcess::new(vec![("espeak-ng", child)]))
+    }
+
+    fn spawn_piper(&self, text: &str) -> Result<BackendProcess> {
+        let mut command = self.piper_command()?;
+        let mut piper = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("start Piper backend {:?}", self.program))?;
+
+        let audio = piper
+            .stdout
+            .take()
+            .context("Piper stdout was unavailable")?;
+        let player = match Command::new(&self.player)
+            .args([
+                "--raw",
+                "--rate",
+                &self.piper_sample_rate.to_string(),
+                "--channels",
+                "1",
+                "--format",
+                "s16",
+                "-",
+            ])
+            .stdin(Stdio::from(audio))
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("start Piper audio player {:?}", self.player))
+        {
+            Ok(player) => player,
+            Err(err) => {
+                let _ = piper.kill();
+                let _ = piper.wait();
+                return Err(err);
+            }
+        };
+
+        let input = piper.stdin.take();
+        let mut process = BackendProcess::new(vec![("piper", piper), ("player", player)]);
+        let write_result = input
+            .context("Piper stdin was unavailable")
+            .and_then(|mut input| {
+                input
+                    .write_all(text.as_bytes())
+                    .context("write text to Piper")
+            });
+        if let Err(err) = write_result {
+            process.cancel();
+            return Err(err);
+        }
+
+        Ok(process)
+    }
+
+    fn piper_command(&self) -> Result<Command> {
+        let model = self
+            .piper_model
+            .as_deref()
+            .context("Piper model was not configured")?;
+        let length_scale = format!("{:.3}", 175.0 / f64::from(self.rate));
+        let volume = format!("{:.2}", f64::from(self.amplitude) / 100.0);
+        let mut command = Command::new(&self.program);
+        command.args([
+            "--model",
+            model,
+            "--output-raw",
+            "--length-scale",
+            &length_scale,
+            "--volume",
+            &volume,
+        ]);
+        Ok(command)
+    }
+}
+
+struct BackendChild {
+    name: &'static str,
+    child: Child,
+    status: Option<ExitStatus>,
+}
+
+struct BackendProcess {
+    children: Vec<BackendChild>,
+}
+
+impl BackendProcess {
+    fn new(children: Vec<(&'static str, Child)>) -> Self {
+        Self {
+            children: children
+                .into_iter()
+                .map(|(name, child)| BackendChild {
+                    name,
+                    child,
+                    status: None,
+                })
+                .collect(),
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<()>> {
+        for process in &mut self.children {
+            if process.status.is_none() {
+                process.status = process
+                    .child
+                    .try_wait()
+                    .with_context(|| format!("waiting for {}", process.name))?;
+            }
+        }
+        if self.children.iter().any(|process| process.status.is_none()) {
+            return Ok(None);
+        }
+        for process in &self.children {
+            let status = process.status.expect("all child statuses were collected");
+            if !status.success() {
+                anyhow::bail!("{} exited with {status}", process.name);
+            }
+        }
+        Ok(Some(()))
+    }
+
+    fn cancel(&mut self) {
+        for process in &mut self.children {
+            if process.status.is_none() {
+                let _ = process.child.kill();
+            }
+        }
+        for process in &mut self.children {
+            if process.status.is_none() {
+                let _ = process.child.wait();
+            }
+        }
     }
 }
 
 fn env_number(name: &str, default: u16, min: u16, max: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (min..=max).contains(value))
+        .unwrap_or(default)
+}
+
+fn env_number_u32(name: &str, default: u32, min: u32, max: u32) -> u32 {
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -147,9 +349,10 @@ fn run_server() -> Result<()> {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
     let (commands_tx, commands_rx) = mpsc::sync_channel(COMMAND_BUFFER);
+    let backend = SpeechBackend::from_env().context("configure speech backend")?;
     std::thread::Builder::new()
         .name("focald-speech-worker".into())
-        .spawn(move || worker_loop(commands_rx, SpeechBackend::from_env()))
+        .spawn(move || worker_loop(commands_rx, backend))
         .context("start speech worker")?;
 
     eprintln!("focald-speech: listening at {}", socket.display());
@@ -221,7 +424,7 @@ fn decode_request(payload: &str) -> Result<WorkerCommand, String> {
 
 fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
     let mut pending = VecDeque::<SpeechJob>::new();
-    let mut current: Option<(Child, String)> = None;
+    let mut current: Option<(BackendProcess, String)> = None;
 
     loop {
         if current.is_none() {
@@ -276,19 +479,16 @@ fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
             }
         }
 
-        if let Some((child, description)) = current.as_mut() {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if status.success() {
-                        eprintln!("[finished] {description:?}");
-                    } else {
-                        eprintln!("[failed] {description:?}: backend exited with {status}");
-                    }
+        if let Some((process, description)) = current.as_mut() {
+            match process.try_wait() {
+                Ok(Some(())) => {
+                    eprintln!("[finished] {description:?}");
                     current = None;
                 }
                 Ok(None) => {}
                 Err(err) => {
-                    eprintln!("[failed] {description:?}: waiting for backend: {err}");
+                    eprintln!("[failed] {description:?}: {err:#}");
+                    process.cancel();
                     current = None;
                 }
             }
@@ -298,10 +498,9 @@ fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
     cancel_current(&mut current);
 }
 
-fn cancel_current(current: &mut Option<(Child, String)>) {
-    if let Some((mut child, description)) = current.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+fn cancel_current(current: &mut Option<(BackendProcess, String)>) {
+    if let Some((mut process, description)) = current.take() {
+        process.cancel();
         eprintln!("[cancelled] {description:?}");
     }
 }
@@ -361,6 +560,49 @@ fn speech_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_names_are_parsed() {
+        assert_eq!(BackendKind::parse("espeak").unwrap(), BackendKind::Espeak);
+        assert_eq!(
+            BackendKind::parse("ESPEAK-NG").unwrap(),
+            BackendKind::Espeak
+        );
+        assert_eq!(BackendKind::parse("Piper").unwrap(), BackendKind::Piper);
+        assert!(BackendKind::parse("festival").is_err());
+    }
+
+    #[test]
+    fn piper_command_uses_model_rate_and_volume() {
+        let backend = SpeechBackend {
+            kind: BackendKind::Piper,
+            program: "piper-custom".into(),
+            voice: None,
+            piper_model: Some("voice.onnx".into()),
+            piper_sample_rate: 22_050,
+            player: "pw-play".into(),
+            rate: 350,
+            amplitude: 80,
+        };
+        let command = backend.piper_command().unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(command.get_program(), "piper-custom");
+        assert_eq!(
+            args,
+            [
+                "--model",
+                "voice.onnx",
+                "--output-raw",
+                "--length-scale",
+                "0.500",
+                "--volume",
+                "0.80"
+            ]
+        );
+    }
 
     #[test]
     fn text_only_request_defaults_to_normal_speech() {
