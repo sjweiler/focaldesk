@@ -53,7 +53,7 @@ install-session-target:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
 
-install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-focald-voice install-focald-speech install-focald-mic
+install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-automation-service install-launch-service install-settings-service install-polkit-service install-focald-voice install-focald-speech install-focald-mic
 
 install-power-service:
     cargo build --release -p focaldesk-powerd
@@ -119,9 +119,12 @@ install-portal:
     target/release/focaldesk-portal --print-xdpw-config > "$HOME/.config/xdg-desktop-portal-wlr/config"
     systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"
 
-install-automation:
+install-automation-service:
     cargo build --release -p focaldesk-automation
     install -Dm755 target/release/focaldesk-automation "$HOME/.local/bin/focaldesk-automation"
+    install -Dm644 packaging/systemd/user/focaldesk-automation.service "$HOME/.config/systemd/user/focaldesk-automation.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-automation.service || echo "Skipping systemd user enable: no user bus available"
 
 install-files:
     cargo build --release -p focaldesk-files
@@ -194,7 +197,7 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-automation-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-speech-service-fedora install-mic-service-fedora
 
 install-session-target-fedora:
     sudo install -Dm644 packaging/systemd/user/focaldesk-session.target /usr/lib/systemd/user/focaldesk-session.target
@@ -236,6 +239,13 @@ install-control-service-fedora:
     rm -f "$HOME/.config/systemd/user/default.target.wants/focaldesk-controlsd.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-controlsd.service || echo "Skipping systemd user enable: no user bus available"
+
+install-automation-service-fedora:
+    cargo build --release -p focaldesk-automation
+    sudo install -Dm755 target/release/focaldesk-automation /usr/bin/focaldesk-automation
+    sudo install -Dm644 packaging/systemd/user/focaldesk-automation-fedora.service /usr/lib/systemd/user/focaldesk-automation.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-automation.service || echo "Skipping systemd user enable: no user bus available"
 
 install-launch-service-fedora:
     cargo build --release -p focal-launchd

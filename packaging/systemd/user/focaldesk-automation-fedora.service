@@ -1,0 +1,14 @@
+[Unit]
+Description=FocalDesk automation daemon
+PartOf=focaldesk-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/focaldesk-automation
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=focaldesk-session.target
