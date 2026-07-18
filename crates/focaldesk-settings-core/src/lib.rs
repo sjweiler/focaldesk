@@ -16,6 +16,38 @@ pub struct Settings {
     pub power: PowerSettings,
     #[serde(default)]
     pub debug: DebugSettings,
+    #[serde(default)]
+    pub chrome: ChromeSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChromeSettings {
+    #[serde(default)]
+    pub sidebar: ChromeRegionSettings,
+    #[serde(default)]
+    pub topbar: ChromeRegionSettings,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChromeRegionSettings {
+    /// Stable numeric element IDs in preferred order. Unlisted built-ins are
+    /// appended, so older settings remain forward-compatible.
+    #[serde(default)]
+    pub order: Vec<u32>,
+    #[serde(default)]
+    pub hidden: Vec<u32>,
+    #[serde(default)]
+    pub custom: Vec<ChromeLaunchItemSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChromeLaunchItemSettings {
+    pub id: u32,
+    pub icon: String,
+    pub tooltip: String,
+    pub command: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,7 +300,12 @@ pub fn default_settings() -> Settings {
         privacy: PrivacySettings::default(),
         power: PowerSettings::default(),
         debug: DebugSettings::default(),
+        chrome: ChromeSettings::default(),
     }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_recent_files() -> bool {
@@ -346,6 +383,20 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.restore_session);
+    }
+
+    #[test]
+    fn chrome_settings_default_for_existing_files_and_round_trip() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("chrome");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.chrome.sidebar.order.is_empty());
+        assert!(settings.chrome.topbar.hidden.is_empty());
+
+        settings.chrome.topbar.hidden.push(103);
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(restored.chrome.topbar.hidden, vec![103]);
     }
 
     #[test]

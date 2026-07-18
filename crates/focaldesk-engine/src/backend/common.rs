@@ -922,6 +922,7 @@ pub(crate) fn bootstrap_compositor_core(
         privacy: settings.privacy,
         power: settings.power,
         debug: settings.debug,
+        chrome_items: settings.chrome,
     };
 
     let mut state = DesktopState::new(init);

@@ -1,7 +1,8 @@
 use crate::chrome_layout::ChromeLayout;
 use crate::clock::ClockComponent;
-use crate::element::UiElement;
-use crate::element::UiRect;
+use crate::element::{ChromeItem, UiElement, UiRect};
+use crate::types::UiElementKind;
+use crate::types::{PanelKind, UiAction};
 use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
 use crate::uicomponent::UiComponent;
@@ -58,10 +59,45 @@ impl Default for TopBar {
 }
 
 impl TopBar {
+    pub const OVERFLOW_ID: u32 = 199_999;
     pub fn layout_from_chrome(&mut self, layout: &ChromeLayout, ctx: &LayoutCtx) {
         self.bounds = layout.topbar.outer.into();
         self.clock.bounds = layout.topbar.clock_well.into();
         let _ = ctx;
+    }
+
+    pub fn layout_status_items(
+        layout: &ChromeLayout,
+        items: impl IntoIterator<Item = ChromeItem>,
+    ) -> Vec<UiElement> {
+        let capacity = layout.topbar.status_wells.len();
+        let mut visible: Vec<_> = items.into_iter().filter(|item| item.visible).collect();
+        if visible.len() > capacity && capacity > 0 {
+            visible.truncate(capacity);
+            visible[capacity - 1] = ChromeItem::new(
+                Self::OVERFLOW_ID,
+                crate::atlas::IconId::Overflow,
+                "More status items · open Settings",
+                UiAction::OpenPanel(PanelKind::Settings),
+            );
+        }
+
+        layout
+            .topbar
+            .status_wells
+            .iter()
+            .zip(visible)
+            .map(|(well, item)| {
+                let mut element = UiElement::from_chrome_item(
+                    UiElementKind::TopbarIndicator,
+                    item,
+                    UiRect::from(*well),
+                );
+                element.hover_scale = 1.08;
+                element.press_scale = 0.96;
+                element
+            })
+            .collect()
     }
 }
 

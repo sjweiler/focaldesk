@@ -569,7 +569,7 @@ impl EguiLayer {
                         actions.push(UiAction::OpenPanel(PanelKind::Settings));
                     }
                     if ui.button("Launch terminal").clicked() {
-                        actions.push(UiAction::LaunchApp("weston-terminal"));
+                        actions.push(UiAction::LaunchApp("weston-terminal".into()));
                     }
                     if ui.button("Custom action").clicked() {
                         actions.push(UiAction::Custom(9001));

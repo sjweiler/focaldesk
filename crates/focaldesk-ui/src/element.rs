@@ -47,7 +47,78 @@ pub struct UiElement {
     pub press_scale: f32, // e.g. 0.96
 }
 
+/// Declarative chrome content before a topbar/sidebar layout assigns bounds.
+///
+/// Runtime owners can add, remove, reorder, hide, or update these items without
+/// coupling their behavior to a slot index. [`UiElement`] remains the laid-out,
+/// interactive representation used for hit testing and rendering.
+#[derive(Debug, Clone)]
+pub struct ChromeItem {
+    pub id: ElementId,
+    pub icon: IconId,
+    pub tooltip: String,
+    pub action: UiAction,
+    pub visible: bool,
+    pub enabled: bool,
+    pub active: bool,
+    pub selected: bool,
+}
+
+impl ChromeItem {
+    pub fn new(id: ElementId, icon: IconId, tooltip: impl Into<String>, action: UiAction) -> Self {
+        Self {
+            id,
+            icon,
+            tooltip: tooltip.into(),
+            action,
+            visible: true,
+            enabled: true,
+            active: false,
+            selected: false,
+        }
+    }
+
+    pub fn visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn active(mut self, active: bool) -> Self {
+        self.active = active;
+        self
+    }
+
+    pub fn selected(mut self, selected: bool) -> Self {
+        self.selected = selected;
+        self
+    }
+}
+
 impl UiElement {
+    pub fn from_chrome_item(kind: UiElementKind, item: ChromeItem, bounds: UiRect) -> Self {
+        Self {
+            id: item.id,
+            kind,
+            bounds,
+            icon: Some(item.icon),
+            label: None,
+            tooltip: Some(item.tooltip),
+            action: Some(item.action),
+            visible: item.visible,
+            enabled: item.enabled,
+            hovered: false,
+            active: item.active,
+            selected: item.selected,
+            hover_scale: 1.1,
+            press_scale: 0.96,
+        }
+    }
+
     pub fn visual_state(&self) -> UiVisualState {
         if !self.enabled {
             UiVisualState::Disabled

@@ -2024,6 +2024,7 @@ fn build_ui(app: &adw::Application) {
         "Displays",
         "Sound",
         "Applications",
+        "Chrome",
         "Workspaces",
         "Keyboard",
         "Privacy",
@@ -2067,6 +2068,7 @@ fn build_ui(app: &adw::Application) {
         "Applications".to_string(),
         applications_page(settings.clone()),
     );
+    pages.insert("Chrome".to_string(), chrome_page(settings.clone()));
     pages.insert("Workspaces".to_string(), workspaces_page(settings.clone()));
     pages.insert("Keyboard".to_string(), keyboard_page());
     pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
@@ -3686,6 +3688,144 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     adw::NavigationPage::new(&page, "Applications")
 }
 
+fn set_chrome_item_visible(hidden: &mut Vec<u32>, id: u32, visible: bool) {
+    hidden.retain(|known| *known != id);
+    if !visible {
+        hidden.push(id);
+    }
+}
+
+fn parse_chrome_order(text: &str) -> Option<Vec<u32>> {
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    text.split(',')
+        .map(|part| part.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn chrome_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Chrome");
+
+    let topbar = adw::PreferencesGroup::new();
+    topbar.set_title("Top Bar Indicators");
+    topbar.set_description(Some(
+        "Show or hide live indicators. Changes apply immediately.",
+    ));
+    for (title, id) in [
+        ("Network", 100),
+        ("Bluetooth", 101),
+        ("Audio and microphone", 102),
+        ("HDR display status", 103),
+        ("Power", 104),
+    ] {
+        let active = !settings.borrow().chrome.topbar.hidden.contains(&id);
+        let toggle = add_switch_row(&topbar, title, None, active);
+        let settings = settings.clone();
+        toggle.connect_active_notify(move |switch| {
+            set_chrome_item_visible(
+                &mut settings.borrow_mut().chrome.topbar.hidden,
+                id,
+                switch.is_active(),
+            );
+            persist_settings(&settings.borrow());
+        });
+    }
+    let topbar_order = add_entry_row(&topbar, "Indicator order", "100, 101, 102, 103, 104");
+    topbar_order.set_text(
+        &settings
+            .borrow()
+            .chrome
+            .topbar
+            .order
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    {
+        let settings = settings.clone();
+        topbar_order.connect_changed(move |entry| {
+            let Some(order) = parse_chrome_order(entry.text().as_str()) else {
+                return;
+            };
+            settings.borrow_mut().chrome.topbar.order = order;
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&topbar);
+
+    let sidebar = adw::PreferencesGroup::new();
+    sidebar.set_title("Sidebar Buttons");
+    sidebar.set_description(Some(
+        "Workspace controls remain dynamic; fixed application buttons can be shown or hidden.",
+    ));
+    for (title, id) in [
+        ("Settings", 1001),
+        ("Launcher", 1000),
+        ("Browser", 1005),
+        ("Terminal", 1006),
+        ("Files", 1007),
+    ] {
+        let active = !settings.borrow().chrome.sidebar.hidden.contains(&id);
+        let toggle = add_switch_row(&sidebar, title, None, active);
+        let settings = settings.clone();
+        toggle.connect_active_notify(move |switch| {
+            set_chrome_item_visible(
+                &mut settings.borrow_mut().chrome.sidebar.hidden,
+                id,
+                switch.is_active(),
+            );
+            persist_settings(&settings.borrow());
+        });
+    }
+    let sidebar_order = add_entry_row(
+        &sidebar,
+        "Fixed-item priority",
+        "1001, 1000, 1005, 1006, 1007",
+    );
+    sidebar_order.set_text(
+        &settings
+            .borrow()
+            .chrome
+            .sidebar
+            .order
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    {
+        let settings = settings.clone();
+        sidebar_order.connect_changed(move |entry| {
+            let Some(order) = parse_chrome_order(entry.text().as_str()) else {
+                return;
+            };
+            settings.borrow_mut().chrome.sidebar.order = order;
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&sidebar);
+
+    let custom = adw::PreferencesGroup::new();
+    custom.set_title("Custom Launch Items");
+    custom.set_description(Some(
+        "Advanced launch items can be added under chrome.sidebar.custom or chrome.topbar.custom in settings.json. Supported icons include browser, terminal, files, settings, wifi, bluetooth, microphone, speaker, hdr, and power.",
+    ));
+    add_info_row(
+        &custom,
+        "Configuration file",
+        None,
+        &focaldesk_settings_core::settings_path()
+            .display()
+            .to_string(),
+    );
+    page.add(&custom);
+
+    adw::NavigationPage::new(&page, "Chrome")
+}
+
 fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Workspaces");
@@ -4671,6 +4811,16 @@ mod tests {
         assert_eq!(hdr_status_subtitle(true, true), "Active now");
         assert_eq!(hdr_status_subtitle(true, false), "Requested, but inactive");
         assert_eq!(hdr_status_subtitle(false, false), "Off");
+    }
+
+    #[test]
+    fn chrome_order_parser_accepts_empty_and_numeric_lists() {
+        assert_eq!(parse_chrome_order(""), Some(vec![]));
+        assert_eq!(
+            parse_chrome_order("104, 100,101"),
+            Some(vec![104, 100, 101])
+        );
+        assert_eq!(parse_chrome_order("network, 100"), None);
     }
 
     #[test]

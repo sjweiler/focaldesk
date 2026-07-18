@@ -84,13 +84,16 @@ use focaldesk_power::{
     PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
 };
 use focaldesk_settings_core::{
-    load_settings, AppSettings, BrowserLaunchBackend, DebugLogLevel, DebugSettings,
-    DisplayColorProfile, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
-    PowerButtonAction, PowerSettings, PrivacySettings, WorkspaceSettings,
+    load_settings, AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings,
+    DebugLogLevel, DebugSettings, DisplayColorProfile, LidCloseAction, LowBatteryAction,
+    OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings, PrivacySettings,
+    WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
+use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
+use focaldesk_ui::element::ChromeItem;
 use indexmap::IndexMap;
 use smithay::delegate_dispatch2;
 use smithay::input::keyboard::FilterResult;
@@ -133,7 +136,8 @@ use std::thread;
 use wayland_server::DisplayHandle;
 
 use crate::core::chrome_layout::{
-    build_chrome_layout, chrome_host_drag_hit, sidebar_slot_index_at, topbar_status_well_index_at,
+    build_chrome_layout, build_chrome_layout_with_config, chrome_host_drag_hit,
+    sidebar_slot_index_at, topbar_status_well_index_at, ChromeLayout,
 };
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
@@ -142,7 +146,8 @@ use crate::core::toplevel_interaction::{
     ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
 use crate::core::ui_builder::{
-    build_ui_for_output_with_options, AiFlowMode, UiBuildOptions, VoiceCaptureStatus,
+    build_ui_for_output_with_options, default_sidebar_items, default_status_items, AiFlowMode,
+    UiBuildOptions, VoiceCaptureStatus,
 };
 use focaldesk_ai::{send_ai_request, AiDaemonStatus, AiIpcRequest, AiIpcResponse};
 use focaldesk_themes::theme::BuiltInThemeId;
@@ -607,6 +612,7 @@ pub struct DesktopInit {
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
     pub debug: DebugSettings,
+    pub chrome_items: ChromeSettings,
 }
 
 enum DesktopIpcMessage {
@@ -747,6 +753,7 @@ pub struct DesktopState {
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
     pub debug: DebugSettings,
+    pub chrome_items: ChromeSettings,
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
     settings_ipc_watchers: Vec<DesktopIpcWatcher>,
     settings_ipc_config: FocalDeskConfig,
@@ -1342,6 +1349,7 @@ impl DesktopState {
         self.workspaces = settings.workspaces;
         self.privacy = settings.privacy;
         self.power = settings.power;
+        self.chrome_items = settings.chrome;
         self.apply_power_settings();
         self.apply_debug_settings(settings.debug);
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
@@ -1922,14 +1930,10 @@ impl DesktopState {
 
         let rects: Vec<(OutputId, Rectangle<i32, Logical>)> = self
             .outputs
-            .iter()
-            .map(|(output_id, output)| {
-                let layout = build_chrome_layout(
-                    output.logical_size,
-                    self.chrome.metrics.topbar_h,
-                    self.chrome.metrics.sidebar_w,
-                );
-                (*output_id, layout.topbar.flow_field)
+            .keys()
+            .filter_map(|output_id| {
+                self.chrome_layout_for_output(*output_id)
+                    .map(|layout| (*output_id, layout.topbar.flow_field))
             })
             .collect();
 
@@ -1945,32 +1949,103 @@ impl DesktopState {
         self.ui.hit_test(x, y)
     }
 
-    fn rebuild_ui_tree_for_output(&mut self, output_id: OutputId) {
-        let Some(output) = self.outputs.get(&output_id) else {
-            return;
+    fn configured_chrome_items(
+        mut items: Vec<ChromeItem>,
+        settings: &ChromeRegionSettings,
+    ) -> Vec<ChromeItem> {
+        for custom in &settings.custom {
+            if custom.command.trim().is_empty() || items.iter().any(|item| item.id == custom.id) {
+                continue;
+            }
+            let Some(icon) = IconId::from_config_name(&custom.icon) else {
+                continue;
+            };
+            items.push(
+                ChromeItem::new(
+                    custom.id,
+                    icon,
+                    custom.tooltip.clone(),
+                    UiAction::LaunchApp(custom.command.clone()),
+                )
+                .enabled(custom.enabled),
+            );
+        }
+
+        for item in &mut items {
+            if settings.hidden.contains(&item.id) {
+                item.visible = false;
+            }
+        }
+
+        if settings.order.is_empty() {
+            return items;
+        }
+
+        let mut ordered = Vec::with_capacity(items.len());
+        for id in &settings.order {
+            if let Some(index) = items.iter().position(|item| item.id == *id) {
+                ordered.push(items.remove(index));
+            }
+        }
+        ordered.extend(items);
+        ordered
+    }
+
+    pub(crate) fn ui_build_options_for_output(
+        &self,
+        output_id: OutputId,
+    ) -> Option<UiBuildOptions> {
+        let output = self.outputs.get(&output_id)?;
+        let mut options = UiBuildOptions {
+            hdr_supported: output.hdr_supported,
+            hdr_requested: output.hdr_requested,
+            hdr_kms_applied: output.hdr_kms_applied,
+            microphone_detected: self.microphone_detected,
+            voice_capture_status: self.voice_capture_status,
+            network_state: self.network_state.clone(),
+            workspace_count: self.workspace_names.len(),
+            max_workspace_slots: self.workspaces.max_workspace_slots as usize,
+            active_workspace: output.active_workspace.0,
+            ai_flow_mode: self.ai_flow_mode(),
+            sidebar_items: None,
+            status_items: None,
         };
-        let layout = build_chrome_layout(
+
+        let default_layout = build_chrome_layout(
             output.logical_size,
             self.chrome.metrics.topbar_h,
             self.chrome.metrics.sidebar_w,
         );
-        let ai_flow_mode = self.ai_flow_mode();
-        build_ui_for_output_with_options(
-            &mut self.ui,
-            &layout,
-            UiBuildOptions {
-                hdr_supported: output.hdr_supported,
-                hdr_requested: output.hdr_requested,
-                hdr_kms_applied: output.hdr_kms_applied,
-                microphone_detected: self.microphone_detected,
-                voice_capture_status: self.voice_capture_status,
-                network_state: self.network_state.clone(),
-                workspace_count: self.workspace_names.len(),
-                max_workspace_slots: self.workspaces.max_workspace_slots as usize,
-                active_workspace: output.active_workspace.0,
-                ai_flow_mode,
-            },
-        );
+        options.sidebar_items = Some(Self::configured_chrome_items(
+            default_sidebar_items(&options, default_layout.sidebar.slots.len()),
+            &self.chrome_items.sidebar,
+        ));
+        options.status_items = Some(Self::configured_chrome_items(
+            default_status_items(&options),
+            &self.chrome_items.topbar,
+        ));
+        Some(options)
+    }
+
+    pub(crate) fn chrome_layout_for_output(&self, output_id: OutputId) -> Option<ChromeLayout> {
+        let output = self.outputs.get(&output_id)?;
+        let options = self.ui_build_options_for_output(output_id)?;
+        Some(build_chrome_layout_with_config(
+            output.logical_size,
+            self.chrome.metrics.topbar_h,
+            self.chrome.metrics.sidebar_w,
+            options.layout_config(),
+        ))
+    }
+
+    fn rebuild_ui_tree_for_output(&mut self, output_id: OutputId) {
+        let Some(options) = self.ui_build_options_for_output(output_id) else {
+            return;
+        };
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return;
+        };
+        build_ui_for_output_with_options(&mut self.ui, &layout, options);
     }
 
     fn play_ui_sound(&self, sound: UiSound) {
@@ -2023,11 +2098,7 @@ impl DesktopState {
         now: Instant,
     ) -> Option<DesktopFrameCtx> {
         let output = self.outputs.get(&output_id)?;
-        let layout = build_chrome_layout(
-            output.logical_size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         Some(DesktopFrameCtx {
             output_size: (output.physical_size.w, output.physical_size.h),
             output_scale: output.scale,
@@ -3187,7 +3258,7 @@ impl DesktopState {
     pub(crate) fn dispatch_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::LaunchApp(cmd) => {
-                let launch_trace_id = self.launch_app(self.resolve_launch_command(cmd));
+                let launch_trace_id = self.launch_app(self.resolve_launch_command(&cmd));
                 flog_info!(
                     "dispatch launch trace_id={} action=LaunchApp",
                     launch_trace_id
@@ -3886,20 +3957,11 @@ impl DesktopState {
             return false;
         };
 
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return false;
+        };
 
         chrome_host_drag_hit(&layout, px, py)
     }
@@ -3910,20 +3972,11 @@ impl DesktopState {
             return false;
         };
 
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return false;
+        };
 
         layout.work_area.recess.contains((px, py))
     }
@@ -3933,12 +3986,7 @@ impl DesktopState {
         output_id: OutputId,
     ) -> Option<Rectangle<i32, Logical>> {
         let output = self.outputs.get(&output_id)?;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         let mut recess = layout.work_area.recess;
         recess.loc += output.logical_origin;
         Some(recess)
@@ -4196,12 +4244,7 @@ impl DesktopState {
         let output = self.outputs.get(&output_id)?;
         let px = self.pointer_pos.x.round() as i32 - output.logical_origin.x;
         let py = self.pointer_pos.y.round() as i32 - output.logical_origin.y;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         sidebar_slot_index_at(&layout, px, py)
     }
 
@@ -4313,13 +4356,7 @@ impl DesktopState {
         now: Instant,
     ) -> Option<Rectangle<i32, Logical>> {
         let pulse = self.sidebar_pulse_for_output(output_id, now)?;
-        let output = self.outputs.get(&output_id)?;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         layout.sidebar.slots.get(pulse.slot).map(|slot| slot.outer)
     }
 
@@ -4329,13 +4366,7 @@ impl DesktopState {
         now: Instant,
     ) -> Option<Rectangle<i32, Logical>> {
         let pulse = self.topbar_pulse_for_output(output_id, now)?;
-        let output = self.outputs.get(&output_id)?;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         layout.topbar.status_wells.get(pulse.indicator).copied()
     }
 
@@ -4345,13 +4376,7 @@ impl DesktopState {
         now: Instant,
     ) -> Option<Rectangle<i32, Logical>> {
         self.flow_field_pulse_for_output(output_id, now)?;
-        let output = self.outputs.get(&output_id)?;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         Some(layout.topbar.flow_field)
     }
 
@@ -4361,13 +4386,7 @@ impl DesktopState {
         now: Instant,
     ) -> Option<Rectangle<i32, Logical>> {
         self.clock_pulse_for_output(output_id, now)?;
-        let output = self.outputs.get(&output_id)?;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let layout = self.chrome_layout_for_output(output_id)?;
         Some(layout.topbar.clock_well)
     }
 
@@ -4375,18 +4394,11 @@ impl DesktopState {
         let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
             return false;
         };
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return false;
+        };
         let Some(slot) = sidebar_slot_index_at(&layout, px, py) else {
             return false;
         };
@@ -4409,18 +4421,11 @@ impl DesktopState {
         let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
             return false;
         };
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return false;
+        };
         let Some(indicator) = topbar_status_well_index_at(&layout, px, py) else {
             return false;
         };
@@ -4443,18 +4448,11 @@ impl DesktopState {
         let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
             return false;
         };
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return false;
+        };
         if !layout.topbar.flow_field.contains((px, py)) {
             return false;
         }
@@ -4479,18 +4477,11 @@ impl DesktopState {
         let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
             return false;
         };
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-        let size = Size::<i32, Logical>::from((output.logical_size.w, output.logical_size.h));
-        let layout = build_chrome_layout(
-            size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
+        let Some(layout) = self.chrome_layout_for_output(output_id) else {
+            return false;
+        };
         if !layout.topbar.clock_well.contains((px, py)) {
             return false;
         }
@@ -4933,6 +4924,7 @@ impl DesktopState {
             privacy: init.privacy,
             power: init.power,
             debug: debug.clone(),
+            chrome_items: init.chrome_items,
             settings_ipc_rx: start_desktop_settings_ipc(),
             settings_ipc_watchers: Vec::new(),
             settings_ipc_config: load_config(),
@@ -6811,14 +6803,10 @@ impl DesktopState {
     fn mark_all_outputs_clock_damage(&mut self, source: DamageSource) {
         let damage: Vec<(OutputId, Rectangle<i32, Logical>)> = self
             .outputs
-            .iter()
-            .map(|(output_id, output)| {
-                let layout = build_chrome_layout(
-                    output.logical_size,
-                    self.chrome.metrics.topbar_h,
-                    self.chrome.metrics.sidebar_w,
-                );
-                (*output_id, layout.topbar.clock_well)
+            .keys()
+            .filter_map(|output_id| {
+                self.chrome_layout_for_output(*output_id)
+                    .map(|layout| (*output_id, layout.topbar.clock_well))
             })
             .collect();
 
@@ -6830,17 +6818,16 @@ impl DesktopState {
     fn mark_all_outputs_chrome_controls_damage(&mut self, source: DamageSource) {
         let damage: Vec<(OutputId, Rectangle<i32, Logical>)> = self
             .outputs
-            .iter()
-            .flat_map(|(output_id, output)| {
-                let layout = build_chrome_layout(
-                    output.logical_size,
-                    self.chrome.metrics.topbar_h,
-                    self.chrome.metrics.sidebar_w,
-                );
+            .keys()
+            .filter_map(|output_id| {
+                self.chrome_layout_for_output(*output_id)
+                    .map(|layout| (*output_id, layout))
+            })
+            .flat_map(|(output_id, layout)| {
                 [
-                    (*output_id, layout.sidebar.outer),
-                    (*output_id, layout.topbar.inner),
-                    (*output_id, layout.topbar.flow_field),
+                    (output_id, layout.sidebar.outer),
+                    (output_id, layout.topbar.inner),
+                    (output_id, layout.topbar.flow_field),
                 ]
             })
             .collect();
@@ -8257,6 +8244,10 @@ mod tests {
     };
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
+    use focaldesk_settings_core::{ChromeLaunchItemSettings, ChromeRegionSettings};
+    use focaldesk_ui::atlas::IconId;
+    use focaldesk_ui::element::ChromeItem;
+    use focaldesk_ui::types::UiAction;
     use smithay::utils::Rectangle;
 
     #[test]
@@ -8268,6 +8259,36 @@ mod tests {
         assert!(is_browser_like("brave-browser"));
         assert!(!is_browser_like("alacritty"));
         assert!(!is_browser_like("cursor"));
+    }
+
+    #[test]
+    fn configured_chrome_items_merge_hide_order_and_custom_launchers() {
+        let defaults = vec![
+            ChromeItem::new(1, IconId::Wifi, "Network", UiAction::Custom(1)),
+            ChromeItem::new(2, IconId::Power, "Power", UiAction::Custom(2)),
+        ];
+        let settings = ChromeRegionSettings {
+            order: vec![2, 900],
+            hidden: vec![1],
+            custom: vec![ChromeLaunchItemSettings {
+                id: 900,
+                icon: "browser".into(),
+                tooltip: "Docs".into(),
+                command: "example-browser https://example.com".into(),
+                enabled: true,
+            }],
+        };
+
+        let items = super::DesktopState::configured_chrome_items(defaults, &settings);
+        assert_eq!(
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![2, 900, 1]
+        );
+        assert!(!items.iter().find(|item| item.id == 1).unwrap().visible);
+        assert!(matches!(
+            items.iter().find(|item| item.id == 900).unwrap().action,
+            UiAction::LaunchApp(ref command) if command == "example-browser https://example.com"
+        ));
     }
 
     #[test]
