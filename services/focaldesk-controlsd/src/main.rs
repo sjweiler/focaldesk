@@ -29,16 +29,16 @@ fn main() -> Result<()> {
 }
 
 fn set_system_setting(setting: ControlSetting, enabled: bool) -> Result<(), String> {
-    let state = if enabled { "on" } else { "off" };
-    let (program, args): (&str, &[&str]) = match setting {
-        ControlSetting::Wifi => ("nmcli", &["radio", "wifi", state]),
-        ControlSetting::Bluetooth => ("bluetoothctl", &["power", state]),
-        ControlSetting::DoNotDisturb => {
-            return Err("do-not-disturb control is not implemented".to_string());
+    match setting {
+        ControlSetting::Wifi => {
+            let state = if enabled { "on" } else { "off" };
+            run_command("nmcli", &["radio", "wifi", state])
         }
-    };
-
-    run_command(program, args)
+        ControlSetting::Bluetooth => focaldesk_bluetooth::set_power(enabled).map(|_| ()),
+        ControlSetting::DoNotDisturb => {
+            Err("do-not-disturb control is not implemented".to_string())
+        }
+    }
 }
 
 fn set_default_audio_volume(volume: f32) -> Result<(), String> {

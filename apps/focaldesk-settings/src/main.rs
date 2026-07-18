@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
     send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
@@ -85,22 +86,6 @@ struct EthernetDevice {
 #[derive(Debug, Clone)]
 struct EthernetSnapshot {
     devices: Vec<EthernetDevice>,
-    error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct BluetoothDevice {
-    address: String,
-    name: String,
-    paired: bool,
-    connected: bool,
-}
-
-#[derive(Debug, Clone)]
-struct BluetoothSnapshot {
-    powered: bool,
-    scanning: bool,
-    devices: Vec<BluetoothDevice>,
     error: Option<String>,
 }
 
@@ -1140,86 +1125,6 @@ fn load_ethernet_snapshot() -> EthernetSnapshot {
     });
 
     EthernetSnapshot {
-        devices,
-        error: None,
-    }
-}
-
-fn parse_bluetooth_devices(output: &str, paired: bool) -> Vec<BluetoothDevice> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, ' ');
-            if parts.next()? != "Device" {
-                return None;
-            }
-
-            let address = parts.next()?.to_string();
-            let name = parts.next().unwrap_or("Unknown Device").to_string();
-
-            Some(BluetoothDevice {
-                address,
-                name,
-                paired,
-                connected: false,
-            })
-        })
-        .collect()
-}
-
-fn bluetooth_info_value(info: &str, key: &str) -> bool {
-    info.lines().any(|line| {
-        let line = line.trim();
-        line.strip_prefix(key)
-            .and_then(|value| value.trim().strip_prefix(':'))
-            .map(|value| value.trim() == "yes")
-            .unwrap_or(false)
-    })
-}
-
-fn load_bluetooth_snapshot(scanning: bool) -> BluetoothSnapshot {
-    let show = match run_control_command("bluetoothctl", &["show"]) {
-        Ok(output) => output,
-        Err(err) => {
-            return BluetoothSnapshot {
-                powered: false,
-                scanning,
-                devices: vec![],
-                error: Some(err),
-            };
-        }
-    };
-
-    let powered = bluetooth_info_value(&show, "Powered");
-    let paired_output =
-        run_control_command("bluetoothctl", &["paired-devices"]).unwrap_or_default();
-    let all_output = run_control_command("bluetoothctl", &["devices"]).unwrap_or_default();
-
-    let mut devices = parse_bluetooth_devices(&paired_output, true);
-
-    for device in parse_bluetooth_devices(&all_output, false) {
-        if !devices.iter().any(|known| known.address == device.address) {
-            devices.push(device);
-        }
-    }
-
-    for device in &mut devices {
-        if let Ok(info) = run_control_command("bluetoothctl", &["info", &device.address]) {
-            device.connected = bluetooth_info_value(&info, "Connected");
-            device.paired = device.paired || bluetooth_info_value(&info, "Paired");
-        }
-    }
-
-    devices.sort_by(|a, b| {
-        b.connected
-            .cmp(&a.connected)
-            .then(b.paired.cmp(&a.paired))
-            .then(a.name.cmp(&b.name))
-    });
-
-    BluetoothSnapshot {
-        powered,
-        scanning,
         devices,
         error: None,
     }
@@ -2833,14 +2738,12 @@ fn populate_bluetooth_list(
             {
                 let address = device.address.clone();
                 let status = status.clone();
-                pair.connect_clicked(move |_| {
-                    match run_control_command("bluetoothctl", &["pair", &address]) {
-                        Ok(output) if output.is_empty() => {
-                            status.set_text(&format!("Paired {address}"));
-                        }
-                        Ok(output) => status.set_text(&output),
-                        Err(err) => status.set_text(&err),
+                pair.connect_clicked(move |_| match focaldesk_bluetooth::pair(&address) {
+                    Ok(output) if output.is_empty() => {
+                        status.set_text(&format!("Paired {address}"));
                     }
+                    Ok(output) => status.set_text(&output),
+                    Err(err) => status.set_text(&err),
                 });
             }
             controls.append(&pair);
@@ -2854,14 +2757,20 @@ fn populate_bluetooth_list(
         connect.add_css_class("pill");
         {
             let address = device.address.clone();
-            let command = if device.connected {
+            let was_connected = device.connected;
+            let command = if was_connected {
                 "disconnect"
             } else {
                 "connect"
             };
             let status = status.clone();
             connect.connect_clicked(move |_| {
-                match run_control_command("bluetoothctl", &[command, &address]) {
+                let result = if was_connected {
+                    focaldesk_bluetooth::disconnect(&address)
+                } else {
+                    focaldesk_bluetooth::connect(&address)
+                };
+                match result {
                     Ok(output) if output.is_empty() => {
                         status.set_text(&format!("{command} sent to {address}"));
                     }
@@ -2878,17 +2787,32 @@ fn populate_bluetooth_list(
             {
                 let address = device.address.clone();
                 let status = status.clone();
-                trust.connect_clicked(move |_| {
-                    match run_control_command("bluetoothctl", &["trust", &address]) {
-                        Ok(output) if output.is_empty() => {
-                            status.set_text(&format!("Trusted {address}"));
-                        }
-                        Ok(output) => status.set_text(&output),
-                        Err(err) => status.set_text(&err),
+                trust.connect_clicked(move |_| match focaldesk_bluetooth::trust(&address) {
+                    Ok(output) if output.is_empty() => {
+                        status.set_text(&format!("Trusted {address}"));
                     }
+                    Ok(output) => status.set_text(&output),
+                    Err(err) => status.set_text(&err),
                 });
             }
             controls.append(&trust);
+
+            let remove = gtk::Button::with_label("Remove");
+            remove.add_css_class("pill");
+            remove.add_css_class("destructive-action");
+            {
+                let address = device.address.clone();
+                let status = status.clone();
+                remove.connect_clicked(move |_| match focaldesk_bluetooth::remove(&address) {
+                    Ok(_) => {
+                        status.set_text(&format!(
+                            "Removed {address} — tap Refresh to update the list"
+                        ));
+                    }
+                    Err(err) => status.set_text(&err),
+                });
+            }
+            controls.append(&remove);
         }
 
         row.add_suffix(&controls);
@@ -3004,8 +2928,7 @@ fn bluetooth_page() -> adw::NavigationPage {
                 return;
             }
 
-            let state = if switch.is_active() { "on" } else { "off" };
-            match run_control_command("bluetoothctl", &["power", state]) {
+            match focaldesk_bluetooth::set_power(switch.is_active()) {
                 Ok(_) => status.set_text(if switch.is_active() {
                     "Bluetooth powered on"
                 } else {
@@ -3025,8 +2948,7 @@ fn bluetooth_page() -> adw::NavigationPage {
                 return;
             }
 
-            let state = if switch.is_active() { "on" } else { "off" };
-            match run_control_command("bluetoothctl", &["scan", state]) {
+            match focaldesk_bluetooth::set_scanning(switch.is_active()) {
                 Ok(_) => {
                     *scanning.borrow_mut() = switch.is_active();
                     status.set_text(if switch.is_active() {

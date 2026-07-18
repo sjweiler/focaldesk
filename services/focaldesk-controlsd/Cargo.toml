@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+focaldesk-bluetooth = { path = "../../crates/focaldesk-bluetooth" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
 tracing = { workspace = true }
