@@ -1693,6 +1693,9 @@ dependencies = [
 [[package]]
 name = "focaldesk-bluetooth"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "focaldesk-cli"
@@ -1734,6 +1737,7 @@ name = "focaldesk-controlsd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "focaldesk-bluetooth",
  "focaldesk-ipc",
  "focaldesk-logging",
  "tracing",
@@ -2047,6 +2051,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "focaldesk-bluetooth",
  "focaldesk-config",
  "focaldesk-ipc",
  "focaldesk-logging",
