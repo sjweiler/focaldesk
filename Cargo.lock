@@ -1682,11 +1682,15 @@ name = "focaldesk-automation"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "dirs 6.0.0",
+ "focaldesk-ipc",
  "focaldesk-logging",
  "mlua",
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
