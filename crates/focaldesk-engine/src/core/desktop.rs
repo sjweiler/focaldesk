@@ -78,6 +78,7 @@ use focaldesk_ipc::{
 };
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
+use focaldesk_network::model::NetworkState;
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_power::{
     PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
@@ -199,6 +200,28 @@ fn toggle_voice_capture(status_tx: mpsc::Sender<VoiceCaptureStatus>) {
                 let _ = status_tx.send(VoiceCaptureStatus::Unavailable);
             }
         });
+}
+
+/// Runs `focaldesk-network`'s async backend to completion on a throwaway
+/// current-thread tokio runtime. Called from a one-shot background thread
+/// (see `process_network_state_timers`), matching the compositor's existing
+/// poll-and-spawn idiom for out-of-process state (mic detection, voice
+/// capture status) rather than keeping a persistent async runtime/task
+/// alive inside the otherwise-synchronous compositor.
+fn poll_network_state() -> NetworkState {
+    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return NetworkState::default();
+    };
+
+    runtime.block_on(async {
+        match focaldesk_network::auto_backend().await {
+            Ok(backend) => backend.current_state().await.unwrap_or_default(),
+            Err(_) => NetworkState::default(),
+        }
+    })
 }
 
 fn clamp_rect_to_bounds(
@@ -698,6 +721,11 @@ pub struct DesktopState {
     voice_capture_status_rx: mpsc::Receiver<VoiceCaptureStatus>,
     voice_capture_status_in_flight: bool,
     last_voice_capture_status_at: Instant,
+    pub(crate) network_state: NetworkState,
+    network_state_tx: mpsc::Sender<NetworkState>,
+    network_state_rx: mpsc::Receiver<NetworkState>,
+    network_state_in_flight: bool,
+    last_network_state_poll_at: Instant,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
     pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
@@ -1156,6 +1184,35 @@ impl DesktopState {
                 .is_err()
             {
                 self.voice_capture_status_in_flight = false;
+            }
+        }
+    }
+
+    pub fn process_network_state_timers(&mut self) {
+        while let Ok(state) = self.network_state_rx.try_recv() {
+            self.network_state_in_flight = false;
+            if self.network_state != state {
+                self.network_state = state;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+        }
+
+        let now = Instant::now();
+        if !self.network_state_in_flight
+            && now.saturating_duration_since(self.last_network_state_poll_at)
+                >= Duration::from_secs(3)
+        {
+            self.last_network_state_poll_at = now;
+            self.network_state_in_flight = true;
+            let result_tx = self.network_state_tx.clone();
+            if thread::Builder::new()
+                .name("focaldesk-network-state".to_string())
+                .spawn(move || {
+                    let _ = result_tx.send(poll_network_state());
+                })
+                .is_err()
+            {
+                self.network_state_in_flight = false;
             }
         }
     }
@@ -1907,6 +1964,7 @@ impl DesktopState {
                 hdr_kms_applied: output.hdr_kms_applied,
                 microphone_detected: self.microphone_detected,
                 voice_capture_status: self.voice_capture_status,
+                network_state: self.network_state.clone(),
                 workspace_count: self.workspace_names.len(),
                 max_workspace_slots: self.workspaces.max_workspace_slots as usize,
                 active_workspace: output.active_workspace.0,
@@ -4765,6 +4823,7 @@ impl DesktopState {
         let (clipboard_capture_tx, clipboard_capture_rx) = mpsc::channel();
         let (microphone_detection_tx, microphone_detection_rx) = mpsc::channel();
         let (voice_capture_status_tx, voice_capture_status_rx) = mpsc::channel();
+        let (network_state_tx, network_state_rx) = mpsc::channel();
         let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -4861,6 +4920,11 @@ impl DesktopState {
             voice_capture_status_rx,
             voice_capture_status_in_flight: false,
             last_voice_capture_status_at: Instant::now() - Duration::from_millis(500),
+            network_state: NetworkState::default(),
+            network_state_tx,
+            network_state_rx,
+            network_state_in_flight: false,
+            last_network_state_poll_at: Instant::now() - Duration::from_secs(3),
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
@@ -5631,7 +5695,11 @@ impl DesktopState {
             }
 
             KeyAction::LaunchBrowser => {
-                todo!();
+                let launch_trace_id = self.launch_app(self.apps.browser.clone());
+                flog_info!(
+                    "dispatch launch trace_id={} action=keybind-browser",
+                    launch_trace_id
+                );
             }
 
             KeyAction::LaunchFiles => {

@@ -1699,6 +1699,7 @@ name = "focaldesk-bluetooth"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "zbus 4.4.0",
 ]
 
 [[package]]
@@ -1804,6 +1805,7 @@ dependencies = [
  "focaldesk-flow",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-network",
  "focaldesk-notifications",
  "focaldesk-permissions",
  "focaldesk-power",
@@ -1826,6 +1828,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smithay",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "wayland-backend",
@@ -2110,6 +2113,7 @@ dependencies = [
  "focaldesk-config",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-network",
  "focaldesk-permissions",
  "focaldesk-power",
  "focaldesk-settings-core",

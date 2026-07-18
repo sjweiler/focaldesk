@@ -33,12 +33,14 @@ focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-sounds = { path = "../focaldesk-sounds" }
 focaldesk-power = { path = "../focaldesk-power" }
 focaldesk-audio = { path = "../focaldesk-audio" }
+focaldesk-network = { path = "../focaldesk-network" }
 focal-launch-shared = { path = "../focal-launch-shared" }
 drm-ffi = { workspace = true }
 
 serde_json = "1"
 dirs = "6.0.0"
 zbus = "3"
+tokio = { version = "1", features = ["rt"] }
 pipewire = "0.8"
 egui = "0.31"
 # Optional backend deps you control (examples)

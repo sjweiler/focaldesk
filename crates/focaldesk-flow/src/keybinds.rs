@@ -63,6 +63,14 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
+                sym: keysyms::KEY_b,
+            },
+            KeyAction::LaunchBrowser,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER,
                 sym: keysyms::KEY_q,
             },
             KeyAction::CloseFocused,

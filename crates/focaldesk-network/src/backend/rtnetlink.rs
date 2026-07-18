@@ -9,6 +9,12 @@ use crate::model::{Connectivity, NetTransport, NetworkState};
 use rtnetlink::RouteMessageBuilder;
 use rtnetlink::packet_route::{AddressFamily, link::LinkAttribute, route::RouteAttribute};
 
+/// Fallback backend for when NetworkManager isn't running. Deliberately
+/// leaves [`NetworkState::wifi`](crate::model::NetworkState::wifi) unset:
+/// SSID/signal strength live in nl80211, a separate netlink family from the
+/// route/link tables this backend already talks to, and pulling it in is
+/// out of scope for a fallback path — NetworkManager (the primary backend,
+/// see [`crate::factory::auto_backend`]) covers wifi info instead.
 pub struct RtnetlinkBackend {
     handle: rtnetlink::Handle,
 }

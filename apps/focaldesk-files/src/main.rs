@@ -83,6 +83,8 @@ struct FileClipboard {
 }
 
 const FILE_TRANSFER_MIME_TYPES: &[&str] = &["x-special/gnome-copied-files", "text/uri-list"];
+const DIRECTORY_RELOAD_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(200);
+const DIRECTORY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
 struct FileManager {
@@ -109,6 +111,10 @@ struct FileManager {
     forward_stack: Rc<RefCell<Vec<Location>>>,
     context_menu_index: Rc<RefCell<Option<i32>>>,
     tab_page: Rc<RefCell<Option<gtk::StackPage>>>,
+    directory_monitor: Rc<RefCell<Option<gio::FileMonitor>>>,
+    pending_directory_reload: Rc<RefCell<Option<glib::SourceId>>>,
+    directory_poll: Rc<RefCell<Option<glib::SourceId>>>,
+    directory_revision: Rc<RefCell<Option<(std::time::SystemTime, usize)>>>,
 }
 
 #[derive(Clone)]
@@ -623,6 +629,10 @@ fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -
         forward_stack: Rc::new(RefCell::new(Vec::new())),
         context_menu_index: Rc::new(RefCell::new(None)),
         tab_page: Rc::new(RefCell::new(None)),
+        directory_monitor: Rc::new(RefCell::new(None)),
+        pending_directory_reload: Rc::new(RefCell::new(None)),
+        directory_poll: Rc::new(RefCell::new(None)),
+        directory_revision: Rc::new(RefCell::new(None)),
     };
 
     ensure_standard_user_dirs();
@@ -878,6 +888,7 @@ impl FileManager {
 
         match read_location_items(&location, self.hidden_toggle.is_active()) {
             Ok(items) => {
+                let location_changed = *self.current_location.borrow() != location;
                 if remember && *self.current_location.borrow() != location {
                     self.back_stack
                         .borrow_mut()
@@ -886,10 +897,15 @@ impl FileManager {
                 }
 
                 *self.current_location.borrow_mut() = location.clone();
+                *self.directory_revision.borrow_mut() = local_directory_revision(&location);
                 *self.entries.borrow_mut() = items;
                 self.path_entry.set_text(&location.display_text());
                 self.render_entries();
                 self.update_tab_title();
+                log_launch(&format!("location opened: {}", location.display_text()));
+                if location_changed || self.directory_monitor.borrow().is_none() {
+                    self.monitor_location(&location);
+                }
             }
             Err(err) => {
                 self.set_status(&format!(
@@ -934,8 +950,134 @@ impl FileManager {
     }
 
     fn reload(&self) {
+        log_launch(&format!(
+            "reloading: {}",
+            self.current_location.borrow().display_text()
+        ));
+        let selected_uris = self
+            .selected_file_items()
+            .into_iter()
+            .map(|item| item.uri)
+            .collect::<Vec<_>>();
+        let scroll_position = self.scroller.vadjustment().value();
         let location = self.current_location.borrow().clone();
         self.open_location(location, false);
+        self.restore_selection(&selected_uris);
+
+        let adjustment = self.scroller.vadjustment();
+        glib::idle_add_local_once(move || {
+            let maximum = (adjustment.upper() - adjustment.page_size()).max(adjustment.lower());
+            adjustment.set_value(scroll_position.clamp(adjustment.lower(), maximum));
+        });
+    }
+
+    fn restore_selection(&self, selected_uris: &[String]) {
+        for (index, item) in self.visible_entries.borrow().iter().enumerate() {
+            if !selected_uris.contains(&item.uri) {
+                continue;
+            }
+
+            match *self.view_mode.borrow() {
+                ViewMode::Grid => {
+                    if let Some(child) = self.grid.child_at_index(index as i32) {
+                        self.grid.select_child(&child);
+                    }
+                }
+                ViewMode::Details | ViewMode::List => {
+                    if let Some(row) = self.list.row_at_index(index as i32) {
+                        self.list.select_row(Some(&row));
+                    }
+                }
+            }
+        }
+    }
+
+    fn monitor_location(&self, location: &Location) {
+        log_launch(&format!(
+            "installing directory watch: {}",
+            location.display_text()
+        ));
+        if let Some(source_id) = self.pending_directory_reload.borrow_mut().take() {
+            source_id.remove();
+        }
+        if let Some(source_id) = self.directory_poll.borrow_mut().take() {
+            source_id.remove();
+        }
+        if let Some(monitor) = self.directory_monitor.borrow_mut().take() {
+            monitor.cancel();
+        }
+
+        if matches!(location, Location::Path(_)) {
+            let this = self.clone();
+            let source_id = glib::timeout_add_local(DIRECTORY_POLL_INTERVAL, move || {
+                if this.root.parent().is_none() {
+                    log_launch("directory poll stopped because tab is detached");
+                    return ControlFlow::Break;
+                }
+
+                let revision = local_directory_revision(&this.current_location.borrow());
+                let changed = revision != *this.directory_revision.borrow();
+                if changed {
+                    log_launch(&format!(
+                        "directory poll detected change: {}",
+                        this.current_location.borrow().display_text()
+                    ));
+                    *this.directory_revision.borrow_mut() = revision;
+                    this.queue_directory_reload();
+                }
+                ControlFlow::Continue
+            });
+            self.directory_poll.borrow_mut().replace(source_id);
+        }
+
+        let file = match location {
+            Location::Path(path) => gio::File::for_path(path),
+            Location::Trash => gio::File::for_uri("trash:///"),
+            Location::Uri(uri) => gio::File::for_uri(uri),
+            Location::Separator => return,
+        };
+        let monitor = match file
+            .monitor_directory(gio::FileMonitorFlags::WATCH_MOVES, gio::Cancellable::NONE)
+        {
+            Ok(monitor) => monitor,
+            Err(err) => {
+                info!(
+                    target: "focaldesk",
+                    location = %location.display_text(),
+                    error = %err,
+                    "directory monitoring unavailable"
+                );
+                return;
+            }
+        };
+
+        monitor.set_rate_limit(DIRECTORY_RELOAD_DEBOUNCE.as_millis() as i32);
+        let this = self.clone();
+        monitor.connect_changed(move |_, file, _, event| {
+            log_launch(&format!(
+                "directory monitor event {event:?}: {}",
+                file.uri()
+            ));
+            this.queue_directory_reload();
+        });
+        self.directory_monitor.borrow_mut().replace(monitor);
+    }
+
+    fn queue_directory_reload(&self) {
+        log_launch("directory reload queued");
+        if let Some(source_id) = self.pending_directory_reload.borrow_mut().take() {
+            source_id.remove();
+        }
+
+        let this = self.clone();
+        let pending_reload = self.pending_directory_reload.clone();
+        let source_id = glib::timeout_add_local_once(DIRECTORY_RELOAD_DEBOUNCE, move || {
+            pending_reload.borrow_mut().take();
+            this.reload();
+        });
+        self.pending_directory_reload
+            .borrow_mut()
+            .replace(source_id);
     }
 
     fn parent_dir(&self) -> Option<PathBuf> {
@@ -2300,6 +2442,15 @@ fn read_location_items(
     }
 }
 
+fn local_directory_revision(location: &Location) -> Option<(std::time::SystemTime, usize)> {
+    let Location::Path(path) = location else {
+        return None;
+    };
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let entry_count = std::fs::read_dir(path).ok()?.filter_map(Result::ok).count();
+    Some((modified, entry_count))
+}
+
 fn read_file_items(file: &gio::File, show_hidden: bool) -> Result<Vec<FileItem>, glib::Error> {
     let enumerator = file.enumerate_children(
         "standard::name,standard::display-name,standard::type,standard::size,time::modified,\
@@ -3364,16 +3515,34 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn creates_tar_gz_archive_with_selected_items() {
+    fn unique_test_dir(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after Unix epoch")
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "focaldesk-files-archive-test-{}-{unique}",
+        std::env::temp_dir().join(format!(
+            "focaldesk-files-{label}-test-{}-{unique}",
             std::process::id()
-        ));
+        ))
+    }
+
+    #[test]
+    fn directory_revision_changes_when_file_is_created() {
+        let root = unique_test_dir("revision");
+        std::fs::create_dir_all(&root).expect("create test folder");
+        let location = Location::Path(root.clone());
+        let before = local_directory_revision(&location).expect("initial revision");
+
+        std::fs::write(root.join("downloaded.txt"), "new file").expect("write test file");
+
+        let after = local_directory_revision(&location).expect("updated revision");
+        assert_ne!(before, after);
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[test]
+    fn creates_tar_gz_archive_with_selected_items() {
+        let root = unique_test_dir("archive");
         std::fs::create_dir_all(root.join("folder")).expect("create test folder");
         std::fs::write(root.join("note.txt"), "archive me").expect("write test file");
         std::fs::write(root.join("folder/nested.txt"), "nested").expect("write nested file");

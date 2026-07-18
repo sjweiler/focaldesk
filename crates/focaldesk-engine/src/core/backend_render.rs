@@ -193,6 +193,7 @@ pub fn prepare_output(
             hdr_kms_applied,
             microphone_detected: state.microphone_detected,
             voice_capture_status: state.voice_capture_status,
+            network_state: state.network_state.clone(),
             workspace_count,
             max_workspace_slots: state.workspaces.max_workspace_slots as usize,
             active_workspace,

@@ -4,6 +4,7 @@ use crate::element::UiElement;
 use crate::element::UiRect;
 use crate::types::{PanelKind, UiAction, UiElementKind};
 use crate::uitree::UiTree;
+use focaldesk_network::model::{Connectivity, NetworkIcon as NetIcon, NetworkState, map_icon};
 
 const SIDEBAR_BASE: u32 = 1_000;
 const CLOCK_ID: u32 = 100_000;
@@ -58,13 +59,14 @@ pub enum VoiceCaptureStatus {
     Stopping,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct UiBuildOptions {
     pub hdr_supported: bool,
     pub hdr_requested: bool,
     pub hdr_kms_applied: bool,
     pub microphone_detected: bool,
     pub voice_capture_status: VoiceCaptureStatus,
+    pub network_state: NetworkState,
     pub workspace_count: usize,
     /// Max number of workspace buttons shown individually before they
     /// collapse into an overflow button. Mirrors
@@ -82,6 +84,7 @@ impl Default for UiBuildOptions {
             hdr_kms_applied: false,
             microphone_detected: false,
             voice_capture_status: VoiceCaptureStatus::Unavailable,
+            network_state: NetworkState::default(),
             workspace_count: 1,
             max_workspace_slots: 4,
             active_workspace: 1,
@@ -99,6 +102,66 @@ fn hdr_tooltip(hdr_supported: bool, hdr_requested: bool, hdr_kms_applied: bool) 
         "HDR requested (pending KMS)"
     } else {
         "HDR supported (off)"
+    }
+}
+
+/// [`NetworkIcon`](focaldesk_network::model::NetworkIcon) has 13 variants
+/// (signal-strength steps, VPN badge) but the icon atlas only has plain
+/// Wifi/WifiOff/Ethernet/EthernetOff glyphs — no signal-strength or VPN
+/// artwork exists yet. This collapses onto what's actually drawable; the
+/// tooltip carries the detail the icon can't.
+fn network_icon(state: &NetworkState) -> IconId {
+    match map_icon(state) {
+        NetIcon::Offline | NetIcon::Connecting | NetIcon::Limited => IconId::WifiOff,
+        NetIcon::Ethernet | NetIcon::EthernetVpn => IconId::Ethernet,
+        NetIcon::Wifi0
+        | NetIcon::Wifi1
+        | NetIcon::Wifi2
+        | NetIcon::Wifi3
+        | NetIcon::Wifi4
+        | NetIcon::WifiVpn0
+        | NetIcon::WifiVpn1
+        | NetIcon::WifiVpn2
+        | NetIcon::WifiVpn3
+        | NetIcon::WifiVpn4 => IconId::Wifi,
+    }
+}
+
+fn network_tooltip(state: &NetworkState) -> String {
+    use focaldesk_network::model::NetTransport;
+
+    let vpn_suffix = if state.vpn_active {
+        " · VPN active"
+    } else {
+        ""
+    };
+
+    match state.connectivity {
+        Connectivity::Unknown | Connectivity::Disconnected => "Offline".to_string(),
+        Connectivity::Connecting => "Connecting…".to_string(),
+        Connectivity::LinkOnly => "No IP address".to_string(),
+        Connectivity::LocalOnly => "No internet access".to_string(),
+        Connectivity::SiteOnly => "Limited connectivity".to_string(),
+        Connectivity::Internet => match state.primary_transport {
+            Some(NetTransport::Wifi) => {
+                let ssid = state
+                    .wifi
+                    .as_ref()
+                    .and_then(|wifi| wifi.ssid.as_deref())
+                    .unwrap_or("Wifi");
+                let signal = state
+                    .wifi
+                    .as_ref()
+                    .and_then(|wifi| wifi.signal_percent)
+                    .map(|percent| format!(" ({percent}%)"))
+                    .unwrap_or_default();
+                format!("{ssid}{signal}{vpn_suffix}")
+            }
+            Some(NetTransport::Ethernet) => format!("Ethernet{vpn_suffix}"),
+            Some(NetTransport::Vpn) => "VPN active".to_string(),
+            Some(NetTransport::Cellular) => format!("Cellular{vpn_suffix}"),
+            Some(NetTransport::Unknown) | None => format!("Connected{vpn_suffix}"),
+        },
     }
 }
 
@@ -270,44 +333,44 @@ pub fn build_ui_for_output_with_options(
     for (i, rect) in layout.topbar.status_wells.iter().enumerate() {
         let (icon, tooltip, action) = match i {
             0 => (
-                IconId::Wifi,
-                "Network",
+                network_icon(&options.network_state),
+                network_tooltip(&options.network_state),
                 UiAction::OpenPanel(PanelKind::Network),
             ),
             1 => (
                 IconId::Bluetooth,
-                "Bluetooth",
+                "Bluetooth".to_string(),
                 UiAction::OpenPanel(PanelKind::Bluetooth),
             ),
             2 => match (options.microphone_detected, options.voice_capture_status) {
                 (_, VoiceCaptureStatus::Starting) => (
                     IconId::Microphone,
-                    "Voice input: starting",
+                    "Voice input: starting".to_string(),
                     UiAction::OpenPanel(PanelKind::Audio),
                 ),
                 (_, VoiceCaptureStatus::Listening) => (
                     IconId::Microphone,
-                    "Voice input: listening — Super+Shift+V to stop",
+                    "Voice input: listening — Super+Shift+V to stop".to_string(),
                     UiAction::OpenPanel(PanelKind::Audio),
                 ),
                 (_, VoiceCaptureStatus::Stopping) => (
                     IconId::Microphone,
-                    "Voice input: stopping",
+                    "Voice input: stopping".to_string(),
                     UiAction::OpenPanel(PanelKind::Audio),
                 ),
                 (true, VoiceCaptureStatus::Idle) => (
                     IconId::MicrophoneOff,
-                    "Voice input: not listening — Super+Shift+V to start",
+                    "Voice input: not listening — Super+Shift+V to start".to_string(),
                     UiAction::OpenPanel(PanelKind::Audio),
                 ),
                 (true, VoiceCaptureStatus::Unavailable) => (
                     IconId::MicrophoneOff,
-                    "Voice input unavailable",
+                    "Voice input unavailable".to_string(),
                     UiAction::OpenPanel(PanelKind::Audio),
                 ),
                 (false, VoiceCaptureStatus::Idle | VoiceCaptureStatus::Unavailable) => (
                     IconId::Speaker,
-                    "Audio",
+                    "Audio".to_string(),
                     UiAction::OpenPanel(PanelKind::Audio),
                 ),
             },
@@ -317,12 +380,13 @@ pub fn build_ui_for_output_with_options(
                     options.hdr_supported,
                     options.hdr_requested,
                     options.hdr_kms_applied,
-                ),
+                )
+                .to_string(),
                 UiAction::OpenPanel(PanelKind::Display),
             ),
             4 => (
                 IconId::Power,
-                "Power menu",
+                "Power menu".to_string(),
                 UiAction::OpenPanel(PanelKind::Power),
             ),
             _ => continue,
@@ -339,6 +403,16 @@ pub fn build_ui_for_output_with_options(
                 VoiceCaptureStatus::Starting | VoiceCaptureStatus::Listening
             );
             el.active = options.voice_capture_status == VoiceCaptureStatus::Listening;
+        }
+        if matches!(icon, IconId::Wifi | IconId::Ethernet | IconId::WifiOff) {
+            el.selected = matches!(options.network_state.connectivity, Connectivity::Internet);
+            el.active = matches!(
+                options.network_state.connectivity,
+                Connectivity::Connecting
+                    | Connectivity::LinkOnly
+                    | Connectivity::LocalOnly
+                    | Connectivity::SiteOnly
+            );
         }
         el.action = Some(action);
         el.hover_scale = 1.08;
