@@ -1,6 +1,7 @@
 use crate::chrome_layout::ChromeLayout;
-use crate::element::UiElement;
-use crate::element::UiRect;
+use crate::element::{ChromeItem, UiElement, UiRect};
+use crate::types::UiElementKind;
+use crate::types::{PanelKind, UiAction};
 use crate::uicomponent::LayoutCtx;
 use crate::uicomponent::RenderCtx;
 use crate::uicomponent::UiComponent;
@@ -35,8 +36,43 @@ impl Default for SideBar {
 }
 
 impl SideBar {
+    pub const OVERFLOW_ID: u32 = 199_998;
     pub fn layout_from_chrome(&mut self, layout: &ChromeLayout, _ctx: &LayoutCtx) {
         self.bounds = layout.sidebar.outer.into();
+    }
+
+    pub fn layout_items(
+        layout: &ChromeLayout,
+        items: impl IntoIterator<Item = ChromeItem>,
+    ) -> Vec<UiElement> {
+        let capacity = layout.sidebar.slots.len();
+        let mut visible: Vec<_> = items.into_iter().filter(|item| item.visible).collect();
+        if visible.len() > capacity && capacity > 0 {
+            visible.truncate(capacity);
+            visible[capacity - 1] = ChromeItem::new(
+                Self::OVERFLOW_ID,
+                crate::atlas::IconId::Overflow,
+                "More sidebar items · open Settings",
+                UiAction::OpenPanel(PanelKind::Settings),
+            );
+        }
+
+        layout
+            .sidebar
+            .slots
+            .iter()
+            .zip(visible)
+            .map(|(slot, item)| {
+                let mut element = UiElement::from_chrome_item(
+                    UiElementKind::SidebarButton,
+                    item,
+                    UiRect::from(slot.outer),
+                );
+                element.hover_scale = 1.10;
+                element.press_scale = 0.96;
+                element
+            })
+            .collect()
     }
 }
 

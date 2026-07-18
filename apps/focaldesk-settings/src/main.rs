@@ -526,6 +526,12 @@ struct PactlAudioDevice {
     active_port: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct AudioDeviceChoice {
+    selector: String,
+    label: String,
+}
+
 fn normalize_audio_label(label: &str) -> String {
     label
         .trim()
@@ -543,21 +549,27 @@ fn audio_label_key(label: &str) -> String {
     label.trim().to_ascii_lowercase()
 }
 
-fn push_unique_audio_label(devices: &mut Vec<String>, label: String, prefer_first: bool) {
+fn push_unique_audio_device(
+    devices: &mut Vec<AudioDeviceChoice>,
+    selector: String,
+    label: String,
+    prefer_first: bool,
+) {
     let label = normalize_audio_label(&label);
-    if label.is_empty() {
+    if selector.is_empty() || label.is_empty() {
         return;
     }
 
-    let key = audio_label_key(&label);
-    if devices.iter().any(|known| audio_label_key(known) == key) {
+    if devices.iter().any(|known| known.selector == selector) {
         return;
     }
+
+    let device = AudioDeviceChoice { selector, label };
 
     if prefer_first {
-        devices.insert(0, label);
+        devices.insert(0, device);
     } else {
-        devices.push(label);
+        devices.push(device);
     }
 }
 
@@ -610,7 +622,7 @@ fn pactl_device_label(
 fn push_pactl_device(
     current: &PactlAudioDevice,
     ports: &HashMap<String, String>,
-    devices: &mut Vec<String>,
+    devices: &mut Vec<AudioDeviceChoice>,
     kind: AudioDeviceKind,
     default_name: Option<&str>,
 ) {
@@ -621,8 +633,10 @@ fn push_pactl_device(
     }
 
     if let Some(label) = pactl_device_label(current, ports) {
-        let prefer_first = current.name.as_deref() == default_name;
-        push_unique_audio_label(devices, label, prefer_first);
+        if let Some(name) = current.name.as_deref() {
+            let prefer_first = Some(name) == default_name;
+            push_unique_audio_device(devices, name.to_string(), label, prefer_first);
+        }
     }
 }
 
@@ -630,7 +644,7 @@ fn parse_pactl_devices(
     output: &str,
     kind: AudioDeviceKind,
     default_name: Option<&str>,
-) -> Vec<String> {
+) -> Vec<AudioDeviceChoice> {
     let mut devices = Vec::new();
     let mut current = PactlAudioDevice::default();
     let mut ports = HashMap::new();
@@ -699,7 +713,7 @@ fn parse_pactl_short_devices(
     output: &str,
     kind: AudioDeviceKind,
     default_name: Option<&str>,
-) -> Vec<String> {
+) -> Vec<AudioDeviceChoice> {
     let mut devices = Vec::new();
 
     for line in output.lines() {
@@ -713,13 +727,18 @@ fn parse_pactl_short_devices(
             continue;
         }
 
-        push_unique_audio_label(&mut devices, name.to_string(), Some(name) == default_name);
+        push_unique_audio_device(
+            &mut devices,
+            name.to_string(),
+            name.to_string(),
+            Some(name) == default_name,
+        );
     }
 
     devices
 }
 
-fn parse_wpctl_devices(output: &str, kind: AudioDeviceKind) -> Vec<String> {
+fn parse_wpctl_devices(output: &str, kind: AudioDeviceKind) -> Vec<AudioDeviceChoice> {
     let mut in_section = false;
     let mut devices = Vec::new();
     let section = match kind {
@@ -743,7 +762,7 @@ fn parse_wpctl_devices(output: &str, kind: AudioDeviceKind) -> Vec<String> {
             break;
         }
 
-        let Some((_, label)) = trimmed.split_once(". ") else {
+        let Some((id, label)) = trimmed.split_once(". ") else {
             continue;
         };
         let label = label
@@ -759,7 +778,13 @@ fn parse_wpctl_devices(output: &str, kind: AudioDeviceKind) -> Vec<String> {
         }
 
         let prefer_first = trimmed.contains('*');
-        push_unique_audio_label(&mut devices, label.to_string(), prefer_first);
+        let id = id.trim().trim_start_matches('*').trim();
+        push_unique_audio_device(
+            &mut devices,
+            format!("wpctl:{id}"),
+            label.to_string(),
+            prefer_first,
+        );
     }
 
     devices
@@ -774,7 +799,7 @@ fn parse_pactl_default_device(output: &str, kind: AudioDeviceKind) -> Option<Str
     output.lines().find_map(|line| pactl_value(line, key))
 }
 
-fn load_audio_devices(kind: AudioDeviceKind) -> Result<Vec<String>, String> {
+fn load_audio_devices(kind: AudioDeviceKind) -> Result<Vec<AudioDeviceChoice>, String> {
     let list_arg = match kind {
         AudioDeviceKind::Sink => "sinks",
         AudioDeviceKind::Source => "sources",
@@ -798,6 +823,18 @@ fn load_audio_devices(kind: AudioDeviceKind) -> Result<Vec<String>, String> {
             Err(wpctl_err) => Err(format!("{pactl_err}; {wpctl_err}")),
         },
     }
+}
+
+fn set_default_audio_device(kind: AudioDeviceKind, selector: &str) -> Result<(), String> {
+    if let Some(id) = selector.strip_prefix("wpctl:") {
+        return run_control_command("wpctl", &["set-default", id]).map(|_| ());
+    }
+
+    let command = match kind {
+        AudioDeviceKind::Sink => "set-default-sink",
+        AudioDeviceKind::Source => "set-default-source",
+    };
+    run_control_command("pactl", &[command, selector]).map(|_| ())
 }
 
 fn add_switch_row(
@@ -1987,6 +2024,7 @@ fn build_ui(app: &adw::Application) {
         "Displays",
         "Sound",
         "Applications",
+        "Chrome",
         "Workspaces",
         "Keyboard",
         "Privacy",
@@ -2030,6 +2068,7 @@ fn build_ui(app: &adw::Application) {
         "Applications".to_string(),
         applications_page(settings.clone()),
     );
+    pages.insert("Chrome".to_string(), chrome_page(settings.clone()));
     pages.insert("Workspaces".to_string(), workspaces_page(settings.clone()));
     pages.insert("Keyboard".to_string(), keyboard_page());
     pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
@@ -2689,6 +2728,10 @@ fn populate_bluetooth_list(
     rows: &DynamicRows,
     snapshot: &BluetoothSnapshot,
     status: &gtk::Label,
+    scanning: &Rc<RefCell<bool>>,
+    power_switch: &gtk::Switch,
+    scan_switch: &gtk::Switch,
+    updating_switches: &Rc<Cell<bool>>,
 ) {
     clear_dynamic_rows(group, rows);
 
@@ -2737,49 +2780,96 @@ fn populate_bluetooth_list(
             pair.add_css_class("pill");
             {
                 let address = device.address.clone();
+                let pair_button = pair.clone();
                 let status = status.clone();
-                pair.connect_clicked(move |_| match focaldesk_bluetooth::pair(&address) {
-                    Ok(output) if output.is_empty() => {
-                        status.set_text(&format!("Paired {address}"));
-                    }
-                    Ok(output) => status.set_text(&output),
-                    Err(err) => status.set_text(&err),
+                let group = group.clone();
+                let rows = rows.clone();
+                let scanning = scanning.clone();
+                let power_switch = power_switch.clone();
+                let scan_switch = scan_switch.clone();
+                let updating_switches = updating_switches.clone();
+                pair.connect_clicked(move |_| {
+                    pair_button.set_sensitive(false);
+                    status.set_text("Pairing and connecting… keep the device in pairing mode");
+
+                    let (tx, rx) = mpsc::channel();
+                    let task_address = address.clone();
+                    thread::spawn(move || {
+                        let _ = tx.send(focaldesk_bluetooth::pair_and_connect(&task_address));
+                    });
+
+                    let pair = pair_button.clone();
+                    let status = status.clone();
+                    let group = group.clone();
+                    let rows = rows.clone();
+                    let scanning = scanning.clone();
+                    let power_switch = power_switch.clone();
+                    let scan_switch = scan_switch.clone();
+                    let updating_switches = updating_switches.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(_)) => {
+                                status.set_text("Paired and connected");
+                                refresh_bluetooth_list_async(
+                                    &group,
+                                    &rows,
+                                    &status,
+                                    &scanning,
+                                    &power_switch,
+                                    &scan_switch,
+                                    &updating_switches,
+                                );
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(err)) => {
+                                pair.set_sensitive(true);
+                                status.set_text(&err);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                pair.set_sensitive(true);
+                                status.set_text("Bluetooth pairing task stopped unexpectedly");
+                                glib::ControlFlow::Break
+                            }
+                        }
+                    });
                 });
             }
             controls.append(&pair);
-        }
-
-        let connect = gtk::Button::with_label(if device.connected {
-            "Disconnect"
         } else {
-            "Connect"
-        });
-        connect.add_css_class("pill");
-        {
-            let address = device.address.clone();
-            let was_connected = device.connected;
-            let command = if was_connected {
-                "disconnect"
+            let connect = gtk::Button::with_label(if device.connected {
+                "Disconnect"
             } else {
-                "connect"
-            };
-            let status = status.clone();
-            connect.connect_clicked(move |_| {
-                let result = if was_connected {
-                    focaldesk_bluetooth::disconnect(&address)
-                } else {
-                    focaldesk_bluetooth::connect(&address)
-                };
-                match result {
-                    Ok(output) if output.is_empty() => {
-                        status.set_text(&format!("{command} sent to {address}"));
-                    }
-                    Ok(output) => status.set_text(&output),
-                    Err(err) => status.set_text(&err),
-                }
+                "Connect"
             });
+            connect.add_css_class("pill");
+            {
+                let address = device.address.clone();
+                let was_connected = device.connected;
+                let command = if was_connected {
+                    "disconnect"
+                } else {
+                    "connect"
+                };
+                let status = status.clone();
+                connect.connect_clicked(move |_| {
+                    let result = if was_connected {
+                        focaldesk_bluetooth::disconnect(&address)
+                    } else {
+                        focaldesk_bluetooth::connect(&address)
+                    };
+                    match result {
+                        Ok(output) if output.is_empty() => {
+                            status.set_text(&format!("{command} sent to {address}"));
+                        }
+                        Ok(output) => status.set_text(&output),
+                        Err(err) => status.set_text(&err),
+                    }
+                });
+            }
+            controls.append(&connect);
         }
-        controls.append(&connect);
 
         if device.paired {
             let trust = gtk::Button::with_label("Trust");
@@ -2858,7 +2948,16 @@ fn refresh_bluetooth_list_async(
             scan_switch.set_active(snapshot.scanning);
             updating_switches.set(false);
             *scanning.borrow_mut() = snapshot.scanning;
-            populate_bluetooth_list(&group, &rows, &snapshot, &status);
+            populate_bluetooth_list(
+                &group,
+                &rows,
+                &snapshot,
+                &status,
+                &scanning,
+                &power_switch,
+                &scan_switch,
+                &updating_switches,
+            );
             glib::ControlFlow::Break
         }
         Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
@@ -2980,6 +3079,33 @@ fn bluetooth_page() -> adw::NavigationPage {
                 &scan_switch,
                 &updating_switches,
             );
+        });
+    }
+
+    // Discovery updates BlueZ's device cache asynchronously. Keep the visible
+    // list in sync while scanning instead of requiring the user to repeatedly
+    // press Refresh after enabling discovery.
+    {
+        let devices_group = devices_group.clone();
+        let device_rows = device_rows.clone();
+        let status = status.clone();
+        let scanning = scanning.clone();
+        let power_switch = power_switch.clone();
+        let scan_switch = scan_switch.clone();
+        let updating_switches = updating_switches.clone();
+        glib::timeout_add_local(Duration::from_secs(2), move || {
+            if *scanning.borrow() {
+                refresh_bluetooth_list_async(
+                    &devices_group,
+                    &device_rows,
+                    &status,
+                    &scanning,
+                    &power_switch,
+                    &scan_switch,
+                    &updating_switches,
+                );
+            }
+            glib::ControlFlow::Continue
         });
     }
 
@@ -3358,8 +3484,20 @@ fn sound_page() -> adw::NavigationPage {
             output_device_row.add_suffix(&dim_label("No Output Devices"));
         }
         Ok(devices) => {
-            let labels: Vec<&str> = devices.iter().map(String::as_str).collect();
-            output_device_row.add_suffix(&dropdown_from_strings(&labels, 0));
+            let labels: Vec<&str> = devices.iter().map(|device| device.label.as_str()).collect();
+            let dropdown = dropdown_from_strings(&labels, 0);
+            let devices = Rc::new(devices);
+            let row = output_device_row.clone();
+            dropdown.connect_selected_notify(move |dropdown| {
+                let Some(device) = devices.get(dropdown.selected() as usize) else {
+                    return;
+                };
+                match set_default_audio_device(AudioDeviceKind::Sink, &device.selector) {
+                    Ok(()) => row.set_subtitle("Default output changed"),
+                    Err(err) => row.set_subtitle(&format!("Could not change output: {err}")),
+                }
+            });
+            output_device_row.add_suffix(&dropdown);
         }
         Err(err) => {
             output_device_row.add_suffix(&dim_label("Output Detection Unavailable"));
@@ -3416,8 +3554,20 @@ fn sound_page() -> adw::NavigationPage {
             input_device_row.add_suffix(&dim_label("No Input Devices"));
         }
         Ok(devices) => {
-            let labels: Vec<&str> = devices.iter().map(String::as_str).collect();
-            input_device_row.add_suffix(&dropdown_from_strings(&labels, 0));
+            let labels: Vec<&str> = devices.iter().map(|device| device.label.as_str()).collect();
+            let dropdown = dropdown_from_strings(&labels, 0);
+            let devices = Rc::new(devices);
+            let row = input_device_row.clone();
+            dropdown.connect_selected_notify(move |dropdown| {
+                let Some(device) = devices.get(dropdown.selected() as usize) else {
+                    return;
+                };
+                match set_default_audio_device(AudioDeviceKind::Source, &device.selector) {
+                    Ok(()) => row.set_subtitle("Default input changed"),
+                    Err(err) => row.set_subtitle(&format!("Could not change input: {err}")),
+                }
+            });
+            input_device_row.add_suffix(&dropdown);
         }
         Err(err) => {
             input_device_row.add_suffix(&dim_label("Input Detection Unavailable"));
@@ -3536,6 +3686,144 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     page.add(&actions_group);
 
     adw::NavigationPage::new(&page, "Applications")
+}
+
+fn set_chrome_item_visible(hidden: &mut Vec<u32>, id: u32, visible: bool) {
+    hidden.retain(|known| *known != id);
+    if !visible {
+        hidden.push(id);
+    }
+}
+
+fn parse_chrome_order(text: &str) -> Option<Vec<u32>> {
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    text.split(',')
+        .map(|part| part.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn chrome_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Chrome");
+
+    let topbar = adw::PreferencesGroup::new();
+    topbar.set_title("Top Bar Indicators");
+    topbar.set_description(Some(
+        "Show or hide live indicators. Changes apply immediately.",
+    ));
+    for (title, id) in [
+        ("Network", 100),
+        ("Bluetooth", 101),
+        ("Audio and microphone", 102),
+        ("HDR display status", 103),
+        ("Power", 104),
+    ] {
+        let active = !settings.borrow().chrome.topbar.hidden.contains(&id);
+        let toggle = add_switch_row(&topbar, title, None, active);
+        let settings = settings.clone();
+        toggle.connect_active_notify(move |switch| {
+            set_chrome_item_visible(
+                &mut settings.borrow_mut().chrome.topbar.hidden,
+                id,
+                switch.is_active(),
+            );
+            persist_settings(&settings.borrow());
+        });
+    }
+    let topbar_order = add_entry_row(&topbar, "Indicator order", "100, 101, 102, 103, 104");
+    topbar_order.set_text(
+        &settings
+            .borrow()
+            .chrome
+            .topbar
+            .order
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    {
+        let settings = settings.clone();
+        topbar_order.connect_changed(move |entry| {
+            let Some(order) = parse_chrome_order(entry.text().as_str()) else {
+                return;
+            };
+            settings.borrow_mut().chrome.topbar.order = order;
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&topbar);
+
+    let sidebar = adw::PreferencesGroup::new();
+    sidebar.set_title("Sidebar Buttons");
+    sidebar.set_description(Some(
+        "Workspace controls remain dynamic; fixed application buttons can be shown or hidden.",
+    ));
+    for (title, id) in [
+        ("Settings", 1001),
+        ("Launcher", 1000),
+        ("Browser", 1005),
+        ("Terminal", 1006),
+        ("Files", 1007),
+    ] {
+        let active = !settings.borrow().chrome.sidebar.hidden.contains(&id);
+        let toggle = add_switch_row(&sidebar, title, None, active);
+        let settings = settings.clone();
+        toggle.connect_active_notify(move |switch| {
+            set_chrome_item_visible(
+                &mut settings.borrow_mut().chrome.sidebar.hidden,
+                id,
+                switch.is_active(),
+            );
+            persist_settings(&settings.borrow());
+        });
+    }
+    let sidebar_order = add_entry_row(
+        &sidebar,
+        "Fixed-item priority",
+        "1001, 1000, 1005, 1006, 1007",
+    );
+    sidebar_order.set_text(
+        &settings
+            .borrow()
+            .chrome
+            .sidebar
+            .order
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    {
+        let settings = settings.clone();
+        sidebar_order.connect_changed(move |entry| {
+            let Some(order) = parse_chrome_order(entry.text().as_str()) else {
+                return;
+            };
+            settings.borrow_mut().chrome.sidebar.order = order;
+            persist_settings(&settings.borrow());
+        });
+    }
+    page.add(&sidebar);
+
+    let custom = adw::PreferencesGroup::new();
+    custom.set_title("Custom Launch Items");
+    custom.set_description(Some(
+        "Advanced launch items can be added under chrome.sidebar.custom or chrome.topbar.custom in settings.json. Supported icons include browser, terminal, files, settings, wifi, bluetooth, microphone, speaker, hdr, and power.",
+    ));
+    add_info_row(
+        &custom,
+        "Configuration file",
+        None,
+        &focaldesk_settings_core::settings_path()
+            .display()
+            .to_string(),
+    );
+    page.add(&custom);
+
+    adw::NavigationPage::new(&page, "Chrome")
 }
 
 fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
@@ -4523,6 +4811,16 @@ mod tests {
         assert_eq!(hdr_status_subtitle(true, true), "Active now");
         assert_eq!(hdr_status_subtitle(true, false), "Requested, but inactive");
         assert_eq!(hdr_status_subtitle(false, false), "Off");
+    }
+
+    #[test]
+    fn chrome_order_parser_accepts_empty_and_numeric_lists() {
+        assert_eq!(parse_chrome_order(""), Some(vec![]));
+        assert_eq!(
+            parse_chrome_order("104, 100,101"),
+            Some(vec![104, 100, 101])
+        );
+        assert_eq!(parse_chrome_order("network, 100"), None);
     }
 
     #[test]

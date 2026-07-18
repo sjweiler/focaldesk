@@ -7,6 +7,22 @@ use smithay::utils::Size;
 pub const NESTED_DEFAULT_TOPBAR_H: i32 = 64;
 pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
 pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 11;
+pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChromeLayoutConfig {
+    pub status_item_count: usize,
+    pub sidebar_item_count: usize,
+}
+
+impl Default for ChromeLayoutConfig {
+    fn default() -> Self {
+        Self {
+            status_item_count: DEFAULT_TOPBAR_STATUS_COUNT,
+            sidebar_item_count: DEFAULT_SIDEBAR_SLOT_COUNT,
+        }
+    }
+}
 
 /// True when `(lx, ly)` (output-local **logical** coords) is in the top bar host-drag strip
 /// but not on status/clock wells.
@@ -222,10 +238,34 @@ fn build_status_cluster(
     (cluster, wells, clock)
 }
 
+fn status_items_that_fit(topbar_inner: Rectangle<i32, Logical>, requested: usize) -> usize {
+    let pad_y = (topbar_inner.size.h / 6).max(4);
+    let well = (topbar_inner.size.h - pad_y * 2).max(18);
+    let clock = ((well as f32) * 3.2) as i32;
+    // Preserve the flow field, a small title region, cluster padding, and gaps.
+    let available = (topbar_inner.size.w - 96 - 24 - clock - 54).max(0);
+    let per_item = well + 6;
+    let fit = (available / per_item).max(0) as usize;
+    if requested == 0 {
+        0
+    } else {
+        requested.min(fit.max(1))
+    }
+}
+
 pub fn build_chrome_layout(
     output_size: Size<i32, Logical>,
     top_h: i32,
     left_w: i32,
+) -> ChromeLayout {
+    build_chrome_layout_with_config(output_size, top_h, left_w, ChromeLayoutConfig::default())
+}
+
+pub fn build_chrome_layout_with_config(
+    output_size: Size<i32, Logical>,
+    top_h: i32,
+    left_w: i32,
+    config: ChromeLayoutConfig,
 ) -> ChromeLayout {
     let w = output_size.w.max(1);
     let h = output_size.h.max(1);
@@ -280,8 +320,9 @@ pub fn build_chrome_layout(
     ));
 
     // Right-side cluster inside topbar_inner
+    let status_count = status_items_that_fit(topbar_inner, config.status_item_count);
     let (status_cluster, status_wells, clock_well) =
-        build_status_cluster(topbar_inner, 10, 6, 8, 5);
+        build_status_cluster(topbar_inner, 10, 6, 8, status_count);
 
     let flow_left = topbar_inner.loc.x + 6;
     let flow_y = topbar_inner.loc.y + 4;
@@ -336,7 +377,7 @@ pub fn build_chrome_layout(
 
     let available_h = (h - top_h - module_margin_top - module_margin_bottom).max(0);
     let max_slots_that_fit = ((available_h + module_gap) / (module_h + module_gap)).max(0) as usize;
-    let slot_count = DEFAULT_SIDEBAR_SLOT_COUNT.min(max_slots_that_fit);
+    let slot_count = config.sidebar_item_count.min(max_slots_that_fit);
 
     for _ in 0..slot_count {
         let outer = Rectangle::from_loc_and_size((module_margin_x, y), (module_w, module_h));
@@ -447,5 +488,21 @@ mod tests {
     fn work_area_glass_matches_work_recess() {
         let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
         assert_eq!(layout.work_area.glass, layout.work_area.recess);
+    }
+
+    #[test]
+    fn layout_capacity_follows_dynamic_item_counts() {
+        let layout = build_chrome_layout_with_config(
+            Size::from((1920, 1080)),
+            64,
+            76,
+            ChromeLayoutConfig {
+                status_item_count: 3,
+                sidebar_item_count: 7,
+            },
+        );
+
+        assert_eq!(layout.topbar.status_wells.len(), 3);
+        assert_eq!(layout.sidebar.slots.len(), 7);
     }
 }

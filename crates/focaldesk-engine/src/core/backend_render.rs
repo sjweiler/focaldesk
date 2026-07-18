@@ -139,16 +139,7 @@ pub fn prepare_output(
     dt: Duration,
     force_full_damage: bool,
 ) -> Result<PreparedOutput, Box<dyn std::error::Error>> {
-    let (
-        logical_w,
-        logical_h,
-        scale_factor,
-        output_scale,
-        buffer_scale,
-        hdr_supported,
-        hdr_requested,
-        hdr_kms_applied,
-    ) = {
+    let (logical_w, logical_h, scale_factor, output_scale, buffer_scale) = {
         let desk_output = state
             .outputs
             .get(&output_id)
@@ -159,9 +150,6 @@ pub fn prepare_output(
             desk_output.scale_factor,
             desk_output.scale,
             desk_output.scale_factor.round().max(1.0) as i32,
-            desk_output.hdr_supported,
-            desk_output.hdr_requested,
-            desk_output.hdr_kms_applied,
         )
     };
 
@@ -172,33 +160,14 @@ pub fn prepare_output(
     let draw_software_cursor =
         pointer_on_this_output && state.cursor_manager.software_cursor_needed();
 
-    let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
+    let layout = state
+        .chrome_layout_for_output(output_id)
+        .expect("active output layout missing");
+    let ui_options = state
+        .ui_build_options_for_output(output_id)
+        .expect("active output UI options missing");
 
-    let layout = build_chrome_layout(
-        logical_size,
-        state.chrome.metrics.topbar_h,
-        state.chrome.metrics.sidebar_w,
-    );
-    let ai_flow_mode = state.ai_flow_mode();
-
-    let workspace_count = state.workspace_names.len();
-    let active_workspace = state.focused_workspace().0;
-
-    build_ui_for_output_with_options(
-        &mut state.ui,
-        &layout,
-        UiBuildOptions {
-            hdr_supported,
-            hdr_requested,
-            hdr_kms_applied,
-            microphone_detected: state.microphone_detected,
-            voice_capture_status: state.voice_capture_status,
-            workspace_count,
-            max_workspace_slots: state.workspaces.max_workspace_slots as usize,
-            active_workspace,
-            ai_flow_mode,
-        },
-    );
+    build_ui_for_output_with_options(&mut state.ui, &layout, ui_options);
     state.refresh_ui_hover_for_output(output_id);
 
     if let Some(rect) = state.active_sidebar_pulse_damage_rect(output_id, now) {

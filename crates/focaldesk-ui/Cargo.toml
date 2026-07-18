@@ -11,6 +11,7 @@ focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-settings-core = { path = "../focaldesk-settings-core" }
 focaldesk-ipc = { path = "../focaldesk-ipc" }
 focaldesk-power = { path = "../focaldesk-power" }
+focaldesk-network = { path = "../focaldesk-network" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-ai = { path = "../focaldesk-ai" }
 image = "0.25"

@@ -134,6 +134,45 @@ pub enum IconId {
     Minus,
 }
 
+impl IconId {
+    /// Stable names accepted by persisted chrome launch items.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+        Some(match normalized.as_str() {
+            "launcher" => Self::Launcher,
+            "ai" | "ai_console" => Self::AiConsole,
+            "overflow" => Self::Overflow,
+            "settings" => Self::Settings,
+            "battery" => Self::Battery,
+            "ethernet" => Self::Ethernet,
+            "ethernet_off" => Self::EthernetOff,
+            "wifi" => Self::Wifi,
+            "wifi_off" => Self::WifiOff,
+            "bluetooth" => Self::Bluetooth,
+            "bluetooth_off" => Self::BluetoothOff,
+            "microphone" => Self::Microphone,
+            "microphone_off" => Self::MicrophoneOff,
+            "speaker" => Self::Speaker,
+            "speaker_off" => Self::SpeakerOff,
+            "power" => Self::Power,
+            "hdr" => Self::HDR,
+            "browser" => Self::Browser,
+            "terminal" => Self::Terminal,
+            "files" => Self::Files,
+            "plus" => Self::Plus,
+            "minus" => Self::Minus,
+            value if value.starts_with("slot_") => {
+                let slot = value.strip_prefix("slot_")?.parse::<u8>().ok()?;
+                if !(1..=9).contains(&slot) {
+                    return None;
+                }
+                Self::Slot(slot)
+            }
+            _ => return None,
+        })
+    }
+}
+
 //#[derive(Hash, Eq, PartialEq, Copy, Clone, Debug)]
 //pub struct AtlasIcon {
 //    pub id: IconId,

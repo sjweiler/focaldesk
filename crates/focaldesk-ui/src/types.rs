@@ -34,7 +34,7 @@ pub enum SystemCommand {
 
 #[derive(Debug, Clone)]
 pub enum UiAction {
-    LaunchApp(&'static str),
+    LaunchApp(String),
     ToggleSetting(SettingKey),
     SetSetting(SettingKey, bool),
     OpenPanel(PanelKind),
