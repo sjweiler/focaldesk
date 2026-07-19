@@ -913,7 +913,7 @@ pub(crate) fn bootstrap_compositor_core(
         cursor_manager,
         seat,
         notification_snapshots,
-        keybinds: Keybinds::default(),
+        keybinds: Keybinds::with_defaults(backend),
         running: true,
         client_wayland_display: wayland_display.clone(),
         theme_manager,

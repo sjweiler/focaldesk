@@ -329,6 +329,9 @@ impl Keybinds {
 
 fn keysym_to_lower(sym: u32) -> u32 {
     let utf32 = xkb::keysym_to_utf32(sym.into());
+    if utf32 == 0 {
+        return sym;
+    }
     let Some(ch) = char::from_u32(utf32) else {
         return sym;
     };
@@ -347,5 +350,48 @@ fn keysym_to_lower(sym: u32) -> u32 {
 impl Default for Keybinds {
     fn default() -> Self {
         Self::with_defaults(BackendKind::Winit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drm_defaults_include_common_and_drm_bindings() {
+        let keybinds = Keybinds::with_defaults(BackendKind::Drm);
+
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            Some(KeyAction::LaunchTerminal)
+        );
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_space, ModMask::SUPER),
+            Some(KeyAction::ToggleLauncher)
+        );
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_Print, ModMask::empty()),
+            Some(KeyAction::TakeScreenshot)
+        );
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_Print, ModMask::SHIFT),
+            Some(KeyAction::TakeScreenshotAll)
+        );
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_F8, ModMask::SUPER),
+            Some(KeyAction::FocusNext)
+        );
+    }
+
+    #[test]
+    fn winit_defaults_exclude_drm_only_bindings() {
+        let keybinds = Keybinds::with_defaults(BackendKind::Winit);
+
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            Some(KeyAction::LaunchTerminal)
+        );
+        assert_eq!(keybinds.resolve(keysyms::KEY_space, ModMask::SUPER), None);
+        assert_eq!(keybinds.resolve(keysyms::KEY_Print, ModMask::empty()), None);
     }
 }

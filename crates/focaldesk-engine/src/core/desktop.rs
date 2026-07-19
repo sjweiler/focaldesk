@@ -536,6 +536,14 @@ pub struct OutputState {
     pub monitor_edid: Option<Vec<u8>>,
 }
 
+#[derive(Debug)]
+pub(crate) struct OutputTopologySnapshot {
+    output_workspaces: HashMap<String, WorkspaceId>,
+    primary_output: Option<String>,
+    focused_output: Option<String>,
+    window_outputs: Vec<(WindowId, Option<String>)>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum DamageSource {
     WindowMove,
@@ -3871,6 +3879,166 @@ impl DesktopState {
         if self.outputs.len() == 1 {
             self.primary_output = output_id;
         }
+    }
+
+    /// Preserve user-visible state while the DRM backend tears down and rebuilds its
+    /// scanout objects after a connector hotplug. OutputIds are backend-local and may
+    /// change when connector enumeration changes, so connector names are the stable key.
+    pub(crate) fn snapshot_output_topology(&self) -> OutputTopologySnapshot {
+        let output_name = |id: OutputId| {
+            self.outputs
+                .get(&id)
+                .map(|output| output.handle.name().to_string())
+        };
+
+        OutputTopologySnapshot {
+            output_workspaces: self
+                .outputs
+                .values()
+                .map(|output| (output.handle.name().to_string(), output.active_workspace))
+                .collect(),
+            primary_output: output_name(self.primary_output),
+            focused_output: output_name(self.focused_output),
+            window_outputs: self
+                .windows
+                .iter()
+                .map(|window| {
+                    let output_id = window
+                        .output
+                        .unwrap_or_else(|| self.preferred_output_id_for_window(&window.window));
+                    (window.id, output_name(output_id))
+                })
+                .collect(),
+        }
+    }
+
+    /// Restore per-output state after a DRM rebuild and rescue windows whose connector
+    /// disappeared. This also invalidates output-indexed capture/cursor state so reused
+    /// OutputIds cannot accidentally refer to textures from the old topology.
+    pub(crate) fn restore_output_topology(&mut self, snapshot: OutputTopologySnapshot) {
+        let outputs_by_name: HashMap<String, OutputId> = self
+            .outputs
+            .iter()
+            .map(|(id, output)| (output.handle.name().to_string(), *id))
+            .collect();
+
+        for (name, workspace) in snapshot.output_workspaces {
+            if let Some(output_id) = outputs_by_name.get(&name) {
+                if let Some(output) = self.outputs.get_mut(output_id) {
+                    output.active_workspace = workspace;
+                }
+            }
+        }
+
+        let first_output = self.outputs.keys().next().copied();
+        let primary = snapshot
+            .primary_output
+            .as_ref()
+            .and_then(|name| outputs_by_name.get(name).copied())
+            .or(first_output);
+        let focused = snapshot
+            .focused_output
+            .as_ref()
+            .and_then(|name| outputs_by_name.get(name).copied())
+            .or(primary);
+
+        let (Some(primary), Some(focused)) = (primary, focused) else {
+            crate::core::portal::invalidate_portal_output_state(self);
+            self.screenshot_requested = None;
+            self.cursor_owner_output = None;
+            return;
+        };
+
+        self.primary_output = primary;
+        self.focused_output = focused;
+        self.active_workspace = self
+            .outputs
+            .get(&focused)
+            .map(|output| output.active_workspace)
+            .unwrap_or(self.active_workspace);
+
+        // Put the pointer on a real output before re-applying fullscreen/maximized
+        // state; those paths intentionally choose the output under the pointer first.
+        let clamp = self.logical_pointer_clamp_rect();
+        let max_x = (clamp.loc.x + clamp.size.w - 1).max(clamp.loc.x) as f64;
+        let max_y = (clamp.loc.y + clamp.size.h - 1).max(clamp.loc.y) as f64;
+        self.pointer_pos.x = self.pointer_pos.x.clamp(clamp.loc.x as f64, max_x);
+        self.pointer_pos.y = self.pointer_pos.y.clamp(clamp.loc.y as f64, max_y);
+        if self.output_under_pointer(self.pointer_pos).is_none() {
+            if let Some(output) = self.outputs.get(&focused) {
+                self.pointer_pos = Point::from((
+                    output.logical_origin.x as f64 + output.logical_size.w as f64 / 2.0,
+                    output.logical_origin.y as f64 + output.logical_size.h as f64 / 2.0,
+                ));
+            }
+        }
+        self.input.pointer_pos = self.pointer_pos;
+
+        let fallback_workspace = self
+            .outputs
+            .get(&focused)
+            .map(|output| output.active_workspace)
+            .unwrap_or(self.active_workspace);
+        let fallback_work = self.work_recess_for_output(focused);
+        let mut rehome = Vec::new();
+
+        for (window_id, old_output_name) in snapshot.window_outputs {
+            let target = old_output_name
+                .as_ref()
+                .and_then(|name| outputs_by_name.get(name).copied())
+                .or_else(|| {
+                    let window = self.window(window_id)?;
+                    self.space
+                        .outputs_for_element(&window.window)
+                        .first()
+                        .and_then(|output| self.output_id_for_space_output(output))
+                });
+            let Some(window) = self.window_mut(window_id) else {
+                continue;
+            };
+            if let Some(target) = target {
+                window.output = Some(target);
+            } else {
+                window.output = Some(focused);
+                window.workspace = fallback_workspace;
+                rehome.push((window_id, window.fullscreen, window.maximized));
+            }
+        }
+
+        for (index, (window_id, fullscreen, maximized)) in rehome.into_iter().enumerate() {
+            if fullscreen {
+                if let Some(window) = self.window_mut(window_id) {
+                    window.fullscreen = false;
+                }
+                self.set_window_fullscreen(window_id, true, None);
+            } else if maximized {
+                if let Some(window) = self.window_mut(window_id) {
+                    window.maximized = false;
+                }
+                self.set_window_maximized(window_id, true);
+            } else if let (Some(work), Some(window)) = (
+                fallback_work,
+                self.window(window_id).map(|managed| managed.window.clone()),
+            ) {
+                let offset = 24 * (index as i32 % 8);
+                let bbox = self.space.element_bbox(&window).unwrap_or_else(|| {
+                    Rectangle::from_loc_and_size(work.loc, window.geometry().size)
+                });
+                let max_x = work.loc.x + (work.size.w - bbox.size.w).max(0);
+                let max_y = work.loc.y + (work.size.h - bbox.size.h).max(0);
+                let loc = Point::from((
+                    (work.loc.x + offset).min(max_x),
+                    (work.loc.y + offset).min(max_y),
+                ));
+                self.map_window_bbox_location(window, loc, false);
+            }
+        }
+
+        crate::core::portal::invalidate_portal_output_state(self);
+        self.screenshot_requested = None;
+        self.cursor_owner_output = None;
+        self.space.refresh();
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
     pub fn output_contains_pointer(&self, output_id: OutputId) -> bool {

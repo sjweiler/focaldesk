@@ -184,6 +184,18 @@ pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id
         .push(PendingPortalCapture { output_id, frame });
 }
 
+/// Fail in-flight frames and discard GPU resources indexed by the old OutputIds.
+/// A DRM topology rebuild may immediately reuse those numeric IDs for other monitors.
+pub(crate) fn invalidate_portal_output_state(state: &mut DesktopState) {
+    for pending in state.pending_portal_captures.drain(..) {
+        pending.frame.fail(CaptureFailureReason::Unknown);
+    }
+    state.portal_frame_cache.clear();
+    state.portal_capture_source.clear();
+    state.portal_offscreen_targets.clear();
+    state.compositor_ready = false;
+}
+
 /// True when every queued portal frame can be satisfied from the latest scanout texture.
 pub fn pending_portal_outputs_have_capture_source(state: &DesktopState) -> bool {
     state
