@@ -319,6 +319,9 @@ const HDR_SCANOUT_FORMATS: [Fourcc; 4] = [
 ];
 const HDR_MAX_BPC: u64 = 10;
 const HDR_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bound any queued DRM frame, not only HDR property transitions. A connector
+/// disappearing between commit and vblank otherwise leaves the CRTC skipped forever.
+const DRM_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const PCI_VENDOR_NVIDIA: u32 = 0x10de;
 
 type FlowDrmOutputManager = DrmOutputManager<
@@ -327,6 +330,10 @@ type FlowDrmOutputManager = DrmOutputManager<
     Option<OutputPresentationFeedback>,
     DrmDeviceFd,
 >;
+
+fn queued_frame_stalled(queued_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(queued_at) >= DRM_FRAME_TIMEOUT
+}
 
 /// Per-DRM-device backend state.
 pub struct DrmDeviceState {
@@ -786,6 +793,67 @@ fn remove_drm_device(
     }
 }
 
+fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState) -> Result<bool> {
+    let resources = device
+        .drm_output_manager
+        .device()
+        .resource_handles()
+        .context("failed to query DRM resources after hotplug")?;
+    let mut connected = std::collections::HashSet::new();
+
+    for connector in resources.connectors() {
+        let info = device
+            .drm_output_manager
+            .device()
+            .get_connector(*connector, false)
+            .context("failed to query DRM connector after hotplug")?;
+        if info.state() != drm::control::connector::State::Connected {
+            continue;
+        }
+        connected.insert(*connector);
+
+        let Some(surface) = device
+            .surfaces
+            .values()
+            .find(|surface| surface.connector == *connector)
+        else {
+            return Ok(true);
+        };
+
+        let selected_mode = info
+            .modes()
+            .iter()
+            .find(|mode| {
+                mode.mode_type()
+                    .contains(drm::control::ModeTypeFlags::PREFERRED)
+            })
+            .or_else(|| info.modes().first());
+        if selected_mode.is_none_or(|mode| {
+            let (width, height) = mode.size();
+            surface.mode.size != Size::from((i32::from(width), i32::from(height)))
+                || surface.mode.refresh != (mode.vrefresh() as i32).max(60) * 1000
+        }) {
+            return Ok(true);
+        }
+
+        let current_edid = connector_edid(device.drm_output_manager.device(), *connector);
+        let advertised_edid = state
+            .outputs
+            .get(&surface.output_id)
+            .and_then(|output| output.monitor_edid.as_ref());
+        if current_edid.as_ref() != advertised_edid {
+            return Ok(true);
+        }
+    }
+
+    let active: std::collections::HashSet<_> = device
+        .surfaces
+        .values()
+        .map(|surface| surface.connector)
+        .collect();
+    Ok(connected != active)
+}
+
 fn reinitialize_drm_device(
     data: &mut DrmLoopData,
     loop_handle: &LoopHandle<'_, DrmLoopData>,
@@ -796,13 +864,16 @@ fn reinitialize_drm_device(
         .ok_or_else(|| anyhow!("failed to resolve DRM path for {:?}", node))?;
 
     flog(&format!(
-        "Reinitializing DRM device {:?} after resume failure via {}",
+        "Reinitializing DRM device {:?} via {}",
         node,
         path.display()
     ));
 
+    let topology = data.core.state.snapshot_output_topology();
     remove_drm_device(data, loop_handle, node);
     device_added(data, loop_handle, node, &path)?;
+    data.core.state.restore_output_topology(topology);
+    refresh_portal_services(&data.core.state.client_wayland_display);
     data.core
         .state
         .mark_all_outputs_full_damage(DamageSource::Unknown);
@@ -978,10 +1049,13 @@ fn sync_output_hdr_flags(
 mod hdr_tests {
     use super::{
         configured_display_hdr_requested, hdr_detection::parse_edid_hdr_support,
-        hdr_driver_allows_output_with_override, intersect_modifiers, DisplayConfig,
-        DisplayTransform, DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport, PCI_VENDOR_NVIDIA,
+        hdr_driver_allows_output_with_override, intersect_modifiers,
+        merge_disconnected_display_configs, queued_frame_stalled, DisplayConfig, DisplayTransform,
+        DrmModifier, EdidHdrMetadata, HdrBpcRange, HdrSupport, DRM_FRAME_TIMEOUT,
+        PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::DisplayColorProfile;
+    use std::time::Instant;
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
         DisplayConfig {
@@ -1016,6 +1090,37 @@ mod hdr_tests {
             &[display_config(false, true)],
             "DP-1"
         ));
+    }
+
+    #[test]
+    fn lost_vblank_is_bounded_even_outside_an_hdr_transition() {
+        let queued_at = Instant::now();
+        assert!(!queued_frame_stalled(
+            queued_at,
+            queued_at + DRM_FRAME_TIMEOUT - std::time::Duration::from_millis(1)
+        ));
+        assert!(queued_frame_stalled(
+            queued_at,
+            queued_at + DRM_FRAME_TIMEOUT
+        ));
+    }
+
+    #[test]
+    fn disconnected_display_preferences_survive_topology_rebuild() {
+        let connected = display_config(false, false);
+        let mut disconnected = display_config(true, true);
+        disconnected.name = "HDMI-A-1".into();
+        disconnected.logical_x = 2560;
+
+        let merged = merge_disconnected_display_configs(vec![connected], &[disconnected]);
+        let saved = merged
+            .iter()
+            .find(|display| display.name == "HDMI-A-1")
+            .expect("disconnected display should remain persisted");
+        assert!(!saved.enabled);
+        assert!(saved.hdr_requested);
+        assert!(!saved.hdr_enabled);
+        assert_eq!(saved.logical_x, 2560);
     }
 
     #[test]
@@ -1306,7 +1411,7 @@ pub(crate) fn collect_display_configs(
 
         let core_output = core.state.outputs.get(&output_id);
 
-        let (scale, logical_x, logical_y, primary) = if let Some(o) = core_output {
+        let (scale, logical_x, logical_y, mut primary) = if let Some(o) = core_output {
             (
                 o.scale_factor,
                 o.logical_origin.x,
@@ -1329,6 +1434,12 @@ pub(crate) fn collect_display_configs(
             .map(|output| output.hdr_enabled)
             .unwrap_or(false);
         let output_name = surface.output.name();
+        if configured_displays.iter().any(|display| display.primary) {
+            primary = configured_displays
+                .iter()
+                .find(|display| display.name == output_name)
+                .is_some_and(|display| display.primary);
+        }
         let color_profile = configured_display_color_profile(configured_displays, &output_name);
         let icc_profile_path = configured_displays
             .iter()
@@ -1362,6 +1473,31 @@ pub(crate) fn collect_display_configs(
             icc_profile_path,
         });
     }
+
+    merge_disconnected_display_configs(displays, configured_displays)
+}
+
+fn merge_disconnected_display_configs(
+    mut displays: Vec<DisplayConfig>,
+    configured_displays: &[DisplayConfig],
+) -> Vec<DisplayConfig> {
+    // Keep disconnected monitors in the file so a later replug can recover their
+    // scale, position, primary choice, ICC profile, and HDR preference.
+    let connected_names: std::collections::HashSet<_> = displays
+        .iter()
+        .map(|display| display.name.clone())
+        .collect();
+    for configured in configured_displays {
+        if connected_names.contains(&configured.name) {
+            continue;
+        }
+        let mut disconnected = configured.clone();
+        disconnected.enabled = false;
+        disconnected.hdr_enabled = false;
+        displays.push(disconnected);
+    }
+
+    displays.sort_by_key(|display| (display.logical_x, display.logical_y, display.name.clone()));
 
     displays
 }
@@ -2213,7 +2349,22 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let Ok(node) = DrmNode::from_dev_id(device_id) else {
                 return;
             };
-            if let Some(device) = data.backend.devices.get_mut(&node) {
+            let topology_changed = data
+                .backend
+                .devices
+                .get(&node)
+                .map(|device| drm_connector_topology_changed(device, &data.core.state));
+            if matches!(topology_changed, Some(Ok(true))) {
+                flog(&format!(
+                    "DRM connector topology changed on {node:?}; rebuilding outputs"
+                ));
+                if let Err(err) = reinitialize_drm_device(data, &udev_handle, node) {
+                    flog(&format!("Failed to rebuild outputs after hotplug: {err}"));
+                }
+            } else if let Some(device) = data.backend.devices.get_mut(&node) {
+                if let Some(Err(err)) = topology_changed {
+                    flog(&format!("Failed to inspect changed DRM device: {err}"));
+                }
                 if data.session_active {
                     if let Err(err) = device.drm_output_manager.lock().activate(false) {
                         flog(&format!("Failed to refresh changed DRM device: {err}"));
@@ -2365,44 +2516,55 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             || data.core.state.screenshot_all_requested
             || portal_needs_composite;
 
-        // Watchdog for a stalled HDR connector commit: runs every tick regardless of
-        // `should_render`, since a frozen output produces no further damage to wake it up.
+        // Watchdog for any stalled DRM frame: runs every tick regardless of `should_render`,
+        // since a frozen output produces no further damage to wake it up.
         // Some drivers accept the TEST_ONLY commit that precedes an HDR transition but then
         // never deliver the completion event for the real (NONBLOCK) commit, leaving
         // `frame_queued_at` set forever and that CRTC skipped on every future tick. Recovering
         // requires a fresh `DrmCompositor` for the device (Smithay has no public API to drop
         // just the stuck one), so we fall back to the same full-device reinit already used
         // after a failed session resume.
-        let mut stalled_hdr_nodes: Vec<DrmNode> = Vec::new();
+        let mut stalled_nodes: Vec<DrmNode> = Vec::new();
         for (node, device) in data.backend.devices.iter_mut() {
             for surface in device.surfaces.values_mut() {
-                if surface.frame_queued_at.is_none() {
+                let Some(frame_queued_at) = surface.frame_queued_at else {
                     continue;
-                }
-                let stalled = surface
+                };
+                let hdr_stalled = surface
                     .hdr_commit_deadline
                     .is_some_and(|deadline| now >= deadline);
-                if !stalled {
+                let frame_stalled = queued_frame_stalled(frame_queued_at, now);
+                if !hdr_stalled && !frame_stalled {
                     continue;
                 }
-                flog_warn!(
-                    "HDR commit stalled on {} past {:?} with no vblank; disabling HDR and reinitializing the device to recover scanout",
-                    surface.output.name(),
-                    HDR_FRAME_TIMEOUT
-                );
-                disable_persisted_hdr_request(&surface.output.name());
-                if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
-                    output.hdr_requested = false;
-                    output.hdr_enabled = false;
+                if hdr_stalled {
+                    flog_warn!(
+                        "HDR commit stalled on {} past {:?} with no vblank; disabling HDR and reinitializing the device to recover scanout",
+                        surface.output.name(),
+                        HDR_FRAME_TIMEOUT
+                    );
+                    disable_persisted_hdr_request(&surface.output.name());
+                    if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
+                        output.hdr_requested = false;
+                        output.hdr_enabled = false;
+                    }
+                } else {
+                    flog_warn!(
+                        "DRM frame stalled on {} past {:?} with no vblank; reinitializing the device to recover scanout",
+                        surface.output.name(),
+                        DRM_FRAME_TIMEOUT
+                    );
                 }
                 surface.hdr_commit_deadline = None;
-                stalled_hdr_nodes.push(*node);
+                if !stalled_nodes.contains(node) {
+                    stalled_nodes.push(*node);
+                }
             }
         }
-        for node in stalled_hdr_nodes {
+        for node in stalled_nodes {
             if let Err(err) = reinitialize_drm_device(&mut data, &loop_handle, node) {
                 flog_warn!(
-                    "Failed to reinitialize DRM device {:?} after stalled HDR commit: {err}",
+                    "Failed to reinitialize DRM device {:?} after stalled frame: {err}",
                     node
                 );
             }
@@ -3165,13 +3327,18 @@ fn device_added(
             // Logical layout in global compositor space (must match `register_output_entry` / `map_output`).
             // wl_output + xdg_output advertise this to clients; leaving (0,0) stacks every head at the origin
             // (e.g. OBS projector shows all DRM outputs on top of each other).
-            let origin = Point::<i32, Logical>::from((next_x, 0));
             let output_scale = configured_display_scale(&configured_displays, &output_name);
             let output_scale_int = output_scale.round().max(1.0) as i32;
             let logical_size = Size::<i32, Logical>::from((
                 (w as f64 / output_scale).round() as i32,
                 (h as f64 / output_scale).round() as i32,
             ));
+            let saved_display = configured_displays
+                .iter()
+                .find(|display| display.name == output_name);
+            let origin = saved_display
+                .map(|display| Point::<i32, Logical>::from((display.logical_x, display.logical_y)))
+                .unwrap_or_else(|| Point::<i32, Logical>::from((next_x, 0)));
             let chrome_layout = build_chrome_layout(
                 logical_size,
                 data.core.state.chrome.metrics.topbar_h,
@@ -3338,7 +3505,7 @@ fn device_added(
             }
             data.core.state.refresh_output_color(output_id);
 
-            if !initialized_one {
+            if saved_display.is_some_and(|display| display.primary) || !initialized_one {
                 data.core.state.primary_output = output_id;
             }
 
@@ -3374,7 +3541,7 @@ fn device_added(
                 },
             );
             id += 1;
-            next_x += logical_size.w;
+            next_x = next_x.max(origin.x + logical_size.w);
             flog("Output initialized (Wayland + DRM)");
             data.core.state.drm_submit_hw_cursor = true;
             initialized_one = true;

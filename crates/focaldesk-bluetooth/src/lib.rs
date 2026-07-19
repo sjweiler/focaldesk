@@ -350,14 +350,29 @@ pub fn pair_and_connect(address: &str) -> Result<String, String> {
 
     let info = run_bluetoothctl(&["info", address])?;
     if !info_value(&info, "Connected") {
-        run_bluetoothctl_with_timeout(&["connect", address], Duration::from_secs(15))?;
+        connect(address)?;
     }
 
     Ok("Paired, trusted, and connected".to_string())
 }
 
 pub fn connect(address: &str) -> Result<String, String> {
-    run_bluetoothctl_with_timeout(&["connect", address], Duration::from_secs(15))
+    const ATTEMPTS: usize = 3;
+
+    for attempt in 1..=ATTEMPTS {
+        match run_bluetoothctl_with_timeout(&["connect", address], Duration::from_secs(15)) {
+            Ok(output) => return Ok(output),
+            Err(err) if attempt < ATTEMPTS && is_transient_connection_error(&err) => {
+                // Headsets commonly need a moment to become page-able after
+                // their case opens. Keep this retry here so every FocalDesk
+                // caller gets the same reconnect behavior.
+                thread::sleep(Duration::from_millis(750));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("the connection loop always returns on its final attempt")
 }
 
 pub fn disconnect(address: &str) -> Result<String, String> {
@@ -490,10 +505,24 @@ fn bluetoothctl_reported_failure(output: &str) -> bool {
     })
 }
 
+fn is_transient_connection_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("br-connection-page-timeout")
+        || lower.contains("br-connection-create-socket")
+        || lower.contains("br-connection-unknown")
+        || lower.contains("did not answer")
+        || lower.contains("not available")
+        || lower.contains("not currently available")
+        || lower.contains("command timed out")
+}
+
 fn friendly_bluetooth_error(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
-    if lower.contains("br-connection-unknown") || lower.contains("not available") {
-        "Bluetooth device is no longer available. Put it back in pairing mode and try Pair again."
+    if lower.contains("br-connection-page-timeout") {
+        "Bluetooth device did not answer. Make sure it is awake, nearby, and not connected to another host, then try Connect again."
+            .to_string()
+    } else if lower.contains("br-connection-unknown") || lower.contains("not available") {
+        "Bluetooth device is not currently available. Make sure it is awake and nearby, then try again."
             .to_string()
     } else if lower.contains("authentication") {
         format!("Bluetooth pairing authentication failed: {message}")
@@ -578,6 +607,29 @@ mod tests {
             "Device 74:65:0C:1E:8F:BB not available"
         ));
         assert!(!bluetoothctl_reported_failure("Connection successful"));
+    }
+
+    #[test]
+    fn recognizes_transient_headset_connection_failures() {
+        assert!(is_transient_connection_error(
+            "bluetoothctl: Failed to connect: org.bluez.Error.Failed br-connection-page-timeout"
+        ));
+        assert!(is_transient_connection_error(
+            "Bluetooth device is not currently available"
+        ));
+        assert!(!is_transient_connection_error(
+            "Bluetooth pairing authentication failed"
+        ));
+    }
+
+    #[test]
+    fn page_timeout_error_explains_how_to_make_headset_reachable() {
+        assert_eq!(
+            friendly_bluetooth_error(
+                "Failed to connect: org.bluez.Error.Failed br-connection-page-timeout"
+            ),
+            "Bluetooth device did not answer. Make sure it is awake, nearby, and not connected to another host, then try Connect again."
+        );
     }
 
     #[test]

@@ -586,6 +586,13 @@ pub fn draw_output_stage(
         .get(&prepared.frame_ctx.rendering_output)
         .map(|o| o.active_workspace)
         .unwrap_or(state.active_workspace);
+    let fullscreen_client = state.windows.iter().any(|window| {
+        window.mapped
+            && !window.minimized
+            && window.fullscreen
+            && window.workspace == active_workspace
+            && window.output == Some(prepared.frame_ctx.rendering_output)
+    });
     let notifications = if state.lock_screen.active && state.privacy.hide_lock_screen_notifications
     {
         Vec::new()
@@ -616,6 +623,7 @@ pub fn draw_output_stage(
         draw_software_cursor: prepared.draw_software_cursor,
         ui_tree: &state.ui,
         current_workspace: active_workspace,
+        fullscreen_client,
         // 👇 ADD THESE
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,

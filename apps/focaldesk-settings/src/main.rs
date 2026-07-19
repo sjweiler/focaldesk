@@ -2852,20 +2852,74 @@ fn populate_bluetooth_list(
                 } else {
                     "connect"
                 };
+                let connect_button = connect.clone();
                 let status = status.clone();
+                let group = group.clone();
+                let rows = rows.clone();
+                let scanning = scanning.clone();
+                let power_switch = power_switch.clone();
+                let scan_switch = scan_switch.clone();
+                let updating_switches = updating_switches.clone();
                 connect.connect_clicked(move |_| {
-                    let result = if was_connected {
-                        focaldesk_bluetooth::disconnect(&address)
+                    connect_button.set_sensitive(false);
+                    status.set_text(if was_connected {
+                        "Disconnecting Bluetooth device…"
                     } else {
-                        focaldesk_bluetooth::connect(&address)
-                    };
-                    match result {
-                        Ok(output) if output.is_empty() => {
-                            status.set_text(&format!("{command} sent to {address}"));
+                        "Connecting Bluetooth device…"
+                    });
+
+                    let (tx, rx) = mpsc::channel();
+                    let task_address = address.clone();
+                    thread::spawn(move || {
+                        let result = if was_connected {
+                            focaldesk_bluetooth::disconnect(&task_address)
+                        } else {
+                            focaldesk_bluetooth::connect(&task_address)
+                        };
+                        let _ = tx.send(result);
+                    });
+
+                    let connect = connect_button.clone();
+                    let result_address = address.clone();
+                    let status = status.clone();
+                    let group = group.clone();
+                    let rows = rows.clone();
+                    let scanning = scanning.clone();
+                    let power_switch = power_switch.clone();
+                    let scan_switch = scan_switch.clone();
+                    let updating_switches = updating_switches.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(output)) => {
+                                if output.is_empty() {
+                                    status.set_text(&format!("{command} sent to {result_address}"));
+                                } else {
+                                    status.set_text(&output);
+                                }
+                                refresh_bluetooth_list_async(
+                                    &group,
+                                    &rows,
+                                    &status,
+                                    &scanning,
+                                    &power_switch,
+                                    &scan_switch,
+                                    &updating_switches,
+                                );
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(err)) => {
+                                connect.set_sensitive(true);
+                                status.set_text(&err);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                connect.set_sensitive(true);
+                                status.set_text("Bluetooth connection task stopped unexpectedly");
+                                glib::ControlFlow::Break
+                            }
                         }
-                        Ok(output) => status.set_text(&output),
-                        Err(err) => status.set_text(&err),
-                    }
+                    });
                 });
             }
             controls.append(&connect);

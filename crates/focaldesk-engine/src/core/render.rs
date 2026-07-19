@@ -233,6 +233,8 @@ pub struct RenderInputs<'a> {
     pub draw_software_cursor: bool,
     pub ui_tree: &'a UiTree,
     pub current_workspace: WorkspaceId,
+    /// A fullscreen client on this output owns the entire display, including the shell chrome.
+    pub fullscreen_client: bool,
     // 👇 ADD THESE
     pub dialogs: &'a [Dialog],
     pub active_dialog: Option<DialogId>,
@@ -1650,37 +1652,41 @@ impl RenderState {
 
             // Chrome draws opaque bevels over the work region; clients must be composited
             // after that shell (and work-area wallpaper), or they are fully covered.
-            self.draw_chrome_below_work_wallpaper(
-                frame,
-                inputs.ctx,
-                inputs.layout,
-                inputs.output,
-                inputs.metrics,
-                muts.ui,
-                inputs.sidebar_hover_slot,
-                inputs.sidebar_pulse,
-                inputs.topbar_pulse,
-                inputs.clock_pulse,
-                theme.chrome,
-            );
+            if !inputs.fullscreen_client {
+                self.draw_chrome_below_work_wallpaper(
+                    frame,
+                    inputs.ctx,
+                    inputs.layout,
+                    inputs.output,
+                    inputs.metrics,
+                    muts.ui,
+                    inputs.sidebar_hover_slot,
+                    inputs.sidebar_pulse,
+                    inputs.topbar_pulse,
+                    inputs.clock_pulse,
+                    theme.chrome,
+                );
 
-            self.draw_wallpaper_in_rect(
-                frame,
-                inputs.ctx,
-                inputs.layout.work_area.recess,
-                inputs.ctx.output_scale,
-                theme.wallpaper.clone(),
-                &inputs.client_compositing,
-            );
+                self.draw_wallpaper_in_rect(
+                    frame,
+                    inputs.ctx,
+                    inputs.layout.work_area.recess,
+                    inputs.ctx.output_scale,
+                    theme.wallpaper.clone(),
+                    &inputs.client_compositing,
+                );
 
-            // Work-area glass must sit under client surfaces (trim/icons stay above).
-            if matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr) {
-                self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+                // Work-area glass must sit under client surfaces (trim/icons stay above).
+                if matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr) {
+                    self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+                }
             }
         }
 
         if matches!(stage, OutputRenderStage::LinearGlassUnderClients) {
-            self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+            if !inputs.fullscreen_client {
+                self.draw_work_area_glass_layer(frame, &inputs, theme)?;
+            }
             return Ok(());
         }
 
@@ -1739,19 +1745,21 @@ impl RenderState {
             return Ok(());
         }
 
-        self.draw_chrome_trim_glass_icons(
-            frame,
-            inputs.ctx,
-            inputs.layout,
-            inputs.output,
-            inputs.metrics,
-            muts.ui,
-            inputs.ui_tree,
-            inputs.current_workspace,
-            inputs.fonts,
-            inputs.flow_field_pulse,
-            theme,
-        );
+        if !inputs.fullscreen_client {
+            self.draw_chrome_trim_glass_icons(
+                frame,
+                inputs.ctx,
+                inputs.layout,
+                inputs.output,
+                inputs.metrics,
+                muts.ui,
+                inputs.ui_tree,
+                inputs.current_workspace,
+                inputs.fonts,
+                inputs.flow_field_pulse,
+                theme,
+            );
+        }
 
         self.draw_popup_elements(
             frame,
