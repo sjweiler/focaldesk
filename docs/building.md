@@ -81,6 +81,23 @@ sudo apt install -y \
 
 Install `xwayland` separately if you want to test X11 applications.
 
+### Vosk voice library
+
+The `focaldesk-voice` crate links to the native `libvosk` shared library. Fedora
+installations can provide it through the distribution's Vosk package. On
+distributions without a packaged library, download the matching native archive
+from the [official Vosk releases](https://github.com/alphacep/vosk-api/releases)
+and make the directory containing `libvosk.so` available at build and runtime:
+
+```sh
+export LIBRARY_PATH=/path/to/vosk-library
+export LD_LIBRARY_PATH=/path/to/vosk-library
+```
+
+A speech-recognition model is separate from this shared library. Configure its
+location with `FOCALDESK_VOSK_MODEL_DIR`; do not commit downloaded models to the
+repository.
+
 ## Clone and build
 
 ```sh

@@ -18,6 +18,8 @@ version numbers where practical.
 
 - Clarified experimental and planned feature claims, including subsurface
   damage tracking, HDR, capture, AI, and automation.
+- Provisioned the pinned native Vosk library in CI so workspace tests can link
+  voice-enabled applications on Ubuntu runners.
 
 ## Historical tags
 

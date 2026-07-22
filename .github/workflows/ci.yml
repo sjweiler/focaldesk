@@ -37,7 +37,25 @@ jobs:
             libgbm-dev \
             libgtk-4-dev \
             libadwaita-1-dev \
-            libpam0g-dev
+            libpam0g-dev \
+            unzip
+
+      - name: Install Vosk native library
+        env:
+          VOSK_VERSION: "0.3.45"
+          VOSK_SHA256: "bbdc8ed85c43979f6443142889770ea95cbfbc56cffb5c5dcd73afa875c5fbb2"
+        run: |
+          archive="$RUNNER_TEMP/vosk-linux-x86_64.zip"
+          install_root="$RUNNER_TEMP/vosk"
+          curl -fsSL \
+            "https://github.com/alphacep/vosk-api/releases/download/v${VOSK_VERSION}/vosk-linux-x86_64-${VOSK_VERSION}.zip" \
+            -o "$archive"
+          echo "${VOSK_SHA256}  ${archive}" | sha256sum --check
+          unzip -q "$archive" -d "$install_root"
+          library_dir="$install_root/vosk-linux-x86_64-${VOSK_VERSION}"
+          test -f "$library_dir/libvosk.so"
+          echo "LIBRARY_PATH=$library_dir" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$library_dir" >> "$GITHUB_ENV"
 
       - name: Rustfmt
         run: cargo fmt --all -- --check
