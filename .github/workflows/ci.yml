@@ -44,3 +44,12 @@ jobs:
 
       - name: Cargo check
         run: cargo check --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Markdown links
+        run: bash scripts/check-markdown-links.sh

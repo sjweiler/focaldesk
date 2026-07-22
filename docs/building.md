@@ -1,284 +1,216 @@
-
-
 # Building FocalDesk
 
-This guide explains how to build and run FocalDesk from source.
+This guide covers development builds, nested testing, and installation as a
+Wayland session. FocalDesk is alpha system software; begin with the nested
+backend and keep another desktop session available.
 
-## Supported Platforms
+## Supported environments
 
-FocalDesk is currently developed and tested on:
+- Fedora Workstation is the primary development environment.
+- Ubuntu is compile-checked by GitHub Actions.
+- Rust stable and a Wayland host session are expected.
+- Other Linux distributions may work but are not currently tested by the
+  project.
 
-- Fedora Workstation
-- Wayland
-- Rust stable
+Hardware behavior, especially DRM/KMS, HDR, multi-GPU, and capture behavior,
+depends on the kernel, Mesa or proprietary driver, and display topology.
 
-Other distributions may work but are not officially tested.
+## Install prerequisites
 
----
+Install Rust with [rustup](https://rustup.rs/), then verify the toolchain:
 
-# Prerequisites
-
-## Rust
-
-Install Rust using rustup:
-
-```bash
-curl https://sh.rustup.rs -sSf | sh
-```
-
-Verify:
-
-```bash
-cargo --version
+```sh
 rustc --version
+cargo --version
 ```
-
----
-
-## System Packages
 
 ### Fedora
 
-Install the required development packages:
-
-```bash
+```sh
 sudo dnf install \
-    meson \
-    ninja-build \
-    cmake \
-    gcc \
-    clang \
-    pkgconf-pkg-config \
-    libxkbcommon-devel \
-    wayland-devel \
-    wayland-protocols-devel \
-    mesa-libEGL-devel \
-    mesa-libGLES-devel \
-    libdrm-devel \
-    libinput-devel \
-    seatd-devel \
-    libdisplay-info-devel \
-    pipewire-devel \
-    gtk4-devel \
-    libadwaita-devel \
-    xorg-x11-server-Xwayland
+  meson \
+  ninja-build \
+  cmake \
+  gcc \
+  clang \
+  libclang-devel \
+  pkgconf-pkg-config \
+  libxkbcommon-devel \
+  wayland-devel \
+  wayland-protocols-devel \
+  mesa-libEGL-devel \
+  mesa-libGLES-devel \
+  libdrm-devel \
+  libinput-devel \
+  seatd-devel \
+  libdisplay-info-devel \
+  pipewire-devel \
+  alsa-lib-devel \
+  polkit-devel \
+  pam-devel \
+  gtk4-devel \
+  libadwaita-devel \
+  xorg-x11-server-Xwayland
 ```
 
-Additional packages may be required as development continues.
+### Ubuntu and Debian-derived distributions
 
----
+The CI build uses:
 
-# Clone the Repository
+```sh
+sudo apt update
+sudo apt install -y \
+  pkg-config \
+  libwayland-dev \
+  libxkbcommon-dev \
+  libudev-dev \
+  libinput-dev \
+  libseat-dev \
+  libpipewire-0.3-dev \
+  libasound2-dev \
+  libpolkit-gobject-1-dev \
+  libpolkit-agent-1-dev \
+  libclang-dev \
+  libegl1-mesa-dev \
+  libgles2-mesa-dev \
+  libgbm-dev \
+  libgtk-4-dev \
+  libadwaita-1-dev \
+  libpam0g-dev
+```
 
-```bash
+Install `xwayland` separately if you want to test X11 applications.
+
+## Clone and build
+
+```sh
 git clone https://github.com/sjweiler/focaldesk.git
 cd focaldesk
+cargo build --workspace
 ```
 
----
+An optimized build takes longer but is more representative of compositor
+performance:
 
-# Build
-
-Compile the workspace:
-
-```bash
-cargo build
+```sh
+cargo build --release --workspace
 ```
 
-For an optimized release build:
+The repository also provides a `justfile`:
 
-```bash
-cargo build --release
+```sh
+just build
 ```
 
----
+## Run nested for development
 
-# Running
+Run the winit backend inside an existing Wayland session:
 
-### Nested (Development)
-
-Run inside an existing Wayland session:
-
-```bash
-cargo run
+```sh
+cargo run -p focaldesk-desktop --no-default-features --features winit,xwayland
 ```
 
-or
+This is the recommended development path because a compositor crash only closes
+the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are
+not available in nested mode.
 
-```bash
-cargo run --release
+Increase diagnostic logging when needed:
+
+```sh
+RUST_LOG=debug cargo run -p focaldesk-desktop --no-default-features --features winit,xwayland
 ```
 
-This is the recommended development workflow.
+See [Troubleshooting](troubleshooting.md) for log locations and common failures.
 
----
+## Install a DRM/KMS Wayland session
 
-### DRM/KMS Session
+The default compositor features build the direct DRM/KMS backend. Install the
+release binary and session entry with:
 
-Running directly on DRM/KMS requires appropriate permissions and a supported Linux system.
-
-This mode is intended for testing a complete desktop session.
-
----
-
-# Workspace Layout
-
-The project is organized as a Rust workspace.
-
-Major crates include:
-
-- FocalDesk compositor
-- Launcher service
-- Shared IPC library
-- Settings application
-- File manager
-
-Additional crates may be added over time.
-
----
-
-# Optional Features
-
-Depending on your hardware and installed packages, FocalDesk may support:
-
-- XWayland
-- PipeWire capture
-- Hardware cursor
-- Multi-monitor
-- HDR experimentation
-
----
-
-# Debug Builds
-
-For development:
-
-```bash
-cargo build
+```sh
+just install-desktop
+just install-desktop-session
 ```
 
-Debug builds include symbols and are recommended while developing.
+These recipes install:
 
----
+- `/usr/local/bin/focaldesk-desktop`
+- `/usr/libexec/focaldesk/focaldesk-polkitd`
+- `/usr/share/wayland-sessions/focaldesk.desktop`
+- `/usr/lib/systemd/user/focaldesk-session.target`
 
-# Release Builds
+Log out, select **FocalDesk** in the display manager, and sign in. Keep a known
+working session installed so you can recover from compositor or driver failures.
 
-```bash
-cargo build --release
+## Install desktop services
+
+For a local, per-user service installation:
+
+```sh
+just install-services
 ```
 
-Release builds provide significantly better rendering performance.
+This installs binaries under `~/.local/bin`, user units under
+`~/.config/systemd/user`, reloads the user service manager, and enables the
+service set. Fedora packagers can instead use:
 
----
-
-# Logging
-
-Increase logging output using:
-
-```bash
-RUST_LOG=debug cargo run
+```sh
+just install-services-fedora
 ```
 
-or
+The Fedora recipes place binaries and units in system locations. Review the
+recipes in `justfile` before using them in a packaging environment.
 
-```bash
-RUST_LOG=trace cargo run
+Individual applications can be installed with recipes such as:
+
+```sh
+just install-launcher
+just install-files
+just install-settings
+just install-ai-console
 ```
 
-If using the built-in logging system, refer to the logging documentation.
+## Development checks
 
----
+Run the same baseline checks expected for pull requests:
 
-# Common Problems
-
-## Missing system libraries
-
-Ensure all required development packages are installed.
-
----
-
-## XWayland not launching
-
-Verify that XWayland is installed:
-
-```bash
-which Xwayland
+```sh
+cargo fmt --all -- --check
+cargo check --workspace
+cargo clippy --workspace --all-targets
+cargo test --workspace
 ```
 
----
+Some hardware-specific behavior cannot be covered by unit tests. Mention the
+GPU, driver, backend, output topology, and manual test performed when submitting
+a compositor, HDR, capture, or multi-monitor change.
 
-## Build fails after dependency updates
+## Updating dependencies
 
-Update dependencies:
+Do not use `cargo update` as a general build-repair step: it changes
+`Cargo.lock`. Update dependencies intentionally, review the lockfile diff, and
+run the complete check suite. For ordinary build failures, first use the locked
+versions already committed to the repository.
 
-```bash
-cargo update
+## Uninstall a local development installation
+
+FocalDesk does not yet provide a packaged uninstaller. Disable user services
+before removing files:
+
+```sh
+systemctl --user disable --now focaldesk-session.target
+systemctl --user daemon-reload
 ```
 
-Clean the build if necessary:
+Then remove only the FocalDesk files installed by the relevant `just` recipes.
+The system session files are listed above, and per-user files are placed under
+`~/.local/bin` and `~/.config/systemd/user`. Preserve
+`~/.config/focaldesk` if you want to keep settings and AI permission records.
 
-```bash
-cargo clean
-cargo build
-```
+## Next steps
 
----
-
-## Permission issues
-
-DRM/KMS mode typically requires:
-
-- seatd
-- logind
-- appropriate user permissions
-
-Nested mode does not require these privileges.
-
----
-
-# Development Workflow
-
-Typical workflow:
-
-```bash
-git pull
-
-cargo fmt
-
-cargo clippy
-
-cargo test
-
-cargo run
-```
-
-Before submitting changes:
-
-```bash
-cargo fmt
-cargo clippy --all-targets
-cargo test
-```
-
----
-
-# Continuous Integration
-
-GitHub Actions automatically builds and validates the project on every push and pull request.
-
-Checks include:
-
-- formatting
-- compilation
-- linting
-- tests
-
----
-
-# Next Steps
-
-After successfully building FocalDesk, see:
-
-- `architecture.md`
-- `vision.md`
-- `roadmap.md`
+- [Configuration](configuration.md)
+- [Default keybindings](keybindings.md)
+- [Troubleshooting](troubleshooting.md)
+- [Architecture](architecture.md)
+- [Roadmap](../ROADMAP.md)

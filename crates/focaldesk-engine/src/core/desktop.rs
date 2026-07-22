@@ -286,6 +286,46 @@ fn should_wait_for_lid_open_on_resume(last_lid_state: Option<bool>) -> bool {
     last_lid_state == Some(true)
 }
 
+const UNATTENDED_SUSPEND_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy)]
+enum UnattendedSuspendState {
+    Requested { at: Instant, unlock_on_resume: bool },
+    Sleeping { unlock_on_resume: bool },
+}
+
+impl UnattendedSuspendState {
+    fn prepare_for_sleep(state: &mut Option<Self>, now: Instant) -> bool {
+        let Some(pending) = state.take() else {
+            return false;
+        };
+
+        match pending {
+            Self::Requested {
+                at,
+                unlock_on_resume,
+            } if now.saturating_duration_since(at) <= UNATTENDED_SUSPEND_PREPARE_TIMEOUT => {
+                *state = Some(Self::Sleeping { unlock_on_resume });
+                true
+            }
+            Self::Sleeping { unlock_on_resume } => {
+                *state = Some(Self::Sleeping { unlock_on_resume });
+                true
+            }
+            Self::Requested { .. } => false,
+        }
+    }
+
+    fn take_resume_unlock(state: &mut Option<Self>) -> bool {
+        matches!(
+            state.take(),
+            Some(Self::Sleeping {
+                unlock_on_resume: true
+            })
+        )
+    }
+}
+
 pub(crate) const DND_CURSOR_ENDED: u8 = 0;
 pub(crate) const DND_CURSOR_FILE: u8 = 1;
 pub(crate) const DND_CURSOR_VALID: u8 = 2;
@@ -717,6 +757,7 @@ pub struct DesktopState {
     last_user_activity_at: Instant,
     idle_lock_triggered: bool,
     idle_suspend_triggered: bool,
+    unattended_suspend_state: Option<UnattendedSuspendState>,
     deferred_power_action: Option<(PowerIpcRequest, &'static str)>,
     low_battery_triggered: bool,
     lid_close_triggered: bool,
@@ -1240,6 +1281,8 @@ impl DesktopState {
 
     /// Reset compositor-side state after the session comes back from suspend.
     pub(crate) fn handle_session_resume(&mut self) {
+        let unlock_on_resume =
+            UnattendedSuspendState::take_resume_unlock(&mut self.unattended_suspend_state);
         self.last_user_activity_at = Instant::now();
         self.idle_lock_triggered = false;
         self.idle_suspend_triggered = false;
@@ -1250,11 +1293,19 @@ impl DesktopState {
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
         self.render.invalidate_gpu_state();
         self.render.egui.refresh_power_status_now();
+        if unlock_on_resume {
+            self.lock_screen.unlock();
+        }
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
     pub(crate) fn handle_session_suspend(&mut self) {
-        self.lock_session();
+        if !UnattendedSuspendState::prepare_for_sleep(
+            &mut self.unattended_suspend_state,
+            Instant::now(),
+        ) {
+            self.lock_session();
+        }
     }
 
     pub(crate) fn on_resume(&mut self) {
@@ -1301,7 +1352,6 @@ impl DesktopState {
             }
             LowBatteryAction::Suspend => {
                 notification_service_notify("Power", format!("{message}. Suspending."), None);
-                self.lock_session();
                 self.dispatch_power_action(
                     PowerIpcRequest::Suspend,
                     "low battery suspend",
@@ -1331,7 +1381,6 @@ impl DesktopState {
     fn handle_lid_close_action(&mut self) {
         match self.power.lid_close_action {
             LidCloseAction::Suspend => {
-                self.lock_session();
                 self.dispatch_power_action(
                     PowerIpcRequest::Suspend,
                     "lid close suspend",
@@ -3415,11 +3464,10 @@ impl DesktopState {
                 self.lock_session();
             }
             focaldesk_ui::types::SystemCommand::Suspend => {
-                self.lock_session();
                 self.dispatch_power_action(
                     PowerIpcRequest::Suspend,
                     "system suspend",
-                    PowerActionInteraction::Interactive,
+                    PowerActionInteraction::NonInteractive,
                 );
             }
             focaldesk_ui::types::SystemCommand::Hibernate => {
@@ -3459,11 +3507,10 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
             PowerButtonAction::Suspend => {
-                self.lock_session();
                 self.dispatch_power_action(
                     PowerIpcRequest::Suspend,
                     "power button suspend",
-                    PowerActionInteraction::Interactive,
+                    PowerActionInteraction::NonInteractive,
                 );
             }
             PowerButtonAction::PowerOff => {
@@ -3494,6 +3541,19 @@ impl DesktopState {
         context: &'static str,
         interaction: PowerActionInteraction,
     ) {
+        if matches!(action, PowerIpcRequest::Suspend) {
+            self.unattended_suspend_state = if interaction == PowerActionInteraction::NonInteractive
+            {
+                Some(UnattendedSuspendState::Requested {
+                    at: Instant::now(),
+                    // Preserve an intentional lock, but undo a lock caused only
+                    // by the idle blank-screen timer after an unattended wake.
+                    unlock_on_resume: !self.lock_screen.active || self.idle_lock_triggered,
+                })
+            } else {
+                None
+            };
+        }
         let interaction = power_action_interaction(&action, self.lock_screen.active, interaction);
         let Some(command) = session_power_command(&action) else {
             power_service_command(action, context, interaction);
@@ -5061,6 +5121,7 @@ impl DesktopState {
             last_user_activity_at: Instant::now(),
             idle_lock_triggered: false,
             idle_suspend_triggered: false,
+            unattended_suspend_state: None,
             deferred_power_action: None,
             low_battery_triggered: false,
             lid_close_triggered: false,
@@ -6917,7 +6978,6 @@ impl DesktopState {
                 now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
             })
             || self.lock_screen.active
-            || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
 
     pub fn output_has_pending_damage(&self, output_id: OutputId) -> bool {
@@ -6931,7 +6991,6 @@ impl DesktopState {
             || self.output_has_active_flow_field_pulse(output_id, now)
             || self.output_has_active_clock_pulse(output_id, now)
             || self.lock_screen.active
-            || (self.lock_screen.active && self.lock_screen.pulse_frame(now).is_some())
     }
 
     pub fn clear_repaint_request(&mut self) {
@@ -8408,7 +8467,8 @@ fn is_obs_like(app_name: &str) -> bool {
 mod tests {
     use super::{
         clamp_rect_to_bounds, is_browser_like, power_action_interaction, session_power_command,
-        should_wait_for_lid_open_on_resume, PowerActionInteraction,
+        should_wait_for_lid_open_on_resume, PowerActionInteraction, UnattendedSuspendState,
+        UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
@@ -8498,6 +8558,47 @@ mod tests {
         assert!(should_wait_for_lid_open_on_resume(Some(true)));
         assert!(!should_wait_for_lid_open_on_resume(Some(false)));
         assert!(!should_wait_for_lid_open_on_resume(None));
+    }
+
+    #[test]
+    fn unattended_suspend_can_unlock_automatically_on_resume() {
+        let now = std::time::Instant::now();
+        let mut state = Some(UnattendedSuspendState::Requested {
+            at: now,
+            unlock_on_resume: true,
+        });
+
+        assert!(UnattendedSuspendState::prepare_for_sleep(&mut state, now));
+        assert!(UnattendedSuspendState::take_resume_unlock(&mut state));
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn stale_unattended_suspend_does_not_bypass_the_lock() {
+        let now = std::time::Instant::now();
+        let mut state = Some(UnattendedSuspendState::Requested {
+            at: now,
+            unlock_on_resume: true,
+        });
+
+        assert!(!UnattendedSuspendState::prepare_for_sleep(
+            &mut state,
+            now + UNATTENDED_SUSPEND_PREPARE_TIMEOUT + std::time::Duration::from_secs(1),
+        ));
+        assert!(state.is_none());
+    }
+
+    #[test]
+    fn unattended_suspend_preserves_an_existing_lock() {
+        let now = std::time::Instant::now();
+        let mut state = Some(UnattendedSuspendState::Requested {
+            at: now,
+            unlock_on_resume: false,
+        });
+
+        assert!(UnattendedSuspendState::prepare_for_sleep(&mut state, now));
+        assert!(!UnattendedSuspendState::take_resume_unlock(&mut state));
+        assert!(state.is_none());
     }
 
     #[test]

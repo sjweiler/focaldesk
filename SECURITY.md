@@ -14,10 +14,11 @@ currently maintain separate supported release branches.
 Please do not report security vulnerabilities in public issues, discussions, or
 pull requests.
 
-If GitHub private vulnerability reporting is enabled for this repository, use
-that channel. Otherwise, contact a maintainer privately. If you do not have a
-private contact path, open a public issue asking for a security contact without
-including exploit details, crash dumps, logs, repro steps, or affected code paths.
+Use [GitHub's private vulnerability report form](https://github.com/sjweiler/focaldesk/security/advisories/new).
+If that form is unavailable, open a public issue asking the project owner to
+establish private contact. Do not include vulnerability details, exploit code,
+crash dumps, logs, reproduction steps, credentials, or affected code paths in
+that public issue.
 
 Include as much of the following as you can safely share:
 
@@ -33,6 +34,11 @@ Include as much of the following as you can safely share:
 Maintainers will acknowledge valid reports when possible, investigate the issue,
 and coordinate a fix before public disclosure. Because FocalDesk is early alpha,
 response times and release processes may vary.
+
+Submitting a report does not guarantee a bounty or a particular disclosure
+timeline. The project owner will try to acknowledge actionable private reports,
+assess impact, prepare a fix, and coordinate disclosure according to available
+time and the severity of the issue.
 
 ## Disclosure
 

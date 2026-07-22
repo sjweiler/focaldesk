@@ -4,13 +4,16 @@ FocalDesk is currently a solo-developed alpha project. Contributions, bug
 reports, and design feedback may be welcome, but there is no formal maintainer
 team, release process, or guaranteed review timeline yet.
 
+Participation in project spaces is subject to the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Project Status
 
 FocalDesk is experimental compositor and desktop environment software. Expect
 breaking changes, incomplete features, and architectural churn.
 
-Before contributing, read the [README](README.md) for the current project shape
-and build instructions.
+Before contributing, read the [README](README.md) for the current project shape,
+[building guide](docs/building.md), and [roadmap](ROADMAP.md).
 
 ## Issues
 
@@ -29,6 +32,7 @@ When reporting a bug, include:
 - Your Linux distribution, desktop/session context, GPU driver, and relevant
   Wayland environment details when applicable.
 - Logs or terminal output when useful.
+- The tested commit and whether the DRM/KMS or nested winit backend was used.
 
 Do not include security-sensitive details in public issues. See
 [SECURITY.md](SECURITY.md) for vulnerability reporting guidance.
@@ -55,8 +59,10 @@ Before opening a pull request, run the relevant checks when possible:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo check --workspace
+cargo clippy --workspace --all-targets
 cargo test --workspace
+./scripts/check-markdown-links.sh
 ```
 
 If a check cannot be run locally, mention that in the pull request.
@@ -72,6 +78,18 @@ If a check cannot be run locally, mention that in the pull request.
   security-sensitive areas.
 - Keep user-facing behavior predictable and recoverable, especially for alpha
   features.
+- Update the relevant status, configuration, keybinding, architecture, or
+  troubleshooting documentation when behavior changes.
+
+## Commit and Pull Request Notes
+
+Use clear, imperative commit subjects and explain why the change is needed.
+Pull requests should identify the affected backend or service, tests performed,
+known limitations, and any follow-up work intentionally left out of scope.
+
+Screenshots are helpful for visible UI changes. Remove personal information,
+tokens, filenames, model prompts, and other sensitive data before attaching
+images or logs.
 
 ## Maintainer Notes
 

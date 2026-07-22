@@ -1,6 +1,5 @@
 # FocalDesk
 
-
 [![CI](https://github.com/sjweiler/focaldesk/actions/workflows/ci.yml/badge.svg)](https://github.com/sjweiler/focaldesk/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/sjweiler/focaldesk/actions/workflows/codeql.yml/badge.svg)](https://github.com/sjweiler/focaldesk/actions/workflows/codeql.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -8,19 +7,44 @@
 ![Wayland](https://img.shields.io/badge/Wayland-native-blue)
 ![Status](https://img.shields.io/badge/status-alpha-red)
 
-FocalDesk is an alpha desktop environment project built around a custom Wayland compositor and a cohesive system experience layer.
+FocalDesk is an experimental Wayland desktop environment built around a custom
+Rust compositor and a cohesive system-experience layer. It is alpha software:
+use it for development and testing, not as the only session protecting important
+work.
 
-The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop with structured workspaces, clear system feedback, and permissioned automation. See [docs/vision.md](docs/vision.md) for the broader project direction.
+The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop
+with structured workspaces, clear system feedback, and permissioned automation.
+See the [project vision](docs/vision.md), [architecture](docs/architecture.md),
+and [roadmap](ROADMAP.md) for the intended direction.
+
+## Project Status
+
+FocalDesk is developed and used by its project owner, but APIs, configuration,
+and behavior may change without compatibility guarantees before a stable
+release.
+
+| Area | Status |
+| --- | --- |
+| Wayland compositor and desktop shell | Working, alpha |
+| DRM/KMS and nested winit backends | Working, alpha |
+| Workspaces and multi-monitor layout | Working, with ongoing edge-case work |
+| XWayland application support | Working, alpha |
+| PipeWire/portal screen capture | Experimental |
+| HDR and color management | Experimental and hardware-dependent |
+| Settings, file manager, launcher, and AI console | Usable prototypes |
+| Local AI and automation services | Experimental and permission-gated |
+| Precise Wayland subsurface damage tracking | Planned |
+
+The table describes repository capabilities, not a compatibility guarantee for
+every distribution, GPU, or application. See [Building FocalDesk](docs/building.md)
+and [Troubleshooting](docs/troubleshooting.md) before testing it.
 
 ## Screenshots
 
-## Desktop
+### Desktop
 
-FocalDesk Desktop Environment
-
-FocalDesk is a modern Wayland desktop environment written in Rust, focused on performance, modularity, and AI integration.
-
-The project now includes a complete desktop stack featuring:
+The main desktop screenshot shows the compositor, shell chrome, workspace UI,
+and native applications running together. The repository contains:
 
 - Native Wayland compositor
 - Desktop shell
@@ -33,70 +57,57 @@ The project now includes a complete desktop stack featuring:
 
 ![FocalDesk Desktop](docs/screenshots/desktop.png)
 
-## Launcher
+### Launcher
 
-Native Application Launcher
-
-FocalDesk includes a lightweight native application launcher that provides quick access to desktop applications through a dedicated launcher service. The launcher communicates with the compositor through typed IPC, allowing application management without tightly coupling launcher logic to the rendering engine.
+The native launcher provides application discovery and starts applications
+through a dedicated launcher service rather than embedding process management
+in the compositor.
 
 ![Launcher](docs/screenshots/launcher.png)
 
-## Settings
+### Settings
 
-Native Settings Application
-
-FocalDesk includes a dedicated settings application for configuring desktop appearance, displays, networking, Bluetooth, audio, printers, workspaces, keyboard shortcuts, privacy, power management, and other system features. The application communicates with desktop services through a modular IPC architecture, providing a centralized configuration experience.
+The settings prototype exposes appearance, display, input, privacy, power, and
+service controls. Some panels are still incomplete or hardware-dependent.
 
 ![Settings](docs/screenshots/settings.png)
 
-## File Manager
+### File Manager
 
-Native File Manager
-
-FocalDesk includes a first-party file manager for browsing local storage with familiar desktop navigation. Features include sidebar navigation, address bar, search, list and grid views, file sorting, and integration with the FocalDesk desktop environment.
+The first-party file manager prototype provides common browsing, navigation,
+search, sorting, and list/grid workflows.
 
 ![File Manager](docs/screenshots/files.png)
 
-## AI Console asking for permission
+### AI Console permission prompt
 
-AI Console & Permission Manager
+This view demonstrates an AI request stopping at the runtime permission boundary
+before an action proceeds.
 
-Demonstrates FocalDesk's built-in AI framework with provider management, model selection, conversation tracking, and runtime permission prompts. AI services communicate through dedicated background daemons, allowing local LLM integration without embedding AI functionality directly into the compositor.
+![AI Console displaying a permission request](docs/screenshots/ai-console-permission-check.png)
 
-![File Manager](docs/screenshots/ai-console-permission-check.png)
+### AI Console processing a query
 
-## AI Console processing query
+The AI Console prototype connects to configured model providers through local
+services. Provider availability and data handling depend on the user's selected
+backend.
 
-Integrated AI Console
+![AI Console processing a model query](docs/screenshots/ai-console-processing-query.png)
 
-FocalDesk includes a native AI Console that connects to local language model providers through a modular service architecture. Users can select AI providers and models, manage conversations, maintain long-term memory, define reusable prompts, and interact with AI services without relying on cloud infrastructure.
+### Wine/DXVK rendering
 
-![File Manager](docs/screenshots/ai-console-processing-query.png)
+This compatibility test shows World of Warcraft running through Wine/DXVK and
+XWayland. It demonstrates a known-working setup, not compatibility with every
+game, Wine version, or GPU driver.
 
-## Wine/DXVK rendering
+![World of Warcraft running through Wine and DXVK](docs/screenshots/wow.png)
 
-Compatibility Demonstration
+### OBS (Open Broadcaster Software)
 
-FocalDesk successfully runs complex graphics applications through DXVK/Wine, including World of Warcraft. This validates compositor compatibility with Vulkan translation layers, XWayland integration, GPU acceleration, input handling, and high-performance rendering.
+OBS Studio is shown capturing a FocalDesk output through PipeWire and the
+Wayland portal path. Screen capture remains experimental.
 
-![Game](docs/screenshots/wow.png)
-
-## OBS (Open Broadcaster Software)
-
-OBS Studio (PipeWire Capture)
-
-OBS Studio capturing the FocalDesk desktop through PipeWire, demonstrating native Wayland screen recording, portal integration, and compatibility with professional streaming and recording applications.
-
-![OBS](docs/screenshots/obs.png)
-
-## Status
-
-FocalDesk is alpha software.
-
-It is stable enough for daily use by the project owner, but it is still early in
-development. Expect incomplete features, breaking changes, rough edges, and
-occasional compositor-level bugs. If you try it as a daily driver, be prepared
-to debug Linux desktop, Wayland, graphics, and input issues.
+![OBS Studio capturing a FocalDesk output through PipeWire](docs/screenshots/obs.png)
 
 ## Repository Layout
 
@@ -115,23 +126,9 @@ to debug Linux desktop, Wayland, graphics, and input issues.
 
 FocalDesk is currently developed as a Rust workspace for Linux.
 
-Install Rust from <https://rustup.rs/>.
-
-On Debian/Ubuntu-style systems, the CI environment installs:
-
-```sh
-sudo apt install -y \
-  pkg-config \
-  libwayland-dev \
-  libxkbcommon-dev \
-  libudev-dev \
-  libinput-dev \
-  libegl1-mesa-dev \
-  libgles2-mesa-dev \
-  libgbm-dev \
-  libgtk-4-dev \
-  libadwaita-1-dev
-```
+Install Rust from <https://rustup.rs/> and follow the Fedora or Ubuntu dependency
+instructions in [docs/building.md](docs/building.md). Fedora is the primary
+development environment; Ubuntu is continuously compile-checked in CI.
 
 ## Build
 
@@ -149,17 +146,21 @@ just build
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets
 cargo test --workspace
 ```
 
 ## Run
 
-The main compositor binary is:
+To run the compositor nested inside an existing Wayland session:
 
 ```sh
-cargo run -p focaldesk-desktop
+cargo run -p focaldesk-desktop --no-default-features --features winit
 ```
+
+The default `focaldesk-desktop` features target a direct DRM/KMS session. Do not
+run that mode casually from an important graphical session; use the installed
+Wayland session described below.
 
 To make FocalDesk show up in GDM, install the compositor and Wayland session:
 
@@ -235,6 +236,10 @@ That installs and enables:
 - `focaldesk-dialogd`
 - `focaldesk-controlsd`
 - `focaldesk-settingsd`
+- `focaldesk-automation`
+- `focald-voice`
+- `focald-speech`
+- `focald-mic`
 
 Each unit lives under `packaging/systemd/user/` and is copied to
 `~/.config/systemd/user/` for a local install.
@@ -280,6 +285,18 @@ Then run `systemctl --user daemon-reload` and restart the daemon with
 installed. `FOCALD_SPEECH_PLAYER` can override the player executable. Set
 `FOCALD_SPEECH_BACKEND=espeak-ng` (or remove the override) to return to eSpeak
 NG.
+
+## Documentation
+
+- [Building and installation](docs/building.md)
+- [Configuration and environment](docs/configuration.md)
+- [Default keybindings](docs/keybindings.md)
+- [Troubleshooting and logs](docs/troubleshooting.md)
+- [Architecture](docs/architecture.md)
+- [IPC design](docs/ipc.md)
+- [Project roadmap](ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
 
 ## License
 
