@@ -7,6 +7,8 @@
 ![Wayland](https://img.shields.io/badge/Wayland-native-blue)
 ![Status](https://img.shields.io/badge/status-alpha-red)
 
+## Overview
+
 FocalDesk is an experimental Wayland desktop environment built around a custom
 Rust compositor and a cohesive system-experience layer. It is alpha software:
 use it for development and testing, not as the only session protecting important
@@ -16,6 +18,23 @@ The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop
 with structured workspaces, clear system feedback, and permissioned automation.
 See the [project vision](docs/vision.md), [architecture](docs/architecture.md),
 and [roadmap](ROADMAP.md) for the intended direction.
+
+## Features
+
+- Custom Wayland compositor with direct DRM/KMS and nested winit backends.
+- Keyboard-oriented workspaces and multi-monitor window management.
+- XWayland support for X11 applications, including tested Wine/DXVK workflows.
+- OpenGL ES rendering with shell effects, damage tracking, and experimental HDR
+  and color-management paths.
+- First-party launcher, Settings, file manager, login greeter, and AI Console.
+- PipeWire and portal integration for experimental screen capture.
+- Separate user services for launching, settings, notifications, power,
+  dialogs, controls, speech, voice input, and permissioned automation.
+- Typed local IPC and explicit permission checks for AI and automation actions.
+
+Features marked experimental are under active development and may be incomplete
+or hardware-dependent. The status table below is the best summary of what works
+today.
 
 ## Project Status
 
@@ -109,6 +128,50 @@ Wayland portal path. Screen capture remains experimental.
 
 ![OBS Studio capturing a FocalDesk output through PipeWire](docs/screenshots/obs.png)
 
+## Architecture
+
+![FocalDesk architecture overview](docs/diagrams/architecture-overview.png)
+
+Wayland and XWayland clients submit surfaces to the compositor, which owns
+window and workspace state, input routing, shell behavior, rendering, and output
+coordination. Desktop applications and background daemons stay outside the
+rendering loop and communicate through local IPC, keeping process launching,
+settings, permissions, and optional AI workflows separated from compositor
+state.
+
+The diagram is conceptual and includes elements marked as planned or future.
+See the [architecture guide](docs/architecture.md) for the rendering and IPC
+diagrams, current boundaries, and implementation notes.
+
+## Technical Challenges
+
+- **Compositor correctness:** surface lifecycles, focus, grabs, popups,
+  subsurfaces, and XWayland behavior must remain correct across many toolkits.
+- **Hardware diversity:** DRM/KMS, GPU drivers, multi-GPU systems, hotplug,
+  mixed refresh rates, scaling, transforms, and hardware cursors vary widely.
+- **Efficient rendering:** damage tracking must avoid unnecessary redraws while
+  preserving correct composition; precise subsurface damage remains planned.
+- **Color and capture:** HDR, wide-gamut color, ICC handling, SDR composition,
+  PipeWire capture, and portal behavior require end-to-end validation.
+- **System boundaries:** local IPC, service privileges, socket ownership, and
+  permission records must stay auditable without blocking the desktop loop.
+- **Safe iteration:** an alpha compositor needs reliable nested testing,
+  diagnostics, crash recovery, and installation paths that leave a working
+  desktop available.
+
+## Technologies Used
+
+| Area | Technology |
+| --- | --- |
+| Core language and build | Rust, Cargo, `just` |
+| Compositor and protocols | Smithay, Wayland, XWayland |
+| Display and input | DRM/KMS, GBM/EGL, libinput, libseat, udev |
+| Rendering and text | OpenGL ES, `glow`, `tiny-skia`, `cosmic-text`, `swash` |
+| Desktop applications | GTK 4, libadwaita |
+| Media and desktop integration | PipeWire, ALSA, xdg-desktop-portal, D-Bus/`zbus` |
+| Services and data | systemd user services, Unix sockets, Serde, SQLite |
+| Automation and voice | Lua (`mlua`), Vosk, eSpeak NG, optional Piper |
+
 ## Repository Layout
 
 - `apps/focaldesk-desktop`: compositor executable
@@ -122,7 +185,7 @@ Wayland portal path. Screen capture remains experimental.
 - `assets/`: bundled visual assets
 - `docs/`: design notes and architecture material
 
-## Requirements
+## Build Instructions
 
 FocalDesk is currently developed as a Rust workspace for Linux.
 
@@ -130,24 +193,39 @@ Install Rust from <https://rustup.rs/> and follow the Fedora or Ubuntu dependenc
 instructions in [docs/building.md](docs/building.md). Fedora is the primary
 development environment; Ubuntu is continuously compile-checked in CI.
 
-## Build
+Clone and build the complete workspace:
 
 ```sh
+git clone https://github.com/sjweiler/focaldesk.git
+cd focaldesk
 cargo build --workspace
 ```
 
-Or, if you have `just` installed:
+For an optimized build:
+
+```sh
+cargo build --release --workspace
+```
+
+If you already have the repository and have `just` installed, the equivalent
+development build is:
 
 ```sh
 just build
 ```
 
-## Check
+The full [building guide](docs/building.md) lists Fedora and Ubuntu/Debian
+packages, the native Vosk dependency, nested testing, DRM/KMS session
+installation, and uninstall guidance.
+
+## Development Checks
 
 ```sh
 cargo fmt --all -- --check
+cargo check --workspace
 cargo clippy --workspace --all-targets
 cargo test --workspace
+./scripts/check-markdown-links.sh
 ```
 
 ## Run
@@ -285,6 +363,31 @@ Then run `systemctl --user daemon-reload` and restart the daemon with
 installed. `FOCALD_SPEECH_PLAYER` can override the player executable. Set
 `FOCALD_SPEECH_BACKEND=espeak-ng` (or remove the override) to return to eSpeak
 NG.
+
+## Roadmap
+
+Near-term work is focused on compositor stability, multi-monitor behavior,
+XWayland and portal hardening, configuration consolidation, auditable AI and
+automation permissions, repeatable alpha releases, and clearing the Clippy
+warning backlog. Rendering priorities include precise subsurface damage,
+expanded HDR/color validation, and broader cursor, direct-scanout, and multi-GPU
+testing.
+
+Longer-term goals include maturing the first-party desktop experience, versioned
+IPC, narrower service privileges, better accessibility and recovery workflows,
+permissioned local automation, and optional remote-desktop support. These are
+directions rather than release promises; see the complete [project
+roadmap](ROADMAP.md) for current priorities and release-readiness criteria.
+
+## Contributing
+
+FocalDesk is currently a solo-developed alpha project. Focused contributions,
+reproducible bug reports, and design feedback may be welcome, but review times
+are not guaranteed and large architectural changes should be discussed before
+implementation. Read [CONTRIBUTING.md](CONTRIBUTING.md) for issue guidance,
+development checks, coding expectations, and pull-request scope. Participation
+is governed by the [Code of Conduct](CODE_OF_CONDUCT.md), and vulnerabilities
+should follow the private process in [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
