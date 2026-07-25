@@ -46,17 +46,6 @@ fn acl_file() -> PathBuf {
 async fn main() -> std::io::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    // Pin all current and future pages: the master key and decrypted secrets
-    // must never reach swap. Needs LimitMEMLOCK headroom (set in the unit);
-    // failure is downgraded to a warning so low rlimits don't brick the broker.
-    // SAFETY: mlockall has no memory-safety preconditions.
-    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
-        log::warn!(
-            "mlockall failed ({}); secrets may be swappable — raise LimitMEMLOCK or use encrypted swap/zram",
-            std::io::Error::last_os_error()
-        );
-    }
-
     let mut key = store::load_master_key()?;
     let db_path = data_file()?;
     let store = store::Store::open(&db_path, &key)?;
@@ -86,6 +75,20 @@ async fn main() -> std::io::Result<()> {
                 *shared.dbus.lock().await = Some(conn);
             }
         }
+    }
+
+    // zbus lazily creates its executor worker while establishing the service
+    // connection above. Pin memory only after that thread exists: MCL_FUTURE
+    // otherwise makes pthread_create fail with EAGAIN when the new stack would
+    // exceed RLIMIT_MEMLOCK, preventing the broker from starting at all.
+    // Failure remains a warning so low limits never make credentials
+    // unavailable.
+    // SAFETY: mlockall has no memory-safety preconditions.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } != 0 {
+        log::warn!(
+            "mlockall failed ({}); secrets may be swappable — raise LimitMEMLOCK or use encrypted swap/zram",
+            std::io::Error::last_os_error()
+        );
     }
 
     // Native IPC surface.

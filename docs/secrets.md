@@ -32,10 +32,11 @@ just install-secrets-pam-fedora
 The PAM recipe only installs the module. It intentionally does not edit
 `/etc/pam.d`, because a bad automated PAM edit can prevent login.
 
-The install recipe also installs a first-session migration unit. It runs before
-the broker, asks the session Secret Service to enumerate GNOME Keyring, and
-copies readable items without deleting or modifying the originals. Locked or
-failed items are reported and the migration retries on a later session.
+The install recipe includes a migration unit, but normal broker startup does
+not run it automatically because activating GNOME Keyring would race
+Focaldesk for `org.freedesktop.secrets`. Run the migration explicitly before
+switching the session to Focaldesk's provider. It copies readable items without
+deleting or modifying the originals.
 
 `focald-secrets` and another Secret Service provider such as
 `gnome-keyring-daemon` cannot own `org.freedesktop.secrets` simultaneously.
@@ -54,7 +55,7 @@ store. It does not infer provider roles from labels or attributes; after
 review, explicitly copy selected provider credentials to `ai/*` keys.
 
 Stop `focald-secrets.service` before running a manual import so it cannot write
-the database concurrently. The migration unit handles ordering automatically.
+the database concurrently.
 
 ## Unlock at login with focaldmd
 
@@ -66,10 +67,10 @@ PAM module:
 just install-focaldm-pam-fedora
 ```
 
-The policy also includes `pam_gnome_keyring.so` in its auth, password, and
-session stacks. This passes the verified login password to GNOME Keyring and
-starts it unlocked, so Chrome and other Secret Service clients do not block on
-an additional keyring prompt after a focaldmd login.
+The policy uses `pam_focald_secrets.so` to provision the runtime key before the
+desktop starts. Focaldesk then owns `org.freedesktop.secrets`, so Chrome and
+other Secret Service clients use the Focaldesk store without a second keyring
+prompt.
 
 The first successful login creates a random store key, wraps it under a key
 derived from the login password, and writes the session copy below
@@ -77,10 +78,36 @@ derived from the login password, and writes the session copy below
 
 Distribution PAM stacks differ; the packaged policy targets Fedora's
 `password-auth` and `postlogin` stacks. On other distributions, add
-`pam_gnome_keyring.so` and `pam_focald_secrets.so` to the equivalent human
-login policy rather than installing the Fedora file. If the password-change
-stack is not integrated, run `focald-secrets-keytool rewrap` when changing the
-login password.
+`pam_focald_secrets.so` to the equivalent human login policy rather than
+installing the Fedora file. If the password-change stack is not integrated,
+run `focald-secrets-keytool rewrap` when changing the login password.
+
+## Memory locking
+
+`focald-secrets` pins its address space with
+`mlockall(MCL_CURRENT|MCL_FUTURE)` after establishing the D-Bus executor. The
+broker unit requests a 128 MiB `LimitMEMLOCK`, but a user service cannot raise
+that limit above the hard limit inherited by its `user@.service` manager.
+Fedora commonly starts the user manager with an 8 MiB ceiling, which is too
+small for the broker's approximately 75 MiB virtual address space.
+
+The Fedora install recipe places
+`90-focaldesk-memlock.conf` under
+`/usr/lib/systemd/system/user@.service.d/`, raising the manager ceiling to
+128 MiB. The new ceiling takes effect for user managers created after the
+change, so log out and back in after installing or upgrading.
+
+Confirm that the broker started without an `mlockall failed` warning:
+
+```sh
+systemctl --user status focald-secrets.service
+journalctl --user -b -u focald-secrets.service
+```
+
+On a running system, `/proc/$PID/status` should report a nonzero `VmLck` for
+the broker process. Do not weaken this to `--password-store=basic` for Chrome;
+that bypasses protected Secret Service storage rather than fixing the session
+limit.
 
 For development sessions without focaldmd/PAM:
 

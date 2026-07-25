@@ -222,7 +222,10 @@ install-secrets-service-fedora:
     sudo install -Dm644 packaging/systemd/user/focald-secrets-fedora.service /usr/lib/systemd/user/focald-secrets.service
     sudo install -Dm644 packaging/systemd/user/focald-secrets.socket /usr/lib/systemd/user/focald-secrets.socket
     sudo install -Dm644 packaging/systemd/user/focald-secrets-import-fedora.service /usr/lib/systemd/user/focald-secrets-import.service
+    sudo install -Dm644 packaging/dbus/org.freedesktop.secrets.service /usr/share/dbus-1/services/org.freedesktop.secrets.service
+    sudo install -Dm644 packaging/systemd/system/90-focaldesk-memlock.conf /usr/lib/systemd/system/user@.service.d/90-focaldesk-memlock.conf
     test -e /etc/focaldesk/secrets-acl.toml || sudo install -Dm644 packaging/focaldesk/secrets-acl.toml /etc/focaldesk/secrets-acl.toml
+    sudo systemctl daemon-reload
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focald-secrets.socket || echo "Unlock the keyring, then start focald-secrets.socket"
 
@@ -231,14 +234,14 @@ install-secrets-pam-fedora:
     cargo build --release -p pam-focald-secrets
     sudo install -Dm755 target/release/libpam_focald_secrets.so /usr/lib64/security/pam_focald_secrets.so
 
-# Install the complete focaldmd login policy. This includes both the native
-# FocalDesk vault and GNOME Keyring auto-unlock used by Chrome and other
-# Secret Service clients.
+# Install the complete focaldmd login policy. The native Focaldesk vault also
+# provides the standard Secret Service API used by Chrome and other clients.
 install-focaldm-pam-fedora: install-secrets-pam-fedora
-    test -e /usr/lib64/security/pam_gnome_keyring.so
-    rg -q '^auth[[:space:]]+optional[[:space:]]+pam_gnome_keyring\\.so$' packaging/pam/focaldmd-fedora
-    rg -q '^session[[:space:]]+optional[[:space:]]+pam_gnome_keyring\\.so[[:space:]]+auto_start$' packaging/pam/focaldmd-fedora
+    test -e /usr/lib64/security/pam_focald_secrets.so
+    ! rg -q 'pam_gnome_keyring\\.so' packaging/pam/focaldmd-fedora
+    rg -q '^auth[[:space:]]+optional[[:space:]]+pam_focald_secrets\\.so$' packaging/pam/focaldmd-fedora
     rg -q '^password[[:space:]]+optional[[:space:]]+pam_focald_secrets\\.so$' packaging/pam/focaldmd-fedora
+    rg -q '^session[[:space:]]+optional[[:space:]]+pam_focald_secrets\\.so$' packaging/pam/focaldmd-fedora
     sudo install -Dm644 packaging/pam/focaldmd-fedora /etc/pam.d/focaldmd
 
 install-session-target-fedora:

@@ -40,10 +40,14 @@ persistence across daemon restart.
   Without PAM (SSH sessions, testing): `focald-secrets-keytool init|unlock|rewrap|status`.
   The PAM module never blocks login: every failure path logs to syslog and
   returns success/ignore — worst case is a locked keyring, never a locked-out user.
-* The daemon calls `mlockall(MCL_CURRENT|MCL_FUTURE)` at startup so key
-  material and decrypted secrets can't be swapped (unit sets `LimitMEMLOCK=128M`;
-  on failure it warns and continues). In-flight secret buffers are `Zeroizing`
-  end-to-end; IPC frames are scrubbed after use.
+* After establishing its D-Bus executor thread, the daemon calls
+  `mlockall(MCL_CURRENT|MCL_FUTURE)` so key material and decrypted secrets
+  can't be swapped. Both the broker unit and its parent `user@.service` manager
+  need a 128 MiB `LimitMEMLOCK`; a user unit cannot raise the hard limit it
+  inherits from the manager. On failure the broker warns and continues.
+  Locking before zbus creates its worker can make thread-stack allocation fail
+  under `RLIMIT_MEMLOCK`. In-flight secret buffers are `Zeroizing` end-to-end;
+  IPC frames are scrubbed after use.
 
 ## ACL (native surface only)
 
