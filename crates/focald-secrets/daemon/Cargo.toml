@@ -1,0 +1,46 @@
+[package]
+name = "focald-secrets"
+version = "0.1.0"
+edition = "2021"
+description = "Focaldesk credential broker: native ACL'd IPC + org.freedesktop.secrets provider"
+license = "MIT"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "signal", "time"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+anyhow = "1"
+
+# crypto: store encryption + Secret Service session encryption
+chacha20poly1305 = { workspace = true }
+keywrap = { package = "focald-secrets-keywrap", path = "../keywrap" }
+libc = { workspace = true }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+sha2 = "0.10"
+hkdf = "0.12"
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"
+zeroize = { workspace = true }
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+
+[[bin]]
+name = "focald-secrets"
+path = "src/main.rs"
+
+[[bin]]
+name = "focald-secrets-keytool"
+path = "src/keytool.rs"
+
+[[bin]]
+name = "focald-secrets-import-gnome-keyring"
+path = "src/import_gnome.rs"

@@ -1,0 +1,14 @@
+[package]
+name = "pam-focald-secrets"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "pam_focald_secrets"
+crate-type = ["cdylib"]
+
+[dependencies]
+keywrap = { package = "focald-secrets-keywrap", path = "../keywrap" }
+libc = { workspace = true }
+zeroize = { workspace = true }

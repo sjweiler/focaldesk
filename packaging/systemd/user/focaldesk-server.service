@@ -1,6 +1,8 @@
 [Unit]
 Description=FocalDesk server
 PartOf=focaldesk-session.target
+Wants=focald-secrets.socket
+After=focald-secrets.socket
 
 [Service]
 Type=simple

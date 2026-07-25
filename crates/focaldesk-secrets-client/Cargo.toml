@@ -1,0 +1,16 @@
+[package]
+name = "focaldesk-secrets-client"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native client for the Focaldesk credential broker"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

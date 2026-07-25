@@ -17,6 +17,7 @@ working configuration before testing a new revision.
 | `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions | Manage through the permission UI when possible |
 | `$XDG_CONFIG_HOME/focaldesk/automation/automations.toml` | Scheduled automation definitions | Experimental |
 | `$XDG_CONFIG_HOME/focaldesk/automation/scripts/` | Lua automation scripts referenced by `automations.toml` | Experimental and security-sensitive |
+| `$XDG_CONFIG_HOME/focaldesk/secrets-acl.toml` | Per-systemd-unit access to native credential-broker keys | Security-sensitive; default deny |
 
 FocalDesk falls back to built-in defaults when a settings file does not exist.
 An invalid file may also cause the affected component to use defaults, so check
@@ -66,11 +67,14 @@ code and logs.
 
 ## Secrets
 
-Cloud-backed AI providers may read credentials such as `OPENAI_API_KEY` or
-`ANTHROPIC_API_KEY` from the service environment. Do not commit credentials to
-the repository or place them in screenshots, issue reports, logs, or shared
-configuration. For systemd user services, use a private service drop-in or an
-appropriate secret-management mechanism.
+Cloud-backed AI providers first query `focald-secrets` for
+`ai/openai-api-key`, `ai/anthropic-api-key`, or `ai/vllm-api-key`.
+`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, and `FOCALDESK_VLLM_API_KEY` remain
+development and upgrade fallbacks. Do not commit credentials or put them in
+screenshots, issue reports, logs, or shared configuration.
+
+See [Credential broker](secrets.md) for installation, login-key provisioning,
+ACLs, and commands for storing provider keys.
 
 ## Logs and state
 

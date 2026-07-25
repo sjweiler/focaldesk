@@ -30,6 +30,8 @@ and [roadmap](ROADMAP.md) for the intended direction.
 - PipeWire and portal integration for experimental screen capture.
 - Separate user services for launching, settings, notifications, power,
   dialogs, controls, speech, voice input, and permissioned automation.
+- Encrypted credential broker with ACL-protected native IPC and Secret Service
+  compatibility for libsecret applications.
 - Typed local IPC and explicit permission checks for AI and automation actions.
 
 Features marked experimental are under active development and may be incomplete
@@ -393,6 +395,7 @@ should follow the private process in [SECURITY.md](SECURITY.md).
 
 - [Building and installation](docs/building.md)
 - [Configuration and environment](docs/configuration.md)
+- [Credential broker](docs/secrets.md)
 - [Default keybindings](docs/keybindings.md)
 - [Troubleshooting and logs](docs/troubleshooting.md)
 - [Architecture](docs/architecture.md)

@@ -1,0 +1,13 @@
+# PAM integration for focald-secrets — lines to add to Focaldesk's human login
+# stack (/etc/pam.d/focaldmd), mirroring pam_gnome_keyring:
+#
+#   auth      optional  pam_focald_secrets.so
+#   session   optional  pam_focald_secrets.so
+#   password  optional  pam_focald_secrets.so
+#
+# Ordering: the auth line goes AFTER pam_unix.so (needs a verified authtok);
+# the session line goes AFTER pam_systemd.so (needs XDG_RUNTIME_DIR).
+# First login transparently creates the wrapped key; password changes rewrap.
+# Install: cp target/release/libpam_focald_secrets.so \
+#             /usr/lib64/security/pam_focald_secrets.so     (Fedora)
+#          # Debian/Ubuntu path: /usr/lib/x86_64-linux-gnu/security/

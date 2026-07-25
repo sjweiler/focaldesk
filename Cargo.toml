@@ -14,6 +14,10 @@ members = [
     "crates/focaldesk-network",
     "crates/focaldesk-logging",
     "crates/focaldesk-voice",
+    "crates/focaldesk-secrets-client",
+    "crates/focald-secrets/daemon",
+    "crates/focald-secrets/keywrap",
+    "crates/focald-secrets/pam-module",
     
 
     # apps
@@ -66,3 +70,9 @@ chrono = "0.4"
 ab_glyph = "0.2"
 image = "0.25"
 glow = "0.16"
+chacha20poly1305 = "0.10"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
+sha2 = "0.10"
+rand = "0.8"
+zeroize = { version = "1", features = ["derive"] }
+libc = "0.2"

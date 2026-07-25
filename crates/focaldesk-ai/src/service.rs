@@ -7,7 +7,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 use tokio::time::{Duration, timeout};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+use zeroize::Zeroizing;
 
 use crate::permissions::authorize_ai_chat;
 use crate::provider::AiProvider;
@@ -56,9 +57,9 @@ impl AiService {
             ollama_model,
         )?));
 
-        if let Ok(api_key) = std::env::var("OPENAI_API_KEY") {
+        if let Some(api_key) = credential("ai/openai-api-key", "OPENAI_API_KEY") {
             service.register(Arc::new(OpenAICompatibleProvider::openai(
-                api_key,
+                api_key.to_string(),
                 std::env::var("FOCALDESK_OPENAI_MODEL").ok(),
             )?));
         }
@@ -66,14 +67,14 @@ impl AiService {
         if let Ok(base_url) = std::env::var("FOCALDESK_VLLM_BASE_URL") {
             service.register(Arc::new(OpenAICompatibleProvider::vllm(
                 base_url,
-                std::env::var("FOCALDESK_VLLM_API_KEY").ok(),
+                credential("ai/vllm-api-key", "FOCALDESK_VLLM_API_KEY").map(|key| key.to_string()),
                 std::env::var("FOCALDESK_VLLM_MODEL").ok(),
             )?));
         }
 
-        if let Ok(api_key) = std::env::var("ANTHROPIC_API_KEY") {
+        if let Some(api_key) = credential("ai/anthropic-api-key", "ANTHROPIC_API_KEY") {
             service.register(Arc::new(AnthropicProvider::new(
-                api_key,
+                api_key.to_string(),
                 std::env::var("FOCALDESK_ANTHROPIC_MODEL").ok(),
             )?));
         }
@@ -271,6 +272,31 @@ impl AiService {
                 error = %err,
                 "memory recall failed, continuing chat without it"
             ),
+        }
+    }
+}
+
+/// Prefer the ACL-protected broker and preserve environment variables as a
+/// development/upgrade fallback. Broker failures are expected on systems that
+/// have not installed focald-secrets yet, so they are debug-level only.
+fn credential(broker_key: &str, environment_key: &str) -> Option<Zeroizing<String>> {
+    match focaldesk_secrets_client::get(broker_key) {
+        Ok(value) => {
+            debug!(
+                target: "focaldesk.ai",
+                key = broker_key,
+                "loaded credential from focald-secrets"
+            );
+            Some(value)
+        }
+        Err(error) => {
+            debug!(
+                target: "focaldesk.ai",
+                key = broker_key,
+                %error,
+                "credential unavailable from focald-secrets; checking environment"
+            );
+            std::env::var(environment_key).ok().map(Zeroizing::new)
         }
     }
 }

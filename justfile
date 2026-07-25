@@ -37,6 +37,9 @@ release-automation:
 release-focaldm-greeter:
     cargo build --release -p focaldm-greeter
 
+release-focald-secrets:
+    cargo build --release -p focald-secrets -p pam-focald-secrets
+
 install-server-service:
     cargo build --release -p focaldesk-server
     install -Dm755 target/release/focaldesk-server "$HOME/.local/bin/focaldesk-server"
@@ -54,6 +57,18 @@ install-session-target:
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
 
 install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-automation-service install-launch-service install-settings-service install-polkit-service install-focald-voice install-focald-speech install-focald-mic
+
+install-secrets-service:
+    cargo build --release -p focald-secrets
+    install -Dm755 target/release/focald-secrets "$HOME/.local/bin/focald-secrets"
+    install -Dm755 target/release/focald-secrets-keytool "$HOME/.local/bin/focald-secrets-keytool"
+    install -Dm755 target/release/focald-secrets-import-gnome-keyring "$HOME/.local/bin/focald-secrets-import-gnome-keyring"
+    install -Dm644 packaging/systemd/user/focald-secrets.service "$HOME/.config/systemd/user/focald-secrets.service"
+    install -Dm644 packaging/systemd/user/focald-secrets.socket "$HOME/.config/systemd/user/focald-secrets.socket"
+    install -Dm644 packaging/systemd/user/focald-secrets-import.service "$HOME/.config/systemd/user/focald-secrets-import.service"
+    test -e "$HOME/.config/focaldesk/secrets-acl.toml" || install -Dm600 packaging/focaldesk/secrets-acl.toml "$HOME/.config/focaldesk/secrets-acl.toml"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focald-secrets.socket || echo "Unlock the keyring, then start focald-secrets.socket"
 
 install-power-service:
     cargo build --release -p focaldesk-powerd
@@ -198,6 +213,33 @@ install-server-service-fedora:
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
 install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-automation-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-speech-service-fedora install-mic-service-fedora
+
+install-secrets-service-fedora:
+    cargo build --release -p focald-secrets
+    sudo install -Dm755 target/release/focald-secrets /usr/bin/focald-secrets
+    sudo install -Dm755 target/release/focald-secrets-keytool /usr/bin/focald-secrets-keytool
+    sudo install -Dm755 target/release/focald-secrets-import-gnome-keyring /usr/bin/focald-secrets-import-gnome-keyring
+    sudo install -Dm644 packaging/systemd/user/focald-secrets-fedora.service /usr/lib/systemd/user/focald-secrets.service
+    sudo install -Dm644 packaging/systemd/user/focald-secrets.socket /usr/lib/systemd/user/focald-secrets.socket
+    sudo install -Dm644 packaging/systemd/user/focald-secrets-import-fedora.service /usr/lib/systemd/user/focald-secrets-import.service
+    test -e /etc/focaldesk/secrets-acl.toml || sudo install -Dm644 packaging/focaldesk/secrets-acl.toml /etc/focaldesk/secrets-acl.toml
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focald-secrets.socket || echo "Unlock the keyring, then start focald-secrets.socket"
+
+# Install FocalDesk's PAM module without changing the active login policy.
+install-secrets-pam-fedora:
+    cargo build --release -p pam-focald-secrets
+    sudo install -Dm755 target/release/libpam_focald_secrets.so /usr/lib64/security/pam_focald_secrets.so
+
+# Install the complete focaldmd login policy. This includes both the native
+# FocalDesk vault and GNOME Keyring auto-unlock used by Chrome and other
+# Secret Service clients.
+install-focaldm-pam-fedora: install-secrets-pam-fedora
+    test -e /usr/lib64/security/pam_gnome_keyring.so
+    rg -q '^auth[[:space:]]+optional[[:space:]]+pam_gnome_keyring\\.so$' packaging/pam/focaldmd-fedora
+    rg -q '^session[[:space:]]+optional[[:space:]]+pam_gnome_keyring\\.so[[:space:]]+auto_start$' packaging/pam/focaldmd-fedora
+    rg -q '^password[[:space:]]+optional[[:space:]]+pam_focald_secrets\\.so$' packaging/pam/focaldmd-fedora
+    sudo install -Dm644 packaging/pam/focaldmd-fedora /etc/pam.d/focaldmd
 
 install-session-target-fedora:
     sudo install -Dm644 packaging/systemd/user/focaldesk-session.target /usr/lib/systemd/user/focaldesk-session.target

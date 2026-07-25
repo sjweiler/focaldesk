@@ -1,0 +1,29 @@
+#%PAM-1.0
+#
+# Human login policy for focaldmd on Fedora.
+# Keep the GNOME Keyring hooks in this policy: applications using the
+# freedesktop Secret Service API (including Chrome) otherwise prompt for the
+# login keyring password after every focaldmd login.
+
+auth        [success=done ignore=ignore default=bad] pam_selinux_permit.so
+auth        substack      password-auth
+auth        optional      pam_gnome_keyring.so
+auth        optional      pam_focald_secrets.so
+auth        include       postlogin
+
+account     required      pam_nologin.so
+account     include       password-auth
+
+password    substack      password-auth
+-password   optional      pam_gnome_keyring.so use_authtok
+password    optional      pam_focald_secrets.so
+
+session     required      pam_selinux.so close
+session     required      pam_loginuid.so
+session     required      pam_selinux.so open
+session     optional      pam_keyinit.so force revoke
+session     required      pam_namespace.so
+session     include       password-auth
+session     optional      pam_gnome_keyring.so auto_start
+session     optional      pam_focald_secrets.so
+session     include       postlogin

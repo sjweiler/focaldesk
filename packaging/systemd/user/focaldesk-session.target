@@ -14,3 +14,5 @@ Wants=focaldesk-settingsd.service
 Wants=focald-voice.service
 Wants=focald-speech.service
 Wants=focald-mic.service
+Wants=focald-secrets.socket
+Wants=focald-secrets.service
