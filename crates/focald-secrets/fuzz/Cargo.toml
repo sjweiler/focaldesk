@@ -1,0 +1,23 @@
+[package]
+name = "focald-secrets-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+focald-secrets = { path = "../daemon" }
+keywrap = { package = "focald-secrets-keywrap", path = "../keywrap" }
+
+[[bin]]
+name = "security_inputs"
+path = "fuzz_targets/security_inputs.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

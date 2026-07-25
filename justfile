@@ -68,7 +68,7 @@ install-secrets-service:
     install -Dm644 packaging/systemd/user/focald-secrets-import.service "$HOME/.config/systemd/user/focald-secrets-import.service"
     test -e "$HOME/.config/focaldesk/secrets-acl.toml" || install -Dm600 packaging/focaldesk/secrets-acl.toml "$HOME/.config/focaldesk/secrets-acl.toml"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focald-secrets.socket || echo "Unlock the keyring, then start focald-secrets.socket"
+    echo "Development unit installed; set FOCALD_SECRETS_KEYFILE explicitly before manual unlock/start"
 
 install-power-service:
     cargo build --release -p focaldesk-powerd
@@ -216,18 +216,26 @@ install-services-fedora: install-session-target-fedora install-server-service-fe
 
 install-secrets-service-fedora:
     cargo build --release -p focald-secrets
+    # Upgrade cleanup: the broker moved from the user manager to a
+    # credential-fed system-manager template. Stop and remove the old socket
+    # activation path so it cannot race the new broker for its Unix socket or
+    # D-Bus name.
+    systemctl --user disable --now focald-secrets.service focald-secrets.socket || true
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focald-secrets.service"
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focald-secrets.socket"
+    sudo rm -f /usr/lib/systemd/user/focald-secrets.service
+    sudo rm -f /usr/lib/systemd/user/focald-secrets.socket
+    sudo rm -f /usr/lib/systemd/system/user@.service.d/90-focaldesk-memlock.conf
     sudo install -Dm755 target/release/focald-secrets /usr/bin/focald-secrets
     sudo install -Dm755 target/release/focald-secrets-keytool /usr/bin/focald-secrets-keytool
     sudo install -Dm755 target/release/focald-secrets-import-gnome-keyring /usr/bin/focald-secrets-import-gnome-keyring
-    sudo install -Dm644 packaging/systemd/user/focald-secrets-fedora.service /usr/lib/systemd/user/focald-secrets.service
-    sudo install -Dm644 packaging/systemd/user/focald-secrets.socket /usr/lib/systemd/user/focald-secrets.socket
     sudo install -Dm644 packaging/systemd/user/focald-secrets-import-fedora.service /usr/lib/systemd/user/focald-secrets-import.service
+    sudo install -Dm644 packaging/systemd/system/focald-secrets@.service /usr/lib/systemd/system/focald-secrets@.service
     sudo install -Dm644 packaging/dbus/org.freedesktop.secrets.service /usr/share/dbus-1/services/org.freedesktop.secrets.service
-    sudo install -Dm644 packaging/systemd/system/90-focaldesk-memlock.conf /usr/lib/systemd/system/user@.service.d/90-focaldesk-memlock.conf
     test -e /etc/focaldesk/secrets-acl.toml || sudo install -Dm644 packaging/focaldesk/secrets-acl.toml /etc/focaldesk/secrets-acl.toml
     sudo systemctl daemon-reload
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focald-secrets.socket || echo "Unlock the keyring, then start focald-secrets.socket"
+    echo "The PAM session hook starts focald-secrets@UID.service with a private credential"
 
 # Install FocalDesk's PAM module without changing the active login policy.
 install-secrets-pam-fedora:

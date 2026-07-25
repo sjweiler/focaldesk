@@ -71,6 +71,7 @@ ab_glyph = "0.2"
 image = "0.25"
 glow = "0.16"
 chacha20poly1305 = "0.10"
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
 rand = "0.8"

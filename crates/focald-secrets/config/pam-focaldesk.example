@@ -6,8 +6,9 @@
 #   password  optional  pam_focald_secrets.so
 #
 # Ordering: the auth line goes AFTER pam_unix.so (needs a verified authtok);
-# the session line goes AFTER pam_systemd.so (needs XDG_RUNTIME_DIR).
-# First login transparently creates the wrapped key; password changes rewrap.
+# the session line goes AFTER pam_systemd.so (the system user instance and
+# session bus must exist before focald-secrets@UID.service starts). First login
+# transparently creates the wrapped key; password changes rewrap.
 # Install: cp target/release/libpam_focald_secrets.so \
 #             /usr/lib64/security/pam_focald_secrets.so     (Fedora)
 #          # Debian/Ubuntu path: /usr/lib/x86_64-linux-gnu/security/

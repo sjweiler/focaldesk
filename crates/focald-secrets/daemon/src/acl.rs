@@ -2,8 +2,7 @@
 //!
 //! Peer identity, in order of preference:
 //!   1. `unit:<name>`  — the systemd user unit owning the peer PID
-//!      (asked of org.freedesktop.systemd1 on the session bus; unforgeable for
-//!      user services)
+//!      (asked of org.freedesktop.systemd1 on the session bus)
 //!   2. `exe:<path>`   — readlink(/proc/<pid>/exe) fallback for non-unit peers
 //!
 //! Grants live in a TOML file and are matched with simple `*` globs.
@@ -69,10 +68,10 @@ impl Acl {
                 }
                 Err(e) => {
                     log::error!(
-                        "acl: {} parse error: {e}; keeping previous grants",
+                        "acl: {} parse error: {e}; default-deny in effect",
                         self.path.display()
                     );
-                    self.loaded.clone()
+                    AclConfig::default()
                 }
             },
             Err(_) => {
@@ -136,15 +135,33 @@ impl Acl {
 
 /// Minimal `*` glob (matches any run of characters, including `/`).
 pub fn glob_match(pattern: &str, s: &str) -> bool {
-    fn inner(p: &[u8], s: &[u8]) -> bool {
-        match (p.first(), s.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => inner(&p[1..], s) || (!s.is_empty() && inner(p, &s[1..])),
-            (Some(pc), Some(sc)) if pc == sc => inner(&p[1..], &s[1..]),
-            _ => false,
+    // Linear-time wildcard matching. The previous recursive implementation
+    // could consume exponential CPU and unbounded stack for adversarial keys
+    // and ACL patterns containing multiple stars.
+    let pattern = pattern.as_bytes();
+    let value = s.as_bytes();
+    let (mut p, mut v) = (0, 0);
+    let (mut star, mut retry) = (None, 0);
+    while v < value.len() {
+        if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = v;
+        } else if p < pattern.len() && pattern[p] == value[v] {
+            p += 1;
+            v += 1;
+        } else if let Some(star_index) = star {
+            retry += 1;
+            v = retry;
+            p = star_index + 1;
+        } else {
+            return false;
         }
     }
-    inner(pattern.as_bytes(), s.as_bytes())
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
 }
 
 /// systemd user-manager availability: 0 unknown, 1 available, 2 unavailable.
@@ -222,5 +239,8 @@ mod tests {
         assert!(!glob_match("google/*", "microsoft/token"));
         assert!(!glob_match("", "x"));
         assert!(glob_match("", ""));
+        assert!(glob_match("*a*b*c*", "xxaaybbzzcqq"));
+        assert!(!glob_match("*a*b*c", "xxaaybbzz"));
+        assert!(glob_match("*", &"x".repeat(1024 * 1024)));
     }
 }

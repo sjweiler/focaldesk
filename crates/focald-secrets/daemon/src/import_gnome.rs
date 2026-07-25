@@ -1,13 +1,7 @@
 //! CLI for previewing or importing credentials from GNOME Keyring.
 
-#[path = "import.rs"]
-mod import;
-#[allow(dead_code)]
-#[path = "store.rs"]
-mod store;
-
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use focald_secrets::{import, store};
 use zeroize::Zeroize as _;
 
 #[derive(Default)]
@@ -46,6 +40,11 @@ fn options() -> Result<Options> {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
+    // The importer temporarily holds every readable source credential.
+    // SAFETY: prctl(PR_SET_DUMPABLE) accepts an integer flag and no pointer.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("disable importer process dumps");
+    }
     let options = options()?;
     let marker = import::marker_file()?;
     if options.import && marker.exists() && !options.force {
@@ -56,7 +55,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
     if options.import {
-        let key_file = runtime_key_file()?;
+        let key_file = store::master_key_path()?;
         if !key_file.exists() {
             if options.if_available {
                 eprintln!(
@@ -66,7 +65,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             bail!(
-                "Focaldesk key is not unlocked at {}; log in through focaldmd or run focald-secrets-keytool init/unlock first",
+                "Focaldesk key is not unlocked at {}; log in through the PAM-managed Focaldesk session",
                 key_file.display()
             );
         }
@@ -121,14 +120,4 @@ async fn main() -> Result<()> {
         eprintln!("GNOME Keyring migration was partial; it will retry next session");
     }
     Ok(())
-}
-
-fn runtime_key_file() -> Result<PathBuf> {
-    std::env::var_os("FOCALD_SECRETS_KEYFILE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR")
-                .map(|directory| PathBuf::from(directory).join("focaldesk/secrets.key"))
-        })
-        .context("neither FOCALD_SECRETS_KEYFILE nor XDG_RUNTIME_DIR is set")
 }

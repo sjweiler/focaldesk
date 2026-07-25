@@ -11,20 +11,47 @@
 //! everything reports unlocked and Unlock is a no-op returning no prompt ("/").
 //! Prompts are never required; all prompt return values are "/" per spec.
 
-use crate::shared::Shared;
+use crate::ipc::KEY_ATTR;
+use crate::shared::{ClientSession, Shared};
 use crate::sscrypto::{SessionCipher, ALG_DH, ALG_PLAIN};
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
+use zbus::message::Header;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue, Type, Value};
 use zbus::{interface, Connection};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const SERVICE_PATH: &str = "/org/freedesktop/secrets";
 pub const COLLECTION_PATH: &str = "/org/freedesktop/secrets/collection/default";
 pub const ALIAS_PATH: &str = "/org/freedesktop/secrets/aliases/default";
 const NO_PROMPT: &str = "/";
+const MAX_SECRET_BYTES: usize = 1024 * 1024;
+const MAX_ATTRIBUTES: usize = 128;
+const MAX_METADATA_BYTES: usize = 4096;
+const MAX_SESSIONS: usize = 256;
+const MAX_SESSIONS_PER_CALLER: usize = 32;
+const SESSION_OPEN_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+const MAX_SESSION_OPENS_PER_WINDOW: usize = 64;
+
+fn admit_session_open(
+    attempts: &mut std::collections::VecDeque<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    while attempts
+        .front()
+        .is_some_and(|attempt| now.duration_since(*attempt) >= SESSION_OPEN_WINDOW)
+    {
+        attempts.pop_front();
+    }
+    if attempts.len() >= MAX_SESSION_OPENS_PER_WINDOW {
+        return false;
+    }
+    attempts.push_back(now);
+    true
+}
 
 /// The wire Secret struct: (session, parameters, value, content_type).
 #[derive(Debug, Clone, Serialize, Deserialize, Type)]
@@ -78,11 +105,43 @@ fn attrs_from_value(v: &Value<'_>) -> Result<BTreeMap<String, String>, SsError> 
         .map_err(|e| SsError::Failed(e.to_string()))?
         .try_into()
         .map_err(|e: zbus::zvariant::Error| SsError::Failed(format!("bad attributes: {e}")))?;
-    Ok(map.into_iter().collect())
+    let attributes: BTreeMap<String, String> = map.into_iter().collect();
+    validate_public_attributes(&attributes)?;
+    Ok(attributes)
+}
+
+fn validate_public_attributes(attributes: &BTreeMap<String, String>) -> Result<(), SsError> {
+    if attributes.contains_key(KEY_ATTR) {
+        return Err(SsError::Failed(format!(
+            "{KEY_ATTR} is reserved for the ACL-protected native broker"
+        )));
+    }
+    if attributes.len() > MAX_ATTRIBUTES
+        || attributes
+            .iter()
+            .any(|(key, value)| key.len() > MAX_METADATA_BYTES || value.len() > MAX_METADATA_BYTES)
+    {
+        return Err(SsError::Failed(
+            "item attributes exceed broker limits".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_public_item(item: &crate::store::Item) -> bool {
+    !item.attributes.contains_key(KEY_ATTR)
+}
+
+fn caller(header: &Header<'_>) -> Result<String, SsError> {
+    header
+        .sender()
+        .map(|name| name.as_str().to_owned())
+        .ok_or_else(|| SsError::Failed("D-Bus method call has no sender".into()))
 }
 
 async fn encrypt_for_session(
     shared: &Shared,
+    owner: &str,
     session: &ObjectPath<'_>,
     plaintext: &[u8],
     content_type: &str,
@@ -90,10 +149,15 @@ async fn encrypt_for_session(
     let sid = session_id(session)
         .ok_or_else(|| SsError::NoSession(format!("unknown session {session}")))?;
     let sessions = shared.sessions.lock().await;
-    let cipher = sessions
+    let state = sessions
         .get(&sid)
         .ok_or_else(|| SsError::NoSession(format!("unknown session {session}")))?;
-    let (params, value) = cipher.encrypt(plaintext);
+    if state.owner != owner {
+        return Err(SsError::NoSession(format!(
+            "session {session} belongs to another caller"
+        )));
+    }
+    let (params, value) = state.cipher.encrypt(plaintext);
     Ok(WireSecret(
         obj(session.as_str()),
         params,
@@ -104,15 +168,23 @@ async fn encrypt_for_session(
 
 async fn decrypt_from_session(
     shared: &Shared,
+    owner: &str,
     secret: &WireSecret,
 ) -> Result<Zeroizing<Vec<u8>>, SsError> {
     let sid = session_id(&secret.0.as_ref())
         .ok_or_else(|| SsError::NoSession(format!("unknown session {}", secret.0)))?;
     let sessions = shared.sessions.lock().await;
-    let cipher = sessions
+    let state = sessions
         .get(&sid)
         .ok_or_else(|| SsError::NoSession(format!("unknown session {}", secret.0)))?;
-    cipher
+    if state.owner != owner {
+        return Err(SsError::NoSession(format!(
+            "session {} belongs to another caller",
+            secret.0
+        )));
+    }
+    state
+        .cipher
         .decrypt(&secret.1, &secret.2)
         .map(Zeroizing::new)
         .map_err(SsError::Failed)
@@ -133,7 +205,32 @@ impl ServiceIface {
         algorithm: String,
         input: Value<'_>,
         #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<(OwnedValue, OwnedObjectPath), SsError> {
+        let owner = caller(&header)?;
+        {
+            let now = std::time::Instant::now();
+            let mut attempts = self.shared.session_open_times.lock().await;
+            if !admit_session_open(&mut attempts, now) {
+                return Err(SsError::Failed(
+                    "secret-service session creation is temporarily rate-limited".into(),
+                ));
+            }
+        }
+        {
+            let sessions = self.shared.sessions.lock().await;
+            if sessions.len() >= MAX_SESSIONS
+                || sessions
+                    .values()
+                    .filter(|state| state.owner == owner)
+                    .count()
+                    >= MAX_SESSIONS_PER_CALLER
+            {
+                return Err(SsError::Failed(
+                    "too many open secret-service sessions".into(),
+                ));
+            }
+        }
         let (cipher, output): (SessionCipher, Value<'_>) = match algorithm.as_str() {
             ALG_PLAIN => (SessionCipher::plain(), Value::from("")),
             ALG_DH => {
@@ -156,9 +253,14 @@ impl ServiceIface {
         };
 
         let sid = self.shared.next_session.fetch_add(1, Ordering::SeqCst);
-        self.shared.sessions.lock().await.insert(sid, cipher);
+        self.shared
+            .sessions
+            .lock()
+            .await
+            .insert(sid, ClientSession { cipher, owner });
         let path = session_path(sid);
-        conn.object_server()
+        if let Err(error) = conn
+            .object_server()
             .at(
                 &path,
                 SessionIface {
@@ -166,7 +268,11 @@ impl ServiceIface {
                     id: sid,
                 },
             )
-            .await?;
+            .await
+        {
+            self.shared.sessions.lock().await.remove(&sid);
+            return Err(error.into());
+        }
         log::debug!("dbus: opened session s{sid} ({algorithm})");
         let out = OwnedValue::try_from(output).map_err(|e| SsError::Failed(e.to_string()))?;
         Ok((out, path))
@@ -187,8 +293,14 @@ impl ServiceIface {
         attributes: HashMap<String, String>,
     ) -> Result<(Vec<OwnedObjectPath>, Vec<OwnedObjectPath>), SsError> {
         let attrs: BTreeMap<String, String> = attributes.into_iter().collect();
+        validate_public_attributes(&attrs)?;
         let store = self.shared.store.lock().await;
-        let unlocked = store.search(&attrs).into_iter().map(item_path).collect();
+        let unlocked = store
+            .search(&attrs)
+            .into_iter()
+            .filter(|id| store.get(*id).is_some_and(is_public_item))
+            .map(item_path)
+            .collect();
         Ok((unlocked, Vec::new()))
     }
 
@@ -212,7 +324,9 @@ impl ServiceIface {
         &self,
         items: Vec<OwnedObjectPath>,
         session: OwnedObjectPath,
+        #[zbus(header)] header: Header<'_>,
     ) -> Result<HashMap<OwnedObjectPath, WireSecret>, SsError> {
+        let owner = caller(&header)?;
         let mut out = HashMap::new();
         for path in items {
             let Some(id) = item_id(&path.as_ref()) else {
@@ -221,11 +335,14 @@ impl ServiceIface {
             let (secret, ct) = {
                 let store = self.shared.store.lock().await;
                 match store.get(id) {
-                    Some(i) => (Zeroizing::new(i.secret.clone()), i.content_type.clone()),
-                    None => continue,
+                    Some(i) if is_public_item(i) => {
+                        (Zeroizing::new(i.secret.clone()), i.content_type.clone())
+                    }
+                    _ => continue,
                 }
             };
-            let wire = encrypt_for_session(&self.shared, &session.as_ref(), &secret, &ct).await?;
+            let wire =
+                encrypt_for_session(&self.shared, &owner, &session.as_ref(), &secret, &ct).await?;
             out.insert(path, wire);
         }
         Ok(out)
@@ -286,16 +403,23 @@ impl CollectionIface {
         attributes: HashMap<String, String>,
     ) -> Result<Vec<OwnedObjectPath>, SsError> {
         let attrs: BTreeMap<String, String> = attributes.into_iter().collect();
+        validate_public_attributes(&attrs)?;
         let store = self.shared.store.lock().await;
-        Ok(store.search(&attrs).into_iter().map(item_path).collect())
+        Ok(store
+            .search(&attrs)
+            .into_iter()
+            .filter(|id| store.get(*id).is_some_and(is_public_item))
+            .map(item_path)
+            .collect())
     }
 
     async fn create_item(
         &self,
         properties: HashMap<String, Value<'_>>,
-        secret: WireSecret,
+        mut secret: WireSecret,
         replace: bool,
         #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> Result<(OwnedObjectPath, OwnedObjectPath), SsError> {
         let label = properties
@@ -310,24 +434,34 @@ impl CollectionIface {
             .get("org.freedesktop.Secret.Item.Type")
             .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
             .unwrap_or_else(|| "org.freedesktop.Secret.Generic".into());
-        let mut plaintext = decrypt_from_session(&self.shared, &secret).await?;
+        let owner = caller(&header)?;
+        let plaintext = decrypt_from_session(&self.shared, &owner, &secret).await;
+        secret.2.zeroize();
+        let mut plaintext = plaintext?;
+        if plaintext.len() > MAX_SECRET_BYTES
+            || label.len() > MAX_METADATA_BYTES
+            || item_type.len() > MAX_METADATA_BYTES
+            || secret.3.len() > MAX_METADATA_BYTES
+        {
+            return Err(SsError::Failed("item exceeds broker limits".into()));
+        }
 
         let (id, replaced) = {
             let mut store = self.shared.store.lock().await;
-            // mem::take moves the buffer into the store (which zeroizes it on
-            // drop); the emptied Zeroizing shell scrubs nothing but is sound.
-            let r = store.create(
-                label,
-                attributes,
-                std::mem::take(&mut *plaintext),
-                secret.3.clone(),
-                item_type,
-                replace,
-            );
             store
-                .save()
-                .map_err(|e| SsError::Failed(format!("persist failed: {e}")))?;
-            r
+                .transaction(move |transaction| {
+                    // mem::take moves the buffer into the candidate store,
+                    // which zeroizes it if persistence fails.
+                    transaction.create(
+                        label,
+                        attributes,
+                        std::mem::take(&mut *plaintext),
+                        secret.3.clone(),
+                        item_type,
+                        replace,
+                    )
+                })
+                .map_err(|e| SsError::Failed(format!("persist failed: {e}")))?
         };
         sync_items(conn, &self.shared).await?;
 
@@ -343,7 +477,12 @@ impl CollectionIface {
     #[zbus(property)]
     async fn items(&self) -> Vec<OwnedObjectPath> {
         let store = self.shared.store.lock().await;
-        store.items().iter().map(|i| item_path(i.id)).collect()
+        store
+            .items()
+            .iter()
+            .filter(|item| is_public_item(item))
+            .map(|i| item_path(i.id))
+            .collect()
     }
 
     #[zbus(property)]
@@ -395,11 +534,14 @@ impl ItemIface {
     ) -> Result<OwnedObjectPath, SsError> {
         {
             let mut store = self.shared.store.lock().await;
-            if !store.delete(self.id) {
+            if store.get(self.id).is_none() {
                 return Err(SsError::NoSuchObject(format!("item {}", self.id)));
             }
             store
-                .save()
+                .transaction(|transaction| {
+                    transaction.delete(self.id);
+                    Ok(())
+                })
                 .map_err(|e| SsError::Failed(format!("persist failed: {e}")))?;
         }
         sync_items(conn, &self.shared).await?;
@@ -410,7 +552,12 @@ impl ItemIface {
     /// NB: the 1-tuple return is deliberate — zbus flattens a top-level struct
     /// return into multiple out-arguments; wrapping keeps the D-Bus signature
     /// `(oayays)` as the spec (and python-secretstorage) requires.
-    async fn get_secret(&self, session: OwnedObjectPath) -> Result<(WireSecret,), SsError> {
+    async fn get_secret(
+        &self,
+        session: OwnedObjectPath,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(WireSecret,), SsError> {
+        let owner = caller(&header)?;
         let (secret, ct) = {
             let store = self.shared.store.lock().await;
             let item = store
@@ -421,17 +568,30 @@ impl ItemIface {
                 item.content_type.clone(),
             )
         };
-        Ok((encrypt_for_session(&self.shared, &session.as_ref(), &secret, &ct).await?,))
+        Ok((encrypt_for_session(&self.shared, &owner, &session.as_ref(), &secret, &ct).await?,))
     }
 
-    async fn set_secret(&self, secret: WireSecret) -> Result<(), SsError> {
-        let mut plaintext = decrypt_from_session(&self.shared, &secret).await?;
+    async fn set_secret(
+        &self,
+        mut secret: WireSecret,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), SsError> {
+        let owner = caller(&header)?;
+        let plaintext = decrypt_from_session(&self.shared, &owner, &secret).await;
+        secret.2.zeroize();
+        let mut plaintext = plaintext?;
+        if plaintext.len() > MAX_SECRET_BYTES || secret.3.len() > MAX_METADATA_BYTES {
+            return Err(SsError::Failed("secret exceeds broker limits".into()));
+        }
         let mut store = self.shared.store.lock().await;
-        if !store.set_secret(self.id, std::mem::take(&mut *plaintext), secret.3.clone()) {
+        if store.get(self.id).is_none() {
             return Err(SsError::NoSuchObject(format!("item {}", self.id)));
         }
         store
-            .save()
+            .transaction(move |transaction| {
+                transaction.set_secret(self.id, std::mem::take(&mut *plaintext), secret.3.clone());
+                Ok(())
+            })
             .map_err(|e| SsError::Failed(format!("persist failed: {e}")))
     }
 
@@ -455,14 +615,20 @@ impl ItemIface {
     }
 
     #[zbus(property)]
-    #[zbus(property)]
-    async fn set_attributes(&self, attrs: HashMap<String, String>) {
+    async fn set_attributes(&self, attrs: HashMap<String, String>) -> zbus::fdo::Result<()> {
+        let attrs: BTreeMap<String, String> = attrs.into_iter().collect();
+        validate_public_attributes(&attrs)
+            .map_err(|error| zbus::fdo::Error::Failed(format!("{error:?}")))?;
         let mut store = self.shared.store.lock().await;
-        if store.set_attributes(self.id, attrs.into_iter().collect()) {
-            if let Err(e) = store.save() {
-                log::error!("dbus: persist after set_attributes failed: {e}");
-            }
+        if store.get(self.id).is_some() {
+            store
+                .transaction(move |transaction| {
+                    transaction.set_attributes(self.id, attrs);
+                    Ok(())
+                })
+                .map_err(|e| zbus::fdo::Error::Failed(format!("persist failed: {e}")))?;
         }
+        Ok(())
     }
 
     #[zbus(property)]
@@ -475,11 +641,22 @@ impl ItemIface {
     }
 
     #[zbus(property)]
-    async fn set_label(&self, v: String) {
-        let mut store = self.shared.store.lock().await;
-        if store.set_label(self.id, v) {
-            let _ = store.save();
+    async fn set_label(&self, v: String) -> zbus::fdo::Result<()> {
+        if v.len() > MAX_METADATA_BYTES {
+            return Err(zbus::fdo::Error::Failed(
+                "item label exceeds broker limits".into(),
+            ));
         }
+        let mut store = self.shared.store.lock().await;
+        if store.get(self.id).is_some() {
+            store
+                .transaction(move |transaction| {
+                    transaction.set_label(self.id, v);
+                    Ok(())
+                })
+                .map_err(|error| zbus::fdo::Error::Failed(format!("persist failed: {error}")))?;
+        }
+        Ok(())
     }
 
     #[zbus(property)]
@@ -515,8 +692,24 @@ pub struct SessionIface {
 
 #[interface(name = "org.freedesktop.Secret.Session")]
 impl SessionIface {
-    async fn close(&self, #[zbus(connection)] conn: &Connection) -> Result<(), SsError> {
-        self.shared.sessions.lock().await.remove(&self.id);
+    async fn close(
+        &self,
+        #[zbus(connection)] conn: &Connection,
+        #[zbus(header)] header: Header<'_>,
+    ) -> Result<(), SsError> {
+        let owner = caller(&header)?;
+        let mut sessions = self.shared.sessions.lock().await;
+        if sessions
+            .get(&self.id)
+            .is_none_or(|session| session.owner != owner)
+        {
+            return Err(SsError::NoSession(format!(
+                "session {} belongs to another caller",
+                session_path(self.id)
+            )));
+        }
+        sessions.remove(&self.id);
+        drop(sessions);
         let path = session_path(self.id);
         let _ = conn.object_server().remove::<SessionIface, _>(&path).await;
         log::debug!("dbus: session s{} closed", self.id);
@@ -532,7 +725,12 @@ impl SessionIface {
 pub async fn sync_items(conn: &Connection, shared: &Shared) -> zbus::Result<()> {
     let current: HashSet<u64> = {
         let store = shared.store.lock().await;
-        store.items().iter().map(|i| i.id).collect()
+        store
+            .items()
+            .iter()
+            .filter(|item| is_public_item(item))
+            .map(|i| i.id)
+            .collect()
     };
     let mut reg = shared.registered_items.lock().await;
     let server = conn.object_server();
@@ -578,6 +776,104 @@ pub async fn start(shared: Shared) -> zbus::Result<Connection> {
         .build()
         .await?;
     sync_items(&conn, &shared).await?;
+    start_session_reaper(&conn, shared);
     log::info!("dbus: serving org.freedesktop.secrets");
     Ok(conn)
+}
+
+fn start_session_reaper(conn: &Connection, shared: Shared) {
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        let proxy = match zbus::fdo::DBusProxy::new(&conn).await {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                log::warn!("dbus: cannot monitor disconnected secret sessions: {error}");
+                return;
+            }
+        };
+        let mut changes = match proxy.receive_name_owner_changed().await {
+            Ok(changes) => changes,
+            Err(error) => {
+                log::warn!("dbus: cannot subscribe to owner changes: {error}");
+                return;
+            }
+        };
+        while let Some(change) = changes.next().await {
+            let Ok(arguments) = change.args() else {
+                continue;
+            };
+            if arguments.new_owner().as_ref().is_some()
+                || !arguments.name().as_str().starts_with(':')
+            {
+                continue;
+            }
+            let owner = arguments.name().as_str();
+            let stale: Vec<u64> = {
+                let mut sessions = shared.sessions.lock().await;
+                let stale = sessions
+                    .iter()
+                    .filter_map(|(id, session)| (session.owner == owner).then_some(*id))
+                    .collect::<Vec<_>>();
+                sessions.retain(|_, session| session.owner != owner);
+                stale
+            };
+            for id in stale {
+                let _ = conn
+                    .object_server()
+                    .remove::<SessionIface, _>(session_path(id))
+                    .await;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        admit_session_open, is_public_item, validate_public_attributes,
+        MAX_SESSION_OPENS_PER_WINDOW, SESSION_OPEN_WINDOW,
+    };
+    use crate::ipc::KEY_ATTR;
+    use crate::store::Item;
+    use std::collections::BTreeMap;
+
+    fn item(attributes: BTreeMap<String, String>) -> Item {
+        Item {
+            id: 1,
+            label: String::new(),
+            attributes,
+            secret: Vec::new(),
+            content_type: "text/plain".into(),
+            item_type: "org.freedesktop.Secret.Generic".into(),
+            created: 0,
+            modified: 0,
+        }
+    }
+
+    #[test]
+    fn native_key_attribute_is_never_public() {
+        let mut attributes = BTreeMap::new();
+        attributes.insert(KEY_ATTR.into(), "ai/token".into());
+        assert!(validate_public_attributes(&attributes).is_err());
+        assert!(!is_public_item(&item(attributes)));
+    }
+
+    #[test]
+    fn ordinary_secret_service_item_is_public() {
+        let mut attributes = BTreeMap::new();
+        attributes.insert("service".into(), "example".into());
+        assert!(validate_public_attributes(&attributes).is_ok());
+        assert!(is_public_item(&item(attributes)));
+    }
+
+    #[test]
+    fn session_open_rate_limit_recovers_after_window() {
+        let now = std::time::Instant::now();
+        let mut attempts = std::collections::VecDeque::new();
+        for _ in 0..MAX_SESSION_OPENS_PER_WINDOW {
+            assert!(admit_session_open(&mut attempts, now));
+        }
+        assert!(!admit_session_open(&mut attempts, now));
+        assert!(admit_session_open(&mut attempts, now + SESSION_OPEN_WINDOW));
+    }
 }

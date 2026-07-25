@@ -5,6 +5,7 @@
 //! source items, and tags copies with their source object path for idempotency.
 
 use std::collections::{BTreeMap, HashMap};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -26,6 +27,7 @@ const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const NO_PROMPT: &str = "/";
 const SOURCE_ATTR: &str = "focald:import-source";
+const NATIVE_KEY_ATTR: &str = "focald:key";
 
 #[derive(Debug, Deserialize, Type)]
 struct WireSecret(OwnedObjectPath, Vec<u8>, Vec<u8>, String);
@@ -80,10 +82,15 @@ pub async fn ensure_gnome_owner(connection: &Connection, activate: bool) -> Resu
         .context("resolve Secret Service owner process")?;
     let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
         .with_context(|| format!("resolve Secret Service owner pid {pid}"))?;
+    let executable_metadata = std::fs::metadata(&exe)
+        .with_context(|| format!("inspect Secret Service executable {}", exe.display()))?;
     let is_gnome = exe
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.trim_end_matches(" (deleted)") == "gnome-keyring-daemon");
+        .is_some_and(|name| name.trim_end_matches(" (deleted)") == "gnome-keyring-daemon")
+        && executable_metadata.is_file()
+        && executable_metadata.uid() == 0
+        && executable_metadata.mode() & 0o022 == 0;
     if !is_gnome {
         bail!(
             "{SERVICE_NAME} is owned by {}, not gnome-keyring-daemon",
@@ -229,31 +236,35 @@ pub fn apply(store: &mut Store, collected: Collected) -> Result<ImportSummary> {
         failed: collected.failed,
         ..ImportSummary::default()
     };
-    for mut item in collected.items {
-        let source = format!("gnome-keyring:{}", item.source_path);
-        if store
-            .items()
-            .iter()
-            .any(|existing| existing.attributes.get(SOURCE_ATTR) == Some(&source))
-        {
-            summary.skipped_existing += 1;
-            continue;
-        }
-        item.attributes.insert(SOURCE_ATTR.into(), source);
-        store.create(
-            item.label,
-            item.attributes,
-            std::mem::take(&mut *item.secret),
-            item.content_type,
-            item.item_type,
-            false,
-        );
-        summary.imported += 1;
-    }
-    if summary.imported > 0 {
-        store.save().context("save imported credentials")?;
-    }
-    Ok(summary)
+    store
+        .transaction(move |transaction| {
+            for mut item in collected.items {
+                // Never let source-controlled attributes turn an imported
+                // public item into an ACL-protected native broker record.
+                item.attributes.remove(NATIVE_KEY_ATTR);
+                let source = format!("gnome-keyring:{}", item.source_path);
+                if transaction
+                    .items()
+                    .iter()
+                    .any(|existing| existing.attributes.get(SOURCE_ATTR) == Some(&source))
+                {
+                    summary.skipped_existing += 1;
+                    continue;
+                }
+                item.attributes.insert(SOURCE_ATTR.into(), source);
+                transaction.create(
+                    item.label,
+                    item.attributes,
+                    std::mem::take(&mut *item.secret),
+                    item.content_type,
+                    item.item_type,
+                    false,
+                )?;
+                summary.imported += 1;
+            }
+            Ok(summary)
+        })
+        .context("save imported credentials")
 }
 
 pub fn data_file() -> Result<PathBuf> {
@@ -286,17 +297,21 @@ pub fn write_marker(path: &Path, summary: &ImportSummary) -> Result<()> {
         .context("migration marker has no parent directory")?;
     std::fs::create_dir_all(parent)?;
     std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-    let temporary = path.with_extension("tmp");
+    let temporary = path.with_extension(format!("tmp.{:016x}", rand::random::<u64>()));
     let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .write(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
         .mode(0o600)
         .open(&temporary)?;
     serde_json::to_writer_pretty(&mut file, summary)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
-    std::fs::rename(temporary, path)?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 
@@ -315,7 +330,7 @@ mod tests {
         let item = || ImportedItem {
             source_path: "/org/freedesktop/secrets/collection/login/1".into(),
             label: "OpenAI API key".into(),
-            attributes: BTreeMap::new(),
+            attributes: BTreeMap::from([("focald:key".into(), "ai/injected".into())]),
             secret: Zeroizing::new(b"test-key".to_vec()),
             content_type: "text/plain".into(),
             item_type: "org.freedesktop.Secret.Generic".into(),

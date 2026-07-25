@@ -12,3 +12,6 @@ crate-type = ["cdylib"]
 keywrap = { package = "focald-secrets-keywrap", path = "../keywrap" }
 libc = { workspace = true }
 zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

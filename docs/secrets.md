@@ -1,18 +1,40 @@
 # Credential broker
 
 Focaldesk includes `focald-secrets`, an encrypted per-user credential store.
-It exposes two views of the same data:
+It exposes two interfaces backed by the same encrypted database:
 
 - `%t/focaldesk/secrets.sock` is a length-prefixed JSON protocol for Focaldesk
   services. The broker identifies the calling systemd user unit and applies
-  `$XDG_CONFIG_HOME/focaldesk/secrets-acl.toml`; missing grants are denied.
+  `/etc/focaldesk/secrets-acl.toml` in the packaged system service, or
+  `$XDG_CONFIG_HOME/focaldesk/secrets-acl.toml` in development; missing grants
+  are denied.
 - `org.freedesktop.secrets` is the standard session-bus Secret Service API for
   applications using libsecret, `secret-tool`, or compatible libraries.
 
-The encrypted database is
-`$XDG_DATA_HOME/focaldesk/secrets.db`. Its random master key exists in the
-runtime directory only while the login session is unlocked. A password-wrapped
-copy is stored as `$XDG_DATA_HOME/focaldesk/secrets.key.enc`.
+For the PAM-managed system service, the encrypted database is
+`/var/lib/focald-secrets/$UID/secrets.db` in a private per-UID state directory
+created by systemd. On first start after upgrading, an existing
+`$XDG_DATA_HOME/focaldesk/secrets.db` is copied there atomically and retained as
+a recovery copy. Development installs continue to use the XDG data path. At
+login, PAM unwraps the database's random master key into a root-only staging
+directory. PID 1 copies it into the broker's private, read-only systemd
+credential ramfs, then PAM removes the source. A password-wrapped copy is
+stored as `$XDG_DATA_HOME/focaldesk/secrets.key.enc`.
+Root-owned per-user locking serializes initialization, upgrades, password
+rewraps, credential staging, and service startup. If an encrypted database
+already exists but its wrapped key is missing, PAM refuses to create a
+replacement key.
+
+Database mutations are copy-on-write transactions: live state changes only
+after the encrypted tempfile is synced and renamed successfully. The encrypted
+store is capped at 64 MiB and 4096 items. Native IPC accepts at most 64
+connections and enforces bounded frame and idle timeouts, a 1 MiB frame limit,
+and a 700 KiB value limit. Secret Service session creation is count- and
+rate-limited.
+
+Records created through the native API carry the reserved `focald:key`
+attribute. They are deliberately hidden from the standard Secret Service API;
+Secret Service clients cannot create or add that reserved attribute.
 
 ## Build and install
 
@@ -67,14 +89,15 @@ PAM module:
 just install-focaldm-pam-fedora
 ```
 
-The policy uses `pam_focald_secrets.so` to provision the runtime key before the
-desktop starts. Focaldesk then owns `org.freedesktop.secrets`, so Chrome and
-other Secret Service clients use the Focaldesk store without a second keyring
-prompt.
+The policy uses `pam_focald_secrets.so` after `pam_systemd.so` to stage a
+root-only credential and start `focald-secrets@$UID.service` through the system
+manager. Focaldesk then owns `org.freedesktop.secrets`, so Chrome and other
+Secret Service clients use the Focaldesk store without a second keyring prompt.
 
-The first successful login creates a random store key, wraps it under a key
-derived from the login password, and writes the session copy below
-`XDG_RUNTIME_DIR`. All failure paths are optional and do not deny login.
+The first successful login creates a random store key and wraps it under an
+Argon2id-derived key (64 MiB, three iterations, one lane). Existing
+PBKDF2-based `FKEY1` files are accepted and atomically upgraded to `FKEY2` after
+a successful login. All failure paths are optional and do not deny login.
 
 Distribution PAM stacks differ; the packaged policy targets Fedora's
 `password-auth` and `postlogin` stacks. On other distributions, add
@@ -84,24 +107,22 @@ run `focald-secrets-keytool rewrap` when changing the login password.
 
 ## Memory locking
 
-`focald-secrets` pins its address space with
+Before loading its master key, `focald-secrets` disables process dumpability;
+the packaged system unit also sets `LimitCORE=0`, uses a private mount
+namespace for its credential, and applies filesystem/process sandboxing. It pins its address space with
 `mlockall(MCL_CURRENT|MCL_FUTURE)` after establishing the D-Bus executor. The
-broker unit requests a 128 MiB `LimitMEMLOCK`, but a user service cannot raise
-that limit above the hard limit inherited by its `user@.service` manager.
-Fedora commonly starts the user manager with an 8 MiB ceiling, which is too
-small for the broker's approximately 75 MiB virtual address space.
-
-The Fedora install recipe places
-`90-focaldesk-memlock.conf` under
-`/usr/lib/systemd/system/user@.service.d/`, raising the manager ceiling to
-128 MiB. The new ceiling takes effect for user managers created after the
-change, so log out and back in after installing or upgrading.
+broker also locks current pages before loading the key and immediately after
+decrypting the store. The production unit requests a 384 MiB
+`LimitMEMLOCK`, caps total memory at 512 MiB, and fails startup if memory
+locking is unavailable. Its cgroup is prohibited from using swap as a second
+line of defense. Development services continue with a warning so they remain
+usable under restrictive shells and containers.
 
 Confirm that the broker started without an `mlockall failed` warning:
 
 ```sh
-systemctl --user status focald-secrets.service
-journalctl --user -b -u focald-secrets.service
+systemctl status "focald-secrets@$(id -u).service"
+journalctl -b -u "focald-secrets@$(id -u).service"
 ```
 
 On a running system, `/proc/$PID/status` should report a nonzero `VmLck` for
@@ -109,15 +130,19 @@ the broker process. Do not weaken this to `--password-store=basic` for Chrome;
 that bypasses protected Secret Service storage rather than fixing the session
 limit.
 
-For development sessions without focaldmd/PAM:
+For development sessions without focaldmd/PAM, choose an explicit private key
+path and pass the same path to the daemon:
 
 ```sh
-focald-secrets-keytool init
-systemctl --user start focald-secrets.service
+export FOCALD_SECRETS_KEYFILE="$XDG_RUNTIME_DIR/focaldesk/secrets.dev.key"
+focald-secrets-keytool init   # or: focald-secrets-keytool unlock
+focald-secrets
 ```
 
-On later sessions, use `focald-secrets-keytool unlock` before starting the
-service.
+The daemon consumes the explicit development/recovery key configured above.
+The old implicit `$XDG_RUNTIME_DIR/focaldesk/secrets.key` lookup is disabled;
+it can only be enabled deliberately with
+`FOCALD_SECRETS_ALLOW_LEGACY_HANDOFF=1` for migration testing.
 
 ## Store AI credentials
 
@@ -162,4 +187,12 @@ allow_write = ["example/state/*"]
 
 ACL edits are reloaded on the next native request. The standard Secret Service
 surface follows its conventional same-user trust model and does not apply the
-native per-unit ACL.
+native per-unit ACL. Native `focald:key` records are not exposed on that
+surface.
+
+The native ACL is defense-in-depth for correctly configured services, not a
+hard boundary against arbitrary malicious code already running as the same
+Unix user. The bootstrap key no longer crosses a user-owned path, but an
+unlocked broker still intentionally serves public Secret Service items to
+same-UID clients. Use separate Unix identities or mandatory access control
+when mutually hostile workloads require credential isolation.

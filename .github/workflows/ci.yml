@@ -41,6 +41,9 @@ jobs:
             libgtk-4-dev \
             libadwaita-1-dev \
             libpam0g-dev \
+            libsecret-tools \
+            dbus-x11 \
+            python3-dbus \
             unzip
 
       - name: Install Vosk native library
@@ -71,6 +74,20 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+      - name: focald-secrets end-to-end security tests
+        run: bash crates/focald-secrets/tests/integration.sh
+
+      - name: Check focald-secrets fuzz harness
+        run: cargo check --locked --manifest-path crates/focald-secrets/fuzz/Cargo.toml
+
+      - name: Install RustSec audit tool
+        run: cargo install cargo-audit --locked
+
+      - name: RustSec dependency audit
+        run: |
+          cargo audit --file Cargo.lock
+          cargo audit --file crates/focald-secrets/fuzz/Cargo.lock
 
       - name: Markdown links
         run: bash scripts/check-markdown-links.sh

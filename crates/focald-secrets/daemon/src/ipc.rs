@@ -14,11 +14,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
+use zeroize::{Zeroize, Zeroizing};
 
 pub const KEY_ATTR: &str = "focald:key";
 const MAX_FRAME: u32 = 1 << 20; // 1 MiB
+const MAX_SECRET_BYTES: usize = 700 * 1024;
+const MAX_KEY_BYTES: usize = 512;
+const MAX_ATTRIBUTES: usize = 128;
+const MAX_METADATA_BYTES: usize = 4096;
+const MAX_CONNECTIONS: usize = 64;
+const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn io_timeout() -> std::time::Duration {
+    std::env::var("FOCALD_SECRETS_IPC_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|milliseconds| (100..=60_000).contains(milliseconds))
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(DEFAULT_IO_TIMEOUT)
+}
+
+#[derive(Default)]
+struct SecretString(String);
+
+impl<'de> Deserialize<'de> for SecretString {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self)
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -29,7 +62,7 @@ enum Request {
     },
     Set {
         key: String,
-        value_b64: String,
+        value_b64: SecretString,
         #[serde(default)]
         label: Option<String>,
         #[serde(default)]
@@ -44,6 +77,13 @@ enum Request {
         #[serde(default)]
         prefix: Option<String>,
     },
+}
+
+/// Parse a native request frame without executing it. This is intentionally
+/// public so fuzzing and external protocol conformance tests hit the exact
+/// production deserializer.
+pub fn validate_request_frame(frame: &[u8]) -> Result<(), serde_json::Error> {
+    serde_json::from_slice::<Request>(frame).map(|_| ())
 }
 
 #[derive(Serialize)]
@@ -70,6 +110,18 @@ enum Response {
         ok: bool, // always false
         error: String,
     },
+}
+
+impl Drop for Response {
+    fn drop(&mut self) {
+        if let Response::Ok {
+            value_b64: Some(value),
+            ..
+        } = self
+        {
+            zeroize::Zeroize::zeroize(value);
+        }
+    }
 }
 
 impl Response {
@@ -120,11 +172,18 @@ pub fn make_listener() -> std::io::Result<UnixListener> {
 }
 
 pub async fn serve(listener: UnixListener, shared: Shared) {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
+                let Ok(permit) = connections.clone().try_acquire_owned() else {
+                    log::warn!("ipc: connection limit ({MAX_CONNECTIONS}) reached");
+                    drop(stream);
+                    continue;
+                };
                 let shared = shared.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_conn(stream, shared).await {
                         log::debug!("ipc: connection ended: {e}");
                     }
@@ -139,6 +198,7 @@ pub async fn serve(listener: UnixListener, shared: Shared) {
 }
 
 async fn handle_conn(mut stream: UnixStream, shared: Shared) -> std::io::Result<()> {
+    let timeout = io_timeout();
     let cred = stream.peer_cred()?;
     // Hard invariant regardless of ACL contents: same-uid peers only.
     // SAFETY: geteuid is always safe to call.
@@ -164,28 +224,41 @@ async fn handle_conn(mut stream: UnixStream, shared: Shared) -> std::io::Result<
 
     loop {
         let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e),
+        match tokio::time::timeout(timeout, stream.read_exact(&mut len_buf)).await {
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "idle timeout",
+                ))
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Ok(Err(e)) => return Err(e),
         }
         let len = u32::from_be_bytes(len_buf);
         if len == 0 || len > MAX_FRAME {
             return Err(std::io::Error::other("frame length out of bounds"));
         }
-        let mut body = vec![0u8; len as usize];
-        stream.read_exact(&mut body).await?;
+        let mut body = Zeroizing::new(vec![0u8; len as usize]);
+        tokio::time::timeout(timeout, stream.read_exact(&mut body))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "frame read timeout")
+            })??;
 
         let resp = match serde_json::from_slice::<Request>(&body) {
             Ok(req) => dispatch(req, &identity, &shared).await,
             Err(e) => Response::err(format!("bad request: {e}")),
         };
-        zeroize::Zeroize::zeroize(&mut body); // frames can carry secret material
-        let mut out = serde_json::to_vec(&resp)?;
-        stream.write_all(&(out.len() as u32).to_be_bytes()).await?;
-        stream.write_all(&out).await?;
-        stream.flush().await?;
-        zeroize::Zeroize::zeroize(&mut out);
+        let out = Zeroizing::new(serde_json::to_vec(&resp)?);
+        let write_result = tokio::time::timeout(timeout, async {
+            stream.write_all(&(out.len() as u32).to_be_bytes()).await?;
+            stream.write_all(&out).await?;
+            stream.flush().await
+        })
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "response timeout"))?;
+        write_result?;
     }
 }
 
@@ -197,6 +270,9 @@ async fn dispatch(req: Request, identity: &str, shared: &Shared) -> Response {
         Request::Ping => Response::ok(),
 
         Request::Get { key } => {
+            if !valid_key(&key) {
+                return Response::err("invalid key");
+            }
             if !shared.acl.lock().await.check(identity, &key, false) {
                 return denied(identity, &key, "get");
             }
@@ -216,36 +292,58 @@ async fn dispatch(req: Request, identity: &str, shared: &Shared) -> Response {
 
         Request::Set {
             key,
-            value_b64,
+            mut value_b64,
             label,
             mut attributes,
             content_type,
         } => {
+            if !valid_key(&key)
+                || attributes.len() > MAX_ATTRIBUTES
+                || label
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_METADATA_BYTES)
+                || content_type
+                    .as_ref()
+                    .is_some_and(|value| value.len() > MAX_METADATA_BYTES)
+                || attributes.iter().any(|(name, value)| {
+                    name.len() > MAX_METADATA_BYTES || value.len() > MAX_METADATA_BYTES
+                })
+            {
+                return Response::err("request metadata exceeds broker limits");
+            }
             if !shared.acl.lock().await.check(identity, &key, true) {
                 return denied(identity, &key, "set");
             }
-            let secret = match base64::engine::general_purpose::STANDARD.decode(&value_b64) {
-                Ok(v) => v,
+            let decoded = base64::engine::general_purpose::STANDARD.decode(value_b64.0.as_bytes());
+            value_b64.0.zeroize();
+            let secret = match decoded {
+                Ok(v) if v.len() <= MAX_SECRET_BYTES => v,
+                Ok(mut v) => {
+                    zeroize::Zeroize::zeroize(&mut v);
+                    return Response::err("secret exceeds broker limits");
+                }
                 Err(e) => return Response::err(format!("value_b64: {e}")),
             };
             attributes.insert(KEY_ATTR.to_string(), key.clone());
             let mut store = shared.store.lock().await;
-            // replace matches on the *full* attribute set; for broker semantics we
-            // want key-identity, so search by key attr and delete matches first.
-            let mut key_only = BTreeMap::new();
-            key_only.insert(KEY_ATTR.to_string(), key.clone());
-            for id in store.search(&key_only) {
-                store.delete(id);
-            }
-            store.create(
-                label.unwrap_or_else(|| key.clone()),
-                attributes,
-                secret,
-                content_type.unwrap_or_else(|| "text/plain".into()),
-                "org.freedesktop.Secret.Generic".into(),
-                false,
-            );
-            if let Err(e) = store.save() {
+            let result = store.transaction(move |transaction| {
+                // Replace by broker key rather than the full attribute set.
+                let mut key_only = BTreeMap::new();
+                key_only.insert(KEY_ATTR.to_string(), key.clone());
+                for id in transaction.search(&key_only) {
+                    transaction.delete(id);
+                }
+                transaction.create(
+                    label.unwrap_or_else(|| key.clone()),
+                    attributes,
+                    secret,
+                    content_type.unwrap_or_else(|| "text/plain".into()),
+                    "org.freedesktop.Secret.Generic".into(),
+                    false,
+                )?;
+                Ok(())
+            });
+            if let Err(e) = result {
                 return Response::err(format!("persist failed: {e}"));
             }
             drop(store);
@@ -254,6 +352,9 @@ async fn dispatch(req: Request, identity: &str, shared: &Shared) -> Response {
         }
 
         Request::Delete { key } => {
+            if !valid_key(&key) {
+                return Response::err("invalid key");
+            }
             if !shared.acl.lock().await.check(identity, &key, true) {
                 return denied(identity, &key, "delete");
             }
@@ -264,10 +365,12 @@ async fn dispatch(req: Request, identity: &str, shared: &Shared) -> Response {
             if ids.is_empty() {
                 return Response::err("not found");
             }
-            for id in ids {
-                store.delete(id);
-            }
-            if let Err(e) = store.save() {
+            if let Err(e) = store.transaction(move |transaction| {
+                for id in ids {
+                    transaction.delete(id);
+                }
+                Ok(())
+            }) {
                 return Response::err(format!("persist failed: {e}"));
             }
             drop(store);
@@ -276,6 +379,12 @@ async fn dispatch(req: Request, identity: &str, shared: &Shared) -> Response {
         }
 
         Request::List { prefix } => {
+            if prefix
+                .as_ref()
+                .is_some_and(|value| value.len() > MAX_KEY_BYTES)
+            {
+                return Response::err("invalid prefix");
+            }
             let store = shared.store.lock().await;
             let acl = shared.acl.lock().await;
             let entries = store
@@ -309,6 +418,12 @@ async fn dispatch(req: Request, identity: &str, shared: &Shared) -> Response {
             }
         }
     }
+}
+
+fn valid_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_KEY_BYTES
+        && !key.bytes().any(|byte| byte.is_ascii_control())
 }
 
 fn denied(identity: &str, key: &str, op: &str) -> Response {

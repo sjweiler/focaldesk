@@ -3,16 +3,22 @@
 use crate::acl::Acl;
 use crate::sscrypto::SessionCipher;
 use crate::store::Store;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+pub struct ClientSession {
+    pub cipher: SessionCipher,
+    pub owner: String,
+}
+
 pub struct SharedInner {
     pub store: Mutex<Store>,
     pub acl: Mutex<Acl>,
-    pub sessions: Mutex<HashMap<u64, SessionCipher>>,
+    pub sessions: Mutex<HashMap<u64, ClientSession>>,
     pub next_session: AtomicU64,
+    pub session_open_times: Mutex<VecDeque<std::time::Instant>>,
     pub dbus: Mutex<Option<zbus::Connection>>,
     /// Item ids currently registered on the D-Bus object server.
     pub registered_items: Mutex<HashSet<u64>>,
@@ -35,6 +41,7 @@ impl Shared {
             acl: Mutex::new(acl),
             sessions: Mutex::new(HashMap::new()),
             next_session: AtomicU64::new(1),
+            session_open_times: Mutex::new(VecDeque::new()),
             dbus: Mutex::new(None),
             registered_items: Mutex::new(HashSet::new()),
         }))
