@@ -56,10 +56,8 @@ pub fn create(password: &[u8]) -> Result<(Zeroizing<[u8; 32]>, Vec<u8>), Error> 
 
 /// Wrap an existing master key under a password.
 pub fn wrap(password: &[u8], master: &[u8; 32]) -> Result<Vec<u8>, Error> {
-    let mut salt = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut salt);
-    let mut nonce = [0u8; 12];
-    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let salt: [u8; 16] = rand::random();
+    let nonce: [u8; 12] = rand::random();
     let k = kek(password, &salt);
     let cipher = ChaCha20Poly1305::new(k.as_ref().into());
     let ct = cipher
@@ -105,36 +103,50 @@ pub fn rewrap(old_password: &[u8], new_password: &[u8], wrapped: &[u8]) -> Resul
 mod tests {
     use super::*;
 
+    fn random_password() -> [u8; 32] {
+        rand::random()
+    }
+
     #[test]
     fn roundtrip() {
-        let (master, wrapped) = create(b"hunter2").unwrap();
+        let password = random_password();
+        let (master, wrapped) = create(&password).unwrap();
         assert_eq!(wrapped.len(), WRAPPED_LEN);
-        let un = unwrap(b"hunter2", &wrapped).unwrap();
+        let un = unwrap(&password, &wrapped).unwrap();
         assert_eq!(master.as_ref(), un.as_ref());
     }
 
     #[test]
     fn wrong_password() {
-        let (_, wrapped) = create(b"hunter2").unwrap();
+        let password = random_password();
+        let mut wrong_password = password;
+        wrong_password[0] ^= 1;
+        let (_, wrapped) = create(&password).unwrap();
         assert_eq!(
-            unwrap(b"hunter3", &wrapped).unwrap_err(),
+            unwrap(&wrong_password, &wrapped).unwrap_err(),
             Error::BadPassword
         );
     }
 
     #[test]
     fn rewrap_preserves_master() {
-        let (master, wrapped) = create(b"old").unwrap();
-        let rewrapped = rewrap(b"old", b"new", &wrapped).unwrap();
-        assert_eq!(unwrap(b"old", &rewrapped).unwrap_err(), Error::BadPassword);
+        let old_password = random_password();
+        let new_password = random_password();
+        let (master, wrapped) = create(&old_password).unwrap();
+        let rewrapped = rewrap(&old_password, &new_password, &wrapped).unwrap();
         assert_eq!(
-            unwrap(b"new", &rewrapped).unwrap().as_ref(),
+            unwrap(&old_password, &rewrapped).unwrap_err(),
+            Error::BadPassword
+        );
+        assert_eq!(
+            unwrap(&new_password, &rewrapped).unwrap().as_ref(),
             master.as_ref()
         );
     }
 
     #[test]
     fn format_rejects_garbage() {
-        assert_eq!(unwrap(b"x", b"nonsense").unwrap_err(), Error::Format);
+        let password = random_password();
+        assert_eq!(unwrap(&password, b"nonsense").unwrap_err(), Error::Format);
     }
 }

@@ -73,8 +73,11 @@ const STASH_NAME: &[u8] = b"focald_secrets_authtok\0";
 extern "C" fn stash_cleanup(_pamh: *mut PamHandle, data: *mut c_void, _status: c_int) {
     if !data.is_null() {
         unsafe {
-            let boxed: Box<Zeroizing<Vec<u8>>> = Box::from_raw(data as *mut Zeroizing<Vec<u8>>);
-            drop(boxed); // Zeroizing scrubs
+            // `pam_sm_authenticate` gives PAM a CString::into_raw pointer.
+            // Reclaim the same allocation, expose its complete capacity as a
+            // Vec, and scrub the password plus terminator before freeing it.
+            let mut bytes = CString::from_raw(data as *mut c_char).into_bytes_with_nul();
+            bytes.zeroize();
         }
     }
 }
@@ -248,16 +251,27 @@ pub unsafe extern "C" fn pam_sm_authenticate(
     _argv: *const *const c_char,
 ) -> c_int {
     if let Some(tok) = get_authtok(pamh, PAM_AUTHTOK) {
-        let boxed = Box::new(tok);
+        // PAM owns this allocation after pam_set_data succeeds and returns it
+        // through pam_get_data until cleanup. PAM passwords originate as C
+        // strings, so the captured token cannot contain an interior NUL.
+        let Ok(stash) = CString::new(tok.as_slice()) else {
+            syslog("authtok unexpectedly contains NUL");
+            return PAM_IGNORE;
+        };
+        let raw = stash.into_raw();
         let rc = unsafe {
             pam_set_data(
                 pamh,
                 STASH_NAME.as_ptr() as *const c_char,
-                Box::into_raw(boxed) as *mut c_void,
+                raw as *mut c_void,
                 Some(stash_cleanup),
             )
         };
         if rc != PAM_SUCCESS {
+            unsafe {
+                let mut bytes = CString::from_raw(raw).into_bytes_with_nul();
+                bytes.zeroize();
+            }
             syslog("failed to stash authtok");
         }
     }
@@ -293,8 +307,10 @@ pub unsafe extern "C" fn pam_sm_open_session(
         let mut data: *const c_void = std::ptr::null();
         let rc = unsafe { pam_get_data(pamh, STASH_NAME.as_ptr() as *const c_char, &mut data) };
         if rc == PAM_SUCCESS && !data.is_null() {
-            let stash = unsafe { &*(data as *const Zeroizing<Vec<u8>>) };
-            Some(Zeroizing::new(stash.to_vec()))
+            // The pointer is the CString allocation registered above. PAM
+            // guarantees module data remains valid until its cleanup callback.
+            let stash = unsafe { CStr::from_ptr(data as *const c_char) };
+            Some(Zeroizing::new(stash.to_bytes().to_vec()))
         } else {
             get_authtok(pamh, PAM_AUTHTOK)
         }
