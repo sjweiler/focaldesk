@@ -13,6 +13,8 @@ version numbers where practical.
 - Project status matrix and annotated architecture documentation.
 - Build, configuration, keybinding, troubleshooting, and roadmap documentation.
 - Contribution and issue-reporting templates.
+- Added semantic accessibility metadata and keyboard focus navigation for
+  compositor-owned shell controls, including visible focus indicators.
 
 ### Changed
 

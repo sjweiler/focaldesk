@@ -127,6 +127,22 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::CTRL | ModMask::ALT,
+                sym: keysyms::KEY_Tab,
+            },
+            KeyAction::FocusShellNext,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::CTRL | ModMask::ALT | ModMask::SHIFT,
+                sym: keysyms::KEY_Tab,
+            },
+            KeyAction::FocusShellPrevious,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::CTRL | ModMask::ALT,
                 sym: keysyms::KEY_d,
             },
             KeyAction::ToggleLauncher,
@@ -321,7 +337,13 @@ impl Keybinds {
     }
 
     pub fn resolve(&self, sym: u32, mods: ModMask) -> Option<KeyAction> {
-        let sym = keysym_to_lower(sym);
+        // XKB commonly reports Shift+Tab as ISO_Left_Tab. Treat it as the same
+        // physical navigation key and let the modifier mask select direction.
+        let sym = if sym == keysyms::KEY_ISO_Left_Tab {
+            keysyms::KEY_Tab
+        } else {
+            keysym_to_lower(sym)
+        };
         let combo = KeyCombo { mods, sym };
         self.map.get(&combo).copied()
     }
@@ -393,5 +415,23 @@ mod tests {
         );
         assert_eq!(keybinds.resolve(keysyms::KEY_space, ModMask::SUPER), None);
         assert_eq!(keybinds.resolve(keysyms::KEY_Print, ModMask::empty()), None);
+    }
+
+    #[test]
+    fn shell_navigation_bindings_are_available_on_every_backend() {
+        for backend in [BackendKind::Winit, BackendKind::Drm] {
+            let keybinds = Keybinds::with_defaults(backend);
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_Tab, ModMask::CTRL | ModMask::ALT),
+                Some(KeyAction::FocusShellNext)
+            );
+            assert_eq!(
+                keybinds.resolve(
+                    keysyms::KEY_ISO_Left_Tab,
+                    ModMask::CTRL | ModMask::ALT | ModMask::SHIFT
+                ),
+                Some(KeyAction::FocusShellPrevious)
+            );
+        }
     }
 }

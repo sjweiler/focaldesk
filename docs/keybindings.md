@@ -17,8 +17,15 @@ user-configurable, and they may change during the alpha period.
 | `Super+Shift+V` | Toggle voice capture | Experimental |
 | `Super+F7` | Focus the previous window | Working |
 | `Super+F8` | Focus the next window | Working |
+| `Ctrl+Alt+Tab` | Enter or advance shell accessibility focus | Working |
+| `Ctrl+Alt+Shift+Tab` | Enter or reverse shell accessibility focus | Working |
 | `Ctrl+Alt+D` | Toggle the application launcher | Working |
 | `Super+Shift+Q` | Exit the compositor | Working; use with care |
+
+After entering shell accessibility focus, use `Tab` or `Shift+Tab` to move,
+`Enter` or `Space` to activate the focused control, and `Escape` to return
+keyboard input fully to the active application. Pointer clicks also leave shell
+accessibility focus.
 
 ## Direct DRM/KMS session bindings
 

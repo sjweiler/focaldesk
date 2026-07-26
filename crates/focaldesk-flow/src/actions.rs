@@ -22,6 +22,8 @@ pub enum KeyAction {
     CloseFocused,
     FocusNext,
     FocusPrev,
+    FocusShellNext,
+    FocusShellPrevious,
     OverflowView,
     QuitCompositor,
     ToggleLauncher,

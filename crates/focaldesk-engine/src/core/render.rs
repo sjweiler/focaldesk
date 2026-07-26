@@ -3844,6 +3844,42 @@ impl RenderState {
 
                     _ => {}
                 }
+
+                if ui_tree.focused == Some(el.id) && ctx.rendering_output == ctx.active_output {
+                    let focus_rect: Rectangle<i32, Physical> =
+                        base_rect_logical.to_physical_precise_round(ctx.output_scale);
+                    let thickness =
+                        ((2.0 * ctx.output_scale.x.max(ctx.output_scale.y)).round() as i32).max(2);
+                    let horizontal_width = focus_rect.size.w.max(1);
+                    let vertical_height = (focus_rect.size.h - thickness * 2).max(1);
+                    let regions = [
+                        Rectangle::from_loc_and_size(focus_rect.loc, (horizontal_width, thickness)),
+                        Rectangle::from_loc_and_size(
+                            (
+                                focus_rect.loc.x,
+                                focus_rect.loc.y + focus_rect.size.h - thickness,
+                            ),
+                            (horizontal_width, thickness),
+                        ),
+                        Rectangle::from_loc_and_size(
+                            (focus_rect.loc.x, focus_rect.loc.y + thickness),
+                            (thickness, vertical_height),
+                        ),
+                        Rectangle::from_loc_and_size(
+                            (
+                                focus_rect.loc.x + focus_rect.size.w - thickness,
+                                focus_rect.loc.y + thickness,
+                            ),
+                            (thickness, vertical_height),
+                        ),
+                    ];
+                    let _ = Self::draw_solid_rect(
+                        frame,
+                        fullscreen_rect,
+                        &regions,
+                        [1.0, 0.82, 0.12, 1.0],
+                    );
+                }
             }
 
             let output_logical_size = Size::<i32, Logical>::from((

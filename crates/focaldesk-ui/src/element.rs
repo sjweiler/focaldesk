@@ -1,4 +1,5 @@
 use crate::UiVisualState;
+use crate::accessibility::{AccessibleInfo, AccessibleRole};
 use crate::atlas::IconId;
 use crate::types::{ElementId, UiAction, UiElementKind};
 use smithay::utils::Logical;
@@ -38,6 +39,7 @@ pub struct UiElement {
     pub label: Option<String>,
     pub tooltip: Option<String>,
     pub action: Option<UiAction>,
+    pub accessible: Option<AccessibleInfo>,
     pub visible: bool,
     pub enabled: bool,
     pub hovered: bool,
@@ -101,6 +103,11 @@ impl ChromeItem {
 
 impl UiElement {
     pub fn from_chrome_item(kind: UiElementKind, item: ChromeItem, bounds: UiRect) -> Self {
+        let accessible_role = match kind {
+            UiElementKind::WorkspaceSlot => AccessibleRole::Tab,
+            _ => AccessibleRole::Button,
+        };
+        let accessible = AccessibleInfo::new(accessible_role, item.tooltip.clone());
         Self {
             id: item.id,
             kind,
@@ -109,6 +116,7 @@ impl UiElement {
             label: None,
             tooltip: Some(item.tooltip),
             action: Some(item.action),
+            accessible: Some(accessible),
             visible: item.visible,
             enabled: item.enabled,
             hovered: false,
@@ -160,6 +168,7 @@ impl UiElement {
             label: None,
             tooltip: None,
             action,
+            accessible: None,
             visible: true,
             enabled: true,
             hovered: false,
@@ -175,14 +184,16 @@ impl UiElement {
         tooltip: impl Into<String>,
         action: UiAction,
     ) -> Self {
+        let tooltip = tooltip.into();
         Self {
             id,
             kind: UiElementKind::SidebarButton,
             bounds: UiRect::default(),
             icon: Some(icon),
             label: None,
-            tooltip: Some(tooltip.into()),
+            tooltip: Some(tooltip.clone()),
             action: Some(action),
+            accessible: Some(AccessibleInfo::new(AccessibleRole::Button, tooltip)),
             visible: true,
             enabled: true,
             hovered: false,
@@ -194,14 +205,16 @@ impl UiElement {
     }
 
     pub fn topbar_indicator(id: ElementId, icon: IconId, tooltip: impl Into<String>) -> Self {
+        let tooltip = tooltip.into();
         Self {
             id,
             kind: UiElementKind::TopbarIndicator,
             bounds: UiRect::default(),
             icon: Some(icon),
             label: None,
-            tooltip: Some(tooltip.into()),
+            tooltip: Some(tooltip.clone()),
             action: None,
+            accessible: Some(AccessibleInfo::new(AccessibleRole::Status, tooltip).live(true)),
             visible: true,
             enabled: true,
             hovered: false,
@@ -210,5 +223,22 @@ impl UiElement {
             hover_scale: 1.08,
             press_scale: 0.96,
         }
+    }
+
+    /// Overrides the inferred accessibility semantics for this element.
+    pub fn with_accessible(mut self, accessible: AccessibleInfo) -> Self {
+        self.accessible = Some(accessible);
+        self
+    }
+
+    /// Returns true when assistive technology can move focus to this element.
+    pub fn is_accessibility_focusable(&self) -> bool {
+        self.visible
+            && self.enabled
+            && self.action.is_some()
+            && self
+                .accessible
+                .as_ref()
+                .is_some_and(|info| info.role.is_interactive())
     }
 }

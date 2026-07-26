@@ -1,3 +1,4 @@
+use crate::accessibility::{AccessibleInfo, AccessibleRole};
 use crate::atlas::IconId;
 use crate::chrome_layout::{
     ChromeLayout, ChromeLayoutConfig, DEFAULT_SIDEBAR_SLOT_COUNT, DEFAULT_TOPBAR_STATUS_COUNT,
@@ -418,6 +419,10 @@ pub fn build_ui_for_output_with_options(
     );
     flow_field.kind = UiElementKind::TopbarFlowField;
     flow_field.action = Some(UiAction::LaunchApp("focaldesk-ai-console".into()));
+    flow_field.accessible = Some(
+        AccessibleInfo::new(AccessibleRole::Button, "FocalDesk AI Console")
+            .description("Open the AI Console"),
+    );
     flow_field.bounds = UiRect {
         x: layout.topbar.flow_field.loc.x,
         y: layout.topbar.flow_field.loc.y,
@@ -451,6 +456,10 @@ pub fn build_ui_for_output_with_options(
         label: None,
         tooltip: None,
         action: Some(UiAction::OpenPanel(PanelKind::Calendar)),
+        accessible: Some(AccessibleInfo::new(
+            AccessibleRole::Button,
+            "Calendar and clock",
+        )),
         visible: true,
         enabled: true,
         hovered: false,
@@ -459,6 +468,7 @@ pub fn build_ui_for_output_with_options(
         hover_scale: 1.03,
         press_scale: 0.98,
     });
+    ui.reconcile_focus();
 }
 
 #[cfg(test)]

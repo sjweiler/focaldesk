@@ -5886,6 +5886,16 @@ impl DesktopState {
                 self.cycle_focused_window(-1);
             }
 
+            KeyAction::FocusShellNext => {
+                self.ui.focus_next();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+
+            KeyAction::FocusShellPrevious => {
+                self.ui.focus_previous();
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+
             KeyAction::LaunchTerminal => {
                 let launch_trace_id = self.launch_app(self.apps.terminal.clone());
                 flog_info!(
@@ -6132,6 +6142,47 @@ impl DesktopState {
                                 return FilterResult::<()>::Intercept(());
                             }
                         }
+                    }
+                }
+
+                // Once shell navigation is entered with Ctrl+Alt+Tab, ordinary Tab navigation and
+                // activation stay in the compositor until Escape or activation exits the mode.
+                // Outside this mode these keys continue to reach the focused client normally.
+                if ds.ui.focused.is_some() {
+                    let navigation_key = matches!(
+                        sym,
+                        keysyms::KEY_Tab
+                            | keysyms::KEY_ISO_Left_Tab
+                            | keysyms::KEY_Return
+                            | keysyms::KEY_KP_Enter
+                            | keysyms::KEY_space
+                            | keysyms::KEY_Escape
+                    );
+                    if navigation_key {
+                        if matches!(smithay_state, SmithayKeyState::Pressed) {
+                            match sym {
+                                keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => {
+                                    if mods.shift || sym == keysyms::KEY_ISO_Left_Tab {
+                                        ds.ui.focus_previous();
+                                    } else {
+                                        ds.ui.focus_next();
+                                    }
+                                }
+                                keysyms::KEY_Return
+                                | keysyms::KEY_KP_Enter
+                                | keysyms::KEY_space => {
+                                    let action = ds.ui.focused_action();
+                                    ds.ui.clear_focus();
+                                    if let Some(action) = action {
+                                        ds.dispatch_ui_action(action);
+                                    }
+                                }
+                                keysyms::KEY_Escape => ds.ui.clear_focus(),
+                                _ => {}
+                            }
+                            ds.mark_focused_output_full_damage(DamageSource::Unknown);
+                        }
+                        return FilterResult::<()>::Intercept(());
                     }
                 }
 
@@ -6609,6 +6660,10 @@ impl DesktopState {
                 position,
                 ..
             } => {
+                if matches!(state, FlowKeyState::Pressed) && self.ui.focused.is_some() {
+                    self.ui.clear_focus();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
                 self.input.pointer_pos = position;
                 self.pointer_pos = position;
 
