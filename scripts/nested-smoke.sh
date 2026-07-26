@@ -116,14 +116,15 @@ wait_for_log() {
     local attempts=$((seconds * 10))
     local attempt
     for ((attempt = 0; attempt < attempts; attempt++)); do
-        if rg -q "$pattern" "$ARTIFACTS/compositor.log" "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
+        if grep -Eq "$pattern" "$ARTIFACTS/compositor.log" \
+            "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
             return 0
         fi
         if [[ -n "$COMPOSITOR_PID" ]] && ! kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
             # Give redirected output a moment to flush so a just-written startup
             # marker or renderer error is visible before reporting the failure.
             sleep 0.1
-            if rg -q "$pattern" "$ARTIFACTS/compositor.log" \
+            if grep -Eq "$pattern" "$ARTIFACTS/compositor.log" \
                 "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
                 return 0
             fi
@@ -177,7 +178,7 @@ wait_for_log 'FocalDesk client socket is focaldesk-[0-9]+' "$START_TIMEOUT" \
     || fail "nested compositor did not announce a client socket"
 
 NESTED_DISPLAY="$(
-    rg -o 'FocalDesk client socket is focaldesk-[0-9]+' \
+    grep -hEo 'FocalDesk client socket is focaldesk-[0-9]+' \
         "$ARTIFACTS/compositor.log" "$ARTIFACTS/compositor.stderr" \
         | tail -1 | sed -E 's/.* is (focaldesk-[0-9]+)$/\1/'
 )"
@@ -190,9 +191,9 @@ pass "nested socket $NESTED_DISPLAY"
 if command -v wayland-info >/dev/null; then
     if timeout 10 env WAYLAND_DISPLAY="$NESTED_DISPLAY" wayland-info \
         >"$ARTIFACTS/wayland-info.txt" 2>&1; then
-        rg -q 'interface: .wl_compositor.' "$ARTIFACTS/wayland-info.txt" \
+        grep -Eq 'interface: .wl_compositor.' "$ARTIFACTS/wayland-info.txt" \
             || fail "wl_compositor global was not advertised"
-        rg -q 'interface: .xdg_wm_base.' "$ARTIFACTS/wayland-info.txt" \
+        grep -Eq 'interface: .xdg_wm_base.' "$ARTIFACTS/wayland-info.txt" \
             || fail "xdg_wm_base global was not advertised"
         pass "Wayland registry and round-trip"
     else
@@ -227,13 +228,14 @@ else
     echo "SKIP no native demo client found" | tee -a "$ARTIFACTS/summary.txt"
 fi
 
-if rg -qi 'panicked at|thread .* panicked|stack backtrace|segmentation fault' \
+if grep -Eqi 'panicked at|thread .* panicked|stack backtrace|segmentation fault' \
     "$ARTIFACTS/compositor.log" "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
     fail "panic or crash signature found in compositor logs"
 fi
 pass "no compositor panic or crash signature"
 
-if rg -q 'XWayland ready' "$ARTIFACTS/compositor.log" "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
+if grep -Eq 'XWayland ready' "$ARTIFACTS/compositor.log" \
+    "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
     pass "XWayland startup"
 else
     fail "XWayland did not become ready"
