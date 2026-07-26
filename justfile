@@ -37,6 +37,9 @@ release-automation:
 release-focaldm-greeter:
     cargo build --release -p focaldm-greeter
 
+release-focaldmd:
+    cargo build --release -p focaldmd
+
 release-focald-secrets:
     cargo build --release -p focald-secrets -p pam-focald-secrets
 
@@ -56,7 +59,7 @@ install-session-target:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
 
-install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-automation-service install-launch-service install-settings-service install-polkit-service install-focald-voice install-focald-speech install-focald-mic
+install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-focald-voice install-focald-speech install-focald-mic
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -188,6 +191,17 @@ install-launcher:
 install-focaldm-greeter: release-focaldm-greeter
     sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"
 
+install-focaldmd-fedora: release-focaldmd release-focaldm-greeter install-focaldm-pam-fedora
+    sudo install -Dm755 target/release/focaldmd /usr/sbin/focaldmd
+    sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"
+    sudo install -Dm644 packaging/systemd/system/focaldmd.service /usr/lib/systemd/system/focaldmd.service
+    sudo install -Dm644 packaging/sysusers.d/focaldesk.conf /usr/lib/sysusers.d/focaldesk.conf
+    sudo install -Dm644 packaging/pam/focaldmd-greeter-fedora /etc/pam.d/focaldmd-greeter
+    sudo install -Dm644 packaging/focaldesk/focaldmd.toml /etc/focaldmd.toml
+    sudo systemd-sysusers /usr/lib/sysusers.d/focaldesk.conf
+    sudo systemctl daemon-reload
+    @echo "focaldmd is installed but not enabled. Keep another display manager available until login testing succeeds."
+
 install-desktop: install-polkit
     cargo build --release -p focaldesk-desktop
     @echo "Build artifact:"
@@ -212,7 +226,7 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-automation-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
 
 install-secrets-service-fedora:
     cargo build --release -p focald-secrets
@@ -322,6 +336,13 @@ install-polkit-service-fedora:
     cargo build --release -p focaldesk-polkitd
     sudo install -Dm755 target/release/focaldesk-polkitd /usr/bin/focaldesk-polkitd
     systemctl --user disable --now focaldesk-polkitd.service || echo "Skipping stale polkit service cleanup: no user bus available"
+
+install-voice-service-fedora:
+    cargo build --release -p focald-voice
+    sudo install -Dm755 target/release/focald-voice /usr/bin/focald-voice
+    sudo install -Dm644 packaging/systemd/user/focald-voice-fedora.service /usr/lib/systemd/user/focald-voice.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focald-voice.service || echo "Skipping systemd user enable: no user bus available"
 
 install-speech-service-fedora:
     cargo build --release -p focald-speech

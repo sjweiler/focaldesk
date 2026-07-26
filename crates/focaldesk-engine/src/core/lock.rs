@@ -2,6 +2,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::time::{Duration, Instant};
+use zeroize::{Zeroize, Zeroizing};
 
 pub const LOCK_PULSE_DURATION: Duration = Duration::from_millis(900);
 const PAM_SUCCESS: c_int = 0;
@@ -31,7 +32,7 @@ pub struct LockPulseFrame {
 #[derive(Clone, Debug)]
 pub struct LockScreenState {
     pub active: bool,
-    pub password: String,
+    pub password: Zeroizing<String>,
     pub password_visible: bool,
     pub message: String,
     pub authenticating: bool,
@@ -53,7 +54,7 @@ impl LockScreenState {
     pub fn new() -> Self {
         Self {
             active: false,
-            password: String::new(),
+            password: Zeroizing::new(String::new()),
             password_visible: false,
             message: "Enter password".to_string(),
             authenticating: false,
@@ -63,7 +64,7 @@ impl LockScreenState {
 
     pub fn lock(&mut self) {
         self.active = true;
-        self.password.clear();
+        self.password.zeroize();
         self.password_visible = false;
         self.message = "Enter password".to_string();
         self.authenticating = false;
@@ -72,7 +73,7 @@ impl LockScreenState {
 
     pub fn unlock(&mut self) {
         self.active = false;
-        self.password.clear();
+        self.password.zeroize();
         self.password_visible = false;
         self.message.clear();
         self.authenticating = false;
@@ -90,7 +91,7 @@ impl LockScreenState {
     }
 
     pub fn clear_password(&mut self) {
-        self.password.clear();
+        self.password.zeroize();
         self.password_visible = false;
     }
 
@@ -120,7 +121,7 @@ impl LockScreenState {
             password_len: self.password.chars().count(),
             password_visible: self.password_visible,
             password_text: if self.password_visible {
-                self.password.clone()
+                self.password.to_string()
             } else {
                 String::new()
             },
@@ -314,6 +315,8 @@ fn authenticate_user(user: &str, password: &str) -> Result<bool, String> {
             (pam.end)(handle, status);
         }
     }
+    let mut password_bytes = password.into_bytes_with_nul();
+    password_bytes.zeroize();
 
     match error {
         None => Ok(true),

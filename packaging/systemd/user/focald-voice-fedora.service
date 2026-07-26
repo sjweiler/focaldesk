@@ -4,7 +4,7 @@ PartOf=focaldesk-session.target
 After=focaldesk-controlsd.service
 
 [Service]
-ExecStart=%h/.local/bin/focald-voice
+ExecStart=/usr/bin/focald-voice
 Restart=on-failure
 Environment=FOCALD_VOICE_SOCKET=%t/focaldesk/focald-voice.sock
 UMask=0077

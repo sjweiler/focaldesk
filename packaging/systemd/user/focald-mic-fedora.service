@@ -12,6 +12,9 @@ RestartSec=2
 Environment=FOCALD_MIC_SOCKET=%t/focaldesk/focald-mic.sock
 Environment=FOCALD_VOICE_SOCKET=%t/focaldesk/focald-voice.sock
 Environment=FOCALD_SPEECH_SOCKET=%t/focaldesk/focald-speech.sock
+UMask=0077
+NoNewPrivileges=yes
+LimitCORE=0
 
 [Install]
 WantedBy=focaldesk-session.target

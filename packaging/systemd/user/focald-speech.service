@@ -10,6 +10,9 @@ ExecStart=%h/.local/bin/focald-speech
 Restart=on-failure
 RestartSec=2
 Environment=FOCALD_SPEECH_SOCKET=%t/focaldesk/focald-speech.sock
+UMask=0077
+NoNewPrivileges=yes
+LimitCORE=0
 
 [Install]
 WantedBy=focaldesk-session.target

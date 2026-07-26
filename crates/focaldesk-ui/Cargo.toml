@@ -14,7 +14,7 @@ focaldesk-power = { path = "../focaldesk-power" }
 focaldesk-network = { path = "../focaldesk-network" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-ai = { path = "../focaldesk-ai" }
-image = "0.25"
+image.workspace = true
 egui = "0.31"
 egui_glow = "0.31"
 glow.workspace = true

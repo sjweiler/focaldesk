@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -147,11 +149,16 @@ impl PersistentPermissionStore {
             fs::create_dir_all(parent).map_err(|err| {
                 focaldesk_permissions::error::PermissionError::Store(err.to_string())
             })?;
+            if parent.file_name().is_some_and(|name| name == "focaldesk") {
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(|err| {
+                    focaldesk_permissions::error::PermissionError::Store(err.to_string())
+                })?;
+            }
         }
 
         let text = toml::to_string_pretty(&file)
             .map_err(|err| focaldesk_permissions::error::PermissionError::Store(err.to_string()))?;
-        fs::write(&self.path, text)
+        write_private_atomic(&self.path, text.as_bytes())
             .map_err(|err| focaldesk_permissions::error::PermissionError::Store(err.to_string()))
     }
 
@@ -181,6 +188,39 @@ impl PersistentPermissionStore {
         self.entries.remove(&key);
         self.save()
     }
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "AI permission path has no parent",
+        )
+    })?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".ai-permissions-{}-{stamp}.tmp",
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 impl PermissionStore for PersistentPermissionStore {
@@ -676,6 +716,7 @@ mod tests {
     use focaldesk_permissions::prompt::PermissionPrompter;
     use focaldesk_permissions::prompt::UserPromptResponse;
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_permission_store_path(test_name: &str) -> PathBuf {
@@ -715,6 +756,10 @@ mod tests {
         };
 
         store.set(state.clone()).expect("store should save");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         let reloaded = PersistentPermissionStore::load_from_path(path.clone());
         let loaded = reloaded

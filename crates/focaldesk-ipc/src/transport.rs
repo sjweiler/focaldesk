@@ -339,13 +339,27 @@ fn policy_allows(identity: &PeerIdentity, policy: PeerPolicy<'_>) -> bool {
         .executable
         .file_name()
         .and_then(|name| name.to_str());
-    let executable_allowed =
-        executable.is_some_and(|name| policy.allowed_executables.contains(&name));
+    let executable_allowed = executable.is_some_and(|name| {
+        policy.allowed_executables.contains(&name) && executable_identity_is_trusted(identity)
+    });
     let unit_allowed = identity
         .unit
         .as_deref()
         .is_some_and(|unit| policy.allowed_units.contains(&unit));
     executable_allowed || unit_allowed
+}
+
+fn executable_identity_is_trusted(identity: &PeerIdentity) -> bool {
+    if cfg!(test)
+        || cfg!(debug_assertions)
+        || std::env::var_os("FOCALDESK_ALLOW_USER_OWNED_IPC_PEERS").is_some()
+    {
+        return true;
+    }
+
+    fs::metadata(&identity.executable)
+        .map(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
+        .unwrap_or(false)
 }
 
 fn systemd_unit_from_cgroup(contents: &str) -> Option<String> {

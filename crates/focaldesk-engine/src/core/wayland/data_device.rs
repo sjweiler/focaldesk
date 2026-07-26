@@ -2,9 +2,10 @@
 
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::core::desktop::{DesktopState, DND_CURSOR_ENDED, DND_CURSOR_INVALID, DND_CURSOR_VALID};
 
@@ -31,6 +32,8 @@ const TEXT_MIME_TYPES: &[&str] = &[
     "STRING",
     "TEXT",
 ];
+const MAX_CLIPBOARD_CAPTURE_BYTES: usize = 1024 * 1024;
+const CLIPBOARD_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Owner of a compositor-provided (server-side) selection, i.e. one set via
 /// [`set_data_device_selection`] rather than by a client directly.
@@ -133,35 +136,103 @@ impl DesktopState {
     /// Drain mime types queued by [`SelectionHandler::new_selection`] and kick off
     /// a background read of the now-current client selection for each.
     pub(crate) fn begin_pending_clipboard_captures(&mut self) {
-        for mime_type in std::mem::take(&mut self.clipboard_pending_captures) {
-            let Ok((read_fd, write_fd)) = nix::unistd::pipe() else {
-                continue;
-            };
-            // Safety: `nix::unistd::pipe` returns two freshly-opened, unique fds.
-            let read_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
-            let write_fd = unsafe { OwnedFd::from_raw_fd(write_fd) };
-
-            if request_data_device_client_selection(&self.seat, mime_type.clone(), write_fd)
-                .is_err()
-            {
-                continue;
-            }
-
-            let tx = self.clipboard_capture_tx.clone();
-            std::thread::spawn(move || {
-                let mut file = File::from(read_fd);
-                let mut buf = Vec::new();
-                if file.read_to_end(&mut buf).is_err() {
-                    return;
-                }
-                let text = String::from_utf8_lossy(&buf)
-                    .trim_end_matches('\0')
-                    .to_string();
-                if !text.is_empty() {
-                    let _ = tx.send((mime_type, text));
-                }
-            });
+        if self.clipboard_capture_active.load(Ordering::Acquire) {
+            return;
         }
+
+        let Some(mime_type) = self.clipboard_pending_captures.pop() else {
+            return;
+        };
+        // Only the newest selection matters. This also bounds work if a client
+        // rapidly replaces its selection while a previous capture is active.
+        self.clipboard_pending_captures.clear();
+
+        let Ok((read_fd, write_fd)) = nix::unistd::pipe() else {
+            return;
+        };
+        // Safety: `nix::unistd::pipe` returns two freshly-opened, unique fds.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(write_fd) };
+
+        if request_data_device_client_selection(&self.seat, mime_type.clone(), write_fd).is_err() {
+            return;
+        }
+
+        self.clipboard_capture_active.store(true, Ordering::Release);
+        let active = self.clipboard_capture_active.clone();
+        let tx = self.clipboard_capture_tx.clone();
+        std::thread::spawn(move || {
+            if let Some(text) = read_clipboard_text(read_fd) {
+                let _ = tx.send((mime_type, text));
+            }
+            active.store(false, Ordering::Release);
+        });
+    }
+}
+
+fn read_clipboard_text(read_fd: OwnedFd) -> Option<String> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+
+    let flags = fcntl(read_fd.as_raw_fd(), FcntlArg::F_GETFL).ok()?;
+    let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
+    fcntl(read_fd.as_raw_fd(), FcntlArg::F_SETFL(flags)).ok()?;
+
+    let mut file = File::from(read_fd);
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 8192];
+    let deadline = Instant::now() + CLIPBOARD_CAPTURE_TIMEOUT;
+
+    loop {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => {
+                if bytes.len().saturating_add(count) > MAX_CLIPBOARD_CAPTURE_BYTES {
+                    return None;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
+
+    let text = String::from_utf8_lossy(&bytes)
+        .trim_end_matches('\0')
+        .to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pipe_with_bytes(bytes: Vec<u8>) -> OwnedFd {
+        let (read_fd, write_fd) = nix::unistd::pipe().unwrap();
+        // Safety: pipe returns two new descriptors with unique ownership.
+        let read_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
+        let write_fd = unsafe { OwnedFd::from_raw_fd(write_fd) };
+        std::thread::spawn(move || {
+            let mut writer = File::from(write_fd);
+            let _ = writer.write_all(&bytes);
+        });
+        read_fd
+    }
+
+    #[test]
+    fn clipboard_capture_reads_bounded_text() {
+        let text = read_clipboard_text(pipe_with_bytes(b"hello clipboard\0".to_vec()));
+        assert_eq!(text.as_deref(), Some("hello clipboard"));
+    }
+
+    #[test]
+    fn clipboard_capture_rejects_oversized_text() {
+        let bytes = vec![b'x'; MAX_CLIPBOARD_CAPTURE_BYTES + 1];
+        assert!(read_clipboard_text(pipe_with_bytes(bytes)).is_none());
     }
 }
 

@@ -1,0 +1,12 @@
+greeter_user = "focaldm"
+greeter_cmd = "/usr/libexec/focaldm-greeter"
+session_cmd = "/usr/local/bin/focaldesk-desktop"
+socket_path = "/run/focaldmd/greeter.sock"
+pam_service = "focaldmd"
+greeter_pam_service = "focaldmd-greeter"
+tty_name = "tty1"
+vt = 1
+keyboard_layout = "us"
+keyboard_variant = ""
+keyboard_model = ""
+keyboard_options = ""

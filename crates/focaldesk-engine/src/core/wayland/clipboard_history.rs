@@ -1,5 +1,8 @@
 use std::collections::VecDeque;
 use std::fs;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -91,9 +94,73 @@ impl ClipboardHistory {
             if fs::create_dir_all(parent).is_err() {
                 return;
             }
+            if fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).is_err() {
+                return;
+            }
         }
         if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
+            let _ = write_private_atomic(&path, json.as_bytes());
         }
+    }
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "clipboard history path has no parent",
+        )
+    })?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".clipboard-history-{}-{stamp}.tmp",
+        std::process::id()
+    ));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_atomic_write_uses_owner_only_permissions() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "focaldesk-clipboard-permissions-{}-{stamp}",
+            std::process::id()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("clipboard_history.json");
+
+        write_private_atomic(&path, b"{}").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(directory);
     }
 }

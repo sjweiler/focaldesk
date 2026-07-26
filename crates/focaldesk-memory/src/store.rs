@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::{fs, os::unix::fs::PermissionsExt};
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
@@ -38,10 +39,16 @@ impl MemoryStore {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
+            if parent.file_name().is_some_and(|name| name == "focaldesk") {
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("failed to protect {}", parent.display()))?;
+            }
         }
 
         let conn = Connection::open(path.as_ref())
             .with_context(|| format!("failed to open {}", path.as_ref().display()))?;
+        fs::set_permissions(path.as_ref(), fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to protect {}", path.as_ref().display()))?;
 
         Self::init_schema(&conn, dimension)?;
 
@@ -208,4 +215,30 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn memory_database_is_private() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "focaldesk-memory-permissions-{}-{stamp}.db",
+            std::process::id()
+        ));
+
+        let store = MemoryStore::open(&path, 4).expect("open memory store");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(store);
+        let _ = fs::remove_file(path);
+    }
 }

@@ -20,7 +20,9 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     fs,
-    path::PathBuf,
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path, PathBuf},
     process::Command,
     rc::Rc,
     sync::mpsc,
@@ -2888,11 +2890,47 @@ fn compact_placeholder_conversations(state: &mut PersistedState) {
 fn persist_state(state: &PersistedState) {
     let path = state_path();
     if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        if parent.file_name().is_some_and(|name| name == "focaldesk")
+            && fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).is_err()
+        {
+            return;
+        }
     }
     if let Ok(text) = serde_json::to_string_pretty(state) {
-        let _ = fs::write(path, text);
+        let _ = write_private_atomic(&path, text.as_bytes());
     }
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "AI Console state path has no parent",
+        )
+    })?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(".ai-console-{}-{stamp}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&temp, path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]

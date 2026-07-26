@@ -47,7 +47,7 @@ impl Default for Config {
         Self {
             greeter_user: "focaldm".into(),
             greeter_cmd: "/usr/libexec/focaldm-greeter".into(),
-            session_cmd: "/usr/bin/focaldesk".into(),
+            session_cmd: "/usr/local/bin/focaldesk-desktop".into(),
             socket_path: PathBuf::from("/run/focaldmd/greeter.sock"),
             pam_service: "focaldmd".into(),
             greeter_pam_service: "focaldmd-greeter".into(),

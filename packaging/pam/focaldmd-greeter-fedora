@@ -1,0 +1,11 @@
+#%PAM-1.0
+#
+# Non-interactive PAM session for the unprivileged FocalDesk greeter.
+# Authentication and account checks cannot prompt; pam_systemd establishes
+# the greeter's logind seat/session so libseat can broker DRM and input.
+
+auth        required      pam_permit.so
+account     required      pam_permit.so
+password    required      pam_deny.so
+session     required      pam_loginuid.so
+session     required      pam_systemd.so

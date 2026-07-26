@@ -169,14 +169,18 @@ just install-services
 
 This installs binaries under `~/.local/bin`, user units under
 `~/.config/systemd/user`, reloads the user service manager, and enables the
-service set. Fedora packagers can instead use:
+core service set. The command-executing automation service is deliberately not
+installed by this bundle; install it explicitly with
+`just install-automation-service` only after reviewing its scripts and unit.
+Fedora packagers can instead use:
 
 ```sh
 just install-services-fedora
 ```
 
 The Fedora recipes place binaries and units in system locations. Review the
-recipes in `justfile` before using them in a packaging environment.
+recipes in `justfile` before using them in a packaging environment. Fedora
+automation is likewise opt-in through `just install-automation-service-fedora`.
 
 Individual applications can be installed with recipes such as:
 
@@ -186,6 +190,23 @@ just install-files
 just install-settings
 just install-ai-console
 ```
+
+## Optional FocalDesk display manager
+
+Fedora installations can install the native `focaldmd` daemon, greeter,
+non-interactive greeter PAM policy, human-login PAM policy, configuration,
+systemd unit, and `focaldm` system user definition with:
+
+```sh
+just install-focaldmd-fedora
+```
+
+The recipe intentionally does not enable or start the display manager. First
+confirm that `/usr/local/bin/focaldesk-desktop` starts as a normal Wayland
+session and keep the distribution's existing display manager available for
+recovery. Switching the system `display-manager.service` alias is an
+administrator action that should only be done after testing the installed
+greeter and PAM policies on the target Fedora release.
 
 ## Development checks
 

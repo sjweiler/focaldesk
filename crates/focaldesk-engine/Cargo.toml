@@ -17,6 +17,7 @@ serde = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zeroize.workspace = true
 focaldesk-ui = { path = "../focaldesk-ui" }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }

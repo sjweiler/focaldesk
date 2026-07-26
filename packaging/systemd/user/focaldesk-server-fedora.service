@@ -12,6 +12,9 @@ EnvironmentFile=-%h/.config/focaldesk/focaldesk-server.env
 Environment=FOCALDESK_AI_PERMISSION=prompt
 KillSignal=SIGINT
 TimeoutStopSec=10
+UMask=0077
+NoNewPrivileges=yes
+LimitCORE=0
 
 [Install]
 WantedBy=focaldesk-session.target

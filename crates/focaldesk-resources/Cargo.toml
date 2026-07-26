@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 focaldesk-sounds = { path = "../focaldesk-sounds" }
-image = "0.25"
+image.workspace = true
 
 tiny-skia.workspace = true
 cosmic-text.workspace = true
