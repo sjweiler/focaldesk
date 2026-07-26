@@ -872,6 +872,16 @@ pub(crate) fn bootstrap_compositor_core(
     };
 
     let theme_manager = ThemeManager::new(theme_id);
+    let mut keybinds = Keybinds::with_defaults(backend);
+    for warning in keybinds.apply_overrides(
+        settings
+            .input
+            .keybindings
+            .iter()
+            .map(|(action, shortcut)| (action.as_str(), shortcut.as_str())),
+    ) {
+        warn!(target: "focaldesk", warning = %warning, "ignored keybinding setting");
+    }
 
     flog_info!(
         "FOCALDESK active theme after manager init = {:?}",
@@ -913,7 +923,7 @@ pub(crate) fn bootstrap_compositor_core(
         cursor_manager,
         seat,
         notification_snapshots,
-        keybinds: Keybinds::with_defaults(backend),
+        keybinds,
         running: true,
         client_wayland_display: wayland_display.clone(),
         theme_manager,

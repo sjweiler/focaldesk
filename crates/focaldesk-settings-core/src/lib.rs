@@ -1,6 +1,6 @@
 // crates/focaldesk-settings-core/src/lib.rs
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -111,6 +111,10 @@ pub struct InputSettings {
     /// XKB options (e.g. "ctrl:nocaps"). Empty means none.
     #[serde(default)]
     pub keyboard_options: String,
+    /// Action name to shortcut overrides, for example
+    /// `"launch_terminal": "Super+Enter"`.
+    #[serde(default)]
+    pub keybindings: BTreeMap<String, String>,
 }
 
 fn default_keyboard_layout() -> String {
@@ -289,6 +293,7 @@ pub fn default_settings() -> Settings {
             keyboard_variant: String::new(),
             keyboard_model: String::new(),
             keyboard_options: String::new(),
+            keybindings: BTreeMap::new(),
         },
         apps: AppSettings {
             terminal: "alacritty".into(),
@@ -383,6 +388,29 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.restore_session);
+    }
+
+    #[test]
+    fn keybindings_default_empty_and_round_trip() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("keybindings");
+
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.input.keybindings.is_empty());
+
+        settings
+            .input
+            .keybindings
+            .insert("launch_terminal".into(), "Ctrl+Alt+T".into());
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(
+            restored.input.keybindings.get("launch_terminal"),
+            Some(&"Ctrl+Alt+T".to_string())
+        );
     }
 
     #[test]

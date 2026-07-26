@@ -60,6 +60,16 @@ const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "P
 const PERFORMANCE_MODE_OPTIONS: &[&str] = &["Balanced", "Performance", "Power saver"];
 const BROWSER_LAUNCH_BACKEND_OPTIONS: &[&str] = &["Auto", "Wayland", "XWayland"];
 const DISPLAY_COLOR_PROFILE_OPTIONS: &[&str] = &["Auto", "sRGB", "Display P3"];
+const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
+    ("launch_terminal", "Open terminal", "Super+Enter"),
+    ("launch_browser", "Open browser", "Super+B"),
+    ("toggle_launcher", "Open launcher", "Ctrl+Alt+D"),
+    ("close_focused", "Close focused window", "Super+Q"),
+    ("lock_screen", "Lock screen", "Super+L"),
+    ("toggle_clipboard_history", "Clipboard history", "Super+V"),
+    ("focus_previous", "Focus previous window", "Super+F7"),
+    ("focus_next", "Focus next window", "Super+F8"),
+];
 
 #[derive(Debug, Clone)]
 struct WifiNetwork {
@@ -2070,7 +2080,7 @@ fn build_ui(app: &adw::Application) {
     );
     pages.insert("Chrome".to_string(), chrome_page(settings.clone()));
     pages.insert("Workspaces".to_string(), workspaces_page(settings.clone()));
-    pages.insert("Keyboard".to_string(), keyboard_page());
+    pages.insert("Keyboard".to_string(), keyboard_page(settings.clone()));
     pages.insert("Privacy".to_string(), privacy_page(settings.clone()));
     pages.insert("Power".to_string(), power_page(settings.clone()));
     pages.insert("Debug".to_string(), debug_page(settings.clone()));
@@ -3891,8 +3901,8 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     ));
 
     let count_row = adw::ActionRow::new();
-    count_row.set_title("Number of workspaces");
-    count_row.set_subtitle("Static workspace slots shown by the desktop shell");
+    count_row.set_title("Visible workspace slots");
+    count_row.set_subtitle("Maximum numbered workspaces shown before the overflow button");
     let count = gtk::SpinButton::with_range(1.0, 9.0, 1.0);
     count.set_value(settings.borrow().workspaces.max_workspace_slots as f64);
     count.set_numeric(true);
@@ -3954,20 +3964,20 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
 
     let keybind_group = adw::PreferencesGroup::new();
     keybind_group.set_title("Keybind Hints");
-    add_info_row(&keybind_group, "Switch to workspace 1", None, "Super+1");
-    add_info_row(&keybind_group, "Switch to workspace 2", None, "Super+2");
+    add_info_row(&keybind_group, "Switch to workspace 1", None, "Alt+1");
     add_info_row(
         &keybind_group,
-        "Move between workspaces",
+        "Move window to workspace 1",
         None,
-        "Super+Arrow",
+        "Alt+Shift+1",
     );
+    add_info_row(&keybind_group, "Show all workspaces", None, "Alt+0");
     page.add(&keybind_group);
 
     adw::NavigationPage::new(&page, "Workspaces")
 }
 
-fn keyboard_page() -> adw::NavigationPage {
+fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Keyboard");
 
@@ -3993,17 +4003,55 @@ fn keyboard_page() -> adw::NavigationPage {
 
     let shortcuts_group = adw::PreferencesGroup::new();
     shortcuts_group.set_title("Shortcuts");
-    add_info_row(&shortcuts_group, "Open launcher", None, "Super");
-    add_info_row(&shortcuts_group, "Open terminal", None, "Super+Enter");
-    add_info_row(&shortcuts_group, "Close focused window", None, "Super+Q");
-    add_info_row(&shortcuts_group, "Screenshot shortcut", None, "Print");
-    add_info_row(&shortcuts_group, "Lock screen shortcut", None, "Super+L");
-    add_button_row(
+    shortcuts_group.set_description(Some(
+        "Use combinations such as Super+Enter, Ctrl+Alt+D, or Print.",
+    ));
+    let mut shortcut_entries = Vec::new();
+    for &(action, label, default_shortcut) in EDITABLE_KEYBINDINGS {
+        let entry = add_entry_row(&shortcuts_group, label, default_shortcut);
+        let value = settings
+            .borrow()
+            .input
+            .keybindings
+            .get(action)
+            .cloned()
+            .unwrap_or_else(|| default_shortcut.to_string());
+        entry.set_text(&value);
+        {
+            let settings = settings.clone();
+            entry.connect_changed(move |entry| {
+                settings
+                    .borrow_mut()
+                    .input
+                    .keybindings
+                    .insert(action.to_string(), entry.text().trim().to_string());
+                persist_settings(&settings.borrow());
+            });
+        }
+        shortcut_entries.push((action, default_shortcut, entry));
+    }
+
+    let reset = add_button_row(
         &shortcuts_group,
         "Reset shortcuts",
         Some("Restore the default keyboard shortcuts"),
         "Reset",
     );
+    {
+        let settings = settings.clone();
+        reset.connect_clicked(move |_| {
+            settings.borrow_mut().input.keybindings.clear();
+            for &(action, default_shortcut, ref entry) in &shortcut_entries {
+                settings
+                    .borrow_mut()
+                    .input
+                    .keybindings
+                    .insert(action.to_string(), default_shortcut.to_string());
+                entry.set_text(default_shortcut);
+            }
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&shortcuts_group);
 
     adw::NavigationPage::new(&page, "Keyboard")

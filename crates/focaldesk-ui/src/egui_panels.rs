@@ -64,6 +64,19 @@ pub struct ClipboardPanel {
     pub entries: Vec<ClipboardEntryView>,
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkspaceEntryView {
+    pub number: u32,
+    pub name: String,
+    pub active: bool,
+}
+
+#[derive(Default)]
+pub struct WorkspacesPanel {
+    pub open: bool,
+    pub entries: Vec<WorkspaceEntryView>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceDialogMode {
     Add,
@@ -165,6 +178,47 @@ impl WorkspaceDialog {
             });
 
         self.open = open && !close_requested;
+    }
+}
+
+impl WorkspacesPanel {
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            return;
+        }
+
+        let mut open = self.open;
+        let mut selected = None;
+        egui::Window::new("Workspaces")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(340.0)
+            .default_pos(egui::pos2(
+                frame_ctx.work.loc.x as f32 + 24.0,
+                frame_ctx.work.loc.y as f32 + 24.0,
+            ))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Choose a workspace for this display");
+                ui.add_space(8.0);
+                for entry in &self.entries {
+                    let label = format!("{}  {}", entry.number, entry.name);
+                    if ui.selectable_label(entry.active, label).clicked() {
+                        selected = Some(entry.number);
+                    }
+                }
+            });
+
+        if let Some(workspace) = selected {
+            actions.push(UiAction::FocusWorkspace(workspace));
+            open = false;
+        }
+        self.open = open;
     }
 }
 

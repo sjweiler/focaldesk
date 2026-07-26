@@ -14,8 +14,8 @@ working configuration before testing a new revision.
 | `$XDG_CONFIG_HOME/focaldesk/settings.json` | Main desktop, application, input, workspace, privacy, power, debug, and chrome settings | Prefer the Settings application |
 | `$XDG_CONFIG_HOME/focaldesk/config.toml` | Compact compositor appearance and display configuration used by the typed config API | Developer-facing; may be consolidated with `settings.json` later |
 | `$XDG_CONFIG_HOME/focaldesk/displays.json` | Detected output topology and runtime display choices | Generated; do not edit while FocalDesk is running |
-| `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions | Manage through the permission UI when possible |
-| `$XDG_CONFIG_HOME/focaldesk/automation/automations.toml` | Scheduled automation definitions | Experimental |
+| `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions; stored mode `0600` | Manage through the permission UI when possible |
+| `$XDG_CONFIG_HOME/focaldesk/automation/automations.toml` | Scheduled automation definitions | Experimental; service is opt-in |
 | `$XDG_CONFIG_HOME/focaldesk/automation/scripts/` | Lua automation scripts referenced by `automations.toml` | Experimental and security-sensitive |
 | `$XDG_CONFIG_HOME/focaldesk/secrets-acl.toml` | Per-systemd-unit access to native credential-broker keys | Security-sensitive; default deny |
 
@@ -30,7 +30,8 @@ The main settings model currently includes:
 - Appearance: theme, accent, shell sizing, icons, and animations.
 - Displays: connector, mode, position, scale, primary output, color profile,
   ICC profile, and requested HDR state.
-- Input: pointer speed, natural scrolling, and XKB layout options.
+- Input: pointer speed, natural scrolling, XKB layout options, and validated
+  compositor shortcut overrides.
 - Applications: preferred terminal, browser, browser backend, and file manager.
 - Workspaces: session restore, launch maximization, and visible workspace slots.
 - Privacy, power, diagnostic logging, and desktop chrome layout.
@@ -38,6 +39,11 @@ The main settings model currently includes:
 Use the Settings application for ordinary changes. If you edit JSON or TOML by
 hand, stop the component that owns the file first and validate the syntax before
 restarting it.
+
+Common shortcuts are editable on the Keyboard page. Advanced overrides use the
+`input.keybindings` object in `settings.json`; see
+[Default Keybindings](keybindings.md#configuration-syntax) for action names and
+shortcut syntax.
 
 ## Environment variables
 
@@ -83,5 +89,8 @@ ACLs, and commands for storing provider keys.
 
 See [Troubleshooting](troubleshooting.md#logs) for log locations. AI memory,
 browser profiles, clipboard history, and other runtime state may also live below
-the standard XDG config, state, or cache directories. Back up the entire
-`focaldesk` directory when preserving an alpha installation across upgrades.
+the standard XDG config, state, or cache directories. Clipboard history, AI
+Console state, AI permission records, and AI memory are created with private
+per-user permissions. Clipboard capture is limited to one MiB and two seconds
+per selection. Back up the entire `focaldesk` directory when preserving an
+alpha installation across upgrades.

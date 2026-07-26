@@ -20,7 +20,8 @@ use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_panels::{
     AudioPanel, BluetoothPanel, CalendarPanel, ClipboardEntryView, ClipboardPanel, DebugPanel,
-    EguiPanelView, NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog,
+    EguiPanelView, NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog, WorkspaceEntryView,
+    WorkspacesPanel,
 };
 use crate::types::{PanelKind, UiAction};
 
@@ -36,6 +37,7 @@ pub struct EguiLayer {
     calendar: CalendarPanel,
     debug: DebugPanel,
     workspace_dialog: WorkspaceDialog,
+    workspaces: WorkspacesPanel,
     clipboard: ClipboardPanel,
 
     textures_delta: TexturesDelta,
@@ -168,6 +170,7 @@ impl Default for EguiLayer {
             calendar: CalendarPanel::default(),
             debug: DebugPanel::default(),
             workspace_dialog: WorkspaceDialog::default(),
+            workspaces: WorkspacesPanel::default(),
             clipboard: ClipboardPanel::default(),
         }
     }
@@ -278,6 +281,7 @@ impl EguiLayer {
             || self.calendar.open
             || self.debug.open
             || self.workspace_dialog.open
+            || self.workspaces.open
             || self.clipboard.open
     }
 
@@ -320,6 +324,10 @@ impl EguiLayer {
                 self.clipboard.open = !self.clipboard.open;
                 opened = self.clipboard.open;
             }
+            PanelKind::Workspaces => {
+                self.workspaces.open = !self.workspaces.open;
+                opened = self.workspaces.open;
+            }
             _ => {}
         }
 
@@ -345,6 +353,7 @@ impl EguiLayer {
             self.debug.show(ctx, frame_ctx, &mut self.actions);
             self.workspace_dialog
                 .show(ctx, frame_ctx, &mut self.actions);
+            self.workspaces.show(ctx, frame_ctx, &mut self.actions);
             self.clipboard.show(ctx, frame_ctx, &mut self.actions);
         });
 
@@ -434,6 +443,7 @@ impl EguiLayer {
         self.calendar.open = false;
         self.debug.open = false;
         self.workspace_dialog.open = false;
+        self.workspaces.open = false;
         self.clipboard.open = false;
         self.owner_output = None;
     }
@@ -444,6 +454,10 @@ impl EguiLayer {
 
     pub fn set_clipboard_entries(&mut self, entries: Vec<ClipboardEntryView>) {
         self.clipboard.entries = entries;
+    }
+
+    pub fn set_workspace_entries(&mut self, entries: Vec<WorkspaceEntryView>) {
+        self.workspaces.entries = entries;
     }
 
     pub fn refresh_power_status_now(&mut self) {
@@ -1064,7 +1078,10 @@ fn egui_work_rect(frame_ctx: &DesktopFrameCtx) -> egui::Rect {
 
 #[cfg(test)]
 mod egui_vertex_layout_tests {
+    use super::EguiLayer;
+    use crate::types::PanelKind;
     use egui::epaint::Vertex;
+    use focaldesk_types::OutputId;
     use std::mem;
 
     #[test]
@@ -1073,5 +1090,18 @@ mod egui_vertex_layout_tests {
         assert_eq!(mem::offset_of!(Vertex, pos), 0);
         assert_eq!(mem::offset_of!(Vertex, uv), 8);
         assert_eq!(mem::offset_of!(Vertex, color), 16);
+    }
+
+    #[test]
+    fn workspace_panel_can_be_opened_and_toggled() {
+        let mut layer = EguiLayer::default();
+        layer.open_panel(PanelKind::Workspaces, OutputId(7));
+
+        assert!(layer.has_open_panels());
+        assert_eq!(layer.owner_output(), Some(OutputId(7)));
+
+        layer.open_panel(PanelKind::Workspaces, OutputId(7));
+        assert!(!layer.has_open_panels());
+        assert_eq!(layer.owner_output(), None);
     }
 }

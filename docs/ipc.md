@@ -186,8 +186,12 @@ PolicyKit agent, portal, and AI service.
 
 This process identity boundary protects services from unrelated applications
 in the same desktop session. It does not treat the user's own writable binaries
-as a security boundary; packaged systemd units and root-owned installed
-binaries provide the strongest identity.
+as a security boundary. Release builds accept executable-name grants only when
+the resolved executable is root-owned and not group- or world-writable;
+systemd-unit grants remain available to packaged user services. Debug builds
+allow user-owned executables for repository development. The
+`FOCALDESK_ALLOW_USER_OWNED_IPC_PEERS` escape hatch restores that development
+behavior explicitly and must not be set in a production session.
 
 AI and automation features must not have unrestricted control over the desktop.
 

@@ -39,6 +39,7 @@ pub enum UiAction {
     SetSetting(SettingKey, bool),
     OpenPanel(PanelKind),
     ReloadSettings,
+    FocusWorkspace(u32),
     CreateWorkspace(String),
     DeleteWorkspace,
     SetVolume(f32),

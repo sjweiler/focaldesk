@@ -347,6 +347,122 @@ impl Keybinds {
         let combo = KeyCombo { mods, sym };
         self.map.get(&combo).copied()
     }
+
+    /// Apply user shortcut overrides while retaining defaults for invalid
+    /// entries. Conflicts are rejected so one override cannot silently disable
+    /// another action.
+    pub fn apply_overrides<'a>(
+        &mut self,
+        overrides: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for (action_name, shortcut) in overrides {
+            let Some(action) = action_from_name(action_name) else {
+                warnings.push(format!("unknown keybinding action `{action_name}`"));
+                continue;
+            };
+            let combo = match parse_shortcut(shortcut) {
+                Ok(combo) => combo,
+                Err(error) => {
+                    warnings.push(format!("invalid shortcut for `{action_name}`: {error}"));
+                    continue;
+                }
+            };
+
+            if let Some(displaced) = self.map.get(&combo).copied()
+                && displaced != action
+            {
+                warnings.push(format!(
+                    "shortcut `{shortcut}` for `{action_name}` conflicts with {displaced:?}"
+                ));
+                continue;
+            }
+            self.map.retain(|_, existing| *existing != action);
+            self.map.insert(combo, action);
+        }
+        warnings
+    }
+}
+
+fn action_from_name(name: &str) -> Option<KeyAction> {
+    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+    let action = match normalized.as_str() {
+        "close_focused" => KeyAction::CloseFocused,
+        "focus_next" => KeyAction::FocusNext,
+        "focus_previous" | "focus_prev" => KeyAction::FocusPrev,
+        "focus_shell_next" => KeyAction::FocusShellNext,
+        "focus_shell_previous" | "focus_shell_prev" => KeyAction::FocusShellPrevious,
+        "show_workspaces" | "overflow_view" => KeyAction::OverflowView,
+        "quit_compositor" => KeyAction::QuitCompositor,
+        "toggle_launcher" => KeyAction::ToggleLauncher,
+        "launch_terminal" => KeyAction::LaunchTerminal,
+        "lock_screen" => KeyAction::LockScreen,
+        "take_screenshot" => KeyAction::TakeScreenshot,
+        "take_screenshot_all" => KeyAction::TakeScreenshotAll,
+        "launch_browser" => KeyAction::LaunchBrowser,
+        "launch_files" => KeyAction::LaunchFiles,
+        "toggle_clipboard_history" => KeyAction::ToggleClipboardHistory,
+        "toggle_voice_capture" => KeyAction::ToggleVoiceCapture,
+        _ => {
+            if let Some(slot) = numbered_action(&normalized, "activate_workspace_") {
+                return Some(KeyAction::ActivateSlot(slot));
+            }
+            if let Some(slot) = numbered_action(&normalized, "move_to_workspace_") {
+                return Some(KeyAction::AssignSlot(slot));
+            }
+            return None;
+        }
+    };
+    Some(action)
+}
+
+fn numbered_action(name: &str, prefix: &str) -> Option<usize> {
+    let number = name.strip_prefix(prefix)?.parse::<usize>().ok()?;
+    (1..=9).contains(&number).then_some(number - 1)
+}
+
+fn parse_shortcut(shortcut: &str) -> Result<KeyCombo, String> {
+    let parts: Vec<&str> = shortcut
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let (key_name, modifiers) = parts
+        .split_last()
+        .ok_or_else(|| "shortcut is empty".to_string())?;
+
+    let mut mods = ModMask::empty();
+    for modifier in modifiers {
+        let flag = match modifier.to_ascii_lowercase().as_str() {
+            "shift" => ModMask::SHIFT,
+            "ctrl" | "control" => ModMask::CTRL,
+            "alt" => ModMask::ALT,
+            "super" | "logo" | "meta" => ModMask::SUPER,
+            _ => return Err(format!("unknown modifier `{modifier}`")),
+        };
+        if mods.contains(flag) {
+            return Err(format!("duplicate modifier `{modifier}`"));
+        }
+        mods |= flag;
+    }
+
+    let canonical = match key_name.to_ascii_lowercase().as_str() {
+        "enter" => "Return".to_string(),
+        "esc" => "Escape".to_string(),
+        "space" => "space".to_string(),
+        "printscreen" => "Print".to_string(),
+        other if other.len() == 1 => other.to_string(),
+        _ => key_name.to_string(),
+    };
+    let sym = xkb::keysym_from_name(&canonical, 0).raw();
+    if sym == keysyms::KEY_NoSymbol {
+        return Err(format!("unknown key `{key_name}`"));
+    }
+
+    Ok(KeyCombo {
+        mods,
+        sym: keysym_to_lower(sym),
+    })
 }
 
 fn keysym_to_lower(sym: u32) -> u32 {
@@ -433,5 +549,65 @@ mod tests {
                 Some(KeyAction::FocusShellPrevious)
             );
         }
+    }
+
+    #[test]
+    fn configurable_shortcuts_replace_defaults() {
+        let mut keybinds = Keybinds::with_defaults(BackendKind::Drm);
+        let warnings = keybinds.apply_overrides([("launch_terminal", "Ctrl+Alt+T")]);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_t, ModMask::CTRL | ModMask::ALT),
+            Some(KeyAction::LaunchTerminal)
+        );
+        assert_eq!(keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER), None);
+    }
+
+    #[test]
+    fn invalid_shortcuts_leave_the_default_binding_intact() {
+        let mut keybinds = Keybinds::with_defaults(BackendKind::Winit);
+        let warnings = keybinds.apply_overrides([("launch_terminal", "Hyper+DefinitelyNotAKey")]);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            Some(KeyAction::LaunchTerminal)
+        );
+    }
+
+    #[test]
+    fn numbered_workspace_actions_are_configurable() {
+        let mut keybinds = Keybinds::with_defaults(BackendKind::Winit);
+        let warnings = keybinds.apply_overrides([
+            ("activate_workspace_4", "Super+4"),
+            ("move_to_workspace_4", "Super+Shift+4"),
+        ]);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_4, ModMask::SUPER),
+            Some(KeyAction::ActivateSlot(3))
+        );
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_4, ModMask::SUPER | ModMask::SHIFT),
+            Some(KeyAction::AssignSlot(3))
+        );
+    }
+
+    #[test]
+    fn conflicting_override_does_not_displace_an_existing_action() {
+        let mut keybinds = Keybinds::with_defaults(BackendKind::Winit);
+        let warnings = keybinds.apply_overrides([("launch_terminal", "Super+B")]);
+
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_b, ModMask::SUPER),
+            Some(KeyAction::LaunchBrowser)
+        );
+        assert_eq!(
+            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            Some(KeyAction::LaunchTerminal)
+        );
     }
 }

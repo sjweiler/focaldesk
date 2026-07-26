@@ -75,6 +75,11 @@ When the user switches workspaces:
 4. Schedule a repaint.
 5. Update shell UI.
 
+The default shortcuts are `Alt+1` through `Alt+9`. `Alt+Shift+1` through
+`Alt+Shift+9` move the focused window and follow it to the destination.
+`Alt+0` opens a selectable list containing every workspace, including entries
+that do not fit in the sidebar.
+
 ## Rendering
 
 Only windows belonging to the active workspace on each output are composited into the scene.
@@ -111,10 +116,7 @@ Changing the workspace on one monitor does not necessarily affect the other.
 - Drag windows between workspaces
 - Workspace thumbnails
 - Animated transitions
-- Dynamic workspace creation
-- Named workspaces
 - Per-workspace wallpapers
-- Keyboard shortcuts
 - Multi-monitor synchronization options
 
 ## Design Principles
@@ -124,4 +126,3 @@ Changing the workspace on one monitor does not necessarily affect the other.
 - Preserve user context.
 - Support independent monitor workflows.
 - Make future extensions straightforward.
-

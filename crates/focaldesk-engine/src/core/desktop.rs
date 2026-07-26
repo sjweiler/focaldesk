@@ -49,7 +49,7 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -291,8 +291,8 @@ const UNATTENDED_SUSPEND_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 enum UnattendedSuspendState {
-    Requested { at: Instant, unlock_on_resume: bool },
-    Sleeping { unlock_on_resume: bool },
+    Requested { at: Instant },
+    Sleeping,
 }
 
 impl UnattendedSuspendState {
@@ -302,28 +302,22 @@ impl UnattendedSuspendState {
         };
 
         match pending {
-            Self::Requested {
-                at,
-                unlock_on_resume,
-            } if now.saturating_duration_since(at) <= UNATTENDED_SUSPEND_PREPARE_TIMEOUT => {
-                *state = Some(Self::Sleeping { unlock_on_resume });
+            Self::Requested { at }
+                if now.saturating_duration_since(at) <= UNATTENDED_SUSPEND_PREPARE_TIMEOUT =>
+            {
+                *state = Some(Self::Sleeping);
                 true
             }
-            Self::Sleeping { unlock_on_resume } => {
-                *state = Some(Self::Sleeping { unlock_on_resume });
+            Self::Sleeping => {
+                *state = Some(Self::Sleeping);
                 true
             }
             Self::Requested { .. } => false,
         }
     }
 
-    fn take_resume_unlock(state: &mut Option<Self>) -> bool {
-        matches!(
-            state.take(),
-            Some(Self::Sleeping {
-                unlock_on_resume: true
-            })
-        )
+    fn clear_after_resume(state: &mut Option<Self>) {
+        state.take();
     }
 }
 
@@ -739,6 +733,7 @@ pub struct DesktopState {
     pub(crate) clipboard_capture_tx: mpsc::Sender<(String, String)>,
     clipboard_capture_rx: mpsc::Receiver<(String, String)>,
     pub(crate) clipboard_pending_captures: Vec<String>,
+    pub(crate) clipboard_capture_active: Arc<AtomicBool>,
     pub pointer_constraints_state: PointerConstraintsState,
     pub relative_pointer_state: RelativePointerManagerState,
     pub layer_shell_state: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
@@ -776,6 +771,7 @@ pub struct DesktopState {
     // focus/input
     pub seat_name: String,
     pub focused_window: Option<WindowId>,
+    workspace_focus: HashMap<(OutputId, WorkspaceId), WindowId>,
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
     last_user_activity_at: Instant,
     idle_lock_triggered: bool,
@@ -813,6 +809,9 @@ pub struct DesktopState {
     //pub sidebar: SidebarModel,
     pub notification_snapshots: Vec<NotificationSnapshot>,
     pub lock_screen: LockScreenState,
+    lock_auth_tx: mpsc::Sender<(u64, bool)>,
+    lock_auth_rx: mpsc::Receiver<(u64, bool)>,
+    lock_auth_generation: u64,
 
     // xwayland and special surfaces
     pub unmapped_windows: Vec<ManagedWindow>,
@@ -1133,6 +1132,23 @@ impl DesktopState {
             return;
         }
 
+        while let Ok((generation, authenticated)) = self.lock_auth_rx.try_recv() {
+            if generation != self.lock_auth_generation || !self.lock_screen.authenticating {
+                continue;
+            }
+            self.lock_screen.authenticating = false;
+            self.lock_screen.clear_password();
+            if authenticated {
+                self.lock_screen.message = "Unlocked".to_string();
+                self.lock_screen.pulse(LockPulseKind::Accepted);
+                self.record_user_activity();
+            } else {
+                self.lock_screen.message = "Wrong password".to_string();
+                self.lock_screen.pulse(LockPulseKind::Rejected);
+            }
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        }
+
         let now = Instant::now();
         if let Some(pulse) = self.lock_screen.pulse {
             let elapsed = now.saturating_duration_since(pulse.started_at);
@@ -1304,8 +1320,7 @@ impl DesktopState {
 
     /// Reset compositor-side state after the session comes back from suspend.
     pub(crate) fn handle_session_resume(&mut self) {
-        let unlock_on_resume =
-            UnattendedSuspendState::take_resume_unlock(&mut self.unattended_suspend_state);
+        UnattendedSuspendState::clear_after_resume(&mut self.unattended_suspend_state);
         self.last_user_activity_at = Instant::now();
         self.idle_lock_triggered = false;
         self.idle_suspend_triggered = false;
@@ -1316,9 +1331,6 @@ impl DesktopState {
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
         self.render.invalidate_gpu_state();
         self.render.egui.refresh_power_status_now();
-        if unlock_on_resume {
-            self.lock_screen.unlock();
-        }
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
@@ -1425,6 +1437,17 @@ impl DesktopState {
         self.apply_config(config);
 
         let settings = load_settings();
+        let mut keybinds = Keybinds::with_defaults(self.backend_kind);
+        for warning in keybinds.apply_overrides(
+            settings
+                .input
+                .keybindings
+                .iter()
+                .map(|(action, shortcut)| (action.as_str(), shortcut.as_str())),
+        ) {
+            flog_warn!("Ignored keybinding setting: {warning}");
+        }
+        self.keybinds = keybinds;
         self.apps = settings.apps;
         self.workspaces = settings.workspaces;
         self.privacy = settings.privacy;
@@ -2204,6 +2227,24 @@ impl DesktopState {
                     id: entry.id,
                     preview: entry.text.clone(),
                 })
+                .collect(),
+        );
+        let active_workspace = self
+            .outputs
+            .get(&frame_ctx.rendering_output)
+            .map(|output| output.active_workspace)
+            .unwrap_or(self.active_workspace);
+        self.render.egui.set_workspace_entries(
+            self.workspace_names
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, name)| focaldesk_ui::egui_panels::WorkspaceEntryView {
+                        number: (index + 1) as u32,
+                        name: name.clone(),
+                        active: active_workspace.0 == (index + 1) as u32,
+                    },
+                )
                 .collect(),
         );
         self.render.egui.update_panels(frame_ctx);
@@ -3354,6 +3395,10 @@ impl DesktopState {
                 self.reload_settings_from_disk();
             }
 
+            UiAction::FocusWorkspace(workspace) => {
+                self.set_focused_workspace(WorkspaceId(workspace));
+            }
+
             UiAction::CreateWorkspace(name) => {
                 self.create_workspace_from_dialog(name);
             }
@@ -3551,6 +3596,7 @@ impl DesktopState {
         self.render.egui.close_all_panels();
         self.active_dialog = None;
         self.clear_client_pointer_focus(self.pointer_pos);
+        self.lock_auth_generation = self.lock_auth_generation.wrapping_add(1);
         self.lock_screen.lock();
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
@@ -3567,12 +3613,7 @@ impl DesktopState {
         if matches!(action, PowerIpcRequest::Suspend) {
             self.unattended_suspend_state = if interaction == PowerActionInteraction::NonInteractive
             {
-                Some(UnattendedSuspendState::Requested {
-                    at: Instant::now(),
-                    // Preserve an intentional lock, but undo a lock caused only
-                    // by the idle blank-screen timer after an unattended wake.
-                    unlock_on_resume: !self.lock_screen.active || self.idle_lock_triggered,
-                })
+                Some(UnattendedSuspendState::Requested { at: Instant::now() })
             } else {
                 None
             };
@@ -3639,24 +3680,28 @@ impl DesktopState {
         self.lock_screen.message = "Authenticating".to_string();
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
 
-        let password = self.lock_screen.password.clone();
-        let authenticated = match authenticate_current_user(&password) {
-            Ok(authenticated) => authenticated,
-            Err(err) => {
-                flog_error!("PAM authentication failed: {err}");
-                false
-            }
-        };
-
-        self.lock_screen.authenticating = false;
+        let password = zeroize::Zeroizing::new(self.lock_screen.password.to_string());
         self.lock_screen.clear_password();
-
-        if authenticated {
-            self.lock_screen.message = "Unlocked".to_string();
-            self.lock_screen.pulse(LockPulseKind::Accepted);
-            self.record_user_activity();
-        } else {
-            self.lock_screen.message = "Wrong password".to_string();
+        self.lock_auth_generation = self.lock_auth_generation.wrapping_add(1);
+        let generation = self.lock_auth_generation;
+        let result_tx = self.lock_auth_tx.clone();
+        if thread::Builder::new()
+            .name("focaldesk-lock-auth".to_string())
+            .spawn(move || {
+                let authenticated = match authenticate_current_user(&password) {
+                    Ok(authenticated) => authenticated,
+                    Err(err) => {
+                        flog_error!("PAM authentication failed: {err}");
+                        false
+                    }
+                };
+                let _ = result_tx.send((generation, authenticated));
+            })
+            .is_err()
+        {
+            self.lock_screen.authenticating = false;
+            self.lock_screen.clear_password();
+            self.lock_screen.message = "Authentication service unavailable".to_string();
             self.lock_screen.pulse(LockPulseKind::Rejected);
         }
 
@@ -3774,12 +3819,63 @@ impl DesktopState {
         if workspace.0 == 0 || workspace.0 as usize > self.workspace_names.len() {
             return;
         }
+        let previous_workspace = self.focused_workspace();
+        if let Some(window_id) = self.focused_window {
+            if self.window(window_id).is_some_and(|window| {
+                window.mapped && !window.minimized && window.workspace == previous_workspace
+            }) {
+                self.workspace_focus
+                    .insert((self.focused_output, previous_workspace), window_id);
+            }
+        }
         if let Some(output) = self.outputs.get_mut(&self.focused_output) {
             output.active_workspace = workspace;
         }
         self.active_workspace = workspace;
         self.rebuild_ui_tree_for_output(self.focused_output);
         self.mark_focused_output_full_damage(DamageSource::Unknown);
+        self.focus_top_window_on_focused_output(workspace);
+    }
+
+    fn focus_top_window_on_focused_output(&mut self, workspace: WorkspaceId) {
+        let remembered =
+            self.workspace_focus
+                .get(&(self.focused_output, workspace))
+                .copied()
+                .filter(|window_id| {
+                    self.window(*window_id).is_some_and(|managed| {
+                        managed.mapped
+                            && !managed.minimized
+                            && managed.workspace == workspace
+                            && managed.output.unwrap_or_else(|| {
+                                self.preferred_output_id_for_window(&managed.window)
+                            }) == self.focused_output
+                    })
+                });
+        let target = remembered.or_else(|| {
+            self.space.elements().rev().find_map(|window| {
+                let managed = self.windows.iter().find(|managed| {
+                    managed.mapped
+                        && !managed.minimized
+                        && managed.workspace == workspace
+                        && &managed.window == window
+                })?;
+                let output = managed
+                    .output
+                    .unwrap_or_else(|| self.preferred_output_id_for_window(window));
+                (output == self.focused_output).then_some(managed.id)
+            })
+        });
+
+        if let Some(window_id) = target {
+            self.focus_window_id(window_id);
+            return;
+        }
+
+        self.focused_window = None;
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        }
     }
 
     fn focused_output_screen(&self) -> Rectangle<i32, Logical> {
@@ -3864,6 +3960,18 @@ impl DesktopState {
         }
 
         self.workspace_names.remove(delete_index);
+        self.workspace_focus = std::mem::take(&mut self.workspace_focus)
+            .into_iter()
+            .filter_map(|((output, mut workspace), window)| {
+                if workspace.0 == deleted_number {
+                    return None;
+                }
+                if workspace.0 > deleted_number {
+                    workspace.0 -= 1;
+                }
+                Some(((output, workspace), window))
+            })
+            .collect();
 
         let fallback = (delete_index.min(self.workspace_names.len().saturating_sub(1)) + 1) as u32;
 
@@ -3999,6 +4107,7 @@ impl DesktopState {
     /// disappeared. This also invalidates output-indexed capture/cursor state so reused
     /// OutputIds cannot accidentally refer to textures from the old topology.
     pub(crate) fn restore_output_topology(&mut self, snapshot: OutputTopologySnapshot) {
+        self.workspace_focus.clear();
         let outputs_by_name: HashMap<String, OutputId> = self
             .outputs
             .iter()
@@ -4987,6 +5096,11 @@ impl DesktopState {
 
         self.focused_window = Some(window_id);
         let window = self.windows[idx].window.clone();
+        let workspace = self.windows[idx].workspace;
+        let output = self.windows[idx]
+            .output
+            .unwrap_or_else(|| self.preferred_output_id_for_window(&window));
+        self.workspace_focus.insert((output, workspace), window_id);
         self.space.raise_element(&window, true);
         let new_focus_bbox = self.global_window_bbox(&window);
 
@@ -5033,13 +5147,24 @@ impl DesktopState {
 
     /// Cycle keyboard focus among mapped windows in compositor stacking order (bottom → top).
     fn cycle_focused_window(&mut self, delta: isize) {
+        let workspace = self.focused_workspace();
+        let focused_output = self.focused_output;
         let ids: Vec<WindowId> = self
             .space
             .elements()
             .filter_map(|w| {
                 self.windows
                     .iter()
-                    .find(|mw| mw.mapped && &mw.window == w)
+                    .find(|mw| {
+                        mw.mapped
+                            && !mw.minimized
+                            && mw.workspace == workspace
+                            && &mw.window == w
+                            && mw
+                                .output
+                                .unwrap_or_else(|| self.preferred_output_id_for_window(w))
+                                == focused_output
+                    })
                     .map(|mw| mw.id)
             })
             .collect();
@@ -5066,6 +5191,7 @@ impl DesktopState {
         let (microphone_detection_tx, microphone_detection_rx) = mpsc::channel();
         let (voice_capture_status_tx, voice_capture_status_rx) = mpsc::channel();
         let (network_state_tx, network_state_rx) = mpsc::channel();
+        let (lock_auth_tx, lock_auth_rx) = mpsc::channel();
         let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
@@ -5107,6 +5233,7 @@ impl DesktopState {
             clipboard_capture_tx: clipboard_capture_tx.clone(),
             clipboard_capture_rx,
             clipboard_pending_captures: Vec::new(),
+            clipboard_capture_active: Arc::new(AtomicBool::new(false)),
             pointer_constraints_state: init.pointer_constraints_state,
             relative_pointer_state: init.relative_pointer_state,
             layer_shell_state: init.layer_shell_state,
@@ -5135,12 +5262,16 @@ impl DesktopState {
 
             seat_name: "seat-0".to_string(),
             focused_window: None,
+            workspace_focus: HashMap::new(),
             pointer_pos: (0.0, 0.0).into(),
             toplevel_pointer: None,
             dnd_cursor_phase: None,
 
             notification_snapshots: init.notification_snapshots,
             lock_screen: LockScreenState::new(),
+            lock_auth_tx,
+            lock_auth_rx,
+            lock_auth_generation: 0,
             last_user_activity_at: Instant::now(),
             idle_lock_triggered: false,
             idle_suspend_triggered: false,
@@ -5917,15 +6048,15 @@ impl DesktopState {
             }
 
             KeyAction::ActivateSlot(n) => {
-                flog_warn!("Activate slot {} (not implemented yet)", n);
+                self.activate_slot(n);
             }
 
             KeyAction::AssignSlot(n) => {
-                flog_warn!("Assign slot {} (not implemented yet)", n);
+                self.assign_slot(n);
             }
 
             KeyAction::OverflowView => {
-                flog_warn!("Overflow view (not implemented yet)");
+                self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::Workspaces));
             }
 
             KeyAction::TakeScreenshot => {
@@ -6005,11 +6136,39 @@ impl DesktopState {
     }
 
     pub fn activate_slot(&mut self, slot: usize) {
-        flog_warn!("Activate slot {} (not implemented yet)", slot);
+        let Some(workspace) = workspace_for_slot(slot, self.workspace_names.len()) else {
+            flog_warn!(
+                "Cannot activate workspace slot {}: it does not exist",
+                slot + 1
+            );
+            return;
+        };
+        self.set_focused_workspace(workspace);
     }
 
     pub fn assign_slot(&mut self, slot: usize) {
-        flog_warn!("Assign slot {} (not implemented yet)", slot);
+        let Some(workspace) = workspace_for_slot(slot, self.workspace_names.len()) else {
+            flog_warn!(
+                "Cannot assign workspace slot {}: it does not exist",
+                slot + 1
+            );
+            return;
+        };
+        let Some(window_id) = self.focused_window else {
+            return;
+        };
+        let focused_output = self.focused_output;
+        let Some(managed) = self.window_mut(window_id) else {
+            self.focused_window = None;
+            return;
+        };
+        if !managed.mapped {
+            return;
+        }
+        managed.set_workspace(workspace);
+        managed.set_output(Some(focused_output));
+        self.set_focused_workspace(workspace);
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
     fn update_focus(&mut self) {}
@@ -8501,6 +8660,11 @@ fn is_chrome_like(app_name: &str) -> bool {
     )
 }
 
+fn workspace_for_slot(slot: usize, workspace_count: usize) -> Option<WorkspaceId> {
+    let number = slot.checked_add(1)?;
+    (number <= 9 && number <= workspace_count).then_some(WorkspaceId(number as u32))
+}
+
 pub(crate) fn is_browser_like(app_name: &str) -> bool {
     let executable = app_name.rsplit('/').next().unwrap_or(app_name);
     matches!(
@@ -8545,8 +8709,8 @@ fn is_obs_like(app_name: &str) -> bool {
 mod tests {
     use super::{
         clamp_rect_to_bounds, is_browser_like, power_action_interaction, session_power_command,
-        should_wait_for_lid_open_on_resume, PowerActionInteraction, UnattendedSuspendState,
-        UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        should_wait_for_lid_open_on_resume, workspace_for_slot, PowerActionInteraction,
+        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
@@ -8565,6 +8729,21 @@ mod tests {
         assert!(is_browser_like("brave-browser"));
         assert!(!is_browser_like("alacritty"));
         assert!(!is_browser_like("cursor"));
+    }
+
+    #[test]
+    fn workspace_slots_are_one_based_and_bounded_by_existing_workspaces() {
+        assert_eq!(
+            workspace_for_slot(0, 4),
+            Some(focaldesk_types::WorkspaceId(1))
+        );
+        assert_eq!(
+            workspace_for_slot(3, 4),
+            Some(focaldesk_types::WorkspaceId(4))
+        );
+        assert_eq!(workspace_for_slot(4, 4), None);
+        assert_eq!(workspace_for_slot(9, 12), None);
+        assert_eq!(workspace_for_slot(usize::MAX, 9), None);
     }
 
     #[test]
@@ -8639,25 +8818,19 @@ mod tests {
     }
 
     #[test]
-    fn unattended_suspend_can_unlock_automatically_on_resume() {
+    fn unattended_suspend_never_requests_an_automatic_unlock() {
         let now = std::time::Instant::now();
-        let mut state = Some(UnattendedSuspendState::Requested {
-            at: now,
-            unlock_on_resume: true,
-        });
+        let mut state = Some(UnattendedSuspendState::Requested { at: now });
 
         assert!(UnattendedSuspendState::prepare_for_sleep(&mut state, now));
-        assert!(UnattendedSuspendState::take_resume_unlock(&mut state));
+        UnattendedSuspendState::clear_after_resume(&mut state);
         assert!(state.is_none());
     }
 
     #[test]
     fn stale_unattended_suspend_does_not_bypass_the_lock() {
         let now = std::time::Instant::now();
-        let mut state = Some(UnattendedSuspendState::Requested {
-            at: now,
-            unlock_on_resume: true,
-        });
+        let mut state = Some(UnattendedSuspendState::Requested { at: now });
 
         assert!(!UnattendedSuspendState::prepare_for_sleep(
             &mut state,
@@ -8667,15 +8840,13 @@ mod tests {
     }
 
     #[test]
-    fn unattended_suspend_preserves_an_existing_lock() {
+    fn repeated_prepare_for_sleep_keeps_the_suspend_state() {
         let now = std::time::Instant::now();
-        let mut state = Some(UnattendedSuspendState::Requested {
-            at: now,
-            unlock_on_resume: false,
-        });
+        let mut state = Some(UnattendedSuspendState::Requested { at: now });
 
         assert!(UnattendedSuspendState::prepare_for_sleep(&mut state, now));
-        assert!(!UnattendedSuspendState::take_resume_unlock(&mut state));
+        assert!(UnattendedSuspendState::prepare_for_sleep(&mut state, now));
+        UnattendedSuspendState::clear_after_resume(&mut state);
         assert!(state.is_none());
     }
 
