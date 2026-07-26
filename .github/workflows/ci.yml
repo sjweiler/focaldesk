@@ -44,6 +44,9 @@ jobs:
             libsecret-tools \
             dbus-x11 \
             python3-dbus \
+            wayland-utils \
+            weston \
+            xwayland \
             unzip
 
       - name: Install Vosk native library
@@ -74,6 +77,19 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+      - name: Nested compositor compatibility smoke test
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: timeout 240 bash scripts/nested-smoke.sh
+
+      - name: Upload nested compatibility artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nested-smoke
+          path: target/nested-smoke
+          if-no-files-found: warn
 
       - name: focald-secrets end-to-end security tests
         run: bash crates/focald-secrets/tests/integration.sh

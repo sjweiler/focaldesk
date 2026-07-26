@@ -395,6 +395,7 @@ should follow the private process in [SECURITY.md](SECURITY.md).
 ## Documentation
 
 - [Building and installation](docs/building.md)
+- [Compatibility testing](docs/compatibility-testing.md)
 - [Configuration and environment](docs/configuration.md)
 - [Credential broker](docs/secrets.md)
 - [Default keybindings](docs/keybindings.md)

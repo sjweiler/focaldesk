@@ -4,6 +4,12 @@ focaldm_greeter_bin := "/usr/libexec/focaldm-greeter"
 build:
     cargo build
 
+nested-smoke:
+    bash scripts/nested-smoke.sh
+
+nested-smoke-no-build:
+    bash scripts/nested-smoke.sh --no-build
+
 release-desktop:
     cargo build --release -p focaldesk-desktop
 

@@ -8,7 +8,9 @@ truth for what is usable today.
 ## Current stabilization priorities
 
 - Improve compositor crash recovery, diagnostics, and reproducible bug reports.
-- Exercise multi-monitor hotplug, scale, transform, and mixed-refresh behavior.
+- Use the completed nested compatibility harness to expand application coverage
+  and exercise multi-monitor hotplug, scale, transform, and mixed-refresh
+  behavior on recorded hardware configurations.
 - Harden XWayland, portal capture, session startup, and user-service lifecycle.
 - Consolidate overlapping `settings.json` and `config.toml` configuration paths.
 - Keep AI and automation actions explicit, permission-gated, and auditable.
@@ -24,8 +26,10 @@ truth for what is usable today.
 
 ## Desktop experience
 
-- Complete workspace-slot activation, assignment, and overflow behavior.
-- Make keybindings configurable and keep Settings hints synchronized with code.
+- Expand the completed workspace-slot controls with overview thumbnails and
+  animated transitions.
+- Expand the completed keybinding editor with shortcut capture, conflict
+  feedback, and configurable pointer gestures.
 - Mature the launcher, Settings application, file manager, notifications, power
   handling, lock screen, and accessibility behavior.
 - Improve first-run setup, recovery, and uninstall workflows.

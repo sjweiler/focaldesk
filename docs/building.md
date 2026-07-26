@@ -139,6 +139,16 @@ RUST_LOG=debug cargo run -p focaldesk-desktop --no-default-features --features w
 
 See [Troubleshooting](troubleshooting.md) for log locations and common failures.
 
+Run the repeatable nested compatibility smoke test with:
+
+```sh
+just nested-smoke
+```
+
+It captures startup, registry, client, XWayland, and crash-check artifacts below
+`target/nested-smoke`. See
+[Compatibility Testing](compatibility-testing.md) for the matrix and options.
+
 ## Install a DRM/KMS Wayland session
 
 The default compositor features build the direct DRM/KMS backend. Install the

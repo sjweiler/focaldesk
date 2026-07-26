@@ -33,6 +33,10 @@ Enable additional tracing for a nested run:
 RUST_LOG=debug cargo run -p focaldesk-desktop --no-default-features --features winit,xwayland
 ```
 
+For a bounded reproduction with collected artifacts, run `just nested-smoke`.
+Attach the relevant files from `target/nested-smoke` after reviewing them for
+private information. See [Compatibility Testing](compatibility-testing.md).
+
 Logs can contain filenames, application identifiers, model-provider errors, and
 other private context. Review them before posting publicly.
 

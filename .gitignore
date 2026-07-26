@@ -18,6 +18,8 @@ dist/
 *.rlib
 *.d
 *.tmp
+!packaging/sysusers.d/
+!packaging/sysusers.d/*.conf
 
 ########################################
 # Wayland / graphics / compositor

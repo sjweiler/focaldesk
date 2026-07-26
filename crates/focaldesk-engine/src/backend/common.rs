@@ -611,11 +611,18 @@ pub(crate) fn stop_focaldesk_session_target() {
 }
 
 fn publish_portal_environment(wayland_display: &str) {
-    ensure_standard_user_dirs();
-    ensure_xdpw_screencast_config();
-
     std::env::set_var("WAYLAND_DISPLAY", wayland_display);
     std::env::set_var("XDG_CURRENT_DESKTOP", "wlroots");
+
+    if std::env::var_os("FOCALDESK_DISABLE_PORTAL_ENV").is_some() {
+        flog(format!(
+            "portal environment publication disabled for {wayland_display}"
+        ));
+        return;
+    }
+
+    ensure_standard_user_dirs();
+    ensure_xdpw_screencast_config();
 
     let status = std::process::Command::new("dbus-update-activation-environment")
         .args(["--systemd", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"])
