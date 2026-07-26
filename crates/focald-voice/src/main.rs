@@ -14,14 +14,14 @@ mod ipc;
 mod llm;
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{BufRead, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 use action::{to_action, CompositorState, MapError};
+use focaldesk_ipc::transport;
 use intent::VoiceIntent;
 use ipc::IpcClient;
 use llm::PromptContext;
@@ -63,22 +63,17 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let socket = voice_socket_path();
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::remove_file(&socket) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-    let listener = UnixListener::bind(&socket)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
+    let socket = voice_socket_path()?;
+    let listener = transport::bind_user_socket(&socket)?;
     eprintln!("focald-voice: listening at {}", socket.display());
 
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_client(stream, &state, &prompt_ctx),
+            Ok(stream) => {
+                if transport::require_authorized_peer(&stream, transport::VOICE_POLICY).is_ok() {
+                    handle_client(stream, &state, &prompt_ctx);
+                }
+            }
             Err(err) => eprintln!("focald-voice: accept failed: {err}"),
         }
     }
@@ -86,36 +81,27 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn voice_socket_path() -> PathBuf {
-    std::env::var_os("FOCALD_VOICE_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
-            runtime.join("focald-voice.sock")
-        })
+fn voice_socket_path() -> Result<PathBuf> {
+    transport::socket_path("FOCALD_VOICE_SOCKET", "focald-voice.sock").map_err(anyhow::Error::msg)
 }
 
 fn handle_client(mut stream: UnixStream, state: &CompositorState, prompt_ctx: &PromptContext) {
-    let mut text = String::new();
-    if let Err(err) = BufReader::new(&stream)
-        .take(64 * 1024)
-        .read_to_string(&mut text)
-    {
-        let _ = writeln!(stream, "error: reading request: {err}");
-        return;
-    }
+    let text = transport::read_limited(&mut stream)
+        .map_err(|err| format!("reading request: {err}"))
+        .and_then(|payload| transport::decode_message::<String>(&payload));
 
-    match process_text(&text, state, prompt_ctx) {
+    let response = match text.and_then(|text| process_text(&text, state, prompt_ctx)) {
         Ok(desc) => {
-            eprintln!("[ok] {:?} -> {desc}", text.trim());
-            let _ = writeln!(stream, "ok: {desc}");
+            eprintln!("[ok] voice request -> {desc}");
+            format!("ok: {desc}\n")
         }
         Err(err) => {
-            eprintln!("[rejected] {:?}: {err}", text.trim());
-            let _ = writeln!(stream, "error: {err}");
+            eprintln!("[rejected] voice request: {err}");
+            format!("error: {err}\n")
         }
+    };
+    if let Ok(encoded) = transport::encode_message(&response) {
+        let _ = stream.write_all(&encoded);
     }
 }
 

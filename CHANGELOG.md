@@ -20,6 +20,10 @@ version numbers where practical.
   damage tracking, HDR, capture, AI, and automation.
 - Provisioned the pinned native Vosk library in CI so workspace tests can link
   voice-enabled applications on Ubuntu runners.
+- Moved desktop-service IPC sockets into a private per-user runtime directory,
+  restricted socket permissions, authenticated peer users and processes,
+  enforced endpoint-specific caller policies, added versioned message
+  envelopes, and bounded request sizes.
 
 ## Historical tags
 

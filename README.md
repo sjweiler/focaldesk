@@ -281,8 +281,9 @@ The background server exposes AI chat over the local IPC socket used by
 `focaldesk-cli ai ...`.
 
 The socket path resolves from `FOCALDESK_AI_SOCKET` first, then
-`$XDG_RUNTIME_DIR/focaldesk-ai.sock` inside a user session, and finally
-`/tmp/focaldesk-ai.sock` when no runtime directory is available.
+`$XDG_RUNTIME_DIR/focaldesk/focaldesk-ai.sock` inside a user session. The
+service refuses to start without a user runtime directory instead of falling
+back to the shared `/tmp` namespace.
 
 By default the AI service asks the compositor to show a native approval modal,
 logs each request, and records the decision through the normal FocalDesk

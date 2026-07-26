@@ -16,3 +16,8 @@ focaldesk-notifications = { path = "../focaldesk-notifications" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-config = { path = "../focaldesk-config" }
 tracing = { workspace = true }
+nix = { workspace = true, features = ["socket", "user"] }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

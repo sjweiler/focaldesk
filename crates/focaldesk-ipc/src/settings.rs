@@ -1,38 +1,36 @@
-use crate::{IpcRequest, IpcResponse, SETTINGS_SOCKET_PATH};
+use crate::{IpcRequest, IpcResponse, settings_socket_path, transport};
 use focaldesk_settings_core::{
     BrowserLaunchBackend, DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode,
     PowerButtonAction, Settings, load_settings, save_settings,
 };
 use std::{
-    io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    io::Write,
+    os::unix::net::UnixStream,
     sync::{Arc, Mutex},
     thread,
 };
 
 pub fn serve_settings_ipc(settings: Arc<Mutex<Settings>>) {
-    let _ = std::fs::remove_file(SETTINGS_SOCKET_PATH);
-
-    let listener = UnixListener::bind(SETTINGS_SOCKET_PATH)
-        .expect("failed to bind FocalDesk settings IPC socket");
+    let path = settings_socket_path().expect("could not resolve FocalDesk settings IPC socket");
+    let listener =
+        transport::bind_user_socket(&path).expect("failed to bind FocalDesk settings IPC socket");
 
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                handle_settings_client(&mut stream, &settings);
-            }
+        for mut stream in listener.incoming().flatten() {
+            handle_settings_client(&mut stream, &settings);
         }
     });
 }
 
 fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings>>) {
-    let mut buf = String::new();
-
-    if stream.read_to_string(&mut buf).is_err() {
+    if transport::require_authorized_peer(stream, transport::SETTINGS_POLICY).is_err() {
         return;
     }
+    let Ok(buf) = transport::read_limited(stream) else {
+        return;
+    };
 
-    let response = match serde_json::from_str::<IpcRequest>(&buf) {
+    let response = match transport::decode_message::<IpcRequest>(&buf) {
         Ok(IpcRequest::GetAll) => {
             let settings = settings.lock().unwrap().clone();
             IpcResponse::Settings { settings }
@@ -100,8 +98,9 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
         },
     };
 
-    let json = serde_json::to_string(&response).unwrap();
-    let _ = stream.write_all(json.as_bytes());
+    if let Ok(json) = transport::encode_message(&response) {
+        let _ = stream.write_all(&json);
+    }
 }
 
 fn apply_setting_value(

@@ -2,13 +2,19 @@ use focaldesk_power::{PowerManager, PowerSnapshot};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixStream,
     sync::Arc,
     thread,
 };
 
-pub const POWER_SOCKET_PATH: &str = "/tmp/focaldesk-power.sock";
+use crate::transport;
 
+pub const POWER_SOCKET_NAME: &str = "power.sock";
+pub const POWER_SOCKET_ENV: &str = "FOCALDESK_POWER_SOCKET_PATH";
+
+pub fn power_socket_path() -> Result<std::path::PathBuf, String> {
+    transport::socket_path(POWER_SOCKET_ENV, POWER_SOCKET_NAME)
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum PowerIpcRequest {
@@ -29,9 +35,11 @@ pub enum PowerIpcResponse {
 }
 
 pub fn send_power_request(request: &PowerIpcRequest) -> Result<PowerIpcResponse, String> {
-    let mut stream = UnixStream::connect(POWER_SOCKET_PATH)
-        .map_err(|err| format!("could not connect to {POWER_SOCKET_PATH}: {err}"))?;
-    let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
+    let path = power_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -42,32 +50,30 @@ pub fn send_power_request(request: &PowerIpcRequest) -> Result<PowerIpcResponse,
     stream
         .read_to_string(&mut response)
         .map_err(|err| err.to_string())?;
-    serde_json::from_str(&response).map_err(|err| err.to_string())
+    transport::decode_message(response.as_bytes())
 }
 
 pub fn serve_power_ipc(manager: Arc<PowerManager>) {
-    let _ = std::fs::remove_file(POWER_SOCKET_PATH);
-
+    let path = power_socket_path().expect("could not resolve FocalDesk power IPC socket");
     let listener =
-        UnixListener::bind(POWER_SOCKET_PATH).expect("failed to bind FocalDesk power IPC socket");
+        transport::bind_user_socket(&path).expect("failed to bind FocalDesk power IPC socket");
 
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                handle_power_client(&mut stream, &manager);
-            }
+        for mut stream in listener.incoming().flatten() {
+            handle_power_client(&mut stream, &manager);
         }
     });
 }
 
 fn handle_power_client(stream: &mut UnixStream, manager: &Arc<PowerManager>) {
-    let mut buf = String::new();
-
-    if stream.read_to_string(&mut buf).is_err() {
+    if transport::require_authorized_peer(stream, transport::POWER_POLICY).is_err() {
         return;
     }
+    let Ok(buf) = transport::read_limited(stream) else {
+        return;
+    };
 
-    let response = match serde_json::from_str::<PowerIpcRequest>(&buf) {
+    let response = match transport::decode_message::<PowerIpcRequest>(&buf) {
         Ok(PowerIpcRequest::GetSnapshot) => PowerIpcResponse::PowerSnapshot {
             snapshot: manager.snapshot(),
         },
@@ -94,8 +100,9 @@ fn handle_power_client(stream: &mut UnixStream, manager: &Arc<PowerManager>) {
         },
     };
 
-    let json = serde_json::to_string(&response).unwrap();
-    let _ = stream.write_all(json.as_bytes());
+    if let Ok(json) = transport::encode_message(&response) {
+        let _ = stream.write_all(&json);
+    }
 }
 
 fn dispatch_power_command(

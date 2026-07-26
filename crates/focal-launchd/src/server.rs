@@ -1,7 +1,6 @@
 // focal-launchd/src/server.rs
 
-use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -10,16 +9,26 @@ use focal_launch_shared::{
     BrowserBackend, LaunchRequest, LaunchResponse, chrome_command_args, is_browser_like,
     is_chrome_like, socket_path,
 };
+use focaldesk_ipc::transport;
 use focaldesk_logging::log_file_path_candidates;
 
 pub fn run() -> anyhow::Result<()> {
-    let socket = socket_path();
-    let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let socket = socket_path()?;
+    let listener = transport::bind_user_socket(&socket)?;
 
     for stream in listener.incoming() {
         let mut stream = stream?;
         thread::spawn(move || {
+            if let Err(err) = transport::require_authorized_peer(&stream, transport::LAUNCH_POLICY)
+            {
+                let response = LaunchResponse::Failed {
+                    message: err.to_string(),
+                };
+                if let Ok(json) = transport::encode_message(&response) {
+                    let _ = stream.write_all(&json);
+                }
+                return;
+            }
             let response = match handle_stream(&mut stream) {
                 Ok(response) => response,
                 Err(err) => LaunchResponse::Failed {
@@ -27,7 +36,8 @@ pub fn run() -> anyhow::Result<()> {
                 },
             };
 
-            let _ = stream.write_all(serde_json::to_string(&response).unwrap().as_bytes());
+            let json = transport::encode_message(&response).unwrap();
+            let _ = stream.write_all(&json);
             let _ = stream.write_all(b"\n");
         });
     }
@@ -36,10 +46,8 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 fn handle_stream(stream: &mut std::os::unix::net::UnixStream) -> anyhow::Result<LaunchResponse> {
-    let mut payload = String::new();
-    stream.read_to_string(&mut payload)?;
-
-    let req: LaunchRequest = serde_json::from_str(&payload)?;
+    let payload = transport::read_limited(stream)?;
+    let req: LaunchRequest = transport::decode_message(&payload).map_err(anyhow::Error::msg)?;
     eprintln!(
         "focal-launchd: accepted launch trace_id={} app={}",
         req.trace_id, req.app

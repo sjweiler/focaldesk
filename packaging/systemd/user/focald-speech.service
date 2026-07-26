@@ -9,7 +9,7 @@ Type=simple
 ExecStart=%h/.local/bin/focald-speech
 Restart=on-failure
 RestartSec=2
-Environment=FOCALD_SPEECH_SOCKET=%t/focald-speech.sock
+Environment=FOCALD_SPEECH_SOCKET=%t/focaldesk/focald-speech.sock
 
 [Install]
 WantedBy=focaldesk-session.target

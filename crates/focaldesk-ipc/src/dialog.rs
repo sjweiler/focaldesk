@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixStream,
     sync::Arc,
     thread,
 };
 
-pub const DIALOG_SOCKET_PATH: &str = "/tmp/focaldesk-dialogd.sock";
+use crate::transport;
 
+pub const DIALOG_SOCKET_NAME: &str = "dialog.sock";
+pub const DIALOG_SOCKET_ENV: &str = "FOCALDESK_DIALOG_SOCKET_PATH";
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DialogIpcRequest {
@@ -58,10 +60,11 @@ pub enum DialogIpcResponse {
 }
 
 pub fn send_dialog_request(request: &DialogIpcRequest) -> Result<DialogIpcResponse, String> {
-    let path = dialog_socket_path();
-    let mut stream =
-        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
-    let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
+    let path = dialog_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -72,22 +75,20 @@ pub fn send_dialog_request(request: &DialogIpcRequest) -> Result<DialogIpcRespon
     stream
         .read_to_string(&mut response)
         .map_err(|err| err.to_string())?;
-    serde_json::from_str(&response).map_err(|err| err.to_string())
+    transport::decode_message(response.as_bytes())
 }
 
 pub fn serve_dialog_ipc(
     app: Arc<dyn Fn(DialogIpcRequest) -> DialogIpcResponse + Send + Sync + 'static>,
 ) {
-    let _ = std::fs::remove_file(DIALOG_SOCKET_PATH);
+    let path = dialog_socket_path().expect("could not resolve FocalDesk dialog IPC socket");
     let listener =
-        UnixListener::bind(DIALOG_SOCKET_PATH).expect("failed to bind FocalDesk dialog IPC socket");
+        transport::bind_user_socket(&path).expect("failed to bind FocalDesk dialog IPC socket");
 
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let app = app.clone();
-                thread::spawn(move || handle_dialog_client(&mut stream, app));
-            }
+        for mut stream in listener.incoming().flatten() {
+            let app = app.clone();
+            thread::spawn(move || handle_dialog_client(&mut stream, app));
         }
     });
 }
@@ -96,26 +97,25 @@ fn handle_dialog_client(
     stream: &mut UnixStream,
     app: Arc<dyn Fn(DialogIpcRequest) -> DialogIpcResponse + Send + Sync + 'static>,
 ) {
-    let mut buf = String::new();
-
-    if stream.read_to_string(&mut buf).is_err() {
+    if transport::require_authorized_peer(stream, transport::DIALOG_POLICY).is_err() {
         return;
     }
+    let Ok(buf) = transport::read_limited(stream) else {
+        return;
+    };
 
-    let response = match serde_json::from_str::<DialogIpcRequest>(&buf) {
+    let response = match transport::decode_message::<DialogIpcRequest>(&buf) {
         Ok(request) => (app)(request),
         Err(err) => DialogIpcResponse::Error {
             message: err.to_string(),
         },
     };
 
-    let json = serde_json::to_string(&response).unwrap();
-    let _ = stream.write_all(json.as_bytes());
+    if let Ok(json) = transport::encode_message(&response) {
+        let _ = stream.write_all(&json);
+    }
 }
 
-fn dialog_socket_path() -> String {
-    std::env::var("FOCALDESK_DIALOG_SOCKET_PATH")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DIALOG_SOCKET_PATH.to_string())
+pub fn dialog_socket_path() -> Result<std::path::PathBuf, String> {
+    transport::socket_path(DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME)
 }

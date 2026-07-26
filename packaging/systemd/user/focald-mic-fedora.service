@@ -9,9 +9,9 @@ Type=simple
 ExecStart=/usr/bin/focald-mic
 Restart=on-failure
 RestartSec=2
-Environment=FOCALD_MIC_SOCKET=%t/focald-mic.sock
-Environment=FOCALD_VOICE_SOCKET=%t/focald-voice.sock
-Environment=FOCALD_SPEECH_SOCKET=%t/focald-speech.sock
+Environment=FOCALD_MIC_SOCKET=%t/focaldesk/focald-mic.sock
+Environment=FOCALD_VOICE_SOCKET=%t/focaldesk/focald-voice.sock
+Environment=FOCALD_SPEECH_SOCKET=%t/focaldesk/focald-speech.sock
 
 [Install]
 WantedBy=focaldesk-session.target

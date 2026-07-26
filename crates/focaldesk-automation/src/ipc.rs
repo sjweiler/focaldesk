@@ -9,6 +9,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 use crate::config::AutomationConfig;
 use crate::runner::{self, SharedRunState};
+use focaldesk_ipc::transport;
 
 pub const AUTOMATION_SOCKET_NAME: &str = "focaldesk-automation.sock";
 pub const AUTOMATION_SOCKET_ENV: &str = "FOCALDESK_AUTOMATION_SOCKET";
@@ -48,36 +49,34 @@ pub struct AutomationSummary {
     pub last_error: Option<String>,
 }
 
-pub fn automation_socket_path() -> PathBuf {
-    if let Some(path) = std::env::var_os(AUTOMATION_SOCKET_ENV) {
-        return PathBuf::from(path);
-    }
-
-    std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(AUTOMATION_SOCKET_NAME)
+pub fn automation_socket_path() -> Result<PathBuf> {
+    transport::socket_path(AUTOMATION_SOCKET_ENV, AUTOMATION_SOCKET_NAME)
+        .map_err(anyhow::Error::msg)
 }
 
 pub async fn serve(config: Arc<AutomationConfig>, state: SharedRunState) -> Result<()> {
-    let path = automation_socket_path();
-    let _ = std::fs::remove_file(&path);
-
-    let listener = UnixListener::bind(&path)
+    let path = automation_socket_path()?;
+    let listener = transport::bind_user_socket(&path)
         .with_context(|| format!("failed to bind automation IPC socket {}", path.display()))?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("failed to set permissions on {}", path.display()))?;
-    }
+    listener
+        .set_nonblocking(true)
+        .context("configure automation IPC listener")?;
+    let listener = UnixListener::from_std(listener).context("adopt automation IPC listener")?;
 
     loop {
         let (stream, _) = listener
             .accept()
             .await
             .context("automation IPC accept failed")?;
+        if let Err(err) = transport::require_authorized_peer(&stream, transport::AUTOMATION_POLICY)
+        {
+            tracing::warn!(
+                target: "focaldesk.automation",
+                error = %err,
+                "rejected automation IPC peer"
+            );
+            continue;
+        }
         let config = config.clone();
         let state = state.clone();
         tokio::spawn(async move {
@@ -94,12 +93,19 @@ async fn handle_connection(
     mut stream: UnixStream,
 ) -> Result<()> {
     let mut input = Vec::new();
-    stream
+    (&mut stream)
+        .take(transport::MAX_REQUEST_BYTES + 1)
         .read_to_end(&mut input)
         .await
         .context("failed to read automation IPC request")?;
+    if input.len() as u64 > transport::MAX_REQUEST_BYTES {
+        bail!(
+            "automation IPC request exceeds {} bytes",
+            transport::MAX_REQUEST_BYTES
+        );
+    }
 
-    let response = match serde_json::from_slice::<AutomationIpcRequest>(&input) {
+    let response = match transport::decode_message::<AutomationIpcRequest>(&input) {
         Ok(AutomationIpcRequest::ListAutomations) => {
             let snapshot = state
                 .lock()
@@ -145,8 +151,7 @@ async fn handle_connection(
         },
     };
 
-    let output =
-        serde_json::to_vec(&response).context("failed to encode automation IPC response")?;
+    let output = transport::encode_message(&response).map_err(anyhow::Error::msg)?;
     stream
         .write_all(&output)
         .await
@@ -157,7 +162,7 @@ async fn handle_connection(
 }
 
 pub fn send_automation_request(request: &AutomationIpcRequest) -> Result<AutomationIpcResponse> {
-    send_automation_request_at(&automation_socket_path(), request)
+    send_automation_request_at(automation_socket_path()?, request)
 }
 
 pub fn send_automation_request_at(
@@ -171,7 +176,8 @@ pub fn send_automation_request_at(
             path.display()
         )
     })?;
-    let json = serde_json::to_vec(request).context("failed to encode automation IPC request")?;
+    transport::configure_stream(&stream).context("configure automation IPC connection")?;
+    let json = transport::encode_message(request).map_err(anyhow::Error::msg)?;
 
     stream
         .write_all(&json)
@@ -189,5 +195,5 @@ pub fn send_automation_request_at(
         bail!("automation IPC returned an empty response");
     }
 
-    serde_json::from_str(&response).context("failed to decode automation IPC response")
+    transport::decode_message(response.as_bytes()).map_err(anyhow::Error::msg)
 }

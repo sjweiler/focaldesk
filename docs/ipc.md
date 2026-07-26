@@ -177,7 +177,19 @@ Future IPC may support:
 
 ## Permission Model
 
-Future AI and automation features should not have unrestricted control over the desktop.
+FocalDesk service sockets are private to the current user and use Linux peer
+credentials to authenticate each connection. Sensitive endpoints then apply a
+deny-by-default caller policy using the peer executable and systemd cgroup
+unit. For example, power requests are accepted only from the compositor and
+Settings, while password-capable dialog requests are accepted only from the
+PolicyKit agent, portal, and AI service.
+
+This process identity boundary protects services from unrelated applications
+in the same desktop session. It does not treat the user's own writable binaries
+as a security boundary; packaged systemd units and root-owned installed
+binaries provide the strongest identity.
+
+AI and automation features must not have unrestricted control over the desktop.
 
 Possible permission levels:
 
@@ -211,11 +223,32 @@ Restricted:
 - Treat AI actions as untrusted until approved
 - Keep IPC contracts documented and versioned
 
+## Wire Contract
+
+Typed JSON requests and responses use a versioned envelope:
+
+```json
+{
+  "protocol_version": 1,
+  "payload": {
+    "type": "GetSnapshot"
+  }
+}
+```
+
+Version 1 is the only supported version. Missing or unsupported versions are
+rejected explicitly rather than being interpreted as a different request
+shape. Requests are limited to 1 MiB and ordinary blocking connections use
+five-second read and write timeouts.
+
+Sockets normally live below `$XDG_RUNTIME_DIR/focaldesk`. The directory is
+required to be owned by the current user with mode `0700`; sockets use mode
+`0600`. FocalDesk refuses to replace a non-socket, symlinked runtime directory,
+or foreign-owned socket path.
+
 ## Open Questions
 
 - Should IPC use Unix domain sockets, D-Bus, or another transport?
-- Should services have separate permissions?
-- Should messages be versioned?
 - Should AI actions require confirmation by default?
 - How should service crashes be handled?
 - How should logs be correlated across services?

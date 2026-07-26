@@ -4,6 +4,7 @@ pub mod dialog;
 pub mod notifications;
 pub mod power;
 pub mod settings;
+pub mod transport;
 
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
@@ -13,22 +14,17 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 
-pub const DESKTOP_SOCKET_PATH: &str = "/tmp/focaldesk-desktop.sock";
-pub const SOCKET_PATH: &str = DESKTOP_SOCKET_PATH;
-pub const SETTINGS_SOCKET_PATH: &str = "/tmp/focaldesk-settings.sock";
+pub const DESKTOP_SOCKET_NAME: &str = "desktop.sock";
+pub const SETTINGS_SOCKET_NAME: &str = "settings.sock";
+pub const DESKTOP_SOCKET_ENV: &str = "FOCALDESK_DESKTOP_SOCKET_PATH";
+pub const SETTINGS_SOCKET_ENV: &str = "FOCALDESK_SETTINGS_SOCKET_PATH";
 
-fn desktop_socket_path() -> String {
-    std::env::var("FOCALDESK_DESKTOP_SOCKET_PATH")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| DESKTOP_SOCKET_PATH.to_string())
+pub fn desktop_socket_path() -> Result<std::path::PathBuf, String> {
+    transport::socket_path(DESKTOP_SOCKET_ENV, DESKTOP_SOCKET_NAME)
 }
 
-fn settings_socket_path() -> String {
-    std::env::var("FOCALDESK_SETTINGS_SOCKET_PATH")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| SETTINGS_SOCKET_PATH.to_string())
+pub fn settings_socket_path() -> Result<std::path::PathBuf, String> {
+    transport::socket_path(SETTINGS_SOCKET_ENV, SETTINGS_SOCKET_NAME)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,10 +131,11 @@ pub struct DisplayRuntimeOutputStatus {
 }
 
 pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String> {
-    let path = desktop_socket_path();
-    let mut stream =
-        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
-    let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
+    let path = desktop_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -149,14 +146,15 @@ pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String>
     stream
         .read_to_string(&mut response)
         .map_err(|err| err.to_string())?;
-    serde_json::from_str(&response).map_err(|err| err.to_string())
+    transport::decode_message(response.as_bytes())
 }
 
 pub fn send_settings_request(request: &IpcRequest) -> Result<IpcResponse, String> {
-    let path = settings_socket_path();
-    let mut stream =
-        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
-    let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
+    let path = settings_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -167,7 +165,7 @@ pub fn send_settings_request(request: &IpcRequest) -> Result<IpcResponse, String
     stream
         .read_to_string(&mut response)
         .map_err(|err| err.to_string())?;
-    serde_json::from_str(&response).map_err(|err| err.to_string())
+    transport::decode_message(response.as_bytes())
 }
 
 pub fn send_desktop_get(key: impl Into<String>) -> Result<Value, String> {
@@ -192,10 +190,11 @@ pub fn watch_desktop_keys(
     keys: Vec<String>,
     mut on_response: impl FnMut(IpcResponse),
 ) -> Result<(), String> {
-    let path = desktop_socket_path();
-    let mut stream =
-        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
-    let json = serde_json::to_vec(&IpcRequest::Watch { keys }).map_err(|err| err.to_string())?;
+    let path = desktop_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(&IpcRequest::Watch { keys })?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -208,7 +207,7 @@ pub fn watch_desktop_keys(
         if line.trim().is_empty() {
             continue;
         }
-        let response = serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        let response = transport::decode_message(line.as_bytes())?;
         on_response(response);
     }
 
@@ -224,17 +223,20 @@ pub fn send_desktop_config(config: FocalDeskConfig) -> Result<(), String> {
 }
 
 pub use controls::{
-    CONTROL_SOCKET_PATH, ControlIpcRequest, ControlIpcResponse, ControlSetting,
-    send_control_request, serve_control_ipc,
+    CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME, ControlIpcRequest, ControlIpcResponse, ControlSetting,
+    control_socket_path, send_control_request, serve_control_ipc,
 };
 pub use dialog::{
-    DIALOG_SOCKET_PATH, DialogIpcRequest, DialogIpcResponse, send_dialog_request, serve_dialog_ipc,
+    DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME, DialogIpcRequest, DialogIpcResponse, dialog_socket_path,
+    send_dialog_request, serve_dialog_ipc,
 };
 pub use notifications::{
-    NOTIFICATIONS_SOCKET_PATH, NotificationIpcRequest, NotificationIpcResponse,
-    send_notification_request, serve_notification_ipc,
+    NOTIFICATIONS_SOCKET_ENV, NOTIFICATIONS_SOCKET_NAME, NotificationIpcRequest,
+    NotificationIpcResponse, notifications_socket_path, send_notification_request,
+    serve_notification_ipc,
 };
 pub use power::{
-    POWER_SOCKET_PATH, PowerIpcRequest, PowerIpcResponse, send_power_request, serve_power_ipc,
+    POWER_SOCKET_ENV, POWER_SOCKET_NAME, PowerIpcRequest, PowerIpcResponse, power_socket_path,
+    send_power_request, serve_power_ipc,
 };
 pub use settings::serve_settings_ipc;

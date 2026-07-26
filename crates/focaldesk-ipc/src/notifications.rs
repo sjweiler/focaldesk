@@ -2,7 +2,7 @@ use focaldesk_notifications::NotificationSnapshot;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixStream,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -10,8 +10,14 @@ use std::{
 
 use focaldesk_notifications::NotificationManager;
 
-pub const NOTIFICATIONS_SOCKET_PATH: &str = "/tmp/focaldesk-notifications.sock";
+use crate::transport;
 
+pub const NOTIFICATIONS_SOCKET_NAME: &str = "notifications.sock";
+pub const NOTIFICATIONS_SOCKET_ENV: &str = "FOCALDESK_NOTIFICATIONS_SOCKET_PATH";
+
+pub fn notifications_socket_path() -> Result<std::path::PathBuf, String> {
+    transport::socket_path(NOTIFICATIONS_SOCKET_ENV, NOTIFICATIONS_SOCKET_NAME)
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum NotificationIpcRequest {
@@ -42,9 +48,11 @@ pub enum NotificationIpcResponse {
 pub fn send_notification_request(
     request: &NotificationIpcRequest,
 ) -> Result<NotificationIpcResponse, String> {
-    let mut stream = UnixStream::connect(NOTIFICATIONS_SOCKET_PATH)
-        .map_err(|err| format!("could not connect to {NOTIFICATIONS_SOCKET_PATH}: {err}"))?;
-    let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
+    let path = notifications_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -55,20 +63,18 @@ pub fn send_notification_request(
     stream
         .read_to_string(&mut response)
         .map_err(|err| err.to_string())?;
-    serde_json::from_str(&response).map_err(|err| err.to_string())
+    transport::decode_message(response.as_bytes())
 }
 
 pub fn serve_notification_ipc(manager: Arc<std::sync::Mutex<NotificationManager>>) {
-    let _ = std::fs::remove_file(NOTIFICATIONS_SOCKET_PATH);
-
-    let listener = UnixListener::bind(NOTIFICATIONS_SOCKET_PATH)
+    let path =
+        notifications_socket_path().expect("could not resolve FocalDesk notifications IPC socket");
+    let listener = transport::bind_user_socket(&path)
         .expect("failed to bind FocalDesk notifications IPC socket");
 
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                handle_notification_client(&mut stream, &manager);
-            }
+        for mut stream in listener.incoming().flatten() {
+            handle_notification_client(&mut stream, &manager);
         }
     });
 }
@@ -77,13 +83,14 @@ fn handle_notification_client(
     stream: &mut UnixStream,
     manager: &Arc<std::sync::Mutex<NotificationManager>>,
 ) {
-    let mut buf = String::new();
-
-    if stream.read_to_string(&mut buf).is_err() {
+    if transport::require_authorized_peer(stream, transport::NOTIFICATIONS_POLICY).is_err() {
         return;
     }
+    let Ok(buf) = transport::read_limited(stream) else {
+        return;
+    };
 
-    let response = match serde_json::from_str::<NotificationIpcRequest>(&buf) {
+    let response = match transport::decode_message::<NotificationIpcRequest>(&buf) {
         Ok(NotificationIpcRequest::Notify {
             title,
             body,
@@ -112,6 +119,7 @@ fn handle_notification_client(
         },
     };
 
-    let json = serde_json::to_string(&response).unwrap();
-    let _ = stream.write_all(json.as_bytes());
+    if let Ok(json) = transport::encode_message(&response) {
+        let _ = stream.write_all(&json);
+    }
 }

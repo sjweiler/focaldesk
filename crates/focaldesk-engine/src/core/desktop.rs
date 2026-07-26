@@ -71,10 +71,10 @@ use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
 use focaldesk_ipc::{
-    send_control_request, send_notification_request, send_power_request, ControlIpcRequest,
-    ControlIpcResponse, ControlSetting, DesktopAction, DesktopDirection,
-    DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, NotificationIpcRequest,
-    NotificationIpcResponse, PowerIpcRequest, PowerIpcResponse, DESKTOP_SOCKET_PATH,
+    desktop_socket_path, send_control_request, send_notification_request, send_power_request,
+    transport, ControlIpcRequest, ControlIpcResponse, ControlSetting, DesktopAction,
+    DesktopDirection, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, NotificationIpcRequest,
+    NotificationIpcResponse, PowerIpcRequest, PowerIpcResponse,
 };
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
@@ -130,7 +130,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::net::UnixStream;
 use std::sync::mpsc;
 use std::thread;
 use wayland_server::DisplayHandle;
@@ -162,17 +162,18 @@ use focaldesk_ui::ui_builder::{
 };
 
 fn mic_command(command: &str) -> io::Result<String> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    let mut stream = UnixStream::connect(runtime.join("focald-mic.sock"))?;
+    let socket =
+        transport::socket_path("FOCALD_MIC_SOCKET", "focald-mic.sock").map_err(io::Error::other)?;
+    let mut stream = UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    write!(stream, r#"{{"command":"{command}"}}"#)?;
+    let request = format!(r#"{{"command":"{command}"}}"#);
+    let request = transport::encode_message(&request).map_err(io::Error::other)?;
+    stream.write_all(&request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    Ok(response)
+    transport::decode_message(response.as_bytes()).map_err(io::Error::other)
 }
 
 fn voice_capture_status(response: &str) -> Option<VoiceCaptureStatus> {
@@ -348,14 +349,25 @@ fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
     let (tx, rx) = mpsc::channel();
 
     thread::spawn(move || {
-        let _ = std::fs::remove_file(DESKTOP_SOCKET_PATH);
-        let listener = match UnixListener::bind(DESKTOP_SOCKET_PATH) {
+        let path = match desktop_socket_path() {
+            Ok(path) => path,
+            Err(err) => {
+                tracing::warn!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = %err,
+                    "failed to resolve desktop settings IPC socket"
+                );
+                return;
+            }
+        };
+        let listener = match transport::bind_user_socket(&path) {
             Ok(listener) => listener,
             Err(err) => {
                 tracing::warn!(
                     target: "focaldesk",
                     session_id = session_id(),
-                    path = %DESKTOP_SOCKET_PATH,
+                    path = %path.display(),
                     error = %err,
                     "failed to bind desktop settings IPC socket"
                 );
@@ -366,7 +378,7 @@ fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
         tracing::info!(
             target: "focaldesk",
             session_id = session_id(),
-            path = %DESKTOP_SOCKET_PATH,
+            path = %path.display(),
             "desktop settings IPC listening"
         );
         for stream in listener.incoming() {
@@ -379,7 +391,7 @@ fn start_desktop_settings_ipc() -> mpsc::Receiver<DesktopIpcMessage> {
                     tracing::warn!(
                         target: "focaldesk",
                         session_id = session_id(),
-                        path = %DESKTOP_SOCKET_PATH,
+                        path = %path.display(),
                         error = %err,
                         "desktop settings IPC accept failed"
                     );
@@ -395,8 +407,7 @@ fn handle_desktop_settings_ipc_stream(
     stream: &mut UnixStream,
     tx: &mpsc::Sender<DesktopIpcMessage>,
 ) {
-    let mut payload = String::new();
-    if let Err(err) = stream.read_to_string(&mut payload) {
+    if let Err(err) = transport::require_authorized_peer(stream, transport::DESKTOP_POLICY) {
         write_ipc_response(
             stream,
             IpcResponse::Error {
@@ -405,8 +416,20 @@ fn handle_desktop_settings_ipc_stream(
         );
         return;
     }
+    let payload = match transport::read_limited(stream) {
+        Ok(payload) => payload,
+        Err(err) => {
+            write_ipc_response(
+                stream,
+                IpcResponse::Error {
+                    message: err.to_string(),
+                },
+            );
+            return;
+        }
+    };
 
-    let request = match serde_json::from_str::<IpcRequest>(&payload) {
+    let request = match transport::decode_message::<IpcRequest>(&payload) {
         Ok(request) => request,
         Err(err) => {
             write_ipc_response(
@@ -456,7 +479,7 @@ fn handle_desktop_settings_ipc_stream(
 }
 
 fn write_ipc_response(stream: &mut UnixStream, response: IpcResponse) {
-    if let Ok(json) = serde_json::to_vec(&response) {
+    if let Ok(json) = transport::encode_message(&response) {
         let _ = stream.write_all(&json);
         let _ = stream.write_all(b"\n");
     }

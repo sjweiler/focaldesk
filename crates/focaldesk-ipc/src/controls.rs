@@ -1,18 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::net::UnixStream,
     sync::Arc,
     thread,
 };
 
-pub const CONTROL_SOCKET_PATH: &str = "/tmp/focaldesk-controls.sock";
+use crate::transport;
 
-fn control_socket_path() -> String {
-    std::env::var("FOCALDESK_CONTROL_SOCKET_PATH")
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| CONTROL_SOCKET_PATH.to_string())
+pub const CONTROL_SOCKET_NAME: &str = "controls.sock";
+pub const CONTROL_SOCKET_ENV: &str = "FOCALDESK_CONTROL_SOCKET_PATH";
+
+pub fn control_socket_path() -> Result<std::path::PathBuf, String> {
+    transport::socket_path(CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -43,10 +43,11 @@ pub enum ControlIpcResponse {
 }
 
 pub fn send_control_request(request: &ControlIpcRequest) -> Result<ControlIpcResponse, String> {
-    let path = control_socket_path();
-    let mut stream =
-        UnixStream::connect(&path).map_err(|err| format!("could not connect to {path}: {err}"))?;
-    let json = serde_json::to_vec(request).map_err(|err| err.to_string())?;
+    let path = control_socket_path()?;
+    let mut stream = UnixStream::connect(&path)
+        .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
+    transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;
     stream
@@ -57,23 +58,20 @@ pub fn send_control_request(request: &ControlIpcRequest) -> Result<ControlIpcRes
     stream
         .read_to_string(&mut response)
         .map_err(|err| err.to_string())?;
-    serde_json::from_str(&response).map_err(|err| err.to_string())
+    transport::decode_message(response.as_bytes())
 }
 
 pub fn serve_control_ipc(
     handler: Arc<dyn Fn(ControlIpcRequest) -> ControlIpcResponse + Send + Sync + 'static>,
 ) {
-    let _ = std::fs::remove_file(CONTROL_SOCKET_PATH);
-
-    let listener = UnixListener::bind(CONTROL_SOCKET_PATH)
-        .expect("failed to bind FocalDesk control IPC socket");
+    let path = control_socket_path().expect("could not resolve FocalDesk control IPC socket");
+    let listener =
+        transport::bind_user_socket(&path).expect("failed to bind FocalDesk control IPC socket");
 
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let handler = handler.clone();
-                thread::spawn(move || handle_control_client(&mut stream, &handler));
-            }
+        for mut stream in listener.incoming().flatten() {
+            let handler = handler.clone();
+            thread::spawn(move || handle_control_client(&mut stream, &handler));
         }
     });
 }
@@ -82,19 +80,21 @@ fn handle_control_client(
     stream: &mut UnixStream,
     handler: &Arc<dyn Fn(ControlIpcRequest) -> ControlIpcResponse + Send + Sync + 'static>,
 ) {
-    let mut buf = String::new();
-
-    if stream.read_to_string(&mut buf).is_err() {
+    if transport::require_authorized_peer(stream, transport::CONTROL_POLICY).is_err() {
         return;
     }
+    let Ok(buf) = transport::read_limited(stream) else {
+        return;
+    };
 
-    let response = match serde_json::from_str::<ControlIpcRequest>(&buf) {
+    let response = match transport::decode_message::<ControlIpcRequest>(&buf) {
         Ok(request) => handler(request),
         Err(e) => ControlIpcResponse::Error {
             message: e.to_string(),
         },
     };
 
-    let json = serde_json::to_string(&response).unwrap();
-    let _ = stream.write_all(json.as_bytes());
+    if let Ok(json) = transport::encode_message(&response) {
+        let _ = stream.write_all(&json);
+    }
 }

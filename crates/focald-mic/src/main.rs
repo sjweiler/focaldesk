@@ -1,17 +1,15 @@
 //! Push-to-talk microphone and speech-to-text daemon for FocalDesk.
 
-use std::io::{BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use focaldesk_ipc::transport;
 use focaldesk_voice::{VoiceEvent, VoiceSession};
 use serde::{Deserialize, Serialize};
-
-const MAX_REQUEST_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -150,27 +148,21 @@ fn main() -> Result<()> {
 }
 
 fn run_server() -> Result<()> {
-    let socket = mic_socket_path();
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::remove_file(&socket) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-
-    let listener = UnixListener::bind(&socket)
+    let socket = mic_socket_path()?;
+    let listener = transport::bind_user_socket(&socket)
         .with_context(|| format!("bind microphone socket {}", socket.display()))?;
     listener.set_nonblocking(true)?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("focald-mic: listening at {}", socket.display());
 
     let mut state = MicState::default();
     loop {
         loop {
             match listener.accept() {
-                Ok((stream, _)) => handle_client(stream, &mut state),
+                Ok((stream, _)) => {
+                    if transport::require_authorized_peer(&stream, transport::MIC_POLICY).is_ok() {
+                        handle_client(stream, &mut state);
+                    }
+                }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(err) => eprintln!("focald-mic: accept failed: {err}"),
             }
@@ -181,13 +173,10 @@ fn run_server() -> Result<()> {
 }
 
 fn handle_client(mut stream: UnixStream, state: &mut MicState) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut payload = String::new();
-    let result = BufReader::new(&stream)
-        .take(MAX_REQUEST_BYTES)
-        .read_to_string(&mut payload)
+    let result = transport::read_limited(&mut stream)
         .map_err(|err| format!("reading request: {err}"))
-        .and_then(|_| decode_request(&payload))
+        .and_then(|payload| transport::decode_message::<String>(&payload))
+        .and_then(|payload| decode_request(&payload))
         .and_then(|command| execute_command(command, state));
 
     let response = match result {
@@ -200,8 +189,11 @@ fn handle_client(mut stream: UnixStream, state: &mut MicState) {
             message: Some(message),
         },
     };
-    let _ = serde_json::to_writer(&mut stream, &response);
-    let _ = writeln!(stream);
+    if let Ok(response) = serde_json::to_string(&response) {
+        if let Ok(encoded) = transport::encode_message(&response) {
+            let _ = stream.write_all(&encoded);
+        }
+    }
 }
 
 fn decode_request(payload: &str) -> Result<MicCommand, String> {
@@ -221,7 +213,9 @@ fn execute_command(command: MicCommand, state: &mut MicState) -> Result<&'static
 
 fn stop_speech() {
     let request = serde_json::json!({ "command": "stop" }).to_string();
-    if let Err(err) = send_socket_request(speech_socket_path(), &request, Duration::from_secs(2)) {
+    let result = speech_socket_path()
+        .and_then(|path| send_socket_request(path, &request, Duration::from_secs(2)));
+    if let Err(err) = result {
         eprintln!("focald-mic: could not stop speech playback: {err:#}");
     }
 }
@@ -230,7 +224,9 @@ fn forward_transcript(text: String) {
     let _ = std::thread::Builder::new()
         .name("focald-mic-forward".into())
         .spawn(move || {
-            match send_socket_request(voice_socket_path(), &text, Duration::from_secs(20)) {
+            let result = voice_socket_path()
+                .and_then(|path| send_socket_request(path, &text, Duration::from_secs(20)));
+            match result {
                 Ok(response) => eprintln!("[forwarded] {}", response.trim()),
                 Err(err) => eprintln!("[forward-failed] {err:#}"),
             }
@@ -257,11 +253,12 @@ fn send_socket_request(path: PathBuf, payload: &str, timeout: Duration) -> Resul
     };
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
-    stream.write_all(payload.as_bytes())?;
+    let payload = transport::encode_message(&payload.to_string()).map_err(anyhow::Error::msg)?;
+    stream.write_all(&payload)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
-    Ok(response)
+    transport::decode_message(response.as_bytes()).map_err(anyhow::Error::msg)
 }
 
 fn run_client(args: &[String]) -> Result<()> {
@@ -279,31 +276,24 @@ fn run_client(args: &[String]) -> Result<()> {
         _ => anyhow::bail!("usage: focald-mic --start | --stop | --toggle | --status"),
     };
     let request = serde_json::json!({ "command": command }).to_string();
-    let response = send_socket_request(mic_socket_path(), &request, Duration::from_secs(5))?;
+    let response = send_socket_request(mic_socket_path()?, &request, Duration::from_secs(5))?;
     print!("{response}");
     Ok(())
 }
 
-fn runtime_socket(name: &str, override_name: &str) -> PathBuf {
-    std::env::var_os(override_name)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"))
-                .join(name)
-        })
+fn runtime_socket(name: &str, override_name: &str) -> Result<PathBuf> {
+    transport::socket_path(override_name, name).map_err(anyhow::Error::msg)
 }
 
-fn mic_socket_path() -> PathBuf {
+fn mic_socket_path() -> Result<PathBuf> {
     runtime_socket("focald-mic.sock", "FOCALD_MIC_SOCKET")
 }
 
-fn voice_socket_path() -> PathBuf {
+fn voice_socket_path() -> Result<PathBuf> {
     runtime_socket("focald-voice.sock", "FOCALD_VOICE_SOCKET")
 }
 
-fn speech_socket_path() -> PathBuf {
+fn speech_socket_path() -> Result<PathBuf> {
     runtime_socket("focald-speech.sock", "FOCALD_SPEECH_SOCKET")
 }
 

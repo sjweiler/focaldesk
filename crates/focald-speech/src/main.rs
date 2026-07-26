@@ -1,18 +1,17 @@
 //! Local text-to-speech daemon for the active FocalDesk session.
 
 use std::collections::VecDeque;
-use std::io::{BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use focaldesk_ipc::transport;
 use serde::{Deserialize, Serialize};
 
-const MAX_REQUEST_BYTES: u64 = 64 * 1024;
 const MAX_TEXT_CHARS: usize = 4096;
 const COMMAND_BUFFER: usize = 32;
 const MAX_PENDING_SPEECH: usize = 32;
@@ -334,19 +333,9 @@ fn main() -> Result<()> {
 }
 
 fn run_server() -> Result<()> {
-    let socket = speech_socket_path();
-    if let Some(parent) = socket.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    match std::fs::remove_file(&socket) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err.into()),
-    }
-
-    let listener = UnixListener::bind(&socket)
+    let socket = speech_socket_path()?;
+    let listener = transport::bind_user_socket(&socket)
         .with_context(|| format!("bind speech socket {}", socket.display()))?;
-    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
 
     let (commands_tx, commands_rx) = mpsc::sync_channel(COMMAND_BUFFER);
     let backend = SpeechBackend::from_env().context("configure speech backend")?;
@@ -358,7 +347,11 @@ fn run_server() -> Result<()> {
     eprintln!("focald-speech: listening at {}", socket.display());
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => handle_client(stream, &commands_tx),
+            Ok(stream) => {
+                if transport::require_authorized_peer(&stream, transport::SPEECH_POLICY).is_ok() {
+                    handle_client(stream, &commands_tx);
+                }
+            }
             Err(err) => eprintln!("focald-speech: accept failed: {err}"),
         }
     }
@@ -366,13 +359,10 @@ fn run_server() -> Result<()> {
 }
 
 fn handle_client(mut stream: UnixStream, commands: &SyncSender<WorkerCommand>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut payload = String::new();
-    let result = BufReader::new(&stream)
-        .take(MAX_REQUEST_BYTES)
-        .read_to_string(&mut payload)
+    let result = transport::read_limited(&mut stream)
         .map_err(|err| format!("reading request: {err}"))
-        .and_then(|_| decode_request(&payload))
+        .and_then(|payload| transport::decode_message::<String>(&payload))
+        .and_then(|payload| decode_request(&payload))
         .and_then(|command| {
             commands.try_send(command).map_err(|err| match err {
                 TrySendError::Full(_) => "speech queue is full".to_string(),
@@ -390,8 +380,11 @@ fn handle_client(mut stream: UnixStream, commands: &SyncSender<WorkerCommand>) {
             message: Some(message),
         },
     };
-    let _ = serde_json::to_writer(&mut stream, &response);
-    let _ = writeln!(stream);
+    if let Ok(response) = serde_json::to_string(&response) {
+        if let Ok(encoded) = transport::encode_message(&response) {
+            let _ = stream.write_all(&encoded);
+        }
+    }
 }
 
 fn decode_request(payload: &str) -> Result<WorkerCommand, String> {
@@ -535,26 +528,22 @@ fn run_client(args: &[String]) -> Result<()> {
         _ => anyhow::bail!("usage: focald-speech --speak TEXT | --interrupt TEXT | --stop"),
     };
 
-    let socket = speech_socket_path();
+    let socket = speech_socket_path()?;
     let mut stream =
         UnixStream::connect(&socket).with_context(|| format!("connect to {}", socket.display()))?;
-    serde_json::to_writer(&mut stream, &request)?;
+    let request = transport::encode_message(&request.to_string()).map_err(anyhow::Error::msg)?;
+    stream.write_all(&request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = String::new();
     stream.read_to_string(&mut response)?;
+    let response: String =
+        transport::decode_message(response.as_bytes()).map_err(anyhow::Error::msg)?;
     print!("{response}");
     Ok(())
 }
 
-fn speech_socket_path() -> PathBuf {
-    std::env::var_os("FOCALD_SPEECH_SOCKET")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("/tmp"));
-            runtime.join("focald-speech.sock")
-        })
+fn speech_socket_path() -> Result<PathBuf> {
+    transport::socket_path("FOCALD_SPEECH_SOCKET", "focald-speech.sock").map_err(anyhow::Error::msg)
 }
 
 #[cfg(test)]

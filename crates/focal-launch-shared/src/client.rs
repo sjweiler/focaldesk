@@ -6,7 +6,7 @@ use std::time::Instant;
 use crate::{DEFAULT_TIMEOUT_MS, LaunchError, LaunchRequest, LaunchResponse, Result, socket_path};
 
 pub fn request_launch(req: &LaunchRequest) -> Result<LaunchResponse> {
-    let socket = socket_path();
+    let socket = socket_path()?;
     let started = Instant::now();
     eprintln!(
         "focal-launch-client: connect trace_id={} app={} source={:?} socket={}",
@@ -32,7 +32,7 @@ pub fn request_launch(req: &LaunchRequest) -> Result<LaunchResponse> {
     stream.set_write_timeout(timeout)?;
     stream.set_read_timeout(timeout)?;
 
-    let json = serde_json::to_vec(req)?;
+    let json = focaldesk_ipc::transport::encode_message(req)?;
     stream.write_all(&json)?;
     stream.write_all(b"\n")?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -42,7 +42,7 @@ pub fn request_launch(req: &LaunchRequest) -> Result<LaunchResponse> {
     let Some(line) = response.lines().find(|line| !line.trim().is_empty()) else {
         return Err(LaunchError::DaemonUnavailable);
     };
-    let parsed = serde_json::from_str::<LaunchResponse>(line)?;
+    let parsed = focaldesk_ipc::transport::decode_message::<LaunchResponse>(line.as_bytes())?;
     eprintln!(
         "focal-launch-client: response trace_id={} app={} elapsed_ms={} response={:?}",
         req.trace_id,

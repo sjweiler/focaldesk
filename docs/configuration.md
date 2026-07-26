@@ -59,7 +59,10 @@ not listed here should be treated as internal and may change without notice.
 
 IPC socket overrides such as `FOCALDESK_DESKTOP_SOCKET_PATH` and
 `FOCALDESK_SETTINGS_SOCKET_PATH` exist for testing multiple local instances.
-They are developer controls, not stable cross-version IPC contracts.
+They are developer controls, not stable cross-version IPC contracts. Override
+paths must live in a real directory owned by the current user; FocalDesk refuses
+shared, symlinked, or foreign-owned socket directories. Normal services use
+private sockets below `$XDG_RUNTIME_DIR/focaldesk`.
 
 HDR and color-management overrides are intentionally omitted here. They bypass
 hardware safeguards and should only be used while investigating the relevant

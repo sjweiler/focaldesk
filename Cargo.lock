@@ -1747,6 +1747,7 @@ name = "focal-launch-shared"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "focaldesk-ipc",
  "serde",
  "serde_json",
 ]
@@ -1757,6 +1758,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "focal-launch-shared",
+ "focaldesk-ipc",
  "focaldesk-logging",
  "serde",
  "serde_json",
@@ -1767,6 +1769,7 @@ name = "focald-mic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "focaldesk-ipc",
  "focaldesk-voice",
  "serde",
  "serde_json",
@@ -1817,6 +1820,7 @@ name = "focald-speech"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "focaldesk-ipc",
  "serde",
  "serde_json",
 ]
@@ -2082,8 +2086,11 @@ dependencies = [
  "focaldesk-notifications",
  "focaldesk-power",
  "focaldesk-settings-core",
+ "libc",
+ "nix 0.27.1",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
 ]
 
