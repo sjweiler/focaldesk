@@ -750,7 +750,7 @@ const RECESSED_BUTTON_FRAG: &str = r#"
 precision mediump float;
 #endif
 
-varying vec2 v_uv;
+varying vec2 v_coords;
 
 uniform vec2 u_size;
 uniform float u_bevel;
@@ -768,7 +768,7 @@ float rounded_box_sdf(vec2 p, vec2 size, float radius) {
 }
 
 void main() {
-    vec2 p = v_uv * u_size;
+    vec2 p = v_coords * u_size;
 
     float radius = u_bevel;
     float sdf = rounded_box_sdf(p, u_size, radius);
@@ -784,7 +784,7 @@ void main() {
     color -= inner * u_inner_shadow * u_shadow_color.rgb;
 
     // Center glow / backlight
-    vec2 centered = v_uv - vec2(0.5);
+    vec2 centered = v_coords - vec2(0.5);
     float dist = length(centered);
     float glow = smoothstep(u_glow_radius, 0.0, dist);
     color += glow * u_glow_strength * u_glow_color.rgb;
@@ -803,7 +803,7 @@ const TOP_BAR_FRAG: &str = r#"
 precision mediump float;
 #endif
 
-varying vec2 v_uv;
+varying vec2 v_coords;
 
 uniform vec2 u_size;
 uniform float u_radius;
@@ -823,7 +823,7 @@ float rounded_box_sdf(vec2 p, vec2 half_size, float r) {
 }
 
 void main() {
-    vec2 p = v_uv * u_size;
+    vec2 p = v_coords * u_size;
     vec2 center = u_size * 0.5;
     vec2 local = p - center;
 
@@ -836,20 +836,20 @@ void main() {
     float edge_band = 1.0 - smoothstep(u_bevel, u_bevel + u_softness, abs(sdf));
 
     // top reflection band
-    float top_band = (1.0 - smoothstep(0.0, 0.22, v_uv.y)) * u_highlight_strength;
+    float top_band = (1.0 - smoothstep(0.0, 0.22, v_coords.y)) * u_highlight_strength;
 
     // soft lower inner shadow
-    float bottom_shadow = smoothstep(0.72, 1.0, v_uv.y) * u_shadow_strength;
+    float bottom_shadow = smoothstep(0.72, 1.0, v_coords.y) * u_shadow_strength;
 
     // faint horizontal material sweep so it does not feel dead flat
-    float horiz = 0.5 + 0.5 * cos((v_uv.x - 0.5) * 3.14159);
+    float horiz = 0.5 + 0.5 * cos((v_coords.x - 0.5) * 3.14159);
     float face_variation = 0.035 * horiz;
 
     // trim line near top
     float trim_mask = 1.0 - smoothstep(
         u_trim_height,
         u_trim_height + max(1.0 / max(u_size.y, 1.0), 0.001),
-        v_uv.y
+        v_coords.y
     );
 
     vec3 color = u_face_color.rgb;
@@ -868,6 +868,19 @@ void main() {
     gl_FragColor = vec4(color, u_face_color.a * alpha);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::{RECESSED_BUTTON_FRAG, TOP_BAR_FRAG};
+
+    #[test]
+    fn pixel_shaders_use_smithays_vertex_varying() {
+        for shader in [RECESSED_BUTTON_FRAG, TOP_BAR_FRAG] {
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(!shader.contains("v_uv"));
+        }
+    }
+}
 
 const TINTED_ICON_FRAG: &str = r#"
 #ifdef GL_ES

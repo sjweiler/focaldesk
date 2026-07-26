@@ -120,6 +120,13 @@ wait_for_log() {
             return 0
         fi
         if [[ -n "$COMPOSITOR_PID" ]] && ! kill -0 "$COMPOSITOR_PID" 2>/dev/null; then
+            # Give redirected output a moment to flush so a just-written startup
+            # marker or renderer error is visible before reporting the failure.
+            sleep 0.1
+            if rg -q "$pattern" "$ARTIFACTS/compositor.log" \
+                "$ARTIFACTS/compositor.stderr" 2>/dev/null; then
+                return 0
+            fi
             return 1
         fi
         sleep 0.1
@@ -160,7 +167,7 @@ export XDG_STATE_HOME="$TEMP_XDG/state"
 export XDG_CACHE_HOME="$TEMP_XDG/cache"
 export FOCALDESK_LOG_FILE="$ARTIFACTS/compositor.log"
 export FOCALDESK_DISABLE_PORTAL_ENV=1
-export RUST_LOG="${RUST_LOG:-focaldesk=debug}"
+export RUST_LOG="${RUST_LOG:-focaldesk=debug,smithay=error}"
 
 WAYLAND_DISPLAY="$HOST_DISPLAY" "$COMPOSITOR" \
     >"$ARTIFACTS/compositor.stderr" 2>&1 &
