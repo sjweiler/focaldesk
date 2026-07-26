@@ -2061,10 +2061,13 @@ name = "focaldesk-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "focaldesk-ai",
  "focaldesk-engine",
+ "focaldesk-ipc",
  "focaldesk-logging",
  "focaldesk-memory",
+ "libc",
  "serde",
  "serde_json",
  "tokio",

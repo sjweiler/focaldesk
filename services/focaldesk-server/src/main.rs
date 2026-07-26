@@ -1,8 +1,12 @@
 use anyhow::Result;
 
-use focaldesk_ai::{serve_ai_ipc, Agent, AiService};
+use focaldesk_ai::{Agent, AiService, serve_ai_ipc};
 use focaldesk_logging::flog_info;
 use std::sync::Arc;
+
+mod control_center;
+
+use control_center::{control_center_socket_path, serve_control_center_ipc};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,6 +29,10 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+    flog_info!(
+        "Control Center IPC listening on {}",
+        control_center_socket_path()?.display()
+    );
 
     // later:
     // start IPC server
@@ -32,5 +40,9 @@ async fn main() -> Result<()> {
     // load policies
     // handle client connections
 
-    serve_ai_ipc(ai_service).await
+    tokio::try_join!(
+        serve_ai_ipc(ai_service.clone()),
+        serve_control_center_ipc(ai_service),
+    )?;
+    Ok(())
 }

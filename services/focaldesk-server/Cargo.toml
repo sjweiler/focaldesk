@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 focaldesk-ai = { path = "../../crates/focaldesk-ai" }
 focaldesk-memory = { path = "../../crates/focaldesk-memory" }
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 
 focaldesk-engine = { path = "../../crates/focaldesk-engine" }
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
@@ -27,3 +28,5 @@ tracing-subscriber = { workspace = true }
 # Serialization for IPC
 serde = { workspace = true }
 serde_json = "1"
+chrono = { workspace = true }
+libc = { workspace = true }

@@ -8,6 +8,7 @@ ExecStart=%h/.local/bin/focaldesk-server
 Restart=on-failure
 RestartSec=2
 Environment=FOCALDESK_AI_SOCKET=%t/focaldesk/focaldesk-ai.sock
+Environment=FOCALDESK_CONTROL_CENTER_SOCKET=%t/focaldesk/control-center.sock
 EnvironmentFile=-%h/.config/focaldesk/focaldesk-server.env
 Environment=FOCALDESK_AI_PERMISSION=prompt
 KillSignal=SIGINT
