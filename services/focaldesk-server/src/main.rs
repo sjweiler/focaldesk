@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use focaldesk_ai::{Agent, AiService, serve_ai_ipc};
+use focaldesk_ai::{serve_ai_ipc, Agent, AiService};
 use focaldesk_logging::flog_info;
 use std::sync::Arc;
 

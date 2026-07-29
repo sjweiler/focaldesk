@@ -19,4 +19,7 @@ focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }
 focaldesk-power = { path = "../../crates/focaldesk-power" }
 focaldesk-bluetooth = { path = "../../crates/focaldesk-bluetooth" }
 focaldesk-sounds = { path = "../../crates/focaldesk-sounds" }
+focaldesk-ai = { path = "../../crates/focaldesk-ai" }
+focaldesk-permissions = { path = "../../crates/focaldesk-permissions" }
 tracing = { workspace = true }
+zbus = "4"

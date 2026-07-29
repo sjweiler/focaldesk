@@ -53,6 +53,8 @@ pub enum IpcRequest {
         outputs: Vec<OutputConfig>,
     },
     GetDisplayRuntimeStatus,
+    /// Returns a bounded, secret-free snapshot of compositor-owned desktop state.
+    GetDesktopSnapshot,
     GetPowerSnapshot,
     IdentifyDisplays,
     Reload,
@@ -87,6 +89,9 @@ pub enum DesktopAction {
     MoveFocused { direction: DesktopDirection },
     CloseFocused,
     SetVolume { percent: u8 },
+    FocusWindow { window_id: u32 },
+    MoveWindowToWorkspace { window_id: u32, workspace: u32 },
+    OpenSettingsPanel { panel: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +118,9 @@ pub enum IpcResponse {
     DisplayRuntimeStatus {
         outputs: Vec<DisplayRuntimeOutputStatus>,
     },
+    DesktopSnapshot {
+        snapshot: DesktopSnapshot,
+    },
     PowerSnapshot {
         snapshot: PowerSnapshot,
     },
@@ -128,6 +136,83 @@ pub struct DisplayRuntimeOutputStatus {
     pub icc_lut_fallback_active: bool,
     #[serde(default)]
     pub wide_gamut_active: bool,
+}
+
+/// MCP and diagnostic consumers receive this typed projection rather than
+/// reaching into compositor state directly. It intentionally contains only
+/// desktop metadata and must never grow credential or clipboard fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DesktopSnapshot {
+    pub session: SessionStatus,
+    pub outputs: Vec<OutputSnapshot>,
+    pub windows: Vec<WindowSnapshot>,
+    pub workspaces: Vec<WorkspaceSnapshot>,
+    pub rendering: RenderingStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatus {
+    pub running: bool,
+    pub locked: bool,
+    pub focused_output_id: u64,
+    pub focused_window_id: Option<u32>,
+    pub active_workspace_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputSnapshot {
+    pub id: u64,
+    pub connector: String,
+    pub make: String,
+    pub model: String,
+    pub serial: String,
+    pub width: i32,
+    pub height: i32,
+    pub x: i32,
+    pub y: i32,
+    pub scale: f64,
+    pub active_workspace_id: u32,
+    pub focused: bool,
+    pub hdr_supported: bool,
+    pub hdr_requested: bool,
+    pub hdr_active: bool,
+    pub wide_gamut_active: bool,
+    pub icc_lut_fallback_active: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowSnapshot {
+    pub id: u32,
+    pub title: String,
+    pub app_id: Option<String>,
+    pub class: Option<String>,
+    pub workspace_id: u32,
+    pub output_id: Option<u64>,
+    pub mapped: bool,
+    pub minimized: bool,
+    pub maximized: bool,
+    pub fullscreen: bool,
+    pub focused: bool,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    pub id: u32,
+    pub name: String,
+    pub active_on_output_ids: Vec<u64>,
+    pub window_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RenderingStatus {
+    pub backend: String,
+    pub compositor_ready: bool,
+    pub output_count: usize,
+    pub damage_debug_enabled: bool,
 }
 
 pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String> {

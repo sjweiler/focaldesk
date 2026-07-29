@@ -1,4 +1,5 @@
 pub mod app;
+pub mod camera;
 pub mod color;
 pub mod colord;
 pub mod consts;

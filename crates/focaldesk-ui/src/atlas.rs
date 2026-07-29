@@ -55,6 +55,8 @@ pub enum IconId {
     Slot(u8),
     Microphone,
     MicrophoneOff,
+    Video,
+    VideoOff,
     Speaker,
     SpeakerOff,
     FocalDeskLabel,
@@ -152,6 +154,8 @@ impl IconId {
             "bluetooth_off" => Self::BluetoothOff,
             "microphone" => Self::Microphone,
             "microphone_off" => Self::MicrophoneOff,
+            "camera" | "video" => Self::Video,
+            "camera_off" | "video_off" => Self::VideoOff,
             "speaker" => Self::Speaker,
             "speaker_off" => Self::SpeakerOff,
             "power" => Self::Power,
@@ -506,6 +510,14 @@ where
         (
             IconId::MicrophoneOff,
             include_bytes!("../../../assets/svg/microphone-off.svg"),
+        ),
+        (
+            IconId::Video,
+            include_bytes!("../../../assets/svg/video.svg"),
+        ),
+        (
+            IconId::VideoOff,
+            include_bytes!("../../../assets/svg/video-off.svg"),
         ),
         //(IconId::FocalDeskLabel, include_bytes!("../../../assets/svg/focaldesk-logo.svg")),
         (

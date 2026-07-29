@@ -38,6 +38,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-portal",
         "focaldesk-cli",
         "focaldesk-ai-console",
+        "focaldesk-mcp",
         "focald-voice",
     ],
     allowed_units: &["focald-voice.service"],
@@ -68,6 +69,7 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-automation",
         "focaldesk-cli",
         "focaldesk-ai-console",
+        "focaldesk-mcp",
     ],
     allowed_units: &["focaldesk-automation.service"],
 };

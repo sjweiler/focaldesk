@@ -168,7 +168,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         nested.state.process_notification_timers();
         nested.state.process_idle_timers();
         nested.state.process_power_timers();
-        nested.state.process_audio_device_timers();
+        nested.state.process_media_device_timers();
         nested.state.process_network_state_timers();
         nested.state.process_lock_timers();
 

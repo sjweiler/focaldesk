@@ -1,0 +1,16 @@
+[Unit]
+Description=FocalDesk desktop portal backend
+PartOf=focaldesk-session.target
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.focaldesk
+ExecStart=/usr/bin/focaldesk-portal --backend
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+LimitCORE=0
+
+[Install]
+WantedBy=focaldesk-session.target

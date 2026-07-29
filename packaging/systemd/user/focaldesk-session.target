@@ -9,6 +9,7 @@ Wants=focaldesk-powerd.service
 Wants=focaldesk-notificationsd.service
 Wants=focaldesk-dialogd.service
 Wants=focaldesk-controlsd.service
+Wants=focaldesk-portald.service
 Wants=focal-launchd.service
 Wants=focaldesk-settingsd.service
 Wants=focald-voice.service

@@ -1922,6 +1922,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-mcp"
+version = "0.1.0"
+dependencies = [
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "focaldesk-memory"
 version = "0.1.0"
 dependencies = [
@@ -2002,9 +2014,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "focaldesk-ipc",
+ "focaldesk-settings-core",
  "serde",
  "serde_json",
+ "tokio",
  "wayland-client",
+ "zbus 5.18.0",
 ]
 
 [[package]]
@@ -2081,10 +2096,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "focaldesk-ai",
  "focaldesk-bluetooth",
  "focaldesk-config",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-permissions",
  "focaldesk-power",
  "focaldesk-settings-core",
  "focaldesk-sounds",
@@ -2094,6 +2111,7 @@ dependencies = [
  "serde_json",
  "toml 0.8.23",
  "tracing",
+ "zbus 4.4.0",
 ]
 
 [[package]]

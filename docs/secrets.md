@@ -90,9 +90,12 @@ just install-focaldm-pam-fedora
 ```
 
 The policy uses `pam_focald_secrets.so` after `pam_systemd.so` to stage a
-root-only credential and start `focald-secrets@$UID.service` through the system
-manager. Focaldesk then owns `org.freedesktop.secrets`, so Chrome and other
-Secret Service clients use the Focaldesk store without a second keyring prompt.
+root-only credential and connect to `focald-secrets@$UID.socket`. The socket
+starts with `user@$UID.service` and activates the broker without a privileged
+process launch from the PAM stack. The hook waits for a broker ping before
+removing the staged credential. Focaldesk then owns
+`org.freedesktop.secrets`, so Chrome and other Secret Service clients use the
+Focaldesk store without a second keyring prompt.
 
 The first successful login creates a random store key and wraps it under an
 Argon2id-derived key (64 MiB, three iterations, one lane). Existing

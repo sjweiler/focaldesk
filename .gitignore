@@ -17,6 +17,8 @@ dist/
 *.so.*
 *.rlib
 *.d
+!packaging/systemd/system/user@.service.d/
+!packaging/systemd/system/user@.service.d/*.conf
 *.tmp
 !packaging/sysusers.d/
 !packaging/sysusers.d/*.conf

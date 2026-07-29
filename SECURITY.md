@@ -4,6 +4,11 @@ FocalDesk is alpha compositor and desktop environment software. Security-sensiti
 behavior may include process launching, IPC, permissions, portals, input handling,
 display output, file access, and automation features.
 
+The MCP adapter is not a credential transport. `focald-secrets` must never
+return plaintext secrets through MCP. Any future integration must expose only
+narrow operations such as signing or short-lived opaque handles, with explicit
+authorization and audit, rather than arbitrary credential retrieval.
+
 ## Supported Versions
 
 Security fixes are handled on the current default branch. FocalDesk does not

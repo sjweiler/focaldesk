@@ -612,7 +612,9 @@ pub(crate) fn stop_focaldesk_session_target() {
 
 fn publish_portal_environment(wayland_display: &str) {
     std::env::set_var("WAYLAND_DISPLAY", wayland_display);
-    std::env::set_var("XDG_CURRENT_DESKTOP", "wlroots");
+    // The first component selects Focaldesk's portal routing (including the
+    // location lockdown backend); wlroots remains as a compatibility fallback.
+    std::env::set_var("XDG_CURRENT_DESKTOP", "focaldesk:wlroots");
 
     if std::env::var_os("FOCALDESK_DISABLE_PORTAL_ENV").is_some() {
         flog(format!(
@@ -630,7 +632,7 @@ fn publish_portal_environment(wayland_display: &str) {
 
     match status {
         Ok(status) if status.success() => flog(format!(
-            "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=wlroots"
+            "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=focaldesk:wlroots"
         )),
         Ok(status) => flog(format!(
             "failed to publish portal environment: dbus-update-activation-environment exited with {status}"

@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
 use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_ipc::{
@@ -7,6 +8,9 @@ use focaldesk_ipc::{
     PowerIpcRequest, PowerIpcResponse,
 };
 use focaldesk_logging::{init_default_logging, session_id};
+use focaldesk_permissions::{
+    PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
+};
 use focaldesk_settings_core::{
     load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile,
     LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
@@ -25,6 +29,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
+
+mod location_permissions;
+
+use location_permissions::{
+    list_location_permission_records, revoke_location_permission, LocationPermissionRecord,
+};
 
 const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("100 %", 1.0),
@@ -1994,15 +2004,28 @@ fn set_scale_if_changed(scale: &gtk::Scale, value: f64) {
 
 fn main() {
     init_default_logging();
+    let initial_panel = requested_panel(std::env::args().skip(1));
     let app = adw::Application::new(
         Some("com.focaldesk.Settings"),
         gtk::gio::ApplicationFlags::NON_UNIQUE,
     );
-    app.connect_activate(build_ui);
+    app.connect_activate(move |app| build_ui(app, initial_panel.as_deref()));
     app.run();
 }
 
-fn build_ui(app: &adw::Application) {
+fn requested_panel(mut args: impl Iterator<Item = String>) -> Option<String> {
+    while let Some(argument) = args.next() {
+        if argument == "--panel" {
+            return args.next().map(|panel| panel.to_ascii_lowercase());
+        }
+        if let Some(panel) = argument.strip_prefix("--panel=") {
+            return Some(panel.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
     let config = Rc::new(RefCell::new(load_config()));
     let settings = Rc::new(RefCell::new(load_settings()));
 
@@ -2026,7 +2049,7 @@ fn build_ui(app: &adw::Application) {
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
 
-    for name in [
+    let panel_names = [
         "Appearance",
         "Network",
         "Bluetooth",
@@ -2041,7 +2064,8 @@ fn build_ui(app: &adw::Application) {
         "Power",
         "Debug",
         "About",
-    ] {
+    ];
+    for name in panel_names {
         let row = gtk::ListBoxRow::new();
         let label = gtk::Label::new(Some(name));
         label.set_xalign(0.0);
@@ -2092,8 +2116,15 @@ fn build_ui(app: &adw::Application) {
 
     split.set_sidebar(Some(&sidebar_page));
     split.set_content(Some(&content_page));
-    content_stack.set_visible_child_name("Appearance");
-    list.select_row(list.row_at_index(0).as_ref());
+    let initial_index = initial_panel
+        .and_then(|requested| {
+            panel_names
+                .iter()
+                .position(|name| name.eq_ignore_ascii_case(requested))
+        })
+        .unwrap_or(0);
+    content_stack.set_visible_child_name(panel_names[initial_index]);
+    list.select_row(list.row_at_index(initial_index as i32).as_ref());
 
     let content_stack_clone = content_stack.clone();
 
@@ -3944,7 +3975,9 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     let maximize_on_launch = add_switch_row(
         &behavior_group,
         "Maximize app on launch",
-        Some("Open new app windows filling the work area; turn off to open at a smaller default size"),
+        Some(
+            "Open new app windows filling the work area; turn off to open at a smaller default size",
+        ),
         settings.borrow().workspaces.maximize_on_launch,
     );
     {
@@ -4065,21 +4098,21 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     permissions_group.set_title("Permissions");
     add_info_row(
         &permissions_group,
-        "Screen capture permission status",
-        Some("PipeWire portal screen sharing"),
-        "No active grant",
+        "Screen sharing",
+        Some("The portal asks you to choose a screen for every request"),
+        "Ask each time",
     );
     add_info_row(
         &permissions_group,
-        "Microphone portal permission",
-        Some("Per-app microphone permissions will appear here"),
-        "Placeholder",
+        "Microphone portal",
+        Some("Per-app portal controls are not available in this build"),
+        "Unavailable",
     );
     add_info_row(
         &permissions_group,
-        "Camera portal permission",
-        Some("Per-app camera permissions will appear here"),
-        "Placeholder",
+        "Camera portal",
+        Some("Per-app portal controls are not available in this build"),
+        "Unavailable",
     );
     let location_services = add_switch_row(
         &permissions_group,
@@ -4095,6 +4128,13 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
     page.add(&permissions_group);
+
+    let saved_permissions_group = adw::PreferencesGroup::new();
+    saved_permissions_group.set_title("Saved App Permissions");
+    saved_permissions_group
+        .set_description(Some("Persistent permission decisions can be revoked here"));
+    populate_saved_permissions(&saved_permissions_group);
+    page.add(&saved_permissions_group);
 
     let history_group = adw::PreferencesGroup::new();
     history_group.set_title("History");
@@ -4143,6 +4183,192 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     page.add(&lock_group);
 
     adw::NavigationPage::new(&page, "Privacy")
+}
+
+fn populate_saved_permissions(group: &adw::PreferencesGroup) {
+    let mut record_count = 0usize;
+    let mut error_count = 0usize;
+
+    match list_ai_permission_records() {
+        Ok(records) => {
+            record_count += records.len();
+            for record in records {
+                add_saved_ai_permission_row(group, record);
+            }
+        }
+        Err(err) => {
+            error_count += 1;
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "failed to load saved AI permissions"
+            );
+            add_info_row(
+                group,
+                "AI permissions could not be loaded",
+                Some("Check the FocalDesk log for details"),
+                "Error",
+            );
+        }
+    }
+
+    match list_location_permission_records() {
+        Ok(records) => {
+            record_count += records.len();
+            for record in records {
+                add_saved_location_permission_row(group, record);
+            }
+        }
+        Err(err) => {
+            error_count += 1;
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "failed to load saved location permissions"
+            );
+            add_info_row(
+                group,
+                "Location permissions could not be loaded",
+                Some("The XDG permission store is unavailable"),
+                "Error",
+            );
+        }
+    }
+
+    if record_count == 0 && error_count == 0 {
+        add_info_row(
+            group,
+            "No saved permissions",
+            Some("Apps will appear after you save a permission decision"),
+            "",
+        );
+    }
+}
+
+fn add_saved_ai_permission_row(group: &adw::PreferencesGroup, record: AiPermissionRecord) {
+    let row = adw::ActionRow::new();
+    row.set_title(&saved_permission_title(&record));
+    row.set_subtitle(&saved_permission_subtitle(&record));
+
+    let revoke = gtk::Button::with_label("Revoke");
+    revoke.add_css_class("pill");
+    row.add_suffix(&revoke);
+    group.add(&row);
+
+    revoke.connect_clicked(move |button| match revoke_ai_permission(&record) {
+        Ok(()) => {
+            button.set_label("Revoked");
+            button.set_sensitive(false);
+            row.set_subtitle("This saved decision has been removed");
+        }
+        Err(err) => {
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                "failed to revoke saved permission"
+            );
+            button.set_label("Retry");
+            row.set_subtitle("Could not revoke this permission; check the FocalDesk log");
+        }
+    });
+}
+
+fn add_saved_location_permission_row(
+    group: &adw::PreferencesGroup,
+    record: LocationPermissionRecord,
+) {
+    let row = adw::ActionRow::new();
+    row.set_title(&format!("Location — {}", record.decision_label()));
+    row.set_subtitle(&format!(
+        "{} • {} • XDG portal",
+        record.app_id,
+        record.accuracy_label()
+    ));
+
+    let revoke = gtk::Button::with_label("Revoke");
+    revoke.add_css_class("pill");
+    row.add_suffix(&revoke);
+    group.add(&row);
+
+    revoke.connect_clicked(move |button| match revoke_location_permission(&record) {
+        Ok(()) => {
+            button.set_label("Revoked");
+            button.set_sensitive(false);
+            row.set_subtitle("This app will be asked again on its next location request");
+        }
+        Err(err) => {
+            warn!(
+                target: "focaldesk",
+                session_id = session_id(),
+                error = %err,
+                app_id = %record.app_id,
+                "failed to revoke saved location permission"
+            );
+            button.set_label("Retry");
+            row.set_subtitle("Could not revoke this permission; check the FocalDesk log");
+        }
+    });
+}
+
+fn saved_permission_title(record: &AiPermissionRecord) -> String {
+    format!(
+        "{} — {}",
+        permission_resource_label(record.resource),
+        permission_decision_label(record.decision)
+    )
+}
+
+fn saved_permission_subtitle(record: &AiPermissionRecord) -> String {
+    format!(
+        "{} • {} • {}",
+        record.app_identity,
+        permission_target_label(&record.target),
+        permission_scope_label(record.scope)
+    )
+}
+
+fn permission_decision_label(decision: PermissionDecision) -> &'static str {
+    match decision {
+        PermissionDecision::Allow => "Allowed",
+        PermissionDecision::Deny => "Denied",
+        PermissionDecision::Ask => "Ask",
+    }
+}
+
+fn permission_scope_label(scope: PermissionScope) -> &'static str {
+    match scope {
+        PermissionScope::Once => "Once",
+        PermissionScope::Session => "Session",
+        PermissionScope::Persistent => "Persistent",
+    }
+}
+
+fn permission_target_label(target: &PermissionTarget) -> String {
+    match target {
+        PermissionTarget::Global => "Global".to_string(),
+        PermissionTarget::Named(name) => name.clone(),
+    }
+}
+
+fn permission_resource_label(resource: PermissionResource) -> &'static str {
+    match resource {
+        PermissionResource::Screenshot => "Screenshot",
+        PermissionResource::Screencast => "Screencast",
+        PermissionResource::ScreenShareWindow => "Window share",
+        PermissionResource::ScreenShareOutput => "Output share",
+        PermissionResource::AiChat => "AI chat",
+        PermissionResource::Microphone => "Microphone",
+        PermissionResource::Camera => "Camera",
+        PermissionResource::ClipboardRead => "Clipboard read",
+        PermissionResource::ClipboardWrite => "Clipboard write",
+        PermissionResource::RemoteInput => "Remote input",
+        PermissionResource::Notifications => "Notifications",
+        PermissionResource::FileOpen => "File open",
+        PermissionResource::FileSave => "File save",
+    }
 }
 
 fn option_index(values: &[Option<u32>], value: Option<u32>) -> u32 {

@@ -19,8 +19,8 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
 use zeroize::{Zeroize, Zeroizing};
 
 // ---- Linux-PAM ABI ---------------------------------------------------------
@@ -584,42 +584,42 @@ fn encrypted_store_exists(user: &UserInfo) -> bool {
 }
 
 fn start_system_broker(uid: libc::uid_t) -> std::io::Result<()> {
-    let unit = format!("focald-secrets@{uid}.service");
-    let mut child = Command::new("/usr/bin/systemctl")
-        .args([
-            "--system",
-            "--no-ask-password",
-            "--quiet",
-            "start",
-            unit.as_str(),
-        ])
-        .env_clear()
-        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
+    // user@.service starts the system socket instance. Connecting to that
+    // socket activates the broker without executing systemctl from PAM (which
+    // is denied after pam_selinux installs its one-shot exec context). A real
+    // ping, rather than connect(2) alone, proves that the daemon loaded the
+    // staged credential before the PAM hook removes it.
+    const PING: &[u8] = br#"{"op":"ping"}"#;
+    let socket = PathBuf::from(format!("/run/user/{uid}/focaldesk/secrets.sock"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(16);
+    loop {
+        if let Ok(mut stream) = UnixStream::connect(&socket) {
+            let io_timeout = Some(std::time::Duration::from_millis(500));
+            let _ = stream.set_read_timeout(io_timeout);
+            let _ = stream.set_write_timeout(io_timeout);
+            let request_len = (PING.len() as u32).to_be_bytes();
+            if stream.write_all(&request_len).is_ok() && stream.write_all(PING).is_ok() {
+                let mut response_len = [0_u8; 4];
+                if stream.read_exact(&mut response_len).is_ok() {
+                    let response_len = u32::from_be_bytes(response_len);
+                    if (1..=4096).contains(&response_len) {
+                        let mut response = vec![0_u8; response_len as usize];
+                        if stream.read_exact(&mut response).is_ok()
+                            && response.windows(9).any(|part| part == br#""ok":true"#)
+                        {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                format!("timed out starting {unit}"),
+                format!("timed out waiting for {}", socket.display()),
             ));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "systemctl failed to start {unit}: {status}"
-        )))
     }
 }
 

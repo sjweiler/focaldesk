@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use chrono::{Local, TimeZone, Utc};
 use focaldesk_ai::AiService;
 use focaldesk_ipc::transport::{self, PeerPolicy};

@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.focaldesk
+Exec=/usr/bin/focaldesk-portal --backend
+SystemdService=focaldesk-portald.service

@@ -25,6 +25,7 @@ pub const TOPBAR_BLUETOOTH_ID: u32 = 101;
 pub const TOPBAR_AUDIO_ID: u32 = 102;
 pub const TOPBAR_DISPLAY_ID: u32 = 103;
 pub const TOPBAR_POWER_ID: u32 = 104;
+pub const TOPBAR_CAMERA_ID: u32 = 105;
 
 // Workspace buttons get dynamically assigned IDs instead of fixed per-slot
 // consts, since the number of individually displayed workspace buttons is
@@ -75,6 +76,8 @@ pub struct UiBuildOptions {
     pub hdr_kms_applied: bool,
     pub microphone_detected: bool,
     pub voice_capture_status: VoiceCaptureStatus,
+    pub camera_detected: bool,
+    pub camera_active: bool,
     pub network_state: NetworkState,
     pub workspace_count: usize,
     /// Max number of workspace buttons shown individually before they
@@ -99,6 +102,8 @@ impl Default for UiBuildOptions {
             hdr_kms_applied: false,
             microphone_detected: false,
             voice_capture_status: VoiceCaptureStatus::Unavailable,
+            camera_detected: false,
+            camera_active: false,
             network_state: NetworkState::default(),
             workspace_count: 1,
             max_workspace_slots: 4,
@@ -266,6 +271,24 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
         )
         .selected(audio_selected)
         .active(audio_active),
+        ChromeItem::new(
+            TOPBAR_CAMERA_ID,
+            if options.camera_active {
+                IconId::Video
+            } else {
+                IconId::VideoOff
+            },
+            if options.camera_active {
+                "Camera in use"
+            } else if options.camera_detected {
+                "Camera detected — not in use"
+            } else {
+                "No camera detected"
+            },
+            UiAction::OpenPanel(PanelKind::Settings),
+        )
+        .selected(options.camera_detected)
+        .active(options.camera_active),
         ChromeItem::new(
             TOPBAR_DISPLAY_ID,
             IconId::HDR,
@@ -633,6 +656,30 @@ mod tests {
     }
 
     #[test]
+    fn default_sidebar_buttons_all_have_actions_after_a_rebuild() {
+        let output_size = smithay::utils::Size::from((1920, 1080));
+        let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
+        let mut ui = UiTree::default();
+
+        for _ in 0..2 {
+            build_ui_for_output_with_options(&mut ui, &layout, UiBuildOptions::default());
+            let sidebar_buttons: Vec<_> = ui
+                .elements
+                .iter()
+                .filter(|element| {
+                    element.kind == crate::types::UiElementKind::SidebarButton && element.visible
+                })
+                .collect();
+            assert!(!sidebar_buttons.is_empty());
+            assert!(
+                sidebar_buttons
+                    .iter()
+                    .all(|element| element.enabled && element.action.is_some())
+            );
+        }
+    }
+
+    #[test]
     fn sidebar_collapses_to_overflow_once_workspace_count_exceeds_slot_setting() {
         let ui = build(5, 3);
 
@@ -725,6 +772,54 @@ mod tests {
         );
         assert!(!microphone_off.selected);
         assert!(!microphone_off.active);
+    }
+
+    #[test]
+    fn camera_well_distinguishes_presence_and_active_use() {
+        let output_size = smithay::utils::Size::from((1920, 1080));
+        let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(
+            &mut ui,
+            &layout,
+            UiBuildOptions {
+                camera_detected: true,
+                camera_active: false,
+                ..UiBuildOptions::default()
+            },
+        );
+
+        let idle_camera = ui
+            .elements
+            .iter()
+            .find(|element| element.id == super::TOPBAR_CAMERA_ID)
+            .expect("camera indicator");
+        assert_eq!(idle_camera.icon, Some(IconId::VideoOff));
+        assert_eq!(
+            idle_camera.tooltip.as_deref(),
+            Some("Camera detected — not in use")
+        );
+        assert!(idle_camera.selected);
+        assert!(!idle_camera.active);
+
+        build_ui_for_output_with_options(
+            &mut ui,
+            &layout,
+            UiBuildOptions {
+                camera_detected: true,
+                camera_active: true,
+                ..UiBuildOptions::default()
+            },
+        );
+        let active_camera = ui
+            .elements
+            .iter()
+            .find(|element| element.id == super::TOPBAR_CAMERA_ID)
+            .expect("active camera indicator");
+        assert_eq!(active_camera.icon, Some(IconId::Video));
+        assert_eq!(active_camera.tooltip.as_deref(), Some("Camera in use"));
+        assert!(active_camera.selected);
+        assert!(active_camera.active);
     }
 
     fn build_flow_field() -> UiElement {

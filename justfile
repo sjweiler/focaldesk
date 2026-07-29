@@ -65,7 +65,7 @@ install-session-target:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
 
-install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-focald-voice install-focald-speech install-focald-mic
+install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -139,8 +139,13 @@ install-polkit-service:
 install-portal:
     cargo build --release -p focaldesk-portal
     install -Dm755 target/release/focaldesk-portal "$HOME/.local/bin/focaldesk-portal"
+    install -Dm644 packaging/systemd/user/focaldesk-portald.service "$HOME/.config/systemd/user/focaldesk-portald.service"
+    install -Dm644 packaging/xdg-desktop-portal/focaldesk.portal "$HOME/.local/share/xdg-desktop-portal/portals/focaldesk.portal"
+    install -Dm644 packaging/xdg-desktop-portal/focaldesk-portals.conf "$HOME/.local/share/xdg-desktop-portal/focaldesk-portals.conf"
     mkdir -p "$HOME/.config/xdg-desktop-portal-wlr"
     target/release/focaldesk-portal --print-xdpw-config > "$HOME/.config/xdg-desktop-portal-wlr/config"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user restart focaldesk-portald.service || echo "Restart the FocalDesk portal backend after logging into FocalDesk"
     systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"
 
 install-automation-service:
@@ -232,9 +237,18 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services-fedora: install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
 
-install-secrets-service-fedora:
+# Both the system credential socket and user-session IPC use this directory.
+# Prepare it before starting user services so a directory created by PID 1
+# cannot leave every desktop service with EACCES.
+install-runtime-dir-fedora:
+    sudo install -Dm644 packaging/systemd/system/focaldesk-runtime-dir@.service /usr/lib/systemd/system/focaldesk-runtime-dir@.service
+    sudo systemctl daemon-reload
+    if test ! -L "/run/user/$(id -u)/focaldesk" && test -d "/run/user/$(id -u)/focaldesk" && test "$(stat -c %u "/run/user/$(id -u)/focaldesk")" != "$(id -u)"; then sudo chown --no-dereference "$(id -u):$(id -g)" "/run/user/$(id -u)/focaldesk"; sudo chmod 0700 "/run/user/$(id -u)/focaldesk"; fi
+    sudo systemctl restart "focaldesk-runtime-dir@$(id -u).service"
+
+install-secrets-service-fedora: install-runtime-dir-fedora
     cargo build --release -p focald-secrets
     # Upgrade cleanup: the broker moved from the user manager to a
     # credential-fed system-manager template. Stop and remove the old socket
@@ -251,11 +265,14 @@ install-secrets-service-fedora:
     sudo install -Dm755 target/release/focald-secrets-import-gnome-keyring /usr/bin/focald-secrets-import-gnome-keyring
     sudo install -Dm644 packaging/systemd/user/focald-secrets-import-fedora.service /usr/lib/systemd/user/focald-secrets-import.service
     sudo install -Dm644 packaging/systemd/system/focald-secrets@.service /usr/lib/systemd/system/focald-secrets@.service
+    sudo install -Dm644 packaging/systemd/system/focald-secrets@.socket /usr/lib/systemd/system/focald-secrets@.socket
+    sudo install -Dm644 packaging/systemd/system/user@.service.d/90-focald-secrets.conf /usr/lib/systemd/system/user@.service.d/90-focald-secrets.conf
     sudo install -Dm644 packaging/dbus/org.freedesktop.secrets.service /usr/share/dbus-1/services/org.freedesktop.secrets.service
     test -e /etc/focaldesk/secrets-acl.toml || sudo install -Dm644 packaging/focaldesk/secrets-acl.toml /etc/focaldesk/secrets-acl.toml
     sudo systemctl daemon-reload
+    sudo systemctl start "focald-secrets@$(id -u).socket"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    echo "The PAM session hook starts focald-secrets@UID.service with a private credential"
+    echo "The PAM session hook unlocks focald-secrets@UID.service through its system socket"
 
 # Install FocalDesk's PAM module without changing the active login policy.
 install-secrets-pam-fedora:
@@ -342,6 +359,17 @@ install-polkit-service-fedora:
     cargo build --release -p focaldesk-polkitd
     sudo install -Dm755 target/release/focaldesk-polkitd /usr/bin/focaldesk-polkitd
     systemctl --user disable --now focaldesk-polkitd.service || echo "Skipping stale polkit service cleanup: no user bus available"
+
+install-portal-fedora:
+    cargo build --release -p focaldesk-portal
+    sudo install -Dm755 target/release/focaldesk-portal /usr/bin/focaldesk-portal
+    sudo install -Dm644 packaging/systemd/user/focaldesk-portald-fedora.service /usr/lib/systemd/user/focaldesk-portald.service
+    sudo install -Dm644 packaging/dbus/org.freedesktop.impl.portal.desktop.focaldesk.service /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.focaldesk.service
+    sudo install -Dm644 packaging/xdg-desktop-portal/focaldesk.portal /usr/share/xdg-desktop-portal/portals/focaldesk.portal
+    sudo install -Dm644 packaging/xdg-desktop-portal/focaldesk-portals.conf /usr/share/xdg-desktop-portal/focaldesk-portals.conf
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user restart focaldesk-portald.service || echo "Restart the FocalDesk portal backend after logging into FocalDesk"
+    systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"
 
 install-voice-service-fedora:
     cargo build --release -p focald-voice

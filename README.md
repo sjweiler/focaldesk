@@ -33,6 +33,8 @@ and [roadmap](ROADMAP.md) for the intended direction.
 - Encrypted credential broker with ACL-protected native IPC and Secret Service
   compatibility for libsecret applications.
 - Typed local IPC and explicit permission checks for AI and automation actions.
+- A read-heavy, capability-gated [MCP adapter](docs/mcp.md) over authoritative
+  typed desktop IPC.
 
 Features marked experimental are under active development and may be incomplete
 or hardware-dependent. The status table below is the best summary of what works

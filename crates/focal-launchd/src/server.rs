@@ -52,12 +52,7 @@ fn handle_stream(stream: &mut std::os::unix::net::UnixStream) -> anyhow::Result<
         "focal-launchd: accepted launch trace_id={} app={}",
         req.trace_id, req.app
     );
-    thread::spawn(move || {
-        if let Err(err) = launch(req) {
-            eprintln!("focal-launchd: launch failed: {err:#}");
-        }
-    });
-
+    launch(req)?;
     Ok(LaunchResponse::Accepted)
 }
 

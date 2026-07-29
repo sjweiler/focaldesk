@@ -9,9 +9,11 @@ use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod backend;
 mod wayland_outputs;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -21,6 +23,10 @@ fn main() -> Result<()> {
 
     if args.iter().any(|arg| arg == "--print-xdpw-config") {
         return print_xdpw_config();
+    }
+
+    if args.iter().any(|arg| arg == "--backend") {
+        return backend::run().await;
     }
 
     run_chooser()
@@ -217,6 +223,7 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  focaldesk-portal");
+    println!("  focaldesk-portal --backend");
     println!("  focaldesk-portal --print-xdpw-config");
     println!();
     println!("Environment:");

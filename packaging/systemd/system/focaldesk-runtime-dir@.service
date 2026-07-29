@@ -1,0 +1,25 @@
+[Unit]
+Description=Prepare FocalDesk runtime directory for UID %i
+Requires=user-runtime-dir@%i.service
+After=user-runtime-dir@%i.service
+Before=focald-secrets@%i.socket
+PartOf=user@%i.service
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+UMask=0077
+ExecStart=/usr/bin/mkdir -p /run/user/%i/focaldesk
+ExecStart=/usr/bin/chmod 0700 /run/user/%i/focaldesk
+RemainAfterExit=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Keep home and the rest of /run/user read-only while allowing the explicit
+# per-user runtime path below. ProtectHome=yes would hide /run/user entirely,
+# so ReadWritePaths could not make this directory writable again.
+ProtectHome=read-only
+PrivateTmp=yes
+# ProtectHome=read-only also covers /run/user.  Allow traversal of the
+# parent mount as well as the per-user directory we create below.
+ReadWritePaths=/run/user /run/user/%i

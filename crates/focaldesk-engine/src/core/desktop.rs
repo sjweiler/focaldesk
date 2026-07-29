@@ -73,8 +73,9 @@ use focaldesk_flow::ModMask;
 use focaldesk_ipc::{
     desktop_socket_path, send_control_request, send_notification_request, send_power_request,
     transport, ControlIpcRequest, ControlIpcResponse, ControlSetting, DesktopAction,
-    DesktopDirection, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, NotificationIpcRequest,
-    NotificationIpcResponse, PowerIpcRequest, PowerIpcResponse,
+    DesktopDirection, DesktopSnapshot, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
+    PowerIpcResponse, RenderingStatus, SessionStatus, WindowSnapshot, WorkspaceSnapshot,
 };
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
@@ -508,6 +509,10 @@ fn runtime_display_status_key() -> &'static str {
     "displays.runtime"
 }
 
+fn bounded_metadata(value: &str) -> String {
+    value.chars().take(512).collect()
+}
+
 fn runtime_display_status_value(state: &DesktopState) -> serde_json::Value {
     let outputs: Vec<DisplayRuntimeOutputStatus> = state
         .outputs
@@ -790,6 +795,11 @@ pub struct DesktopState {
     microphone_detection_rx: mpsc::Receiver<bool>,
     microphone_detection_in_flight: bool,
     last_microphone_detection_at: Instant,
+    pub(crate) camera_status: crate::core::camera::CameraStatus,
+    camera_status_tx: mpsc::Sender<crate::core::camera::CameraStatus>,
+    camera_status_rx: mpsc::Receiver<crate::core::camera::CameraStatus>,
+    camera_status_in_flight: bool,
+    last_camera_status_at: Instant,
     pub(crate) voice_capture_status: VoiceCaptureStatus,
     voice_capture_status_tx: mpsc::Sender<VoiceCaptureStatus>,
     voice_capture_status_rx: mpsc::Receiver<VoiceCaptureStatus>,
@@ -880,7 +890,7 @@ pub struct DesktopState {
     pending_ui_actions: Vec<UiAction>,
     pending_egui_ops: Vec<PendingEguiOp>,
     pending_sidebar_dialogs: HashMap<DialogId, SidebarDialogKind>,
-    pending_app_launches: Vec<(u64, String)>,
+    pending_app_launches: Vec<(u64, String, Vec<String>)>,
     /// Map/focus deferred out of `handle_commit` so Wayland dispatch does not re-enter seat/xdg.
     pending_window_maps: Vec<(WindowId, Point<i32, Logical>)>,
     pending_focus_window: Option<WindowId>,
@@ -1086,15 +1096,15 @@ impl DesktopState {
             browser_launch_backend: self.apps.browser_launch_backend,
             backend_kind: self.backend_kind,
         };
-        let apps: Vec<(u64, String)> = self.pending_app_launches.drain(..).collect();
-        for (launch_trace_id, app) in apps {
+        let apps: Vec<(u64, String, Vec<String>)> = self.pending_app_launches.drain(..).collect();
+        for (launch_trace_id, app, args) in apps {
             flog_info!(
                 "dequeuing app launch trace_id={} app={}",
                 launch_trace_id,
                 app
             );
             let ctx = ctx.clone();
-            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app));
+            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app, args));
         }
     }
 
@@ -1224,7 +1234,7 @@ impl DesktopState {
         self.handle_low_battery_action(&snapshot);
     }
 
-    pub fn process_audio_device_timers(&mut self) {
+    pub fn process_media_device_timers(&mut self) {
         while let Ok(detected) = self.microphone_detection_rx.try_recv() {
             self.microphone_detection_in_flight = false;
             if self.microphone_detected != detected {
@@ -1237,6 +1247,14 @@ impl DesktopState {
             self.voice_capture_status_in_flight = false;
             if self.voice_capture_status != status {
                 self.voice_capture_status = status;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+        }
+
+        while let Ok(status) = self.camera_status_rx.try_recv() {
+            self.camera_status_in_flight = false;
+            if self.camera_status != status {
+                self.camera_status = status;
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
             }
         }
@@ -1257,6 +1275,23 @@ impl DesktopState {
                 .is_err()
             {
                 self.microphone_detection_in_flight = false;
+            }
+        }
+
+        if !self.camera_status_in_flight
+            && now.saturating_duration_since(self.last_camera_status_at) >= Duration::from_secs(2)
+        {
+            self.last_camera_status_at = now;
+            self.camera_status_in_flight = true;
+            let result_tx = self.camera_status_tx.clone();
+            if thread::Builder::new()
+                .name("focaldesk-camera-status".to_string())
+                .spawn(move || {
+                    let _ = result_tx.send(crate::core::camera::camera_status());
+                })
+                .is_err()
+            {
+                self.camera_status_in_flight = false;
             }
         }
 
@@ -1564,12 +1599,113 @@ impl DesktopState {
             IpcRequest::GetDisplayRuntimeStatus => Some(IpcResponse::DisplayRuntimeStatus {
                 outputs: self.runtime_display_statuses(),
             }),
+            IpcRequest::GetDesktopSnapshot => Some(IpcResponse::DesktopSnapshot {
+                snapshot: self.desktop_snapshot(),
+            }),
             IpcRequest::GetPowerSnapshot => Some(IpcResponse::Error {
                 message: "request is handled by focaldesk-powerd".to_string(),
             }),
             IpcRequest::GetAll | IpcRequest::SetValue { .. } => Some(IpcResponse::Error {
                 message: "legacy settings.json IPC is not handled by focaldesk-desktop".to_string(),
             }),
+        }
+    }
+
+    fn desktop_snapshot(&self) -> DesktopSnapshot {
+        let outputs = self
+            .outputs
+            .iter()
+            .take(32)
+            .map(|(id, output)| OutputSnapshot {
+                id: id.0,
+                connector: bounded_metadata(&output.handle.name()),
+                make: bounded_metadata(&output.monitor_make),
+                model: bounded_metadata(&output.monitor_model),
+                serial: bounded_metadata(&output.monitor_serial),
+                width: output.logical_size.w,
+                height: output.logical_size.h,
+                x: output.logical_origin.x,
+                y: output.logical_origin.y,
+                scale: output.scale_factor,
+                active_workspace_id: output.active_workspace.0,
+                focused: *id == self.focused_output,
+                hdr_supported: output.hdr_supported,
+                hdr_requested: output.hdr_requested,
+                hdr_active: output.hdr_enabled,
+                wide_gamut_active: output.color_description.primaries
+                    != crate::core::color::ColorPrimaries::Srgb,
+                icc_lut_fallback_active: output.icc_lut_fallback_active,
+            })
+            .collect();
+
+        let windows = self
+            .windows
+            .iter()
+            .take(256)
+            .map(|window| {
+                let geometry = self.global_window_bbox(&window.window);
+                WindowSnapshot {
+                    id: window.id.0,
+                    title: bounded_metadata(&window.title()),
+                    app_id: window.app_id().map(bounded_metadata),
+                    class: window.class().map(bounded_metadata),
+                    workspace_id: window.workspace.0,
+                    output_id: window.output.map(|id| id.0),
+                    mapped: window.mapped,
+                    minimized: window.minimized,
+                    maximized: window.maximized,
+                    fullscreen: window.fullscreen,
+                    focused: self.focused_window == Some(window.id),
+                    x: geometry.map(|rect| rect.loc.x),
+                    y: geometry.map(|rect| rect.loc.y),
+                    width: geometry.map(|rect| rect.size.w),
+                    height: geometry.map(|rect| rect.size.h),
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let workspaces = self
+            .workspace_names
+            .iter()
+            .take(64)
+            .enumerate()
+            .map(|(index, name)| {
+                let id = (index + 1) as u32;
+                WorkspaceSnapshot {
+                    id,
+                    name: bounded_metadata(name),
+                    active_on_output_ids: self
+                        .outputs
+                        .iter()
+                        .filter_map(|(output_id, output)| {
+                            (output.active_workspace.0 == id).then_some(output_id.0)
+                        })
+                        .collect(),
+                    window_count: windows
+                        .iter()
+                        .filter(|window| window.workspace_id == id)
+                        .count(),
+                }
+            })
+            .collect();
+
+        DesktopSnapshot {
+            session: SessionStatus {
+                running: self.running,
+                locked: self.lock_screen.active,
+                focused_output_id: self.focused_output.0,
+                focused_window_id: self.focused_window.map(|id| id.0),
+                active_workspace_id: self.focused_workspace().0,
+            },
+            outputs,
+            windows,
+            workspaces,
+            rendering: RenderingStatus {
+                backend: format!("{:?}", self.backend_kind).to_lowercase(),
+                compositor_ready: self.compositor_ready,
+                output_count: self.outputs.len(),
+                damage_debug_enabled: self.damage_debug_enabled,
+            },
         }
     }
 
@@ -1638,6 +1774,60 @@ impl DesktopState {
                     Ok(ControlIpcResponse::Error { message }) => return Err(message),
                     Err(err) => return Err(format!("control service unavailable: {err}")),
                 }
+            }
+            DesktopAction::FocusWindow { window_id } => {
+                let id = WindowId(window_id);
+                let window = self
+                    .window(id)
+                    .filter(|window| window.mapped && !window.minimized)
+                    .ok_or_else(|| format!("window {window_id} is not focusable"))?;
+                let workspace = window.workspace;
+                let output = window
+                    .output
+                    .unwrap_or_else(|| self.preferred_output_id_for_window(&window.window));
+                self.set_focused_output(output);
+                self.set_focused_workspace(workspace);
+                self.focus_window_id(id);
+            }
+            DesktopAction::MoveWindowToWorkspace {
+                window_id,
+                workspace,
+            } => {
+                if workspace == 0 || workspace as usize > self.workspace_names.len() {
+                    return Err(format!("workspace {workspace} does not exist"));
+                }
+                let managed = self
+                    .window_mut(WindowId(window_id))
+                    .ok_or_else(|| format!("window {window_id} does not exist"))?;
+                managed.workspace = WorkspaceId(workspace);
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+            DesktopAction::OpenSettingsPanel { panel } => {
+                const PANELS: &[&str] = &[
+                    "appearance",
+                    "network",
+                    "bluetooth",
+                    "printers",
+                    "displays",
+                    "sound",
+                    "applications",
+                    "chrome",
+                    "workspaces",
+                    "keyboard",
+                    "privacy",
+                    "power",
+                    "debug",
+                    "about",
+                ];
+                if !PANELS.contains(&panel.as_str()) {
+                    return Err(format!("unknown settings panel: {panel}"));
+                }
+                // The typed action deliberately carries the panel even though older
+                // Settings builds will simply open their default page.
+                self.launch_app_with_args(
+                    focaldesk_settings_command(),
+                    vec!["--panel".to_string(), panel],
+                );
             }
         }
         Ok(())
@@ -2105,6 +2295,8 @@ impl DesktopState {
             hdr_kms_applied: output.hdr_kms_applied,
             microphone_detected: self.microphone_detected,
             voice_capture_status: self.voice_capture_status,
+            camera_detected: self.camera_status.detected,
+            camera_active: self.camera_status.active,
             network_state: self.network_state.clone(),
             workspace_count: self.workspace_names.len(),
             max_workspace_slots: self.workspaces.max_workspace_slots as usize,
@@ -5190,6 +5382,7 @@ impl DesktopState {
         let (clipboard_capture_tx, clipboard_capture_rx) = mpsc::channel();
         let (microphone_detection_tx, microphone_detection_rx) = mpsc::channel();
         let (voice_capture_status_tx, voice_capture_status_rx) = mpsc::channel();
+        let (camera_status_tx, camera_status_rx) = mpsc::channel();
         let (network_state_tx, network_state_rx) = mpsc::channel();
         let (lock_auth_tx, lock_auth_rx) = mpsc::channel();
         let state = Self {
@@ -5289,6 +5482,11 @@ impl DesktopState {
             microphone_detection_rx,
             microphone_detection_in_flight: false,
             last_microphone_detection_at: Instant::now() - Duration::from_secs(2),
+            camera_status: crate::core::camera::CameraStatus::default(),
+            camera_status_tx,
+            camera_status_rx,
+            camera_status_in_flight: false,
+            last_camera_status_at: Instant::now() - Duration::from_secs(2),
             voice_capture_status: VoiceCaptureStatus::Unavailable,
             voice_capture_status_tx,
             voice_capture_status_rx,
@@ -6211,10 +6409,14 @@ impl DesktopState {
     }
 
     pub fn launch_app(&mut self, app: String) -> u64 {
+        self.launch_app_with_args(app, Vec::new())
+    }
+
+    fn launch_app_with_args(&mut self, app: String, args: Vec<String>) -> u64 {
         let launch_trace_id = self.next_launch_trace_id;
         self.next_launch_trace_id = self.next_launch_trace_id.saturating_add(1);
         flog_info!("queue launch trace_id={} app={}", launch_trace_id, app);
-        self.pending_app_launches.push((launch_trace_id, app));
+        self.pending_app_launches.push((launch_trace_id, app, args));
         launch_trace_id
     }
 
@@ -6829,6 +7031,10 @@ impl DesktopState {
                 if let Some(id) = self.output_under_pointer(position) {
                     self.set_focused_output(id);
                 }
+                // Rendering rebuilds the compositor's single UiTree once per
+                // output. Resolve this click against the output that actually
+                // received it, not whichever output happened to render last.
+                self.rebuild_ui_tree_for_output(self.focused_output);
                 let cursor_owner_damage = self.update_cursor_owner_damage();
                 let stale_cursor_damage = self.clear_stale_software_cursor_damage();
 
@@ -8531,7 +8737,12 @@ fn browser_backend_for_launch(backend: BrowserLaunchBackend) -> BrowserBackend {
     }
 }
 
-fn spawn_app_detached(ctx: LaunchContext, launch_trace_id: u64, app: String) {
+fn spawn_app_detached(
+    ctx: LaunchContext,
+    launch_trace_id: u64,
+    app: String,
+    extra_args: Vec<String>,
+) {
     let app_name = app.clone();
     let chrome_like = is_chrome_like(&app_name);
     let browser_like = is_browser_like(&app_name);
@@ -8581,9 +8792,11 @@ fn spawn_app_detached(ctx: LaunchContext, launch_trace_id: u64, app: String) {
             trace_id: launch_trace_id,
             app: candidate.clone(),
             args: if cursor_like {
-                chrome_command_args(prefer_x11)
+                let mut args = chrome_command_args(prefer_x11);
+                args.extend(extra_args.clone());
+                args
             } else {
-                Vec::new()
+                extra_args.clone()
             },
             wayland_display: ctx.client_wayland_display.clone(),
             xwayland_display: xwayland_display.map(|display| display.to_string()),

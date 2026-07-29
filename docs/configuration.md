@@ -45,6 +45,10 @@ Common shortcuts are editable on the Keyboard page. Advanced overrides use the
 [Default Keybindings](keybindings.md#configuration-syntax) for action names and
 shortcut syntax.
 
+The `privacy.location_services` setting controls the standard XDG Location
+portal. See [Location services](location-services.md) for the request flow,
+runtime dependencies, and security boundary.
+
 ## Environment variables
 
 The following variables are useful supported development controls. Variables
