@@ -43,10 +43,11 @@ regions where possible. The OpenGL ES renderer draws the scene, applies enabled
 effects and color processing, and hands the completed framebuffer to DRM/KMS
 for presentation.
 
-Current damage tracking includes output and top-level window regions. Precise
-damage propagation for Wayland subsurfaces is planned for a future update; the
-diagram's damage-tracking stage should not be read as claiming that optimization
-is already complete.
+Damage tracking includes output regions and Smithay's per-surface damage
+history for mapped Wayland window trees. Synchronized subsurface damage is
+translated through buffer transforms, scaling, viewporter state, and surface
+placement before it reaches the output damage queue. Top-level window regions
+remain as a conservative fallback for commits outside that path.
 
 ## IPC Architecture
 

@@ -54,9 +54,9 @@ impl CompositorHandler for DesktopState {
             drop(states.cached_state.get::<SurfaceColorState>());
         });
         add_destruction_hook::<DesktopState, _>(surface, |state, surface| {
-            state
-                .surface_colors
-                .remove(&Id::from_wayland_resource(surface));
+            let id = Id::from_wayland_resource(surface);
+            state.surface_colors.remove(&id);
+            state.remove_surface_damage_state(&id);
         });
         add_pre_commit_hook::<DesktopState, _>(surface, |state, _dh, surface| {
             #[cfg(not(feature = "xwayland"))]

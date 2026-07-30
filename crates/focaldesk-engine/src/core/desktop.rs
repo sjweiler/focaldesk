@@ -4,14 +4,14 @@ use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::buffer_dimensions;
-use smithay::backend::renderer::utils::import_surface_tree;
+use smithay::backend::renderer::utils::{import_surface_tree, CommitCounter, SurfaceView};
 use smithay::desktop::{
     find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
 };
 use smithay::wayland::compositor::get_parent;
 use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::compositor::{with_surface_tree_downward, CompositorState, TraversalAction};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -103,7 +103,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmit
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::utils::Serial;
 use smithay::utils::SERIAL_COUNTER;
-use smithay::utils::{Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{
@@ -598,6 +598,44 @@ pub struct OutputState {
     pub monitor_edid: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Debug)]
+struct SurfaceDamageState {
+    commit: CommitCounter,
+    geometry: Rectangle<i32, Logical>,
+    view: SurfaceView,
+    root: Id,
+}
+
+fn surface_buffer_damage_to_logical(
+    damage: Rectangle<i32, Buffer>,
+    buffer_dimensions: Size<i32, Buffer>,
+    buffer_scale: i32,
+    buffer_transform: Transform,
+    view: SurfaceView,
+) -> Option<Rectangle<i32, Logical>> {
+    if view.src.size.w <= 0.0 || view.src.size.h <= 0.0 {
+        return None;
+    }
+
+    let viewport_scale = Scale::from((
+        view.dst.w as f64 / view.src.size.w,
+        view.dst.h as f64 / view.src.size.h,
+    ));
+
+    damage
+        .to_f64()
+        .to_logical(
+            buffer_scale as f64,
+            buffer_transform,
+            &buffer_dimensions.to_f64(),
+        )
+        .intersection(view.src)
+        .map(|mut rect| {
+            rect.loc -= view.src.loc;
+            rect.upscale(viewport_scale).to_i32_up::<i32>()
+        })
+}
+
 #[derive(Debug)]
 pub(crate) struct OutputTopologySnapshot {
     output_workspaces: HashMap<String, WorkspaceId>,
@@ -872,6 +910,8 @@ pub struct DesktopState {
     pub theme: ThemeManager,
     /// Latest committed color state per Wayland surface render id.
     pub surface_colors: HashMap<Id, SurfaceColorRenderState>,
+    /// Last rendered placement and Smithay damage commit for each mapped Wayland surface.
+    surface_damage: HashMap<Id, SurfaceDamageState>,
     /// Last output used for `wp_color` surface feedback (detect cross-monitor moves).
     wp_color_surface_outputs: HashMap<wayland_server::backend::ObjectId, OutputId>,
     pub damage_debug_enabled: bool,
@@ -2985,7 +3025,20 @@ impl DesktopState {
     fn mark_global_logical_damage(&mut self, rect: Rectangle<i32, Logical>) {
         const WINDOW_DAMAGE_MARGIN: i32 = 24;
 
-        let rect = Self::expand_logical_rect(rect, WINDOW_DAMAGE_MARGIN);
+        self.mark_global_logical_damage_with_margin(
+            rect,
+            WINDOW_DAMAGE_MARGIN,
+            DamageSource::Unknown,
+        );
+    }
+
+    fn mark_global_logical_damage_with_margin(
+        &mut self,
+        rect: Rectangle<i32, Logical>,
+        margin: i32,
+        source: DamageSource,
+    ) {
+        let rect = Self::expand_logical_rect(rect, margin);
         let mut damage = Vec::new();
 
         for (output_id, output) in &self.outputs {
@@ -3007,7 +3060,7 @@ impl DesktopState {
         }
 
         for (output_id, rect) in damage {
-            self.mark_output_damage_source(output_id, rect, DamageSource::Unknown);
+            self.mark_output_damage_source(output_id, rect, source);
         }
     }
 
@@ -3055,6 +3108,146 @@ impl DesktopState {
         if let Some(bbox) = self.global_window_bbox(&window) {
             self.mark_window_bbox_damage_source(bbox, source);
         }
+    }
+
+    pub(crate) fn remove_surface_damage_state(&mut self, id: &Id) {
+        self.surface_damage.remove(id);
+    }
+
+    /// Queue the buffer damage Smithay accumulated for every mapped surface in a window tree.
+    ///
+    /// Smithay keeps client damage in buffer coordinates. This converts it through the surface's
+    /// buffer transform, scale, and viewport, then adds the subsurface offset and window placement
+    /// so FocalDesk's output-local damage queues receive precise rectangles.
+    fn mark_surface_tree_damage(&mut self, window: &Window, root: &WlSurface) -> bool {
+        let Some(element_loc) = self.space.element_location(window) else {
+            return false;
+        };
+
+        let geometry = window.geometry();
+        let tree_origin = element_loc - geometry.loc;
+        let root_id = Id::from_wayland_resource(root);
+        let previous = &mut self.surface_damage;
+        let mut damage = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut handled = false;
+
+        with_surface_tree_downward(
+            root,
+            tree_origin,
+            |_, states, location| {
+                let Some(view) = states
+                    .data_map
+                    .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .and_then(|data| data.lock().ok()?.view())
+                else {
+                    return TraversalAction::SkipChildren;
+                };
+
+                TraversalAction::DoChildren(*location + view.offset)
+            },
+            |surface, states, location| {
+                handled = true;
+                let id = Id::from_wayland_resource(surface);
+                visited.insert(id.clone());
+                // The tree traversal already holds this surface's user-data lock. Calling
+                // `with_renderer_surface_state` here would try to acquire it again and deadlock.
+                let Some(renderer_state) = states
+                    .data_map
+                    .get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+                    .and_then(|data| data.lock().ok())
+                else {
+                    if let Some(old) = previous.remove(&id) {
+                        damage.push(old.geometry);
+                    }
+                    return;
+                };
+                let Some((
+                    view,
+                    buffer_size,
+                    buffer_scale,
+                    buffer_transform,
+                    current_commit,
+                    buffer_damage,
+                )) = (|| {
+                    let view = renderer_state.view()?;
+                    let buffer_size = renderer_state.buffer_size()?;
+                    let old_commit = previous.get(&id).map(|old| old.commit);
+                    Some((
+                        view,
+                        buffer_size,
+                        renderer_state.buffer_scale(),
+                        renderer_state.buffer_transform(),
+                        renderer_state.current_commit(),
+                        renderer_state.damage_since(old_commit),
+                    ))
+                })()
+                else {
+                    if let Some(old) = previous.remove(&id) {
+                        damage.push(old.geometry);
+                    }
+                    return;
+                };
+
+                let surface_location = *location + view.offset;
+                let surface_geometry = Rectangle::from_loc_and_size(surface_location, view.dst);
+                let old = previous.get(&id).cloned();
+
+                if old
+                    .as_ref()
+                    .is_none_or(|old| old.geometry != surface_geometry || old.view != view)
+                {
+                    if let Some(old) = old.as_ref() {
+                        damage.push(old.geometry);
+                    }
+                    damage.push(surface_geometry);
+                } else if view.src.size.w > 0.0 && view.src.size.h > 0.0 {
+                    let buffer_dimensions = buffer_size.to_buffer(buffer_scale, buffer_transform);
+                    damage.extend(buffer_damage.iter().filter_map(|rect| {
+                        surface_buffer_damage_to_logical(
+                            *rect,
+                            buffer_dimensions,
+                            buffer_scale,
+                            buffer_transform,
+                            view,
+                        )
+                        .map(|mut rect| {
+                            rect.loc += surface_location;
+                            rect
+                        })
+                    }));
+                }
+
+                previous.insert(
+                    id,
+                    SurfaceDamageState {
+                        commit: current_commit,
+                        geometry: surface_geometry,
+                        view,
+                        root: root_id.clone(),
+                    },
+                );
+            },
+            |_, _, _| true,
+        );
+
+        let detached: Vec<_> = previous
+            .iter()
+            .filter(|(id, state)| state.root == root_id && !visited.contains(*id))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in detached {
+            if let Some(old) = previous.remove(&id) {
+                damage.push(old.geometry);
+                handled = true;
+            }
+        }
+
+        for rect in damage {
+            // Cover the compositor's client-adjacent effects as well as fractional-scale rounding.
+            self.mark_global_logical_damage_with_margin(rect, 24, DamageSource::CommitBbox);
+        }
+        handled
     }
 
     pub(crate) fn mark_output_logical_damage(
@@ -5524,6 +5717,7 @@ impl DesktopState {
             screenshot_seq: 0,
             theme: init.theme_manager,
             surface_colors: HashMap::new(),
+            surface_damage: HashMap::new(),
             wp_color_surface_outputs: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
@@ -6033,6 +6227,18 @@ impl DesktopState {
         }
 
         self.ensure_popup_initial_configure(surface);
+
+        if !mapped_window && resize_damage.is_none() && !commit_damage_queued {
+            if let Some(window) = committed_window.as_ref() {
+                let is_window_tree_root = window
+                    .wl_surface()
+                    .as_ref()
+                    .is_some_and(|window_root| **window_root == root);
+                if is_window_tree_root {
+                    commit_damage_queued = self.mark_surface_tree_damage(window, &root);
+                }
+            }
+        }
 
         if mapped_window {
             if let Some(window) = committed_window.as_ref() {
@@ -8922,8 +9128,8 @@ fn is_obs_like(app_name: &str) -> bool {
 mod tests {
     use super::{
         clamp_rect_to_bounds, is_browser_like, power_action_interaction, session_power_command,
-        should_wait_for_lid_open_on_resume, workspace_for_slot, PowerActionInteraction,
-        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        should_wait_for_lid_open_on_resume, surface_buffer_damage_to_logical, workspace_for_slot,
+        PowerActionInteraction, UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
@@ -8931,7 +9137,54 @@ mod tests {
     use focaldesk_ui::atlas::IconId;
     use focaldesk_ui::element::ChromeItem;
     use focaldesk_ui::types::UiAction;
-    use smithay::utils::Rectangle;
+    use smithay::backend::renderer::utils::SurfaceView;
+    use smithay::utils::{Buffer, Logical, Rectangle, Size, Transform};
+
+    #[test]
+    fn surface_damage_respects_buffer_scale() {
+        let damage = Rectangle::<i32, Buffer>::from_loc_and_size((20, 10), (40, 20));
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::from_loc_and_size((0.0, 0.0), (100.0, 50.0)),
+            dst: (100, 50).into(),
+            offset: (0, 0).into(),
+        };
+
+        let logical = surface_buffer_damage_to_logical(
+            damage,
+            Size::from((200, 100)),
+            2,
+            Transform::Normal,
+            view,
+        );
+
+        assert_eq!(
+            logical,
+            Some(Rectangle::from_loc_and_size((10, 5), (20, 10)))
+        );
+    }
+
+    #[test]
+    fn surface_damage_respects_viewport_crop_and_scale() {
+        let damage = Rectangle::<i32, Buffer>::from_loc_and_size((75, 20), (25, 10));
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::from_loc_and_size((50.0, 10.0), (100.0, 50.0)),
+            dst: (200, 100).into(),
+            offset: (0, 0).into(),
+        };
+
+        let logical = surface_buffer_damage_to_logical(
+            damage,
+            Size::from((200, 100)),
+            1,
+            Transform::Normal,
+            view,
+        );
+
+        assert_eq!(
+            logical,
+            Some(Rectangle::from_loc_and_size((50, 20), (50, 20)))
+        );
+    }
 
     #[test]
     fn browser_like_matches_common_browser_executables() {

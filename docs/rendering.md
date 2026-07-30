@@ -8,9 +8,11 @@ The renderer is responsible for composing application surfaces, shell UI, shader
 
 Rendering is designed to be modular so additional effects, color management, HDR, and future rendering backends can be added without redesigning the compositor.
 
-Damage is tracked at output and top-level window granularity to avoid full
-redraws where possible. Precise damage propagation for Wayland subsurfaces is
-planned and is not yet represented as a complete optimization.
+Damage is tracked per output. Wayland client commits use Smithay's per-surface
+damage history, including synchronized subsurfaces, buffer transforms, buffer
+scales, and viewporter crops. Surface placement or viewport changes damage both
+the old and new regions. Top-level window damage remains as a conservative
+fallback for commits that cannot be associated with a mapped surface tree.
 
 See [Architecture](architecture.md#rendering-pipeline) for an annotated pipeline
 diagram and [HDR Support](hdr.md) for the status of color-management work.
