@@ -42,6 +42,16 @@ fn damage_area_percent(
     (damage_area * 100 / output_area.max(1)).clamp(0, 100)
 }
 
+#[cfg(test)]
+fn damage_area_permyriad(
+    damage: &[Rectangle<i32, Physical>],
+    output_size: Size<i32, Physical>,
+) -> i64 {
+    let output_area = i64::from(output_size.w.max(0)) * i64::from(output_size.h.max(0)).max(1);
+    let damage_area: i64 = damage.iter().copied().map(rect_area).sum();
+    (damage_area * 10_000 / output_area.max(1)).clamp(0, 10_000)
+}
+
 fn is_full_damage(damage: &[Rectangle<i32, Physical>], output_size: Size<i32, Physical>) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_loc_and_size((0, 0), output_size)
 }
@@ -73,6 +83,17 @@ fn expand_rect(rect: Rectangle<i32, Physical>, margin: i32) -> Rectangle<i32, Ph
     )
 }
 
+fn merge_rects(
+    a: Rectangle<i32, Physical>,
+    b: Rectangle<i32, Physical>,
+) -> Rectangle<i32, Physical> {
+    let min_x = a.loc.x.min(b.loc.x);
+    let min_y = a.loc.y.min(b.loc.y);
+    let max_x = (a.loc.x + a.size.w).max(b.loc.x + b.size.w);
+    let max_y = (a.loc.y + a.size.h).max(b.loc.y + b.size.h);
+    Rectangle::from_loc_and_size((min_x, min_y), (max_x - min_x, max_y - min_y))
+}
+
 fn compact_damage(
     damage: &[Rectangle<i32, Physical>],
     output_size: Size<i32, Physical>,
@@ -83,7 +104,7 @@ fn compact_damage(
 
     let full = Rectangle::from_loc_and_size((0, 0), output_size);
     let output_area = rect_area(full).max(1);
-    let mut rects = Vec::with_capacity(damage.len());
+    let mut rects: Vec<Rectangle<i32, Physical>> = Vec::with_capacity(damage.len().min(MAX_RECTS));
 
     for rect in damage {
         if rect.size.w <= 0 || rect.size.h <= 0 {
@@ -91,7 +112,19 @@ fn compact_damage(
         }
         if let Some(clipped) = rect.intersection(full) {
             if !clipped.is_empty() {
-                rects.push(clipped);
+                let mut candidate = clipped;
+                let mut i = 0;
+                while i < rects.len() {
+                    if expand_rect(candidate, MERGE_MARGIN).overlaps(rects[i]) {
+                        candidate = merge_rects(candidate, rects.swap_remove(i));
+                        // A merge can bridge a rectangle inspected earlier. Restart to guarantee
+                        // transitive coalescing and non-overlapping output rectangles.
+                        i = 0;
+                    } else {
+                        i += 1;
+                    }
+                }
+                rects.push(candidate);
             }
         }
     }
@@ -100,21 +133,8 @@ fn compact_damage(
         return vec![full];
     }
 
-    let mut i = 0;
-    while i < rects.len() {
-        let mut j = i + 1;
-        while j < rects.len() {
-            if expand_rect(rects[i], MERGE_MARGIN).overlaps(rects[j]) {
-                let merged = rect_bounds(&[rects[i], rects[j]]).expect("two rects");
-                rects[i] = merged;
-                rects.swap_remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
-    }
-
+    // The insertion pass coalesces overlapping/nearby rectangles transitively, so this sum is
+    // actual covered area rather than an overlap-inflated estimate.
     let total_area: i64 = rects.iter().copied().map(rect_area).sum();
     if total_area * 100 >= output_area * FULL_DAMAGE_PERCENT {
         return vec![full];
@@ -678,5 +698,74 @@ mod tests {
                 output_size
             )]
         );
+    }
+
+    #[test]
+    fn compact_damage_coalesces_transitive_neighbors() {
+        let output_size = Size::<i32, Physical>::from((200, 100));
+        let damage = [
+            Rectangle::from_loc_and_size((10, 10), (10, 10)),
+            Rectangle::from_loc_and_size((36, 10), (10, 10)),
+            Rectangle::from_loc_and_size((23, 10), (10, 10)),
+        ];
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert_eq!(
+            compacted,
+            vec![Rectangle::from_loc_and_size((10, 10), (36, 10))]
+        );
+    }
+
+    #[test]
+    fn overlapping_damage_does_not_inflate_full_frame_threshold() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+        let repeated = Rectangle::from_loc_and_size((10, 10), (60, 50));
+
+        let compacted = compact_damage(&[repeated, repeated], output_size);
+
+        assert_eq!(compacted, vec![repeated]);
+        assert!(!is_full_damage(&compacted, output_size));
+    }
+
+    #[test]
+    fn small_surface_updates_avoid_nearly_all_4k_pixels() {
+        let output_size = Size::<i32, Physical>::from((3840, 2160));
+        // A 64x64 client update plus the one-pixel logical safety border at scale 1.
+        let damage = [Rectangle::from_loc_and_size((100, 100), (66, 66))];
+
+        let compacted = compact_damage(&damage, output_size);
+        let damaged_permyriad = damage_area_permyriad(&compacted, output_size);
+
+        assert_eq!(compacted, damage);
+        assert!(
+            damaged_permyriad <= 6,
+            "expected <=0.06% of a 4K output, got {}.{:02}%",
+            damaged_permyriad / 100,
+            damaged_permyriad % 100
+        );
+    }
+
+    #[test]
+    fn commit_storm_compaction_keeps_a_bounded_render_list() {
+        let output_size = Size::<i32, Physical>::from((1920, 1080));
+        let damage: Vec<_> = (0..512)
+            .map(|i| {
+                let x = (i * 37) % 1900;
+                let y = (i * 53) % 1060;
+                Rectangle::from_loc_and_size((x, y), (8, 8))
+            })
+            .collect();
+
+        let compacted = compact_damage(&damage, output_size);
+
+        assert!(
+            compacted.len() <= 8,
+            "renderer received {} rectangles",
+            compacted.len()
+        );
+        assert!(compacted
+            .iter()
+            .all(|rect| rect.overlaps(Rectangle::from_size(output_size))));
     }
 }

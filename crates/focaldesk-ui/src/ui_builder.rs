@@ -19,6 +19,7 @@ pub const SIDEBAR_DELETE_WORKSPACE_ID: u32 = SIDEBAR_BASE + 4;
 pub const SIDEBAR_BROWSER_ID: u32 = SIDEBAR_BASE + 5;
 pub const SIDEBAR_TERMINAL_ID: u32 = SIDEBAR_BASE + 6;
 pub const SIDEBAR_FILES_ID: u32 = SIDEBAR_BASE + 7;
+pub const SIDEBAR_EMAIL_ID: u32 = SIDEBAR_BASE + 8;
 pub const SIDEBAR_WORKSPACE_OVERFLOW_ID: u32 = SIDEBAR_BASE + 10;
 pub const TOPBAR_NETWORK_ID: u32 = 100;
 pub const TOPBAR_BLUETOOTH_ID: u32 = 101;
@@ -315,7 +316,7 @@ pub fn default_sidebar_items(options: &UiBuildOptions, total_slots: usize) -> Ve
     let fixed_before = 2; // settings, launcher
     let add_slot = 1;
     let remove_slot = usize::from(workspace_count > 1);
-    let fixed_after = 3; // browser, terminal, files
+    let fixed_after = 4; // browser, terminal, files, email
     let reserved_no_overflow = fixed_before + add_slot + remove_slot + fixed_after;
     let slots_for_workspaces_no_overflow = total_slots.saturating_sub(reserved_no_overflow).max(1);
 
@@ -403,6 +404,12 @@ pub fn default_sidebar_items(options: &UiBuildOptions, total_slots: usize) -> Ve
             IconId::Files,
             "Files",
             UiAction::Custom(SIDEBAR_FILES_ID),
+        ),
+        ChromeItem::new(
+            SIDEBAR_EMAIL_ID,
+            IconId::Email,
+            "Email",
+            UiAction::Custom(SIDEBAR_EMAIL_ID),
         ),
     ]);
     items
@@ -500,9 +507,9 @@ mod tests {
     use crate::atlas::IconId;
     use crate::element::{ChromeItem, UiElement};
     use crate::ui_builder::{
-        SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID,
-        SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions,
-        VoiceCaptureStatus, build_ui_for_output_with_options, sidebar_workspace_id,
+        SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID,
+        SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction,
+        UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options, sidebar_workspace_id,
         sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
@@ -653,6 +660,19 @@ mod tests {
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_BROWSER_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_TERMINAL_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_FILES_ID));
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_EMAIL_ID));
+        let files_index = ui
+            .elements
+            .iter()
+            .position(|el| el.id == SIDEBAR_FILES_ID)
+            .unwrap();
+        let email = &ui.elements[files_index + 1];
+        assert_eq!(email.id, SIDEBAR_EMAIL_ID);
+        assert_eq!(email.icon, Some(IconId::Email));
+        assert!(matches!(
+            email.action,
+            Some(UiAction::Custom(SIDEBAR_EMAIL_ID))
+        ));
     }
 
     #[test]
@@ -698,6 +718,7 @@ mod tests {
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_BROWSER_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_TERMINAL_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_FILES_ID));
+        assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_EMAIL_ID));
     }
 
     #[test]

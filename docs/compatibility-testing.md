@@ -20,9 +20,11 @@ The harness:
 3. Waits for FocalDesk's client socket.
 4. Performs a Wayland registry round-trip and checks core globals.
 5. Connects a native demo client when one is installed.
-6. Confirms the compositor survives client rendering.
-7. Confirms XWayland reaches its ready state.
-8. Rejects panic and crash signatures in the logs.
+6. Confirms the client exercises precise surface-tree damage and records the
+   latest tree/rectangle/fallback counters.
+7. Confirms the compositor survives client rendering.
+8. Confirms XWayland reaches its ready state.
+9. Rejects panic and crash signatures in the logs.
 
 Results are written to `target/nested-smoke` by default. Preserve that directory
 when filing a compatibility bug. It contains a short summary, compositor logs,
@@ -44,7 +46,7 @@ FOCALDESK_SMOKE_ARTIFACTS=/tmp/focaldesk-smoke \
 ```
 
 The client command is intended for trusted local test commands. It is observed
-for three seconds by default; a timeout is a successful result when the client
+for five seconds by default; a timeout is a successful result when the client
 remains open and the compositor remains healthy.
 
 ## Compatibility matrix
@@ -53,7 +55,7 @@ remains open and the compositor remains healthy.
 | --- | --- | --- |
 | Compositor startup and first render | Required | DRM/KMS login session |
 | Wayland registry and round-trip | Required | Protocol-specific applications |
-| Native XDG client connection | Required when a demo client is installed | GTK, Qt, browsers, Electron, games |
+| Native XDG client connection and precise damage | Required when a demo client is installed | GTK, Qt, browsers, Electron, games |
 | XWayland server startup | Required | Real X11 applications, Wine, clipboard, drag and drop |
 | Panic/crash detection | Required | Long-running soak and recovery |
 | Window resize, maximize, and fullscreen | Client survival only | Visual and input verification |

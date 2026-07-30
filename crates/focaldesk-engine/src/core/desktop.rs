@@ -48,7 +48,7 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -159,7 +159,8 @@ use focaldesk_ui::dialog::{Dialog, DialogButton, DialogId, DialogKind, DialogSta
 use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::ui_builder::{
     sidebar_workspace_number, SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID,
-    SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID,
+    SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID,
+    SIDEBAR_TERMINAL_ID,
 };
 
 fn mic_command(command: &str) -> io::Result<String> {
@@ -606,6 +607,68 @@ struct SurfaceDamageState {
     root: Id,
 }
 
+#[derive(Debug, Default)]
+struct SurfaceDamageScratch {
+    damage: Vec<Rectangle<i32, Logical>>,
+    visited: HashSet<Id>,
+    detached: Vec<Id>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SurfaceDamageMetrics {
+    pub tree_commits: u64,
+    pub precise_commits: u64,
+    pub unchanged_commits: u64,
+    pub callback_only_commits: u64,
+    pub fallback_commits: u64,
+    pub rectangles_queued: u64,
+    pub destroyed_surfaces: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceDamageResult {
+    PreciseDamageQueued,
+    NoVisualChange,
+    Unsupported,
+}
+
+impl SurfaceDamageResult {
+    fn handled(self) -> bool {
+        !matches!(self, Self::Unsupported)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SurfaceTreeDamageTarget {
+    origin: Point<i32, Logical>,
+    root: WlSurface,
+}
+
+fn remove_surface_root_membership(roots: &mut HashMap<Id, HashSet<Id>>, root: &Id, surface: &Id) {
+    let remove_root = roots.get_mut(root).is_some_and(|members| {
+        members.remove(surface);
+        members.is_empty()
+    });
+    if remove_root {
+        roots.remove(root);
+    }
+}
+
+fn set_surface_root_membership(
+    roots: &mut HashMap<Id, HashSet<Id>>,
+    surface: &Id,
+    old_root: Option<&Id>,
+    new_root: &Id,
+) {
+    if let Some(old_root) = old_root.filter(|old_root| *old_root != new_root) {
+        remove_surface_root_membership(roots, old_root, surface);
+    }
+    roots
+        .entry(new_root.clone())
+        .or_default()
+        .insert(surface.clone());
+}
+
 fn surface_buffer_damage_to_logical(
     damage: Rectangle<i32, Buffer>,
     buffer_dimensions: Size<i32, Buffer>,
@@ -634,6 +697,13 @@ fn surface_buffer_damage_to_logical(
             rect.loc -= view.src.loc;
             rect.upscale(viewport_scale).to_i32_up::<i32>()
         })
+}
+
+fn logical_damage_to_physical(
+    damage: Rectangle<i32, Logical>,
+    output_scale: Scale<f64>,
+) -> Rectangle<i32, Physical> {
+    damage.to_physical_precise_up::<f64, i32>(output_scale)
 }
 
 #[derive(Debug)]
@@ -912,10 +982,15 @@ pub struct DesktopState {
     pub surface_colors: HashMap<Id, SurfaceColorRenderState>,
     /// Last rendered placement and Smithay damage commit for each mapped Wayland surface.
     surface_damage: HashMap<Id, SurfaceDamageState>,
+    /// Surfaces grouped by tree root, avoiding a full state-map scan on every commit.
+    surface_damage_roots: HashMap<Id, HashSet<Id>>,
+    surface_damage_scratch: SurfaceDamageScratch,
+    pub surface_damage_metrics: SurfaceDamageMetrics,
     /// Last output used for `wp_color` surface feedback (detect cross-monitor moves).
     wp_color_surface_outputs: HashMap<wayland_server::backend::ObjectId, OutputId>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
+    damage_last_logged_surface_commit: u64,
     pub sidebar_pulse: Option<SidebarPulse>,
     pub topbar_pulse: Option<TopbarPulse>,
     pub flow_field_pulse: Option<FlowFieldPulse>,
@@ -3055,7 +3130,7 @@ impl DesktopState {
                 ),
                 clipped.size,
             );
-            let physical = local.to_physical_precise_round::<f64, i32>(output.scale);
+            let physical = logical_damage_to_physical(local, output.scale);
             damage.push((*output_id, physical));
         }
 
@@ -3092,7 +3167,7 @@ impl DesktopState {
                 ),
                 clipped.size,
             );
-            let physical = local.to_physical_precise_round::<f64, i32>(output.scale);
+            let physical = logical_damage_to_physical(local, output.scale);
             damage.push((*output_id, physical));
         }
 
@@ -3110,8 +3185,73 @@ impl DesktopState {
         }
     }
 
-    pub(crate) fn remove_surface_damage_state(&mut self, id: &Id) {
-        self.surface_damage.remove(id);
+    pub(crate) fn handle_surface_destroyed(&mut self, id: &Id) {
+        let Some(old) = self.surface_damage.remove(id) else {
+            return;
+        };
+
+        remove_surface_root_membership(&mut self.surface_damage_roots, &old.root, id);
+
+        self.surface_damage_metrics.destroyed_surfaces += 1;
+        self.surface_damage_metrics.rectangles_queued += 1;
+        self.mark_global_logical_damage_with_margin(old.geometry, 1, DamageSource::CommitBbox);
+    }
+
+    fn window_surface_tree_target(
+        &self,
+        window: &Window,
+        root: &WlSurface,
+    ) -> Option<SurfaceTreeDamageTarget> {
+        let toplevel = window.wl_surface()?;
+        let element_loc = self.space.element_location(window)?;
+        let window_origin = element_loc - window.geometry().loc;
+
+        if &*toplevel == root {
+            return Some(SurfaceTreeDamageTarget {
+                origin: window_origin,
+                root: root.clone(),
+            });
+        }
+
+        PopupManager::popups_for_surface(&toplevel).find_map(|(popup, popup_offset)| {
+            (popup.wl_surface() == root).then(|| SurfaceTreeDamageTarget {
+                origin: window_origin + popup_offset - popup.geometry().loc,
+                root: root.clone(),
+            })
+        })
+    }
+
+    fn layer_surface_tree_target(&self, root: &WlSurface) -> Option<SurfaceTreeDamageTarget> {
+        let layer = self.space.layer_for_surface(root, WindowSurfaceType::ALL)?;
+        let layer_root = layer.wl_surface();
+        let layer_origin = self.space.outputs().find_map(|output| {
+            let map = smithay::desktop::layer_map_for_output(output);
+            map.layer_geometry(&layer).map(|geometry| geometry.loc)
+        })?;
+
+        if layer_root == root {
+            return Some(SurfaceTreeDamageTarget {
+                origin: layer_origin,
+                root: root.clone(),
+            });
+        }
+
+        PopupManager::popups_for_surface(layer_root).find_map(|(popup, popup_offset)| {
+            (popup.wl_surface() == root).then(|| SurfaceTreeDamageTarget {
+                origin: layer_origin + popup_offset - popup.geometry().loc,
+                root: root.clone(),
+            })
+        })
+    }
+
+    fn surface_tree_damage_target(
+        &self,
+        committed_window: Option<&Window>,
+        root: &WlSurface,
+    ) -> Option<SurfaceTreeDamageTarget> {
+        committed_window
+            .and_then(|window| self.window_surface_tree_target(window, root))
+            .or_else(|| self.layer_surface_tree_target(root))
     }
 
     /// Queue the buffer damage Smithay accumulated for every mapped surface in a window tree.
@@ -3119,21 +3259,24 @@ impl DesktopState {
     /// Smithay keeps client damage in buffer coordinates. This converts it through the surface's
     /// buffer transform, scale, and viewport, then adds the subsurface offset and window placement
     /// so FocalDesk's output-local damage queues receive precise rectangles.
-    fn mark_surface_tree_damage(&mut self, window: &Window, root: &WlSurface) -> bool {
-        let Some(element_loc) = self.space.element_location(window) else {
-            return false;
-        };
+    fn mark_surface_tree_damage(&mut self, target: SurfaceTreeDamageTarget) -> SurfaceDamageResult {
+        let tree_origin = target.origin;
+        let root = target.root;
+        let root_id = Id::from_wayland_resource(&root);
+        self.surface_damage_metrics.tree_commits += 1;
 
-        let geometry = window.geometry();
-        let tree_origin = element_loc - geometry.loc;
-        let root_id = Id::from_wayland_resource(root);
+        let mut scratch = std::mem::take(&mut self.surface_damage_scratch);
+        scratch.damage.clear();
+        scratch.visited.clear();
+        scratch.detached.clear();
+
         let previous = &mut self.surface_damage;
-        let mut damage = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let roots = &mut self.surface_damage_roots;
         let mut handled = false;
+        let mut frame_callback_pending = false;
 
         with_surface_tree_downward(
-            root,
+            &root,
             tree_origin,
             |_, states, location| {
                 let Some(view) = states
@@ -3148,8 +3291,14 @@ impl DesktopState {
             },
             |surface, states, location| {
                 handled = true;
+                frame_callback_pending |= !states
+                    .cached_state
+                    .get::<SurfaceAttributes>()
+                    .current()
+                    .frame_callbacks
+                    .is_empty();
                 let id = Id::from_wayland_resource(surface);
-                visited.insert(id.clone());
+                scratch.visited.insert(id.clone());
                 // The tree traversal already holds this surface's user-data lock. Calling
                 // `with_renderer_surface_state` here would try to acquire it again and deadlock.
                 let Some(renderer_state) = states
@@ -3158,7 +3307,8 @@ impl DesktopState {
                     .and_then(|data| data.lock().ok())
                 else {
                     if let Some(old) = previous.remove(&id) {
-                        damage.push(old.geometry);
+                        remove_surface_root_membership(roots, &old.root, &id);
+                        scratch.damage.push(old.geometry);
                     }
                     return;
                 };
@@ -3184,7 +3334,8 @@ impl DesktopState {
                 })()
                 else {
                     if let Some(old) = previous.remove(&id) {
-                        damage.push(old.geometry);
+                        remove_surface_root_membership(roots, &old.root, &id);
+                        scratch.damage.push(old.geometry);
                     }
                     return;
                 };
@@ -3198,26 +3349,34 @@ impl DesktopState {
                     .is_none_or(|old| old.geometry != surface_geometry || old.view != view)
                 {
                     if let Some(old) = old.as_ref() {
-                        damage.push(old.geometry);
+                        scratch.damage.push(old.geometry);
                     }
-                    damage.push(surface_geometry);
+                    scratch.damage.push(surface_geometry);
                 } else if view.src.size.w > 0.0 && view.src.size.h > 0.0 {
                     let buffer_dimensions = buffer_size.to_buffer(buffer_scale, buffer_transform);
-                    damage.extend(buffer_damage.iter().filter_map(|rect| {
-                        surface_buffer_damage_to_logical(
-                            *rect,
-                            buffer_dimensions,
-                            buffer_scale,
-                            buffer_transform,
-                            view,
-                        )
-                        .map(|mut rect| {
-                            rect.loc += surface_location;
-                            rect
-                        })
-                    }));
+                    scratch
+                        .damage
+                        .extend(buffer_damage.iter().filter_map(|rect| {
+                            surface_buffer_damage_to_logical(
+                                *rect,
+                                buffer_dimensions,
+                                buffer_scale,
+                                buffer_transform,
+                                view,
+                            )
+                            .map(|mut rect| {
+                                rect.loc += surface_location;
+                                rect
+                            })
+                        }));
                 }
 
+                set_surface_root_membership(
+                    roots,
+                    &id,
+                    old.as_ref().map(|old| &old.root),
+                    &root_id,
+                );
                 previous.insert(
                     id,
                     SurfaceDamageState {
@@ -3231,23 +3390,53 @@ impl DesktopState {
             |_, _, _| true,
         );
 
-        let detached: Vec<_> = previous
-            .iter()
-            .filter(|(id, state)| state.root == root_id && !visited.contains(*id))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in detached {
+        if let Some(members) = roots.get(&root_id) {
+            scratch.detached.extend(
+                members
+                    .iter()
+                    .filter(|id| !scratch.visited.contains(*id))
+                    .cloned(),
+            );
+        }
+        for id in scratch.detached.drain(..) {
             if let Some(old) = previous.remove(&id) {
-                damage.push(old.geometry);
+                scratch.damage.push(old.geometry);
                 handled = true;
             }
+            remove_surface_root_membership(roots, &root_id, &id);
         }
 
-        for rect in damage {
-            // Cover the compositor's client-adjacent effects as well as fractional-scale rounding.
-            self.mark_global_logical_damage_with_margin(rect, 24, DamageSource::CommitBbox);
+        let mut queued = scratch.damage.len();
+        let visual_damage_queued = queued > 0;
+        for rect in scratch.damage.drain(..) {
+            // One logical pixel covers fractional-scale rounding without repainting broad borders
+            // around every small client update.
+            self.mark_global_logical_damage_with_margin(rect, 1, DamageSource::CommitBbox);
         }
-        handled
+        if queued == 0 && handled && frame_callback_pending {
+            // A visually unchanged commit can still carry a frame callback. Schedule a one-pixel
+            // presentation so the callback is delivered without repainting the whole window.
+            self.mark_global_logical_damage_with_margin(
+                Rectangle::from_loc_and_size(tree_origin, (1, 1)),
+                0,
+                DamageSource::CommitBbox,
+            );
+            queued = 1;
+            self.surface_damage_metrics.callback_only_commits += 1;
+        }
+        self.surface_damage_scratch = scratch;
+
+        self.surface_damage_metrics.rectangles_queued += queued as u64;
+        if visual_damage_queued {
+            self.surface_damage_metrics.precise_commits += 1;
+            SurfaceDamageResult::PreciseDamageQueued
+        } else if handled {
+            self.surface_damage_metrics.unchanged_commits += 1;
+            SurfaceDamageResult::NoVisualChange
+        } else {
+            self.surface_damage_metrics.fallback_commits += 1;
+            SurfaceDamageResult::Unsupported
+        }
     }
 
     pub(crate) fn mark_output_logical_damage(
@@ -3267,7 +3456,7 @@ impl DesktopState {
             return;
         };
 
-        let physical = clipped.to_physical_precise_round::<f64, i32>(output.scale);
+        let physical = logical_damage_to_physical(clipped, output.scale);
         self.mark_output_damage_source(output_id, physical, source);
     }
 
@@ -3842,6 +4031,13 @@ impl DesktopState {
                     let launch_trace_id = self.launch_app(focaldesk_files_command());
                     flog_info!(
                         "dispatch launch trace_id={} action=sidebar-files",
+                        launch_trace_id
+                    );
+                }
+                SIDEBAR_EMAIL_ID => {
+                    let launch_trace_id = self.launch_app("evolution".to_string());
+                    flog_info!(
+                        "dispatch launch trace_id={} action=sidebar-email",
                         launch_trace_id
                     );
                 }
@@ -5718,9 +5914,13 @@ impl DesktopState {
             theme: init.theme_manager,
             surface_colors: HashMap::new(),
             surface_damage: HashMap::new(),
+            surface_damage_roots: HashMap::new(),
+            surface_damage_scratch: SurfaceDamageScratch::default(),
+            surface_damage_metrics: SurfaceDamageMetrics::default(),
             wp_color_surface_outputs: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
+            damage_last_logged_surface_commit: 0,
             sidebar_pulse: None,
             topbar_pulse: None,
             flow_field_pulse: None,
@@ -6229,14 +6429,11 @@ impl DesktopState {
         self.ensure_popup_initial_configure(surface);
 
         if !mapped_window && resize_damage.is_none() && !commit_damage_queued {
-            if let Some(window) = committed_window.as_ref() {
-                let is_window_tree_root = window
-                    .wl_surface()
-                    .as_ref()
-                    .is_some_and(|window_root| **window_root == root);
-                if is_window_tree_root {
-                    commit_damage_queued = self.mark_surface_tree_damage(window, &root);
-                }
+            if let Some(target) = self.surface_tree_damage_target(committed_window.as_ref(), &root)
+            {
+                commit_damage_queued = self.mark_surface_tree_damage(target).handled();
+            } else {
+                self.surface_damage_metrics.fallback_commits += 1;
             }
         }
 
@@ -7745,7 +7942,7 @@ impl DesktopState {
     }
 
     pub fn log_damage_frame(
-        &self,
+        &mut self,
         output_id: OutputId,
         pre_rects: usize,
         post_rects: usize,
@@ -7754,13 +7951,19 @@ impl DesktopState {
         full_damage: bool,
         redraw_all: bool,
     ) {
-        if !self.damage_debug_enabled || !self.render.frame_no.is_multiple_of(120) {
+        if !self.damage_debug_enabled {
             return;
         }
 
         let c = self.damage_source_counts;
+        let surface = self.surface_damage_metrics;
+        let surface_changed = surface.tree_commits != self.damage_last_logged_surface_commit;
+        if !surface_changed && !self.render.frame_no.is_multiple_of(120) {
+            return;
+        }
+        self.damage_last_logged_surface_commit = surface.tree_commits;
         flog(format!(
-            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, hover={}, commit={}, full_fallback={}, unknown={})",
+            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
             output_id,
             self.render.frame_no,
             pre_rects,
@@ -7775,7 +7978,14 @@ impl DesktopState {
             c.hover,
             c.commit_bbox,
             c.full_redraw_fallback,
-            c.unknown
+            c.unknown,
+            surface.tree_commits,
+            surface.precise_commits,
+            surface.unchanged_commits,
+            surface.callback_only_commits,
+            surface.fallback_commits,
+            surface.rectangles_queued,
+            surface.destroyed_surfaces,
         ));
     }
 
@@ -9127,9 +9337,11 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_rect_to_bounds, is_browser_like, power_action_interaction, session_power_command,
-        should_wait_for_lid_open_on_resume, surface_buffer_damage_to_logical, workspace_for_slot,
-        PowerActionInteraction, UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        clamp_rect_to_bounds, is_browser_like, logical_damage_to_physical,
+        power_action_interaction, remove_surface_root_membership, session_power_command,
+        set_surface_root_membership, should_wait_for_lid_open_on_resume,
+        surface_buffer_damage_to_logical, workspace_for_slot, PowerActionInteraction,
+        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
@@ -9137,8 +9349,10 @@ mod tests {
     use focaldesk_ui::atlas::IconId;
     use focaldesk_ui::element::ChromeItem;
     use focaldesk_ui::types::UiAction;
+    use smithay::backend::renderer::element::Id;
     use smithay::backend::renderer::utils::SurfaceView;
-    use smithay::utils::{Buffer, Logical, Rectangle, Size, Transform};
+    use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
+    use std::collections::HashMap;
 
     #[test]
     fn surface_damage_respects_buffer_scale() {
@@ -9184,6 +9398,94 @@ mod tests {
             logical,
             Some(Rectangle::from_loc_and_size((50, 20), (50, 20)))
         );
+    }
+
+    #[test]
+    fn surface_damage_supports_every_buffer_transform() {
+        let transforms = [
+            Transform::Normal,
+            Transform::_90,
+            Transform::_180,
+            Transform::_270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ];
+        let buffer_dimensions = Size::<i32, Buffer>::from((200, 100));
+
+        for transform in transforms {
+            let logical_size = buffer_dimensions.to_logical(1, transform);
+            let view = SurfaceView {
+                src: Rectangle::<f64, Logical>::from_size(logical_size.to_f64()),
+                dst: logical_size,
+                offset: (0, 0).into(),
+            };
+
+            let logical = surface_buffer_damage_to_logical(
+                Rectangle::from_size(buffer_dimensions),
+                buffer_dimensions,
+                1,
+                transform,
+                view,
+            );
+
+            assert_eq!(
+                logical,
+                Some(Rectangle::from_size(logical_size)),
+                "full-buffer damage was not preserved for {transform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_damage_outside_viewport_is_discarded() {
+        let view = SurfaceView {
+            src: Rectangle::<f64, Logical>::from_loc_and_size((50.0, 50.0), (50.0, 50.0)),
+            dst: (50, 50).into(),
+            offset: (0, 0).into(),
+        };
+
+        let logical = surface_buffer_damage_to_logical(
+            Rectangle::from_loc_and_size((0, 0), (25, 25)),
+            Size::from((200, 200)),
+            1,
+            Transform::Normal,
+            view,
+        );
+
+        assert_eq!(logical, None);
+    }
+
+    #[test]
+    fn fractional_output_damage_rounds_outward() {
+        let logical = Rectangle::<i32, Logical>::from_loc_and_size((1, 1), (1, 1));
+
+        let physical = logical_damage_to_physical(logical, Scale::from((1.5, 1.5)));
+
+        assert_eq!(
+            physical,
+            Rectangle::<i32, smithay::utils::Physical>::from_loc_and_size((1, 1), (2, 2))
+        );
+    }
+
+    #[test]
+    fn surface_root_index_handles_reparent_and_destroy_without_stale_entries() {
+        let surface = Id::new();
+        let first_root = Id::new();
+        let second_root = Id::new();
+        let mut roots = HashMap::new();
+
+        set_surface_root_membership(&mut roots, &surface, None, &first_root);
+        set_surface_root_membership(&mut roots, &surface, Some(&first_root), &second_root);
+
+        assert!(!roots.contains_key(&first_root));
+        assert!(roots
+            .get(&second_root)
+            .is_some_and(|members| members.contains(&surface)));
+
+        remove_surface_root_membership(&mut roots, &second_root, &surface);
+        assert!(roots.is_empty());
     }
 
     #[test]

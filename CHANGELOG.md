@@ -26,6 +26,9 @@ version numbers where practical.
 - Added an isolated nested compositor compatibility harness with headless Weston
   fallback, Wayland registry checks, native-client survival, XWayland readiness,
   crash detection, CI coverage, and captured diagnostics.
+- Added lifecycle-safe precise damage propagation for Wayland toplevel, popup,
+  layer-shell, and synchronized subsurface trees, with transform, viewport,
+  fractional-scale, destruction, effectiveness, and commit-storm coverage.
 
 ### Changed
 
@@ -51,6 +54,9 @@ version numbers where practical.
   their private Wayland socket does not replace the host session environment.
 - Disabled unused image codecs, removing the yanked `core2` dependency and
   reducing the RustSec warning set.
+- Indexed damage state per surface-tree root, reused traversal storage, reduced
+  client-damage expansion to a one-pixel rounding guard, and made rectangle
+  compaction transitive without overlap-inflated full-frame decisions.
 
 ## Historical tags
 

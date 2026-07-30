@@ -56,7 +56,7 @@ release.
 | HDR and color management | Experimental and hardware-dependent |
 | Settings, file manager, launcher, and AI console | Usable prototypes |
 | Local AI and automation services | Experimental and permission-gated |
-| Precise Wayland subsurface damage tracking | Planned |
+| Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |
 
 The table describes repository capabilities, not a compatibility guarantee for
 every distribution, GPU, or application. See [Building FocalDesk](docs/building.md)
@@ -154,7 +154,8 @@ diagrams, current boundaries, and implementation notes.
 - **Hardware diversity:** DRM/KMS, GPU drivers, multi-GPU systems, hotplug,
   mixed refresh rates, scaling, transforms, and hardware cursors vary widely.
 - **Efficient rendering:** damage tracking must avoid unnecessary redraws while
-  preserving correct composition; precise subsurface damage remains planned.
+  preserving correct composition; runtime metrics and compatibility tests are
+  used to keep precise surface-tree tracking effective.
 - **Color and capture:** HDR, wide-gamut color, ICC handling, SDR composition,
   PipeWire capture, and portal behavior require end-to-end validation.
 - **System boundaries:** local IPC, service privileges, socket ownership, and
@@ -374,9 +375,8 @@ NG.
 Near-term work is focused on compositor stability, multi-monitor behavior,
 XWayland and portal hardening, configuration consolidation, auditable AI and
 automation permissions, repeatable alpha releases, and clearing the Clippy
-warning backlog. Rendering priorities include precise subsurface damage,
-expanded HDR/color validation, and broader cursor, direct-scanout, and multi-GPU
-testing.
+warning backlog. Rendering priorities include damage-path profiling, expanded
+HDR/color validation, and broader cursor, direct-scanout, and multi-GPU testing.
 
 Longer-term goals include maturing the first-party desktop experience, versioned
 IPC, narrower service privileges, better accessibility and recovery workflows,

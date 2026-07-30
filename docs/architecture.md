@@ -44,10 +44,12 @@ effects and color processing, and hands the completed framebuffer to DRM/KMS
 for presentation.
 
 Damage tracking includes output regions and Smithay's per-surface damage
-history for mapped Wayland window trees. Synchronized subsurface damage is
-translated through buffer transforms, scaling, viewporter state, and surface
-placement before it reaches the output damage queue. Top-level window regions
-remain as a conservative fallback for commits outside that path.
+history for mapped toplevel, popup, and layer-shell trees. Synchronized
+subsurface damage is translated through buffer transforms, scaling, viewporter
+state, and surface placement before it reaches the output damage queue.
+Detach, reparent, and destruction paths preserve and repaint old placements.
+Bounding-box and full-output damage remain safe fallbacks for unsupported
+commits and layer-shell rearrangements that can move sibling surfaces.
 
 ## IPC Architecture
 

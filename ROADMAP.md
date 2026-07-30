@@ -19,8 +19,10 @@ truth for what is usable today.
 
 ## Rendering and display work
 
-- Add precise Wayland subsurface damage propagation.
-- Reduce full-output damage fallbacks and document damage metrics.
+- Profile the completed subsurface damage path across GTK, Qt, browsers, games,
+  mixed-scale outputs, and direct DRM/KMS sessions.
+- Continue reducing categorized full-output fallbacks using captured damage
+  metrics and GPU measurements.
 - Continue HDR, wide-gamut, ICC, and SDR-composition validation.
 - Expand hardware-cursor, direct-scanout, multi-GPU, and presentation testing.
 

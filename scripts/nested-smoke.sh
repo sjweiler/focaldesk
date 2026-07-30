@@ -5,7 +5,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ARTIFACTS="${FOCALDESK_SMOKE_ARTIFACTS:-$ROOT/target/nested-smoke}"
 START_TIMEOUT="${FOCALDESK_SMOKE_START_TIMEOUT:-30}"
-CLIENT_SECONDS="${FOCALDESK_SMOKE_CLIENT_SECONDS:-3}"
+CLIENT_SECONDS="${FOCALDESK_SMOKE_CLIENT_SECONDS:-5}"
 BUILD=1
 HOST_PID=""
 COMPOSITOR_PID=""
@@ -22,7 +22,7 @@ is available, the script starts a private headless Weston session.
 Environment:
   FOCALDESK_SMOKE_CLIENT          Optional native Wayland client command
   FOCALDESK_SMOKE_START_TIMEOUT   Compositor startup timeout (default: 30)
-  FOCALDESK_SMOKE_CLIENT_SECONDS  Client observation time (default: 3)
+  FOCALDESK_SMOKE_CLIENT_SECONDS  Client observation time (default: 5)
 EOF
 }
 
@@ -168,6 +168,7 @@ export XDG_STATE_HOME="$TEMP_XDG/state"
 export XDG_CACHE_HOME="$TEMP_XDG/cache"
 export FOCALDESK_LOG_FILE="$ARTIFACTS/compositor.log"
 export FOCALDESK_DISABLE_PORTAL_ENV=1
+export FOCALDESK_DAMAGE_DEBUG="${FOCALDESK_DAMAGE_DEBUG:-1}"
 export RUST_LOG="${RUST_LOG:-focaldesk=debug,smithay=error}"
 
 WAYLAND_DISPLAY="$HOST_DISPLAY" "$COMPOSITOR" \
@@ -224,6 +225,17 @@ if [[ -n "$CLIENT" ]]; then
     fi
     kill -0 "$COMPOSITOR_PID" 2>/dev/null || fail "compositor exited while running native client"
     pass "native client connection and render survival ($CLIENT)"
+    if wait_for_log 'surface\(trees=[1-9][0-9]*, precise=[1-9][0-9]*,' 5; then
+        DAMAGE_METRICS="$(
+            grep -hE 'damage output=.*surface\(trees=' \
+                "$ARTIFACTS/compositor.log" "$ARTIFACTS/compositor.stderr" \
+                | tail -1 | sed -E 's/^.*surface\(([^)]*)\).*$/\1/'
+        )"
+        echo "damage_metrics=$DAMAGE_METRICS" >>"$ARTIFACTS/summary.txt"
+        pass "precise surface-tree damage exercised"
+    else
+        fail "native client did not exercise precise surface-tree damage"
+    fi
 else
     echo "SKIP no native demo client found" | tee -a "$ARTIFACTS/summary.txt"
 fi

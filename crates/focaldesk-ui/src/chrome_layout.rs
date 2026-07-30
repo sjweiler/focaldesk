@@ -6,7 +6,7 @@ use smithay::utils::Size;
 /// Defaults aligned with `focaldesk_ui::chrome::ChromeMetrics::default` for nested (winit) mode.
 pub const NESTED_DEFAULT_TOPBAR_H: i32 = 64;
 pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
-pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 11;
+pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 12;
 pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

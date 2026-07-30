@@ -132,6 +132,7 @@ pub enum IconId {
     Browser,
     Terminal,
     Files,
+    Email,
     Plus,
     Minus,
 }
@@ -163,6 +164,7 @@ impl IconId {
             "browser" => Self::Browser,
             "terminal" => Self::Terminal,
             "files" => Self::Files,
+            "email" | "mail" => Self::Email,
             "plus" => Self::Plus,
             "minus" => Self::Minus,
             value if value.starts_with("slot_") => {
@@ -689,6 +691,10 @@ where
         (
             IconId::Files,
             include_bytes!("../../../assets/svg/files.svg"),
+        ),
+        (
+            IconId::Email,
+            include_bytes!("../../../assets/svg/email.svg"),
         ),
         (IconId::Plus, include_bytes!("../../../assets/svg/plus.svg")),
         (

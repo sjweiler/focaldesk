@@ -56,7 +56,7 @@ impl CompositorHandler for DesktopState {
         add_destruction_hook::<DesktopState, _>(surface, |state, surface| {
             let id = Id::from_wayland_resource(surface);
             state.surface_colors.remove(&id);
-            state.remove_surface_damage_state(&id);
+            state.handle_surface_destroyed(&id);
         });
         add_pre_commit_hook::<DesktopState, _>(surface, |state, _dh, surface| {
             #[cfg(not(feature = "xwayland"))]
@@ -158,8 +158,18 @@ impl CompositorHandler for DesktopState {
         // Import deferred to the render path (`import_mapped_surfaces_for_output`). Importing
         // during `dispatch_clients` wedged the GPU when GTK apps commit many subsurfaces at once.
         self.handle_commit(surface);
-        for output in self.space.outputs() {
-            layer_map_for_output(output).arrange();
+        let outputs: Vec<_> = self.space.outputs().cloned().collect();
+        for output in outputs {
+            if layer_map_for_output(&output).arrange() {
+                if let Some(output_id) = self.output_id_for_space_output(&output) {
+                    // A layer-shell arrangement can move multiple sibling layers. Repaint this
+                    // output until every affected layer has an independently tracked old/new box.
+                    self.mark_output_full_damage(
+                        output_id,
+                        crate::core::desktop::DamageSource::CommitBbox,
+                    );
+                }
+            }
         }
     }
 }
