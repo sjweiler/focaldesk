@@ -1250,7 +1250,6 @@ impl RenderState {
         icon: IconId,
         control_rect_logical: Rectangle<i32, Logical>,
         icon_rect_logical: Rectangle<i32, Logical>,
-        output_size: (i32, i32),
         scale: Scale<f64>,
         theme: &FlowTheme,
         hovered: bool,
@@ -1278,7 +1277,6 @@ impl RenderState {
         let required_h = self.glass_control_background_size.1.max(control.size.h);
         let resized = (required_w, required_h) != self.glass_control_background_size;
         let background_id = background.tex_id();
-        let framebuffer_y = output_size.1 - control.loc.y - control.size.h;
         frame.with_context(|gl| unsafe {
             gl.ActiveTexture(ffi::TEXTURE1);
             gl.BindTexture(ffi::TEXTURE_2D, background_id);
@@ -1313,7 +1311,7 @@ impl RenderState {
                 0,
                 0,
                 control.loc.x,
-                framebuffer_y,
+                control.loc.y,
                 control.size.w,
                 control.size.h,
             );
@@ -3883,7 +3881,6 @@ impl RenderState {
                                     icon_id,
                                     control_rect_logical,
                                     icon_rect_logical,
-                                    ctx.output_size,
                                     ctx.output_scale,
                                     active_theme,
                                     el.hovered,
@@ -3931,7 +3928,6 @@ impl RenderState {
                                     icon_id,
                                     base_rect_logical,
                                     icon_rect_logical,
-                                    ctx.output_size,
                                     ctx.output_scale,
                                     active_theme,
                                     el.hovered,
@@ -4019,7 +4015,6 @@ impl RenderState {
                                 icon_id,
                                 base_rect_logical,
                                 icon_rect_logical,
-                                ctx.output_size,
                                 ctx.output_scale,
                                 active_theme,
                                 el.hovered,

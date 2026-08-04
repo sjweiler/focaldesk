@@ -1939,9 +1939,10 @@ void main() {
         discard;
     }
 
-    // CopyTexSubImage2D stores the framebuffer bottom row at texture v=0.
+    // The compositor's Transform::Normal offscreen projection and the copied texture
+    // use the same top-to-bottom local coordinate convention.
     vec2 background_texture_size = u_size / max(u_background_uv_size, vec2(0.0001));
-    vec2 background_uv = (vec2(0.5) + vec2(uv.x, 1.0 - uv.y)
+    vec2 background_uv = (vec2(0.5) + uv
         * max(u_size - vec2(1.0), vec2(0.0))) / background_texture_size;
     vec3 background = texture2D(u_background, background_uv).rgb;
     float hover = clamp(u_hover, 0.0, 1.0);
