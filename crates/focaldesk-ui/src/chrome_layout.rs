@@ -325,7 +325,6 @@ pub fn build_chrome_layout_with_config(
         build_status_cluster(topbar_inner, 10, 6, 8, status_count);
 
     let flow_left = topbar_inner.loc.x + 6;
-    let flow_y = topbar_inner.loc.y + 4;
     let flow_gap = 10;
     let flow_available = (status_cluster.loc.x - flow_left - flow_gap).max(0);
     let flow_preferred = 136;
@@ -338,8 +337,8 @@ pub fn build_chrome_layout_with_config(
     .max(1);
 
     let flow_field = Rectangle::from_loc_and_size(
-        (flow_left, flow_y),
-        (flow_w, (topbar_inner.size.h - 8).max(1)),
+        (flow_left, status_cluster.loc.y),
+        (flow_w, status_cluster.size.h),
     );
 
     // Title gets the remaining space to the left of the cluster
@@ -504,5 +503,22 @@ mod tests {
 
         assert_eq!(layout.topbar.status_wells.len(), 3);
         assert_eq!(layout.sidebar.slots.len(), 7);
+    }
+
+    #[test]
+    fn flow_field_matches_status_and_clock_vertical_clearance() {
+        let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+        let flow = layout.topbar.flow_field;
+        let clock = layout.topbar.clock_well;
+
+        assert_eq!(flow.loc.y, clock.loc.y);
+        assert_eq!(flow.size.h, clock.size.h);
+        assert!(
+            layout
+                .topbar
+                .status_wells
+                .iter()
+                .all(|well| well.loc.y == flow.loc.y && well.size.h == flow.size.h)
+        );
     }
 }

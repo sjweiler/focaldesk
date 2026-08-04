@@ -40,6 +40,9 @@ release-portal:
 release-automation:
     cargo build --release -p focaldesk-automation
 
+release-mcp:
+    cargo build --release -p focaldesk-mcp
+
 release-focaldm-greeter:
     cargo build --release -p focaldm-greeter
 
@@ -154,6 +157,11 @@ install-automation-service:
     install -Dm644 packaging/systemd/user/focaldesk-automation.service "$HOME/.config/systemd/user/focaldesk-automation.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-automation.service || echo "Skipping systemd user enable: no user bus available"
+
+# MCP clients launch this stdio server on demand; it is not a systemd service.
+install-mcp:
+    cargo build --release -p focaldesk-mcp
+    install -Dm755 target/release/focaldesk-mcp "$HOME/.local/bin/focaldesk-mcp"
 
 install-files:
     cargo build --release -p focaldesk-files

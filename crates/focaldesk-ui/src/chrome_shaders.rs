@@ -33,6 +33,8 @@ pub struct ChromeShaders {
     pub accent: Option<GlesPixelProgram>,
     pub flow_field: Option<GlesPixelProgram>,
     pub screensaver: Option<GlesPixelProgram>,
+    pub glass_control: Option<GlesTexProgram>,
+    glass_control_disabled: bool,
 }
 
 impl Default for ChromeShaders {
@@ -66,6 +68,8 @@ impl ChromeShaders {
             accent: None,
             flow_field: None,
             screensaver: None,
+            glass_control: None,
+            glass_control_disabled: false,
         }
     }
 
@@ -119,6 +123,7 @@ impl ChromeShaders {
                 &[
                     UniformName::new("u_size", UniformType::_2f),
                     UniformName::new("u_opacity", UniformType::_1f),
+                    UniformName::new("u_output_factor", UniformType::_1f),
                     UniformName::new("u_edge_width", UniformType::_1f),
                     UniformName::new("u_edge_brightness", UniformType::_1f),
                     UniformName::new("u_highlight_strength", UniformType::_1f),
@@ -151,6 +156,44 @@ impl ChromeShaders {
                 TINTED_ICON_FRAG,
                 &[UniformName::new("u_tint", UniformType::_4f)],
             )?);
+        }
+
+        if self.glass_control.is_none() && !self.glass_control_disabled {
+            match renderer.compile_custom_texture_shader(
+                GLASS_CONTROL_FRAG,
+                &[
+                    UniformName::new("u_background", UniformType::_1i),
+                    UniformName::new("u_background_uv_size", UniformType::_2f),
+                    UniformName::new("u_size", UniformType::_2f),
+                    UniformName::new("u_icon_uv_origin", UniformType::_2f),
+                    UniformName::new("u_icon_uv_size", UniformType::_2f),
+                    UniformName::new("u_icon_rect", UniformType::_4f),
+                    UniformName::new("u_icon_texel_size", UniformType::_2f),
+                    UniformName::new("u_glass_tint", UniformType::_4f),
+                    UniformName::new("u_accent_color", UniformType::_3f),
+                    UniformName::new("u_corner_radius", UniformType::_1f),
+                    UniformName::new("u_border_width", UniformType::_1f),
+                    UniformName::new("u_hover", UniformType::_1f),
+                    UniformName::new("u_pressed", UniformType::_1f),
+                    UniformName::new("u_enabled", UniformType::_1f),
+                    UniformName::new("u_active", UniformType::_1f),
+                    UniformName::new("u_warning", UniformType::_1f),
+                    UniformName::new("u_light_dir", UniformType::_3f),
+                    UniformName::new("u_opacity", UniformType::_1f),
+                    UniformName::new("u_output_factor", UniformType::_1f),
+                    UniformName::new("u_icon_strength", UniformType::_1f),
+                    UniformName::new("u_etch_depth", UniformType::_1f),
+                ],
+            ) {
+                Ok(program) => self.glass_control = Some(program),
+                Err(err) => {
+                    self.glass_control_disabled = true;
+                    focaldesk_logging::flog_warn!(
+                        "glass_control shader compile failed; keeping legacy chrome controls: {:?}",
+                        err
+                    );
+                }
+            }
         }
 
         if self.font_text.is_none() {
@@ -871,7 +914,7 @@ void main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECESSED_BUTTON_FRAG, TOP_BAR_FRAG};
+    use super::{GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TOP_BAR_FRAG};
 
     #[test]
     fn pixel_shaders_use_smithays_vertex_varying() {
@@ -879,6 +922,17 @@ mod tests {
             assert!(shader.contains("varying vec2 v_coords;"));
             assert!(!shader.contains("v_uv"));
         }
+    }
+
+    #[test]
+    fn glass_control_uses_smithays_texture_shader_contract() {
+        assert!(GLASS_CONTROL_FRAG.contains("//_DEFINES"));
+        assert!(GLASS_CONTROL_FRAG.contains("varying vec2 v_coords;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D tex;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform float alpha;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D u_background;"));
+        assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
+        assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
     }
 }
 
@@ -1816,5 +1870,143 @@ void main() {
     color += vec3(0.10, 0.12, 0.18) * neighborhood_pull * 0.12;
 
     gl_FragColor = vec4(clamp(color, 0.0, 1.0), 1.0);
+}
+"#;
+
+const GLASS_CONTROL_FRAG: &str = r#"
+//_DEFINES
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : enable
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+#if defined(EXTERNAL)
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+uniform sampler2D u_background;
+uniform float alpha;
+
+varying vec2 v_coords;
+
+uniform vec2 u_size;
+uniform vec2 u_background_uv_size;
+uniform vec2 u_icon_uv_origin;
+uniform vec2 u_icon_uv_size;
+uniform vec4 u_icon_rect;
+uniform vec2 u_icon_texel_size;
+uniform vec4 u_glass_tint;
+uniform vec3 u_accent_color;
+uniform float u_corner_radius;
+uniform float u_border_width;
+uniform float u_hover;
+uniform float u_pressed;
+uniform float u_enabled;
+uniform float u_active;
+uniform float u_warning;
+uniform vec3 u_light_dir;
+uniform float u_opacity;
+uniform float u_output_factor;
+uniform float u_icon_strength;
+uniform float u_etch_depth;
+
+float rounded_rect_sdf(vec2 point, vec2 half_size, float radius) {
+    vec2 q = abs(point) - half_size + vec2(radius);
+    return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - radius;
+}
+
+float icon_sample(vec2 local_uv) {
+    vec2 icon_uv = (local_uv - u_icon_rect.xy) / max(u_icon_rect.zw, vec2(0.0001));
+    float inside = step(0.0, icon_uv.x) * step(0.0, icon_uv.y)
+        * step(icon_uv.x, 1.0) * step(icon_uv.y, 1.0);
+    vec2 atlas_uv = u_icon_uv_origin + clamp(icon_uv, 0.0, 1.0) * u_icon_uv_size;
+    return texture2D(tex, atlas_uv).a * inside;
+}
+
+void main() {
+    vec2 uv = v_coords;
+    vec2 p = (uv - vec2(0.5)) * u_size;
+    float radius = min(u_corner_radius, min(u_size.x, u_size.y) * 0.5);
+    float distance_to_button = rounded_rect_sdf(p, u_size * 0.5, radius);
+    float edge_aa = 1.0;
+    float button_alpha = 1.0 - smoothstep(-edge_aa, edge_aa, distance_to_button);
+    if (button_alpha <= 0.0) {
+        discard;
+    }
+
+    // CopyTexSubImage2D stores the framebuffer bottom row at texture v=0.
+    vec2 background_texture_size = u_size / max(u_background_uv_size, vec2(0.0001));
+    vec2 background_uv = (vec2(0.5) + vec2(uv.x, 1.0 - uv.y)
+        * max(u_size - vec2(1.0), vec2(0.0))) / background_texture_size;
+    vec3 background = texture2D(u_background, background_uv).rgb;
+    float hover = clamp(u_hover, 0.0, 1.0);
+    float pressed = clamp(u_pressed, 0.0, 1.0);
+    float enabled = clamp(u_enabled, 0.0, 1.0);
+    float active = clamp(u_active, 0.0, 1.0);
+    float warning = clamp(u_warning, 0.0, 1.0);
+
+    float glass_mix = clamp(u_glass_tint.a + hover * 0.05 + pressed * 0.04, 0.0, 1.0);
+    vec3 glass_color = mix(background, u_glass_tint.rgb, glass_mix);
+    float top_highlight = smoothstep(0.55, 0.0, uv.y)
+        * smoothstep(0.0, 0.25, uv.x) * smoothstep(1.0, 0.75, uv.x);
+    glass_color += vec3(0.10) * top_highlight;
+    glass_color += vec3(0.025) * (1.0 - uv.y);
+    glass_color -= vec3(0.020) * uv.y;
+
+    float border = smoothstep(-edge_aa, edge_aa, distance_to_button + u_border_width)
+        * button_alpha;
+    vec3 border_color = mix(vec3(0.35), vec3(0.75), top_highlight)
+        + u_accent_color * active * 0.15;
+    glass_color = mix(glass_color, border_color, border * 0.30);
+
+    // Convert one atlas texel to button-local UV before taking mask derivatives.
+    vec2 local_texel = u_icon_texel_size / max(u_icon_uv_size, vec2(0.0001))
+        * u_icon_rect.zw;
+    float center = icon_sample(uv);
+    float left = icon_sample(uv - vec2(local_texel.x, 0.0));
+    float right = icon_sample(uv + vec2(local_texel.x, 0.0));
+    float up = icon_sample(uv - vec2(0.0, local_texel.y));
+    float down = icon_sample(uv + vec2(0.0, local_texel.y));
+    vec2 gradient = vec2(right - left, down - up);
+    vec3 light_direction = normalize(u_light_dir);
+    vec3 icon_normal = normalize(vec3(-gradient * u_etch_depth, 1.0));
+    float diffuse = max(dot(icon_normal, light_direction), 0.0);
+    vec2 light_xy = normalize(light_direction.xy + vec2(0.0001));
+    float directional_edge = dot(normalize(gradient + vec2(0.0001)), light_xy);
+    float etched_highlight = max(-directional_edge, 0.0);
+    float etched_shadow = max(directional_edge, 0.0);
+    float icon_edge = clamp(length(gradient) * 2.5, 0.0, 1.0);
+    float surface_luminance = dot(glass_color, vec3(0.2126, 0.7152, 0.0722));
+    vec3 icon_contrast = mix(
+        vec3(0.94, 0.96, 1.0),
+        vec3(0.10, 0.08, 0.12),
+        smoothstep(0.40, 0.62, surface_luminance)
+    );
+    vec3 icon_base = mix(icon_contrast, u_accent_color, active * 0.40);
+    icon_base *= mix(0.55, 1.0, enabled);
+
+    glass_color += u_accent_color * active * center * (0.20 + hover * 0.10);
+    glass_color += mix(u_accent_color, vec3(1.0, 0.35, 0.08), warning)
+        * warning * center * 0.35;
+    glass_color = mix(glass_color, icon_base, center * u_icon_strength);
+    glass_color += vec3(0.36) * etched_highlight * icon_edge * center;
+    glass_color -= vec3(0.28) * etched_shadow * icon_edge * center;
+    glass_color += vec3(0.06) * diffuse * icon_edge;
+    glass_color *= mix(1.0, 0.90, pressed);
+    glass_color += u_accent_color * border * hover * 0.08;
+
+    float luminance = dot(glass_color, vec3(0.2126, 0.7152, 0.0722));
+    glass_color = mix(vec3(luminance), glass_color, enabled);
+    // The captured background is already part of glass_color, so replace the covered
+    // framebuffer pixel instead of blending the same background into it twice.
+    float effect_mix = clamp(u_opacity * u_output_factor, 0.0, 1.0);
+    vec3 final_color = mix(background, glass_color, effect_mix);
+    float coverage = button_alpha * alpha;
+    gl_FragColor = vec4(final_color * coverage, coverage);
 }
 "#;

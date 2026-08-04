@@ -10,6 +10,7 @@ use focaldesk_ui::uitree::UiTree;
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
+use smithay::backend::renderer::gles::ffi;
 use smithay::backend::renderer::gles::GlesFrame;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::gles::GlesTexture;
@@ -201,6 +202,10 @@ pub struct RenderState {
     pub resources: RenderResources,
     pub redraw_all: bool,
     pub chrome_shaders: ChromeShaders,
+    /// Reused framebuffer snapshot for the small sidebar/topbar glass controls.
+    pub glass_control_background: Option<GlesTexture>,
+    glass_control_background_size: (i32, i32),
+    glass_control_background_disabled: bool,
     pub egui: EguiLayer,
     pub start_time: Instant,
     //pub chrome_svg: ChromeSvgCache,
@@ -589,6 +594,9 @@ impl RenderState {
             resources: RenderResources::new(),
             redraw_all: true,
             chrome_shaders: ChromeShaders::new(),
+            glass_control_background: None,
+            glass_control_background_size: (1, 1),
+            glass_control_background_disabled: false,
             egui: EguiLayer::default(),
             start_time: Instant::now(),
 
@@ -1234,8 +1242,192 @@ impl RenderState {
         RenderState::render_icon_with_tint(frame, atlas, icon, rect_logical, scale, style, program);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glass_control(
+        &mut self,
+        frame: &mut GlesFrame<'_, '_>,
+        atlas: &focaldesk_ui::atlas::IconAtlas,
+        icon: IconId,
+        control_rect_logical: Rectangle<i32, Logical>,
+        icon_rect_logical: Rectangle<i32, Logical>,
+        output_size: (i32, i32),
+        scale: Scale<f64>,
+        theme: &FlowTheme,
+        hovered: bool,
+        enabled: bool,
+        active: bool,
+        output_factor: f32,
+    ) -> Result<bool, GlesError> {
+        let Some(program) = self.chrome_shaders.glass_control.clone() else {
+            return Ok(false);
+        };
+        let Some(background) = self.glass_control_background.clone() else {
+            return Ok(false);
+        };
+        let Some(entry) = atlas.get(icon).copied() else {
+            return Ok(false);
+        };
+
+        let control = to_physical_rect(control_rect_logical, scale);
+        let icon_rect = to_physical_rect(icon_rect_logical, scale);
+        if control.size.w <= 0 || control.size.h <= 0 {
+            return Ok(false);
+        }
+
+        let required_w = self.glass_control_background_size.0.max(control.size.w);
+        let required_h = self.glass_control_background_size.1.max(control.size.h);
+        let resized = (required_w, required_h) != self.glass_control_background_size;
+        let background_id = background.tex_id();
+        let framebuffer_y = output_size.1 - control.loc.y - control.size.h;
+        frame.with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, background_id);
+            if resized {
+                gl.TexImage2D(
+                    ffi::TEXTURE_2D,
+                    0,
+                    ffi::RGBA as i32,
+                    required_w,
+                    required_h,
+                    0,
+                    ffi::RGBA,
+                    ffi::UNSIGNED_BYTE,
+                    std::ptr::null(),
+                );
+            }
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            gl.CopyTexSubImage2D(
+                ffi::TEXTURE_2D,
+                0,
+                0,
+                0,
+                control.loc.x,
+                framebuffer_y,
+                control.size.w,
+                control.size.h,
+            );
+            gl.ActiveTexture(ffi::TEXTURE0);
+        })?;
+        if resized {
+            self.glass_control_background_size = (required_w, required_h);
+        }
+
+        let atlas_size = atlas.texture.size();
+        let icon_uv_origin = [
+            entry.x as f32 / atlas_size.w as f32,
+            entry.y as f32 / atlas_size.h as f32,
+        ];
+        let icon_uv_size = [
+            entry.w as f32 / atlas_size.w as f32,
+            entry.h as f32 / atlas_size.h as f32,
+        ];
+        let icon_local_rect = [
+            (icon_rect.loc.x - control.loc.x) as f32 / control.size.w as f32,
+            (icon_rect.loc.y - control.loc.y) as f32 / control.size.h as f32,
+            icon_rect.size.w as f32 / control.size.w as f32,
+            icon_rect.size.h as f32 / control.size.h as f32,
+        ];
+        let source = Rectangle::<f64, Buffer>::from_loc_and_size(
+            (0.0, 0.0),
+            (atlas_size.w as f64, atlas_size.h as f64),
+        );
+        let damage = [Rectangle::from_loc_and_size((0, 0), control.size)];
+        let opacity = if enabled { 0.96 } else { 0.72 };
+        let result = frame.render_texture_from_to(
+            &atlas.texture,
+            source,
+            control,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(&program),
+            &[
+                Uniform::new("u_background", 1i32),
+                Uniform::new(
+                    "u_background_uv_size",
+                    [
+                        control.size.w as f32 / required_w as f32,
+                        control.size.h as f32 / required_h as f32,
+                    ],
+                ),
+                Uniform::new("u_size", [control.size.w as f32, control.size.h as f32]),
+                Uniform::new("u_icon_uv_origin", icon_uv_origin),
+                Uniform::new("u_icon_uv_size", icon_uv_size),
+                Uniform::new("u_icon_rect", icon_local_rect),
+                Uniform::new(
+                    "u_icon_texel_size",
+                    [1.0 / atlas_size.w as f32, 1.0 / atlas_size.h as f32],
+                ),
+                Uniform::new("u_glass_tint", theme.chrome.glass_tint),
+                Uniform::new(
+                    "u_accent_color",
+                    [
+                        theme.chrome.accent_color[0],
+                        theme.chrome.accent_color[1],
+                        theme.chrome.accent_color[2],
+                    ],
+                ),
+                Uniform::new(
+                    "u_corner_radius",
+                    theme.chrome.corner_radius * scale.x.max(scale.y) as f32,
+                ),
+                Uniform::new(
+                    "u_border_width",
+                    (theme.chrome.border_width * scale.x.max(scale.y) as f32).max(1.0),
+                ),
+                Uniform::new("u_hover", hovered as u8 as f32),
+                // UiElement currently uses `active` for the depressed/latched visual state.
+                Uniform::new("u_pressed", active as u8 as f32),
+                Uniform::new("u_enabled", enabled as u8 as f32),
+                Uniform::new("u_active", active as u8 as f32),
+                Uniform::new("u_warning", 0.0f32),
+                Uniform::new("u_light_dir", [-0.45f32, -0.65, 0.80]),
+                Uniform::new("u_opacity", opacity),
+                Uniform::new("u_output_factor", output_factor),
+                Uniform::new("u_icon_strength", 0.88f32),
+                Uniform::new("u_etch_depth", 5.0f32),
+            ],
+        );
+        let _ = frame.with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE1);
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.ActiveTexture(ffi::TEXTURE0);
+        });
+        result.map(|_| true)
+    }
+
     pub fn ensure_shader_programs(&mut self, renderer: &mut GlesRenderer) -> Result<(), GlesError> {
-        self.chrome_shaders.ensure_compiled(renderer)
+        self.chrome_shaders.ensure_compiled(renderer)?;
+        if self.chrome_shaders.glass_control.is_some()
+            && self.glass_control_background.is_none()
+            && !self.glass_control_background_disabled
+        {
+            match renderer.import_memory(&[0, 0, 0, 0], Fourcc::Abgr8888, (1, 1).into(), false) {
+                Ok(texture) => {
+                    self.glass_control_background = Some(texture);
+                    self.glass_control_background_size = (1, 1);
+                }
+                Err(err) => {
+                    self.glass_control_background_disabled = true;
+                    flog(format!(
+                        "glass control background allocation failed; keeping legacy controls: {err}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Drop every cached shader program and GPU texture handle.
@@ -1248,6 +1440,9 @@ impl RenderState {
     /// GL_INVALID_* error flood) instead of recompiling/re-uploading them.
     pub fn invalidate_gpu_state(&mut self) {
         self.chrome_shaders = ChromeShaders::new();
+        self.glass_control_background = None;
+        self.glass_control_background_size = (1, 1);
+        self.glass_control_background_disabled = false;
         self.wallpaper_texture = None;
         self.sw_cursor_texture = None;
         self.sw_cursor_cache_key = None;
@@ -3658,20 +3853,6 @@ impl RenderState {
 
                 match el.kind {
                     UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot => {
-                        if el.selected || el.active {
-                            let selected_rect_logical = inset_rect(base_rect_logical, 3);
-                            let selected_style =
-                                selected_sidebar_style(active_theme, el.hovered || el.active);
-                            let _ = Self::draw_beveled_panel(
-                                frame,
-                                &beveled,
-                                selected_rect_logical,
-                                ctx.output_scale,
-                                damage,
-                                &selected_style,
-                            );
-                        }
-
                         if let Some(icon_id) = el.icon {
                             let mut icon_rect_logical =
                                 icon_rect_in_module(base_rect_logical, icon_px);
@@ -3694,32 +3875,83 @@ impl RenderState {
                                     (new_w_logical, new_h_logical),
                                 );
                             }
-                            Self::draw_icon_in_rect(
-                                frame,
-                                atlas,
-                                icon_id,
-                                icon_state,
-                                icon_rect_logical,
-                                ctx.output_scale,
-                                style,
-                                &tinted_icon,
-                            );
+                            let control_rect_logical = inset_rect(base_rect_logical, 3);
+                            let drew_glass = self
+                                .draw_glass_control(
+                                    frame,
+                                    atlas,
+                                    icon_id,
+                                    control_rect_logical,
+                                    icon_rect_logical,
+                                    ctx.output_size,
+                                    ctx.output_scale,
+                                    active_theme,
+                                    el.hovered,
+                                    el.enabled,
+                                    el.active || el.selected,
+                                    output_factor,
+                                )
+                                .unwrap_or(false);
+                            if !drew_glass {
+                                if el.selected || el.active {
+                                    let selected_style = selected_sidebar_style(
+                                        active_theme,
+                                        el.hovered || el.active,
+                                    );
+                                    let _ = Self::draw_beveled_panel(
+                                        frame,
+                                        &beveled,
+                                        control_rect_logical,
+                                        ctx.output_scale,
+                                        damage,
+                                        &selected_style,
+                                    );
+                                }
+                                Self::draw_icon_in_rect(
+                                    frame,
+                                    atlas,
+                                    icon_id,
+                                    icon_state,
+                                    icon_rect_logical,
+                                    ctx.output_scale,
+                                    style,
+                                    &tinted_icon,
+                                );
+                            }
                         }
                     }
 
                     UiElementKind::TopbarIndicator | UiElementKind::TopbarButton => {
                         if let Some(icon_id) = el.icon {
                             let icon_rect_logical = well_icon_rect(base_rect_logical);
-                            Self::draw_icon_in_rect(
-                                frame,
-                                atlas,
-                                icon_id,
-                                icon_state,
-                                icon_rect_logical,
-                                ctx.output_scale,
-                                style,
-                                &tinted_icon,
-                            );
+                            let drew_glass = self
+                                .draw_glass_control(
+                                    frame,
+                                    atlas,
+                                    icon_id,
+                                    base_rect_logical,
+                                    icon_rect_logical,
+                                    ctx.output_size,
+                                    ctx.output_scale,
+                                    active_theme,
+                                    el.hovered,
+                                    el.enabled,
+                                    el.active || el.selected,
+                                    output_factor,
+                                )
+                                .unwrap_or(false);
+                            if !drew_glass {
+                                Self::draw_icon_in_rect(
+                                    frame,
+                                    atlas,
+                                    icon_id,
+                                    icon_state,
+                                    icon_rect_logical,
+                                    ctx.output_scale,
+                                    style,
+                                    &tinted_icon,
+                                );
+                            }
                         }
                     }
 
@@ -3773,6 +4005,33 @@ impl RenderState {
                             );
                         }
 
+                        // Let the flow field remain visible through the same captured-glass
+                        // surface used by the sidebar and status controls. Drawing the glass
+                        // after the flow field makes the animation part of the material while
+                        // keeping the AI icon etched and legible on top of it.
+                        let drew_glass = if let Some(icon_id) = el.icon {
+                            let icon_px = base_rect_logical.size.h.min(28).max(1);
+                            let icon_rect_logical =
+                                center_rect_in(base_rect_logical, icon_px, icon_px);
+                            self.draw_glass_control(
+                                frame,
+                                atlas,
+                                icon_id,
+                                base_rect_logical,
+                                icon_rect_logical,
+                                ctx.output_size,
+                                ctx.output_scale,
+                                active_theme,
+                                el.hovered,
+                                el.enabled,
+                                el.active || el.selected,
+                                output_factor,
+                            )
+                            .unwrap_or(false)
+                        } else {
+                            false
+                        };
+
                         if let (Some(pulse_shader), Some(pulse_frame)) =
                             (self.chrome_shaders.pulse.as_ref(), flow_field_pulse)
                         {
@@ -3790,25 +4049,27 @@ impl RenderState {
                             );
                         }
 
-                        if let Some(icon_id) = el.icon {
-                            if let Some(entry) = atlas.get(icon_id) {
-                                let icon_px = base_rect_logical.size.h.min(28).max(1);
-                                let icon_rect_logical =
-                                    center_rect_in(base_rect_logical, icon_px, icon_px);
-                                let icon_rect =
-                                    to_physical_rect(icon_rect_logical, ctx.output_scale);
-                                let output_size = Size::<i32, Physical>::from(ctx.output_size);
-                                let _ = render_atlas_icon_with_alpha(
-                                    frame,
-                                    &atlas.texture,
-                                    *entry,
-                                    icon_rect.loc.x,
-                                    icon_rect.loc.y,
-                                    icon_rect.size.w,
-                                    icon_rect.size.h,
-                                    output_size,
-                                    style.alpha,
-                                );
+                        if !drew_glass {
+                            if let Some(icon_id) = el.icon {
+                                if let Some(entry) = atlas.get(icon_id) {
+                                    let icon_px = base_rect_logical.size.h.min(28).max(1);
+                                    let icon_rect_logical =
+                                        center_rect_in(base_rect_logical, icon_px, icon_px);
+                                    let icon_rect =
+                                        to_physical_rect(icon_rect_logical, ctx.output_scale);
+                                    let output_size = Size::<i32, Physical>::from(ctx.output_size);
+                                    let _ = render_atlas_icon_with_alpha(
+                                        frame,
+                                        &atlas.texture,
+                                        *entry,
+                                        icon_rect.loc.x,
+                                        icon_rect.loc.y,
+                                        icon_rect.size.w,
+                                        icon_rect.size.h,
+                                        output_size,
+                                        style.alpha,
+                                    );
+                                }
                             }
                         }
                     }

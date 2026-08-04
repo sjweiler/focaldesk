@@ -13,6 +13,14 @@ pub struct McpServer<B> {
     backend: B,
     catalog: Vec<ToolDefinition>,
     capabilities: HashSet<String>,
+    lifecycle: Lifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lifecycle {
+    Uninitialized,
+    Initializing,
+    Ready,
 }
 
 impl<B: Backend> McpServer<B> {
@@ -21,6 +29,7 @@ impl<B: Backend> McpServer<B> {
             backend,
             catalog: tool_catalog(),
             capabilities: capabilities_from_env(),
+            lifecycle: Lifecycle::Uninitialized,
         }
     }
 
@@ -30,26 +39,50 @@ impl<B: Backend> McpServer<B> {
             backend,
             catalog: tool_catalog(),
             capabilities: capabilities.iter().map(|value| value.to_string()).collect(),
+            lifecycle: Lifecycle::Uninitialized,
         }
     }
 
-    pub fn handle(&self, request: Value) -> Option<Value> {
-        let id = request.get("id").cloned();
-        let method = request.get("method").and_then(Value::as_str)?;
-        if id.is_none() {
-            return None;
+    pub fn handle(&mut self, request: Value) -> Option<Value> {
+        let Some(object) = request.as_object() else {
+            return Some(error_response(
+                Value::Null,
+                -32600,
+                "invalid JSON-RPC request",
+            ));
+        };
+        let response_id = valid_request_id(object.get("id"));
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Some(error_response(
+                response_id.unwrap_or(Value::Null),
+                -32600,
+                "jsonrpc must be `2.0`",
+            ));
         }
-        let id = id.unwrap_or(Value::Null);
+        let Some(method) = object.get("method").and_then(Value::as_str) else {
+            return Some(error_response(
+                response_id.unwrap_or(Value::Null),
+                -32600,
+                "method must be a string",
+            ));
+        };
+        if object.contains_key("id") && response_id.is_none() {
+            return Some(error_response(
+                Value::Null,
+                -32600,
+                "request id must be a string or integer",
+            ));
+        }
+        let Some(id) = response_id else {
+            self.handle_notification(method);
+            return None;
+        };
+
+        if method != "initialize" && method != "ping" && self.lifecycle != Lifecycle::Ready {
+            return Some(error_response(id, -32002, "server is not initialized"));
+        }
         let result = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": negotiated_protocol_version(&request),
-                "capabilities": {"tools": {"listChanged": false}},
-                "serverInfo": {
-                    "name": "focaldesk-mcp",
-                    "version": env!("CARGO_PKG_VERSION")
-                },
-                "instructions": "FocalDesk typed IPC remains authoritative. Mutating tools require an explicit session capability; sensitive actions are intentionally absent."
-            })),
+            "initialize" => self.initialize(&request),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(self.list_tools()),
             "tools/call" => self.call_tool(request.get("params").unwrap_or(&Value::Null)),
@@ -59,6 +92,54 @@ impl<B: Backend> McpServer<B> {
             Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
             Err((code, message)) => error_response(id, code, &message),
         })
+    }
+
+    fn initialize(&mut self, request: &Value) -> Result<Value, (i64, String)> {
+        if self.lifecycle != Lifecycle::Uninitialized {
+            return Err((-32600, "server is already initialized".to_string()));
+        }
+        let params = request
+            .get("params")
+            .and_then(Value::as_object)
+            .ok_or_else(|| (-32602, "initialize params are required".to_string()))?;
+        for (field, expected) in [
+            ("protocolVersion", "a string"),
+            ("capabilities", "an object"),
+            ("clientInfo", "an object"),
+        ] {
+            let valid = match field {
+                "protocolVersion" => params.get(field).is_some_and(Value::is_string),
+                _ => params.get(field).is_some_and(Value::is_object),
+            };
+            if !valid {
+                return Err((-32602, format!("{field} must be {expected}")));
+            }
+        }
+        let client_info = params["clientInfo"].as_object().expect("validated above");
+        if !client_info.get("name").is_some_and(Value::is_string)
+            || !client_info.get("version").is_some_and(Value::is_string)
+        {
+            return Err((
+                -32602,
+                "clientInfo.name and clientInfo.version must be strings".to_string(),
+            ));
+        }
+        self.lifecycle = Lifecycle::Initializing;
+        Ok(json!({
+            "protocolVersion": negotiated_protocol_version(request),
+            "capabilities": {"tools": {"listChanged": false}},
+            "serverInfo": {
+                "name": "focaldesk-mcp",
+                "version": env!("CARGO_PKG_VERSION")
+            },
+            "instructions": "FocalDesk typed IPC remains authoritative. Mutating tools require an explicit session capability; sensitive actions are intentionally absent."
+        }))
+    }
+
+    fn handle_notification(&mut self, method: &str) {
+        if method == "notifications/initialized" && self.lifecycle == Lifecycle::Initializing {
+            self.lifecycle = Lifecycle::Ready;
+        }
     }
 
     fn list_tools(&self) -> Value {
@@ -164,14 +245,28 @@ impl<B: Backend> McpServer<B> {
             Ok(value) => {
                 let text = serde_json::to_string_pretty(&value)
                     .unwrap_or_else(|_| "{\"error\":\"serialization failed\"}".to_string());
+                let structured_content = match value {
+                    Value::Object(_) => value,
+                    other => json!({"value": other}),
+                };
                 Ok(json!({
                     "content": [{"type": "text", "text": text}],
-                    "structuredContent": value,
+                    "structuredContent": structured_content,
                     "isError": false
                 }))
             }
             Err(message) => Ok(tool_error(message)),
         }
+    }
+}
+
+fn valid_request_id(id: Option<&Value>) -> Option<Value> {
+    match id {
+        Some(Value::String(value)) => Some(Value::String(value.clone())),
+        Some(Value::Number(value)) if value.is_i64() || value.is_u64() => {
+            Some(Value::Number(value.clone()))
+        }
+        _ => None,
     }
 }
 
@@ -189,10 +284,10 @@ fn validate_arguments(tool: &ToolDefinition, arguments: &Value) -> Result<(), St
     let properties = tool.input_schema["properties"]
         .as_object()
         .ok_or_else(|| "tool schema is invalid".to_string())?;
-    if tool.input_schema["additionalProperties"] == Value::Bool(false) {
-        if let Some(unknown) = object.keys().find(|key| !properties.contains_key(*key)) {
-            return Err(format!("unknown argument: {unknown}"));
-        }
+    if tool.input_schema["additionalProperties"] == Value::Bool(false)
+        && let Some(unknown) = object.keys().find(|key| !properties.contains_key(*key))
+    {
+        return Err(format!("unknown argument: {unknown}"));
     }
     if let Some(required) = tool.input_schema["required"].as_array() {
         for key in required.iter().filter_map(Value::as_str) {
@@ -246,10 +341,10 @@ fn validate_arguments(tool: &ToolDefinition, arguments: &Value) -> Result<(), St
             }
             _ => {}
         }
-        if let Some(allowed) = schema["enum"].as_array() {
-            if !allowed.contains(value) {
-                return Err(format!("{key} is not an allowed value"));
-            }
+        if let Some(allowed) = schema["enum"].as_array()
+            && !allowed.contains(value)
+        {
+            return Err(format!("{key} is not an allowed value"));
         }
     }
     Ok(())
@@ -311,7 +406,7 @@ fn error_response(id: Value, code: i64, message: &str) -> Value {
 pub struct StdioTransport;
 
 impl StdioTransport {
-    pub fn run<B: Backend>(server: McpServer<B>) -> Result<(), String> {
+    pub fn run<B: Backend>(mut server: McpServer<B>) -> Result<(), String> {
         let stdin = std::io::stdin();
         let mut input = stdin.lock();
         let stdout = std::io::stdout();
@@ -375,16 +470,43 @@ mod tests {
         })
     }
 
+    fn initialize() -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1.0"}
+            }
+        })
+    }
+
+    fn ready_server(capabilities: &[&str]) -> McpServer<MockBackend> {
+        let mut server = McpServer::with_capabilities(MockBackend::default(), capabilities);
+        assert!(server.handle(initialize()).unwrap().get("result").is_some());
+        assert!(
+            server
+                .handle(json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized"
+                }))
+                .is_none()
+        );
+        server
+    }
+
     #[test]
     fn read_tools_do_not_need_a_capability() {
-        let server = McpServer::with_capabilities(MockBackend::default(), &[]);
+        let mut server = ready_server(&[]);
         let response = server.handle(tool_call("list_outputs", json!({}))).unwrap();
         assert_eq!(response["result"]["isError"], false);
     }
 
     #[test]
     fn mutations_are_denied_without_exact_capability() {
-        let server = McpServer::with_capabilities(MockBackend::default(), &[]);
+        let mut server = ready_server(&[]);
         let response = server
             .handle(tool_call(
                 "focus_window",
@@ -402,7 +524,7 @@ mod tests {
 
     #[test]
     fn confirmation_is_enforced_after_capability_authorization() {
-        let server = McpServer::with_capabilities(MockBackend::default(), &["focus_window"]);
+        let mut server = ready_server(&["focus_window"]);
         let response = server
             .handle(tool_call(
                 "focus_window",
@@ -420,7 +542,7 @@ mod tests {
 
     #[test]
     fn declared_schema_is_enforced_before_dispatch() {
-        let server = McpServer::with_capabilities(MockBackend::default(), &["show_notification"]);
+        let mut server = ready_server(&["show_notification"]);
         let response = server
             .handle(tool_call(
                 "show_notification",
@@ -434,5 +556,44 @@ mod tests {
                 .unwrap()
                 .contains("maximum")
         );
+    }
+
+    #[test]
+    fn tools_are_unavailable_until_initialized_notification() {
+        let mut server = McpServer::with_capabilities(MockBackend::default(), &[]);
+        let before_initialize = server.handle(tool_call("list_outputs", json!({}))).unwrap();
+        assert_eq!(before_initialize["error"]["code"], -32002);
+
+        server.handle(initialize()).unwrap();
+        let before_notification = server.handle(tool_call("list_outputs", json!({}))).unwrap();
+        assert_eq!(before_notification["error"]["code"], -32002);
+
+        server.handle(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }));
+        let ready = server.handle(tool_call("list_outputs", json!({}))).unwrap();
+        assert_eq!(ready["result"]["isError"], false);
+    }
+
+    #[test]
+    fn malformed_json_rpc_requests_are_rejected() {
+        let mut server = McpServer::with_capabilities(MockBackend::default(), &[]);
+        for request in [
+            json!([]),
+            json!({"jsonrpc": "1.0", "id": 1, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": null, "method": "ping"}),
+            json!({"jsonrpc": "2.0", "id": 1}),
+        ] {
+            let response = server.handle(request).unwrap();
+            assert_eq!(response["error"]["code"], -32600);
+        }
+    }
+
+    #[test]
+    fn structured_content_is_always_an_object() {
+        let mut server = ready_server(&[]);
+        let response = server.handle(tool_call("list_outputs", json!({}))).unwrap();
+        assert!(response["result"]["structuredContent"].is_object());
     }
 }

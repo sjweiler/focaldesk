@@ -8,6 +8,9 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 pub trait Backend {
     fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String>;
@@ -38,7 +41,7 @@ impl Backend for IpcBackend {
     fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
         match tool {
             "get_session_status" => to_value(self.snapshot()?.session),
-            "list_outputs" => to_value(self.snapshot()?.outputs),
+            "list_outputs" => Ok(json!({"outputs": self.snapshot()?.outputs})),
             "get_output_details" => {
                 let snapshot = self.snapshot()?;
                 let output_id = arguments.get("output_id").and_then(Value::as_u64);
@@ -52,8 +55,8 @@ impl Backend for IpcBackend {
                 });
                 to_value(output.ok_or_else(|| "output not found".to_string())?)
             }
-            "list_windows" => to_value(self.snapshot()?.windows),
-            "list_workspaces" => to_value(self.snapshot()?.workspaces),
+            "list_windows" => Ok(json!({"windows": self.snapshot()?.windows})),
+            "list_workspaces" => Ok(json!({"workspaces": self.snapshot()?.workspaces})),
             "get_rendering_status" => to_value(self.snapshot()?.rendering),
             "get_service_health" => service_health(),
             "search_recent_logs" => search_recent_logs(arguments),
@@ -141,8 +144,8 @@ fn service_health() -> Result<Value, String> {
         ("ai", "focaldesk-ai.sock"),
         ("launcher", "focal-launchd.sock"),
     ];
-    Ok(Value::Array(
-        services
+    Ok(json!({
+        "services": services
             .into_iter()
             .map(|(name, socket)| {
                 let state = if is_socket(&root.join(socket)) {
@@ -152,8 +155,8 @@ fn service_health() -> Result<Value, String> {
                 };
                 json!({"service": name, "state": state})
             })
-            .collect(),
-    ))
+            .collect::<Vec<_>>()
+    }))
 }
 
 #[cfg(unix)]
@@ -195,30 +198,77 @@ fn search_recent_logs(arguments: &Value) -> Result<Value, String> {
 
 fn redact_log_line(line: &str) -> String {
     let bounded: String = line.chars().take(4_096).collect();
-    let mut words = Vec::new();
-    for word in bounded.split_whitespace() {
-        let lower = word.to_ascii_lowercase();
-        if [
-            "password=",
-            "passwd=",
-            "secret=",
-            "token=",
-            "authorization=",
-        ]
-        .iter()
-        .any(|marker| lower.starts_with(marker))
-            || lower.starts_with("bearer:")
-        {
-            let key = word
-                .split_once('=')
-                .map(|(key, _)| key)
-                .unwrap_or("credential");
-            words.push(format!("{key}=[REDACTED]"));
-        } else {
-            words.push(word.to_string());
-        }
+    if let Ok(mut json) = serde_json::from_str::<Value>(&bounded) {
+        redact_json(&mut json);
+        return serde_json::to_string(&json).unwrap_or_else(|_| "[REDACTED]".to_string());
     }
-    words.join(" ")
+
+    static BEARER: OnceLock<Regex> = OnceLock::new();
+    static QUOTED_ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+    let bearer = BEARER.get_or_init(|| {
+        Regex::new(r"(?i)\bbearer[\s:]+[^\s,;}\]]+").expect("valid bearer redaction regex")
+    });
+    let assignment = ASSIGNMENT.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(password|passwd|secret|token|authorization|api[_-]?key|access[_-]?key|private[_-]?key|credential)\b[\"']?\s*[:=]\s*[\"']?[^\s,;}\]]+"#,
+        )
+        .expect("valid credential redaction regex")
+    });
+    let quoted_assignment = QUOTED_ASSIGNMENT.get_or_init(|| {
+        Regex::new(
+            r#"(?i)\b(password|passwd|secret|token|authorization|api[_-]?key|access[_-]?key|private[_-]?key|credential)\b[\"']?\s*[:=]\s*(\"[^\"]*\"|'[^']*')"#,
+        )
+        .expect("valid quoted credential redaction regex")
+    });
+    let redacted = bearer.replace_all(&bounded, "Bearer [REDACTED]");
+    let redacted = quoted_assignment.replace_all(&redacted, "$1=[REDACTED]");
+    assignment
+        .replace_all(&redacted, "$1=[REDACTED]")
+        .into_owned()
+}
+
+fn redact_json(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if is_sensitive_key(key) {
+                    *value = Value::String("[REDACTED]".to_string());
+                } else {
+                    redact_json(value);
+                }
+            }
+        }
+        Value::Array(values) => values.iter_mut().for_each(redact_json),
+        _ => {}
+    }
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "authorization",
+        "api_key",
+        "access_key",
+        "private_key",
+        "credential",
+    ]
+    .iter()
+    .any(|sensitive| {
+        let sensitive: String = sensitive
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .collect();
+        normalized == sensitive || normalized.ends_with(&sensitive)
+    })
 }
 
 #[cfg(test)]
@@ -232,5 +282,23 @@ mod tests {
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("hunter2"));
         assert!(redacted.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn log_search_redacts_nested_json_credentials() {
+        let line = r#"{"request":{"api_key":"abc","safe":"visible"},"accessToken":"def"}"#;
+        let redacted = redact_log_line(line);
+        assert!(!redacted.contains("abc"));
+        assert!(!redacted.contains("def"));
+        assert!(redacted.contains("visible"));
+    }
+
+    #[test]
+    fn log_search_redacts_colon_and_bearer_credentials() {
+        let line = "authorization: Bearer abc123 api-key='def 456' status=failed";
+        let redacted = redact_log_line(line);
+        assert!(!redacted.contains("abc123"));
+        assert!(!redacted.contains("def 456"));
+        assert!(redacted.contains("status=failed"));
     }
 }

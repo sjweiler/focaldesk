@@ -1927,6 +1927,7 @@ version = "0.1.0"
 dependencies = [
  "focaldesk-ipc",
  "focaldesk-logging",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

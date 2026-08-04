@@ -81,6 +81,15 @@ Build the server:
 cargo build -p focaldesk-mcp
 ```
 
+For a user-local release installation:
+
+```sh
+just install-mcp
+```
+
+This installs `focaldesk-mcp` in `~/.local/bin`. MCP clients launch the stdio
+server on demand, so no systemd unit is needed.
+
 A typical stdio client entry is:
 
 ```json
@@ -98,6 +107,13 @@ A typical stdio client entry is:
 
 The server implements MCP initialization, ping, tool listing, and tool calls
 using newline-delimited JSON-RPC over stdio. Messages over 1 MiB are rejected.
+After the initialize response, clients must send `notifications/initialized`
+before listing or calling tools. Malformed JSON-RPC requests receive standard
+parse or invalid-request errors.
+
+Tool results provide both text content and object-valued `structuredContent`.
+Collection tools use named fields such as `outputs`, `windows`, `workspaces`,
+and `services` instead of returning a bare array.
 
 ## Secrets boundary
 
