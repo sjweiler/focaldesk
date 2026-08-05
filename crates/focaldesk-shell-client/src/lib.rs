@@ -330,6 +330,14 @@ impl ShellClient {
                 .collect::<Vec<_>>()
                 .join(" ");
             draw_text(canvas, width, 16, 18, &workspace_text);
+            if let Some(title) = self.shell.focused_window_title.as_deref() {
+                let title = title
+                    .chars()
+                    .take(18)
+                    .collect::<String>()
+                    .to_ascii_uppercase();
+                draw_text(canvas, width, 72, 18, &title);
+            }
             draw_text(
                 canvas,
                 width,
@@ -340,6 +348,18 @@ impl ShellClient {
             let mut x = width.saturating_sub(120);
             if self.shell.do_not_disturb {
                 draw_text(canvas, width, x, 18, "DND");
+                x += 24;
+            }
+            if self.shell.notification_unread_count > 0 {
+                draw_text(canvas, width, x, 18, "N");
+                x += 12;
+                draw_text(
+                    canvas,
+                    width,
+                    x,
+                    18,
+                    &self.shell.notification_unread_count.min(99).to_string(),
+                );
                 x += 24;
             }
             if self.shell.network_carrier {
@@ -386,6 +406,42 @@ fn draw_text(canvas: &mut [u8], width: u32, x: u32, y: u32, text: &str) {
             ],
             'T' => [
                 0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            ],
+            'A' => [
+                0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'B' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+            ],
+            'C' => [
+                0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+            ],
+            'F' => [
+                0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'G' => [
+                0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+            ],
+            'H' => [
+                0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+            ],
+            'I' => [
+                0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+            ],
+            'L' => [
+                0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+            ],
+            'O' => [
+                0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'U' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+            ],
+            'V' => [
+                0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+            ],
+            'Y' => [
+                0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
             ],
             'P' => [
                 0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
