@@ -1896,6 +1896,24 @@ impl DesktopState {
                 focused_window_id: self.focused_window.map(|id| id.0),
                 active_workspace_id: self.focused_workspace().0,
             },
+            shell: focaldesk_ipc::ShellSnapshot {
+                do_not_disturb: self.do_not_disturb,
+                notification_unread_count: self.notification_unread_count,
+                network_carrier: self.network_state.has_carrier,
+                wifi_signal_percent: self
+                    .network_state
+                    .wifi
+                    .as_ref()
+                    .and_then(|wifi| wifi.signal_percent),
+                battery_percent: self
+                    .last_power_snapshot
+                    .as_ref()
+                    .and_then(PowerSnapshot::lowest_battery_percentage),
+                focused_window_title: self.focused_window.and_then(|id| {
+                    self.window(id)
+                        .map(|window| bounded_metadata(&window.title()))
+                }),
+            },
             outputs,
             windows,
             workspaces,

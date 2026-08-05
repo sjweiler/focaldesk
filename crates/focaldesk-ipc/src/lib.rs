@@ -144,10 +144,23 @@ pub struct DisplayRuntimeOutputStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DesktopSnapshot {
     pub session: SessionStatus,
+    #[serde(default)]
+    pub shell: ShellSnapshot,
     pub outputs: Vec<OutputSnapshot>,
     pub windows: Vec<WindowSnapshot>,
     pub workspaces: Vec<WorkspaceSnapshot>,
     pub rendering: RenderingStatus,
+}
+
+/// Small, secret-free state projection intended for trusted shell clients.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ShellSnapshot {
+    pub do_not_disturb: bool,
+    pub notification_unread_count: usize,
+    pub network_carrier: bool,
+    pub wifi_signal_percent: Option<u8>,
+    pub battery_percent: Option<u8>,
+    pub focused_window_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

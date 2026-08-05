@@ -2355,6 +2355,7 @@ name = "focaldesk-shell-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "focaldesk-ipc",
  "smithay-client-toolkit 0.19.2",
  "wayland-client",
 ]

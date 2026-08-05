@@ -22,3 +22,9 @@ executable or a launch token.
 The next migration step is moving the existing `UiTree` action model and
 theme-derived drawing into the clients, then disabling the corresponding legacy
 compositor chrome only after the client has committed its first frame.
+
+The panel client now proves the first part of that boundary: it polls the
+existing desktop snapshot IPC, paints a small client-owned workspace indicator,
+and sends pointer activation through the existing typed desktop-action IPC.
+Those actions are intentionally conservative until the complete topbar model
+has moved across.
