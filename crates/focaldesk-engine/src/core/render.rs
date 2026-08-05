@@ -246,6 +246,7 @@ pub struct RenderInputs<'a> {
     pub fonts: &'a FontSystem,
     pub theme: &'a FlowTheme,
     pub notifications: &'a [NotificationSnapshot],
+    pub notification_unread_count: usize,
     pub lock_screen: &'a LockScreenSnapshot,
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
@@ -1944,6 +1945,7 @@ impl RenderState {
                 inputs.current_workspace,
                 inputs.fonts,
                 inputs.flow_field_pulse,
+                inputs.notification_unread_count,
                 theme,
             );
         }
@@ -3718,6 +3720,7 @@ impl RenderState {
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
         flow_field_pulse: Option<FlowFieldPulseFrame>,
+        notification_unread_count: usize,
         theme: &FlowTheme,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
@@ -3898,6 +3901,43 @@ impl RenderState {
                                     ctx.output_scale,
                                     style,
                                     &tinted_icon,
+                                );
+                            }
+                            if el.id == focaldesk_ui::ui_builder::TOPBAR_NOTIFICATIONS_ID
+                                && notification_unread_count > 0
+                            {
+                                let count = notification_unread_count.min(99).to_string();
+                                let badge = Rectangle::from_loc_and_size(
+                                    (
+                                        base_rect_logical.loc.x + base_rect_logical.size.w - 16,
+                                        base_rect_logical.loc.y + 4,
+                                    ),
+                                    (18, 14),
+                                );
+                                let _ = self.draw_rounded_rect(
+                                    frame,
+                                    badge,
+                                    ctx.output_scale,
+                                    6.0,
+                                    active_theme.chrome.accent_color,
+                                );
+                                let badge_style = style_for(
+                                    FontRole::Meta,
+                                    11,
+                                    active_theme
+                                        .id
+                                        .builtin_id()
+                                        .unwrap_or(BuiltInThemeId::Eagle),
+                                );
+                                let _ = self.draw_text_cached(
+                                    frame,
+                                    fonts,
+                                    &count,
+                                    badge.loc.x + 5,
+                                    badge.loc.y + 11,
+                                    badge_style,
+                                    active_theme.text.title,
+                                    ctx.output_scale,
                                 );
                             }
                         }

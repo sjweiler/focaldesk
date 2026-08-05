@@ -1,6 +1,7 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::{SettingKey, SystemCommand, UiAction};
 use chrono::{Datelike, Local, NaiveDate};
+use focaldesk_ipc::{NotificationIpcRequest, NotificationIpcResponse, send_notification_request};
 pub mod settings;
 
 pub use settings::SettingsPanel;
@@ -44,6 +45,108 @@ pub struct NetworkPanel {
 pub struct BluetoothPanel {
     pub open: bool,
     bluetooth_enabled: bool,
+}
+
+pub struct NotificationHistoryPanel {
+    pub open: bool,
+    entries: Vec<focaldesk_notifications::NotificationSnapshot>,
+    do_not_disturb: bool,
+    marked_read: bool,
+    last_poll: std::time::Instant,
+}
+
+impl Default for NotificationHistoryPanel {
+    fn default() -> Self {
+        Self {
+            open: false,
+            entries: Vec::new(),
+            do_not_disturb: false,
+            marked_read: false,
+            last_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
+        }
+    }
+}
+
+impl EguiPanelView for NotificationHistoryPanel {
+    fn title(&self) -> &'static str {
+        "Notifications"
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        _actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            self.marked_read = false;
+            return;
+        }
+        if !self.marked_read {
+            let _ = send_notification_request(&NotificationIpcRequest::MarkAllRead);
+            self.marked_read = true;
+        }
+        if frame_ctx.now.saturating_duration_since(self.last_poll)
+            >= std::time::Duration::from_millis(500)
+        {
+            self.last_poll = frame_ctx.now;
+            if let Ok(NotificationIpcResponse::History { notifications }) =
+                send_notification_request(&NotificationIpcRequest::GetHistory)
+            {
+                self.entries = notifications;
+            }
+            if let Ok(NotificationIpcResponse::State { do_not_disturb }) =
+                send_notification_request(&NotificationIpcRequest::GetState)
+            {
+                self.do_not_disturb = do_not_disturb;
+            }
+        }
+        let mut open = self.open;
+        egui::Window::new(self.title())
+            .default_pos(egui::pos2(
+                (frame_ctx.work.loc.x + frame_ctx.work.size.w - 360) as f32,
+                (frame_ctx.work.loc.y + 24) as f32,
+            ))
+            .default_width(340.0)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Notifications");
+                    let mut dnd = self.do_not_disturb;
+                    if ui.checkbox(&mut dnd, "DND").changed() {
+                        let _ =
+                            send_notification_request(&NotificationIpcRequest::SetDoNotDisturb {
+                                enabled: dnd,
+                            });
+                        self.do_not_disturb = dnd;
+                    }
+                    if ui.button("Clear all").clicked() {
+                        let _ = send_notification_request(&NotificationIpcRequest::ClearHistory);
+                        self.entries.clear();
+                    }
+                });
+                ui.separator();
+                if self.entries.is_empty() {
+                    ui.label("No notifications");
+                } else {
+                    for entry in &self.entries {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.strong(&entry.title);
+                                if ui.small_button("Dismiss").clicked() {
+                                    let _ = send_notification_request(
+                                        &NotificationIpcRequest::Dismiss { id: entry.id },
+                                    );
+                                }
+                            });
+                            ui.label(&entry.body);
+                        });
+                    }
+                }
+            });
+        self.open = open;
+    }
 }
 
 #[derive(Default)]

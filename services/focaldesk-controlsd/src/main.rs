@@ -1,5 +1,8 @@
 use anyhow::{Result, anyhow};
-use focaldesk_ipc::{ControlIpcRequest, ControlIpcResponse, ControlSetting, serve_control_ipc};
+use focaldesk_ipc::{
+    ControlIpcRequest, ControlIpcResponse, ControlSetting, NotificationIpcRequest,
+    NotificationIpcResponse, send_notification_request, serve_control_ipc,
+};
 use focaldesk_logging::flog_info;
 use std::process::Command;
 use std::sync::Arc;
@@ -36,7 +39,12 @@ fn set_system_setting(setting: ControlSetting, enabled: bool) -> Result<(), Stri
         }
         ControlSetting::Bluetooth => focaldesk_bluetooth::set_power(enabled).map(|_| ()),
         ControlSetting::DoNotDisturb => {
-            Err("do-not-disturb control is not implemented".to_string())
+            match send_notification_request(&NotificationIpcRequest::SetDoNotDisturb { enabled }) {
+                Ok(NotificationIpcResponse::Ok) => Ok(()),
+                Ok(NotificationIpcResponse::Error { message }) => Err(message),
+                Ok(other) => Err(format!("unexpected notification response: {other:?}")),
+                Err(err) => Err(err),
+            }
         }
     }
 }

@@ -27,6 +27,8 @@ pub const TOPBAR_AUDIO_ID: u32 = 102;
 pub const TOPBAR_DISPLAY_ID: u32 = 103;
 pub const TOPBAR_POWER_ID: u32 = 104;
 pub const TOPBAR_CAMERA_ID: u32 = 105;
+pub const TOPBAR_DND_ID: u32 = 106;
+pub const TOPBAR_NOTIFICATIONS_ID: u32 = 107;
 
 // Workspace buttons get dynamically assigned IDs instead of fixed per-slot
 // consts, since the number of individually displayed workspace buttons is
@@ -79,6 +81,9 @@ pub struct UiBuildOptions {
     pub voice_capture_status: VoiceCaptureStatus,
     pub camera_detected: bool,
     pub camera_active: bool,
+    pub do_not_disturb: bool,
+    pub notification_unread: bool,
+    pub notification_unread_count: usize,
     pub network_state: NetworkState,
     pub workspace_count: usize,
     /// Max number of workspace buttons shown individually before they
@@ -105,6 +110,9 @@ impl Default for UiBuildOptions {
             voice_capture_status: VoiceCaptureStatus::Unavailable,
             camera_detected: false,
             camera_active: false,
+            do_not_disturb: false,
+            notification_unread: false,
+            notification_unread_count: 0,
             network_state: NetworkState::default(),
             workspace_count: 1,
             max_workspace_slots: 4,
@@ -272,6 +280,29 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
         )
         .selected(audio_selected)
         .active(audio_active),
+        ChromeItem::new(
+            TOPBAR_NOTIFICATIONS_ID,
+            IconId::Notifications,
+            match options.notification_unread_count {
+                count if count > 0 => format!("Notification center: {count} unread notifications"),
+                _ => "Notification center".to_string(),
+            },
+            UiAction::OpenPanel(PanelKind::NotificationHistory),
+        )
+        .selected(options.notification_unread)
+        .active(options.notification_unread),
+        ChromeItem::new(
+            TOPBAR_DND_ID,
+            IconId::SpeakerOff,
+            if options.do_not_disturb {
+                "Do Not Disturb: on"
+            } else {
+                "Do Not Disturb: off"
+            },
+            UiAction::Custom(TOPBAR_DND_ID),
+        )
+        .selected(options.do_not_disturb)
+        .active(options.do_not_disturb),
         ChromeItem::new(
             TOPBAR_CAMERA_ID,
             if options.camera_active {

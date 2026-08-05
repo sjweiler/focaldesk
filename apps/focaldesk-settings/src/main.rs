@@ -8,6 +8,7 @@ use focaldesk_ipc::{
     send_settings_request, watch_desktop_keys, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
     PowerIpcRequest, PowerIpcResponse,
 };
+use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_permissions::{
     PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
@@ -4256,6 +4257,49 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
     let history_status = dim_label("Recent history is local to this user");
+    let retention = add_dropdown_row(
+        &history_group,
+        "Notification history retention",
+        Some("Maximum saved notification entries"),
+        &["25 entries", "50 entries", "100 entries"],
+        match settings.borrow().privacy.notification_history_limit {
+            0..=25 => 0,
+            26..=50 => 1,
+            _ => 2,
+        },
+    );
+    {
+        let settings = settings.clone();
+        retention.connect_selected_notify(move |dropdown| {
+            let limit = match dropdown.selected() {
+                0 => 25,
+                1 => 50,
+                _ => 100,
+            };
+            settings.borrow_mut().privacy.notification_history_limit = limit;
+            persist_settings(&settings.borrow());
+            let _ = send_notification_request(&NotificationIpcRequest::SetHistoryLimit { limit });
+        });
+    }
+    let clear_on_logout = add_switch_row(
+        &history_group,
+        "Clear notifications on logout",
+        Some("Do not retain notification history between sessions"),
+        settings
+            .borrow()
+            .privacy
+            .clear_notification_history_on_logout,
+    );
+    {
+        let settings = settings.clone();
+        clear_on_logout.connect_active_notify(move |switch| {
+            settings
+                .borrow_mut()
+                .privacy
+                .clear_notification_history_on_logout = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     let clear_history = add_button_row(
         &history_group,
         "Clear recent history",

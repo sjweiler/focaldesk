@@ -59,6 +59,7 @@ pub enum IconId {
     VideoOff,
     Speaker,
     SpeakerOff,
+    Notifications,
     FocalDeskLabel,
     Power,
     HDR,
@@ -159,6 +160,7 @@ impl IconId {
             "camera_off" | "video_off" => Self::VideoOff,
             "speaker" => Self::Speaker,
             "speaker_off" => Self::SpeakerOff,
+            "notifications" | "notification" => Self::Notifications,
             "power" => Self::Power,
             "hdr" => Self::HDR,
             "browser" => Self::Browser,
@@ -679,6 +681,10 @@ where
         (
             IconId::SpeakerOff,
             include_bytes!("../../../assets/svg/volume-off.svg"),
+        ),
+        (
+            IconId::Notifications,
+            include_bytes!("../../../assets/svg/notifications.svg"),
         ),
         (
             IconId::Browser,

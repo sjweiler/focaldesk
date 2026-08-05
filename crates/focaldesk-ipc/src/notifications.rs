@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
+    path::PathBuf,
     sync::Arc,
     thread,
     time::{Duration, Instant},
@@ -28,6 +29,19 @@ pub enum NotificationIpcRequest {
         timeout_ms: Option<u64>,
     },
     GetVisible,
+    SetDoNotDisturb {
+        enabled: bool,
+    },
+    GetState,
+    GetHistory,
+    Dismiss {
+        id: u64,
+    },
+    ClearHistory,
+    SetHistoryLimit {
+        limit: u32,
+    },
+    MarkAllRead,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -38,6 +52,12 @@ pub enum NotificationIpcResponse {
         id: u64,
     },
     VisibleNotifications {
+        notifications: Vec<NotificationSnapshot>,
+    },
+    State {
+        do_not_disturb: bool,
+    },
+    History {
         notifications: Vec<NotificationSnapshot>,
     },
     Error {
@@ -66,7 +86,10 @@ pub fn send_notification_request(
     transport::decode_message(response.as_bytes())
 }
 
-pub fn serve_notification_ipc(manager: Arc<std::sync::Mutex<NotificationManager>>) {
+pub fn serve_notification_ipc(
+    manager: Arc<std::sync::Mutex<NotificationManager>>,
+    state_path: PathBuf,
+) {
     let path =
         notifications_socket_path().expect("could not resolve FocalDesk notifications IPC socket");
     let listener = transport::bind_user_socket(&path)
@@ -74,7 +97,7 @@ pub fn serve_notification_ipc(manager: Arc<std::sync::Mutex<NotificationManager>
 
     thread::spawn(move || {
         for mut stream in listener.incoming().flatten() {
-            handle_notification_client(&mut stream, &manager);
+            handle_notification_client(&mut stream, &manager, &state_path);
         }
     });
 }
@@ -82,6 +105,7 @@ pub fn serve_notification_ipc(manager: Arc<std::sync::Mutex<NotificationManager>
 fn handle_notification_client(
     stream: &mut UnixStream,
     manager: &Arc<std::sync::Mutex<NotificationManager>>,
+    state_path: &std::path::Path,
 ) {
     if transport::require_authorized_peer(stream, transport::NOTIFICATIONS_POLICY).is_err() {
         return;
@@ -112,7 +136,59 @@ fn handle_notification_client(
                 manager.visible_snapshots(now)
             };
 
+            let _ = manager.lock().unwrap().save_history(state_path);
             NotificationIpcResponse::VisibleNotifications { notifications }
+        }
+        Ok(NotificationIpcRequest::SetDoNotDisturb { enabled }) => {
+            let mut manager = manager.lock().unwrap();
+            manager.set_do_not_disturb(enabled);
+            NotificationIpcResponse::Ok
+        }
+        Ok(NotificationIpcRequest::GetState) => {
+            let manager = manager.lock().unwrap();
+            NotificationIpcResponse::State {
+                do_not_disturb: manager.do_not_disturb(),
+            }
+        }
+        Ok(NotificationIpcRequest::GetHistory) => {
+            let mut manager = manager.lock().unwrap();
+            let now = Instant::now();
+            let _ = manager.expire(now);
+            let response = NotificationIpcResponse::History {
+                notifications: manager.history_snapshots(now),
+            };
+            let _ = manager.save_history(state_path);
+            response
+        }
+        Ok(NotificationIpcRequest::Dismiss { id }) => {
+            let mut manager = manager.lock().unwrap();
+            let dismissed = manager.dismiss(id);
+            let _ = manager.save_history(state_path);
+            if dismissed {
+                NotificationIpcResponse::Ok
+            } else {
+                NotificationIpcResponse::Error {
+                    message: "notification not found".into(),
+                }
+            }
+        }
+        Ok(NotificationIpcRequest::ClearHistory) => {
+            let mut manager = manager.lock().unwrap();
+            manager.clear_history();
+            let _ = manager.save_history(state_path);
+            NotificationIpcResponse::Ok
+        }
+        Ok(NotificationIpcRequest::SetHistoryLimit { limit }) => {
+            let mut manager = manager.lock().unwrap();
+            manager.set_history_limit(limit as usize);
+            let _ = manager.save_history(state_path);
+            NotificationIpcResponse::Ok
+        }
+        Ok(NotificationIpcRequest::MarkAllRead) => {
+            let mut manager = manager.lock().unwrap();
+            manager.mark_all_read();
+            let _ = manager.save_history(state_path);
+            NotificationIpcResponse::Ok
         }
         Err(err) => NotificationIpcResponse::Error {
             message: err.to_string(),

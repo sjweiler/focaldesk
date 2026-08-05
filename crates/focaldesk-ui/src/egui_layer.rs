@@ -27,8 +27,8 @@ use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_panels::{
     AudioPanel, BluetoothPanel, CalendarPanel, ClipboardEntryView, ClipboardPanel, DebugPanel,
-    EguiPanelView, NetworkPanel, PowerPanel, SettingsPanel, WorkspaceDialog, WorkspaceEntryView,
-    WorkspacesPanel,
+    EguiPanelView, NetworkPanel, NotificationHistoryPanel, PowerPanel, SettingsPanel,
+    WorkspaceDialog, WorkspaceEntryView, WorkspacesPanel,
 };
 use crate::types::{PanelKind, UiAction};
 
@@ -46,6 +46,7 @@ pub struct EguiLayer {
     workspace_dialog: WorkspaceDialog,
     workspaces: WorkspacesPanel,
     clipboard: ClipboardPanel,
+    notifications: NotificationHistoryPanel,
 
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
@@ -280,6 +281,7 @@ impl Default for EguiLayer {
             workspace_dialog: WorkspaceDialog::default(),
             workspaces: WorkspacesPanel::default(),
             clipboard: ClipboardPanel::default(),
+            notifications: NotificationHistoryPanel::default(),
         }
     }
 }
@@ -391,6 +393,7 @@ impl EguiLayer {
             || self.workspace_dialog.open
             || self.workspaces.open
             || self.clipboard.open
+            || self.notifications.open
     }
 
     pub fn owner_output(&self) -> Option<OutputId> {
@@ -432,6 +435,10 @@ impl EguiLayer {
                 self.clipboard.open = !self.clipboard.open;
                 opened = self.clipboard.open;
             }
+            PanelKind::NotificationHistory => {
+                self.notifications.open = !self.notifications.open;
+                opened = self.notifications.open;
+            }
             PanelKind::Workspaces => {
                 self.workspaces.open = !self.workspaces.open;
                 opened = self.workspaces.open;
@@ -464,6 +471,7 @@ impl EguiLayer {
                 .show(ctx, frame_ctx, &mut self.actions);
             self.workspaces.show(ctx, frame_ctx, &mut self.actions);
             self.clipboard.show(ctx, frame_ctx, &mut self.actions);
+            self.notifications.show(ctx, frame_ctx, &mut self.actions);
         });
 
         if let Some(update) = output.platform_output.accesskit_update.take() {

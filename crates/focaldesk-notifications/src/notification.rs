@@ -10,6 +10,7 @@ pub struct Notification {
     pub body: String,
     pub created_at: Instant,
     pub timeout: Option<Duration>,
+    pub unread: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19,6 +20,7 @@ pub struct NotificationSnapshot {
     pub body: String,
     pub age: Duration,
     pub timeout: Option<Duration>,
+    pub unread: bool,
 }
 
 impl Notification {
@@ -34,6 +36,7 @@ impl Notification {
             body: self.body.clone(),
             age: now.duration_since(self.created_at),
             timeout: self.timeout,
+            unread: self.unread,
         }
     }
 }

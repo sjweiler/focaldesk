@@ -197,6 +197,10 @@ pub struct PrivacySettings {
     pub location_services: bool,
     #[serde(default = "default_hide_lock_screen_notifications")]
     pub hide_lock_screen_notifications: bool,
+    #[serde(default = "default_notification_history_limit")]
+    pub notification_history_limit: u32,
+    #[serde(default)]
+    pub clear_notification_history_on_logout: bool,
 }
 
 impl Default for PrivacySettings {
@@ -205,6 +209,8 @@ impl Default for PrivacySettings {
             recent_files: default_recent_files(),
             location_services: default_location_services(),
             hide_lock_screen_notifications: default_hide_lock_screen_notifications(),
+            notification_history_limit: default_notification_history_limit(),
+            clear_notification_history_on_logout: false,
         }
     }
 }
@@ -338,6 +344,10 @@ fn default_location_services() -> bool {
 
 fn default_hide_lock_screen_notifications() -> bool {
     true
+}
+
+fn default_notification_history_limit() -> u32 {
+    100
 }
 
 fn default_blank_screen_minutes() -> Option<u32> {

@@ -2175,6 +2175,7 @@ name = "focaldesk-notifications"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -2185,6 +2186,7 @@ dependencies = [
  "focaldesk-ipc",
  "focaldesk-logging",
  "focaldesk-notifications",
+ "focaldesk-settings-core",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2365,6 +2367,7 @@ dependencies = [
  "focaldesk-ipc",
  "focaldesk-logging",
  "focaldesk-network",
+ "focaldesk-notifications",
  "focaldesk-permissions",
  "focaldesk-power",
  "focaldesk-settings-core",

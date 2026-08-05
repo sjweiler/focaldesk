@@ -184,6 +184,19 @@ fn apply_setting_value(
                 .ok_or("hide_lock_screen_notifications must be bool")?;
         }
 
+        "privacy.notification_history_limit" => {
+            settings.privacy.notification_history_limit = value
+                .as_u64()
+                .ok_or("notification_history_limit must be integer")?
+                .clamp(25, 100) as u32;
+        }
+
+        "privacy.clear_notification_history_on_logout" => {
+            settings.privacy.clear_notification_history_on_logout = value
+                .as_bool()
+                .ok_or("clear_notification_history_on_logout must be bool")?;
+        }
+
         "power.blank_screen_minutes" => {
             settings.power.blank_screen_minutes = optional_minutes(value)?;
         }

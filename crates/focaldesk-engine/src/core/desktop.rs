@@ -160,7 +160,7 @@ use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::ui_builder::{
     sidebar_workspace_number, SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID,
     SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID,
-    SIDEBAR_TERMINAL_ID,
+    SIDEBAR_TERMINAL_ID, TOPBAR_DND_ID,
 };
 
 fn mic_command(command: &str) -> io::Result<String> {
@@ -927,6 +927,9 @@ pub struct DesktopState {
     //pub topbar: TopBarModel,
     //pub sidebar: SidebarModel,
     pub notification_snapshots: Vec<NotificationSnapshot>,
+    pub do_not_disturb: bool,
+    pub notification_unread: bool,
+    pub notification_unread_count: usize,
     pub lock_screen: LockScreenState,
     lock_auth_tx: mpsc::Sender<(u64, bool)>,
     lock_auth_rx: mpsc::Receiver<(u64, bool)>,
@@ -1311,6 +1314,19 @@ impl DesktopState {
         self.last_notification_poll_at = now;
 
         let snapshots = notification_service_snapshots().unwrap_or_default();
+        if let Some(enabled) = notification_service_do_not_disturb() {
+            if enabled != self.do_not_disturb {
+                self.do_not_disturb = enabled;
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+        }
+        if let Some(unread_count) = notification_service_unread_count() {
+            if unread_count != self.notification_unread_count {
+                self.notification_unread_count = unread_count;
+                self.notification_unread = unread_count > 0;
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+        }
         let had_visible = !self.notification_snapshots.is_empty();
         let has_visible = !snapshots.is_empty();
         self.notification_snapshots = snapshots;
@@ -2480,6 +2496,9 @@ impl DesktopState {
             voice_capture_status: self.voice_capture_status,
             camera_detected: self.camera_status.detected,
             camera_active: self.camera_status.active,
+            do_not_disturb: self.do_not_disturb,
+            notification_unread: self.notification_unread,
+            notification_unread_count: self.notification_unread_count,
             network_state: self.network_state.clone(),
             workspace_count: self.workspace_names.len(),
             max_workspace_slots: self.workspaces.max_workspace_slots as usize,
@@ -4112,6 +4131,12 @@ impl DesktopState {
                         launch_trace_id
                     );
                 }
+                TOPBAR_DND_ID => {
+                    let enabled = !self.do_not_disturb;
+                    self.set_system_setting(focaldesk_ui::types::SettingKey::DoNotDisturb, enabled);
+                    self.do_not_disturb = enabled;
+                    self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                }
                 SIDEBAR_ADD_WORKSPACE_ID => {
                     let name = format!("Workspace {}", self.workspace_names.len() + 1);
                     self.create_workspace_from_dialog(name);
@@ -4182,7 +4207,7 @@ impl DesktopState {
                 self.control_service_set_system_setting(ControlSetting::Bluetooth, enabled);
             }
             focaldesk_ui::types::SettingKey::DoNotDisturb => {
-                flog_warn!("do-not-disturb setting is not implemented");
+                self.control_service_set_system_setting(ControlSetting::DoNotDisturb, enabled);
             }
         }
     }
@@ -4236,6 +4261,9 @@ impl DesktopState {
                 );
             }
             focaldesk_ui::types::SystemCommand::Logout => {
+                if self.privacy.clear_notification_history_on_logout {
+                    let _ = send_notification_request(&NotificationIpcRequest::ClearHistory);
+                }
                 self.running = false;
             }
             focaldesk_ui::types::SystemCommand::Restart => {
@@ -5959,6 +5987,9 @@ impl DesktopState {
             dnd_cursor_phase: None,
 
             notification_snapshots: init.notification_snapshots,
+            do_not_disturb: false,
+            notification_unread: false,
+            notification_unread_count: 0,
             lock_screen: LockScreenState::new(),
             lock_auth_tx,
             lock_auth_rx,
@@ -9119,6 +9150,36 @@ fn notification_service_snapshots() -> Option<Vec<NotificationSnapshot>> {
             flog_warn!("notification snapshots unavailable: {err}");
             None
         }
+    }
+}
+
+fn notification_service_do_not_disturb() -> Option<bool> {
+    match send_notification_request(&NotificationIpcRequest::GetState) {
+        Ok(NotificationIpcResponse::State { do_not_disturb }) => Some(do_not_disturb),
+        Ok(NotificationIpcResponse::Error { message }) => {
+            flog_warn!("notification state request rejected: {message}");
+            None
+        }
+        Ok(other) => {
+            flog_warn!("unexpected notification state response: {other:?}");
+            None
+        }
+        Err(err) => {
+            flog_warn!("notification state unavailable: {err}");
+            None
+        }
+    }
+}
+
+fn notification_service_unread_count() -> Option<usize> {
+    match send_notification_request(&NotificationIpcRequest::GetHistory) {
+        Ok(NotificationIpcResponse::History { notifications }) => Some(
+            notifications
+                .iter()
+                .filter(|notification| notification.unread)
+                .count(),
+        ),
+        _ => None,
     }
 }
 
