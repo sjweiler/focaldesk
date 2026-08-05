@@ -88,7 +88,7 @@ pub fn run(role: ShellRole) -> Result<()> {
     };
     let layer_count = targets.len();
     let mut layers = Vec::with_capacity(targets.len());
-    for output in targets {
+    for output in targets.iter().cloned() {
         let surface = compositor.create_surface(&qh);
         let layer = layer_shell.create_layer_surface(
             &qh,
@@ -111,14 +111,16 @@ pub fn run(role: ShellRole) -> Result<()> {
 
     let mut client = ShellClient {
         registry_state: RegistryState::new(&globals),
+        compositor,
+        layer_shell,
         output_state,
         seat_state: SeatState::new(&globals, &qh),
         shm,
         pool,
         layers,
+        layer_outputs: targets,
         role,
-        width,
-        height,
+        sizes: vec![(width, height); layer_count],
         configured: vec![false; layer_count],
         closed: false,
         pointer: None,
@@ -137,14 +139,16 @@ pub fn run(role: ShellRole) -> Result<()> {
 
 struct ShellClient {
     registry_state: RegistryState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
     output_state: OutputState,
     seat_state: SeatState,
     shm: Shm,
     pool: SlotPool,
     layers: Vec<LayerSurface>,
+    layer_outputs: Vec<Option<wl_output::WlOutput>>,
     role: ShellRole,
-    width: u32,
-    height: u32,
+    sizes: Vec<(u32, u32)>,
     configured: Vec<bool>,
     closed: bool,
     pointer: Option<wl_pointer::WlPointer>,
@@ -208,9 +212,35 @@ impl OutputHandler for ShellClient {
     fn output_state(&mut self) -> &mut OutputState {
         &mut self.output_state
     }
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if self
+            .layer_outputs
+            .iter()
+            .flatten()
+            .any(|known| known == &output)
+        {
+            return;
+        }
+        self.add_output_surface(qh, output);
+    }
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        output: wl_output::WlOutput,
+    ) {
+        if let Some(index) = self
+            .layer_outputs
+            .iter()
+            .position(|known| known.as_ref() == Some(&output))
+        {
+            self.layers.remove(index);
+            self.layer_outputs.remove(index);
+            self.sizes.remove(index);
+            self.configured.remove(index);
+        }
+    }
 }
 
 impl SeatHandler for ShellClient {
@@ -281,11 +311,12 @@ impl LayerShellHandler for ShellClient {
         let Some(index) = self.layers.iter().position(|candidate| candidate == layer) else {
             return;
         };
+        let (width, height) = &mut self.sizes[index];
         if configure.new_size.0 > 0 {
-            self.width = self.width.max(configure.new_size.0);
+            *width = configure.new_size.0;
         }
         if configure.new_size.1 > 0 {
-            self.height = self.height.max(configure.new_size.1);
+            *height = configure.new_size.1;
         }
         if !self.configured[index] {
             self.configured[index] = true;
@@ -301,6 +332,31 @@ impl ShmHandler for ShellClient {
 }
 
 impl ShellClient {
+    fn add_output_surface(&mut self, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Top,
+            Some(self.role.namespace()),
+            Some(&output),
+        );
+        let (width, height) = self.role.preferred_size();
+        layer.set_anchor(self.role.anchor());
+        layer.set_exclusive_zone(if width == 0 {
+            height as i32
+        } else {
+            width as i32
+        });
+        layer.set_size(width, height);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.commit();
+        self.layers.push(layer);
+        self.layer_outputs.push(Some(output));
+        self.sizes.push((width, height));
+        self.configured.push(false);
+    }
+
     fn refresh_snapshot(&mut self) {
         if self.last_snapshot.elapsed() < Duration::from_millis(500) {
             return;
@@ -317,18 +373,22 @@ impl ShellClient {
     }
 
     fn activate_at(&self, x: i32) {
+        let width = self
+            .sizes
+            .iter()
+            .map(|(width, _)| *width)
+            .max()
+            .unwrap_or(0) as i32;
         let action = match self.role {
-            ShellRole::Panel if x >= self.width as i32 - 48 => DesktopAction::ToggleDoNotDisturb,
-            ShellRole::Panel if x >= self.width as i32 - 96 => {
-                DesktopAction::OpenNotificationsPanel
-            }
-            ShellRole::Panel if x >= self.width as i32 - 144 => DesktopAction::OpenSettingsPanel {
+            ShellRole::Panel if x >= width - 48 => DesktopAction::ToggleDoNotDisturb,
+            ShellRole::Panel if x >= width - 96 => DesktopAction::OpenNotificationsPanel,
+            ShellRole::Panel if x >= width - 144 => DesktopAction::OpenSettingsPanel {
                 panel: "power".into(),
             },
-            ShellRole::Panel if x >= self.width as i32 - 192 => DesktopAction::OpenSettingsPanel {
+            ShellRole::Panel if x >= width - 192 => DesktopAction::OpenSettingsPanel {
                 panel: "sound".into(),
             },
-            ShellRole::Panel if x >= self.width as i32 - 240 => DesktopAction::OpenSettingsPanel {
+            ShellRole::Panel if x >= width - 240 => DesktopAction::OpenSettingsPanel {
                 panel: "network".into(),
             },
             ShellRole::Panel => DesktopAction::FocusWorkspace {
@@ -345,8 +405,11 @@ impl ShellClient {
 
     fn draw(&mut self, index: usize, qh: &QueueHandle<Self>) {
         self.refresh_snapshot();
-        let width = self.width.max(1);
-        let height = self.height.max(1);
+        let Some(&(configured_width, configured_height)) = self.sizes.get(index) else {
+            return;
+        };
+        let width = configured_width.max(1);
+        let height = configured_height.max(1);
         let stride = width as i32 * 4;
         let (buffer, canvas) = self
             .pool

@@ -6,6 +6,9 @@ Wayland layer-shell clients:
 - `focal-panel` (`focal-panel` namespace): top-anchored, exclusive top zone.
 - `focal-dock` (`focal-dock` namespace): left-anchored, exclusive left zone.
 
+Each client now creates one layer surface per advertised output and adds/removes
+surfaces as outputs are hotplugged.
+
 The compositor still renders the legacy chrome until the clients provide the
 full action, accessibility, and theme surfaces. The clients in this first slice
 are therefore safe to run independently: they exercise configure, damage,
