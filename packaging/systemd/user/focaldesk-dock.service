@@ -1,0 +1,15 @@
+[Unit]
+Description=FocalDesk trusted dock
+PartOf=focaldesk-session.target
+After=focaldesk-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focal-dock
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=focaldesk-session.target

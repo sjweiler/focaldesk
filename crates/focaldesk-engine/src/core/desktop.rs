@@ -1791,6 +1791,22 @@ impl DesktopState {
                     Err(message) => IpcResponse::Error { message },
                 })
             }
+            IpcRequest::ShellReady {
+                namespace,
+                output_count,
+            } => {
+                if matches!(namespace.as_str(), "focal-panel" | "focal-dock") {
+                    flog_info!(
+                        "trusted shell ready namespace={} outputs={output_count}",
+                        namespace
+                    );
+                    Some(IpcResponse::Ok)
+                } else {
+                    Some(IpcResponse::Error {
+                        message: "unrecognized shell namespace".to_string(),
+                    })
+                }
+            }
             IpcRequest::SetDisplays { outputs } => match self.apply_display_configs(outputs) {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),

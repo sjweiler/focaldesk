@@ -68,6 +68,11 @@ pub enum IpcRequest {
     ExecuteDesktopAction {
         action: DesktopAction,
     },
+    /// Sent by a trusted shell client after its first configured frame.
+    ShellReady {
+        namespace: String,
+        output_count: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

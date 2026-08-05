@@ -128,6 +128,7 @@ pub fn run(role: ShellRole) -> Result<()> {
         workspace_count: 1,
         shell: focaldesk_ipc::ShellSnapshot::default(),
         last_snapshot: Instant::now() - Duration::from_secs(10),
+        ready_reported: false,
     };
     while !client.closed {
         event_queue
@@ -156,6 +157,7 @@ struct ShellClient {
     workspace_count: usize,
     shell: focaldesk_ipc::ShellSnapshot,
     last_snapshot: Instant,
+    ready_reported: bool,
 }
 
 impl CompositorHandler for ShellClient {
@@ -321,6 +323,13 @@ impl LayerShellHandler for ShellClient {
         if !self.configured[index] {
             self.configured[index] = true;
             self.draw(index, qh);
+            if !self.ready_reported {
+                self.ready_reported = true;
+                let _ = send_desktop_request(&IpcRequest::ShellReady {
+                    namespace: self.role.namespace().to_string(),
+                    output_count: self.layers.len(),
+                });
+            }
         }
     }
 }

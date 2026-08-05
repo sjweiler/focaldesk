@@ -89,7 +89,8 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             | IpcRequest::GetDisplayRuntimeStatus
             | IpcRequest::GetDesktopSnapshot
             | IpcRequest::Notify { .. }
-            | IpcRequest::ExecuteDesktopAction { .. },
+            | IpcRequest::ExecuteDesktopAction { .. }
+            | IpcRequest::ShellReady { .. },
         ) => IpcResponse::Error {
             message: "request is handled by focaldesk-desktop".to_string(),
         },
