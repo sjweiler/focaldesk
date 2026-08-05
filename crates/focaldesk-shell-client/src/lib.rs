@@ -78,31 +78,48 @@ pub fn run(role: ShellRole) -> Result<()> {
     let layer_shell = LayerShell::bind(&globals, &qh).context("wlr-layer-shell unavailable")?;
     let shm = Shm::bind(&globals, &qh).context("wl_shm unavailable")?;
     let pool = SlotPool::new(1024 * 1024, &shm).context("create shared-memory pool")?;
-    let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some(role.namespace()), None);
     let (width, height) = role.preferred_size();
-    layer.set_anchor(role.anchor());
-    layer.set_exclusive_zone(if width == 0 {
-        height as i32
+    let output_state = OutputState::new(&globals, &qh);
+    let outputs: Vec<_> = output_state.outputs().collect();
+    let targets: Vec<Option<wl_output::WlOutput>> = if outputs.is_empty() {
+        vec![None]
     } else {
-        width as i32
-    });
-    layer.set_size(width, height);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
-    layer.commit();
+        outputs.into_iter().map(Some).collect()
+    };
+    let layer_count = targets.len();
+    let mut layers = Vec::with_capacity(targets.len());
+    for output in targets {
+        let surface = compositor.create_surface(&qh);
+        let layer = layer_shell.create_layer_surface(
+            &qh,
+            surface,
+            Layer::Top,
+            Some(role.namespace()),
+            output.as_ref(),
+        );
+        layer.set_anchor(role.anchor());
+        layer.set_exclusive_zone(if width == 0 {
+            height as i32
+        } else {
+            width as i32
+        });
+        layer.set_size(width, height);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.commit();
+        layers.push(layer);
+    }
 
     let mut client = ShellClient {
         registry_state: RegistryState::new(&globals),
-        output_state: OutputState::new(&globals, &qh),
+        output_state,
         seat_state: SeatState::new(&globals, &qh),
         shm,
         pool,
-        layer,
+        layers,
         role,
         width,
         height,
-        configured: false,
+        configured: vec![false; layer_count],
         closed: false,
         pointer: None,
         active_workspace: 1,
@@ -124,11 +141,11 @@ struct ShellClient {
     seat_state: SeatState,
     shm: Shm,
     pool: SlotPool,
-    layer: LayerSurface,
+    layers: Vec<LayerSurface>,
     role: ShellRole,
     width: u32,
     height: u32,
-    configured: bool,
+    configured: Vec<bool>,
     closed: bool,
     pointer: Option<wl_pointer::WlPointer>,
     active_workspace: u32,
@@ -154,8 +171,20 @@ impl CompositorHandler for ShellClient {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, qh: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        self.draw(qh);
+    fn frame(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if let Some(index) = self
+            .layers
+            .iter()
+            .position(|layer| layer.wl_surface() == surface)
+        {
+            self.draw(index, qh);
+        }
     }
     fn surface_enter(
         &mut self,
@@ -223,7 +252,11 @@ impl PointerHandler for ShellClient {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if event.surface != *self.layer.wl_surface() {
+            if !self
+                .layers
+                .iter()
+                .any(|layer| event.surface == *layer.wl_surface())
+            {
                 continue;
             }
             if let PointerEventKind::Press { .. } = event.kind {
@@ -241,19 +274,22 @@ impl LayerShellHandler for ShellClient {
         &mut self,
         _: &Connection,
         qh: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
+        let Some(index) = self.layers.iter().position(|candidate| candidate == layer) else {
+            return;
+        };
         if configure.new_size.0 > 0 {
-            self.width = configure.new_size.0;
+            self.width = self.width.max(configure.new_size.0);
         }
         if configure.new_size.1 > 0 {
-            self.height = configure.new_size.1;
+            self.height = self.height.max(configure.new_size.1);
         }
-        if !self.configured {
-            self.configured = true;
-            self.draw(qh);
+        if !self.configured[index] {
+            self.configured[index] = true;
+            self.draw(index, qh);
         }
     }
 }
@@ -307,7 +343,7 @@ impl ShellClient {
         let _ = send_desktop_request(&IpcRequest::ExecuteDesktopAction { action });
     }
 
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
+    fn draw(&mut self, index: usize, qh: &QueueHandle<Self>) {
         self.refresh_snapshot();
         let width = self.width.max(1);
         let height = self.height.max(1);
@@ -372,16 +408,15 @@ impl ShellClient {
                 draw_text(canvas, width, x, 18, &percent.to_string());
             }
         }
-        self.layer
+        let layer = &self.layers[index];
+        layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32, height as i32);
-        self.layer
-            .wl_surface()
-            .frame(qh, self.layer.wl_surface().clone());
+        layer.wl_surface().frame(qh, layer.wl_surface().clone());
         buffer
-            .attach_to(self.layer.wl_surface())
+            .attach_to(layer.wl_surface())
             .expect("attach shell buffer");
-        self.layer.commit();
+        layer.commit();
     }
 }
 
