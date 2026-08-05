@@ -33,7 +33,7 @@ members = [
 
     # services
     "services/focaldesk-mcp",
-    "services/focaldesk-server", "services/focaldesk-powerd", "services/focaldesk-notificationsd", "services/focaldesk-dialogd", "services/focaldesk-controlsd", "services/focaldesk-polkitd", "crates/focaldesk-types", "crates/focaldesk-power", "crates/focaldesk-audio", "crates/focaldesk-bluetooth", "crates/focaldesk-notifications", "crates/focaldesk-resources", "crates/focaldesk-cursor", "crates/focaldesk-config", "crates/focaldesk-permissions", "apps/focaldesk-portal", "apps/focaldesk-settings", "crates/focaldesk-themes", "crates/focaldesk-sounds", "apps/focaldesk-ai-console", "crates/focal-launch-shared", "crates/focal-launchd", "apps/focaldmd", "apps/focaldm-greeter", "crates/focald-voice", "crates/focald-speech", "crates/focald-mic",
+    "services/focaldesk-server", "services/focaldesk-powerd", "services/focaldesk-notificationsd", "services/focaldesk-dialogd", "services/focaldesk-controlsd", "services/focaldesk-polkitd", "crates/focaldesk-types", "crates/focaldesk-power", "crates/focaldesk-audio", "crates/focaldesk-bluetooth", "crates/focaldesk-notifications", "crates/focaldesk-resources", "crates/focaldesk-cursor", "crates/focaldesk-config", "crates/focaldesk-permissions", "apps/focaldesk-portal", "apps/focaldesk-settings", "crates/focaldesk-themes", "crates/focaldesk-sounds", "apps/focaldesk-ai-console", "crates/focal-launch-shared", "crates/focal-launchd", "apps/focaldmd", "apps/focaldm-greeter", "crates/focald-voice", "crates/focald-speech", "crates/focald-mic", "crates/focaldesk-shell-client", "apps/focal-panel", "apps/focal-dock",
 ]
 resolver = "2"
 
@@ -72,6 +72,7 @@ chrono = "0.4"
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 glow = "0.16"
+smithay-client-toolkit = "0.19.2"
 chacha20poly1305 = "0.10"
 argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }

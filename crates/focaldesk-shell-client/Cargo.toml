@@ -1,0 +1,11 @@
+[package]
+name = "focaldesk-shell-client"
+version = "0.1.0"
+edition = "2021"
+description = "Shared layer-shell runtime for FocalDesk trusted shell clients"
+license = "MIT"
+
+[dependencies]
+anyhow.workspace = true
+smithay-client-toolkit.workspace = true
+wayland-client = "0.31"

@@ -2527,10 +2527,22 @@ impl DesktopState {
     pub(crate) fn chrome_layout_for_output(&self, output_id: OutputId) -> Option<ChromeLayout> {
         let output = self.outputs.get(&output_id)?;
         let options = self.ui_build_options_for_output(output_id)?;
+        let trusted_shell =
+            crate::core::wayland::trusted_shell::reservation_for_output(&output.handle);
+        let topbar_h = if trusted_shell.top > 0 {
+            trusted_shell.top
+        } else {
+            self.chrome.metrics.topbar_h
+        };
+        let sidebar_w = if trusted_shell.left > 0 {
+            trusted_shell.left
+        } else {
+            self.chrome.metrics.sidebar_w
+        };
         Some(build_chrome_layout_with_config(
             output.logical_size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
+            topbar_h,
+            sidebar_w,
             options.layout_config(),
         ))
     }

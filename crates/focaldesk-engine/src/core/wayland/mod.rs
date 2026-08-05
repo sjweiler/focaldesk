@@ -10,6 +10,7 @@ pub mod pointer_constraints;
 pub mod portal_capture;
 pub mod seat;
 pub mod shm;
+pub mod trusted_shell;
 pub mod xdg_activation;
 pub mod xdg_shell;
 #[cfg(feature = "xwayland")]
