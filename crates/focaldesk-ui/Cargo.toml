@@ -15,8 +15,9 @@ focaldesk-network = { path = "../focaldesk-network" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-ai = { path = "../focaldesk-ai" }
 image.workspace = true
-egui = "0.31"
+egui = { version = "0.31", features = ["accesskit"] }
 egui_glow = "0.31"
+accesskit_unix = "0.13.1"
 glow.workspace = true
 
 tiny-skia.workspace = true

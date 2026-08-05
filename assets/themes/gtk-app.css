@@ -1,0 +1,306 @@
+/* Shared GTK/libadwaita styling for first-party FocalDesk applications. */
+window.focaldesk-app {
+    background-color: @fd_app_bg;
+    color: @fd_app_text;
+}
+
+window.focaldesk-app headerbar,
+window.focaldesk-app .toolbar {
+    min-height: 44px;
+    background-image: linear-gradient(to bottom, @fd_app_surface_raised, @fd_app_bg);
+    color: @fd_app_text;
+    border-bottom: 1px solid @fd_app_border;
+    box-shadow: inset 0 1px rgba(148, 219, 255, 0.20);
+}
+
+window.focaldesk-app headerbar windowcontrols button {
+    background: transparent;
+    border-color: transparent;
+    box-shadow: none;
+}
+
+window.focaldesk-app button {
+    min-height: 30px;
+    border-radius: 8px;
+    color: @fd_app_text;
+    background-image: linear-gradient(to bottom, @fd_app_surface_raised, @fd_app_surface);
+    border: 1px solid @fd_app_border;
+    box-shadow: inset 0 1px rgba(230, 242, 255, 0.09), 0 1px 2px rgba(0, 0, 0, 0.30);
+}
+
+window.focaldesk-app button:hover {
+    color: white;
+    background-image: linear-gradient(to bottom, @fd_app_surface_hover, @fd_app_surface_raised);
+    border-color: @fd_app_accent;
+}
+
+window.focaldesk-app button:active,
+window.focaldesk-app button:checked {
+    color: white;
+    background-image: linear-gradient(to bottom, @fd_app_accent, @fd_app_accent_muted);
+    border-color: @fd_app_accent_bright;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.42);
+}
+
+window.focaldesk-app button.suggested-action {
+    color: #081119;
+    background-image: linear-gradient(to bottom, @fd_app_accent_bright, @fd_app_accent);
+    border-color: @fd_app_accent_bright;
+}
+
+window.focaldesk-app button.destructive-action {
+    color: white;
+    background-image: linear-gradient(to bottom, @fd_app_danger, shade(@fd_app_danger, 0.70));
+    border-color: @fd_app_danger;
+}
+
+window.focaldesk-app button:disabled {
+    color: alpha(@fd_app_text_dim, 0.55);
+    background: alpha(@fd_app_surface, 0.72);
+    border-color: alpha(@fd_app_border_soft, 0.65);
+    box-shadow: none;
+}
+
+window.focaldesk-app entry,
+window.focaldesk-app searchentry,
+window.focaldesk-app spinbutton,
+window.focaldesk-app dropdown,
+window.focaldesk-app combobox {
+    min-height: 34px;
+    border-radius: 8px;
+    color: @fd_app_text;
+    background: @fd_app_input;
+    border: 1px solid @fd_app_border;
+    caret-color: @fd_app_accent_bright;
+    box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.42);
+}
+
+window.focaldesk-app entry:focus-within,
+window.focaldesk-app searchentry:focus-within,
+window.focaldesk-app dropdown:focus {
+    border-color: @fd_app_accent_bright;
+    box-shadow: 0 0 0 2px alpha(@fd_app_accent, 0.30);
+}
+
+window.focaldesk-app textview,
+window.focaldesk-app textview text {
+    color: @fd_app_text;
+    background: @fd_app_input;
+}
+
+window.focaldesk-app popover > contents,
+window.focaldesk-app dialog,
+window.focaldesk-app messagedialog {
+    color: @fd_app_text;
+    background: @fd_app_surface;
+    border: 1px solid @fd_app_border;
+    border-radius: 10px;
+}
+
+window.focaldesk-app list,
+window.focaldesk-app listview,
+window.focaldesk-app gridview,
+window.focaldesk-app flowbox {
+    color: @fd_app_text;
+    background: transparent;
+}
+
+window.focaldesk-app list > row,
+window.focaldesk-app listview > row,
+window.focaldesk-app .boxed-list > row {
+    color: @fd_app_text;
+    background: @fd_app_surface;
+    border-bottom: 1px solid @fd_app_border_soft;
+}
+
+window.focaldesk-app row:hover,
+window.focaldesk-app listview > row:hover {
+    background: @fd_app_surface_hover;
+}
+
+window.focaldesk-app row:selected,
+window.focaldesk-app listview > row:selected,
+window.focaldesk-app flowboxchild:selected {
+    color: white;
+    background: @fd_app_accent_muted;
+    box-shadow: inset 3px 0 @fd_app_accent_bright;
+}
+
+window.focaldesk-app .navigation-sidebar,
+window.focaldesk-app .settings-sidebar,
+window.focaldesk-app .places-sidebar {
+    color: @fd_app_text;
+    background: @fd_app_bg;
+    border-right: 1px solid @fd_app_border_soft;
+}
+
+window.focaldesk-app .dim-label,
+window.focaldesk-app .subtitle,
+window.focaldesk-app label.dimmed {
+    color: @fd_app_text_dim;
+}
+
+window.focaldesk-app preferencespage,
+window.focaldesk-app preferencesgroup,
+window.focaldesk-app clamp,
+window.focaldesk-app leaflet,
+window.focaldesk-app navigationview,
+window.focaldesk-app stack {
+    color: @fd_app_text;
+    background-color: @fd_app_bg;
+}
+
+window.focaldesk-app preferencesgroup > box > box > label.title {
+    color: @fd_app_accent_bright;
+}
+
+window.focaldesk-app switch {
+    color: @fd_app_text;
+    background: @fd_app_input;
+    border: 1px solid @fd_app_border;
+}
+
+window.focaldesk-app switch:checked {
+    background: @fd_app_accent;
+    border-color: @fd_app_accent_bright;
+}
+
+window.focaldesk-app scale highlight,
+window.focaldesk-app progressbar progress {
+    background: @fd_app_accent;
+}
+
+window.focaldesk-app scrollbar slider {
+    min-width: 6px;
+    min-height: 6px;
+    border-radius: 6px;
+    background: alpha(@fd_app_accent, 0.48);
+}
+
+window.focaldesk-app scrollbar slider:hover {
+    background: @fd_app_accent;
+}
+
+window.focaldesk-app separator {
+    background: @fd_app_border_soft;
+}
+
+window.focaldesk-app *:focus-visible {
+    outline-color: @fd_app_accent_bright;
+    outline-width: 2px;
+    outline-offset: 2px;
+}
+
+window.focaldesk-app .launcher-root,
+window.focaldesk-app .files-root {
+    background: @fd_app_bg;
+}
+
+window.focaldesk-app .launcher-quick {
+    color: #081119;
+    background-image: linear-gradient(to bottom, @fd_app_accent_bright, @fd_app_accent);
+    border-color: @fd_app_accent_bright;
+}
+
+window.focaldesk-app .launcher-category {
+    border-radius: 999px;
+}
+
+window.focaldesk-app .launcher-category-scroll {
+    background: transparent;
+    border: none;
+}
+
+window.focaldesk-app .launcher-empty {
+    min-height: 220px;
+    padding: 32px;
+    color: @fd_app_text;
+}
+
+window.focaldesk-app .launcher-app-tile,
+window.focaldesk-app .file-grid-tile {
+    background-image: linear-gradient(to bottom, @fd_app_surface_raised, @fd_app_surface);
+    border-color: @fd_app_border_soft;
+}
+
+window.focaldesk-app .launcher-app-tile:hover,
+window.focaldesk-app .file-grid-tile:hover {
+    background-image: linear-gradient(to bottom, @fd_app_surface_hover, @fd_app_surface_raised);
+    border-color: @fd_app_accent;
+}
+
+window.focaldesk-app .launcher-app-tile.launcher-best-match {
+    border-color: @fd_app_accent_bright;
+    box-shadow: inset 0 0 0 1px alpha(@fd_app_accent_bright, 0.35),
+                0 0 10px alpha(@fd_app_accent, 0.22);
+}
+
+window.focaldesk-app .launcher-app-tile.launcher-favorite {
+    border-color: @fd_app_amber;
+    box-shadow: inset 3px 0 @fd_app_amber;
+}
+
+window.focaldesk-app .files-tabbar {
+    padding: 6px 10px;
+    background: @fd_app_bg;
+    border-bottom: 1px solid @fd_app_border_soft;
+}
+
+window.focaldesk-app .fd-state-view {
+    min-height: 220px;
+    padding: 32px;
+    color: @fd_app_text;
+}
+
+window.focaldesk-app .fd-state-view image {
+    color: @fd_app_accent_bright;
+    margin-bottom: 4px;
+}
+
+window.focaldesk-app .fd-status-banner {
+    min-height: 34px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: @fd_app_text;
+    background: @fd_app_surface;
+    border: 1px solid @fd_app_border_soft;
+}
+
+window.focaldesk-app .fd-status-banner image,
+window.focaldesk-app .fd-status-banner spinner {
+    color: @fd_app_accent_bright;
+}
+
+window.focaldesk-app .state-error,
+window.focaldesk-app .state-permission,
+window.focaldesk-app .state-service {
+    border-color: @fd_app_danger;
+}
+
+window.focaldesk-app .state-error image,
+window.focaldesk-app .state-permission image,
+window.focaldesk-app .state-service image {
+    color: @fd_app_danger;
+}
+
+window.focaldesk-app .state-success {
+    border-color: @fd_app_accent;
+}
+
+window.focaldesk-app .state-empty image,
+window.focaldesk-app .state-offline image {
+    color: @fd_app_text_dim;
+}
+
+window.focaldesk-app .fd-toast {
+    min-width: 320px;
+    margin: 12px;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+}
+
+tooltip {
+    color: @fd_app_text;
+    background: @fd_app_surface;
+    border: 1px solid @fd_app_accent;
+    border-radius: 6px;
+}

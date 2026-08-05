@@ -821,6 +821,7 @@ pub struct DesktopState {
     pub xwayland_loop_handle: Option<LoopHandle<'static, DesktopState>>,
     pub winit_scale_factor: f64,
     pub ui: UiTree,
+    pub accessibility: crate::core::accessibility::AccessibilityBridge,
     pub active_workspace: WorkspaceId,
     pub workspace_names: Vec<String>,
     pub next_window_id: WindowId,
@@ -1151,6 +1152,72 @@ impl DesktopState {
         }
     }
 
+    pub fn process_accessibility_actions(&mut self) {
+        use crate::core::accessibility::AccessibilityAction;
+
+        let actions: Vec<_> = self.accessibility.pending_actions().collect();
+        if !actions.is_empty() {
+            // Rendering reuses one UiTree across outputs. Rebuild the focused
+            // output before resolving an AT-SPI node action against stable IDs.
+            self.rebuild_ui_tree_for_output(self.focused_output);
+        }
+        let mut changed = false;
+        for action in actions {
+            match action {
+                AccessibilityAction::Focus(id) => changed |= self.ui.set_focus(id),
+                AccessibilityAction::Blur(id) => {
+                    if self.ui.focused == Some(id) {
+                        self.ui.clear_focus();
+                        changed = true;
+                    }
+                }
+                AccessibilityAction::Click(id) => {
+                    let action = self
+                        .ui
+                        .elements
+                        .iter()
+                        .find(|element| {
+                            element.id == id
+                                && element.visible
+                                && element.enabled
+                                && element.is_accessibility_focusable()
+                        })
+                        .and_then(|element| element.action.clone());
+                    if let Some(action) = action {
+                        self.queue_ui_action(action);
+                    }
+                }
+                AccessibilityAction::FocusDialogButton { dialog, button } => {
+                    if self.active_dialog == Some(dialog) {
+                        self.accessibility.focus_dialog_button(dialog, button);
+                        changed = true;
+                    }
+                }
+                AccessibilityAction::BlurDialogButton { dialog, button } => {
+                    if self.active_dialog == Some(dialog) {
+                        self.accessibility.blur_dialog_button(dialog, button);
+                        changed = true;
+                    }
+                }
+                AccessibilityAction::ClickDialogButton { dialog, button } => {
+                    let action = self
+                        .dialogs
+                        .iter()
+                        .find(|candidate| candidate.id == dialog)
+                        .and_then(|dialog| dialog.buttons.get(button))
+                        .map(|button| button.action);
+                    if let Some(action) = action {
+                        self.handle_dialog_action(dialog, action);
+                    }
+                }
+            }
+        }
+        if changed {
+            self.publish_accessibility_tree();
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+    }
+
     pub fn process_pending_egui_ops(&mut self) {
         let ops = std::mem::take(&mut self.pending_egui_ops);
         for op in ops {
@@ -1174,6 +1241,7 @@ impl DesktopState {
     /// Drain deferred sidebar/topbar clicks, app launches, and egui panel opens.
     /// Call from the backend main loop after input dispatch, before Wayland client dispatch.
     pub fn process_deferred_ui_and_launches(&mut self) {
+        self.process_accessibility_actions();
         self.process_pending_ui_actions();
         self.process_pending_app_launches();
         self.process_pending_egui_ops();
@@ -2456,6 +2524,46 @@ impl DesktopState {
             return;
         };
         build_ui_for_output_with_options(&mut self.ui, &layout, options);
+        if output_id == self.focused_output {
+            self.publish_accessibility_tree();
+        }
+    }
+
+    pub(crate) fn publish_accessibility_tree(&mut self) {
+        use crate::core::accessibility::{AccessibleDialog, AccessibleDialogButton};
+
+        let dialog = self.active_dialog.and_then(|active_id| {
+            let dialog = self.dialogs.iter().find(|dialog| dialog.id == active_id)?;
+            let output = self.outputs.get(&dialog.owner_output)?;
+            let screen = Rectangle::from_loc_and_size((0, 0), output.logical_size);
+            let layout = layout_dialog(dialog, screen);
+            Some(AccessibleDialog {
+                id: dialog.id,
+                title: dialog.title.clone(),
+                message: dialog.message.clone(),
+                modal: dialog.modal,
+                bounds: [
+                    layout.bounds.loc.x,
+                    layout.bounds.loc.y,
+                    layout.bounds.size.w,
+                    layout.bounds.size.h,
+                ],
+                buttons: layout
+                    .button_rects
+                    .iter()
+                    .filter_map(|(index, bounds)| {
+                        dialog
+                            .buttons
+                            .get(*index)
+                            .map(|button| AccessibleDialogButton {
+                                label: button.label.clone(),
+                                bounds: [bounds.loc.x, bounds.loc.y, bounds.size.w, bounds.size.h],
+                            })
+                    })
+                    .collect(),
+            })
+        });
+        self.accessibility.update(&self.ui, dialog.as_ref());
     }
 
     fn play_ui_sound(&self, sound: UiSound) {
@@ -5792,6 +5900,7 @@ impl DesktopState {
             xwayland_loop_handle: None,
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
+            accessibility: crate::core::accessibility::AccessibilityBridge::new(),
             active_workspace: WorkspaceId(1),
             workspace_names: vec!["Workspace 1".to_string()],
             next_window_id: WindowId(1),
@@ -6181,6 +6290,7 @@ impl DesktopState {
         );
 
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        self.publish_accessibility_tree();
     }
 
     fn alloc_dialog_id(&mut self) -> DialogId {
@@ -6200,6 +6310,7 @@ impl DesktopState {
         }
 
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        self.publish_accessibility_tree();
     }
 
     pub fn handle_dialog_action(&mut self, id: DialogId, action: DialogAction) {
@@ -6620,11 +6731,13 @@ impl DesktopState {
 
             KeyAction::FocusShellNext => {
                 self.ui.focus_next();
+                self.publish_accessibility_tree();
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
             KeyAction::FocusShellPrevious => {
                 self.ui.focus_previous();
+                self.publish_accessibility_tree();
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
 
@@ -6944,6 +7057,7 @@ impl DesktopState {
                                 keysyms::KEY_Escape => ds.ui.clear_focus(),
                                 _ => {}
                             }
+                            ds.publish_accessibility_tree();
                             ds.mark_focused_output_full_damage(DamageSource::Unknown);
                         }
                         return FilterResult::<()>::Intercept(());
@@ -7426,6 +7540,7 @@ impl DesktopState {
             } => {
                 if matches!(state, FlowKeyState::Pressed) && self.ui.focused.is_some() {
                     self.ui.clear_focus();
+                    self.publish_accessibility_tree();
                     self.mark_focused_output_full_damage(DamageSource::Unknown);
                 }
                 self.input.pointer_pos = position;

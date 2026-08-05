@@ -58,6 +58,8 @@ pub struct AppearanceSettings {
     pub topbar_height: i32,
     pub icon_size: i32,
     pub animations: bool,
+    #[serde(default)]
+    pub high_contrast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -284,6 +286,7 @@ pub fn default_settings() -> Settings {
             topbar_height: 56,
             icon_size: 32,
             animations: true,
+            high_contrast: false,
         },
         displays: DisplaySettings { outputs: vec![] },
         input: InputSettings {
@@ -411,6 +414,18 @@ mod tests {
             restored.input.keybindings.get("launch_terminal"),
             Some(&"Ctrl+Alt+T".to_string())
         );
+    }
+
+    #[test]
+    fn high_contrast_defaults_off_for_existing_settings() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["appearance"]
+            .as_object_mut()
+            .unwrap()
+            .remove("high_contrast");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(!settings.appearance.high_contrast);
     }
 
     #[test]

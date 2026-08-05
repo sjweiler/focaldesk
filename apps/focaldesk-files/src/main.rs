@@ -1,5 +1,9 @@
 use adw::prelude::*;
+use focaldesk_config::load_config;
+use focaldesk_gtk::{classify_status, StateKind, StatusBanner, ToastOverlay};
 use focaldesk_logging::{init_default_logging, session_id};
+use focaldesk_settings_core::load_settings;
+use focaldesk_themes::{gtk_app_css, gtk_app_prefers_dark, theme_by_name, GtkAppThemeOptions};
 use glib::ControlFlow;
 use gtk::gio;
 use gtk::gio::prelude::AppInfoExt;
@@ -96,7 +100,8 @@ struct FileManager {
     grid: gtk::FlowBox,
     scroller: gtk::ScrolledWindow,
     column_header: gtk::Grid,
-    status: gtk::Label,
+    status: StatusBanner,
+    toasts: ToastOverlay,
     hidden_toggle: gtk::ToggleButton,
     places: gtk::StringList,
     view_mode: Rc<RefCell<ViewMode>>,
@@ -123,15 +128,17 @@ struct TabManager {
     stack: gtk::Stack,
     tabs: Rc<RefCell<Vec<FileManager>>>,
     tab_counter: Rc<RefCell<u32>>,
+    toasts: ToastOverlay,
 }
 
 impl TabManager {
-    fn new(window: &adw::ApplicationWindow, stack: &gtk::Stack) -> Self {
+    fn new(window: &adw::ApplicationWindow, stack: &gtk::Stack, toasts: &ToastOverlay) -> Self {
         Self {
             window: window.clone(),
             stack: stack.clone(),
             tabs: Rc::new(RefCell::new(Vec::new())),
             tab_counter: Rc::new(RefCell::new(1)),
+            toasts: toasts.clone(),
         }
     }
 
@@ -401,7 +408,7 @@ impl TabManager {
     fn add_location_tab(&self, location: Location) {
         let tab_name = self.next_tab_name();
         let tab_name_for_stack = tab_name.clone();
-        let tab = create_file_manager_page(&self.window, tab_name);
+        let tab = create_file_manager_page(&self.window, tab_name, &self.toasts);
         let page = self.stack.add_titled(
             &tab.root,
             Some(&tab.tab_name),
@@ -441,7 +448,9 @@ fn main() {
 }
 
 fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
+    install_focaldesk_theme();
     let window = adw::ApplicationWindow::new(app);
+    window.add_css_class("focaldesk-app");
     window.set_title(Some("FocalDesk Files"));
     window.set_default_size(1040, 680);
 
@@ -455,6 +464,7 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
 
     let new_tab_button = icon_button("tab-new-symbolic", "New Tab");
     let tab_bar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tab_bar.add_css_class("files-tabbar");
     tab_bar.set_margin_top(8);
     tab_bar.set_margin_bottom(8);
     tab_bar.set_margin_start(12);
@@ -463,11 +473,13 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     tab_bar.append(&new_tab_button);
 
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.add_css_class("files-root");
     outer.append(&tab_bar);
     outer.append(&stack);
-    window.set_content(Some(&outer));
+    let toasts = ToastOverlay::new(&outer);
+    window.set_content(Some(&toasts.widget()));
 
-    let tabs = TabManager::new(&window, &stack);
+    let tabs = TabManager::new(&window, &stack, &toasts);
     tabs.install_actions();
 
     let tabs_for_button = tabs.clone();
@@ -480,7 +492,60 @@ fn build_ui(app: &adw::Application, initial_path: Option<PathBuf>) {
     window.present();
 }
 
-fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -> FileManager {
+fn install_focaldesk_theme() {
+    let provider = gtk::CssProvider::new();
+    let initial = active_theme_snapshot();
+    apply_theme_snapshot(&provider, &initial);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
+    let current = Rc::new(RefCell::new(initial));
+    glib::timeout_add_local(std::time::Duration::from_millis(500), move || {
+        let next = active_theme_snapshot();
+        if next != *current.borrow() {
+            apply_theme_snapshot(&provider, &next);
+            *current.borrow_mut() = next;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn active_theme_snapshot() -> (String, GtkAppThemeOptions) {
+    let config = load_config();
+    let settings = load_settings();
+    (
+        config.appearance.theme,
+        GtkAppThemeOptions {
+            font_scale: config.appearance.font_scale,
+            animations: settings.appearance.animations,
+            high_contrast: settings.appearance.high_contrast,
+        },
+    )
+}
+
+fn apply_theme_snapshot(provider: &gtk::CssProvider, snapshot: &(String, GtkAppThemeOptions)) {
+    let theme = theme_by_name(&snapshot.0);
+    adw::StyleManager::default().set_color_scheme(if gtk_app_prefers_dark(&theme) {
+        adw::ColorScheme::ForceDark
+    } else {
+        adw::ColorScheme::ForceLight
+    });
+    provider.load_from_string(&gtk_app_css(&theme, snapshot.1));
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_enable_animations(snapshot.1.animations);
+    }
+}
+
+fn create_file_manager_page(
+    window: &adw::ApplicationWindow,
+    tab_name: String,
+    toasts: &ToastOverlay,
+) -> FileManager {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     header.set_show_title(false);
@@ -540,6 +605,7 @@ fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -
     places_view.add_css_class("navigation-sidebar");
 
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    sidebar_box.add_css_class("places-sidebar");
     sidebar_box.set_margin_top(12);
     sidebar_box.set_margin_bottom(12);
     sidebar_box.set_margin_start(12);
@@ -580,10 +646,7 @@ fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -
     sort_descending.set_icon_name("view-sort-descending-symbolic");
     sort_descending.set_tooltip_text(Some("Toggle sort order"));
 
-    let status = gtk::Label::new(None);
-    status.set_xalign(0.0);
-    status.add_css_class("dim-label");
-    status.set_margin_top(8);
+    let status = StatusBanner::new("Ready");
 
     let controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     controls.set_margin_top(8);
@@ -600,7 +663,7 @@ fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -
     let column_header = column_header();
     content.append(&column_header);
     content.append(&scroller);
-    content.append(&status);
+    content.append(&status.widget());
     split.set_content(Some(&adw::NavigationPage::new(&content, "Files")));
 
     toolbar.set_content(Some(&split));
@@ -615,6 +678,7 @@ fn create_file_manager_page(window: &adw::ApplicationWindow, tab_name: String) -
         scroller,
         column_header,
         status,
+        toasts: toasts.clone(),
         hidden_toggle,
         places,
         view_mode: Rc::new(RefCell::new(ViewMode::Details)),
@@ -1751,6 +1815,10 @@ impl FileManager {
 
     fn set_status(&self, text: &str) {
         self.status.set_text(text);
+        let kind = classify_status(text);
+        if matches!(kind, StateKind::Error | StateKind::Success) {
+            self.toasts.show(kind, text);
+        }
     }
 
     fn show_selected_path(&self) {

@@ -107,7 +107,8 @@ impl UiElement {
             UiElementKind::WorkspaceSlot => AccessibleRole::Tab,
             _ => AccessibleRole::Button,
         };
-        let accessible = AccessibleInfo::new(accessible_role, item.tooltip.clone());
+        let accessible = AccessibleInfo::new(accessible_role, item.tooltip.clone())
+            .live(matches!(kind, UiElementKind::TopbarIndicator));
         Self {
             id: item.id,
             kind,

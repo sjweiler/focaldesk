@@ -189,6 +189,9 @@ pub fn prepare_output(
 
     build_ui_for_output_with_options(&mut state.ui, &layout, ui_options);
     state.refresh_ui_hover_for_output(output_id);
+    if output_id == state.focused_output {
+        state.publish_accessibility_tree();
+    }
 
     if let Some(rect) = state.active_sidebar_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(

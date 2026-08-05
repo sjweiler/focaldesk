@@ -2,6 +2,7 @@ use adw::prelude::*;
 use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
 use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
     send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
     send_settings_request, watch_desktop_keys, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
@@ -16,6 +17,7 @@ use focaldesk_settings_core::{
     LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
+use focaldesk_themes::{gtk_app_css, gtk_app_prefers_dark, theme_by_name, GtkAppThemeOptions};
 
 use gtk::cairo;
 use gtk::glib;
@@ -2013,6 +2015,55 @@ fn main() {
     app.run();
 }
 
+fn install_focaldesk_theme() {
+    let provider = gtk::CssProvider::new();
+    let initial = active_theme_snapshot();
+    apply_theme_snapshot(&provider, &initial);
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+
+    let current = Rc::new(RefCell::new(initial));
+    glib::timeout_add_local(Duration::from_millis(500), move || {
+        let next = active_theme_snapshot();
+        if next != *current.borrow() {
+            apply_theme_snapshot(&provider, &next);
+            *current.borrow_mut() = next;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn active_theme_snapshot() -> (String, GtkAppThemeOptions) {
+    let config = load_config();
+    let settings = load_settings();
+    (
+        config.appearance.theme,
+        GtkAppThemeOptions {
+            font_scale: config.appearance.font_scale,
+            animations: settings.appearance.animations,
+            high_contrast: settings.appearance.high_contrast,
+        },
+    )
+}
+
+fn apply_theme_snapshot(provider: &gtk::CssProvider, snapshot: &(String, GtkAppThemeOptions)) {
+    let theme = theme_by_name(&snapshot.0);
+    adw::StyleManager::default().set_color_scheme(if gtk_app_prefers_dark(&theme) {
+        adw::ColorScheme::ForceDark
+    } else {
+        adw::ColorScheme::ForceLight
+    });
+    provider.load_from_string(&gtk_app_css(&theme, snapshot.1));
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_enable_animations(snapshot.1.animations);
+    }
+}
+
 fn requested_panel(mut args: impl Iterator<Item = String>) -> Option<String> {
     while let Some(argument) = args.next() {
         if argument == "--panel" {
@@ -2026,10 +2077,12 @@ fn requested_panel(mut args: impl Iterator<Item = String>) -> Option<String> {
 }
 
 fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
+    install_focaldesk_theme();
     let config = Rc::new(RefCell::new(load_config()));
     let settings = Rc::new(RefCell::new(load_settings()));
 
     let window = adw::ApplicationWindow::new(app);
+    window.add_css_class("focaldesk-app");
     window.set_title(Some("FocalDesk Settings"));
     window.set_default_size(1000, 700);
 
@@ -2041,6 +2094,7 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
 
     // ----- sidebar -----
     let sidebar_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    sidebar_box.add_css_class("settings-sidebar");
     sidebar_box.set_margin_top(12);
     sidebar_box.set_margin_bottom(12);
     sidebar_box.set_margin_start(12);
@@ -2089,7 +2143,10 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
     let content_page = adw::NavigationPage::new(&content_stack, "Content");
     let mut pages: HashMap<String, adw::NavigationPage> = HashMap::new();
 
-    pages.insert("Appearance".to_string(), appearance_page(config.clone()));
+    pages.insert(
+        "Appearance".to_string(),
+        appearance_page(config.clone(), settings.clone()),
+    );
     pages.insert("Network".to_string(), network_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Printers".to_string(), printers_page());
@@ -2142,7 +2199,10 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
     window.present();
 }
 
-fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage {
+fn appearance_page(
+    config: Rc<RefCell<FocalDeskConfig>>,
+    settings: Rc<RefCell<Settings>>,
+) -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Appearance");
 
@@ -2234,6 +2294,38 @@ fn appearance_page(config: Rc<RefCell<FocalDeskConfig>>) -> adw::NavigationPage 
 
     theme_row.add_suffix(&theme_dropdown);
     visual_group.add(&theme_row);
+
+    let contrast_row = adw::ActionRow::new();
+    contrast_row.set_title("High contrast");
+    contrast_row.set_subtitle("Strengthen text, borders, and keyboard focus indicators");
+    let contrast_switch = gtk::Switch::new();
+    contrast_switch.set_active(settings.borrow().appearance.high_contrast);
+    contrast_row.add_suffix(&contrast_switch);
+    contrast_row.set_activatable_widget(Some(&contrast_switch));
+    {
+        let settings = settings.clone();
+        contrast_switch.connect_active_notify(move |switch| {
+            settings.borrow_mut().appearance.high_contrast = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    visual_group.add(&contrast_row);
+
+    let motion_row = adw::ActionRow::new();
+    motion_row.set_title("Reduce motion");
+    motion_row.set_subtitle("Disable application and shell interface animations");
+    let motion_switch = gtk::Switch::new();
+    motion_switch.set_active(!settings.borrow().appearance.animations);
+    motion_row.add_suffix(&motion_switch);
+    motion_row.set_activatable_widget(Some(&motion_switch));
+    {
+        let settings = settings.clone();
+        motion_switch.connect_active_notify(move |switch| {
+            settings.borrow_mut().appearance.animations = !switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
+    visual_group.add(&motion_row);
 
     {
         let config = config.clone();
@@ -2399,15 +2491,18 @@ fn populate_ethernet_list(
     group: &adw::PreferencesGroup,
     rows: &DynamicRows,
     snapshot: &EthernetSnapshot,
-    status: &gtk::Label,
+    status: &StatusBanner,
 ) {
     clear_dynamic_rows(group, rows);
 
     if let Some(err) = &snapshot.error {
-        status.set_text(err);
+        status.set(StateKind::ServiceUnavailable, "Network service unavailable");
+        status.set_details(Some(err));
     } else if snapshot.devices.is_empty() {
+        status.set_details(None);
         status.set_text("No Ethernet devices found");
     } else {
+        status.set_details(None);
         status.set_text("Ethernet devices are managed by NetworkManager");
     }
 
@@ -2473,7 +2568,7 @@ fn populate_ethernet_list(
 fn refresh_ethernet_list_async(
     group: &adw::PreferencesGroup,
     rows: &DynamicRows,
-    status: &gtk::Label,
+    status: &StatusBanner,
 ) {
     clear_dynamic_rows(group, rows);
     status.set_text("Loading Ethernet state");
@@ -2510,15 +2605,18 @@ fn populate_wifi_list(
     group: &adw::PreferencesGroup,
     rows: &DynamicRows,
     snapshot: &WifiSnapshot,
-    status: &gtk::Label,
+    status: &StatusBanner,
 ) {
     clear_dynamic_rows(group, rows);
 
     if let Some(err) = &snapshot.error {
-        status.set_text(err);
+        status.set(StateKind::ServiceUnavailable, "Wi-Fi service unavailable");
+        status.set_details(Some(err));
     } else if snapshot.enabled {
+        status.set_details(None);
         status.set_text("Wi-Fi is enabled");
     } else {
+        status.set_details(None);
         status.set_text("Wi-Fi is disabled");
     }
 
@@ -2605,7 +2703,7 @@ fn populate_wifi_list(
 fn refresh_wifi_list_async(
     group: &adw::PreferencesGroup,
     rows: &DynamicRows,
-    status: &gtk::Label,
+    status: &StatusBanner,
     wifi_switch: &gtk::Switch,
     updating_switch: &Rc<Cell<bool>>,
 ) {
@@ -2649,7 +2747,7 @@ fn network_page() -> adw::NavigationPage {
     let page = adw::PreferencesPage::new();
     page.set_title("Network");
 
-    let ethernet_status = dim_label("Loading Ethernet state");
+    let ethernet_status = StatusBanner::new("Loading Ethernet state");
 
     let ethernet_group = adw::PreferencesGroup::new();
     ethernet_group.set_title("Ethernet");
@@ -2661,7 +2759,7 @@ fn network_page() -> adw::NavigationPage {
     ethernet_refresh_button.add_css_class("pill");
     ethernet_refresh_row.add_suffix(&ethernet_refresh_button);
     ethernet_group.add(&ethernet_refresh_row);
-    ethernet_group.add(&ethernet_status);
+    ethernet_group.add(&ethernet_status.widget());
     page.add(&ethernet_group);
 
     let ethernet_devices_group = adw::PreferencesGroup::new();
@@ -2669,7 +2767,7 @@ fn network_page() -> adw::NavigationPage {
     page.add(&ethernet_devices_group);
     let ethernet_device_rows = Rc::new(RefCell::new(Vec::new()));
 
-    let wifi_status = dim_label("Loading Wi-Fi state");
+    let wifi_status = StatusBanner::new("Loading Wi-Fi state");
 
     let controls_group = adw::PreferencesGroup::new();
     controls_group.set_title("Wi-Fi");
@@ -2689,7 +2787,7 @@ fn network_page() -> adw::NavigationPage {
     refresh_button.add_css_class("pill");
     refresh_row.add_suffix(&refresh_button);
     controls_group.add(&refresh_row);
-    controls_group.add(&wifi_status);
+    controls_group.add(&wifi_status.widget());
     page.add(&controls_group);
 
     let networks_group = adw::PreferencesGroup::new();
@@ -2768,7 +2866,7 @@ fn populate_bluetooth_list(
     group: &adw::PreferencesGroup,
     rows: &DynamicRows,
     snapshot: &BluetoothSnapshot,
-    status: &gtk::Label,
+    status: &StatusBanner,
     scanning: &Rc<RefCell<bool>>,
     power_switch: &gtk::Switch,
     scan_switch: &gtk::Switch,
@@ -2777,14 +2875,20 @@ fn populate_bluetooth_list(
     clear_dynamic_rows(group, rows);
 
     if let Some(err) = &snapshot.error {
-        status.set_text(err);
+        status.set(
+            StateKind::ServiceUnavailable,
+            "Bluetooth service unavailable",
+        );
+        status.set_details(Some(err));
     } else if snapshot.powered {
+        status.set_details(None);
         status.set_text(if snapshot.scanning {
             "Bluetooth is scanning"
         } else {
             "Bluetooth is powered on"
         });
     } else {
+        status.set_details(None);
         status.set_text("Bluetooth is powered off");
     }
 
@@ -3008,7 +3112,7 @@ fn populate_bluetooth_list(
 fn refresh_bluetooth_list_async(
     group: &adw::PreferencesGroup,
     rows: &DynamicRows,
-    status: &gtk::Label,
+    status: &StatusBanner,
     scanning: &Rc<RefCell<bool>>,
     power_switch: &gtk::Switch,
     scan_switch: &gtk::Switch,
@@ -3069,7 +3173,7 @@ fn bluetooth_page() -> adw::NavigationPage {
     page.set_title("Bluetooth");
 
     let scanning = Rc::new(RefCell::new(false));
-    let status = dim_label("Loading Bluetooth state");
+    let status = StatusBanner::new("Loading Bluetooth state");
 
     let controls_group = adw::PreferencesGroup::new();
     controls_group.set_title("Bluetooth");
@@ -3095,7 +3199,7 @@ fn bluetooth_page() -> adw::NavigationPage {
     refresh_button.add_css_class("pill");
     refresh_row.add_suffix(&refresh_button);
     controls_group.add(&refresh_row);
-    controls_group.add(&status);
+    controls_group.add(&status.widget());
     page.add(&controls_group);
 
     let devices_group = adw::PreferencesGroup::new();
@@ -4496,30 +4600,30 @@ fn power_status_text(snapshot: &focaldesk_power::PowerSnapshot) -> String {
     let battery = snapshot
         .batteries
         .first()
-        .map(|battery| {
-            let percent = battery
-                .percentage
-                .map(|value| format!("{value}%"))
-                .unwrap_or_else(|| "unknown charge".to_string());
-            let state = battery.state.as_deref().unwrap_or("unknown");
-            format!("{percent}, {state}")
-        })
+        .map(
+            |battery| match (battery.percentage, battery.state.as_deref()) {
+                (Some(percent), Some(state)) => format!("Battery {percent}% · {state}"),
+                (Some(percent), None) => format!("Battery {percent}%"),
+                (None, Some(state)) => format!("Battery information unavailable · {state}"),
+                (None, None) => "Battery information unavailable".to_string(),
+            },
+        )
         .unwrap_or_else(|| "No battery detected".to_string());
-    let line_power = match snapshot.line_power_online {
-        Some(true) => "plugged in",
-        Some(false) => "on battery",
-        None => "line power unknown",
-    };
-    let profile = snapshot
+    let mut parts = vec![battery];
+    if let Some(online) = snapshot.line_power_online {
+        parts.push(if online { "Plugged in" } else { "On battery" }.to_string());
+    }
+    if let Some(profile) = snapshot
         .performance_profile
         .as_deref()
         .filter(|profile| !profile.is_empty())
-        .unwrap_or("profile unknown");
-
-    format!("{battery}; {line_power}; {profile}")
+    {
+        parts.push(format!("{} profile", profile.replace('-', " ")));
+    }
+    parts.join(" · ")
 }
 
-fn run_power_action(request: PowerIpcRequest, status: &gtk::Label) {
+fn run_power_action(request: PowerIpcRequest, status: &StatusBanner) {
     match send_power_request(&request) {
         Ok(PowerIpcResponse::Ok) => status.set_text("Power action started"),
         Ok(PowerIpcResponse::Error { message }) => {
@@ -4565,8 +4669,8 @@ fn power_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
 
     let status_group = adw::PreferencesGroup::new();
     status_group.set_title("Status");
-    let status_label = dim_label(&power_status_text(&snapshot));
-    status_group.add(&status_label);
+    let status_label = StatusBanner::new(&power_status_text(&snapshot));
+    status_group.add(&status_label.widget());
     page.add(&status_group);
 
     let timing_group = adw::PreferencesGroup::new();

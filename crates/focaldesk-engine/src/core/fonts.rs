@@ -296,6 +296,20 @@ impl FontSystem {
         w
     }
 
+    /// Return the visible glyph bounds relative to the text baseline.
+    pub fn vertical_bounds(&self, text: &str, style: TextStyle) -> Option<(i32, i32)> {
+        text.chars()
+            .filter_map(|ch| self.glyph((style.font, style.size_px, ch)))
+            .filter(|glyph| glyph.h > 0)
+            .map(|glyph| {
+                let bottom = -glyph.ymin;
+                (bottom - glyph.h as i32, bottom)
+            })
+            .reduce(|(top, bottom), (glyph_top, glyph_bottom)| {
+                (top.min(glyph_top), bottom.max(glyph_bottom))
+            })
+    }
+
     fn prepare_glyph(&mut self, ch: char, style: TextStyle) -> anyhow::Result<()> {
         let key = (style.font, style.size_px, ch);
 

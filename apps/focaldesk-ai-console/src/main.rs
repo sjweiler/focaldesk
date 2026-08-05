@@ -3,11 +3,14 @@ use focaldesk_ai::{
     AiDaemonStatus, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, MemoryId, ProviderInfo,
     ProviderModelInfo, SearchHit, send_ai_request,
 };
+use focaldesk_config::load_config;
+use focaldesk_gtk::{StateKind, StateView, StatusBanner};
 use focaldesk_ipc::{
     IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
     send_notification_request,
 };
 use focaldesk_settings_core::load_settings;
+use focaldesk_themes::{GtkAppThemeOptions, gtk_app_css, gtk_app_prefers_dark, theme_by_name};
 use focaldesk_voice::{VoiceEvent, VoiceSession};
 use glib::ControlFlow;
 use gtk4::prelude::*;
@@ -388,6 +391,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         .default_width(950)
         .default_height(650)
         .build();
+    window.add_css_class("focaldesk-app");
     *main_window.borrow_mut() = Some(window.clone());
     {
         let main_window = main_window.clone();
@@ -1407,8 +1411,10 @@ fn refresh_providers_page_view(view: Rc<ProvidersPage>) {
     ]));
 
     if let Some(error) = runtime_snapshot.load_error.as_ref() {
-        view.summary_box
-            .append(&info_card(&[format!("AI daemon query failed: {error}")]));
+        let status = StatusBanner::new("AI service unavailable");
+        status.set(StateKind::ServiceUnavailable, "AI service unavailable");
+        status.set_details(Some(error));
+        view.summary_box.append(&status.widget());
     }
 
     if !runtime_snapshot.provider_model_errors.is_empty() {
@@ -2085,7 +2091,17 @@ fn load_active_conversation(chat_view: &Box, conversations: &[Conversation], app
 }
 
 fn render_active_conversation(chat_view: &Box, store: &PersistedState) {
-    load_active_conversation(chat_view, &store.conversations, &store.app_state);
+    if store.conversations.is_empty() {
+        clear_box(chat_view);
+        let empty = StateView::new(
+            StateKind::Empty,
+            "No conversation selected",
+            "Start a new chat or open a saved conversation.",
+        );
+        chat_view.append(&empty.widget());
+    } else {
+        load_active_conversation(chat_view, &store.conversations, &store.app_state);
+    }
 }
 
 fn clear_box(container: &Box) {
@@ -2623,53 +2639,50 @@ fn set_active_nav(
     }
 }
 
-fn load_css() {
-    let provider = gtk4::CssProvider::new();
-
-    provider.load_from_data(
-        r#"
+const AI_CONSOLE_CSS: &str = r#"
         .ai-root {
             padding: 14px;
-            background: #11141b;
-            color: #e9eef8;
+            background: @fd_app_bg;
+            color: @fd_app_text;
         }
 
         .ai-sidebar {
             padding: 12px;
             border-radius: 18px;
-            background: #1a2030;
+            background: @fd_app_surface;
+            border: 1px solid @fd_app_border;
         }
 
         .sidebar-button {
             border-radius: 12px;
             padding: 10px;
-            background: #263147;
-            color: #e9eef8;
-            border: 1px solid #34435f;
+            background: @fd_app_surface_raised;
+            color: @fd_app_text;
+            border: 1px solid @fd_app_border;
         }
 
         .sidebar-button:hover {
-            background: #32405c;
+            background: @fd_app_surface_hover;
         }
 
         .sidebar-button-active {
-            background: #5b79ff;
+            background: @fd_app_accent_muted;
             color: #ffffff;
-            border-color: #7f95ff;
+            border-color: @fd_app_accent_bright;
         }
 
         .ai-main {
             padding: 12px;
             border-radius: 18px;
-            background: #151b25;
+            background: @fd_app_bg;
         }
 
         .mode-banner {
             padding: 12px;
             margin-bottom: 6px;
             border-radius: 16px;
-            background: linear-gradient(90deg, #213150 0%, #1b2235 100%);
-            border: 1px solid #4f6bd9;
+            background: linear-gradient(90deg, @fd_app_accent_muted 0%, @fd_app_surface 100%);
+            border: 1px solid @fd_app_accent;
         }
 
         .mode-banner-button {
@@ -2679,14 +2692,14 @@ fn load_css() {
         }
 
         .mode-banner-title {
-            font-size: 14px;
+            font-size: 1.0em;
             font-weight: 700;
-            color: #f3f6ff;
+            color: @fd_app_text;
         }
 
         .mode-banner-body {
-            color: #cdd7ef;
-            font-size: 13px;
+            color: @fd_app_text_dim;
+            font-size: 0.92em;
         }
 
         .chat-list {
@@ -2696,15 +2709,15 @@ fn load_css() {
         .chat-card {
             padding: 12px;
             border-radius: 14px;
-            color: #edf2fb;
-            border: 1px solid #30405d;
+            color: @fd_app_text;
+            border: 1px solid @fd_app_border;
         }
 
         .panel-page {
             padding: 18px;
             border-radius: 16px;
-            background: #18202c;
-            border: 1px solid #2b3a53;
+            background: @fd_app_surface;
+            border: 1px solid @fd_app_border;
         }
 
         .split-pane {
@@ -2721,84 +2734,85 @@ fn load_css() {
 
         .pane-scroll {
             border-radius: 14px;
-            border: 1px solid #31415e;
-            background: #151b25;
+            border: 1px solid @fd_app_border;
+            background: @fd_app_bg;
         }
 
         .pane-heading {
-            font-size: 13px;
+            font-size: 0.92em;
             font-weight: 700;
-            color: #f3f6ff;
+            color: @fd_app_text;
             padding-left: 2px;
         }
 
         .composer-status {
             min-width: 260px;
-            color: #cdd7ef;
-            font-size: 12px;
+            color: @fd_app_text_dim;
+            font-size: 0.85em;
         }
 
         .panel-title {
-            font-size: 18px;
+            font-size: 1.25em;
             font-weight: 700;
-            color: #f3f6ff;
+            color: @fd_app_text;
         }
 
         .panel-body {
-            color: #cdd7e8;
+            color: @fd_app_text_dim;
         }
 
         .item-card {
             padding: 12px;
             border-radius: 14px;
-            background: #20293a;
-            border: 1px solid #31415e;
+            background: @fd_app_surface_raised;
+            border: 1px solid @fd_app_border;
         }
 
         .item-title {
             font-weight: 700;
-            color: #f0f4ff;
+            color: @fd_app_text;
         }
 
         .item-body {
-            color: #d1d9e8;
+            color: @fd_app_text;
         }
 
         .item-meta {
-            color: #97a2c0;
-            font-size: 11px;
+            color: @fd_app_text_dim;
+            font-size: 0.78em;
         }
 
         .info-card {
-            background: #233149;
-            border: 1px solid #40567a;
+            background: @fd_app_accent_muted;
+            border: 1px solid @fd_app_accent;
         }
 
         .user-card {
-            background: #26324a;
+            background: @fd_app_accent_muted;
         }
 
         .ai-card {
-            background: #1f2734;
+            background: @fd_app_surface;
         }
 
         .action-card {
-            background: #2d2a21;
-            border: 1px solid #c49a53;
+            background: alpha(@fd_app_amber, 0.15);
+            border: 1px solid @fd_app_amber;
         }
 
         .composer {
             padding: 10px;
             border-radius: 18px;
-            background: #1a2030;
-            border: 1px solid #31415e;
+            background: @fd_app_surface;
+            border: 1px solid @fd_app_border;
         }
 
         entry {
             border-radius: 14px;
             padding: 8px;
-            background: #f7f9fe;
-            color: #11141b;
+            background: @fd_app_input;
+            color: @fd_app_text;
+            border: 1px solid @fd_app_border;
         }
 
         button {
@@ -2809,10 +2823,14 @@ fn load_css() {
         combobox,
         dropdown,
         switch {
-            color: #e9eef8;
+            color: @fd_app_text;
         }
-        "#,
-    );
+        "#;
+
+fn load_css() {
+    let provider = gtk4::CssProvider::new();
+    let initial = active_theme_snapshot();
+    apply_theme_snapshot(&provider, &initial);
 
     if let Some(display) = gtk4::gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
@@ -2820,6 +2838,39 @@ fn load_css() {
             &provider,
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+
+    let current = Rc::new(RefCell::new(initial));
+    glib::timeout_add_local(Duration::from_millis(500), move || {
+        let next = active_theme_snapshot();
+        if next != *current.borrow() {
+            apply_theme_snapshot(&provider, &next);
+            *current.borrow_mut() = next;
+        }
+        glib::ControlFlow::Continue
+    });
+}
+
+fn active_theme_snapshot() -> (String, GtkAppThemeOptions) {
+    let config = load_config();
+    let settings = load_settings();
+    (
+        config.appearance.theme,
+        GtkAppThemeOptions {
+            font_scale: config.appearance.font_scale,
+            animations: settings.appearance.animations,
+            high_contrast: settings.appearance.high_contrast,
+        },
+    )
+}
+
+fn apply_theme_snapshot(provider: &gtk4::CssProvider, snapshot: &(String, GtkAppThemeOptions)) {
+    let theme = theme_by_name(&snapshot.0);
+    let css = format!("{}\n{}", gtk_app_css(&theme, snapshot.1), AI_CONSOLE_CSS);
+    provider.load_from_string(&css);
+    if let Some(settings) = gtk4::Settings::default() {
+        settings.set_gtk_enable_animations(snapshot.1.animations);
+        settings.set_gtk_application_prefer_dark_theme(gtk_app_prefers_dark(&theme));
     }
 }
 

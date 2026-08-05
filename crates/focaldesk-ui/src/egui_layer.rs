@@ -1,7 +1,14 @@
 //! egui overlay — rendered last, above dialogs and compositor chrome.
 
-use std::{mem, sync::Arc};
+use std::{
+    mem,
+    sync::{
+        Arc, RwLock,
+        mpsc::{self, Receiver, Sender},
+    },
+};
 
+use accesskit_unix::Adapter as AccessKitAdapter;
 use egui::{
     ClippedPrimitive, Context, Event, FontData, FontDefinitions, FontFamily, ImageData, Modifiers,
     MouseWheelUnit, PointerButton, Pos2, RawInput, Rect, TextureId, TexturesDelta, Vec2,
@@ -54,6 +61,105 @@ pub struct EguiLayer {
     owner_output: Option<OutputId>,
     pub screen_height_pts: f32,
     pub last_frame_ctx: Option<DesktopFrameCtx>,
+    accessibility: EguiAccessibility,
+}
+
+#[derive(Clone)]
+struct EguiActivation {
+    ctx: Context,
+    latest: Arc<RwLock<Option<egui::accesskit::TreeUpdate>>>,
+}
+
+impl egui::accesskit::ActivationHandler for EguiActivation {
+    fn request_initial_tree(&mut self) -> Option<egui::accesskit::TreeUpdate> {
+        self.ctx.enable_accesskit();
+        self.latest.read().ok().and_then(|latest| latest.clone())
+    }
+}
+
+struct EguiActions(Sender<egui::accesskit::ActionRequest>);
+
+impl egui::accesskit::ActionHandler for EguiActions {
+    fn do_action(&mut self, request: egui::accesskit::ActionRequest) {
+        let _ = self.0.send(request);
+    }
+}
+
+struct EguiDeactivation(Context);
+
+impl egui::accesskit::DeactivationHandler for EguiDeactivation {
+    fn deactivate_accessibility(&mut self) {
+        self.0.disable_accesskit();
+    }
+}
+
+struct EguiAccessibility {
+    adapter: AccessKitAdapter,
+    latest: Arc<RwLock<Option<egui::accesskit::TreeUpdate>>>,
+    actions: Receiver<egui::accesskit::ActionRequest>,
+}
+
+impl EguiAccessibility {
+    fn new(ctx: &Context) -> Self {
+        let latest = Arc::new(RwLock::new(None));
+        let (sender, actions) = mpsc::channel();
+        let adapter = AccessKitAdapter::new(
+            EguiActivation {
+                ctx: ctx.clone(),
+                latest: Arc::clone(&latest),
+            },
+            EguiActions(sender),
+            EguiDeactivation(ctx.clone()),
+        );
+        Self {
+            adapter,
+            latest,
+            actions,
+        }
+    }
+
+    fn update(&mut self, update: egui::accesskit::TreeUpdate) {
+        if let Ok(mut latest) = self.latest.write() {
+            *latest = Some(update.clone());
+        }
+        self.adapter.update_window_focus_state(true);
+        self.adapter.update_if_active(|| update);
+    }
+
+    fn set_inactive(&mut self) {
+        self.adapter.update_window_focus_state(false);
+        let hidden = self.latest.read().ok().and_then(|latest| {
+            let latest = latest.as_ref()?;
+            let tree = latest.tree.clone()?;
+            let root = tree.root;
+            let mut node = egui::accesskit::Node::new(egui::accesskit::Role::Window);
+            node.set_hidden();
+            Some(egui::accesskit::TreeUpdate {
+                nodes: vec![(root, node)],
+                tree: Some(tree),
+                focus: root,
+            })
+        });
+        if let Some(hidden) = hidden {
+            if self
+                .latest
+                .read()
+                .is_ok_and(|latest| latest.as_ref() == Some(&hidden))
+            {
+                return;
+            }
+            if let Ok(mut latest) = self.latest.write() {
+                *latest = Some(hidden.clone());
+            }
+            self.adapter.update_if_active(|| hidden);
+        }
+    }
+
+    fn append_actions(&self, raw_input: &mut RawInput) {
+        raw_input
+            .events
+            .extend(self.actions.try_iter().map(Event::AccessKitActionRequest));
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,6 +249,7 @@ impl Default for EguiLayer {
         let ctx = Context::default();
         ctx.set_fonts(focaldesk_egui_fonts());
         apply_focaldesk_egui_style(&ctx);
+        let accessibility = EguiAccessibility::new(&ctx);
 
         Self {
             ctx,
@@ -162,6 +269,7 @@ impl Default for EguiLayer {
             owner_output: None,
             screen_height_pts: 1.0,
             last_frame_ctx: None,
+            accessibility,
             settings: SettingsPanel::default(),
             network: NetworkPanel::default(),
             bluetooth: BluetoothPanel::default(),
@@ -342,8 +450,9 @@ impl EguiLayer {
     pub fn update_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
         self.last_frame_ctx = Some(frame_ctx.clone());
         self.prepare_raw_input(frame_ctx);
+        self.accessibility.append_actions(&mut self.raw_input);
 
-        let output = self.ctx.run(self.raw_input.take(), |ctx| {
+        let mut output = self.ctx.run(self.raw_input.take(), |ctx| {
             self.settings.show(ctx, frame_ctx, &mut self.actions);
             self.network.show(ctx, frame_ctx, &mut self.actions);
             self.bluetooth.show(ctx, frame_ctx, &mut self.actions);
@@ -356,6 +465,10 @@ impl EguiLayer {
             self.workspaces.show(ctx, frame_ctx, &mut self.actions);
             self.clipboard.show(ctx, frame_ctx, &mut self.actions);
         });
+
+        if let Some(update) = output.platform_output.accesskit_update.take() {
+            self.accessibility.update(update);
+        }
 
         self.textures_delta.append(output.textures_delta);
         self.primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
@@ -492,6 +605,7 @@ impl EguiLayer {
         self.primitives.clear();
         self.wants_pointer_input = false;
         self.wants_keyboard_input = false;
+        self.accessibility.set_inactive();
     }
 
     pub fn render(
@@ -550,13 +664,17 @@ impl EguiLayer {
         build: impl FnOnce(&Context, &mut Vec<UiAction>),
     ) {
         self.prepare_raw_input(frame_ctx);
+        self.accessibility.append_actions(&mut self.raw_input);
         let mut actions = Vec::new();
         let mut build = Some(build);
-        let output = self.ctx.run(self.raw_input.take(), |ctx| {
+        let mut output = self.ctx.run(self.raw_input.take(), |ctx| {
             if let Some(build) = build.take() {
                 build(ctx, &mut actions);
             }
         });
+        if let Some(update) = output.platform_output.accesskit_update.take() {
+            self.accessibility.update(update);
+        }
         self.textures_delta.append(output.textures_delta);
         self.primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
         self.actions.extend(actions);
@@ -1079,10 +1197,12 @@ fn egui_work_rect(frame_ctx: &DesktopFrameCtx) -> egui::Rect {
 #[cfg(test)]
 mod egui_vertex_layout_tests {
     use super::EguiLayer;
+    use crate::desktop_frame::DesktopFrameCtx;
     use crate::types::PanelKind;
     use egui::epaint::Vertex;
     use focaldesk_types::OutputId;
-    use std::mem;
+    use smithay::utils::{Rectangle, Scale};
+    use std::{mem, time::Instant};
 
     #[test]
     fn vertex_layout_matches_gl_attribs() {
@@ -1103,5 +1223,37 @@ mod egui_vertex_layout_tests {
         layer.open_panel(PanelKind::Workspaces, OutputId(7));
         assert!(!layer.has_open_panels());
         assert_eq!(layer.owner_output(), None);
+    }
+
+    #[test]
+    fn generated_widget_tree_is_available_to_the_unix_adapter() {
+        let mut layer = EguiLayer::default();
+        layer.ctx.enable_accesskit();
+        let now = Instant::now();
+        let frame = DesktopFrameCtx {
+            output_size: (800, 600),
+            output_scale: Scale::from(1.0),
+            work: Rectangle::from_loc_and_size((0, 0), (800, 600)),
+            active_output: OutputId(1),
+            rendering_output: OutputId(1),
+            now,
+            start_time: now,
+            flip_egui_y: false,
+            portal_capture: false,
+        };
+
+        layer.run_ui(&frame, |ctx, _| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let _ = ui.button("Accessible action");
+            });
+        });
+
+        let latest = layer.accessibility.latest.read().unwrap();
+        let update = latest.as_ref().expect("accessibility update");
+        assert!(update.nodes.len() >= 2);
+        assert!(update.nodes.iter().any(|(_, node)| {
+            node.role() == egui::accesskit::Role::Button
+                && node.label() == Some("Accessible action")
+        }));
     }
 }

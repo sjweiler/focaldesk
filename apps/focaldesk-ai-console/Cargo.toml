@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-gtk4 = "0.9"
+gtk4 = { version = "0.9", features = ["v4_12"] }
 glib = "0.20"
 dirs = "6"
 focaldesk-ai = { path = "../../crates/focaldesk-ai" }
+focaldesk-gtk = { path = "../../crates/focaldesk-gtk" }
+focaldesk-config = { path = "../../crates/focaldesk-config" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }
+focaldesk-themes = { path = "../../crates/focaldesk-themes" }
 focaldesk-voice = { path = "../../crates/focaldesk-voice" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }

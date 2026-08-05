@@ -11,6 +11,7 @@ members = [
     "crates/focaldesk-settings-core",
     "crates/focaldesk-automation",
     "crates/focaldesk-ui",
+    "crates/focaldesk-gtk",
     "crates/focaldesk-network",
     "crates/focaldesk-logging",
     "crates/focaldesk-voice",

@@ -643,7 +643,7 @@ impl RenderState {
         Ok(&self.output_icc_lut_gpu.get(&output_id).unwrap().texture)
     }
 
-    fn draw_topbar_meta(
+    fn draw_topbar_identity(
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         fonts: &FontSystem,
@@ -659,20 +659,47 @@ impl RenderState {
         let style = style_for(FontRole::Meta, 18, builtin_id);
         let gap = theme.spacing.max(4);
 
-        let y_logical = layout.topbar.title.loc.y + 24;
-        // Same left inset as `draw_topbar_title`, then skip past measured title so meta never overlaps.
-        let title_left_logical = layout.topbar.title.loc.x + 14;
-        let mut x_logical = title_left_logical + fonts.advance_width(title, title_style) + gap;
-
         let output_s = output_number.to_string();
         let workspace_s = workspace_number.to_string();
+        let title_bounds = fonts
+            .vertical_bounds(title, title_style)
+            .unwrap_or((-(title_style.size_px as i32), 0));
+        let meta_bounds = [
+            fonts.vertical_bounds("OUT", style),
+            fonts.vertical_bounds(&output_s, style),
+            fonts.vertical_bounds("WS", style),
+            fonts.vertical_bounds(&workspace_s, style),
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|(top, bottom), (next_top, next_bottom)| {
+            (top.min(next_top), bottom.max(next_bottom))
+        })
+        .unwrap_or((-(style.size_px as i32), 0));
+        let title_center_y = layout.topbar.title.loc.y + layout.topbar.title.size.h / 2;
+        let title_y = title_center_y - (title_bounds.0 + title_bounds.1) / 2;
+        let meta_y = title_center_y - (meta_bounds.0 + meta_bounds.1) / 2;
+        let mut x_logical = layout.topbar.title.loc.x + 14;
+
+        self.draw_text_cached(
+            frame,
+            fonts,
+            title,
+            x_logical,
+            title_y,
+            title_style,
+            theme.text.title,
+            scale,
+        )?;
+
+        x_logical += fonts.advance_width(title, title_style) + gap;
 
         self.draw_text_cached(
             frame,
             fonts,
             "OUT",
             x_logical,
-            y_logical,
+            meta_y,
             style,
             theme.text.meta_label,
             scale,
@@ -685,7 +712,7 @@ impl RenderState {
             fonts,
             &output_s,
             x_logical,
-            y_logical,
+            meta_y,
             style,
             theme.text.meta_value,
             scale,
@@ -698,7 +725,7 @@ impl RenderState {
             fonts,
             "WS",
             x_logical,
-            y_logical,
+            meta_y,
             style,
             theme.text.meta_label,
             scale,
@@ -711,42 +738,9 @@ impl RenderState {
             fonts,
             &workspace_s,
             x_logical,
-            y_logical,
+            meta_y,
             style,
             theme.text.meta_value,
-            scale,
-        )?;
-
-        Ok(())
-    }
-
-    fn draw_topbar_title(
-        &mut self,
-        frame: &mut GlesFrame<'_, '_>,
-        fonts: &FontSystem,
-        layout: &ChromeLayoutLogical,
-        title: &str,
-        theme: &focaldesk_themes::FlowTheme,
-        scale: Scale<f64>,
-    ) -> Result<(), GlesError> {
-        let builtin_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
-
-        let style = style_for(FontRole::Title, 24, builtin_id);
-        // let style = TextStyle {
-        //    font: FontId::Debug,
-        //    size_px: 24,
-        //};
-        let x_logical = layout.topbar.title.loc.x + 14; // 120;
-        let y_logical = layout.topbar.title.loc.y + 24;
-
-        self.draw_text_cached(
-            frame,
-            fonts,
-            title,
-            x_logical,
-            y_logical,
-            style,
-            theme.text.title,
             scale,
         )?;
 
@@ -3771,16 +3765,7 @@ impl RenderState {
             let workspace_number = current_workspace.0 as usize;
             let active_theme = theme;
 
-            let _ = self.draw_topbar_title(
-                frame,
-                fonts,
-                layout,
-                "FOCALDESK",
-                active_theme,
-                ctx.output_scale,
-            );
-
-            let _ = self.draw_topbar_meta(
+            let _ = self.draw_topbar_identity(
                 frame,
                 fonts,
                 layout,
