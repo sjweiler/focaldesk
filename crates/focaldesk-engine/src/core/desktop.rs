@@ -2046,6 +2046,18 @@ impl DesktopState {
                     vec!["--panel".to_string(), panel],
                 );
             }
+            DesktopAction::OpenNotificationsPanel => {
+                self.pending_egui_ops.push(PendingEguiOp::OpenPanel(
+                    focaldesk_ui::types::PanelKind::NotificationHistory,
+                    self.focused_output,
+                ));
+            }
+            DesktopAction::ToggleDoNotDisturb => {
+                let enabled = !self.do_not_disturb;
+                self.set_system_setting(focaldesk_ui::types::SettingKey::DoNotDisturb, enabled);
+                self.do_not_disturb = enabled;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
         }
         Ok(())
     }

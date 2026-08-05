@@ -92,6 +92,8 @@ pub enum DesktopAction {
     FocusWindow { window_id: u32 },
     MoveWindowToWorkspace { window_id: u32, workspace: u32 },
     OpenSettingsPanel { panel: String },
+    OpenNotificationsPanel,
+    ToggleDoNotDisturb,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

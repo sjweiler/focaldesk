@@ -278,8 +278,18 @@ impl ShellClient {
 
     fn activate_at(&self, x: i32) {
         let action = match self.role {
-            ShellRole::Panel if x >= self.width as i32 - 96 => DesktopAction::OpenSettingsPanel {
-                panel: "chrome".into(),
+            ShellRole::Panel if x >= self.width as i32 - 48 => DesktopAction::ToggleDoNotDisturb,
+            ShellRole::Panel if x >= self.width as i32 - 96 => {
+                DesktopAction::OpenNotificationsPanel
+            }
+            ShellRole::Panel if x >= self.width as i32 - 144 => DesktopAction::OpenSettingsPanel {
+                panel: "power".into(),
+            },
+            ShellRole::Panel if x >= self.width as i32 - 192 => DesktopAction::OpenSettingsPanel {
+                panel: "sound".into(),
+            },
+            ShellRole::Panel if x >= self.width as i32 - 240 => DesktopAction::OpenSettingsPanel {
+                panel: "network".into(),
             },
             ShellRole::Panel => DesktopAction::FocusWorkspace { workspace: 1 },
             ShellRole::Dock => DesktopAction::OpenSettingsPanel {
@@ -323,6 +333,8 @@ impl ShellClient {
                 draw_text(canvas, width, x, 18, "NET");
                 x += 24;
             }
+            draw_text(canvas, width, x, 18, "PWR");
+            x += 24;
             if let Some(percent) = self.shell.battery_percent {
                 draw_text(canvas, width, x, 18, &percent.to_string());
             }
@@ -361,6 +373,12 @@ fn draw_text(canvas: &mut [u8], width: u32, x: u32, y: u32, text: &str) {
             ],
             'T' => [
                 0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+            ],
+            'P' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+            ],
+            'R' => [
+                0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
             ],
             '0'..='9' => digit_glyph(ch as u8 - b'0'),
             _ => [0; 7],
