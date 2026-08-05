@@ -6,6 +6,7 @@
 //! blank the desktop.
 
 use anyhow::{Context, Result};
+use chrono::Local;
 use focaldesk_ipc::{send_desktop_request, DesktopAction, IpcRequest, IpcResponse};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
@@ -105,6 +106,7 @@ pub fn run(role: ShellRole) -> Result<()> {
         closed: false,
         pointer: None,
         active_workspace: 1,
+        workspace_count: 1,
         shell: focaldesk_ipc::ShellSnapshot::default(),
         last_snapshot: Instant::now() - Duration::from_secs(10),
     };
@@ -130,6 +132,7 @@ struct ShellClient {
     closed: bool,
     pointer: Option<wl_pointer::WlPointer>,
     active_workspace: u32,
+    workspace_count: usize,
     shell: focaldesk_ipc::ShellSnapshot,
     last_snapshot: Instant,
 }
@@ -273,6 +276,7 @@ impl ShellClient {
             return;
         };
         self.active_workspace = snapshot.session.active_workspace_id.max(1);
+        self.workspace_count = snapshot.shell.workspace_count.max(1);
         self.shell = snapshot.shell;
     }
 
@@ -291,7 +295,11 @@ impl ShellClient {
             ShellRole::Panel if x >= self.width as i32 - 240 => DesktopAction::OpenSettingsPanel {
                 panel: "network".into(),
             },
-            ShellRole::Panel => DesktopAction::FocusWorkspace { workspace: 1 },
+            ShellRole::Panel => DesktopAction::FocusWorkspace {
+                workspace: ((x.max(0) / 40 + 1) as usize)
+                    .min(self.workspace_count)
+                    .max(1) as u32,
+            },
             ShellRole::Dock => DesktopAction::OpenSettingsPanel {
                 panel: "chrome".into(),
             },
@@ -317,12 +325,17 @@ impl ShellClient {
             pixel.copy_from_slice(&self.role.color());
         }
         if self.role == ShellRole::Panel {
+            let workspace_text = (1..=self.workspace_count.min(6))
+                .map(|workspace| workspace.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            draw_text(canvas, width, 16, 18, &workspace_text);
             draw_text(
                 canvas,
                 width,
-                16,
+                width.saturating_sub(32),
                 18,
-                &format!("WS {}", self.active_workspace),
+                &Local::now().format("%H%M").to_string(),
             );
             let mut x = width.saturating_sub(120);
             if self.shell.do_not_disturb {

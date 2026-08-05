@@ -8,5 +8,6 @@ license = "MIT"
 [dependencies]
 anyhow.workspace = true
 focaldesk-ipc = { path = "../focaldesk-ipc" }
+chrono.workspace = true
 smithay-client-toolkit.workspace = true
 wayland-client = "0.31"

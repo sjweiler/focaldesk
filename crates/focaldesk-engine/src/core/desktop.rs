@@ -1897,6 +1897,7 @@ impl DesktopState {
                 active_workspace_id: self.focused_workspace().0,
             },
             shell: focaldesk_ipc::ShellSnapshot {
+                workspace_count: self.workspace_names.len(),
                 do_not_disturb: self.do_not_disturb,
                 notification_unread_count: self.notification_unread_count,
                 network_carrier: self.network_state.has_carrier,

@@ -157,6 +157,7 @@ pub struct DesktopSnapshot {
 /// Small, secret-free state projection intended for trusted shell clients.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShellSnapshot {
+    pub workspace_count: usize,
     pub do_not_disturb: bool,
     pub notification_unread_count: usize,
     pub network_carrier: bool,
