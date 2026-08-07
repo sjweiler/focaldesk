@@ -1,7 +1,8 @@
 [Unit]
-Description=FocalDesk trusted dock
-PartOf=focaldesk-session.target
-After=focaldesk-session.target
+Description=FocalDesk experimental external dock
+PartOf=focaldesk-session.target focaldesk-panel.service
+Requires=focaldesk-panel.service
+After=focaldesk-session.target focaldesk-panel.service
 
 [Service]
 Type=simple
@@ -10,6 +11,3 @@ Restart=on-failure
 RestartSec=2
 KillSignal=SIGINT
 TimeoutStopSec=10
-
-[Install]
-WantedBy=focaldesk-session.target

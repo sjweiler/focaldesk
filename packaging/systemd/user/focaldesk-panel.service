@@ -1,5 +1,5 @@
 [Unit]
-Description=FocalDesk trusted top panel
+Description=FocalDesk experimental external top panel
 PartOf=focaldesk-session.target
 After=focaldesk-session.target
 
@@ -10,6 +10,3 @@ Restart=on-failure
 RestartSec=2
 KillSignal=SIGINT
 TimeoutStopSec=10
-
-[Install]
-WantedBy=focaldesk-session.target

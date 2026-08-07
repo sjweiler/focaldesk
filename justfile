@@ -67,6 +67,9 @@ install-session-target:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/"focaldesk-*.service
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
+    # The native compositor chrome is primary; keep external shell clients opt-in.
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-panel.service"
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-dock.service"
 
 install-services: install-session-target install-server-service install-power-service install-notifications-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
 
@@ -303,6 +306,9 @@ install-session-target-fedora:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/"focaldesk-*.service
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
+    # The native compositor chrome is primary; keep external shell clients opt-in.
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-panel.service"
+    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-dock.service"
 
 install-power-service-fedora:
     cargo build --release -p focaldesk-powerd
