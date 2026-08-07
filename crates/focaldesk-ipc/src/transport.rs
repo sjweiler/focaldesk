@@ -22,6 +22,7 @@ pub struct PeerIdentity {
     pub pid: i32,
     pub executable: PathBuf,
     pub unit: Option<String>,
+    executable_trusted: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -258,12 +259,17 @@ pub fn peer_identity(stream: &impl AsFd) -> io::Result<PeerIdentity> {
         }
         OwnedFd::from_raw_fd(fd as i32)
     };
-    let executable = fs::read_link(format!("/proc/{pid}/exe")).map_err(|err| {
+    let proc_executable = PathBuf::from(format!("/proc/{pid}/exe"));
+    let executable = fs::read_link(&proc_executable).map_err(|err| {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("could not identify IPC peer pid {pid}: {err}"),
         )
     })?;
+    // Inspect the procfs executable link while the pidfd still pins this process.
+    // Unlike the resolved path, /proc/<pid>/exe remains stat-able after an
+    // atomic package upgrade unlinks the running executable.
+    let executable_trusted = executable_path_is_trusted(&proc_executable);
     let unit = fs::read_to_string(format!("/proc/{pid}/cgroup"))
         .ok()
         .and_then(|contents| systemd_unit_from_cgroup(&contents));
@@ -272,6 +278,7 @@ pub fn peer_identity(stream: &impl AsFd) -> io::Result<PeerIdentity> {
         pid,
         executable,
         unit,
+        executable_trusted,
     })
 }
 
@@ -346,7 +353,11 @@ fn policy_allows(identity: &PeerIdentity, policy: PeerPolicy<'_>) -> bool {
     let executable = identity
         .executable
         .file_name()
-        .and_then(|name| name.to_str());
+        .and_then(|name| name.to_str())
+        // Linux annotates a running executable whose directory entry was
+        // replaced during an upgrade. The inode is still pinned and verified
+        // above, so this suffix is state, not part of the executable name.
+        .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name));
     let executable_allowed = executable.is_some_and(|name| {
         policy.allowed_executables.contains(&name) && executable_identity_is_trusted(identity)
     });
@@ -358,6 +369,10 @@ fn policy_allows(identity: &PeerIdentity, policy: PeerPolicy<'_>) -> bool {
 }
 
 fn executable_identity_is_trusted(identity: &PeerIdentity) -> bool {
+    identity.executable_trusted
+}
+
+fn executable_path_is_trusted(path: &Path) -> bool {
     if cfg!(test)
         || cfg!(debug_assertions)
         || std::env::var_os("FOCALDESK_ALLOW_USER_OWNED_IPC_PEERS").is_some()
@@ -365,7 +380,7 @@ fn executable_identity_is_trusted(identity: &PeerIdentity) -> bool {
         return true;
     }
 
-    fs::metadata(&identity.executable)
+    fs::metadata(path)
         .map(|metadata| metadata.uid() == 0 && metadata.mode() & 0o022 == 0)
         .unwrap_or(false)
 }
@@ -487,6 +502,7 @@ mod tests {
             pid: 42,
             executable: PathBuf::from("/usr/bin/untrusted-app"),
             unit: Some("app-untrusted.scope".to_string()),
+            executable_trusted: false,
         };
         let policy = PeerPolicy {
             endpoint: "dialog",
@@ -503,12 +519,14 @@ mod tests {
             pid: 42,
             executable: PathBuf::from("/usr/bin/focaldesk-polkitd"),
             unit: None,
+            executable_trusted: true,
         };
         let by_unit = PeerIdentity {
             uid: 1000,
             pid: 43,
             executable: PathBuf::from("/usr/bin/launcher-wrapper"),
             unit: Some("focaldesk-polkitd.service".to_string()),
+            executable_trusted: false,
         };
         let policy = PeerPolicy {
             endpoint: "dialog",
@@ -517,6 +535,29 @@ mod tests {
         };
         assert!(policy_allows(&by_executable, policy));
         assert!(policy_allows(&by_unit, policy));
+    }
+
+    #[test]
+    fn endpoint_policy_accepts_a_trusted_executable_replaced_during_upgrade() {
+        let policy = PeerPolicy {
+            endpoint: "ai",
+            allowed_executables: &["focaldesk-ai-console"],
+            allowed_units: &[],
+        };
+        let trusted = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/usr/local/bin/focaldesk-ai-console (deleted)"),
+            unit: Some("focal-launchd.service".to_string()),
+            executable_trusted: true,
+        };
+        let untrusted = PeerIdentity {
+            executable_trusted: false,
+            ..trusted.clone()
+        };
+
+        assert!(policy_allows(&trusted, policy));
+        assert!(!policy_allows(&untrusted, policy));
     }
 
     #[test]
