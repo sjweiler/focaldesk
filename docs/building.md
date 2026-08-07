@@ -61,8 +61,11 @@ The CI build uses:
 ```sh
 sudo apt update
 sudo apt install -y \
+  meson \
+  ninja-build \
   pkg-config \
   libwayland-dev \
+  wayland-protocols \
   libxkbcommon-dev \
   libudev-dev \
   libinput-dev \
@@ -76,9 +79,23 @@ sudo apt install -y \
   libgles2-mesa-dev \
   libgbm-dev \
   libgtk-4-dev \
-  libgtk4-layer-shell-dev \
   libadwaita-1-dev \
   libpam0g-dev
+```
+
+Ubuntu 24.04 does not package the GTK4 version of layer shell. Build a pinned
+upstream release after installing the prerequisites above:
+
+```sh
+git clone --branch v1.0.4 --depth 1 \
+  https://github.com/wmww/gtk4-layer-shell.git /tmp/gtk4-layer-shell
+meson setup /tmp/gtk4-layer-shell/build /tmp/gtk4-layer-shell \
+  --prefix=/usr \
+  -Dexamples=false -Ddocs=false -Dtests=false -Dsmoke-tests=false \
+  -Dintrospection=false -Dvapi=false
+meson compile -C /tmp/gtk4-layer-shell/build
+sudo meson install -C /tmp/gtk4-layer-shell/build
+sudo ldconfig
 ```
 
 Install `xwayland` separately if you want to test X11 applications.

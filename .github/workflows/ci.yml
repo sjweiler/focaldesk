@@ -24,8 +24,11 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y \
+            meson \
+            ninja-build \
             pkg-config \
             libwayland-dev \
+            wayland-protocols \
             libxkbcommon-dev \
             libudev-dev \
             libinput-dev \
@@ -39,7 +42,6 @@ jobs:
             libgles2-mesa-dev \
             libgbm-dev \
             libgtk-4-dev \
-            libgtk4-layer-shell-dev \
             libadwaita-1-dev \
             libpam0g-dev \
             libsecret-tools \
@@ -49,6 +51,25 @@ jobs:
             weston \
             xwayland \
             unzip
+
+      - name: Install GTK4 layer shell
+        env:
+          GTK4_LAYER_SHELL_VERSION: "1.0.4"
+        run: |
+          source_dir="$RUNNER_TEMP/gtk4-layer-shell"
+          git clone --branch "v${GTK4_LAYER_SHELL_VERSION}" --depth 1 \
+            https://github.com/wmww/gtk4-layer-shell.git "$source_dir"
+          meson setup "$source_dir/build" "$source_dir" \
+            --prefix=/usr \
+            -Dexamples=false \
+            -Ddocs=false \
+            -Dtests=false \
+            -Dsmoke-tests=false \
+            -Dintrospection=false \
+            -Dvapi=false
+          meson compile -C "$source_dir/build"
+          sudo meson install -C "$source_dir/build"
+          sudo ldconfig
 
       - name: Install Vosk native library
         env:
