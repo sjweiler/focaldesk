@@ -34,6 +34,8 @@ pub struct PeerPolicy<'a> {
 pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "desktop",
     allowed_executables: &[
+        "focal-dock",
+        "focal-panel",
         "focaldesk-settings",
         "focaldesk-portal",
         "focaldesk-cli",
@@ -41,7 +43,11 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-mcp",
         "focald-voice",
     ],
-    allowed_units: &["focald-voice.service"],
+    allowed_units: &[
+        "focaldesk-dock.service",
+        "focaldesk-panel.service",
+        "focald-voice.service",
+    ],
 };
 
 pub const SETTINGS_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -377,6 +383,22 @@ fn systemd_unit_from_cgroup(contents: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_policy_allows_trusted_shell_clients() {
+        assert!(DESKTOP_POLICY.allowed_executables.contains(&"focal-dock"));
+        assert!(DESKTOP_POLICY.allowed_executables.contains(&"focal-panel"));
+        assert!(
+            DESKTOP_POLICY
+                .allowed_units
+                .contains(&"focaldesk-dock.service")
+        );
+        assert!(
+            DESKTOP_POLICY
+                .allowed_units
+                .contains(&"focaldesk-panel.service")
+        );
+    }
 
     #[test]
     fn private_listener_uses_restrictive_permissions_and_accepts_same_user() {

@@ -63,7 +63,7 @@ use focaldesk_themes::TextTheme;
 use focaldesk_themes::WallpaperTheme;
 use focaldesk_types::WorkspaceId;
 use focaldesk_ui::chrome_draw::draw_flow_field;
-use focaldesk_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical};
+use focaldesk_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use focaldesk_ui::chrome_shaders::ChromeShaders;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::dialog::{Dialog, DialogId};
@@ -240,6 +240,8 @@ pub struct RenderInputs<'a> {
     pub current_workspace: WorkspaceId,
     /// A fullscreen client on this output owns the entire display, including the shell chrome.
     pub fullscreen_client: bool,
+    /// False when trusted standalone panel/dock layer surfaces own the shell presentation.
+    pub draw_internal_chrome: bool,
     // 👇 ADD THESE
     pub dialogs: &'a [Dialog],
     pub active_dialog: Option<DialogId>,
@@ -1841,19 +1843,21 @@ impl RenderState {
             // Chrome draws opaque bevels over the work region; clients must be composited
             // after that shell (and work-area wallpaper), or they are fully covered.
             if !inputs.fullscreen_client {
-                self.draw_chrome_below_work_wallpaper(
-                    frame,
-                    inputs.ctx,
-                    inputs.layout,
-                    inputs.output,
-                    inputs.metrics,
-                    muts.ui,
-                    inputs.sidebar_hover_slot,
-                    inputs.sidebar_pulse,
-                    inputs.topbar_pulse,
-                    inputs.clock_pulse,
-                    theme.chrome,
-                );
+                if inputs.draw_internal_chrome {
+                    self.draw_chrome_below_work_wallpaper(
+                        frame,
+                        inputs.ctx,
+                        inputs.layout,
+                        inputs.output,
+                        inputs.metrics,
+                        muts.ui,
+                        inputs.sidebar_hover_slot,
+                        inputs.sidebar_pulse,
+                        inputs.topbar_pulse,
+                        inputs.clock_pulse,
+                        theme.chrome,
+                    );
+                }
 
                 self.draw_wallpaper_in_rect(
                     frame,
@@ -1865,14 +1869,16 @@ impl RenderState {
                 );
 
                 // Work-area glass must sit under client surfaces (trim/icons stay above).
-                if matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr) {
+                if inputs.draw_internal_chrome
+                    && matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr)
+                {
                     self.draw_work_area_glass_layer(frame, &inputs, theme)?;
                 }
             }
         }
 
         if matches!(stage, OutputRenderStage::LinearGlassUnderClients) {
-            if !inputs.fullscreen_client {
+            if !inputs.fullscreen_client && inputs.draw_internal_chrome {
                 self.draw_work_area_glass_layer(frame, &inputs, theme)?;
             }
             return Ok(());
@@ -1933,7 +1939,7 @@ impl RenderState {
             return Ok(());
         }
 
-        if !inputs.fullscreen_client {
+        if !inputs.fullscreen_client && inputs.draw_internal_chrome {
             self.draw_chrome_trim_glass_icons(
                 frame,
                 inputs.ctx,
@@ -2731,6 +2737,26 @@ impl RenderState {
         _damage: &[Rectangle<i32, Physical>],
         style: &BevelStyle,
     ) -> Result<(), GlesError> {
+        Self::draw_beveled_panel_with_radius(
+            frame,
+            program,
+            rect_logical,
+            scale,
+            _damage,
+            style,
+            0.0,
+        )
+    }
+
+    fn draw_beveled_panel_with_radius(
+        frame: &mut GlesFrame<'_, '_>,
+        program: &GlesPixelProgram,
+        rect_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+        _damage: &[Rectangle<i32, Physical>],
+        style: &BevelStyle,
+        corner_radius: f32,
+    ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
         let src_rect = Rectangle::from_loc_and_size(
             (0.0, 0.0),
@@ -2746,6 +2772,10 @@ impl RenderState {
             Uniform::new("u_glow_width", style.glow_width),
             Uniform::new("u_glow_alpha", style.glow_alpha),
             Uniform::new("u_inner_shadow", style.inner_shadow),
+            Uniform::new(
+                "u_corner_radius",
+                corner_radius * scale.x.max(scale.y) as f32,
+            ),
             Uniform::new("u_face_color", style.face_color),
             Uniform::new("u_light_color", style.light_color),
             Uniform::new("u_shadow_color", style.shadow_color),
@@ -3112,7 +3142,6 @@ impl RenderState {
             crate::core::portal::push_layer_elements_for_output(
                 renderer,
                 out_handle,
-                region.loc,
                 region.size,
                 Scale::from(scale),
                 &mut out,
@@ -3427,22 +3456,24 @@ impl RenderState {
             &legacy_theme.frame_inner,
         );
 
-        let _ = Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel_with_radius(
             frame,
             &beveled,
             layout.sidebar.outer,
             ctx.output_scale,
             damage,
             &legacy_theme.sidebar,
+            SIDEBAR_CORNER_RADIUS,
         );
 
-        let _ = Self::draw_beveled_panel(
+        let _ = Self::draw_beveled_panel_with_radius(
             frame,
             &beveled,
             layout.sidebar.inner,
             ctx.output_scale,
             damage,
             &legacy_theme.panel_inner,
+            (SIDEBAR_CORNER_RADIUS - 4.0).max(0.0),
         );
 
         let _ = Self::draw_beveled_panel(

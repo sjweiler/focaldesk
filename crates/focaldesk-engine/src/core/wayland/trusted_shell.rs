@@ -5,17 +5,34 @@
 //! layer-shell client cannot silently move the desktop work area.
 
 use smithay::{
+    backend::renderer::utils::RendererSurfaceStateUserData,
     desktop::layer_map_for_output,
     output::Output,
-    utils::{Logical, Rectangle},
+    utils::{Logical, Point, Rectangle},
+    wayland::compositor::with_states,
     wayland::shell::wlr_layer::{Anchor, ExclusiveZone},
 };
 
 pub const PANEL_NAMESPACE: &str = "focal-panel";
 pub const DOCK_NAMESPACE: &str = "focal-dock";
+pub const PANEL_INPUT_HEIGHT: i32 = 64;
+pub const DOCK_INPUT_WIDTH: i32 = 76;
 
 pub fn is_trusted_namespace(namespace: &str) -> bool {
     matches!(namespace, PANEL_NAMESPACE | DOCK_NAMESPACE)
+}
+
+/// The interactive part of each trusted shell surface. The clients allocate a
+/// transparent extension for their tooltips, so their full layer geometry must
+/// not become an input target. This is also used as a compositor-side fallback
+/// when Smithay has not yet attached the committed `wl_region` to its renderer
+/// surface view (notably after a viewport/fractional-scale transition).
+pub fn input_region_contains(namespace: &str, point: Point<f64, Logical>) -> bool {
+    match namespace {
+        PANEL_NAMESPACE => point.x >= 0.0 && point.y >= 0.0 && point.y < PANEL_INPUT_HEIGHT as f64,
+        DOCK_NAMESPACE => point.x >= 0.0 && point.x < DOCK_INPUT_WIDTH as f64 && point.y >= 0.0,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -40,6 +57,20 @@ pub fn reservation_for_output(output: &Output) -> TrustedShellReservation {
     let mut reservation = TrustedShellReservation::default();
 
     for layer in map.layers() {
+        // Do not let a configured-but-unpainted shell surface hide the
+        // compositor's built-in chrome. Renderer state only gains a view after
+        // a real client buffer has been imported successfully.
+        let has_renderable_buffer = with_states(layer.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .and_then(|state| state.lock().ok())
+                .and_then(|state| state.view())
+                .is_some()
+        });
+        if !has_renderable_buffer {
+            continue;
+        }
         let zone = match layer.cached_state().exclusive_zone {
             ExclusiveZone::Exclusive(amount) if amount > 0 => amount,
             _ => continue,
@@ -93,5 +124,17 @@ mod tests {
             .size,
             (1, 1).into()
         );
+    }
+
+    #[test]
+    fn trusted_input_regions_exclude_tooltip_extensions() {
+        assert!(input_region_contains(PANEL_NAMESPACE, (500.0, 32.0).into()));
+        assert!(!input_region_contains(
+            PANEL_NAMESPACE,
+            (500.0, 70.0).into()
+        ));
+        assert!(input_region_contains(DOCK_NAMESPACE, (38.0, 500.0).into()));
+        assert!(!input_region_contains(DOCK_NAMESPACE, (84.0, 500.0).into()));
+        assert!(!input_region_contains("untrusted", (1.0, 1.0).into()));
     }
 }

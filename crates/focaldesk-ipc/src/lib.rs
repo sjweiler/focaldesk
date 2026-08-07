@@ -99,6 +99,9 @@ pub enum DesktopAction {
     OpenSettingsPanel { panel: String },
     OpenNotificationsPanel,
     ToggleDoNotDisturb,
+    CreateWorkspace,
+    DeleteWorkspace,
+    OpenCalendarPanel,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

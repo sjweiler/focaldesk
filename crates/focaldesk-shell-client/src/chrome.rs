@@ -1,20 +1,30 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 
+use smithay::backend::renderer::gles::{ffi, GlesError, GlesFrame, GlesTexture, Uniform};
 use smithay::backend::renderer::Frame;
-use smithay::backend::renderer::gles::{GlesFrame, GlesTexture, Uniform, ffi};
 use smithay::backend::renderer::{ImportMem, Renderer, RendererSuper, Texture};
 use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transform};
 //use crate::icons::{IconCache, IconId, IconKey, IconState};
-use crate::atlas::{IconAtlas, IconId, build_icon_atlas, render_atlas_icon};
+use crate::atlas::{
+    build_icon_atlas, render_atlas_icon, render_atlas_icon_with_alpha, IconAtlas, IconId,
+};
 use crate::chrome_draw::{draw_beveled_panel, draw_recessed_button, draw_top_bar, well_icon_rect};
-use crate::chrome_layout::{ChromeLayoutConfig, build_chrome_layout_with_config};
+use crate::chrome_layout::{build_chrome_layout_with_config, ChromeLayoutConfig};
 use crate::chrome_shaders::ChromeShaders;
-use crate::chrome_theme::{ChromeTheme, chrome_theme_from_flow_theme};
+use crate::chrome_theme::{chrome_theme_from_flow_theme, ChromeTheme};
+use crate::controls::ShellControl;
 use crate::font_atlas::FontAtlas;
 use crate::svg::rasterize_svg;
 use focaldesk_themes::FlowTheme;
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PulseFrame {
+    pub control: usize,
+    pub click: (f64, f64),
+    pub elapsed: std::time::Duration,
+}
 
 pub fn load_svg_texture<R>(
     renderer: &mut R,
@@ -53,6 +63,41 @@ where
         .map_err(|e| anyhow!("import_memory failed for {path}: {:?}", e))?;
 
     Ok(tex)
+}
+
+pub(crate) fn dock_slot_rects(
+    logical_w: i32,
+    logical_h: i32,
+    requested: usize,
+) -> Vec<Rectangle<i32, Logical>> {
+    let slot_w = (logical_w - 16).max(16);
+    let max_slots = ((logical_h - 10 - 24 + 8).max(0) / 56) as usize;
+    (0..requested.min(max_slots))
+        .map(|index| Rectangle::from_loc_and_size((8, 10 + index as i32 * 56), (slot_w, 48)))
+        .collect()
+}
+
+fn scale_rect_about_center(rect: Rectangle<i32, Logical>, factor: f64) -> Rectangle<i32, Logical> {
+    let w = (rect.size.w as f64 * factor).round() as i32;
+    let h = (rect.size.h as f64 * factor).round() as i32;
+    Rectangle::from_loc_and_size(
+        (
+            rect.loc.x - (w - rect.size.w) / 2,
+            rect.loc.y - (h - rect.size.h) / 2,
+        ),
+        (w.max(1), h.max(1)),
+    )
+}
+
+fn centered_square(rect: Rectangle<i32, Logical>, side: i32) -> Rectangle<i32, Logical> {
+    let side = side.min(rect.size.w).min(rect.size.h).max(1);
+    Rectangle::from_loc_and_size(
+        (
+            rect.loc.x + (rect.size.w - side) / 2,
+            rect.loc.y + (rect.size.h - side) / 2,
+        ),
+        (side, side),
+    )
 }
 
 #[derive(Default, Debug, Clone)]
@@ -205,10 +250,11 @@ impl Chrome {
         x: i32,
         baseline_y: i32,
         output_size: Size<i32, Physical>,
+        scale: f64,
         tint: [f32; 4],
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
         if let Some(font_atlas) = &self.font_atlas {
-            font_atlas.render(frame, text, x, baseline_y, output_size, tint)?;
+            font_atlas.render(frame, text, x, baseline_y, output_size, scale, tint)?;
         }
         Ok(())
     }
@@ -241,7 +287,10 @@ impl Chrome {
         frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
         output_size: Size<i32, Physical>,
         scale: f64,
-    ) {
+        controls: &[ShellControl],
+        hovered: Option<usize>,
+        pulse: Option<PulseFrame>,
+    ) -> std::result::Result<(), GlesError> {
         let beveled = self.shaders.beveled_panel.as_ref();
         let button = self.shaders.recessed_button.as_ref();
         let damage = [Rectangle::from_size(output_size)];
@@ -255,19 +304,19 @@ impl Chrome {
             self.metrics.topbar_h,
             self.metrics.sidebar_w,
             ChromeLayoutConfig {
-                status_item_count: 6,
+                status_item_count: controls.len(),
                 sidebar_item_count: 0,
             },
         );
         if let Some(top_bar) = self.shaders.top_bar.as_ref() {
-            let _ = draw_top_bar(
+            draw_top_bar(
                 frame,
                 top_bar,
                 layout.topbar.outer,
                 sc,
                 &damage,
                 &self.theme.top_bar,
-            );
+            )?;
         }
         if let Some(beveled) = beveled {
             for (rect, style) in [
@@ -276,47 +325,116 @@ impl Chrome {
                 (layout.topbar.title, &self.theme.panel_inner),
                 (layout.topbar.trim, &self.theme.trim),
             ] {
-                let _ = draw_beveled_panel(frame, beveled, rect, sc, &damage, style);
-            }
-        }
-        if let Some(button) = button {
-            for well in layout
-                .topbar
-                .status_wells
-                .iter()
-                .chain(std::iter::once(&layout.topbar.clock_well))
-            {
-                let _ = draw_recessed_button(frame, button, *well, sc, &damage, &self.theme.button);
+                draw_beveled_panel(frame, beveled, rect, sc, &damage, style)?;
             }
         }
         let launcher_control = layout.topbar.flow_field;
-        let launcher_icon = well_icon_rect(launcher_control);
+        // Match the compositor's TopbarFlowField constructor: keep the AI
+        // glyph square and cap it at 28 logical pixels inside the wide well.
+        let mut launcher_icon = centered_square(launcher_control, launcher_control.size.h.min(28));
+        if hovered == Some(0) {
+            launcher_icon = scale_rect_about_center(launcher_icon, 1.08);
+        }
+        let launcher_state = ShellControl {
+            icon: IconId::AiConsole,
+            tooltip: "Launch FocalDesk AI Console".into(),
+            action: focaldesk_ipc::DesktopAction::LaunchApp {
+                app: "focaldesk-ai-console".into(),
+            },
+            selected: false,
+            active: false,
+            enabled: true,
+        };
         if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-            let _ = self.draw_glass_icon(
+            self.draw_glass_icon(
                 frame,
-                IconId::Launcher,
+                IconId::AiConsole,
                 launcher_control,
                 launcher_icon,
                 scale,
                 output_size,
-            );
+                hovered == Some(0),
+                &launcher_state,
+            )?;
         }
-        if let (Some(atlas), Some(entry)) = (
-            self.atlas.as_ref(),
-            self.atlas.as_ref().and_then(|a| a.get(IconId::Launcher)),
-        ) {
-            let physical = launcher_icon.to_physical_precise_round(sc);
-            let _ = render_atlas_icon(
+        self.render_icon(frame, IconId::AiConsole, launcher_icon, sc, output_size)?;
+        if let Some(pulse) = pulse.filter(|pulse| pulse.control == 0) {
+            self.draw_pulse(frame, launcher_control, pulse, sc, &damage)?;
+        }
+
+        for (index, (well, control)) in layout.topbar.status_wells.iter().zip(controls).enumerate()
+        {
+            let control_index = index + 1;
+            if let Some(button) = button {
+                let mut style = self.theme.button;
+                if control.selected || control.active || hovered == Some(control_index) {
+                    style.glow_strength = if control.active { 1.0 } else { 0.72 };
+                    style.glow_radius = style.glow_radius.max(7.0);
+                }
+                if !control.enabled {
+                    style.face_color[3] *= 0.52;
+                    style.glow_strength = 0.0;
+                }
+                draw_recessed_button(frame, button, *well, sc, &damage, &style)?;
+            }
+            let mut icon_rect = well_icon_rect(*well);
+            if hovered == Some(control_index) {
+                icon_rect = scale_rect_about_center(icon_rect, 1.08);
+            }
+            if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
+                self.draw_glass_icon(
+                    frame,
+                    control.icon,
+                    *well,
+                    icon_rect,
+                    scale,
+                    output_size,
+                    hovered == Some(control_index),
+                    control,
+                )?;
+            }
+            self.render_icon_alpha(
                 frame,
-                &atlas.texture,
-                *entry,
-                physical.loc.x,
-                physical.loc.y,
-                physical.size.w,
-                physical.size.h,
+                control.icon,
+                icon_rect,
+                sc,
                 output_size,
-            );
+                if control.enabled { 1.0 } else { 0.38 },
+            )?;
+            if let Some(pulse) = pulse.filter(|pulse| pulse.control == control_index) {
+                self.draw_pulse(frame, *well, pulse, sc, &damage)?;
+            }
         }
+        let clock_index = controls.len() + 1;
+        if let Some(button) = button {
+            let mut style = self.theme.button;
+            if hovered == Some(clock_index) {
+                style.glow_strength = 0.72;
+                style.glow_radius = style.glow_radius.max(7.0);
+            }
+            draw_recessed_button(frame, button, layout.topbar.clock_well, sc, &damage, &style)?;
+        }
+        if let Some(pulse) = pulse.filter(|pulse| pulse.control == clock_index) {
+            self.draw_pulse(frame, layout.topbar.clock_well, pulse, sc, &damage)?;
+        }
+        if let Some(index) = hovered {
+            let (tooltip, anchor) = if index == 0 {
+                ("Launch FocalDesk AI Console", launcher_control)
+            } else if index == clock_index {
+                ("Calendar and clock", layout.topbar.clock_well)
+            } else if let Some(control) = controls.get(index - 1) {
+                (
+                    control.tooltip.as_str(),
+                    layout.topbar.status_wells[index - 1],
+                )
+            } else {
+                ("", launcher_control)
+            };
+            if !tooltip.is_empty() {
+                self.render_tooltip(frame, tooltip, anchor, output_size, scale, true)?;
+            }
+        }
+        Ok(())
     }
 
     /// Render only the sidebar portion for a standalone layer-shell dock.
@@ -324,102 +442,139 @@ impl Chrome {
         &self,
         frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
         output_size: Size<i32, Physical>,
-        workspace_count: usize,
+        controls: &[ShellControl],
+        hovered: Option<usize>,
+        pulse: Option<PulseFrame>,
         scale: f64,
-    ) {
+    ) -> std::result::Result<(), GlesError> {
         let beveled = self.shaders.beveled_panel.as_ref();
         let button = self.shaders.recessed_button.as_ref();
         let damage = [Rectangle::from_size(output_size)];
         let sc = Scale::from((scale, scale));
-        let logical_w = (output_size.w as f64 / scale) as i32;
+        let logical_w = self.metrics.sidebar_w;
         let logical_h = (output_size.h as f64 / scale) as i32;
-        let requested_items = 2 + workspace_count.clamp(1, 9) + 5;
-        let layout = build_chrome_layout_with_config(
-            Size::from((logical_w, logical_h)),
-            self.metrics.topbar_h,
-            self.metrics.sidebar_w,
-            ChromeLayoutConfig {
-                status_item_count: 0,
-                sidebar_item_count: requested_items,
-            },
+        let outer = Rectangle::<i32, Logical>::from_loc_and_size(
+            (0, 0),
+            (logical_w.max(1), logical_h.max(1)),
         );
+        let inner = crate::chrome_draw::inset_rect(outer, 4);
         if let Some(beveled) = beveled {
-            let _ = draw_beveled_panel(
-                frame,
-                beveled,
-                layout.sidebar.outer,
-                sc,
-                &damage,
-                &self.theme.sidebar,
-            );
-            let _ = draw_beveled_panel(
-                frame,
-                beveled,
-                layout.sidebar.inner,
-                sc,
-                &damage,
-                &self.theme.panel_inner,
-            );
+            draw_beveled_panel(frame, beveled, outer, sc, &damage, &self.theme.sidebar)?;
+            draw_beveled_panel(frame, beveled, inner, sc, &damage, &self.theme.panel_inner)?;
         }
 
-        let icons = std::iter::once(IconId::Settings)
-            .chain(std::iter::once(IconId::Launcher))
-            .chain((1..=workspace_count.clamp(1, 9)).map(|n| IconId::Slot(n as u8)))
-            .chain([
-                IconId::Plus,
-                IconId::Browser,
-                IconId::Terminal,
-                IconId::Files,
-                IconId::Email,
-            ]);
-        for (slot, icon) in layout.sidebar.slots.iter().zip(icons) {
+        let slots = dock_slot_rects(logical_w, logical_h, controls.len());
+        for (index, (control, slot_outer)) in controls.iter().zip(slots).enumerate() {
+            let slot_inner = crate::chrome_draw::inset_rect(slot_outer, 2);
+            let icon_well = crate::chrome_draw::inset_rect(slot_inner, 3);
+            let active = control.selected || control.active;
             if let Some(beveled) = beveled {
-                let _ =
-                    draw_beveled_panel(frame, beveled, slot.outer, sc, &damage, &self.theme.module);
-                let _ = draw_beveled_panel(
+                draw_beveled_panel(frame, beveled, slot_outer, sc, &damage, &self.theme.module)?;
+                draw_beveled_panel(
                     frame,
                     beveled,
-                    slot.inner,
+                    slot_inner,
                     sc,
                     &damage,
-                    &self.theme.module_inner,
-                );
+                    if active {
+                        &self.theme.icon_well_active
+                    } else {
+                        &self.theme.module_inner
+                    },
+                )?;
             }
             if let Some(button) = button {
-                let _ = draw_recessed_button(
-                    frame,
-                    button,
-                    slot.icon_well,
-                    sc,
-                    &damage,
-                    &self.theme.button,
-                );
-            }
-            let icon_rect = well_icon_rect(slot.icon_well);
-            if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-                if let Err(error) =
-                    self.draw_glass_icon(frame, icon, slot.icon_well, icon_rect, scale, output_size)
-                {
-                    eprintln!("focal dock glass icon {icon:?}: {error}");
+                let mut style = self.theme.button;
+                if active || hovered == Some(index) {
+                    style.glow_strength = 1.0;
+                    style.glow_radius = style.glow_radius.max(7.0);
+                    style.face_color = self.theme.icon_well_active.face_color;
                 }
+                if !control.enabled {
+                    style.face_color[3] *= 0.52;
+                    style.glow_strength = 0.0;
+                }
+                draw_recessed_button(frame, button, icon_well, sc, &damage, &style)?;
             }
-            if let (Some(atlas), Some(entry)) = (
-                self.atlas.as_ref(),
-                self.atlas.as_ref().and_then(|a| a.get(icon)),
-            ) {
-                let physical = icon_rect.to_physical_precise_round(sc);
-                let _ = render_atlas_icon(
+            let mut icon_rect = well_icon_rect(icon_well);
+            if hovered == Some(index) {
+                icon_rect = scale_rect_about_center(icon_rect, 1.10);
+            }
+            if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
+                self.draw_glass_icon(
                     frame,
-                    &atlas.texture,
-                    *entry,
-                    physical.loc.x,
-                    physical.loc.y,
-                    physical.size.w,
-                    physical.size.h,
+                    control.icon,
+                    icon_well,
+                    icon_rect,
+                    scale,
                     output_size,
-                );
+                    hovered == Some(index),
+                    control,
+                )?;
+            }
+            self.render_icon_alpha(
+                frame,
+                control.icon,
+                icon_rect,
+                sc,
+                output_size,
+                if control.enabled { 1.0 } else { 0.38 },
+            )?;
+            if let Some(pulse) = pulse.filter(|pulse| pulse.control == index) {
+                self.draw_pulse(frame, slot_outer, pulse, sc, &damage)?;
+            }
+            if hovered == Some(index) {
+                self.render_tooltip(
+                    frame,
+                    &control.tooltip,
+                    slot_outer,
+                    output_size,
+                    scale,
+                    false,
+                )?;
             }
         }
+        Ok(())
+    }
+
+    fn render_icon(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        icon: IconId,
+        rect: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+        output_size: Size<i32, Physical>,
+    ) -> std::result::Result<(), GlesError> {
+        self.render_icon_alpha(frame, icon, rect, scale, output_size, 1.0)
+    }
+
+    fn render_icon_alpha(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        icon: IconId,
+        rect: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+        output_size: Size<i32, Physical>,
+        alpha: f32,
+    ) -> std::result::Result<(), GlesError> {
+        let Some(atlas) = self.atlas.as_ref() else {
+            return Ok(());
+        };
+        let Some(entry) = atlas.get(icon) else {
+            return Ok(());
+        };
+        let physical = rect.to_physical_precise_round(scale);
+        render_atlas_icon_with_alpha(
+            frame,
+            &atlas.texture,
+            *entry,
+            physical.loc.x,
+            physical.loc.y,
+            physical.size.w,
+            physical.size.h,
+            output_size,
+            alpha,
+        )
     }
 
     /// Render one atlas icon through the shared glass-control shader.  The
@@ -433,6 +588,8 @@ impl Chrome {
         icon_rect: Rectangle<i32, Logical>,
         scale: f64,
         output_size: Size<i32, Physical>,
+        hovered: bool,
+        control_state: &ShellControl,
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
         let (Some(program), Some(background), Some(atlas)) = (
             self.shaders.glass_control.as_ref(),
@@ -518,7 +675,7 @@ impl Chrome {
             &atlas.texture,
             source,
             control,
-            &[Rectangle::from_size(control.size)],
+            &[Rectangle::from_size(output_size)],
             &[],
             Transform::Normal,
             1.0,
@@ -554,10 +711,20 @@ impl Chrome {
                 ),
                 Uniform::new("u_corner_radius", self.theme.top_bar.radius * scale as f32),
                 Uniform::new("u_border_width", 2.0f32),
-                Uniform::new("u_hover", 0.0f32),
+                Uniform::new("u_hover", if hovered { 1.0f32 } else { 0.0 }),
                 Uniform::new("u_pressed", 0.0f32),
-                Uniform::new("u_enabled", 1.0f32),
-                Uniform::new("u_active", 0.0f32),
+                Uniform::new(
+                    "u_enabled",
+                    if control_state.enabled { 1.0f32 } else { 0.0 },
+                ),
+                Uniform::new(
+                    "u_active",
+                    if control_state.active || control_state.selected {
+                        1.0f32
+                    } else {
+                        0.0
+                    },
+                ),
                 Uniform::new("u_warning", 0.0f32),
                 Uniform::new("u_light_dir", [-0.45f32, -0.65, 0.80]),
                 Uniform::new("u_opacity", 0.96f32),
@@ -571,8 +738,89 @@ impl Chrome {
             gl.BindTexture(ffi::TEXTURE_2D, 0);
             gl.ActiveTexture(ffi::TEXTURE0);
         });
-        let _ = output_size;
         result
+    }
+
+    fn draw_pulse(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        rect: Rectangle<i32, Logical>,
+        pulse: PulseFrame,
+        scale: Scale<f64>,
+        damage: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        let Some(program) = self.shaders.pulse.as_ref() else {
+            return Ok(());
+        };
+        let dst = rect.to_physical_precise_round(scale);
+        let src = Rectangle::<f64, Buffer>::from_loc_and_size(
+            (0.0, 0.0),
+            (dst.size.w as f64, dst.size.h as f64),
+        );
+        let click_x =
+            ((pulse.click.0 - rect.loc.x as f64) * scale.x).clamp(0.0, dst.size.w as f64) as f32;
+        let click_y =
+            ((pulse.click.1 - rect.loc.y as f64) * scale.y).clamp(0.0, dst.size.h as f64) as f32;
+        frame.render_pixel_shader_to(
+            program,
+            src,
+            dst,
+            Size::<i32, Buffer>::from((dst.size.w, dst.size.h)),
+            Some(damage),
+            1.0,
+            &[
+                Uniform::new("u_click_pos", [click_x, click_y]),
+                Uniform::new("u_time", pulse.elapsed.as_secs_f32()),
+                Uniform::new("u_size", [dst.size.w as f32, dst.size.h as f32]),
+                Uniform::new("u_color", [0.0f32, 0.5, 1.0, 1.0]),
+            ],
+        )
+    }
+
+    fn render_tooltip(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        text: &str,
+        anchor: Rectangle<i32, Logical>,
+        output_size: Size<i32, Physical>,
+        scale: f64,
+        panel: bool,
+    ) -> Result<(), GlesError> {
+        let max_chars = 38usize;
+        let label = text.chars().take(max_chars).collect::<String>();
+        let max_width = if panel { 300 } else { 232 };
+        let width = (label.chars().count() as i32 * 8 + 20).clamp(80, max_width);
+        let logical_surface_w = (output_size.w as f64 / scale).round() as i32;
+        let logical_surface_h = (output_size.h as f64 / scale).round() as i32;
+        let rect = if panel {
+            Rectangle::from_loc_and_size(
+                (
+                    (anchor.loc.x + anchor.size.w / 2 - width / 2)
+                        .clamp(4, logical_surface_w - width - 4),
+                    70,
+                ),
+                (width, 34),
+            )
+        } else {
+            Rectangle::from_loc_and_size(
+                (84, (anchor.loc.y + 7).clamp(4, logical_surface_h - 38)),
+                (width, 34),
+            )
+        };
+        let sc = Scale::from((scale, scale));
+        let damage = [Rectangle::from_size(output_size)];
+        if let Some(beveled) = self.shaders.beveled_panel.as_ref() {
+            draw_beveled_panel(frame, beveled, rect, sc, &damage, &self.theme.module)?;
+        }
+        self.render_text(
+            frame,
+            &label,
+            ((rect.loc.x + 10) as f64 * scale).round() as i32,
+            ((rect.loc.y + 23) as f64 * scale).round() as i32,
+            output_size,
+            scale,
+            [0.95, 0.97, 1.0, 1.0],
+        )
     }
 
     fn draw_topbar_icons(
@@ -658,5 +906,27 @@ impl Chrome {
             }
             y += self.metrics.icon_base_px as i32 + self.metrics.slot_spacing;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dock_slots_start_in_dock_local_coordinates() {
+        let slots = dock_slot_rects(76, 1080, 12);
+        assert_eq!(slots.len(), 12);
+        assert_eq!(slots[0].loc, (8, 10).into());
+        assert_eq!(slots[0].size, (60, 48).into());
+        assert!(slots.last().unwrap().loc.y + slots.last().unwrap().size.h <= 1080);
+    }
+
+    #[test]
+    fn flow_field_icon_stays_square_in_a_wide_control() {
+        let control = Rectangle::from_loc_and_size((10, 8), (138, 44));
+        let icon = centered_square(control, control.size.h.min(28));
+        assert_eq!(icon.size, (28, 28).into());
+        assert_eq!(icon.loc, (65, 16).into());
     }
 }

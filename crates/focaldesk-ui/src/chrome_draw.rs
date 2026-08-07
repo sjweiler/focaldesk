@@ -8,7 +8,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 
 use crate::atlas::{IconAtlas, IconId, render_atlas_icon_with_alpha};
 use crate::chrome::ChromeMetrics;
-use crate::chrome_layout::ChromeLayoutLogical;
+use crate::chrome_layout::{ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use crate::chrome_shaders::ChromeShaders;
 use crate::chrome_theme::{
     BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle, TopBarStyle,
@@ -79,7 +79,22 @@ pub fn draw_chrome_below_work_wallpaper(
         } else {
             &legacy_theme.frame_outer
         };
-        let _ = draw_beveled_panel(frame, &beveled, rect, frame_ctx.output_scale, damage, style);
+        let corner_radius = if rect == layout.sidebar.outer {
+            SIDEBAR_CORNER_RADIUS
+        } else if rect == layout.sidebar.inner {
+            (SIDEBAR_CORNER_RADIUS - 4.0).max(0.0)
+        } else {
+            0.0
+        };
+        let _ = draw_beveled_panel_with_radius(
+            frame,
+            &beveled,
+            rect,
+            frame_ctx.output_scale,
+            damage,
+            style,
+            corner_radius,
+        );
     }
 
     let _ = draw_beveled_panel(
@@ -737,6 +752,18 @@ pub fn draw_beveled_panel(
     damage: &[Rectangle<i32, Physical>],
     style: &BevelStyle,
 ) -> Result<(), GlesError> {
+    draw_beveled_panel_with_radius(frame, program, rect_logical, scale, damage, style, 0.0)
+}
+
+pub fn draw_beveled_panel_with_radius(
+    frame: &mut GlesFrame<'_, '_>,
+    program: &GlesPixelProgram,
+    rect_logical: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    damage: &[Rectangle<i32, Physical>],
+    style: &BevelStyle,
+    corner_radius: f32,
+) -> Result<(), GlesError> {
     let rect_physical = to_physical_rect(rect_logical, scale);
     let src_rect = Rectangle::from_loc_and_size(
         (0.0, 0.0),
@@ -756,6 +783,10 @@ pub fn draw_beveled_panel(
             Uniform::new("u_glow_width", style.glow_width),
             Uniform::new("u_glow_alpha", style.glow_alpha),
             Uniform::new("u_inner_shadow", style.inner_shadow),
+            Uniform::new(
+                "u_corner_radius",
+                corner_radius * scale.x.max(scale.y) as f32,
+            ),
             Uniform::new("u_face_color", style.face_color),
             Uniform::new("u_light_color", style.light_color),
             Uniform::new("u_shadow_color", style.shadow_color),

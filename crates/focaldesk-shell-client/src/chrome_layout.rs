@@ -3,12 +3,11 @@ use smithay::utils::Physical;
 use smithay::utils::Rectangle;
 use smithay::utils::Size;
 
-/// Defaults aligned with `focaldesk_ui::chrome::ChromeMetrics::default` for nested (winit) mode.
+/// Canonical geometry owned by the standalone shell clients.
 pub const NESTED_DEFAULT_TOPBAR_H: i32 = 64;
 pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
 pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 12;
 pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 6;
-pub const SIDEBAR_CORNER_RADIUS: f32 = 16.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromeLayoutConfig {
@@ -280,6 +279,8 @@ pub fn build_chrome_layout_with_config(
 
     let topbar_outer = Rectangle::from_loc_and_size((0, 0), (w, top_h));
 
+    let sidebar_outer = Rectangle::from_loc_and_size((0, top_h), (left_w, (h - top_h).max(1)));
+
     let work_outer =
         Rectangle::from_loc_and_size((left_w, top_h), ((w - left_w).max(1), (h - top_h).max(1)));
 
@@ -356,30 +357,26 @@ pub fn build_chrome_layout_with_config(
     // 4. SIDEBAR STACK
     // -------------------------------------------------------------------------
 
+    let mut slots = Vec::new();
+
+    let sidebar_inner = inset_rect(sidebar_outer, 4);
+
+    //let mut slot_outer_rects = Vec::new();
+    // let mut slot_inner_rects = Vec::new();
+    // let mut slot_icon_wells = Vec::new();
+
     let module_h = 48;
     let module_gap = 8;
     let module_margin_x = 8;
     let module_margin_top = 10;
-    let module_margin_bottom = 10;
+    let module_margin_bottom = 24;
 
     let module_w = (left_w - module_margin_x * 2).max(16);
+    let mut y = top_h + module_margin_top;
+
     let available_h = (h - top_h - module_margin_top - module_margin_bottom).max(0);
     let max_slots_that_fit = ((available_h + module_gap) / (module_h + module_gap)).max(0) as usize;
     let slot_count = config.sidebar_item_count.min(max_slots_that_fit);
-    let modules_h = if slot_count == 0 {
-        0
-    } else {
-        slot_count as i32 * module_h + (slot_count as i32 - 1) * module_gap
-    };
-    let sidebar_h = (module_margin_top + modules_h + module_margin_bottom)
-        .min((h - top_h).max(1))
-        .max(1);
-    let sidebar_y = top_h + ((h - top_h - sidebar_h).max(0) / 2);
-    let sidebar_outer = Rectangle::from_loc_and_size((0, sidebar_y), (left_w, sidebar_h));
-    let sidebar_inner = inset_rect(sidebar_outer, 4);
-
-    let mut slots = Vec::with_capacity(slot_count);
-    let mut y = sidebar_outer.loc.y + module_margin_top;
 
     for _ in 0..slot_count {
         let outer = Rectangle::from_loc_and_size((module_margin_x, y), (module_w, module_h));
@@ -391,28 +388,56 @@ pub fn build_chrome_layout_with_config(
             inner,
             icon_well: well,
         });
+
+        //slot_outer_rects.push(outer);
+        //slot_inner_rects.push(inner);
+        //slot_icon_wells.push(well);
+
         y += module_h + module_gap;
     }
 
     // Keeping your existing field name for now, even though this is really more
     // like a sidebar accent rail than a per-slot light.
     let sidebar_light_rect = Some(Rectangle::from_loc_and_size(
-        (6, sidebar_outer.loc.y + 12),
-        (3, (sidebar_outer.size.h - 24).max(1)),
+        (6, top_h + 12),
+        (3, (h - top_h - 24).max(1)),
     ));
 
-    // The compact rail's rounded shell replaces the old square end-caps.
-    let sidebar_caps = Vec::new();
+    // Top and bottom end-caps for the sidebar.
+    let cap_h = 6;
+    let sidebar_caps: Vec<Rectangle<i32, Logical>> = vec![
+        Rectangle::from_loc_and_size(
+            (sidebar_outer.loc.x, sidebar_outer.loc.y),
+            (sidebar_outer.size.w, cap_h),
+        ),
+        Rectangle::from_loc_and_size(
+            (
+                sidebar_outer.loc.x,
+                sidebar_outer.loc.y + sidebar_outer.size.h - cap_h,
+            ),
+            (sidebar_outer.size.w, cap_h),
+        ),
+    ];
 
     // -------------------------------------------------------------------------
     // 5. DECORATIVE CAPS / JOINTS
     // -------------------------------------------------------------------------
 
     let cap = 6;
-    let corner_caps = vec![Rectangle::from_loc_and_size((w - cap, 0), (cap, cap))];
+    let corner_caps = vec![
+        // top-right of top bar
+        Rectangle::from_loc_and_size((w - cap, 0), (cap, cap)),
+        // bottom-left of sidebar
+        Rectangle::from_loc_and_size((0, h - cap), (cap, cap)),
+        // bottom-right of sidebar
+        Rectangle::from_loc_and_size((left_w - cap, h - cap), (cap, cap)),
+    ];
 
-    // The dock is now detached from the top bar, so it has no square joint.
-    let corner_joint_caps = Vec::new();
+    let corner_joint_caps = vec![
+        // top-left joint where top bar meets sidebar
+        Rectangle::from_loc_and_size((0, top_h.saturating_sub(2)), (8, 6)),
+        Rectangle::from_loc_and_size((0, top_h.saturating_sub(2)), (6, 8)),
+    ];
 
     // -------------------------------------------------------------------------
     // 6. FINAL STRUCT
@@ -478,28 +503,6 @@ mod tests {
 
         assert_eq!(layout.topbar.status_wells.len(), 3);
         assert_eq!(layout.sidebar.slots.len(), 7);
-        assert_eq!(layout.sidebar.outer.size.h, 404);
-        assert_eq!(layout.sidebar.outer.loc.y, 370);
-        assert!(layout.sidebar.caps.is_empty());
-        assert!(layout.decoration.corner_joint_caps.is_empty());
-    }
-
-    #[test]
-    fn compact_sidebar_preserves_the_full_left_work_area_reservation() {
-        let layout = build_chrome_layout_with_config(
-            Size::from((1920, 1080)),
-            64,
-            76,
-            ChromeLayoutConfig {
-                status_item_count: 0,
-                sidebar_item_count: 3,
-            },
-        );
-
-        assert_eq!(layout.sidebar.outer.size.h, 180);
-        assert_eq!(layout.sidebar.outer.loc.y, 482);
-        assert_eq!(layout.work_area.outer.loc.x, 76);
-        assert_eq!(layout.work_area.outer.size.w, 1844);
     }
 
     #[test]
@@ -510,12 +513,10 @@ mod tests {
 
         assert_eq!(flow.loc.y, clock.loc.y);
         assert_eq!(flow.size.h, clock.size.h);
-        assert!(
-            layout
-                .topbar
-                .status_wells
-                .iter()
-                .all(|well| well.loc.y == flow.loc.y && well.size.h == flow.size.h)
-        );
+        assert!(layout
+            .topbar
+            .status_wells
+            .iter()
+            .all(|well| well.loc.y == flow.loc.y && well.size.h == flow.size.h));
     }
 }

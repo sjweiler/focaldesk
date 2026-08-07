@@ -758,6 +758,9 @@ pub struct DesktopInit {
     pub primary_output: OutputId,
     pub running: bool,
     pub compositor_state: CompositorState,
+    pub fractional_scale_manager_state:
+        smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
     pub render: RenderState,
     pub xdg_shell_state: XdgShellState,
     pub dmabuf_state: DmabufState,
@@ -832,6 +835,9 @@ pub struct DesktopState {
     // pub keybinds: Keybinds,
     pub running: bool,
     pub compositor_state: CompositorState,
+    pub fractional_scale_manager_state:
+        smithay::wayland::fractional_scale::FractionalScaleManagerState,
+    pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
     pub render: RenderState,
     pub xdg_shell_state: smithay::wayland::shell::xdg::XdgShellState,
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
@@ -1946,6 +1952,7 @@ impl DesktopState {
     fn execute_desktop_action(&mut self, action: DesktopAction) -> Result<(), String> {
         match action {
             DesktopAction::LaunchApp { app } => {
+                let app = self.resolve_launch_command(&app);
                 self.launch_app(app);
             }
             DesktopAction::FocusWorkspace { workspace } => {
@@ -2074,6 +2081,21 @@ impl DesktopState {
                 self.set_system_setting(focaldesk_ui::types::SettingKey::DoNotDisturb, enabled);
                 self.do_not_disturb = enabled;
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+            DesktopAction::CreateWorkspace => {
+                let name = format!("Workspace {}", self.workspace_names.len() + 1);
+                self.create_workspace_from_dialog(name);
+            }
+            DesktopAction::DeleteWorkspace => {
+                if self.workspace_names.len() > 1 {
+                    self.open_delete_workspace_dialog();
+                }
+            }
+            DesktopAction::OpenCalendarPanel => {
+                self.pending_egui_ops.push(PendingEguiOp::OpenPanel(
+                    focaldesk_ui::types::PanelKind::Calendar,
+                    self.focused_output,
+                ));
             }
         }
         Ok(())
@@ -2379,7 +2401,18 @@ impl DesktopState {
         let x = rel.x.round() as i32;
         let y = rel.y.round() as i32;
 
-        let new_hovered = self.ui.hit_test(x, y).map(|e| e.id);
+        let reservation = self
+            .outputs
+            .get(&output_id)
+            .map(|output| {
+                crate::core::wayland::trusted_shell::reservation_for_output(&output.handle)
+            })
+            .unwrap_or_default();
+        let new_hovered = self
+            .ui
+            .hit_test(x, y)
+            .filter(|element| !Self::external_shell_owns_element(reservation, element.kind))
+            .map(|element| element.id);
         self.ui.hovered = new_hovered;
 
         for el in &mut self.ui.elements {
@@ -2485,7 +2518,30 @@ impl DesktopState {
         let local = self.pointer_relative_to_output_logical(output_id)?;
         let x = local.x.round() as i32;
         let y = local.y.round() as i32;
-        self.ui.hit_test(x, y)
+        let element = self.ui.hit_test(x, y)?;
+        let output = self.outputs.get(&output_id)?;
+        let reservation =
+            crate::core::wayland::trusted_shell::reservation_for_output(&output.handle);
+        (!Self::external_shell_owns_element(reservation, element.kind)).then_some(element)
+    }
+
+    fn external_shell_owns_element(
+        reservation: crate::core::wayland::trusted_shell::TrustedShellReservation,
+        kind: UiElementKind,
+    ) -> bool {
+        (reservation.left > 0
+            && matches!(
+                kind,
+                UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot
+            ))
+            || (reservation.top > 0
+                && matches!(
+                    kind,
+                    UiElementKind::TopbarIndicator
+                        | UiElementKind::TopbarButton
+                        | UiElementKind::TopbarFlowField
+                        | UiElementKind::Clock
+                ))
     }
 
     fn configured_chrome_items(
@@ -3739,11 +3795,72 @@ impl DesktopState {
         self.space.map_element(window, space_loc, activate);
     }
 
+    fn pointer_layer_surface_under(
+        &self,
+        pos: Point<f64, Logical>,
+        layer_order: &[smithay::wayland::shell::wlr_layer::Layer],
+    ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
+        let output_id = self.output_under_pointer(pos)?;
+        let output = self.outputs.get(&output_id)?;
+        let output_geo = self
+            .space
+            .output_geometry(&output.handle)
+            .unwrap_or_else(|| {
+                Rectangle::from_loc_and_size(output.logical_origin, output.logical_size)
+            });
+        let output_local = pos - output_geo.loc.to_f64();
+        let layers = smithay::desktop::layer_map_for_output(&output.handle);
+
+        layer_order.iter().find_map(|layer_kind| {
+            // `LayerMap::layer_under` only checks a layer's bounding box. If
+            // that layer has a smaller (or empty) input region, selecting it
+            // first and then returning `None` prevents pointer input from
+            // falling through to another layer below it. This matters for the
+            // panel and dock: both use the top layer and have transparent
+            // extensions reserved for tooltips.
+            layers.layers_on(*layer_kind).rev().find_map(|layer| {
+                let layer_loc = layers.layer_geometry(layer)?.loc;
+                let layer_local = output_local - layer_loc.to_f64();
+                layer
+                    .surface_under(layer_local, WindowSurfaceType::ALL)
+                    .or_else(|| {
+                        // A trusted shell's input strip is fixed and known to
+                        // the compositor. Keep pointer delivery working while
+                        // Smithay updates renderer/input-region state around a
+                        // viewport or fractional-scale commit. Without this,
+                        // the visible panel/dock renders normally but never
+                        // receives enter, motion, or button events.
+                        let bbox = layer.bbox();
+                        (!bbox.is_empty()
+                            && crate::core::wayland::trusted_shell::input_region_contains(
+                                layer.namespace(),
+                                layer_local,
+                            ))
+                        .then(|| (layer.wl_surface().clone(), (0, 0).into()))
+                    })
+                    .map(|(surface, surface_loc)| {
+                        (
+                            PointerFocusTarget::Wayland(surface),
+                            (surface_loc + layer_loc + output_geo.loc).to_f64(),
+                        )
+                    })
+            })
+        })
+    }
+
     /// Topmost client subsurface or xdg popup under `pos` (global logical), if any.
     pub(crate) fn pointer_surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
+        use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
+
+        if let Some(hit) =
+            self.pointer_layer_surface_under(pos, &[WlrLayer::Overlay, WlrLayer::Top])
+        {
+            return Some(hit);
+        }
+
         let ws = self.focused_workspace();
         for window in self.space.elements() {
             window.on_commit();
@@ -3822,7 +3939,7 @@ impl DesktopState {
             }
         }
 
-        None
+        self.pointer_layer_surface_under(pos, &[WlrLayer::Bottom, WlrLayer::Background])
     }
 
     fn clear_client_pointer_focus(&mut self, pos: Point<f64, Logical>) {
@@ -4132,6 +4249,7 @@ impl DesktopState {
             "nautilus" | "@files" => focaldesk_files_command(),
             "@settings" | "focaldesk-settings" => focaldesk_settings_command(),
             "@launcher" | "focaldesk-launcher" => focaldesk_launcher_command(),
+            "@ai-console" | "focaldesk-ai-console" => focaldesk_ai_console_command(),
             other => other.to_string(),
         }
     }
@@ -5996,6 +6114,8 @@ impl DesktopState {
             focus_changed_at: Instant::now(),
             input: InputState::default(),
             compositor_state: init.compositor_state,
+            fractional_scale_manager_state: init.fractional_scale_manager_state,
+            viewporter_state: init.viewporter_state,
             render: init.render,
             xdg_shell_state: init.xdg_shell_state,
             dmabuf_state: init.dmabuf_state,
@@ -9732,6 +9852,32 @@ mod tests {
         assert!(is_browser_like("brave-browser"));
         assert!(!is_browser_like("alacritty"));
         assert!(!is_browser_like("cursor"));
+    }
+
+    #[test]
+    fn external_shell_reservations_disable_only_owned_legacy_hit_regions() {
+        use crate::core::wayland::trusted_shell::TrustedShellReservation;
+        use focaldesk_ui::types::UiElementKind;
+
+        let panel = TrustedShellReservation { top: 64, left: 0 };
+        assert!(super::DesktopState::external_shell_owns_element(
+            panel,
+            UiElementKind::TopbarIndicator
+        ));
+        assert!(!super::DesktopState::external_shell_owns_element(
+            panel,
+            UiElementKind::SidebarButton
+        ));
+
+        let dock = TrustedShellReservation { top: 0, left: 76 };
+        assert!(super::DesktopState::external_shell_owns_element(
+            dock,
+            UiElementKind::SidebarButton
+        ));
+        assert!(!super::DesktopState::external_shell_owns_element(
+            dock,
+            UiElementKind::Clock
+        ));
     }
 
     #[test]

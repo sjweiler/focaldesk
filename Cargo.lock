@@ -2356,9 +2356,34 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "focaldesk-config",
  "focaldesk-ipc",
+ "focaldesk-logging",
+ "focaldesk-shell-gtk",
+ "focaldesk-themes",
+ "fontdue",
+ "image",
+ "resvg 0.41.0",
+ "smithay",
  "smithay-client-toolkit 0.19.2",
+ "usvg 0.41.0",
  "wayland-client",
+ "wayland-egl",
+ "wayland-protocols",
+]
+
+[[package]]
+name = "focaldesk-shell-gtk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "focaldesk-config",
+ "focaldesk-ipc",
+ "focaldesk-logging",
+ "focaldesk-themes",
+ "gtk4",
+ "gtk4-layer-shell",
 ]
 
 [[package]]
@@ -2401,6 +2426,7 @@ dependencies = [
  "focaldesk-themes",
  "focaldesk-types",
  "fontdb 0.16.2",
+ "fontdue",
  "glow",
  "image",
  "resvg 0.41.0",
@@ -2741,6 +2767,7 @@ dependencies = [
  "gdk-pixbuf",
  "gdk4-sys",
  "gio 0.20.12",
+ "gl",
  "glib 0.20.12",
  "libc",
  "pango",
@@ -3122,6 +3149,34 @@ dependencies = [
  "gtk4-sys",
  "libc",
  "pango",
+]
+
+[[package]]
+name = "gtk4-layer-shell"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3e1e1b1516be3d7ca089dfa6a1e688e268c74aef50c0c25fe8c46b1ba8ed1cc"
+dependencies = [
+ "bitflags 2.11.0",
+ "gdk4",
+ "glib 0.20.12",
+ "glib-sys 0.20.10",
+ "gtk4",
+ "gtk4-layer-shell-sys",
+ "libc",
+]
+
+[[package]]
+name = "gtk4-layer-shell-sys"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3057dc117db2d664a9b45f1956568701914e80cf9f2c8cef0a755af4c1c8105"
+dependencies = [
+ "gdk4-sys",
+ "glib-sys 0.20.10",
+ "gtk4-sys",
+ "libc",
+ "system-deps 7.0.8",
 ]
 
 [[package]]

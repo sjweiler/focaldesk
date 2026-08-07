@@ -2,4 +2,7 @@
 
 mod config;
 
-pub use config::{load_config, save_config, FocalDeskConfig};
+pub use config::{
+    load_config, save_config, DockConfig, DockPosition, DockSize, FocalDeskConfig, PanelConfig,
+    PanelPosition, ShellConfig, ShellStyle,
+};

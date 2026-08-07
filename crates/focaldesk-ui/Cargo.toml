@@ -29,5 +29,6 @@ usvg.workspace = true
 resvg.workspace = true
 chrono.workspace = true
 ab_glyph.workspace = true
+fontdue = "0.9"
 anyhow.workspace = true
 smithay = { workspace = true, features = ["renderer_gl"] }

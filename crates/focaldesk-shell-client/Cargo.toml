@@ -2,12 +2,23 @@
 name = "focaldesk-shell-client"
 version = "0.1.0"
 edition = "2021"
-description = "Shared layer-shell runtime for FocalDesk trusted shell clients"
+description = "Standalone GLES layer-shell runtime for FocalDesk panel and dock"
 license = "MIT"
 
 [dependencies]
 anyhow.workspace = true
-focaldesk-ipc = { path = "../focaldesk-ipc" }
 chrono.workspace = true
+fontdue = "0.9"
+focaldesk-ipc = { path = "../focaldesk-ipc" }
+focaldesk-config = { path = "../focaldesk-config" }
+focaldesk-logging = { path = "../focaldesk-logging" }
+focaldesk-shell-gtk = { path = "../focaldesk-shell-gtk" }
+focaldesk-themes = { path = "../focaldesk-themes" }
+image.workspace = true
+resvg.workspace = true
+smithay.workspace = true
 smithay-client-toolkit.workspace = true
+usvg.workspace = true
 wayland-client = "0.31"
+wayland-egl = "0.32"
+wayland-protocols.workspace = true

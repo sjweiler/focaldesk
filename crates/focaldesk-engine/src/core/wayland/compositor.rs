@@ -24,6 +24,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use smithay::desktop::layer_map_for_output;
+use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
 
 use crate::core::desktop::DesktopState;
 use smithay::backend::renderer::element::Id;
@@ -170,6 +171,43 @@ impl CompositorHandler for DesktopState {
                     );
                 }
             }
+            // Layer-shell's initial configure must follow the client's first
+            // wl_surface.commit. `LayerMap::arrange` records the correct size
+            // here, but intentionally does not send an initial configure.
+            // Sending it from `new_layer_surface` is too early: the client's
+            // size and anchors have not been committed yet, so Smithay falls
+            // back to a half-output-sized surface.
+            for layer in layer_map_for_output(&output).layers() {
+                if layer.wl_surface() == surface && layer.layer_surface().has_pending_changes() {
+                    layer.layer_surface().send_configure();
+                }
+            }
+            let scale = self
+                .output_id_for_space_output(&output)
+                .and_then(|id| self.outputs.get(&id))
+                .map(|state| state.scale_factor)
+                .unwrap_or_else(|| output.current_scale().fractional_scale());
+            for layer in layer_map_for_output(&output).layers() {
+                with_states(layer.wl_surface(), |states| {
+                    with_fractional_scale(states, |fractional| {
+                        fractional.set_preferred_scale(scale)
+                    });
+                });
+            }
         }
+    }
+}
+
+impl FractionalScaleHandler for DesktopState {
+    fn new_fractional_scale(&mut self, surface: WlSurface) {
+        let scale = self
+            .outputs
+            .get(&self.focused_output)
+            .or_else(|| self.outputs.get(&self.primary_output))
+            .map(|output| output.scale_factor)
+            .unwrap_or(1.0);
+        with_states(&surface, |states| {
+            with_fractional_scale(states, |fractional| fractional.set_preferred_scale(scale));
+        });
     }
 }

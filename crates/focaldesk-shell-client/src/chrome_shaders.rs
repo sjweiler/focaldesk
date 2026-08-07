@@ -1,4 +1,4 @@
-// crates/focaldesk-engine/src/core/chrome_shader.rs
+//! Shader programs owned and compiled by the standalone shell process.
 use focaldesk_logging::flog;
 
 use smithay::backend::renderer::gles::GlesTexProgram;
@@ -87,7 +87,6 @@ impl ChromeShaders {
                     UniformName::new("u_glow_width", UniformType::_1f),
                     UniformName::new("u_glow_alpha", UniformType::_1f),
                     UniformName::new("u_inner_shadow", UniformType::_1f),
-                    UniformName::new("u_corner_radius", UniformType::_1f),
                     UniformName::new("u_face_color", UniformType::_4f),
                     UniformName::new("u_light_color", UniformType::_4f),
                     UniformName::new("u_shadow_color", UniformType::_4f),
@@ -169,6 +168,20 @@ impl ChromeShaders {
                 Err(error) => eprintln!("focal shell glass_control shader: {error}"),
             }
         }
+        if self.pulse.is_none() {
+            match renderer.compile_custom_pixel_shader(
+                PULSE_FRAG,
+                &[
+                    UniformName::new("u_click_pos", UniformType::_2f),
+                    UniformName::new("u_time", UniformType::_1f),
+                    UniformName::new("u_size", UniformType::_2f),
+                    UniformName::new("u_color", UniformType::_4f),
+                ],
+            ) {
+                Ok(program) => self.pulse = Some(program),
+                Err(error) => eprintln!("focal shell pulse shader: {error}"),
+            }
+        }
         Ok(())
     }
 
@@ -183,7 +196,6 @@ impl ChromeShaders {
                     UniformName::new("u_glow_width", UniformType::_1f),
                     UniformName::new("u_glow_alpha", UniformType::_1f),
                     UniformName::new("u_inner_shadow", UniformType::_1f),
-                    UniformName::new("u_corner_radius", UniformType::_1f),
                     UniformName::new("u_face_color", UniformType::_4f),
                     UniformName::new("u_light_color", UniformType::_4f),
                     UniformName::new("u_shadow_color", UniformType::_4f),
@@ -747,7 +759,6 @@ uniform float u_softness;
 uniform float u_glow_width;
 uniform float u_glow_alpha;
 uniform float u_inner_shadow;
-uniform float u_corner_radius;
 
 uniform vec4 u_face_color;
 uniform vec4 u_light_color;
@@ -758,12 +769,6 @@ float hash(float n) {
     return fract(sin(n) * 43758.5453123);
 }
 
-float rounded_box_sdf(vec2 p, vec2 box_size, float radius) {
-    vec2 half_size = box_size * 0.5;
-    vec2 q = abs(p - half_size) - (half_size - vec2(radius));
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
-}
-
 void main() {
     vec2 p = v_coords * size;
 
@@ -772,12 +777,10 @@ void main() {
     float dr = size.x - p.x;
     float db = size.y - p.y;
 
+    float edge_dist = min(min(dl, dr), min(dt, db));
+
     float bevel = max(u_bevel, 0.0001);
     float soft  = max(u_softness, 0.0001);
-    float radius = clamp(u_corner_radius, 0.0, min(size.x, size.y) * 0.5);
-    float outer_sdf = rounded_box_sdf(p, size, radius);
-    float outer_mask = 1.0 - smoothstep(0.0, soft, outer_sdf);
-    float edge_dist = max(-outer_sdf, 0.0);
 
     vec3 color = u_face_color.rgb;
 
@@ -813,7 +816,7 @@ void main() {
         color += u_glow_color.rgb * glow_ring * u_glow_alpha * 0.35;
     }
 
-    gl_FragColor = vec4(color, u_face_color.a * alpha * outer_mask);
+    gl_FragColor = vec4(color, u_face_color.a * alpha);
 }
 "#;
 

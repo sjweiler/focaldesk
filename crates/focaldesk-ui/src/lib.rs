@@ -5,6 +5,8 @@ pub mod ai_permission;
 pub mod atlas;
 pub mod chrome;
 pub mod element;
+pub mod font_atlas;
+pub mod fonts;
 pub mod layout;
 pub mod svg;
 pub mod text;

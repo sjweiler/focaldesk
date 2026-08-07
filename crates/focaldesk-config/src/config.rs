@@ -3,12 +3,17 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FocalDeskConfig {
     pub appearance: AppearanceConfig,
     pub displays: DisplaysConfig,
+    pub shell: ShellConfig,
+    pub panel: PanelConfig,
+    pub dock: DockConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppearanceConfig {
     pub theme: String,
     pub glow_strength: f64,
@@ -30,14 +35,124 @@ impl FocalDeskConfig {
 impl Default for FocalDeskConfig {
     fn default() -> Self {
         Self {
-            appearance: AppearanceConfig {
-                theme: "Eagle".into(),
-                glow_strength: 0.75,
-                font_scale: 1.0,
-                output_focus_glow: true,
-                shader_chrome: true,
-            },
+            appearance: AppearanceConfig::default(),
             displays: DisplaysConfig::default(),
+            shell: ShellConfig::default(),
+            panel: PanelConfig::default(),
+            dock: DockConfig::default(),
+        }
+    }
+}
+
+impl Default for AppearanceConfig {
+    fn default() -> Self {
+        Self {
+            theme: "Eagle".into(),
+            glow_strength: 0.75,
+            font_scale: 1.0,
+            output_focus_glow: true,
+            shader_chrome: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShellStyle {
+    Floating,
+    Attached,
+}
+
+impl Default for ShellStyle {
+    fn default() -> Self {
+        Self::Attached
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ShellConfig {
+    pub style: ShellStyle,
+}
+
+impl Default for ShellConfig {
+    fn default() -> Self {
+        Self {
+            style: ShellStyle::Attached,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelPosition {
+    Top,
+    Bottom,
+}
+
+impl Default for PanelPosition {
+    fn default() -> Self {
+        Self::Top
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PanelConfig {
+    pub position: PanelPosition,
+    pub corner_radius: f64,
+}
+
+impl Default for PanelConfig {
+    fn default() -> Self {
+        Self {
+            position: PanelPosition::Top,
+            corner_radius: 16.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DockPosition {
+    Left,
+    Right,
+}
+
+impl Default for DockPosition {
+    fn default() -> Self {
+        Self::Left
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DockSize {
+    Compact,
+    Normal,
+    Expanded,
+}
+
+impl Default for DockSize {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DockConfig {
+    pub position: DockPosition,
+    pub corner_radius: f64,
+    pub size: DockSize,
+}
+
+impl Default for DockConfig {
+    fn default() -> Self {
+        Self {
+            position: DockPosition::Left,
+            corner_radius: 24.0,
+            size: DockSize::Normal,
         }
     }
 }
@@ -72,6 +187,7 @@ pub fn save_config(config: &FocalDeskConfig) -> Result<()> {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct DisplaysConfig {
     pub topbar_on_all_outputs: bool,
     pub sidebar_on_all_outputs: bool,
@@ -85,5 +201,55 @@ impl Default for DisplaysConfig {
             sidebar_on_all_outputs: true,
             remember_focused_output: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn older_partial_config_gets_shell_defaults() {
+        let config: FocalDeskConfig = toml::from_str(
+            r#"
+            [appearance]
+            theme = "Classic"
+            glow_strength = 0.5
+            font_scale = 1.0
+            output_focus_glow = true
+            shader_chrome = true
+            "#,
+        )
+        .expect("parse partial configuration");
+
+        assert_eq!(config.shell.style, ShellStyle::Attached);
+        assert_eq!(config.panel.position, PanelPosition::Top);
+        assert_eq!(config.dock.position, DockPosition::Left);
+        assert_eq!(config.dock.size, DockSize::Normal);
+    }
+
+    #[test]
+    fn shell_configuration_uses_lowercase_toml_values() {
+        let config: FocalDeskConfig = toml::from_str(
+            r#"
+            [shell]
+            style = "attached"
+
+            [panel]
+            position = "bottom"
+            corner_radius = 18
+
+            [dock]
+            position = "right"
+            corner_radius = 20
+            size = "expanded"
+            "#,
+        )
+        .expect("parse shell configuration");
+
+        assert_eq!(config.shell.style, ShellStyle::Attached);
+        assert_eq!(config.panel.position, PanelPosition::Bottom);
+        assert_eq!(config.dock.position, DockPosition::Right);
+        assert_eq!(config.dock.size, DockSize::Expanded);
     }
 }

@@ -49,6 +49,7 @@ sudo dnf install \
   polkit-devel \
   pam-devel \
   gtk4-devel \
+  gtk4-layer-shell-devel \
   libadwaita-devel \
   xorg-x11-server-Xwayland
 ```
@@ -75,6 +76,7 @@ sudo apt install -y \
   libgles2-mesa-dev \
   libgbm-dev \
   libgtk-4-dev \
+  libgtk4-layer-shell-dev \
   libadwaita-1-dev \
   libpam0g-dev
 ```

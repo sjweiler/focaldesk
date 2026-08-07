@@ -809,6 +809,9 @@ pub(crate) fn bootstrap_compositor_core(
     });
 
     let compositor_state = CompositorState::new::<DesktopState>(&dh);
+    let fractional_scale_manager_state =
+        smithay::wayland::fractional_scale::FractionalScaleManagerState::new::<DesktopState>(&dh);
+    let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<DesktopState>(&dh);
     let xdg_shell_state = XdgShellState::new::<DesktopState>(&dh);
     let dmabuf_state = DmabufState::new();
     let shm_state = ShmState::new::<DesktopState>(&dh, vec![]);
@@ -905,6 +908,8 @@ pub(crate) fn bootstrap_compositor_core(
         chrome,
         primary_output: OutputId(1),
         compositor_state,
+        fractional_scale_manager_state,
+        viewporter_state,
         render,
         xdg_shell_state,
         dmabuf_state,

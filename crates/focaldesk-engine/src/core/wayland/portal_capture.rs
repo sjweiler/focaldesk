@@ -132,7 +132,41 @@ impl WlrLayerShellHandler for DesktopState {
         };
 
         let mut map = layer_map_for_output(&output);
-        let _ = map.map_layer(&LayerSurface::new(surface, namespace));
+        // LayerMap assigns intersecting exclusive edges in insertion order.
+        // The panel owns the top-left corner, so when it reconnects after an
+        // existing dock, temporarily remove the dock and map it again after
+        // the panel. This keeps the panel full-width and starts the dock below
+        // it regardless of process startup/restart timing.
+        let remap_docks = if namespace == crate::core::wayland::trusted_shell::PANEL_NAMESPACE {
+            map.layers()
+                .filter(|mapped| {
+                    mapped.namespace() == crate::core::wayland::trusted_shell::DOCK_NAMESPACE
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for dock in &remap_docks {
+            map.unmap_layer(dock);
+        }
+        let layer = LayerSurface::new(surface, namespace);
+        if let Err(error) = map.map_layer(&layer) {
+            focaldesk_logging::flog(format!("failed to map layer-shell surface: {error}"));
+            return;
+        }
+        for dock in &remap_docks {
+            if let Err(error) = map.map_layer(dock) {
+                focaldesk_logging::flog(format!(
+                    "failed to restore trusted dock layer ordering: {error}"
+                ));
+            }
+        }
+
+        // Do not configure here. This callback runs when get_layer_surface is
+        // handled, before the client's set_size/set_anchor requests and first
+        // wl_surface.commit. The compositor commit handler arranges the layer
+        // using that committed state and sends the initial configure there.
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {

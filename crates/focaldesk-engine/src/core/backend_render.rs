@@ -531,13 +531,25 @@ pub fn build_output_popup_elements(
         .map(|o| o.active_workspace)
         .unwrap_or_else(|| state.focused_workspace());
 
-    state.render.build_popup_elements_for_output(
+    let mut elements = state.render.build_popup_elements_for_output(
         &state.space,
         &state.windows,
         active_workspace,
         &output_handle,
         renderer,
-    )
+    );
+
+    if let Some(output) = state.outputs.get(&output_id) {
+        crate::core::portal::push_trusted_shell_elements_for_output(
+            renderer,
+            &output.handle,
+            output.logical_size,
+            smithay::utils::Scale::from(output.scale_factor),
+            &mut elements,
+        );
+    }
+
+    elements
 }
 
 pub fn draw_output(
@@ -623,6 +635,13 @@ pub fn draw_output_stage(
         state.notification_snapshots.clone()
     };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
+    let draw_internal_chrome = state
+        .outputs
+        .get(&prepared.frame_ctx.rendering_output)
+        .map(|output| {
+            !crate::core::wayland::trusted_shell::reservation_for_output(&output.handle).is_active()
+        })
+        .unwrap_or(true);
 
     let inputs = RenderInputs {
         ctx: &prepared.frame_ctx,
@@ -647,6 +666,7 @@ pub fn draw_output_stage(
         ui_tree: &state.ui,
         current_workspace: active_workspace,
         fullscreen_client,
+        draw_internal_chrome,
         // 👇 ADD THESE
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,

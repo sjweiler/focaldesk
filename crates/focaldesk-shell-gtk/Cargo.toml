@@ -1,0 +1,16 @@
+[package]
+name = "focaldesk-shell-gtk"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable GTK4 shell components for FocalDesk panel and dock clients"
+license = "MIT"
+
+[dependencies]
+anyhow.workspace = true
+focaldesk-ipc = { path = "../focaldesk-ipc" }
+focaldesk-logging = { path = "../focaldesk-logging" }
+focaldesk-config = { path = "../focaldesk-config" }
+focaldesk-themes = { path = "../focaldesk-themes" }
+chrono.workspace = true
+gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
+gtk4-layer-shell = "0.4"

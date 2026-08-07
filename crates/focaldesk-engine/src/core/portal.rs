@@ -787,30 +787,35 @@ fn write_rgba_to_shm_buffer(
     .map_err(|_| ())?
 }
 
-/// Append [`wlr-layer-shell`](https://wayland.app/protocols/wlr-layer-shell-unstable-v1) surfaces
-/// for `output` into `out` (overlay-style: drawn after regular toplevels).
-pub fn push_layer_elements_for_output(
+fn push_layer_elements_for_output_matching(
     renderer: &mut GlesRenderer,
     output: &smithay::output::Output,
-    origin: Point<i32, smithay::utils::Logical>,
     logical_size: Size<i32, smithay::utils::Logical>,
     output_scale: smithay::utils::Scale<f64>,
+    trusted_shell: bool,
     out: &mut Vec<crate::core::render::FlowRenderElement>,
 ) {
     use smithay::backend::renderer::element::AsRenderElements;
     use smithay::utils::Logical;
 
-    let output_rect = Rectangle::<i32, Logical>::from_loc_and_size(origin, logical_size);
+    // LayerMap geometry is output-local. Using the Space/global output origin
+    // here made every layer on a non-origin output fail the overlap test and,
+    // if it survived, shifted its render position by the output origin again.
+    let output_rect = Rectangle::<i32, Logical>::from_size(logical_size);
     let map = layer_map_for_output(output);
     for layer in map.layers() {
+        if crate::core::wayland::trusted_shell::is_trusted_namespace(layer.namespace())
+            != trusted_shell
+        {
+            continue;
+        }
         let Some(geo) = map.layer_geometry(layer) else {
             continue;
         };
         if !geo.overlaps(output_rect) {
             continue;
         }
-        let local_loc = geo.loc - origin;
-        let render_pos = local_loc.to_physical_precise_round(output_scale);
+        let render_pos = geo.loc.to_physical_precise_round(output_scale);
         out.extend(
             layer.render_elements::<crate::core::render::FlowRenderElement>(
                 renderer,
@@ -820,6 +825,46 @@ pub fn push_layer_elements_for_output(
             ),
         );
     }
+}
+
+/// Append ordinary layer-shell surfaces to the color-managed client pass.
+pub fn push_layer_elements_for_output(
+    renderer: &mut GlesRenderer,
+    output: &smithay::output::Output,
+    logical_size: Size<i32, smithay::utils::Logical>,
+    output_scale: smithay::utils::Scale<f64>,
+    out: &mut Vec<crate::core::render::FlowRenderElement>,
+) {
+    push_layer_elements_for_output_matching(
+        renderer,
+        output,
+        logical_size,
+        output_scale,
+        false,
+        out,
+    );
+}
+
+/// Append FocalDesk's trusted panel and dock to the final sRGB UI pass.
+///
+/// Their GLES shaders use the same sRGB theme values as compositor-owned
+/// chrome. Keeping them out of the scene-linear application pass preserves
+/// the appearance of translucent bevels and glass controls.
+pub fn push_trusted_shell_elements_for_output(
+    renderer: &mut GlesRenderer,
+    output: &smithay::output::Output,
+    logical_size: Size<i32, smithay::utils::Logical>,
+    output_scale: smithay::utils::Scale<f64>,
+    out: &mut Vec<crate::core::render::FlowRenderElement>,
+) {
+    push_layer_elements_for_output_matching(
+        renderer,
+        output,
+        logical_size,
+        output_scale,
+        true,
+        out,
+    );
 }
 
 /// Store the Wayland [`Output`](smithay::output::Output) on an image-capture source (for constraints).

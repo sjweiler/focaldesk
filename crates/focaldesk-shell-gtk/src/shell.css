@@ -1,0 +1,213 @@
+window.focal-shell-window {
+  background: transparent;
+  color: @fd_shell_text;
+  font-family: "IBM Plex Sans", sans-serif;
+}
+
+window.focal-dock-window {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+window.focal-dock-window > .focal-dock {
+  background-color: @fd_shell_bg;
+  background-image: linear-gradient(to right, @fd_shell_glass_bottom, @fd_shell_bg 18%, @fd_shell_bg 82%, @fd_shell_glass_bottom);
+  border: 1px solid @fd_shell_border;
+  box-shadow: inset 1px 1px @fd_shell_highlight, 0 3px 8px @fd_shell_shadow;
+}
+
+.focal-dock {
+  background-clip: padding-box;
+}
+
+.dock-button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  margin: 0;
+  border: 1px solid @fd_shell_rim;
+  background-color: @fd_shell_surface_raised;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_glass_mid 48%, @fd_shell_glass_bottom);
+  color: @fd_shell_icon;
+  box-shadow: inset 0 1px @fd_shell_highlight, inset 1px 0 @fd_shell_highlight, 0 2px 4px @fd_shell_shadow;
+}
+
+.dock-button image,
+.panel-launcher image,
+.panel-status-button image {
+  -gtk-icon-shadow: 0 1px @fd_shell_highlight, 0 -1px @fd_shell_shadow;
+}
+
+.dock-button:hover {
+  background: @fd_shell_surface_hover;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_surface_hover 48%, @fd_shell_glass_bottom);
+  border-color: @fd_shell_accent;
+  color: @fd_shell_icon_hover;
+}
+
+.dock-button:active,
+.dock-button.active {
+  background: @fd_shell_surface_active;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_surface_active 52%, @fd_shell_glass_bottom);
+  border-color: @fd_shell_accent;
+  color: @fd_shell_icon_active;
+  box-shadow: inset 0 1px @fd_shell_highlight, 0 0 7px @fd_shell_glow;
+}
+
+.workspace-button {
+  font-weight: 700;
+  font-size: 13px;
+}
+
+.dock-separator {
+  margin: 7px 1px;
+  background: @fd_shell_border_soft;
+}
+
+window.focal-panel-window {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+window.focal-panel-window > .focal-panel {
+  border-bottom: 1px solid @fd_shell_border;
+  background-color: @fd_shell_bg;
+  background-image: linear-gradient(to bottom, @fd_shell_glass_top, @fd_shell_bg 24%, @fd_shell_glass_bottom);
+  box-shadow: inset 0 -1px @fd_shell_highlight;
+}
+
+.focal-panel {
+  padding: 5px;
+  background: transparent;
+}
+
+.panel-corner {
+  min-width: 58px;
+  background: transparent;
+}
+
+.panel-launcher {
+  min-width: 138px;
+  min-height: 44px;
+  padding: 0;
+  border: 1px solid @fd_shell_rim;
+  background-color: @fd_shell_surface_raised;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_glass_mid 48%, @fd_shell_glass_bottom);
+  color: @fd_shell_icon;
+  box-shadow: inset 0 1px @fd_shell_highlight, inset 1px 0 @fd_shell_highlight, 0 2px 4px @fd_shell_shadow;
+}
+
+.panel-launcher:hover,
+.panel-status-button:hover {
+  background: @fd_shell_surface_hover;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_surface_hover 48%, @fd_shell_glass_bottom);
+  border-color: @fd_shell_accent;
+  color: @fd_shell_icon_hover;
+}
+
+.panel-identity,
+.panel-well {
+  min-height: 44px;
+  padding: 0 9px;
+  border: 1px solid @fd_shell_rim;
+  background-color: @fd_shell_surface;
+  background-image: linear-gradient(to bottom, @fd_shell_glass_top, @fd_shell_surface 42%, @fd_shell_glass_bottom);
+  box-shadow: inset 0 1px @fd_shell_highlight, 0 2px 4px @fd_shell_shadow;
+}
+
+.panel-brand {
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: @fd_shell_text;
+}
+
+.panel-meta {
+  color: @fd_shell_text_dim;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.panel-workspace-button {
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid @fd_shell_border_soft;
+  background: @fd_shell_surface_raised;
+  color: @fd_shell_text;
+}
+
+.panel-workspace-button:hover {
+  border-color: @fd_shell_accent;
+  background: @fd_shell_surface_hover;
+}
+
+popover.workspace-popover > contents {
+  min-width: 210px;
+  border: 1px solid @fd_shell_border;
+  background: @fd_shell_bg;
+  color: @fd_shell_text;
+  box-shadow: 0 6px 18px @fd_shell_shadow;
+}
+
+.workspace-menu-heading {
+  padding: 4px 8px;
+  color: @fd_shell_text_dim;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.workspace-menu-item {
+  padding: 7px 10px;
+  border: none;
+  background: transparent;
+  color: @fd_shell_text;
+}
+
+.workspace-menu-item:hover {
+  background: @fd_shell_surface_hover;
+  color: @fd_shell_icon_hover;
+}
+
+.panel-title {
+  color: @fd_shell_text;
+}
+
+.panel-status-cluster {
+  background: transparent;
+}
+
+.panel-status-button {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 0;
+  border: 1px solid @fd_shell_rim;
+  background-color: @fd_shell_surface_raised;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_glass_mid 48%, @fd_shell_glass_bottom);
+  color: @fd_shell_icon;
+  box-shadow: inset 0 1px @fd_shell_highlight, 0 2px 4px @fd_shell_shadow;
+}
+
+.panel-status-button.active {
+  background: @fd_shell_surface_active;
+  background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_surface_active 52%, @fd_shell_glass_bottom);
+  border-color: @fd_shell_accent;
+  color: @fd_shell_icon_active;
+  box-shadow: inset 0 1px @fd_shell_highlight, 0 0 7px @fd_shell_glow;
+}
+
+.panel-battery {
+  min-width: 44px;
+  padding: 0 6px;
+  color: @fd_shell_text_dim;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.panel-clock {
+  min-width: 108px;
+  padding: 0 9px;
+  background: @fd_shell_surface_raised;
+  color: @fd_shell_clock;
+  font-weight: 600;
+}
