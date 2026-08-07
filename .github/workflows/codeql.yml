@@ -88,6 +88,7 @@ jobs:
           libgles2-mesa-dev \
           libgbm-dev \
           libgtk-4-dev \
+          libgtk4-layer-shell-dev \
           libadwaita-1-dev
 
     # Initializes the CodeQL tools for scanning.
