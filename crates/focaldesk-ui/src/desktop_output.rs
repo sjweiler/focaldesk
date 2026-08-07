@@ -20,7 +20,6 @@ use crate::egui_layer::EguiLayer;
 use crate::overlay::OverlayManager;
 use crate::sidebar::SideBar;
 use crate::topbar::TopBar;
-use crate::ui_builder::build_ui_for_output;
 use crate::uicomponent::{LayoutCtx, UiComponent, UiHit};
 use crate::uitree::UiTree;
 use crate::workarea::WorkArea;
@@ -88,8 +87,14 @@ impl DesktopOutput {
             0
         };
 
-        self.chrome_layout = build_chrome_layout(rect.size, top_h, left_w);
-        build_ui_for_output(ui_tree, &self.chrome_layout);
+        let options = crate::ui_builder::UiBuildOptions::default();
+        self.chrome_layout = crate::chrome_layout::build_chrome_layout_with_config(
+            rect.size,
+            top_h,
+            left_w,
+            options.layout_config(),
+        );
+        crate::ui_builder::build_ui_for_output_with_options(ui_tree, &self.chrome_layout, options);
 
         let layout_ctx = LayoutCtx {
             screen: rect,

@@ -1,8 +1,6 @@
 use crate::accessibility::{AccessibleInfo, AccessibleRole};
 use crate::atlas::IconId;
-use crate::chrome_layout::{
-    ChromeLayout, ChromeLayoutConfig, DEFAULT_SIDEBAR_SLOT_COUNT, DEFAULT_TOPBAR_STATUS_COUNT,
-};
+use crate::chrome_layout::{ChromeLayout, ChromeLayoutConfig, DEFAULT_SIDEBAR_SLOT_COUNT};
 use crate::element::{ChromeItem, UiElement, UiRect};
 use crate::sidebar::SideBar;
 use crate::topbar::TopBar;
@@ -134,7 +132,12 @@ impl UiBuildOptions {
                 .status_items
                 .as_ref()
                 .map(|items| items.iter().filter(|item| item.visible).count())
-                .unwrap_or(DEFAULT_TOPBAR_STATUS_COUNT),
+                .unwrap_or_else(|| {
+                    default_status_items(self)
+                        .iter()
+                        .filter(|item| item.visible)
+                        .count()
+                }),
             sidebar_item_count: self
                 .sidebar_items
                 .as_ref()
@@ -540,8 +543,8 @@ mod tests {
     use crate::ui_builder::{
         SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID,
         SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction,
-        UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options, sidebar_workspace_id,
-        sidebar_workspace_number,
+        UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options, default_status_items,
+        sidebar_workspace_id, sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
 
@@ -592,6 +595,38 @@ mod tests {
             ui.elements
                 .iter()
                 .any(|element| element.id == crate::sidebar::SideBar::OVERFLOW_ID)
+        );
+    }
+
+    #[test]
+    fn default_status_collection_gets_one_well_per_visible_item() {
+        let options = UiBuildOptions::default();
+        let visible_count = default_status_items(&options)
+            .iter()
+            .filter(|item| item.visible)
+            .count();
+        let layout = crate::chrome_layout::build_chrome_layout_with_config(
+            smithay::utils::Size::from((1920, 1080)),
+            64,
+            76,
+            options.layout_config(),
+        );
+
+        assert_eq!(layout.topbar.status_wells.len(), visible_count);
+
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(&mut ui, &layout, options);
+        assert_eq!(
+            ui.elements
+                .iter()
+                .filter(|element| { element.kind == crate::types::UiElementKind::TopbarIndicator })
+                .count(),
+            visible_count
+        );
+        assert!(
+            !ui.elements
+                .iter()
+                .any(|element| element.id == crate::topbar::TopBar::OVERFLOW_ID)
         );
     }
 
@@ -829,17 +864,19 @@ mod tests {
     #[test]
     fn camera_well_distinguishes_presence_and_active_use() {
         let output_size = smithay::utils::Size::from((1920, 1080));
-        let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
-        let mut ui = UiTree::default();
-        build_ui_for_output_with_options(
-            &mut ui,
-            &layout,
-            UiBuildOptions {
-                camera_detected: true,
-                camera_active: false,
-                ..UiBuildOptions::default()
-            },
+        let idle_options = UiBuildOptions {
+            camera_detected: true,
+            camera_active: false,
+            ..UiBuildOptions::default()
+        };
+        let layout = crate::chrome_layout::build_chrome_layout_with_config(
+            output_size,
+            64,
+            76,
+            idle_options.layout_config(),
         );
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(&mut ui, &layout, idle_options);
 
         let idle_camera = ui
             .elements
