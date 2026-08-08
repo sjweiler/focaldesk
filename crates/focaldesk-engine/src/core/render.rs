@@ -5,8 +5,7 @@ use crate::core::layout::LayoutSnapshot;
 use crate::core::output::OutputState; // if still needed (ideally not)
 use crate::core::ui_state::UiState;
 use focaldesk_ui::chrome::ChromeMetrics;
-use focaldesk_ui::types::UiElementKind;
-use focaldesk_ui::uitree::UiTree;
+use focaldesk_ui::types::{ElementId, UiElementKind};
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
@@ -237,7 +236,9 @@ pub struct RenderInputs<'a> {
     pub clock_pulse: Option<ClockPulseFrame>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
-    pub ui_tree: &'a UiTree,
+    /// Focus is retained by the accessibility model, while chrome rendering
+    /// reads element state exclusively from the per-output components.
+    pub ui_focus: Option<ElementId>,
     pub chrome_components: &'a ChromeComponents,
     pub current_workspace: WorkspaceId,
     /// A fullscreen client on this output owns the entire display, including the shell chrome.
@@ -836,7 +837,7 @@ impl RenderState {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         fonts: &FontSystem,
-        ui_tree: &UiTree,
+        chrome_components: &ChromeComponents,
         output_size: Size<i32, Logical>,
         theme: &FlowTheme,
         scale: Scale<f64>,
@@ -845,17 +846,23 @@ impl RenderState {
             return Ok(());
         }
 
-        let Some(el) = ui_tree.elements.iter().find(|el| {
-            el.hovered
-                && matches!(
-                    el.kind,
-                    UiElementKind::SidebarButton
-                        | UiElementKind::WorkspaceSlot
-                        | UiElementKind::TopbarIndicator
-                        | UiElementKind::TopbarButton
-                        | UiElementKind::TopbarFlowField
-                )
-        }) else {
+        let Some(el) = chrome_components
+            .dock
+            .elements
+            .iter()
+            .chain(chrome_components.system_panel.elements.iter())
+            .find(|el| {
+                el.hovered
+                    && matches!(
+                        el.kind,
+                        UiElementKind::SidebarButton
+                            | UiElementKind::WorkspaceSlot
+                            | UiElementKind::TopbarIndicator
+                            | UiElementKind::TopbarButton
+                            | UiElementKind::TopbarFlowField
+                    )
+            })
+        else {
             return Ok(());
         };
 
@@ -1949,7 +1956,7 @@ impl RenderState {
                 inputs.output,
                 inputs.metrics,
                 muts.ui,
-                inputs.ui_tree,
+                inputs.ui_focus,
                 inputs.chrome_components,
                 inputs.current_workspace,
                 inputs.fonts,
@@ -3750,7 +3757,7 @@ impl RenderState {
         metrics: &ChromeMetrics,
         //ui: &mut UiState<GlesTexture>,
         ui_state: &mut UiState<GlesTexture>,
-        ui_tree: &UiTree,
+        ui_focus: Option<ElementId>,
         chrome_components: &ChromeComponents,
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
@@ -4166,7 +4173,7 @@ impl RenderState {
                     _ => {}
                 }
 
-                if ui_tree.focused == Some(el.id) && ctx.rendering_output == ctx.active_output {
+                if ui_focus == Some(el.id) && ctx.rendering_output == ctx.active_output {
                     let focus_rect: Rectangle<i32, Physical> =
                         base_rect_logical.to_physical_precise_round(ctx.output_scale);
                     let thickness =
@@ -4211,7 +4218,7 @@ impl RenderState {
             let _ = self.draw_hover_tooltip(
                 frame,
                 fonts,
-                ui_tree,
+                chrome_components,
                 output_logical_size,
                 active_theme,
                 ctx.output_scale,

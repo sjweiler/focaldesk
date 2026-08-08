@@ -666,7 +666,7 @@ pub fn draw_output_stage(
         clock_pulse: state
             .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
-        ui_tree: &state.ui,
+        ui_focus: state.ui.focused,
         chrome_components: state
             .chrome_components
             .get(&prepared.frame_ctx.rendering_output)
