@@ -178,6 +178,24 @@ install-ai-console:
     cargo build --release -p focaldesk-ai-console
     sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
 
+# Install the AI IPC backend used at session boot and the console launched from
+# the desktop. The console is an application, so it is intentionally not a
+# long-running systemd service of its own.
+install-ai: install-dialog-service install-server-service install-ai-console
+
+# Fedora system-installed variant: use the /usr/bin daemon and the Fedora
+# user-unit path. It is still managed by systemctl --user because it belongs
+# to the logged-in graphical desktop session.
+install-ai-fedora: migrate-ai-user-units install-dialog-service-fedora install-server-service-fedora install-ai-console
+
+# Remove the older per-user development units before installing Fedora's
+# system-provided user units. A unit in ~/.config/systemd/user overrides the
+# matching unit in /usr/lib/systemd/user, even when the latter is newer.
+migrate-ai-user-units:
+    systemctl --user disable --now focaldesk-server.service focaldesk-dialogd.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/focaldesk-server.service" "$HOME/.config/systemd/user/focaldesk-dialogd.service"
+    systemctl --user daemon-reload || true
+
 install-focald-voice:
     cargo build --release -p focald-voice
     install -Dm755 target/release/focald-voice "$HOME/.local/bin/focald-voice"

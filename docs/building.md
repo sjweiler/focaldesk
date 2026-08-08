@@ -207,9 +207,23 @@ Fedora packagers can instead use:
 just install-services-fedora
 ```
 
-The Fedora recipes place binaries and units in system locations. Review the
-recipes in `justfile` before using them in a packaging environment. Fedora
+The Fedora recipes place binaries and unit files in system locations. Review
+the recipes in `justfile` before using them in a packaging environment. Fedora
 automation is likewise opt-in through `just install-automation-service-fedora`.
+
+To install the AI backend and console on Fedora, use the dedicated recipe:
+
+```sh
+just install-ai-fedora
+systemctl --user restart focaldesk-server.service
+```
+
+This installs `focaldesk-server` and `focaldesk-dialogd` under `/usr/bin` and
+their user-session units under `/usr/lib/systemd/user`. They are intentionally
+managed with `systemctl --user`, because the AI server needs the logged-in
+desktop session's runtime directory and IPC sockets. The recipe also removes
+older per-user development units from `~/.config/systemd/user`, which would
+otherwise override the Fedora units.
 
 Individual applications can be installed with recipes such as:
 

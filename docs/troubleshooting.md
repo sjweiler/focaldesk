@@ -21,6 +21,25 @@ systemctl --user status focaldesk-server.service
 journalctl --user -u focaldesk-server.service -b
 ```
 
+If AI chat reports that it is blocked for a provider, inspect the permission
+mode and the dialog broker:
+
+```sh
+systemctl --user --no-pager show focaldesk-server.service -p Environment
+systemctl --user status focaldesk-dialogd.service
+```
+
+For Fedora installations, reinstall the matching system-installed user units
+with `just install-ai-fedora`; do not mix them with the local development
+recipe `just install-ai`. Fedora units live under `/usr/lib/systemd/user` but
+still use `systemctl --user` because they run inside the graphical session.
+After changing a unit, reload and restart it:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart focaldesk-server.service
+```
+
 Inspect compositor messages for the current boot with:
 
 ```sh
@@ -39,6 +58,34 @@ private information. See [Compatibility Testing](compatibility-testing.md).
 
 Logs can contain filenames, application identifiers, model-provider errors, and
 other private context. Review them before posting publicly.
+
+## Diagnostic bundles and crash reports
+
+Create a bounded diagnostic archive for a bug report with:
+
+```sh
+focaldesk-cli diagnostics
+```
+
+The command prints the archive path and includes system/session metadata, DRM
+connector and GPU context, user-service state, recent FocalDesk journal entries,
+the active FocalDesk log, and the latest crash report when available. Choose a
+specific destination or omit logs when only system context is needed:
+
+```sh
+focaldesk-cli diagnostics --output focaldesk-report.tar.gz
+focaldesk-cli diagnostics --no-logs
+```
+
+Bundle entries and the archive use owner-only permissions. Collection is
+bounded, and common credential shapes, home paths, usernames, and hostnames are
+redacted automatically. Redaction is best effort: inspect the archive before
+sharing it.
+
+Processes using `focaldesk-logging` save the latest panic and backtrace under
+`$XDG_STATE_HOME/focaldesk/crashes/latest.txt`, or the corresponding
+`~/.local/state` location when `XDG_STATE_HOME` is unset. This file is also
+owner-only and is replaced atomically.
 
 ## `cargo run` selects no binary
 
