@@ -779,6 +779,10 @@ fn remove_drm_device(
             data.core.state.space.unmap_output(&surface.output);
             data.core.state.outputs.shift_remove(&surface.output_id);
             data.core
+                .state
+                .desktop_outputs
+                .shift_remove(&surface.output_id);
+            data.core
                 .output_state
                 .outputs
                 .shift_remove(&surface.output_id);

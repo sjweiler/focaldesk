@@ -16,6 +16,7 @@ use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::DialogId;
 use crate::dialog_layer::DialogLayer;
 use crate::egui_layer::EguiLayer;
+use crate::element::UiElement;
 use crate::overlay::OverlayManager;
 use crate::sidebar::Dock;
 use crate::topbar::SystemPanel;
@@ -117,6 +118,73 @@ impl DesktopOutput {
         renderer: &mut GlesRenderer,
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
         self.chrome_shaders.ensure_compiled(renderer)
+    }
+
+    /// Synchronize the output-owned chrome model from the compositor's current
+    /// layout and accessibility projection.
+    pub fn sync_chrome(
+        &mut self,
+        logical_rect: Rectangle<i32, Logical>,
+        scale_factor: f64,
+        metrics: ChromeMetrics,
+        chrome_layout: ChromeLayout,
+        ui_tree: &UiTree,
+    ) {
+        self.logical_rect = logical_rect;
+        self.scale_factor = scale_factor;
+        self.metrics = metrics;
+        self.chrome_layout = chrome_layout;
+        self.update_components_from_ui_tree(ui_tree);
+
+        let layout_ctx = LayoutCtx {
+            screen: logical_rect,
+            scale: scale_factor as f32,
+        };
+        if let Some(system_panel) = &mut self.system_panel {
+            system_panel.layout_from_chrome(&self.chrome_layout, &layout_ctx);
+        }
+        if let Some(dock) = &mut self.dock {
+            dock.layout_from_chrome(&self.chrome_layout, &layout_ctx);
+        }
+        self.workarea
+            .layout_from_chrome(&self.chrome_layout, &layout_ctx);
+    }
+
+    pub fn chrome_elements(&self) -> impl Iterator<Item = &UiElement> {
+        self.dock
+            .iter()
+            .flat_map(|dock| dock.elements.iter())
+            .chain(
+                self.system_panel
+                    .iter()
+                    .flat_map(|panel| panel.elements.iter()),
+            )
+    }
+
+    pub fn sidebar_hover_slot(&self) -> Option<usize> {
+        self.dock
+            .as_ref()?
+            .elements
+            .iter()
+            .position(|element| element.hovered)
+    }
+
+    pub fn clear_chrome_hover(&mut self) {
+        if let Some(system_panel) = &mut self.system_panel {
+            system_panel.clear_hover();
+        }
+        if let Some(dock) = &mut self.dock {
+            dock.clear_hover();
+        }
+    }
+
+    pub fn update_chrome_hover(&mut self, point: Point<i32, Logical>) {
+        if let Some(system_panel) = &mut self.system_panel {
+            system_panel.update_hover(point);
+        }
+        if let Some(dock) = &mut self.dock {
+            dock.update_hover(point);
+        }
     }
 
     /// Rebuild component-owned chrome content when layout/content changes.

@@ -57,3 +57,17 @@ IDs must be unique within a region. Invalid icons, empty commands, and custom
 items whose IDs collide with built-ins are ignored safely. When a region cannot
 fit all visible items, its last available position becomes an overflow button
 that opens Settings.
+
+## Per-output ownership
+
+Each connected display has a persistent `DesktopOutput` UI model owned by the
+compositor's desktop state. The model owns that display's topbar, dock,
+workarea, dialogs, overlays, and chrome rendering resources. Layout rebuilds
+synchronize the compatibility `UiTree` projection into the model; input and
+rendering then read the same output-owned component state instead of keeping a
+second set of compositor-side chrome components.
+
+The model is created when an output is registered and removed when a DRM
+device disappears. This keeps hover state, layout metrics, scale, theme, and
+rendering resources scoped to the correct display and prevents stale UI state
+after hot-unplugging a monitor.

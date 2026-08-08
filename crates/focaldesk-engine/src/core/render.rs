@@ -43,7 +43,6 @@ use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
 use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
-use crate::core::desktop::ChromeComponents;
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
     ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame,
@@ -239,7 +238,7 @@ pub struct RenderInputs<'a> {
     /// Focus is retained by the accessibility model, while chrome rendering
     /// reads element state exclusively from the per-output components.
     pub ui_focus: Option<ElementId>,
-    pub chrome_components: &'a ChromeComponents,
+    pub desktop_output: &'a focaldesk_ui::desktop_output::DesktopOutput,
     pub current_workspace: WorkspaceId,
     /// A fullscreen client on this output owns the entire display, including the shell chrome.
     pub fullscreen_client: bool,
@@ -837,7 +836,7 @@ impl RenderState {
         &mut self,
         frame: &mut GlesFrame<'_, '_>,
         fonts: &FontSystem,
-        chrome_components: &ChromeComponents,
+        desktop_output: &focaldesk_ui::desktop_output::DesktopOutput,
         output_size: Size<i32, Logical>,
         theme: &FlowTheme,
         scale: Scale<f64>,
@@ -846,23 +845,17 @@ impl RenderState {
             return Ok(());
         }
 
-        let Some(el) = chrome_components
-            .dock
-            .elements
-            .iter()
-            .chain(chrome_components.system_panel.elements.iter())
-            .find(|el| {
-                el.hovered
-                    && matches!(
-                        el.kind,
-                        UiElementKind::SidebarButton
-                            | UiElementKind::WorkspaceSlot
-                            | UiElementKind::TopbarIndicator
-                            | UiElementKind::TopbarButton
-                            | UiElementKind::TopbarFlowField
-                    )
-            })
-        else {
+        let Some(el) = desktop_output.chrome_elements().find(|el| {
+            el.hovered
+                && matches!(
+                    el.kind,
+                    UiElementKind::SidebarButton
+                        | UiElementKind::WorkspaceSlot
+                        | UiElementKind::TopbarIndicator
+                        | UiElementKind::TopbarButton
+                        | UiElementKind::TopbarFlowField
+                )
+        }) else {
             return Ok(());
         };
 
@@ -1957,7 +1950,7 @@ impl RenderState {
                 inputs.metrics,
                 muts.ui,
                 inputs.ui_focus,
-                inputs.chrome_components,
+                inputs.desktop_output,
                 inputs.current_workspace,
                 inputs.fonts,
                 inputs.flow_field_pulse,
@@ -3758,7 +3751,7 @@ impl RenderState {
         //ui: &mut UiState<GlesTexture>,
         ui_state: &mut UiState<GlesTexture>,
         ui_focus: Option<ElementId>,
-        chrome_components: &ChromeComponents,
+        desktop_output: &focaldesk_ui::desktop_output::DesktopOutput,
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
         flow_field_pulse: Option<FlowFieldPulseFrame>,
@@ -3827,12 +3820,7 @@ impl RenderState {
                 .clone()
                 .expect("glass shader not compiled");
 
-            for el in chrome_components
-                .dock
-                .elements
-                .iter()
-                .chain(chrome_components.system_panel.elements.iter())
-            {
+            for el in desktop_output.chrome_elements() {
                 if !el.visible {
                     continue;
                 }
@@ -4218,7 +4206,7 @@ impl RenderState {
             let _ = self.draw_hover_tooltip(
                 frame,
                 fonts,
-                chrome_components,
+                desktop_output,
                 output_logical_size,
                 active_theme,
                 ctx.output_scale,

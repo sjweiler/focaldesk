@@ -1,9 +1,6 @@
 #![allow(unused_imports)]
 
 use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
-use focaldesk_ui::sidebar::Dock;
-use focaldesk_ui::topbar::SystemPanel;
-use focaldesk_ui::uicomponent::LayoutCtx;
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::buffer_dimensions;
@@ -827,10 +824,10 @@ pub struct DesktopState {
     pub xwayland_loop_handle: Option<LoopHandle<'static, DesktopState>>,
     pub winit_scale_factor: f64,
     pub ui: UiTree,
-    /// Persistent compositor-owned chrome components, one pair per output.
+    /// Persistent compositor-owned desktop UI, one model per output.
     /// `UiTree` remains the compatibility projection for accessibility and
     /// legacy rendering while the component renderer is being migrated.
-    pub chrome_components: IndexMap<OutputId, ChromeComponents>,
+    pub desktop_outputs: IndexMap<OutputId, focaldesk_ui::desktop_output::DesktopOutput>,
     pub accessibility: crate::core::accessibility::AccessibilityBridge,
     pub active_workspace: WorkspaceId,
     pub workspace_names: Vec<String>,
@@ -1028,67 +1025,6 @@ pub struct DesktopState {
     pending_focus_window: Option<WindowId>,
     next_launch_trace_id: u64,
     //pub popups: Vec<PopupState>,
-}
-
-pub struct ChromeComponents {
-    pub system_panel: SystemPanel,
-    pub dock: Dock,
-}
-
-impl Default for ChromeComponents {
-    fn default() -> Self {
-        Self {
-            system_panel: SystemPanel::default(),
-            dock: Dock::default(),
-        }
-    }
-}
-
-impl ChromeComponents {
-    pub fn sidebar_hover_slot(&self) -> Option<usize> {
-        self.dock
-            .elements
-            .iter()
-            .position(|element| element.hovered)
-    }
-
-    fn update_from_ui_tree(&mut self, layout: &ChromeLayout, scale: f64, ui_tree: &UiTree) {
-        let layout_ctx = LayoutCtx {
-            screen: layout.topbar.outer,
-            scale: scale as f32,
-        };
-        self.system_panel.layout_from_chrome(layout, &layout_ctx);
-        self.dock.layout_from_chrome(layout, &layout_ctx);
-        self.system_panel.set_elements(
-            ui_tree
-                .elements
-                .iter()
-                .filter(|element| {
-                    matches!(
-                        element.kind,
-                        UiElementKind::TopbarIndicator
-                            | UiElementKind::TopbarButton
-                            | UiElementKind::TopbarFlowField
-                            | UiElementKind::Clock
-                    )
-                })
-                .cloned()
-                .collect(),
-        );
-        self.dock.set_elements(
-            ui_tree
-                .elements
-                .iter()
-                .filter(|element| {
-                    matches!(
-                        element.kind,
-                        UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot
-                    )
-                })
-                .cloned()
-                .collect(),
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2460,9 +2396,8 @@ impl DesktopState {
                 el.hovered = false;
             }
 
-            if let Some(components) = self.chrome_components.get_mut(&output_id) {
-                components.system_panel.clear_hover();
-                components.dock.clear_hover();
+            if let Some(desktop_output) = self.desktop_outputs.get_mut(&output_id) {
+                desktop_output.clear_chrome_hover();
             }
 
             return false;
@@ -2492,9 +2427,8 @@ impl DesktopState {
             el.hovered = Some(el.id) == self.ui.hovered;
         }
 
-        if let Some(components) = self.chrome_components.get_mut(&output_id) {
-            components.system_panel.update_hover(Point::from((x, y)));
-            components.dock.update_hover(Point::from((x, y)));
+        if let Some(desktop_output) = self.desktop_outputs.get_mut(&output_id) {
+            desktop_output.update_chrome_hover(Point::from((x, y)));
         }
 
         let sidebar_hover_sound_target = new_hovered
@@ -2737,10 +2671,22 @@ impl DesktopState {
         };
         build_ui_for_output_with_options(&mut self.ui, &layout, options);
         if let Some(output) = self.outputs.get(&output_id) {
-            self.chrome_components
-                .entry(output_id)
-                .or_default()
-                .update_from_ui_tree(&layout, output.scale_factor, &self.ui);
+            let config = focaldesk_ui::desktop_output::DesktopOutputConfig {
+                show_topbar: true,
+                show_sidebar: true,
+                theme_id: self.theme.active_theme().id.clone(),
+            };
+            let desktop_output = self.desktop_outputs.entry(output_id).or_insert_with(|| {
+                focaldesk_ui::desktop_output::DesktopOutput::new(output_id, config)
+            });
+            desktop_output.config.theme_id = self.theme.active_theme().id.clone();
+            desktop_output.sync_chrome(
+                Rectangle::from_loc_and_size((0, 0), output.logical_size),
+                output.scale_factor,
+                self.chrome.metrics.clone(),
+                layout,
+                &self.ui,
+            );
         }
         if output_id == self.focused_output {
             self.publish_accessibility_tree();
@@ -6189,7 +6135,7 @@ impl DesktopState {
             xwayland_loop_handle: None,
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
-            chrome_components: IndexMap::new(),
+            desktop_outputs: IndexMap::new(),
             accessibility: crate::core::accessibility::AccessibilityBridge::new(),
             active_workspace: WorkspaceId(1),
             workspace_names: vec!["Workspace 1".to_string()],
@@ -8503,7 +8449,16 @@ impl DesktopState {
             );
         }
 
-        self.chrome_components.entry(id).or_default();
+        self.desktop_outputs.entry(id).or_insert_with(|| {
+            focaldesk_ui::desktop_output::DesktopOutput::new(
+                id,
+                focaldesk_ui::desktop_output::DesktopOutputConfig {
+                    show_topbar: true,
+                    show_sidebar: true,
+                    theme_id: self.theme.active_theme().id.clone(),
+                },
+            )
+        });
 
         self.cursor_manager
             .set_base_size_and_scale(24, scale as f32);
