@@ -13,6 +13,7 @@ toml = "0.8"
 anyhow = "1"
 dirs = "5"
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+focaldesk-launcher-state = { path = "../../crates/focaldesk-launcher-state" }
 focaldesk-gtk = { path = "../../crates/focaldesk-gtk" }
 focaldesk-config = { path = "../../crates/focaldesk-config" }
 focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }

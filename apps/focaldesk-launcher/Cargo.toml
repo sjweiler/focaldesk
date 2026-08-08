@@ -9,6 +9,7 @@ adw = { package = "libadwaita", version = "0.7", features = ["v1_4"] }
 
 anyhow = "1"
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+focaldesk-launcher-state = { path = "../../crates/focaldesk-launcher-state" }
 focaldesk-gtk = { path = "../../crates/focaldesk-gtk" }
 focaldesk-config = { path = "../../crates/focaldesk-config" }
 focaldesk-settings-core = { path = "../../crates/focaldesk-settings-core" }

@@ -1,6 +1,7 @@
 use adw::prelude::*;
 use focaldesk_config::load_config;
 use focaldesk_gtk::{classify_status, StateKind, StatusBanner, ToastOverlay};
+use focaldesk_launcher_state::{is_file_favorite, toggle_file_favorite};
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_settings_core::load_settings;
 use focaldesk_themes::{gtk_app_css, gtk_app_prefers_dark, theme_by_name, GtkAppThemeOptions};
@@ -1175,15 +1176,19 @@ impl FileManager {
             let row_for_context = row.clone();
             let context_index = self.context_menu_index.clone();
             let this = self.clone();
+            let this_for_favorite = self.clone();
+            let item_for_favorite = item.clone();
             let item_for_rename = item.clone();
             attach_file_context_menu(
                 &row,
                 file_context_target(item),
+                item.uri.clone(),
                 move || {
                     list.unselect_all();
                     list.select_row(Some(&row_for_context));
                     *context_index.borrow_mut() = Some(row_for_context.index());
                 },
+                move || this_for_favorite.toggle_launcher_favorite(&item_for_favorite),
                 move || {
                     let this = this.clone();
                     let item = item_for_rename.clone();
@@ -1198,15 +1203,19 @@ impl FileManager {
             let child_for_context = child.clone();
             let context_index = self.context_menu_index.clone();
             let this = self.clone();
+            let this_for_favorite = self.clone();
+            let item_for_favorite = item.clone();
             let item_for_rename = item.clone();
             attach_file_context_menu(
                 &child,
                 file_context_target(item),
+                item.uri.clone(),
                 move || {
                     grid.unselect_all();
                     grid.select_child(&child_for_context);
                     *context_index.borrow_mut() = Some(child_for_context.index());
                 },
+                move || this_for_favorite.toggle_launcher_favorite(&item_for_favorite),
                 move || {
                     let this = this.clone();
                     let item = item_for_rename.clone();
@@ -2004,6 +2013,23 @@ impl FileManager {
         self.selected_index()
     }
 
+    fn toggle_launcher_favorite(&self, item: &FileItem) {
+        match toggle_file_favorite(&item.uri) {
+            Ok(true) => self.toasts.show(
+                StateKind::Success,
+                &format!("Added {} to Launcher Favorites.", item.name),
+            ),
+            Ok(false) => self.toasts.show(
+                StateKind::Success,
+                &format!("Removed {} from Launcher Favorites.", item.name),
+            ),
+            Err(err) => self.toasts.show(
+                StateKind::Error,
+                &format!("Could not update Launcher Favorites: {err}"),
+            ),
+        }
+    }
+
     fn set_view_mode(&self, view_mode: ViewMode) {
         if *self.view_mode.borrow() == view_mode {
             return;
@@ -2121,7 +2147,7 @@ impl FileManager {
         add_property_row(&grid, &mut row, "Modified", modified_text);
 
         if let Some(path) = &items[0].path {
-            add_property_row(&grid, &mut row, "Path", path.to_string_lossy().into_owned());
+            add_property_row(&grid, &mut row, "Path", path.to_string_lossy());
         } else {
             add_property_row(&grid, &mut row, "URI", items[0].uri.clone());
         }
@@ -2692,12 +2718,25 @@ fn file_context_target(item: &FileItem) -> FileContextTarget {
     }
 }
 
+fn launcher_favorite_action_label(uri: &str, is_favorite: bool) -> Option<&'static str> {
+    if uri.is_empty() {
+        None
+    } else if is_favorite {
+        Some("Remove from Launcher Favorites")
+    } else {
+        Some("Add to Launcher Favorites")
+    }
+}
+
 fn attach_file_context_menu(
     widget: &impl IsA<gtk::Widget>,
     target: FileContextTarget,
+    uri: String,
     select_item: impl Fn() + 'static,
+    toggle_launcher_favorite: impl Fn() + 'static,
     rename_item: impl Fn() + 'static,
 ) {
+    let toggle_launcher_favorite: Rc<dyn Fn()> = Rc::new(toggle_launcher_favorite);
     let rename_item: Rc<dyn Fn()> = Rc::new(rename_item);
     let click = gtk::GestureClick::new();
     click.set_button(3);
@@ -2711,6 +2750,22 @@ fn attach_file_context_menu(
             menu.set_margin_bottom(6);
             menu.set_margin_start(6);
             menu.set_margin_end(6);
+
+            if let Some(favorite_label) =
+                launcher_favorite_action_label(&uri, is_file_favorite(&uri))
+            {
+                let favorite = gtk::Button::with_label(favorite_label);
+                favorite.add_css_class("flat");
+                favorite.set_halign(gtk::Align::Fill);
+                let toggle_launcher_favorite = toggle_launcher_favorite.clone();
+                let popover_for_favorite = popover.clone();
+                favorite.connect_clicked(move |_| {
+                    popover_for_favorite.popdown();
+                    toggle_launcher_favorite();
+                });
+                menu.append(&favorite);
+                menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+            }
 
             menu.append(&file_context_action_button("Open", "win.file-open"));
             if matches!(target, FileContextTarget::Folder) {
@@ -2767,7 +2822,13 @@ fn attach_file_context_menu(
                 "win.file-properties",
             ));
 
-            popover.set_child(Some(&menu));
+            let menu_scroll = gtk::ScrolledWindow::new();
+            menu_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+            menu_scroll.set_propagate_natural_width(true);
+            menu_scroll.set_propagate_natural_height(true);
+            menu_scroll.set_max_content_height(520);
+            menu_scroll.set_child(Some(&menu));
+            popover.set_child(Some(&menu_scroll));
             popover.set_has_arrow(false);
             popover.set_parent(&parent);
             popover.connect_closed(|popover| popover.unparent());
@@ -3606,6 +3667,18 @@ mod tests {
         let after = local_directory_revision(&location).expect("updated revision");
         assert_ne!(before, after);
         std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[test]
+    fn windows_executables_can_be_added_to_launcher_favorites() {
+        assert_eq!(
+            launcher_favorite_action_label("file:///home/user/Game.exe", false),
+            Some("Add to Launcher Favorites")
+        );
+        assert_eq!(
+            launcher_favorite_action_label("file:///home/user/Game.exe", true),
+            Some("Remove from Launcher Favorites")
+        );
     }
 
     #[test]

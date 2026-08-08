@@ -38,7 +38,7 @@ fn theme_to_css(theme: &FlowTheme) -> String {
 
     let mut css = String::new();
     css.push_str("/* Generated from focaldesk-themes built-in theme data. */\n");
-    css.push_str(&format!(":root {{\n"));
+    css.push_str(":root {\n");
     css.push_str(&format!("  --fd-theme-id: \"{}\";\n", id));
     css.push_str(&format!(
         "  --fd-theme-name: \"{}\";\n",

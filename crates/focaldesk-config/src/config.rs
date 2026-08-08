@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct FocalDeskConfig {
     pub appearance: AppearanceConfig,
@@ -32,18 +32,6 @@ impl FocalDeskConfig {
     }
 }
 
-impl Default for FocalDeskConfig {
-    fn default() -> Self {
-        Self {
-            appearance: AppearanceConfig::default(),
-            displays: DisplaysConfig::default(),
-            shell: ShellConfig::default(),
-            panel: PanelConfig::default(),
-            dock: DockConfig::default(),
-        }
-    }
-}
-
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
@@ -56,17 +44,12 @@ impl Default for AppearanceConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ShellStyle {
     Floating,
+    #[default]
     Attached,
-}
-
-impl Default for ShellStyle {
-    fn default() -> Self {
-        Self::Attached
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,17 +66,12 @@ impl Default for ShellConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum PanelPosition {
+    #[default]
     Top,
     Bottom,
-}
-
-impl Default for PanelPosition {
-    fn default() -> Self {
-        Self::Top
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,31 +90,21 @@ impl Default for PanelConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DockPosition {
+    #[default]
     Left,
     Right,
 }
 
-impl Default for DockPosition {
-    fn default() -> Self {
-        Self::Left
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DockSize {
     Compact,
+    #[default]
     Normal,
     Expanded,
-}
-
-impl Default for DockSize {
-    fn default() -> Self {
-        Self::Normal
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

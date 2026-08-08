@@ -1,13 +1,15 @@
 use adw::prelude::*;
 use focaldesk_config::load_config;
-use focaldesk_gtk::{StateKind, StateView};
+use focaldesk_gtk::{StateKind, StateView, ToastOverlay};
+use focaldesk_launcher_state::{
+    load_launcher_state, remember_recent_app, remove_file_favorite, toggle_app_favorite,
+    LauncherState,
+};
 use focaldesk_logging::init_default_logging;
 use focaldesk_settings_core::load_settings;
 use focaldesk_themes::{gtk_app_css, gtk_app_prefers_dark, theme_by_name, GtkAppThemeOptions};
 use gtk::{gdk, gio, glib};
 use std::cell::RefCell;
-use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
@@ -21,13 +23,28 @@ struct LauncherApp {
     category: &'static str,
 }
 
-#[derive(Debug, Default)]
-struct LauncherState {
-    favorites: Vec<String>,
-    recents: Vec<String>,
+#[derive(Clone)]
+struct FavoriteFile {
+    uri: String,
+    name: String,
+    file: gio::File,
+    icon: gio::Icon,
+    is_dir: bool,
+    available: bool,
 }
 
-const MAX_RECENTS: usize = 12;
+#[derive(Clone)]
+struct LauncherView {
+    flow: gtk::FlowBox,
+    results: gtk::Stack,
+    empty_state: StateView,
+    apps: Rc<Vec<LauncherApp>>,
+    window: adw::ApplicationWindow,
+    state: Rc<RefCell<LauncherState>>,
+    toasts: ToastOverlay,
+}
+
+type QuickLaunchEntry = (&'static str, &'static str, Box<dyn Fn() -> String>);
 
 const CATEGORIES: [&str; 10] = [
     "All",
@@ -41,74 +58,6 @@ const CATEGORIES: [&str; 10] = [
     "System",
     "Utilities",
 ];
-
-fn state_path() -> PathBuf {
-    glib::user_config_dir()
-        .join("focaldesk")
-        .join("launcher-state")
-}
-
-fn load_launcher_state() -> LauncherState {
-    let Ok(contents) = fs::read_to_string(state_path()) else {
-        return LauncherState::default();
-    };
-
-    let mut state = LauncherState::default();
-    for line in contents.lines() {
-        if let Some(id) = line.strip_prefix("favorite\t") {
-            if !id.is_empty() && !state.favorites.iter().any(|entry| entry == id) {
-                state.favorites.push(id.to_string());
-            }
-        } else if let Some(id) = line.strip_prefix("recent\t") {
-            if !id.is_empty() && !state.recents.iter().any(|entry| entry == id) {
-                state.recents.push(id.to_string());
-            }
-        }
-    }
-    state.recents.truncate(MAX_RECENTS);
-    state
-}
-
-fn save_launcher_state(state: &LauncherState) {
-    let path = state_path();
-    if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            warn!(%err, "focaldesk-launcher: failed to create state directory");
-            return;
-        }
-    }
-
-    let mut contents = String::new();
-    for id in &state.favorites {
-        contents.push_str("favorite\t");
-        contents.push_str(id);
-        contents.push('\n');
-    }
-    for id in &state.recents {
-        contents.push_str("recent\t");
-        contents.push_str(id);
-        contents.push('\n');
-    }
-    if let Err(err) = fs::write(path, contents) {
-        warn!(%err, "focaldesk-launcher: failed to save launcher state");
-    }
-}
-
-fn remember_recent(state: &mut LauncherState, id: &str) {
-    state.recents.retain(|entry| entry != id);
-    state.recents.insert(0, id.to_string());
-    state.recents.truncate(MAX_RECENTS);
-}
-
-fn toggle_favorite(state: &mut LauncherState, id: &str) -> bool {
-    if let Some(index) = state.favorites.iter().position(|entry| entry == id) {
-        state.favorites.remove(index);
-        false
-    } else {
-        state.favorites.push(id.to_string());
-        true
-    }
-}
 
 fn sibling_binary(name: &str) -> String {
     std::env::current_exe()
@@ -179,6 +128,42 @@ fn installed_apps() -> Vec<LauncherApp> {
     apps
 }
 
+fn favorite_file(uri: &str) -> FavoriteFile {
+    let file = gio::File::for_uri(uri);
+    let info = file
+        .query_info(
+            "standard::display-name,standard::icon,standard::type",
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .ok();
+    let name = info
+        .as_ref()
+        .map(|info| info.display_name().to_string())
+        .or_else(|| {
+            file.basename()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| uri.to_string());
+    let icon = info
+        .as_ref()
+        .and_then(|info| info.icon())
+        .unwrap_or_else(|| gio::ThemedIcon::new("text-x-generic-symbolic").upcast());
+    let is_dir = info
+        .as_ref()
+        .is_some_and(|info| info.file_type() == gio::FileType::Directory);
+    let available = info.is_some();
+
+    FavoriteFile {
+        uri: uri.to_string(),
+        name,
+        file,
+        icon,
+        is_dir,
+        available,
+    }
+}
+
 const LAUNCH_ENV_KEYS: &[&str] = &[
     "WAYLAND_DISPLAY",
     "DISPLAY",
@@ -216,6 +201,7 @@ fn app_button(
     app: &LauncherApp,
     window: &adw::ApplicationWindow,
     state: &Rc<RefCell<LauncherState>>,
+    toasts: &ToastOverlay,
 ) -> gtk::Button {
     let button = gtk::Button::new();
     button.add_css_class("launcher-app-tile");
@@ -248,18 +234,22 @@ fn app_button(
 
     let info = app.info.clone();
     let app_id = app.id.clone();
-    let state_for_launch = state.clone();
     let window_for_launch = window.clone();
+    let toasts_for_launch = toasts.clone();
     button.connect_clicked(move |_| {
         let context =
             gtk::prelude::WidgetExt::display(&window_for_launch).app_launch_context();
         apply_launch_environment(&context, app_targets_exe(&info));
         if let Err(err) = info.launch(&[], Some(&context)) {
             warn!(app = %info.display_name(), %err, "focaldesk-launcher: failed to launch desktop app");
+            toasts_for_launch.show(
+                StateKind::Error,
+                &format!("Could not launch {}: {err}", info.display_name()),
+            );
         } else {
-            let mut state = state_for_launch.borrow_mut();
-            remember_recent(&mut state, &app_id);
-            save_launcher_state(&state);
+            if let Err(err) = remember_recent_app(&app_id) {
+                warn!(%err, "focaldesk-launcher: failed to update recent applications");
+            }
             window_for_launch.close();
         }
     });
@@ -276,19 +266,27 @@ fn app_button(
     popover.set_child(Some(&favorite_action));
 
     let app_id = app.id.clone();
-    let state_for_favorite = state.clone();
     let button_for_favorite = button.clone();
     let popover_for_action = popover.clone();
+    let toasts_for_favorite = toasts.clone();
     favorite_action.connect_clicked(move |action| {
-        let mut state = state_for_favorite.borrow_mut();
-        let favorite = toggle_favorite(&mut state, &app_id);
-        save_launcher_state(&state);
-        if favorite {
-            button_for_favorite.add_css_class("launcher-favorite");
-            action.set_label("Remove from Favorites");
-        } else {
-            button_for_favorite.remove_css_class("launcher-favorite");
-            action.set_label("Add to Favorites");
+        match toggle_app_favorite(&app_id) {
+            Ok(favorite) => {
+                if favorite {
+                    button_for_favorite.add_css_class("launcher-favorite");
+                    action.set_label("Remove from Favorites");
+                } else {
+                    button_for_favorite.remove_css_class("launcher-favorite");
+                    action.set_label("Add to Favorites");
+                }
+            }
+            Err(err) => {
+                warn!(%err, "focaldesk-launcher: failed to update application favorite");
+                toasts_for_favorite.show(
+                    StateKind::Error,
+                    &format!("Could not update Favorites: {err}"),
+                );
+            }
         }
         popover_for_action.popdown();
     });
@@ -322,6 +320,135 @@ fn app_button(
     button
 }
 
+fn favorite_file_button(
+    favorite: &FavoriteFile,
+    window: &adw::ApplicationWindow,
+    toasts: &ToastOverlay,
+) -> gtk::Button {
+    let button = gtk::Button::new();
+    button.add_css_class("launcher-app-tile");
+    button.add_css_class("launcher-favorite");
+    button.set_size_request(132, 92);
+    button.set_hexpand(true);
+    if favorite.available {
+        button.set_tooltip_text(Some(&format!(
+            "{} · Right-click to remove from Favorites",
+            favorite.name
+        )));
+    } else {
+        button.add_css_class("launcher-unavailable");
+        button.set_tooltip_text(Some(&format!(
+            "{} is unavailable · Right-click to remove from Favorites",
+            favorite.name
+        )));
+    }
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    content.set_valign(gtk::Align::Center);
+    let image = gtk::Image::from_gicon(&favorite.icon);
+    image.set_pixel_size(40);
+    let label = gtk::Label::new(Some(&favorite.name));
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(16);
+    content.append(&image);
+    content.append(&label);
+    if !favorite.available {
+        let unavailable = gtk::Label::new(Some("Unavailable"));
+        unavailable.add_css_class("dim-label");
+        unavailable.add_css_class("caption");
+        content.append(&unavailable);
+    }
+    button.set_child(Some(&content));
+
+    let file = favorite.file.clone();
+    let is_dir = favorite.is_dir;
+    let available = favorite.available;
+    let favorite_name = favorite.name.clone();
+    let window_for_launch = window.clone();
+    let toasts_for_launch = toasts.clone();
+    button.connect_clicked(move |_| {
+        if !available {
+            toasts_for_launch.show(
+                StateKind::Error,
+                &format!("Favorite is unavailable: {favorite_name}"),
+            );
+            return;
+        }
+        let result = if is_dir {
+            if let Some(path) = file.path() {
+                Command::new(sibling_binary("focaldesk-files"))
+                    .arg(path)
+                    .spawn()
+                    .map(|_| ())
+                    .map_err(|err| glib::Error::new(gio::IOErrorEnum::Failed, &err.to_string()))
+            } else {
+                let context =
+                    gtk::prelude::WidgetExt::display(&window_for_launch).app_launch_context();
+                apply_launch_environment(&context, false);
+                gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&context))
+            }
+        } else {
+            let context = gtk::prelude::WidgetExt::display(&window_for_launch).app_launch_context();
+            apply_launch_environment(&context, file_requires_x11(&file));
+            gio::AppInfo::launch_default_for_uri(&file.uri(), Some(&context))
+        };
+
+        match result {
+            Ok(()) => window_for_launch.close(),
+            Err(err) => {
+                warn!(uri = %file.uri(), %err, "focaldesk-launcher: failed to open favorite file");
+                toasts_for_launch.show(
+                    StateKind::Error,
+                    &format!("Could not open {favorite_name}: {err}"),
+                );
+            }
+        }
+    });
+
+    let popover = gtk::Popover::new();
+    popover.set_has_arrow(true);
+    popover.set_parent(&button);
+    let remove_action = gtk::Button::with_label("Remove from Favorites");
+    remove_action.add_css_class("flat");
+    popover.set_child(Some(&remove_action));
+
+    let uri = favorite.uri.clone();
+    let button_for_remove = button.clone();
+    let popover_for_remove = popover.clone();
+    let toasts_for_remove = toasts.clone();
+    remove_action.connect_clicked(move |_| {
+        match remove_file_favorite(&uri) {
+            Ok(_) => {
+                button_for_remove.set_visible(false);
+            }
+            Err(err) => {
+                warn!(%err, "focaldesk-launcher: failed to remove file favorite");
+                toasts_for_remove.show(
+                    StateKind::Error,
+                    &format!("Could not update Favorites: {err}"),
+                );
+            }
+        }
+        popover_for_remove.popdown();
+    });
+
+    let secondary_click = gtk::GestureClick::new();
+    secondary_click.set_button(gdk::BUTTON_SECONDARY);
+    secondary_click.connect_pressed(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        popover.popup();
+    });
+    button.add_controller(secondary_click);
+    button
+}
+
+fn file_requires_x11(file: &gio::File) -> bool {
+    file.path().as_deref().is_some_and(|path| {
+        path.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    })
+}
+
 fn app_search_score(name: &str, query: &str) -> Option<u8> {
     if query.is_empty() {
         return Some(0);
@@ -343,85 +470,105 @@ fn app_search_score(name: &str, query: &str) -> Option<u8> {
     }
 }
 
-fn render_apps(
-    flow: &gtk::FlowBox,
-    results: &gtk::Stack,
-    empty_state: &StateView,
-    apps: &[LauncherApp],
-    category: &str,
-    query: &str,
-    window: &adw::ApplicationWindow,
-    state: &Rc<RefCell<LauncherState>>,
-) {
-    while let Some(child) = flow.first_child() {
-        flow.remove(&child);
-    }
+impl LauncherView {
+    fn render(&self, category: &str, query: &str) {
+        while let Some(child) = self.flow.first_child() {
+            self.flow.remove(&child);
+        }
 
-    let query = query.trim().to_lowercase();
-    let state_snapshot = state.borrow();
-    let mut matches: Vec<_> = apps
-        .iter()
-        .filter(|app| match category {
-            "All" => true,
-            "Favorites" => state_snapshot.favorites.iter().any(|id| id == &app.id),
-            "Recent" => state_snapshot.recents.iter().any(|id| id == &app.id),
-            category => app.category == category,
-        })
-        .filter_map(|app| app_search_score(&app.name, &query).map(|score| (score, app)))
-        .collect();
-
-    matches.sort_by(|(score_a, app_a), (score_b, app_b)| {
-        score_a.cmp(score_b).then_with(|| {
-            if category == "Recent" && query.is_empty() {
-                let position_a = state_snapshot
-                    .recents
-                    .iter()
-                    .position(|id| id == &app_a.id)
-                    .unwrap_or(usize::MAX);
-                let position_b = state_snapshot
-                    .recents
-                    .iter()
-                    .position(|id| id == &app_b.id)
-                    .unwrap_or(usize::MAX);
-                position_a.cmp(&position_b)
+        let query = query.trim().to_lowercase();
+        let state_snapshot = self.state.borrow();
+        let favorite_file_uris =
+            if category == "Favorites" || (category == "All" && !query.is_empty()) {
+                state_snapshot.file_favorites.clone()
             } else {
-                app_a.name.to_lowercase().cmp(&app_b.name.to_lowercase())
+                Vec::new()
+            };
+        let mut matches: Vec<_> = self
+            .apps
+            .iter()
+            .filter(|app| match category {
+                "All" => true,
+                "Favorites" => state_snapshot.favorites.iter().any(|id| id == &app.id),
+                "Recent" => state_snapshot.recents.iter().any(|id| id == &app.id),
+                category => app.category == category,
+            })
+            .filter_map(|app| app_search_score(&app.name, &query).map(|score| (score, app)))
+            .collect();
+
+        matches.sort_by(|(score_a, app_a), (score_b, app_b)| {
+            score_a.cmp(score_b).then_with(|| {
+                if category == "Recent" && query.is_empty() {
+                    let position_a = state_snapshot
+                        .recents
+                        .iter()
+                        .position(|id| id == &app_a.id)
+                        .unwrap_or(usize::MAX);
+                    let position_b = state_snapshot
+                        .recents
+                        .iter()
+                        .position(|id| id == &app_b.id)
+                        .unwrap_or(usize::MAX);
+                    position_a.cmp(&position_b)
+                } else {
+                    app_a.name.to_lowercase().cmp(&app_b.name.to_lowercase())
+                }
+            })
+        });
+        drop(state_snapshot);
+
+        let mut file_matches: Vec<_> = favorite_file_uris
+            .iter()
+            .map(|uri| favorite_file(uri))
+            .filter_map(|file| app_search_score(&file.name, &query).map(|score| (score, file)))
+            .collect();
+        file_matches.sort_by(|(score_a, file_a), (score_b, file_b)| {
+            score_a
+                .cmp(score_b)
+                .then_with(|| file_a.name.to_lowercase().cmp(&file_b.name.to_lowercase()))
+        });
+
+        for (index, (_, app)) in matches.iter().enumerate() {
+            let button = app_button(app, &self.window, &self.state, &self.toasts);
+            if index == 0 && !query.is_empty() {
+                button.add_css_class("launcher-best-match");
             }
-        })
-    });
-    drop(state_snapshot);
-
-    for (index, (_, app)) in matches.iter().enumerate() {
-        let button = app_button(app, window, state);
-        if index == 0 && !query.is_empty() {
-            button.add_css_class("launcher-best-match");
+            self.flow.insert(&button, -1);
         }
-        flow.insert(&button, -1);
-    }
 
-    if matches.is_empty() {
-        if query.is_empty() && category == "Favorites" {
-            empty_state.set(
-                StateKind::Empty,
-                "No favorite applications yet",
-                "Right-click an application and add it to Favorites.",
-            );
-        } else if query.is_empty() && category == "Recent" {
-            empty_state.set(
-                StateKind::Empty,
-                "No recently launched applications",
-                "Applications you launch will appear here.",
-            );
+        let app_match_count = matches.len();
+        for (index, (_, file)) in file_matches.iter().enumerate() {
+            let button = favorite_file_button(file, &self.window, &self.toasts);
+            if app_match_count + index == 0 && !query.is_empty() {
+                button.add_css_class("launcher-best-match");
+            }
+            self.flow.insert(&button, -1);
+        }
+
+        if matches.is_empty() && file_matches.is_empty() {
+            if query.is_empty() && category == "Favorites" {
+                self.empty_state.set(
+                    StateKind::Empty,
+                    "No favorites yet",
+                    "Favorite an application here or a file in Files.",
+                );
+            } else if query.is_empty() && category == "Recent" {
+                self.empty_state.set(
+                    StateKind::Empty,
+                    "No recently launched applications",
+                    "Applications you launch will appear here.",
+                );
+            } else {
+                self.empty_state.set(
+                    StateKind::Empty,
+                    "No applications found",
+                    "Try another search or category.",
+                );
+            }
+            self.results.set_visible_child_name("empty");
         } else {
-            empty_state.set(
-                StateKind::Empty,
-                "No applications found",
-                "Try another search or category.",
-            );
+            self.results.set_visible_child_name("apps");
         }
-        results.set_visible_child_name("empty");
-    } else {
-        results.set_visible_child_name("apps");
     }
 }
 
@@ -443,10 +590,11 @@ fn build_ui(app: &adw::Application) {
     let toolbar_view = adw::ToolbarView::new();
     toolbar_view.add_top_bar(&header);
     toolbar_view.set_content(Some(&root));
-    window.set_content(Some(&toolbar_view));
+    let toasts = ToastOverlay::new(&toolbar_view);
+    window.set_content(Some(&toasts.widget()));
 
     let search = gtk::SearchEntry::new();
-    search.set_placeholder_text(Some("Search applications"));
+    search.set_placeholder_text(Some("Search applications and favorites"));
     root.append(&search);
 
     let quick_label = gtk::Label::new(Some("Quick launch"));
@@ -461,7 +609,7 @@ fn build_ui(app: &adw::Application) {
     quick.set_max_children_per_line(3);
     quick.set_row_spacing(8);
     quick.set_column_spacing(8);
-    let entries: [(&str, &str, Box<dyn Fn() -> String>); 3] = [
+    let entries: [QuickLaunchEntry; 3] = [
         (
             "Terminal",
             "utilities-terminal-symbolic",
@@ -530,6 +678,15 @@ fn build_ui(app: &adw::Application) {
 
     let apps = Rc::new(installed_apps());
     let launcher_state = Rc::new(RefCell::new(load_launcher_state()));
+    let view = LauncherView {
+        flow: flow.clone(),
+        results: results.clone(),
+        empty_state: empty_state.clone(),
+        apps: apps.clone(),
+        window: window.clone(),
+        state: launcher_state.clone(),
+        toasts,
+    };
     for category in CATEGORIES {
         let button = gtk::ToggleButton::with_label(category);
         button.add_css_class("launcher-category");
@@ -537,60 +694,43 @@ fn build_ui(app: &adw::Application) {
         if let Some(previous) = categories.last_child().and_downcast::<gtk::ToggleButton>() {
             button.set_group(Some(&previous));
         }
-        let apps = apps.clone();
-        let flow = flow.clone();
         let search = search.clone();
-        let window = window.clone();
         let selected_category = selected_category.clone();
-        let results = results.clone();
-        let empty_state = empty_state.clone();
-        let launcher_state = launcher_state.clone();
+        let view = view.clone();
         button.connect_toggled(move |button| {
             if button.is_active() {
                 *selected_category.borrow_mut() = category;
-                render_apps(
-                    &flow,
-                    &results,
-                    &empty_state,
-                    &apps,
-                    category,
-                    search.text().as_str(),
-                    &window,
-                    &launcher_state,
-                );
+                view.render(category, search.text().as_str());
             }
         });
         categories.append(&button);
     }
 
-    let apps_for_search = apps.clone();
-    let flow_for_search = flow.clone();
-    let window_for_search = window.clone();
-    let results_for_search = results.clone();
-    let empty_state_for_search = empty_state.clone();
-    let state_for_search = launcher_state.clone();
+    let view_for_search = view.clone();
+    let selected_category_for_search = selected_category.clone();
     search.connect_search_changed(move |entry| {
-        render_apps(
-            &flow_for_search,
-            &results_for_search,
-            &empty_state_for_search,
-            &apps_for_search,
-            *selected_category.borrow(),
+        view_for_search.render(
+            *selected_category_for_search.borrow(),
             entry.text().as_str(),
-            &window_for_search,
-            &state_for_search,
         );
     });
-    render_apps(
-        &flow,
-        &results,
-        &empty_state,
-        &apps,
-        "All",
-        "",
-        &window,
-        &launcher_state,
-    );
+    view.render("All", "");
+
+    let view_for_state_changes = view.clone();
+    let state_for_changes = launcher_state.clone();
+    let category_for_changes = selected_category.clone();
+    let search_for_changes = search.clone();
+    glib::timeout_add_local(Duration::from_millis(350), move || {
+        let next = load_launcher_state();
+        if next != *state_for_changes.borrow() {
+            *state_for_changes.borrow_mut() = next;
+            view_for_state_changes.render(
+                *category_for_changes.borrow(),
+                search_for_changes.text().as_str(),
+            );
+        }
+        glib::ControlFlow::Continue
+    });
 
     let search_keys = gtk::EventControllerKey::new();
     let flow_for_keys = flow.clone();
@@ -695,7 +835,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{app_search_score, remember_recent, toggle_favorite, LauncherState};
+    use super::{app_search_score, file_requires_x11};
+    use gtk::gio;
 
     #[test]
     fn search_prioritizes_exact_prefix_and_word_prefix_matches() {
@@ -707,20 +848,13 @@ mod tests {
     }
 
     #[test]
-    fn recent_apps_move_to_the_front_without_duplicates() {
-        let mut state = LauncherState::default();
-        remember_recent(&mut state, "one.desktop");
-        remember_recent(&mut state, "two.desktop");
-        remember_recent(&mut state, "one.desktop");
-        assert_eq!(state.recents, ["one.desktop", "two.desktop"]);
-    }
-
-    #[test]
-    fn favorites_toggle_cleanly() {
-        let mut state = LauncherState::default();
-        assert!(toggle_favorite(&mut state, "one.desktop"));
-        assert_eq!(state.favorites, ["one.desktop"]);
-        assert!(!toggle_favorite(&mut state, "one.desktop"));
-        assert!(state.favorites.is_empty());
+    fn windows_executable_favorites_force_xwayland() {
+        assert!(file_requires_x11(&gio::File::for_path("/games/Game.EXE")));
+        assert!(!file_requires_x11(&gio::File::for_path(
+            "/games/readme.txt"
+        )));
+        assert!(!file_requires_x11(&gio::File::for_uri(
+            "smb://server/Game.exe"
+        )));
     }
 }

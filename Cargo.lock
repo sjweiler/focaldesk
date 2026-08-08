@@ -2060,6 +2060,7 @@ dependencies = [
  "dirs 5.0.1",
  "focaldesk-config",
  "focaldesk-gtk",
+ "focaldesk-launcher-state",
  "focaldesk-logging",
  "focaldesk-settings-core",
  "focaldesk-themes",
@@ -2124,12 +2125,21 @@ dependencies = [
  "anyhow",
  "focaldesk-config",
  "focaldesk-gtk",
+ "focaldesk-launcher-state",
  "focaldesk-logging",
  "focaldesk-settings-core",
  "focaldesk-themes",
  "gtk4",
  "libadwaita",
  "tracing",
+]
+
+[[package]]
+name = "focaldesk-launcher-state"
+version = "0.1.0"
+dependencies = [
+ "dirs 5.0.1",
+ "libc",
 ]
 
 [[package]]

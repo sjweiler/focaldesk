@@ -29,6 +29,9 @@ version numbers where practical.
 - Added lifecycle-safe precise damage propagation for Wayland toplevel, popup,
   layer-shell, and synchronized subsurface trees, with transform, viewport,
   fractional-scale, destruction, effectiveness, and commit-storm coverage.
+- Added file and folder favorites shared between Files and Launcher, including
+  live updates, unavailable-item feedback, XWayland-aware Windows executable
+  launches, and private atomic state updates that preserve concurrent changes.
 
 ### Changed
 
