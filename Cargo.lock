@@ -1918,6 +1918,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "focaldesk-ai",
+ "focaldesk-diagnostics",
  "focaldesk-ipc",
  "tokio",
  "tracing",
@@ -1980,6 +1981,17 @@ dependencies = [
  "focaldesk-ui",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "focaldesk-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "focaldesk-logging",
+ "regex",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

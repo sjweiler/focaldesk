@@ -255,7 +255,7 @@ impl Chrome {
             self.metrics.topbar_h,
             self.metrics.sidebar_w,
             ChromeLayoutConfig {
-                status_item_count: 6,
+                status_item_count: crate::chrome_layout::DEFAULT_TOPBAR_STATUS_COUNT,
                 sidebar_item_count: 0,
             },
         );

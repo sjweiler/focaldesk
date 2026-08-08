@@ -1,3 +1,4 @@
+use crate::chrome_draw::{draw_chrome_icons_for_elements, draw_chrome_topbar_frame};
 use crate::chrome_layout::ChromeLayout;
 use crate::clock::ClockComponent;
 use crate::element::{ChromeItem, UiElement, UiRect};
@@ -13,7 +14,7 @@ use smithay::backend::renderer::gles::GlesError;
 use smithay::utils::Logical;
 use smithay::utils::Point;
 
-pub struct TopBarMeta {
+pub struct SystemPanelMeta {
     pub title: String,
     pub application_name: Option<String>,
 
@@ -24,20 +25,20 @@ pub struct TopBarMeta {
     pub workspace_id: usize,
 }
 
-pub struct TopBar {
+pub struct SystemPanel {
     pub title: String,
-    pub meta: TopBarMeta,
+    pub meta: SystemPanelMeta,
     pub indicators: Vec<UiElement>,
     pub clock: ClockComponent,
     pub bounds: UiRect,
     pub elements: Vec<UiElement>,
 }
 
-impl Default for TopBar {
+impl Default for SystemPanel {
     fn default() -> Self {
         Self {
             title: "FOCALDESK".into(),
-            meta: TopBarMeta {
+            meta: SystemPanelMeta {
                 title: "FOCALDESK".into(),
                 application_name: None,
                 show_output_label: true,
@@ -58,12 +59,36 @@ impl Default for TopBar {
     }
 }
 
-impl TopBar {
+impl SystemPanel {
     pub const OVERFLOW_ID: u32 = 199_999;
     pub fn layout_from_chrome(&mut self, layout: &ChromeLayout, ctx: &LayoutCtx) {
         self.bounds = layout.topbar.outer.into();
         self.clock.bounds = layout.topbar.clock_well.into();
         let _ = ctx;
+    }
+
+    pub fn set_elements(&mut self, elements: Vec<UiElement>) {
+        self.elements = elements;
+    }
+
+    pub fn update_hover(&mut self, point: Point<i32, Logical>) -> bool {
+        let mut changed = false;
+        for element in &mut self.elements {
+            let hovered =
+                element.visible && element.enabled && element.bounds.contains(point.x, point.y);
+            changed |= element.hovered != hovered;
+            element.hovered = hovered;
+        }
+        changed
+    }
+
+    pub fn clear_hover(&mut self) -> bool {
+        let mut changed = false;
+        for element in &mut self.elements {
+            changed |= element.hovered;
+            element.hovered = false;
+        }
+        changed
     }
 
     pub fn layout_status_items(
@@ -101,7 +126,7 @@ impl TopBar {
     }
 }
 
-impl UiComponent for TopBar {
+impl UiComponent for SystemPanel {
     fn layout(&mut self, ctx: &LayoutCtx) {
         self.bounds = ctx.screen.into();
     }
@@ -110,7 +135,7 @@ impl UiComponent for TopBar {
         for element in self.elements.iter().rev() {
             if element.bounds.contains(point.x, point.y) {
                 return Some(UiHit {
-                    target: UiHitTarget::TopBar,
+                    target: UiHitTarget::SystemPanel,
                     widget_id: WidgetId(element.id),
                     point,
                 });
@@ -121,7 +146,28 @@ impl UiComponent for TopBar {
     }
 
     fn render(&self, ctx: &mut RenderCtx) -> Result<(), GlesError> {
-        // Later: render topbar background, title, meta text, indicators.
-        self.clock.render(ctx)
+        draw_chrome_topbar_frame(
+            ctx.frame,
+            ctx.shaders,
+            ctx.frame_ctx,
+            ctx.chrome_layout,
+            &ctx.theme.chrome,
+        );
+        Ok(())
+    }
+}
+
+impl SystemPanel {
+    pub fn render_icons(&self, ctx: &mut RenderCtx) -> Result<(), GlesError> {
+        draw_chrome_icons_for_elements(
+            ctx.frame,
+            ctx.shaders,
+            ctx.frame_ctx,
+            ctx.chrome_layout,
+            &self.elements,
+            ctx.theme,
+            ctx.atlas,
+            ctx.metrics,
+        )
     }
 }

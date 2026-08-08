@@ -44,6 +44,7 @@ use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
 use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
+use crate::core::desktop::ChromeComponents;
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
     ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame,
@@ -237,6 +238,7 @@ pub struct RenderInputs<'a> {
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     pub ui_tree: &'a UiTree,
+    pub chrome_components: &'a ChromeComponents,
     pub current_workspace: WorkspaceId,
     /// A fullscreen client on this output owns the entire display, including the shell chrome.
     pub fullscreen_client: bool,
@@ -1948,6 +1950,7 @@ impl RenderState {
                 inputs.metrics,
                 muts.ui,
                 inputs.ui_tree,
+                inputs.chrome_components,
                 inputs.current_workspace,
                 inputs.fonts,
                 inputs.flow_field_pulse,
@@ -3748,6 +3751,7 @@ impl RenderState {
         //ui: &mut UiState<GlesTexture>,
         ui_state: &mut UiState<GlesTexture>,
         ui_tree: &UiTree,
+        chrome_components: &ChromeComponents,
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
         flow_field_pulse: Option<FlowFieldPulseFrame>,
@@ -3816,7 +3820,12 @@ impl RenderState {
                 .clone()
                 .expect("glass shader not compiled");
 
-            for el in &ui_tree.elements {
+            for el in chrome_components
+                .dock
+                .elements
+                .iter()
+                .chain(chrome_components.system_panel.elements.iter())
+            {
                 if !el.visible {
                     continue;
                 }

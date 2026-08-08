@@ -7,7 +7,7 @@ use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Rectangle, Size};
 
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
-use crate::core::desktop::DesktopState;
+use crate::core::desktop::{ChromeComponents, DesktopState};
 use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
@@ -651,7 +651,10 @@ pub fn draw_output_stage(
         metrics: &state.chrome.metrics,
         elements,
         popup_elements,
-        sidebar_hover_slot: state.sidebar_hover_for_output(prepared.frame_ctx.active_output),
+        sidebar_hover_slot: state
+            .chrome_components
+            .get(&prepared.frame_ctx.rendering_output)
+            .and_then(ChromeComponents::sidebar_hover_slot),
         sidebar_pulse: state
             .sidebar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         topbar_pulse: state
@@ -664,6 +667,10 @@ pub fn draw_output_stage(
             .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
         ui_tree: &state.ui,
+        chrome_components: state
+            .chrome_components
+            .get(&prepared.frame_ctx.rendering_output)
+            .expect("chrome components missing for output"),
         current_workspace: active_workspace,
         fullscreen_client,
         draw_internal_chrome,

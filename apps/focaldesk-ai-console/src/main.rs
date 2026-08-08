@@ -1997,7 +1997,7 @@ fn build_chat_request(
     prompt: &str,
 ) -> ChatRequest {
     let mut messages = vec![ChatMessage::system(
-        "You are the FocalDesk AI Console. Keep responses concise.",
+        "You are the FocalDesk AI Console. Keep responses concise. Respond in English unless the user requests another language.",
     )];
 
     if let Some(conversation) = store.conversations.get(conversation_idx) {
@@ -3023,7 +3023,7 @@ mod tests {
             vec![
                 (
                     "system",
-                    "You are the FocalDesk AI Console. Keep responses concise."
+                    "You are the FocalDesk AI Console. Keep responses concise. Respond in English unless the user requests another language."
                 ),
                 ("system", "Conversation: Current thread"),
                 ("user", "first"),

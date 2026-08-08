@@ -2,8 +2,8 @@ use crate::accessibility::{AccessibleInfo, AccessibleRole};
 use crate::atlas::IconId;
 use crate::chrome_layout::{ChromeLayout, ChromeLayoutConfig, DEFAULT_SIDEBAR_SLOT_COUNT};
 use crate::element::{ChromeItem, UiElement, UiRect};
-use crate::sidebar::SideBar;
-use crate::topbar::TopBar;
+use crate::sidebar::Dock;
+use crate::topbar::SystemPanel;
 use crate::types::{PanelKind, UiAction, UiElementKind};
 use crate::uitree::UiTree;
 use focaldesk_network::model::{Connectivity, NetworkIcon as NetIcon, NetworkState, map_icon};
@@ -21,12 +21,16 @@ pub const SIDEBAR_EMAIL_ID: u32 = SIDEBAR_BASE + 8;
 pub const SIDEBAR_WORKSPACE_OVERFLOW_ID: u32 = SIDEBAR_BASE + 10;
 pub const TOPBAR_NETWORK_ID: u32 = 100;
 pub const TOPBAR_BLUETOOTH_ID: u32 = 101;
-pub const TOPBAR_AUDIO_ID: u32 = 102;
+/// Default output-volume indicator. Keep the value stable for persisted chrome
+/// ordering/visibility settings that previously knew it as the audio item.
+pub const TOPBAR_VOLUME_ID: u32 = 102;
+pub const TOPBAR_AUDIO_ID: u32 = TOPBAR_VOLUME_ID;
 pub const TOPBAR_DISPLAY_ID: u32 = 103;
 pub const TOPBAR_POWER_ID: u32 = 104;
 pub const TOPBAR_CAMERA_ID: u32 = 105;
 pub const TOPBAR_DND_ID: u32 = 106;
 pub const TOPBAR_NOTIFICATIONS_ID: u32 = 107;
+pub const TOPBAR_MICROPHONE_ID: u32 = 108;
 
 // Workspace buttons get dynamically assigned IDs instead of fixed per-slot
 // consts, since the number of individually displayed workspace buttons is
@@ -220,7 +224,7 @@ fn network_tooltip(state: &NetworkState) -> String {
 }
 
 pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
-    let (audio_icon, audio_tooltip, audio_selected, audio_active) =
+    let (microphone_icon, microphone_tooltip, microphone_selected, microphone_active) =
         match (options.microphone_detected, options.voice_capture_status) {
             (_, VoiceCaptureStatus::Starting) => {
                 (IconId::Microphone, "Voice input: starting", true, false)
@@ -246,9 +250,12 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
                 false,
                 false,
             ),
-            (false, VoiceCaptureStatus::Idle | VoiceCaptureStatus::Unavailable) => {
-                (IconId::Speaker, "Audio", false, false)
-            }
+            (false, VoiceCaptureStatus::Idle | VoiceCaptureStatus::Unavailable) => (
+                IconId::MicrophoneOff,
+                "No microphone detected",
+                false,
+                false,
+            ),
         };
 
     let network_selected = matches!(options.network_state.connectivity, Connectivity::Internet);
@@ -276,13 +283,19 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
             UiAction::OpenPanel(PanelKind::Bluetooth),
         ),
         ChromeItem::new(
-            TOPBAR_AUDIO_ID,
-            audio_icon,
-            audio_tooltip,
+            TOPBAR_VOLUME_ID,
+            IconId::Speaker,
+            "Output volume",
+            UiAction::OpenPanel(PanelKind::Audio),
+        ),
+        ChromeItem::new(
+            TOPBAR_MICROPHONE_ID,
+            microphone_icon,
+            microphone_tooltip,
             UiAction::OpenPanel(PanelKind::Audio),
         )
-        .selected(audio_selected)
-        .active(audio_active),
+        .selected(microphone_selected)
+        .active(microphone_active),
         ChromeItem::new(
             TOPBAR_NOTIFICATIONS_ID,
             IconId::Notifications,
@@ -474,7 +487,7 @@ pub fn build_ui_for_output_with_options(
         .unwrap_or_else(|| default_sidebar_items(&options, layout.sidebar.slots.len()));
 
     ui.elements
-        .extend(SideBar::layout_items(layout, sidebar_entries));
+        .extend(Dock::layout_items(layout, sidebar_entries));
 
     let mut flow_field = UiElement::topbar_indicator(
         TOPBAR_FLOW_FIELD_ID,
@@ -505,7 +518,7 @@ pub fn build_ui_for_output_with_options(
         .clone()
         .unwrap_or_else(|| default_status_items(&options));
     ui.elements
-        .extend(TopBar::layout_status_items(layout, status_items));
+        .extend(SystemPanel::layout_status_items(layout, status_items));
 
     ui.elements.push(UiElement {
         id: CLOCK_ID,
@@ -589,12 +602,12 @@ mod tests {
         assert!(
             ui.elements
                 .iter()
-                .any(|element| element.id == crate::topbar::TopBar::OVERFLOW_ID)
+                .any(|element| element.id == crate::topbar::SystemPanel::OVERFLOW_ID)
         );
         assert!(
             ui.elements
                 .iter()
-                .any(|element| element.id == crate::sidebar::SideBar::OVERFLOW_ID)
+                .any(|element| element.id == crate::sidebar::Dock::OVERFLOW_ID)
         );
     }
 
@@ -626,7 +639,7 @@ mod tests {
         assert!(
             !ui.elements
                 .iter()
-                .any(|element| element.id == crate::topbar::TopBar::OVERFLOW_ID)
+                .any(|element| element.id == crate::topbar::SystemPanel::OVERFLOW_ID)
         );
     }
 
@@ -809,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn audio_well_shows_voice_capture_state() {
+    fn volume_and_microphone_are_separate_status_items() {
         let output_size = smithay::utils::Size::from((1920, 1080));
         let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
         let mut ui = UiTree::default();
@@ -823,11 +836,20 @@ mod tests {
             },
         );
 
+        let volume = ui
+            .elements
+            .iter()
+            .find(|element| element.id == super::TOPBAR_VOLUME_ID)
+            .expect("output volume indicator");
+        assert_eq!(volume.icon, Some(IconId::Speaker));
+        assert_eq!(volume.tooltip.as_deref(), Some("Output volume"));
+
         let microphone = ui
             .elements
             .iter()
-            .find(|element| element.icon == Some(IconId::Microphone))
+            .find(|element| element.id == super::TOPBAR_MICROPHONE_ID)
             .expect("microphone indicator");
+        assert_eq!(microphone.icon, Some(IconId::Microphone));
         assert_eq!(
             microphone.tooltip.as_deref(),
             Some("Voice input: listening — Super+Shift+V to stop")
@@ -851,8 +873,9 @@ mod tests {
         let microphone_off = ui
             .elements
             .iter()
-            .find(|element| element.icon == Some(IconId::MicrophoneOff))
+            .find(|element| element.id == super::TOPBAR_MICROPHONE_ID)
             .expect("idle microphone indicator");
+        assert_eq!(microphone_off.icon, Some(IconId::MicrophoneOff));
         assert_eq!(
             microphone_off.tooltip.as_deref(),
             Some("Voice input: not listening — Super+Shift+V to start")

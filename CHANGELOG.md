@@ -32,6 +32,9 @@ version numbers where practical.
 - Added file and folder favorites shared between Files and Launcher, including
   live updates, unavailable-item feedback, XWayland-aware Windows executable
   launches, and private atomic state updates that preserve concurrent changes.
+- Added bounded, redacted `focaldesk-cli diagnostics` archives containing
+  system, display, GPU, service, journal, log, and latest-crash context, plus
+  atomic owner-only panic reports from the shared logging layer.
 
 ### Changed
 

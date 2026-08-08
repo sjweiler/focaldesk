@@ -1,3 +1,5 @@
+use crate::atlas::IconAtlas;
+use crate::chrome::ChromeMetrics;
 use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::dialog::DialogId;
@@ -24,8 +26,8 @@ pub struct UiHit {
 
 #[derive(Debug, Clone, Copy)]
 pub enum UiHitTarget {
-    TopBar,
-    SideBar,
+    SystemPanel,
+    Dock,
     WorkArea,
     Dialog,
     Overlay,
@@ -48,6 +50,9 @@ pub struct RenderCtx<'a, 'b> {
     // NEW
     pub shaders: &'a ChromeShaders,
     pub theme: &'a FlowTheme,
+    pub atlas: Option<&'a IconAtlas>,
+    pub chrome_layout: &'a crate::chrome_layout::ChromeLayoutLogical,
+    pub metrics: &'a ChromeMetrics,
     pub active_dialog: Option<DialogId>,
     pub draw_on_this_output: bool,
 }

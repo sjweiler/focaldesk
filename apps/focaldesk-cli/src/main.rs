@@ -1,10 +1,12 @@
 use anyhow::{Context, bail};
 use focaldesk_ai::providers::OllamaProvider;
 use focaldesk_ai::{AiIpcRequest, AiIpcResponse, AiProvider, ChatRequest, send_ai_request};
+use focaldesk_diagnostics::{DiagnosticsOptions, collect_diagnostics};
 use focaldesk_ipc::{
     IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
     send_notification_request,
 };
+use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -54,6 +56,7 @@ fn main() -> anyhow::Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+        "diagnostics" => handle_diagnostics(args.collect()),
         "ai" => handle_ai(args.collect()),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -61,6 +64,37 @@ fn main() -> anyhow::Result<()> {
         }
         other => bail!("unknown command: {other}"),
     }
+}
+
+fn handle_diagnostics(args: Vec<String>) -> anyhow::Result<()> {
+    let options = parse_diagnostics_options(args)?;
+    let report = collect_diagnostics(&options).with_context(|| {
+        format!(
+            "could not create diagnostics archive at {}",
+            options.output.display()
+        )
+    })?;
+    println!("{}", report.path.display());
+    eprintln!(
+        "collected {} artifacts ({} uncompressed bytes); review before sharing",
+        report.artifact_count, report.uncompressed_bytes
+    );
+    Ok(())
+}
+
+fn parse_diagnostics_options(args: Vec<String>) -> anyhow::Result<DiagnosticsOptions> {
+    let mut options = DiagnosticsOptions::default();
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--output" => {
+                options.output = PathBuf::from(args.next().context("--output requires a path")?);
+            }
+            "--no-logs" => options.include_logs = false,
+            other => bail!("unknown diagnostics option: {other}"),
+        }
+    }
+    Ok(options)
 }
 
 fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
@@ -147,6 +181,7 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("  focaldesk-cli notify <title> [body...] [--timeout-ms <ms>]");
     eprintln!("  focaldesk-cli identify-displays");
+    eprintln!("  focaldesk-cli diagnostics [--output <archive.tar.gz>] [--no-logs]");
     eprintln!("  focaldesk-cli ai providers");
     eprintln!(
         "  focaldesk-cli ai chat [--provider <id>] [--model <model>] [--no-fallback] <prompt...>"
@@ -296,7 +331,7 @@ fn strip_terminal_sequences(input: &str) -> String {
             '\u{1b}' => match chars.peek().copied() {
                 Some('[') => {
                     let _ = chars.next();
-                    while let Some(next) = chars.next() {
+                    for next in chars.by_ref() {
                         if ('@'..='~').contains(&next) {
                             break;
                         }
@@ -330,7 +365,20 @@ fn strip_terminal_sequences(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render_ai_output;
+    use super::{parse_diagnostics_options, render_ai_output};
+    use std::path::Path;
+
+    #[test]
+    fn diagnostics_options_support_private_log_free_bundles() {
+        let options = parse_diagnostics_options(vec![
+            "--no-logs".into(),
+            "--output".into(),
+            "report.tar.gz".into(),
+        ])
+        .unwrap();
+        assert!(!options.include_logs);
+        assert_eq!(options.output, Path::new("report.tar.gz"));
+    }
 
     #[test]
     fn normalize_ai_output_converts_crlf() {

@@ -1,6 +1,8 @@
 use std::backtrace::Backtrace;
-use std::fs::{create_dir_all, File, OpenOptions};
-use std::path::PathBuf;
+use std::fs::{self, create_dir_all, File, OpenOptions};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -61,6 +63,94 @@ pub fn log_file_path_candidates() -> Vec<PathBuf> {
 
     paths.push(PathBuf::from("/tmp/focaldesk.log"));
     paths
+}
+
+pub fn crash_report_path_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    if let Ok(path) = std::env::var("FOCALDESK_CRASH_REPORT") {
+        paths.push(PathBuf::from(path));
+    }
+
+    if let Some(state_dir) = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("state"))
+        })
+    {
+        paths.push(
+            state_dir
+                .join("focaldesk")
+                .join("crashes")
+                .join("latest.txt"),
+        );
+    }
+
+    if let Some(cache_dir) = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".cache"))
+        })
+    {
+        paths.push(
+            cache_dir
+                .join("focaldesk")
+                .join("crashes")
+                .join("latest.txt"),
+        );
+    }
+
+    paths.dedup();
+    paths
+}
+
+fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "crash report path has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    let temporary = parent.join(format!(
+        ".latest.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn persist_crash_report(contents: &str) -> Option<PathBuf> {
+    const MAX_CRASH_REPORT_BYTES: usize = 256 * 1024;
+    let mut end = contents.len().min(MAX_CRASH_REPORT_BYTES);
+    while !contents.is_char_boundary(end) {
+        end -= 1;
+    }
+    crash_report_path_candidates()
+        .into_iter()
+        .find(|path| write_private_atomic(path, &contents.as_bytes()[..end]).is_ok())
 }
 
 fn open_log_file() -> Option<File> {
@@ -281,8 +371,32 @@ pub fn install_panic_hook() {
 
             let message = format!("panic captured at {location}: {payload}");
             let backtrace = Backtrace::force_capture();
+            let executable = std::env::current_exe()
+                .ok()
+                .and_then(|path| {
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let report = format!(
+                "FocalDesk crash report\n\
+                 timestamp_unix_ms: {}\n\
+                 process: {executable}\n\
+                 pid: {}\n\
+                 {message}\n\
+                 backtrace:\n{backtrace:?}\n",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                std::process::id()
+            );
+            let crash_report_path = persist_crash_report(&report);
             eprintln!("{message}");
             eprintln!("panic backtrace:\n{:?}", backtrace);
+            if let Some(path) = crash_report_path {
+                eprintln!("crash report saved to {}", path.display());
+            }
             tracing::error!(target: "focaldesk", "{message}");
             tracing::error!(target: "focaldesk", "panic backtrace:\n{:?}", backtrace);
 
@@ -349,4 +463,61 @@ macro_rules! flog_trace {
             format!($($arg)*)
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{init_default_logging, write_private_atomic};
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    #[test]
+    fn crash_reports_are_replaced_atomically_with_private_permissions() {
+        let directory = std::env::temp_dir().join(format!(
+            "focaldesk-crash-report-test-{}",
+            std::process::id()
+        ));
+        let path = directory.join("latest.txt");
+        write_private_atomic(&path, b"first").unwrap();
+        write_private_atomic(&path, b"second").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn panic_hook_child() {
+        if std::env::var_os("FOCALDESK_TEST_PANIC_CHILD").is_some() {
+            init_default_logging();
+            panic!("diagnostic-test-panic");
+        }
+    }
+
+    #[test]
+    fn panic_hook_persists_a_report_before_process_exit() {
+        let directory =
+            std::env::temp_dir().join(format!("focaldesk-panic-hook-test-{}", std::process::id()));
+        let path = directory.join("latest.txt");
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "logging::tests::panic_hook_child"])
+            .env("FOCALDESK_TEST_PANIC_CHILD", "1")
+            .env("FOCALDESK_CRASH_REPORT", &path)
+            .output()
+            .unwrap();
+
+        assert!(!result.status.success());
+        let report = std::fs::read_to_string(&path).unwrap();
+        assert!(report.contains("FocalDesk crash report"));
+        assert!(report.contains("diagnostic-test-panic"));
+        assert!(report.contains("backtrace:"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

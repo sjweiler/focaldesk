@@ -10,7 +10,6 @@ use smithay::utils::{Logical, Physical, Rectangle, Size};
 
 use crate::atlas::IconAtlas;
 use crate::chrome::ChromeMetrics;
-use crate::chrome_draw::{draw_chrome_below_work_wallpaper, draw_chrome_trim_glass_icons};
 use crate::chrome_layout::{ChromeLayout, build_chrome_layout};
 use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
@@ -18,8 +17,8 @@ use crate::dialog::DialogId;
 use crate::dialog_layer::DialogLayer;
 use crate::egui_layer::EguiLayer;
 use crate::overlay::OverlayManager;
-use crate::sidebar::SideBar;
-use crate::topbar::TopBar;
+use crate::sidebar::Dock;
+use crate::topbar::SystemPanel;
 use crate::uicomponent::{LayoutCtx, UiComponent, UiHit};
 use crate::uitree::UiTree;
 use crate::workarea::WorkArea;
@@ -38,8 +37,8 @@ pub struct DesktopOutput {
     pub config: DesktopOutputConfig,
     pub metrics: ChromeMetrics,
     pub chrome_layout: ChromeLayout,
-    pub topbar: Option<TopBar>,
-    pub sidebar: Option<SideBar>,
+    pub system_panel: Option<SystemPanel>,
+    pub dock: Option<Dock>,
     pub workarea: WorkArea,
     pub overlays: Option<OverlayManager>,
     pub dialog: Option<DialogLayer>,
@@ -57,8 +56,8 @@ impl DesktopOutput {
             config,
             metrics: ChromeMetrics::default(),
             chrome_layout: build_chrome_layout(Size::from((1, 1)), 64, 76),
-            topbar: Some(TopBar::default()),
-            sidebar: Some(SideBar::default()),
+            system_panel: Some(SystemPanel::default()),
+            dock: Some(Dock::default()),
             workarea: WorkArea::new(),
             overlays: Some(OverlayManager::default()),
             dialog: None,
@@ -96,16 +95,18 @@ impl DesktopOutput {
         );
         crate::ui_builder::build_ui_for_output_with_options(ui_tree, &self.chrome_layout, options);
 
+        self.update_components_from_ui_tree(ui_tree);
+
         let layout_ctx = LayoutCtx {
             screen: rect,
             scale: self.scale_factor as f32,
         };
 
-        if let Some(topbar) = &mut self.topbar {
-            topbar.layout_from_chrome(&self.chrome_layout, &layout_ctx);
+        if let Some(system_panel) = &mut self.system_panel {
+            system_panel.layout_from_chrome(&self.chrome_layout, &layout_ctx);
         }
-        if let Some(sidebar) = &mut self.sidebar {
-            sidebar.layout_from_chrome(&self.chrome_layout, &layout_ctx);
+        if let Some(dock) = &mut self.dock {
+            dock.layout_from_chrome(&self.chrome_layout, &layout_ctx);
         }
         self.workarea
             .layout_from_chrome(&self.chrome_layout, &layout_ctx);
@@ -118,10 +119,83 @@ impl DesktopOutput {
         self.chrome_shaders.ensure_compiled(renderer)
     }
 
+    /// Rebuild component-owned chrome content when layout/content changes.
+    /// Rendering does not copy the UiTree every frame.
+    fn update_components_from_ui_tree(&mut self, ui_tree: &UiTree) {
+        if let Some(system_panel) = &mut self.system_panel {
+            system_panel.set_elements(
+                ui_tree
+                    .elements
+                    .iter()
+                    .filter(|element| {
+                        matches!(
+                            element.kind,
+                            crate::types::UiElementKind::TopbarIndicator
+                                | crate::types::UiElementKind::TopbarButton
+                                | crate::types::UiElementKind::TopbarFlowField
+                                | crate::types::UiElementKind::Clock
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        }
+        if let Some(dock) = &mut self.dock {
+            dock.set_elements(
+                ui_tree
+                    .elements
+                    .iter()
+                    .filter(|element| {
+                        matches!(
+                            element.kind,
+                            crate::types::UiElementKind::SidebarButton
+                                | crate::types::UiElementKind::WorkspaceSlot
+                        )
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        }
+    }
+
+    /// Update hover state in the component-owned chrome model. Call this from
+    /// pointer-motion handling before scheduling a redraw.
+    pub fn update_pointer(&mut self, point: Point<i32, Logical>) -> bool {
+        let hit = self.hit_test(point);
+        let mut changed = false;
+        match hit.map(|hit| hit.target) {
+            Some(crate::uicomponent::UiHitTarget::SystemPanel) => {
+                if let Some(system_panel) = &mut self.system_panel {
+                    changed |= system_panel.update_hover(point);
+                }
+                if let Some(dock) = &mut self.dock {
+                    changed |= dock.clear_hover();
+                }
+            }
+            Some(crate::uicomponent::UiHitTarget::Dock) => {
+                if let Some(system_panel) = &mut self.system_panel {
+                    changed |= system_panel.clear_hover();
+                }
+                if let Some(dock) = &mut self.dock {
+                    changed |= dock.update_hover(point);
+                }
+            }
+            _ => {
+                if let Some(system_panel) = &mut self.system_panel {
+                    changed |= system_panel.clear_hover();
+                }
+                if let Some(dock) = &mut self.dock {
+                    changed |= dock.clear_hover();
+                }
+            }
+        }
+        changed
+    }
+
     #[allow(clippy::too_many_arguments)]
-    pub fn render(
+    pub fn render<'a>(
         &mut self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut GlesFrame<'a, 'a>,
         frame_ctx: &DesktopFrameCtx,
         theme: &FlowTheme,
         ui_tree: &UiTree,
@@ -206,21 +280,41 @@ impl DesktopOutput {
     }
 
     /// Structural top bar / sidebar / work-area shell (under wallpaper and clients).
-    fn render_bottom_chrome(
+    fn render_bottom_chrome<'a>(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut GlesFrame<'a, 'a>,
         frame_ctx: &DesktopFrameCtx,
         theme: &FlowTheme,
         sidebar_hover_slot: Option<usize>,
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-        draw_chrome_below_work_wallpaper(
+        crate::chrome_draw::draw_chrome_workarea_frame(
             frame,
             &self.chrome_shaders,
             frame_ctx,
             &self.chrome_layout,
-            sidebar_hover_slot,
             &theme.chrome,
         );
+        let mut ctx = crate::uicomponent::RenderCtx {
+            frame,
+            frame_ctx,
+            damage: &[],
+            output_scale: frame_ctx.output_scale.x,
+            output_id: self.output_id,
+            shaders: &self.chrome_shaders,
+            theme,
+            atlas: None,
+            chrome_layout: &self.chrome_layout,
+            metrics: &self.metrics,
+            active_dialog: None,
+            draw_on_this_output: true,
+        };
+        if let Some(system_panel) = &self.system_panel {
+            system_panel.render(&mut ctx)?;
+        }
+        if let Some(dock) = &self.dock {
+            dock.render(&mut ctx)?;
+        }
+        let _ = sidebar_hover_slot;
         Ok(())
     }
 
@@ -229,26 +323,45 @@ impl DesktopOutput {
     }
 
     /// Trim, glass tint, and chrome icons above client surfaces.
-    fn render_top_chrome(
+    fn render_top_chrome<'a>(
         &self,
-        frame: &mut GlesFrame<'_, '_>,
+        frame: &mut GlesFrame<'a, 'a>,
         frame_ctx: &DesktopFrameCtx,
         theme: &FlowTheme,
         ui_tree: &UiTree,
         sidebar_hover_slot: Option<usize>,
         icon_atlas: Option<&IconAtlas>,
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
-        draw_chrome_trim_glass_icons(
+        crate::chrome_draw::draw_chrome_trim_glass(
             frame,
             &self.chrome_shaders,
             frame_ctx,
             &self.chrome_layout,
-            &self.metrics,
-            ui_tree,
             theme,
-            sidebar_hover_slot,
-            icon_atlas,
-        )
+        )?;
+
+        let mut ctx = crate::uicomponent::RenderCtx {
+            frame,
+            frame_ctx,
+            damage: &[],
+            output_scale: frame_ctx.output_scale.x,
+            output_id: self.output_id,
+            shaders: &self.chrome_shaders,
+            theme,
+            atlas: icon_atlas,
+            chrome_layout: &self.chrome_layout,
+            metrics: &self.metrics,
+            active_dialog: None,
+            draw_on_this_output: true,
+        };
+        if let Some(system_panel) = &self.system_panel {
+            system_panel.render_icons(&mut ctx)?;
+        }
+        if let Some(dock) = &self.dock {
+            dock.render_icons(&mut ctx)?;
+        }
+        let _ = (ui_tree, sidebar_hover_slot);
+        Ok(())
     }
 
     fn render_dialogs(
@@ -309,14 +422,14 @@ impl DesktopOutput {
             return Some(hit);
         }
 
-        if let Some(topbar) = &self.topbar
-            && let Some(hit) = topbar.hit_test(point)
+        if let Some(system_panel) = &self.system_panel
+            && let Some(hit) = system_panel.hit_test(point)
         {
             return Some(hit);
         }
 
-        if let Some(sidebar) = &self.sidebar
-            && let Some(hit) = sidebar.hit_test(point)
+        if let Some(dock) = &self.dock
+            && let Some(hit) = dock.hit_test(point)
         {
             return Some(hit);
         }

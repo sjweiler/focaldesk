@@ -80,7 +80,7 @@ impl UiComponent for ClockComponent {
         for element in self.elements.iter().rev() {
             if element.bounds.contains(point.x, point.y) {
                 return Some(UiHit {
-                    target: UiHitTarget::TopBar,
+                    target: UiHitTarget::SystemPanel,
                     widget_id: WidgetId(element.id),
                     point,
                 });

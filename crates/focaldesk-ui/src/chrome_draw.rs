@@ -241,6 +241,214 @@ pub fn draw_chrome_below_work_wallpaper(
     }
 }
 
+/// Draw only the structural frame around the work area. Topbar and sidebar
+/// frames are owned by their respective `UiComponent`s.
+pub fn draw_chrome_workarea_frame(
+    frame: &mut GlesFrame<'_, '_>,
+    shaders: &ChromeShaders,
+    frame_ctx: &DesktopFrameCtx,
+    layout: &ChromeLayoutLogical,
+    theme: &ChromeTheme,
+) {
+    let legacy_theme = chrome_theme_from_flow_theme(theme);
+    let Some(beveled) = shaders.beveled_panel.as_ref() else {
+        return;
+    };
+    let damage = &[Rectangle::from_loc_and_size((0, 0), frame_ctx.output_size)];
+    for (rect, style) in [
+        (layout.work_area.outer, &legacy_theme.frame_outer),
+        (layout.work_area.inner_frame, &legacy_theme.frame_outer),
+        (layout.work_area.recess, &legacy_theme.panel_inner),
+    ] {
+        let _ = draw_beveled_panel(frame, beveled, rect, frame_ctx.output_scale, damage, style);
+    }
+}
+
+/// Draw the structural topbar frame and controls. Icons are rendered in the
+/// top-chrome pass so they remain above client surfaces.
+pub fn draw_chrome_topbar_frame(
+    frame: &mut GlesFrame<'_, '_>,
+    shaders: &ChromeShaders,
+    frame_ctx: &DesktopFrameCtx,
+    layout: &ChromeLayoutLogical,
+    theme: &ChromeTheme,
+) {
+    let legacy_theme = chrome_theme_from_flow_theme(theme);
+    let (Some(beveled), Some(light), Some(button), Some(top_bar)) = (
+        shaders.beveled_panel.as_ref(),
+        shaders.light_channel.as_ref(),
+        shaders.recessed_button.as_ref(),
+        shaders.top_bar.as_ref(),
+    ) else {
+        return;
+    };
+    let damage = &[Rectangle::from_loc_and_size((0, 0), frame_ctx.output_size)];
+    let scale = frame_ctx.output_scale;
+    let _ = draw_top_bar(
+        frame,
+        top_bar,
+        layout.topbar.outer,
+        scale,
+        damage,
+        &legacy_theme.top_bar,
+    );
+    for (rect, style) in [
+        (layout.topbar.inner, &legacy_theme.frame_inner),
+        (layout.topbar.flow_field, &legacy_theme.panel_inner),
+        (layout.topbar.title, &legacy_theme.panel_inner),
+        (layout.topbar.trim, &legacy_theme.trim),
+    ] {
+        let _ = draw_beveled_panel(frame, beveled, rect, scale, damage, style);
+    }
+    if let Some(rect) = layout.topbar.light {
+        let _ = draw_light_channel(frame, light, rect, scale, damage, &legacy_theme.light);
+    }
+    for rect in &layout.topbar.status_wells {
+        let _ = draw_recessed_button(frame, button, *rect, scale, damage, &legacy_theme.button);
+        let _ = draw_light_channel(
+            frame,
+            light,
+            inset_rect(*rect, 3),
+            scale,
+            damage,
+            &legacy_theme.light,
+        );
+    }
+    let _ = draw_recessed_button(
+        frame,
+        button,
+        layout.topbar.clock_well,
+        scale,
+        damage,
+        &legacy_theme.button,
+    );
+    let _ = draw_light_channel(
+        frame,
+        light,
+        inset_rect(layout.topbar.clock_well, 3),
+        scale,
+        damage,
+        &legacy_theme.light,
+    );
+}
+
+/// Draw the structural sidebar frame and button wells.
+pub fn draw_chrome_sidebar_frame(
+    frame: &mut GlesFrame<'_, '_>,
+    shaders: &ChromeShaders,
+    frame_ctx: &DesktopFrameCtx,
+    layout: &ChromeLayoutLogical,
+    hovered_slot: Option<usize>,
+    theme: &ChromeTheme,
+) {
+    let legacy_theme = chrome_theme_from_flow_theme(theme);
+    let (Some(beveled), Some(light), Some(button)) = (
+        shaders.beveled_panel.as_ref(),
+        shaders.light_channel.as_ref(),
+        shaders.recessed_button.as_ref(),
+    ) else {
+        return;
+    };
+    let damage = &[Rectangle::from_loc_and_size((0, 0), frame_ctx.output_size)];
+    let scale = frame_ctx.output_scale;
+    let _ = draw_beveled_panel(
+        frame,
+        beveled,
+        layout.sidebar.outer,
+        scale,
+        damage,
+        &legacy_theme.sidebar,
+    );
+    let _ = draw_beveled_panel(
+        frame,
+        beveled,
+        layout.sidebar.inner,
+        scale,
+        damage,
+        &legacy_theme.panel_inner,
+    );
+    for (index, slot) in layout.sidebar.slots.iter().enumerate() {
+        let _ = draw_beveled_panel(
+            frame,
+            beveled,
+            slot.outer,
+            scale,
+            damage,
+            &legacy_theme.module,
+        );
+        let _ = draw_beveled_panel(
+            frame,
+            beveled,
+            slot.inner,
+            scale,
+            damage,
+            &legacy_theme.module_inner,
+        );
+        let _ = draw_recessed_button(
+            frame,
+            button,
+            slot.icon_well,
+            scale,
+            damage,
+            &legacy_theme.button,
+        );
+        let hovered = hovered_slot == Some(index);
+        let hover = if hovered { 1.0 } else { 0.0 };
+        let mut style = legacy_theme.light;
+        style.glow_color[3] = 0.08 + hover * 0.55;
+        style.core_color[3] = 0.18 + hover * 0.55;
+        style.glow_radius = 8.0 + hover * 6.0;
+        style.core_inset = 3.0 - hover * 0.75;
+        let _ = draw_light_channel(
+            frame,
+            light,
+            inset_rect(slot.icon_well, 3),
+            scale,
+            damage,
+            &style,
+        );
+    }
+    if let Some(rect) = layout.sidebar.light {
+        let _ = draw_light_channel(frame, light, rect, scale, damage, &legacy_theme.light);
+    }
+    for rect in layout
+        .sidebar
+        .caps
+        .iter()
+        .chain(layout.decoration.corner_caps.iter())
+        .chain(layout.decoration.corner_joint_caps.iter())
+    {
+        let _ = draw_beveled_panel(
+            frame,
+            beveled,
+            *rect,
+            scale,
+            damage,
+            &legacy_theme.corner_cap,
+        );
+    }
+}
+
+/// Render only component-owned icons. The common trim/glass pass is omitted.
+pub fn draw_chrome_icons_for_elements(
+    frame: &mut GlesFrame<'_, '_>,
+    shaders: &ChromeShaders,
+    frame_ctx: &DesktopFrameCtx,
+    layout: &ChromeLayoutLogical,
+    elements: &[crate::element::UiElement],
+    theme: &FlowTheme,
+    atlas: Option<&IconAtlas>,
+    metrics: &ChromeMetrics,
+) -> Result<(), GlesError> {
+    let ui_tree = UiTree {
+        elements: elements.to_vec(),
+        ..UiTree::default()
+    };
+    draw_chrome_trim_glass_icons_impl(
+        frame, shaders, frame_ctx, layout, metrics, &ui_tree, theme, None, atlas, false,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn draw_chrome_trim_glass_icons(
     frame: &mut GlesFrame<'_, '_>,
@@ -252,6 +460,56 @@ pub fn draw_chrome_trim_glass_icons(
     theme: &FlowTheme,
     sidebar_hover_slot: Option<usize>,
     atlas: Option<&IconAtlas>,
+) -> Result<(), GlesError> {
+    draw_chrome_trim_glass_icons_impl(
+        frame,
+        shaders,
+        frame_ctx,
+        layout,
+        metrics,
+        ui_tree,
+        theme,
+        Some(sidebar_hover_slot),
+        atlas,
+        true,
+    )
+}
+
+/// Draw the shared top-chrome trim, glass, and active-output lightbar without
+/// drawing any component-owned icons.
+pub fn draw_chrome_trim_glass(
+    frame: &mut GlesFrame<'_, '_>,
+    shaders: &ChromeShaders,
+    frame_ctx: &DesktopFrameCtx,
+    layout: &ChromeLayoutLogical,
+    theme: &FlowTheme,
+) -> Result<(), GlesError> {
+    let empty = UiTree::default();
+    draw_chrome_trim_glass_icons_impl(
+        frame,
+        shaders,
+        frame_ctx,
+        layout,
+        &ChromeMetrics::default(),
+        &empty,
+        theme,
+        None,
+        None,
+        true,
+    )
+}
+
+fn draw_chrome_trim_glass_icons_impl(
+    frame: &mut GlesFrame<'_, '_>,
+    shaders: &ChromeShaders,
+    frame_ctx: &DesktopFrameCtx,
+    layout: &ChromeLayoutLogical,
+    metrics: &ChromeMetrics,
+    ui_tree: &UiTree,
+    theme: &FlowTheme,
+    sidebar_hover_slot: Option<Option<usize>>,
+    atlas: Option<&IconAtlas>,
+    draw_surface: bool,
 ) -> Result<(), GlesError> {
     let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
     let beveled = shaders
@@ -266,28 +524,30 @@ pub fn draw_chrome_trim_glass_icons(
     );
     let damage = &[fullscreen_rect];
 
-    if let Some(rect) = layout.work_area.trim {
-        let _ = draw_beveled_panel(
+    if draw_surface {
+        if let Some(rect) = layout.work_area.trim {
+            let _ = draw_beveled_panel(
+                frame,
+                &beveled,
+                rect,
+                frame_ctx.output_scale,
+                damage,
+                &legacy_theme.trim,
+            );
+        }
+
+        let _ = draw_workarea_glass(
             frame,
-            &beveled,
-            rect,
+            frame_ctx,
+            glass,
+            layout.work_area.glass,
             frame_ctx.output_scale,
             damage,
-            &legacy_theme.trim,
+            &legacy_theme.glass,
         );
+
+        draw_active_lightbar(frame, shaders, frame_ctx, layout);
     }
-
-    let _ = draw_workarea_glass(
-        frame,
-        frame_ctx,
-        glass,
-        layout.work_area.glass,
-        frame_ctx.output_scale,
-        damage,
-        &legacy_theme.glass,
-    );
-
-    draw_active_lightbar(frame, shaders, frame_ctx, layout);
 
     let Some(atlas) = atlas else {
         return Ok(());

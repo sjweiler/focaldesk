@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 focaldesk-ai = { path = "../../crates/focaldesk-ai" }
+focaldesk-diagnostics = { path = "../../crates/focaldesk-diagnostics" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 
 anyhow = { workspace = true }

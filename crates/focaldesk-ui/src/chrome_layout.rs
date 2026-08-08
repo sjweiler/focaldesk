@@ -7,7 +7,10 @@ use smithay::utils::Size;
 pub const NESTED_DEFAULT_TOPBAR_H: i32 = 64;
 pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
 pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 12;
-pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 6;
+/// Number of built-in status indicators. Runtime/custom collections override
+/// this through `ChromeLayoutConfig::status_item_count` and are only limited by
+/// the available output width.
+pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 9;
 pub const SIDEBAR_CORNER_RADIUS: f32 = 16.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,6 +485,21 @@ mod tests {
         assert_eq!(layout.sidebar.outer.loc.y, 370);
         assert!(layout.sidebar.caps.is_empty());
         assert!(layout.decoration.corner_joint_caps.is_empty());
+    }
+
+    #[test]
+    fn topbar_status_layout_is_not_capped_at_six_items() {
+        let layout = build_chrome_layout_with_config(
+            Size::from((2560, 1440)),
+            64,
+            76,
+            ChromeLayoutConfig {
+                status_item_count: 12,
+                sidebar_item_count: 0,
+            },
+        );
+
+        assert_eq!(layout.topbar.status_wells.len(), 12);
     }
 
     #[test]

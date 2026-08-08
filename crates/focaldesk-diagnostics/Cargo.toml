@@ -1,0 +1,11 @@
+[package]
+name = "focaldesk-diagnostics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+chrono.workspace = true
+focaldesk-logging = { path = "../focaldesk-logging" }
+regex = "1"
+serde_json = "1"
+tempfile = "3"

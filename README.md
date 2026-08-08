@@ -278,6 +278,16 @@ Because FocalDesk is alpha compositor/system software, run it from a safe
 development session first. Avoid switching important work over to it until you
 know the current state of your local build.
 
+Create a redacted, bounded diagnostic archive after a crash or compatibility
+problem with:
+
+```sh
+focaldesk-cli diagnostics
+```
+
+Review the archive before sharing it. See [Troubleshooting](docs/troubleshooting.md)
+for included data, privacy behavior, output options, and crash-report locations.
+
 ## AI Service
 
 The background server exposes AI chat over the local IPC socket used by
