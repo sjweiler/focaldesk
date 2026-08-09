@@ -102,13 +102,6 @@ search, sorting, and list/grid workflows.
 
 ![File Manager](docs/screenshots/files.png)
 
-### AI Console permission prompt
-
-This view demonstrates an AI request stopping at the runtime permission boundary
-before an action proceeds.
-
-![AI Console displaying a permission request](docs/screenshots/ai-console-permission-check.png)
-
 ### AI Console processing a query
 
 The AI Console prototype connects to configured model providers through local
