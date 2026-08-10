@@ -228,6 +228,18 @@ pub fn composite_linear_layer_onto_sdr_srgb(
 }
 
 /// Full-frame scene sRGB → monitor encode (C1b parametric, C2c ICC LUT, or C3b HDR PQ).
+fn resolve_hdr_encode_state(
+    selected: bool,
+    requested: bool,
+    supported: bool,
+    kms_applied: bool,
+    transition_target: Option<bool>,
+    test_encode: bool,
+) -> (bool, bool) {
+    let kms_target = selected && requested && supported && transition_target.unwrap_or(kms_applied);
+    (kms_target || (selected && test_encode), kms_target)
+}
+
 pub fn apply_output_encode(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -237,23 +249,34 @@ pub fn apply_output_encode(
 ) -> Result<Option<SyncPoint>> {
     targets.encoded_hdr = false;
     let output_state = state.outputs.get(&output_id);
-    let hdr_active = output_state
+    let (hdr_active, hdr_kms_target) = output_state
         .map(|o| {
-            o.hdr_enabled
-                || crate::core::color::output_hdr_pq_test_encode_active(
+            let selected = crate::core::color::hdr_output_selected(&o.handle.name());
+            let test_encode = selected
+                && crate::core::color::output_hdr_pq_test_encode_active(
                     o.hdr_requested,
                     o.hdr_supported,
                     o.hdr_kms_applied,
-                )
+                );
+            resolve_hdr_encode_state(
+                selected,
+                o.hdr_requested,
+                o.hdr_supported,
+                o.hdr_kms_applied,
+                o.hdr_transition_target,
+                test_encode,
+            )
         })
-        .unwrap_or(false);
+        .unwrap_or((false, false));
     let hdr_max = output_state.and_then(|o| o.edid_hdr_max_luminance_nits);
     let hdr_fall = output_state.and_then(|o| o.edid_hdr_max_fall_nits);
     let sdr_white_nits = output_state
         .map(|o| o.color_description.reference_white_nits)
         .unwrap_or(80.0);
 
-    if hdr_active && hdr_render_runtime_enabled() {
+    // A real KMS HDR transition must carry a PQ-encoded first frame. The
+    // runtime flag remains relevant only to the userspace-only PQ lab mode.
+    if hdr_active && (hdr_kms_target || hdr_render_runtime_enabled()) {
         if let Some(max_nits) = hdr_max.filter(|n| *n > 0.0) {
             if targets.hdr_supported {
                 match apply_hdr_pq_encode(
@@ -1052,4 +1075,33 @@ pub fn present_offscreen_texture(
         None,
         &[],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_hdr_encode_state;
+
+    #[test]
+    fn pending_hdr_enable_encodes_first_frame_as_pq() {
+        assert_eq!(
+            resolve_hdr_encode_state(true, true, true, false, Some(true), false),
+            (true, true)
+        );
+    }
+
+    #[test]
+    fn pending_hdr_disable_encodes_first_frame_as_sdr() {
+        assert_eq!(
+            resolve_hdr_encode_state(true, false, true, true, Some(false), false),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn ten_bit_scanout_does_not_enable_pq_by_itself() {
+        assert_eq!(
+            resolve_hdr_encode_state(true, false, true, false, None, false),
+            (false, false)
+        );
+    }
 }

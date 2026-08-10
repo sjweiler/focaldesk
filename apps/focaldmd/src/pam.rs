@@ -534,6 +534,16 @@ fn session_exec_spec(cfg: &Config, user: &nix::unistd::User) -> ExecSpec {
             cfg.keyboard_options.clone(),
         ));
     }
+    // focaldmd starts the desktop with a complete, clean environment rather
+    // than inheriting its own service environment. Apply administrator
+    // session overrides last so compositor feature flags can be configured
+    // in focaldmd.toml. PAM's session environment is still merged afterward.
+    for (key, value) in &cfg.session_environment {
+        match env.iter_mut().find(|(existing, _)| existing == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => env.push((key.clone(), value.clone())),
+        }
+    }
 
     ExecSpec {
         program: cfg.session_cmd.clone(),

@@ -2,6 +2,7 @@
 //! Every field has a sane default so the daemon runs unconfigured on a
 //! freshly installed system; the file only needs to override what differs.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::Context as _;
@@ -18,6 +19,10 @@ pub struct Config {
     pub greeter_cmd: String,
     /// Command exec'd for the authenticated user's session (focaldesk).
     pub session_cmd: String,
+    /// Extra environment variables exported to the authenticated user's
+    /// session. This is the native-display-manager equivalent of variables
+    /// set by a GDM session wrapper.
+    pub session_environment: BTreeMap<String, String>,
     /// Unix socket the greeter connects to.
     pub socket_path: PathBuf,
     /// PAM service name (an entry under /etc/pam.d/) for authenticating a
@@ -48,6 +53,7 @@ impl Default for Config {
             greeter_user: "focaldm".into(),
             greeter_cmd: "/usr/libexec/focaldm-greeter".into(),
             session_cmd: "/usr/local/bin/focaldesk-desktop".into(),
+            session_environment: BTreeMap::new(),
             socket_path: PathBuf::from("/run/focaldmd/greeter.sock"),
             pam_service: "focaldmd".into(),
             greeter_pam_service: "focaldmd-greeter".into(),
@@ -69,5 +75,31 @@ impl Config {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).context("read /etc/focaldmd.toml"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+
+    #[test]
+    fn parses_session_environment() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [session_environment]
+            FOCALDESK_HDR_OUTPUT = "DP-3"
+            FOCALDESK_HDR_RENDER = "1"
+            "#,
+        )
+        .expect("parse focaldmd config");
+
+        assert_eq!(
+            cfg.session_environment.get("FOCALDESK_HDR_OUTPUT"),
+            Some(&"DP-3".to_string())
+        );
+        assert_eq!(
+            cfg.session_environment.get("FOCALDESK_HDR_RENDER"),
+            Some(&"1".to_string())
+        );
     }
 }

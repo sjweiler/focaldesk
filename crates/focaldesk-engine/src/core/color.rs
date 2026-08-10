@@ -477,7 +477,7 @@ pub fn hdr_render_runtime_enabled() -> bool {
     )
 }
 
-/// When true, apply HDR connector properties and 10-bit scanout (C3c).
+/// When true, apply HDR connector properties to the persistent scanout path (C3c).
 pub fn hdr_kms_env_blocked() -> bool {
     matches!(
         std::env::var("FOCALDESK_HDR").ok().as_deref(),
@@ -491,6 +491,25 @@ pub fn hdr_kms_env_forced() -> bool {
         std::env::var("FOCALDESK_HDR").ok().as_deref(),
         Some("1") | Some("true") | Some("yes")
     )
+}
+
+/// Limit experimental HDR rendering and KMS changes to one connector.
+///
+/// This is a development safety rail, not a persistent display preference. An
+/// unset or empty selector allows every output whose normal HDR preference is
+/// enabled; otherwise connector names must match exactly (for example `DP-3`).
+pub fn hdr_output_selected(output_name: &str) -> bool {
+    hdr_output_selected_with_selector(
+        output_name,
+        std::env::var("FOCALDESK_HDR_OUTPUT").ok().as_deref(),
+    )
+}
+
+fn hdr_output_selected_with_selector(output_name: &str, selector: Option<&str>) -> bool {
+    selector
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+        .is_none_or(|selector| selector == output_name)
 }
 
 /// Whether the DRM loop may attempt live KMS HDR commits.
@@ -647,6 +666,14 @@ mod tests {
         assert!(hdr_runtime_may_apply_kms(true));
         assert!(!output_hdr_render_active(false, true, true));
         assert!(!output_hdr_render_active(true, false, true));
+    }
+
+    #[test]
+    fn hdr_output_selector_limits_hdr_to_one_connector() {
+        assert!(hdr_output_selected_with_selector("DP-3", None));
+        assert!(hdr_output_selected_with_selector("DP-3", Some("")));
+        assert!(hdr_output_selected_with_selector("DP-3", Some(" DP-3 ")));
+        assert!(!hdr_output_selected_with_selector("DP-4", Some("DP-3")));
     }
 
     #[test]

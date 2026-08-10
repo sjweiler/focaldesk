@@ -577,8 +577,12 @@ pub struct OutputState {
     pub scale: Scale<f64>,
     pub hdr_supported: bool,
     pub hdr_requested: bool,
-    /// KMS connector + 10-bit scanout HDR state is live on this output.
+    /// KMS connector HDR state is live on this output. Scanout may remain
+    /// 10-bit independently while displaying SDR.
     pub hdr_kms_applied: bool,
+    /// HDR state staged for the next DRM frame. Rendering targets this state,
+    /// while `hdr_kms_applied` changes only after the matching vblank.
+    pub hdr_transition_target: Option<bool>,
     pub hdr_enabled: bool,
     /// EDID Type-1 HDR static metadata (nits), when detected.
     pub edid_hdr_max_luminance_nits: Option<f32>,
@@ -4961,6 +4965,7 @@ impl DesktopState {
                 hdr_supported: false,
                 hdr_requested: false,
                 hdr_kms_applied: false,
+                hdr_transition_target: None,
                 hdr_enabled: false,
                 edid_hdr_max_luminance_nits: None,
                 edid_hdr_max_fall_nits: None,
@@ -8428,6 +8433,7 @@ impl DesktopState {
                     hdr_supported: false,
                     hdr_requested: false,
                     hdr_kms_applied: false,
+                    hdr_transition_target: None,
                     hdr_enabled: false,
                     edid_hdr_max_luminance_nits: None,
                     edid_hdr_max_fall_nits: None,

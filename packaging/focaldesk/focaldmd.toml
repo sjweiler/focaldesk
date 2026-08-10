@@ -10,3 +10,10 @@ keyboard_layout = "us"
 keyboard_variant = ""
 keyboard_model = ""
 keyboard_options = ""
+
+# Extra variables for the authenticated FocalDesk session belong here because
+# focaldmd launches it with a clean environment. For example, a controlled HDR
+# test on one connector can be configured with:
+#
+# [session_environment]
+# FOCALDESK_HDR_OUTPUT = "DP-3"
