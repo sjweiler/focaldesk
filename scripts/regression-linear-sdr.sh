@@ -24,10 +24,10 @@ cargo build -p focaldesk-desktop -p focaldesk-color-tag-test --quiet
 pass "focaldesk-desktop + focaldesk-color-tag-test build"
 
 section "Session logs (current boot)"
-if ! journalctl --user -b -q -g 'Linear SDR probe' --no-pager 2>/dev/null | grep -q .; then
+if ! journalctl --user -b -q -g 'linear SDR probe' --no-pager 2>/dev/null | grep -qi .; then
     warn "No 'Linear SDR probe' lines — compositor may not be running this boot"
 else
-    journalctl --user -b -g 'Linear SDR probe' --no-pager | tail -5
+    journalctl --user -b -g 'linear SDR probe' --no-pager | tail -5
     pass "Linear SDR startup probe present"
 fi
 
@@ -66,10 +66,12 @@ fi
 
 section "Manual checklist (visual)"
 cat <<'EOF'
-  [ ] Linear default: full wallpaper both outputs, no diagonal black wedge
+  [ ] Legacy default: full wallpaper both outputs, no diagonal black wedge
+  [ ] FOCALDESK_LINEAR_SDR=1 restart: full wallpaper both outputs, no diagonal black wedge
   [ ] Glass + chrome + cursor + popups look correct
+  [ ] Icon edges are clean at partial opacity (no bright boxes or dark halos)
+  [ ] Overlap sRGB and linear-tagged windows; raising either preserves stacking order
   [ ] Drag window across outputs (DP-3 / DP-4)
-  [ ] FOCALDESK_LINEAR_SDR=0 restart: legacy path still OK
   [ ] focaldesk-color-tag-test --transfer srgb|linear (or RUN_COLOR_TAG_TEST=1)
 EOF
 

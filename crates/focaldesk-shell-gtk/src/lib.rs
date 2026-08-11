@@ -415,6 +415,7 @@ fn build_panel(
             });
         },
     );
+    launcher.add_css_class("panel-well");
     panel.append(&launcher);
 
     let identity = gtk::Box::new(gtk::Orientation::Horizontal, 7);

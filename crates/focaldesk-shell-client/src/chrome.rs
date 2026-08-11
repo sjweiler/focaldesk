@@ -321,7 +321,6 @@ impl Chrome {
         if let Some(beveled) = beveled {
             for (rect, style) in [
                 (layout.topbar.inner, &self.theme.frame_inner),
-                (layout.topbar.flow_field, &self.theme.panel_inner),
                 (layout.topbar.title, &self.theme.panel_inner),
                 (layout.topbar.trim, &self.theme.trim),
             ] {
@@ -329,6 +328,14 @@ impl Chrome {
             }
         }
         let launcher_control = layout.topbar.flow_field;
+        if let Some(button) = button {
+            let mut style = self.theme.button;
+            if hovered == Some(0) {
+                style.glow_strength = 0.72;
+                style.glow_radius = style.glow_radius.max(7.0);
+            }
+            draw_recessed_button(frame, button, launcher_control, sc, &damage, &style)?;
+        }
         // Match the compositor's TopbarFlowField constructor: keep the AI
         // glyph square and cap it at 28 logical pixels inside the wide well.
         let mut launcher_icon = centered_square(launcher_control, launcher_control.size.h.min(28));

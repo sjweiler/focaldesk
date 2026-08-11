@@ -64,6 +64,30 @@ pub enum AiFlowMode {
     Error,
 }
 
+impl AiFlowMode {
+    /// Short copy that remains legible inside the compact top-bar field.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "AI ready",
+            Self::Thinking => "Thinking",
+            Self::Acting => "Working",
+            Self::PermissionWait => "Approval needed",
+            Self::Error => "AI unavailable",
+        }
+    }
+
+    /// Detailed copy for hover and assistive technology.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Idle => "AI ready — open Console",
+            Self::Thinking => "Thinking — open for details",
+            Self::Acting => "Working — open for progress",
+            Self::PermissionWait => "Approval needed — open Console",
+            Self::Error => "AI unavailable — check Console",
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum VoiceCaptureStatus {
     #[default]
@@ -489,16 +513,20 @@ pub fn build_ui_for_output_with_options(
     ui.elements
         .extend(Dock::layout_items(layout, sidebar_entries));
 
+    let flow_mode = options.ai_flow_mode;
     let mut flow_field = UiElement::topbar_indicator(
         TOPBAR_FLOW_FIELD_ID,
         IconId::AiConsole,
-        "Launch FocalDesk AI Console",
+        flow_mode.description(),
     );
     flow_field.kind = UiElementKind::TopbarFlowField;
     flow_field.action = Some(UiAction::LaunchApp("focaldesk-ai-console".into()));
+    flow_field.label = Some(flow_mode.label().into());
     flow_field.accessible = Some(
         AccessibleInfo::new(AccessibleRole::Button, "FocalDesk AI Console")
-            .description("Open the AI Console"),
+            .description(flow_mode.description())
+            .value_text(flow_mode.label())
+            .live(true),
     );
     flow_field.bounds = UiRect {
         x: layout.topbar.flow_field.loc.x,
@@ -554,10 +582,10 @@ mod tests {
     use crate::atlas::IconId;
     use crate::element::{ChromeItem, UiElement};
     use crate::ui_builder::{
-        SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID,
-        SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID, UiAction,
-        UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options, default_status_items,
-        sidebar_workspace_id, sidebar_workspace_number,
+        AiFlowMode, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID,
+        SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID,
+        UiAction, UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options,
+        default_status_items, sidebar_workspace_id, sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
 
@@ -819,6 +847,56 @@ mod tests {
             Some(UiAction::LaunchApp(command)) if command == "focaldesk-ai-console"
         ));
         assert_eq!(flow_field.icon, Some(IconId::AiConsole));
+        assert_eq!(flow_field.label.as_deref(), Some("AI ready"));
+        assert_eq!(
+            flow_field.tooltip.as_deref(),
+            Some("AI ready — open Console")
+        );
+        assert_eq!(
+            flow_field
+                .accessible
+                .as_ref()
+                .and_then(|info| info.value_text.as_deref()),
+            Some("AI ready")
+        );
+        assert!(flow_field.accessible.as_ref().is_some_and(|info| info.live));
+    }
+
+    #[test]
+    fn flow_field_exposes_plain_language_copy_for_every_ai_state() {
+        let cases = [
+            (AiFlowMode::Idle, "AI ready"),
+            (AiFlowMode::Thinking, "Thinking"),
+            (AiFlowMode::Acting, "Working"),
+            (AiFlowMode::PermissionWait, "Approval needed"),
+            (AiFlowMode::Error, "AI unavailable"),
+        ];
+
+        for (mode, expected) in cases {
+            let output_size = smithay::utils::Size::from((1920, 1080));
+            let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
+            let mut ui = UiTree::default();
+            build_ui_for_output_with_options(
+                &mut ui,
+                &layout,
+                UiBuildOptions {
+                    ai_flow_mode: mode,
+                    ..UiBuildOptions::default()
+                },
+            );
+            let flow = ui
+                .elements
+                .iter()
+                .find(|element| element.id == TOPBAR_FLOW_FIELD_ID)
+                .expect("flow field");
+            assert_eq!(flow.label.as_deref(), Some(expected));
+            assert_eq!(
+                flow.accessible
+                    .as_ref()
+                    .and_then(|info| info.value_text.as_deref()),
+                Some(expected)
+            );
+        }
     }
 
     #[test]

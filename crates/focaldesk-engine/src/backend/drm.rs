@@ -565,7 +565,14 @@ fn capture_surface_pixels(
     renderer: &mut GlesRenderer,
     surface: &mut DrmSurfaceState,
 ) -> Result<Vec<u8>> {
-    let (texture, size) = if surface.render_targets.encoded_scanout {
+    let (texture, size) = if surface.render_targets.encoded_hdr {
+        let hdr = surface
+            .render_targets
+            .hdr_offscreen
+            .as_mut()
+            .ok_or_else(|| anyhow!("HDR offscreen missing for capture"))?;
+        (&mut hdr.texture, hdr.size)
+    } else if surface.render_targets.encoded_scanout {
         let scratch = surface
             .render_targets
             .encode_scratch
@@ -2521,14 +2528,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .chrome_shaders
                         .client_to_scene_linear
                         .clone();
-                    let linear_to_srgb =
-                        data.core.state.render.chrome_shaders.linear_to_srgb.clone();
+                    let srgb_to_linear =
+                        data.core.state.render.chrome_shaders.srgb_to_linear.clone();
                     let use_linear_sdr = use_linear_sdr_path(
                         &mut device.renderer,
                         &surface.render_targets,
                         surface.size,
                     ) && client_to_scene.is_some()
-                        && linear_to_srgb.is_some();
+                        && srgb_to_linear.is_some();
 
                     if use_linear_sdr {
                         if let Err(err) = surface
@@ -2555,7 +2562,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 &data.core.scene,
                                 &data.core.output_state,
                                 client_to_scene.as_ref().unwrap(),
-                                linear_to_srgb.as_ref().unwrap(),
+                                srgb_to_linear.as_ref().unwrap(),
                             )?
                         } else {
                             run_sdr_pass(

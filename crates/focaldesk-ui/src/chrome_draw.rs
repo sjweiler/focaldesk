@@ -6,7 +6,7 @@ use smithay::backend::renderer::gles::{
 };
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
-use crate::atlas::{IconAtlas, IconId, render_atlas_icon_with_alpha};
+use crate::atlas::{IconAtlas, IconId};
 use crate::chrome::ChromeMetrics;
 use crate::chrome_layout::{ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use crate::chrome_shaders::ChromeShaders;
@@ -105,13 +105,21 @@ pub fn draw_chrome_below_work_wallpaper(
         damage,
         &legacy_theme.panel_inner,
     );
-    let _ = draw_beveled_panel(
+    let _ = draw_recessed_button(
         frame,
-        &beveled,
+        button,
         layout.topbar.flow_field,
         frame_ctx.output_scale,
         damage,
-        &legacy_theme.panel_inner,
+        &legacy_theme.button,
+    );
+    let _ = draw_light_channel(
+        frame,
+        light,
+        inset_rect(layout.topbar.flow_field, 3),
+        frame_ctx.output_scale,
+        damage,
+        &legacy_theme.light,
     );
     let _ = draw_beveled_panel(
         frame,
@@ -294,12 +302,27 @@ pub fn draw_chrome_topbar_frame(
     );
     for (rect, style) in [
         (layout.topbar.inner, &legacy_theme.frame_inner),
-        (layout.topbar.flow_field, &legacy_theme.panel_inner),
         (layout.topbar.title, &legacy_theme.panel_inner),
         (layout.topbar.trim, &legacy_theme.trim),
     ] {
         let _ = draw_beveled_panel(frame, beveled, rect, scale, damage, style);
     }
+    let _ = draw_recessed_button(
+        frame,
+        button,
+        layout.topbar.flow_field,
+        scale,
+        damage,
+        &legacy_theme.button,
+    );
+    let _ = draw_light_channel(
+        frame,
+        light,
+        inset_rect(layout.topbar.flow_field, 3),
+        scale,
+        damage,
+        &legacy_theme.light,
+    );
     if let Some(rect) = layout.topbar.light {
         let _ = draw_light_channel(frame, light, rect, scale, damage, &legacy_theme.light);
     }
@@ -659,23 +682,17 @@ fn draw_chrome_trim_glass_icons_impl(
                 }
 
                 if let Some(icon_id) = el.icon {
-                    if let Some(entry) = atlas.get(icon_id) {
-                        let icon_px = base_rect_logical.size.h.min(28).max(1);
-                        let icon_rect = icon_rect_in_module(base_rect_logical, icon_px);
-                        let icon_rect = to_physical_rect(icon_rect, frame_ctx.output_scale);
-                        let output_size = Size::<i32, Physical>::from(frame_ctx.output_size);
-                        let _ = render_atlas_icon_with_alpha(
-                            frame,
-                            &atlas.texture,
-                            *entry,
-                            icon_rect.loc.x,
-                            icon_rect.loc.y,
-                            icon_rect.size.w,
-                            icon_rect.size.h,
-                            output_size,
-                            style.alpha,
-                        );
-                    }
+                    let icon_px = base_rect_logical.size.h.min(28).max(1);
+                    let icon_rect = icon_rect_in_module(base_rect_logical, icon_px);
+                    render_icon_with_tint(
+                        frame,
+                        atlas,
+                        icon_id,
+                        icon_rect,
+                        frame_ctx.output_scale,
+                        style,
+                        &tinted_icon,
+                    );
                 }
             }
             UiElementKind::Clock => {

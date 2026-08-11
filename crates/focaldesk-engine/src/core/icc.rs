@@ -74,17 +74,18 @@ pub fn parse_icc_profile(data: &[u8]) -> Result<ParsedIccProfile, IccError> {
     let primaries = primaries_from_profile(&profile)?;
     let transfer = transfer_from_profile(&profile);
     let (reference_white_nits, max_luminance_nits) = luminances_from_profile(&profile);
-    let output_lut = icc_lut::build_srgb_to_device_lut(data).ok();
+    let description = ColorDescription {
+        primaries,
+        transfer,
+        reference_white_nits,
+        max_luminance_nits,
+        max_cll_nits: None,
+        max_fall_nits: None,
+    };
+    let output_lut = icc_lut::build_output_to_device_lut(data, description).ok();
 
     Ok(ParsedIccProfile {
-        description: ColorDescription {
-            primaries,
-            transfer,
-            reference_white_nits,
-            max_luminance_nits,
-            max_cll_nits: None,
-            max_fall_nits: None,
-        },
+        description,
         bytes: data.to_vec(),
         output_lut,
     })

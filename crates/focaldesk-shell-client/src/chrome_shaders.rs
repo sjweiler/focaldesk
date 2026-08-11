@@ -1026,7 +1026,7 @@ void main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TOP_BAR_FRAG};
+    use super::{GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TINTED_ICON_FRAG, TOP_BAR_FRAG};
 
     #[test]
     fn pixel_shaders_use_smithays_vertex_varying() {
@@ -1046,6 +1046,12 @@ mod tests {
         assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
         assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
     }
+
+    #[test]
+    fn tinted_icon_outputs_premultiplied_alpha() {
+        assert!(TINTED_ICON_FRAG.contains("uniform float alpha;"));
+        assert!(TINTED_ICON_FRAG.contains("vec4(u_tint.rgb * coverage, coverage)"));
+    }
 }
 
 const TINTED_ICON_FRAG: &str = r#"
@@ -1057,6 +1063,7 @@ varying vec2 v_coords;
 
 uniform sampler2D tex;
 uniform vec4 u_tint;
+uniform float alpha;
 
 void main() {
     vec4 src = texture2D(tex, v_coords);
@@ -1065,7 +1072,8 @@ void main() {
         discard;
     }
 
-    gl_FragColor = vec4(u_tint.rgb, src.a * u_tint.a);
+    float coverage = src.a * u_tint.a * alpha;
+    gl_FragColor = vec4(u_tint.rgb * coverage, coverage);
 }
 "#;
 

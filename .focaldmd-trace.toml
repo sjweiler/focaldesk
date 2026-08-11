@@ -1,0 +1,12 @@
+greeter_cmd = "/usr/local/bin/focaldm-greeter"
+session_cmd = "/usr/local/bin/focaldesk-desktop"
+tty_name = "tty7"
+vt = 7
+
+[session_environment]
+  FOCALDESK_HDR_OUTPUT = ""
+  FOCALDESK_HDR_RENDER = "0"
+  FOCALDESK_HDR_ALLOW_NVIDIA = "0"
+  FOCALDESK_HDR_NVIDIA_DUAL = "0"
+  FOCALDESK_LINEAR_SDR = "1"
+  FOCALDESK_WP_COLOR_TRACE = "1"

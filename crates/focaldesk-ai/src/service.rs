@@ -29,7 +29,25 @@ pub struct AiService {
     request_timeout: Duration,
     concurrency: Arc<Semaphore>,
     active_requests: Arc<AtomicUsize>,
+    pending_permissions: Arc<AtomicUsize>,
     memory: Option<MemoryService>,
+}
+
+struct ActivityGuard<'a> {
+    counter: &'a AtomicUsize,
+}
+
+impl<'a> ActivityGuard<'a> {
+    fn new(counter: &'a AtomicUsize) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for ActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl AiService {
@@ -40,6 +58,7 @@ impl AiService {
             request_timeout: Duration::from_secs(120),
             concurrency: Arc::new(Semaphore::new(2)),
             active_requests: Arc::new(AtomicUsize::new(0)),
+            pending_permissions: Arc::new(AtomicUsize::new(0)),
             memory: None,
         }
     }
@@ -150,6 +169,7 @@ impl AiService {
     pub fn status(&self) -> crate::types::AiDaemonStatus {
         crate::types::AiDaemonStatus {
             active_requests: self.active_requests.load(Ordering::Relaxed) as u32,
+            pending_permissions: self.pending_permissions.load(Ordering::Relaxed) as u32,
             default_provider: self.default_provider.clone(),
             provider_count: self.providers.len(),
         }
@@ -180,26 +200,18 @@ impl AiService {
 
         let prompt_title = format!("Allow AI chat from {provider_id}?");
         let prompt_message = build_prompt_message(&request, &provider_id);
-        authorize_ai_chat(&prompt_title, &prompt_message, true)
-            .with_context(|| format!("AI chat blocked for provider {provider_id}"))?;
+        {
+            let _permission_guard = ActivityGuard::new(&self.pending_permissions);
+            authorize_ai_chat(&prompt_title, &prompt_message, true)
+                .with_context(|| format!("AI chat blocked for provider {provider_id}"))?;
+        }
 
         let _permit = self
             .concurrency
             .acquire()
             .await
             .context("AI request concurrency limiter closed")?;
-        self.active_requests.fetch_add(1, Ordering::Relaxed);
-        struct ActiveRequestGuard<'a> {
-            counter: &'a AtomicUsize,
-        }
-        impl Drop for ActiveRequestGuard<'_> {
-            fn drop(&mut self) {
-                self.counter.fetch_sub(1, Ordering::Relaxed);
-            }
-        }
-        let _active_guard = ActiveRequestGuard {
-            counter: &self.active_requests,
-        };
+        let _active_guard = ActivityGuard::new(&self.active_requests);
 
         let started = std::time::Instant::now();
         let response = timeout(self.request_timeout, provider.chat(request))
@@ -357,6 +369,16 @@ fn truncate_preview(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::types::ChatMessage;
+
+    #[test]
+    fn activity_guard_reports_and_clears_in_flight_work() {
+        let counter = AtomicUsize::new(0);
+        {
+            let _guard = ActivityGuard::new(&counter);
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn permission_preview_uses_latest_user_turn() {

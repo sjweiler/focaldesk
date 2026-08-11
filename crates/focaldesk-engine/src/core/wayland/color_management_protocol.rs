@@ -120,6 +120,9 @@ fn send_surface_feedback_preferred_changed(
 }
 
 fn should_advertise_output_profiles(state: &DesktopState) -> bool {
+    if !crate::core::color::linear_sdr_runtime_enabled() {
+        return false;
+    }
     let any_wide_gamut_output = state
         .outputs
         .values()
@@ -255,8 +258,6 @@ pub struct ColorManagementState {
     output_preferred_identities: HashMap<OutputId, u64>,
     /// Widest output description advertised this session; masks transient sRGB reload blips.
     pub preferred_output_descriptions: HashMap<OutputId, ColorDescription>,
-    /// Widest client color tag per surface; Chrome may send sRGB after Display P3 before commit.
-    pub surface_widest_descriptions: HashMap<backend::ObjectId, ColorDescription>,
     /// `wp_image_description_info_v1.done` is a destructor event; sending it inside
     /// `get_information` destroys the object before wayland-backend assigns child userdata.
     pending_info_done: Vec<wp_image_description_info_v1::WpImageDescriptionInfoV1>,
@@ -663,7 +664,10 @@ fn primaries_from_wire(
     w_x: i32,
     w_y: i32,
 ) -> Option<PrimariesChromaticity> {
-    let scale = 100_000.0f32;
+    // color-management-v1 carries CIE xy coordinates multiplied by one
+    // million.  Using 1e5 here rejected Chromium's valid custom primaries and
+    // silently collapsed those buffers back to the output color space.
+    let scale = 1_000_000.0f32;
     let ch = PrimariesChromaticity {
         r: [r_x as f32 / scale, r_y as f32 / scale],
         g: [g_x as f32 / scale, g_y as f32 / scale],
@@ -673,52 +677,11 @@ fn primaries_from_wire(
     primaries_plausible(&ch).then_some(ch)
 }
 
-fn client_primaries_trusted(
-    state: &DesktopState,
-    surface: &WlSurface,
-    description: &ColorDescription,
-) -> bool {
-    let ColorPrimaries::Custom(ch) = description.primaries else {
-        return true;
-    };
-    if !primaries_plausible(&ch) {
-        return false;
-    }
-    let output_id = state.preferred_output_id_for_surface(surface);
-    let Some(output) = state.outputs.get(&output_id) else {
-        return false;
-    };
-    if !output
-        .icc_profile
-        .as_ref()
-        .is_some_and(|icc| !icc.is_empty())
-    {
-        return true;
-    }
-    description.primaries == output.color_description.primaries
-}
-
 fn sanitize_client_color_description(
-    state: &DesktopState,
-    surface: &WlSurface,
+    _state: &DesktopState,
+    _surface: &WlSurface,
     description: ColorDescription,
 ) -> ColorDescription {
-    let description = if client_primaries_trusted(state, surface, &description) {
-        description
-    } else {
-        let output_id = state.preferred_output_id_for_surface(surface);
-        let output_desc = state.output_color_description(output_id);
-        if let ColorPrimaries::Custom(ch) = description.primaries {
-            flog_warn!(
-                "surface color: ignoring client primaries {ch:?}; using output {output_id:?} primaries {:?}",
-                output_desc.primaries
-            );
-        }
-        ColorDescription {
-            primaries: output_desc.primaries,
-            ..description
-        }
-    };
     description
 }
 
@@ -765,14 +728,14 @@ fn emit_image_description_info_events(
         ColorPrimaries::Bt2020 if !use_custom => info.primaries_named(Primaries::Bt2020),
         ColorPrimaries::Custom(ch) if use_custom => {
             info.primaries(
-                (ch.r[0] * 100_000.0).round() as i32,
-                (ch.r[1] * 100_000.0).round() as i32,
-                (ch.g[0] * 100_000.0).round() as i32,
-                (ch.g[1] * 100_000.0).round() as i32,
-                (ch.b[0] * 100_000.0).round() as i32,
-                (ch.b[1] * 100_000.0).round() as i32,
-                (ch.w[0] * 100_000.0).round() as i32,
-                (ch.w[1] * 100_000.0).round() as i32,
+                (ch.r[0] * 1_000_000.0).round() as i32,
+                (ch.r[1] * 1_000_000.0).round() as i32,
+                (ch.g[0] * 1_000_000.0).round() as i32,
+                (ch.g[1] * 1_000_000.0).round() as i32,
+                (ch.b[0] * 1_000_000.0).round() as i32,
+                (ch.b[1] * 1_000_000.0).round() as i32,
+                (ch.w[0] * 1_000_000.0).round() as i32,
+                (ch.w[1] * 1_000_000.0).round() as i32,
             );
         }
         _ => {
@@ -885,24 +848,6 @@ fn apply_surface_description(
     let description =
         description.map(|desc| sanitize_client_color_description(state, surface, desc));
 
-    if let Some(new_desc) = description {
-        if let Some(widest) = state
-            .color_management_state
-            .surface_widest_descriptions
-            .get(&surface.id())
-        {
-            if primaries_wider_than(widest.primaries, new_desc.primaries) {
-                wp_color_trace!(
-                    "apply surface description: ignored gamut downgrade on surface={:?} {:?} -> {:?}",
-                    surface.id(),
-                    widest.primaries,
-                    new_desc.primaries
-                );
-                return;
-            }
-        }
-    }
-
     wp_color_trace!(
         "apply surface description: surface={:?} desc={:?} intent={intent:?}",
         surface.id(),
@@ -920,16 +865,6 @@ fn apply_surface_description(
             .pending()
             .intent = intent;
     });
-    if let Some(desc) = description {
-        let entry = state
-            .color_management_state
-            .surface_widest_descriptions
-            .entry(surface.id())
-            .or_insert(desc);
-        if primaries_wider_than(desc.primaries, entry.primaries) {
-            *entry = desc;
-        }
-    }
     state.refresh_surface_color(surface);
 }
 
@@ -1719,10 +1654,6 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, Surfac
             .color_management_state
             .surface_objects
             .remove(&surface_mgmt.surface.id());
-        state
-            .color_management_state
-            .surface_widest_descriptions
-            .remove(&surface_mgmt.surface.id());
         wp_color_trace!(
             "surface management destroyed: surface={:?}",
             surface_mgmt.surface.id()
@@ -1775,15 +1706,37 @@ mod tests {
 
     #[test]
     fn primaries_from_wire_uses_protocol_scale_only() {
-        let ch = super::primaries_from_wire(64845, 33084, 23025, 70148, 15589, 6603, 34570, 35854)
-            .expect("1e5 scale");
+        let ch = super::primaries_from_wire(
+            648450, 330840, 230250, 701480, 155890, 66030, 345700, 358540,
+        )
+        .expect("1e6 scale");
         assert!((ch.r[0] - 0.64845).abs() < 0.001);
 
-        // Chrome has sent 304229-style values; 1e7 wrongly accepts ~0.03 xy as "valid".
-        assert!(super::primaries_from_wire(
-            304229, 270282, 230029, 444840, 398100, 261034, 312700, 329000
+        // A ten-times-too-small encoding is not a plausible RGB primary set.
+        assert!(
+            super::primaries_from_wire(30422, 27028, 23002, 44484, 39810, 26103, 31270, 32900)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn chromium_style_custom_p3_primaries_survive_wire_decode() {
+        let ch = super::primaries_from_wire(
+            680_000, 320_000, 265_000, 690_000, 150_000, 60_000, 312_700, 329_000,
         )
-        .is_none());
+        .expect("Display P3 chromaticities");
+        let description = ColorDescription {
+            primaries: crate::core::color::ColorPrimaries::Custom(ch),
+            ..ColorDescription::DISPLAY_P3_SRGB
+        };
+        let render = crate::core::color::SurfaceColorRenderState::for_description(
+            description,
+            crate::core::color::RenderingIntent::Perceptual,
+        );
+        assert_ne!(
+            render.client_to_scene,
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        );
     }
 
     #[test]

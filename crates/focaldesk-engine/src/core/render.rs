@@ -38,7 +38,7 @@ use focaldesk_ui::atlas::{render_atlas_icon_with_alpha, IconId, IconState};
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
-use smithay::backend::renderer::element::{Id, Kind};
+use smithay::backend::renderer::element::{Element, Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
@@ -117,7 +117,7 @@ pub enum OutputRenderStage {
     LinearGlassUnderClients,
     Clients,
     Overlay,
-    /// egui + software cursor only (sRGB), after linear scene → KMS encode.
+    /// egui + software cursor only (sRGB), decoded into the linear scene before output encode.
     EguiOverlay,
 }
 
@@ -142,12 +142,13 @@ pub enum ClientCompositingMode {
     },
     Linear {
         client_to_scene: GlesTexProgram,
+        srgb_to_linear: GlesTexProgram,
     },
 }
 
 impl ClientCompositingMode {
     pub fn ui_textures_linear(&self) -> bool {
-        matches!(self, Self::LinearUi { .. })
+        matches!(self, Self::LinearUi { .. } | Self::Linear { .. })
     }
 }
 
@@ -204,6 +205,7 @@ pub struct RenderState {
     /// Reused framebuffer snapshot for the small sidebar/topbar glass controls.
     pub glass_control_background: Option<GlesTexture>,
     glass_control_background_size: (i32, i32),
+    glass_control_background_linear: bool,
     glass_control_background_disabled: bool,
     pub egui: EguiLayer,
     pub start_time: Instant,
@@ -300,6 +302,66 @@ fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
     t.icons.disabled = linearize_rgba(t.icons.disabled);
     t.icons.glow = linearize_rgba(t.icons.glow);
     t
+}
+
+/// Split a front-to-back render-element list without moving elements across a
+/// color-state boundary.
+///
+/// Smithay consumes the complete list front-to-back for occlusion and draws it
+/// back-to-front.  Color-managed rendering needs a different texture program
+/// for some elements, so each run is submitted separately in reverse run order.
+/// Grouping non-adjacent elements with the same key would change stacking.
+fn contiguous_runs_by_key<'a, T, K: PartialEq>(
+    items: &'a [T],
+    mut key_for: impl FnMut(&T) -> K,
+) -> Vec<(K, &'a [T])> {
+    let Some(first) = items.first() else {
+        return Vec::new();
+    };
+
+    let mut runs = Vec::new();
+    let mut start = 0;
+    let mut current_key = key_for(first);
+    for (index, item) in items.iter().enumerate().skip(1) {
+        let next_key = key_for(item);
+        if next_key != current_key {
+            runs.push((current_key, &items[start..index]));
+            start = index;
+            current_key = next_key;
+        }
+    }
+    runs.push((current_key, &items[start..]));
+    runs
+}
+
+#[cfg(test)]
+mod color_run_tests {
+    use super::contiguous_runs_by_key;
+
+    #[test]
+    fn alternating_color_runs_preserve_back_to_front_draw_order() {
+        // Input is Smithay's required front-to-back order. The first and last
+        // elements intentionally share a color state but must not be batched.
+        let elements = [('s', 0), ('s', 1), ('p', 2), ('s', 3), ('s', 4)];
+        let runs = contiguous_runs_by_key(&elements, |element| element.0);
+
+        assert_eq!(
+            runs.iter()
+                .map(|(key, run)| (*key, run.len()))
+                .collect::<Vec<_>>(),
+            vec![('s', 2), ('p', 1), ('s', 2)]
+        );
+
+        // Each Smithay submission reverses its run internally. Submitting the
+        // runs in reverse therefore matches one full-list submission exactly.
+        let draw_order = runs
+            .iter()
+            .rev()
+            .flat_map(|(_, run)| run.iter().rev())
+            .map(|element| element.1)
+            .collect::<Vec<_>>();
+        assert_eq!(draw_order, vec![4, 3, 2, 1, 0]);
+    }
 }
 
 fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> ChromeTheme {
@@ -601,6 +663,7 @@ impl RenderState {
             chrome_shaders: ChromeShaders::new(),
             glass_control_background: None,
             glass_control_background_size: (1, 1),
+            glass_control_background_linear: false,
             glass_control_background_disabled: false,
             egui: EguiLayer::default(),
             start_time: Instant::now(),
@@ -1255,6 +1318,7 @@ impl RenderState {
         enabled: bool,
         active: bool,
         output_factor: f32,
+        linear_target: bool,
     ) -> Result<bool, GlesError> {
         let Some(program) = self.chrome_shaders.glass_control.clone() else {
             return Ok(false);
@@ -1272,23 +1336,36 @@ impl RenderState {
             return Ok(false);
         }
 
+        // glCopyTexSubImage2D cannot convert between floating-point and
+        // normalized fixed-point attachments. Match the snapshot texture to
+        // the active scene target: RGBA16F for the staged linear compositor,
+        // RGBA8 for the legacy SDR path.
         let required_w = self.glass_control_background_size.0.max(control.size.w);
         let required_h = self.glass_control_background_size.1.max(control.size.h);
-        let resized = (required_w, required_h) != self.glass_control_background_size;
+        let reallocate = (required_w, required_h) != self.glass_control_background_size
+            || linear_target != self.glass_control_background_linear;
         let background_id = background.tex_id();
         frame.with_context(|gl| unsafe {
             gl.ActiveTexture(ffi::TEXTURE1);
             gl.BindTexture(ffi::TEXTURE_2D, background_id);
-            if resized {
+            if reallocate {
                 gl.TexImage2D(
                     ffi::TEXTURE_2D,
                     0,
-                    ffi::RGBA as i32,
+                    if linear_target {
+                        ffi::RGBA16F as i32
+                    } else {
+                        ffi::RGBA as i32
+                    },
                     required_w,
                     required_h,
                     0,
                     ffi::RGBA,
-                    ffi::UNSIGNED_BYTE,
+                    if linear_target {
+                        ffi::HALF_FLOAT
+                    } else {
+                        ffi::UNSIGNED_BYTE
+                    },
                     std::ptr::null(),
                 );
             }
@@ -1316,8 +1393,9 @@ impl RenderState {
             );
             gl.ActiveTexture(ffi::TEXTURE0);
         })?;
-        if resized {
+        if reallocate {
             self.glass_control_background_size = (required_w, required_h);
+            self.glass_control_background_linear = linear_target;
         }
 
         let atlas_size = atlas.texture.size();
@@ -1439,6 +1517,7 @@ impl RenderState {
         self.chrome_shaders = ChromeShaders::new();
         self.glass_control_background = None;
         self.glass_control_background_size = (1, 1);
+        self.glass_control_background_linear = false;
         self.glass_control_background_disabled = false;
         self.wallpaper_texture = None;
         self.sw_cursor_texture = None;
@@ -1757,16 +1836,46 @@ impl RenderState {
         ctx: &FrameCtx,
         elements: &[FlowRenderElement],
         client_compositing: &ClientCompositingMode,
+        surface_colors: &std::collections::HashMap<Id, SurfaceColorRenderState>,
     ) -> Result<(), GlesError> {
         let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
-            frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
-            draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
-            frame.clear_tex_program_override();
-        } else {
-            draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+        match client_compositing {
+            ClientCompositingMode::Linear {
+                client_to_scene, ..
+            } => {
+                let runs = contiguous_runs_by_key(elements, |elem| {
+                    surface_colors
+                        .get(elem.id())
+                        .copied()
+                        .unwrap_or_else(SurfaceColorRenderState::srgb_default)
+                });
+                for (color, run) in runs.into_iter().rev() {
+                    let m = color.client_to_scene;
+                    let uniforms = vec![
+                        Uniform::new(
+                            "u_decode_tf",
+                            color.description.transfer.decode_mode() as u32 as f32,
+                        ),
+                        Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
+                        Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
+                        Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
+                    ];
+                    frame.override_default_tex_program(client_to_scene.clone(), uniforms);
+                    let result = draw_render_elements(frame, ctx.output_scale.x, run, damage);
+                    frame.clear_tex_program_override();
+                    result?;
+                }
+            }
+            ClientCompositingMode::LinearUi { srgb_to_linear } => {
+                frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
+                draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+                frame.clear_tex_program_override();
+            }
+            ClientCompositingMode::Sdr => {
+                draw_render_elements(frame, ctx.output_scale.x, elements, damage)?;
+            }
         }
 
         Ok(())
@@ -1956,6 +2065,7 @@ impl RenderState {
                 inputs.flow_field_pulse,
                 inputs.notification_unread_count,
                 theme,
+                inputs.client_compositing.ui_textures_linear(),
             );
         }
 
@@ -1964,6 +2074,7 @@ impl RenderState {
             inputs.ctx,
             inputs.popup_elements,
             &inputs.client_compositing,
+            inputs.surface_colors,
         )?;
 
         if inputs.ctx.active_output == inputs.ctx.rendering_output {
@@ -2966,7 +3077,7 @@ impl RenderState {
         target_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
         theme: WallpaperTheme,
-        _client_compositing: &ClientCompositingMode,
+        client_compositing: &ClientCompositingMode,
     ) {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
@@ -3019,7 +3130,14 @@ impl RenderState {
 
         let uniforms = [
             Uniform::new("u_tint", theme.tint_color),
-            Uniform::new("u_decode_srgb", 0.0f32),
+            Uniform::new(
+                "u_decode_srgb",
+                if client_compositing.ui_textures_linear() {
+                    1.0f32
+                } else {
+                    0.0f32
+                },
+            ),
         ];
 
         frame
@@ -3337,7 +3455,10 @@ impl RenderState {
         let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
         let damage = std::slice::from_ref(&full);
 
-        let ClientCompositingMode::Linear { client_to_scene } = client_compositing else {
+        let ClientCompositingMode::Linear {
+            client_to_scene, ..
+        } = client_compositing
+        else {
             if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
                 frame.override_default_tex_program(srgb_to_linear.clone(), vec![]);
                 draw_render_elements(frame, ctx.output_scale.x, elements, damage).unwrap();
@@ -3348,20 +3469,13 @@ impl RenderState {
             return;
         };
 
-        let mut batches: Vec<(SurfaceColorRenderState, Vec<&FlowRenderElement>)> = Vec::new();
-        for elem in elements {
-            let color = surface_colors
+        let runs = contiguous_runs_by_key(elements, |elem| {
+            surface_colors
                 .get(elem.id())
                 .copied()
-                .unwrap_or_else(SurfaceColorRenderState::srgb_default);
-            if let Some((_, batch)) = batches.iter_mut().find(|(c, _)| *c == color) {
-                batch.push(elem);
-            } else {
-                batches.push((color, vec![elem]));
-            }
-        }
-
-        for (color, batch) in batches {
+                .unwrap_or_else(SurfaceColorRenderState::srgb_default)
+        });
+        for (color, run) in runs.into_iter().rev() {
             let m = color.client_to_scene;
             let uniforms = vec![
                 Uniform::new(
@@ -3373,8 +3487,9 @@ impl RenderState {
                 Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
             ];
             frame.override_default_tex_program(client_to_scene.clone(), uniforms);
-            draw_render_elements(frame, ctx.output_scale.x, &batch, damage).unwrap();
+            let result = draw_render_elements(frame, ctx.output_scale.x, run, damage);
             frame.clear_tex_program_override();
+            result.unwrap();
         }
     }
 
@@ -3519,13 +3634,22 @@ impl RenderState {
             &legacy_theme.panel_inner,
         );
 
-        let _ = Self::draw_beveled_panel(
+        Self::draw_recessed_button(
             frame,
-            &beveled,
+            button,
             layout.topbar.flow_field,
             ctx.output_scale,
             damage,
-            &legacy_theme.panel_inner,
+            &legacy_theme.button,
+        );
+
+        let _ = Self::draw_light_channel(
+            frame,
+            light,
+            inset_rect(layout.topbar.flow_field, 3),
+            ctx.output_scale,
+            damage,
+            &legacy_theme.light,
         );
 
         let _ = Self::draw_beveled_panel(
@@ -3757,6 +3881,7 @@ impl RenderState {
         flow_field_pulse: Option<FlowFieldPulseFrame>,
         notification_unread_count: usize,
         theme: &FlowTheme,
+        linear_target: bool,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
 
@@ -3910,6 +4035,7 @@ impl RenderState {
                                     el.enabled,
                                     el.active || el.selected,
                                     output_factor,
+                                    linear_target,
                                 )
                                 .unwrap_or(false);
                             if !drew_glass {
@@ -3994,6 +4120,7 @@ impl RenderState {
                                     el.enabled,
                                     el.active || el.selected,
                                     output_factor,
+                                    linear_target,
                                 )
                                 .unwrap_or(false);
                             if !drew_glass {
@@ -4061,31 +4188,54 @@ impl RenderState {
                             );
                         }
 
-                        // Let the flow field remain visible through the same captured-glass
-                        // surface used by the sidebar and status controls. Drawing the glass
-                        // after the flow field makes the animation part of the material while
-                        // keeping the AI icon etched and legible on top of it.
-                        let drew_glass = if let Some(icon_id) = el.icon {
-                            let icon_px = base_rect_logical.size.h.min(28).max(1);
-                            let icon_rect_logical =
-                                center_rect_in(base_rect_logical, icon_px, icon_px);
-                            self.draw_glass_control(
-                                frame,
-                                atlas,
-                                icon_id,
-                                base_rect_logical,
-                                icon_rect_logical,
-                                ctx.output_scale,
-                                active_theme,
-                                el.hovered,
-                                el.enabled,
-                                el.active || el.selected,
-                                output_factor,
+                        let show_status = el.label.is_some() && base_rect_logical.size.w >= 88;
+                        let icon_px = base_rect_logical.size.h.min(24).max(1);
+                        let icon_rect_logical = if show_status {
+                            Rectangle::from_loc_and_size(
+                                (
+                                    base_rect_logical.loc.x + 10,
+                                    base_rect_logical.loc.y
+                                        + (base_rect_logical.size.h - icon_px) / 2,
+                                ),
+                                (icon_px, icon_px),
                             )
-                            .unwrap_or(false)
                         } else {
-                            false
+                            center_rect_in(base_rect_logical, icon_px, icon_px)
                         };
+
+                        // Let the flow field remain visible through the same captured-glass
+                        // surface used by the sidebar and status controls. The destination
+                        // icon is drawn explicitly above this material and the pulse below.
+                        if let Some(icon_id) = el.icon {
+                            let drew_glass = self
+                                .draw_glass_control(
+                                    frame,
+                                    atlas,
+                                    icon_id,
+                                    base_rect_logical,
+                                    icon_rect_logical,
+                                    ctx.output_scale,
+                                    active_theme,
+                                    el.hovered,
+                                    el.enabled,
+                                    el.active || el.selected,
+                                    output_factor,
+                                    linear_target,
+                                )
+                                .unwrap_or(false);
+                            if !drew_glass {
+                                Self::draw_icon_in_rect(
+                                    frame,
+                                    atlas,
+                                    icon_id,
+                                    icon_state,
+                                    icon_rect_logical,
+                                    ctx.output_scale,
+                                    style,
+                                    &tinted_icon,
+                                );
+                            }
+                        }
 
                         if let (Some(pulse_shader), Some(pulse_frame)) =
                             (self.chrome_shaders.pulse.as_ref(), flow_field_pulse)
@@ -4104,27 +4254,53 @@ impl RenderState {
                             );
                         }
 
-                        if !drew_glass {
-                            if let Some(icon_id) = el.icon {
-                                if let Some(entry) = atlas.get(icon_id) {
-                                    let icon_px = base_rect_logical.size.h.min(28).max(1);
-                                    let icon_rect_logical =
-                                        center_rect_in(base_rect_logical, icon_px, icon_px);
-                                    let icon_rect =
-                                        to_physical_rect(icon_rect_logical, ctx.output_scale);
-                                    let output_size = Size::<i32, Physical>::from(ctx.output_size);
-                                    let _ = render_atlas_icon_with_alpha(
-                                        frame,
-                                        &atlas.texture,
-                                        *entry,
-                                        icon_rect.loc.x,
-                                        icon_rect.loc.y,
-                                        icon_rect.size.w,
-                                        icon_rect.size.h,
-                                        output_size,
-                                        style.alpha,
-                                    );
-                                }
+                        // Keep the destination glyph independent from the glass material.
+                        // The glass pass may etch the atlas mask subtly, but the explicit
+                        // top layer guarantees that the AI Console icon remains legible.
+                        if let Some(icon_id) = el.icon {
+                            Self::draw_icon_in_rect(
+                                frame,
+                                atlas,
+                                icon_id,
+                                icon_state,
+                                icon_rect_logical,
+                                ctx.output_scale,
+                                style,
+                                &tinted_icon,
+                            );
+                        }
+
+                        // The animation conveys energy; this label conveys meaning. Keep it
+                        // persistent so the state is understandable without hover, color, or
+                        // motion perception.
+                        if show_status {
+                            if let Some(label) = el.label.as_deref() {
+                                let label_style = style_for(
+                                    FontRole::Label,
+                                    12,
+                                    active_theme
+                                        .id
+                                        .builtin_id()
+                                        .unwrap_or(BuiltInThemeId::Eagle),
+                                );
+                                let bounds = fonts
+                                    .vertical_bounds(label, label_style)
+                                    .unwrap_or((-(label_style.size_px as i32), 0));
+                                let center_y =
+                                    base_rect_logical.loc.y + base_rect_logical.size.h / 2;
+                                let baseline_y = center_y - (bounds.0 + bounds.1) / 2;
+                                let label_x =
+                                    icon_rect_logical.loc.x + icon_rect_logical.size.w + 8;
+                                let _ = self.draw_text_cached(
+                                    frame,
+                                    fonts,
+                                    label,
+                                    label_x,
+                                    baseline_y,
+                                    label_style,
+                                    active_theme.text.title,
+                                    ctx.output_scale,
+                                );
                             }
                         }
                     }

@@ -102,6 +102,9 @@ pub struct ProviderModelInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiDaemonStatus {
     pub active_requests: u32,
+    /// Requests currently blocked on an interactive AI permission decision.
+    #[serde(default)]
+    pub pending_permissions: u32,
     pub default_provider: String,
     pub provider_count: usize,
 }

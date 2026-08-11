@@ -272,7 +272,6 @@ impl Chrome {
         if let Some(beveled) = beveled {
             for (rect, style) in [
                 (layout.topbar.inner, &self.theme.frame_inner),
-                (layout.topbar.flow_field, &self.theme.panel_inner),
                 (layout.topbar.title, &self.theme.panel_inner),
                 (layout.topbar.trim, &self.theme.trim),
             ] {
@@ -284,6 +283,7 @@ impl Chrome {
                 .topbar
                 .status_wells
                 .iter()
+                .chain(std::iter::once(&layout.topbar.flow_field))
                 .chain(std::iter::once(&layout.topbar.clock_well))
             {
                 let _ = draw_recessed_button(frame, button, *well, sc, &damage, &self.theme.button);
@@ -294,7 +294,7 @@ impl Chrome {
         if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
             let _ = self.draw_glass_icon(
                 frame,
-                IconId::Launcher,
+                IconId::AiConsole,
                 launcher_control,
                 launcher_icon,
                 scale,
@@ -303,7 +303,7 @@ impl Chrome {
         }
         if let (Some(atlas), Some(entry)) = (
             self.atlas.as_ref(),
-            self.atlas.as_ref().and_then(|a| a.get(IconId::Launcher)),
+            self.atlas.as_ref().and_then(|a| a.get(IconId::AiConsole)),
         ) {
             let physical = launcher_icon.to_physical_precise_round(sc);
             let _ = render_atlas_icon(

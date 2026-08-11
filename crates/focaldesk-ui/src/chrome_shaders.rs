@@ -19,11 +19,11 @@ pub struct ChromeShaders {
     pub wallpaper_tint: Option<GlesTexProgram>,
     pub srgb_to_linear: Option<GlesTexProgram>,
     pub client_to_scene_linear: Option<GlesTexProgram>,
-    pub linear_to_srgb: Option<GlesTexProgram>,
-    pub composite_linear_layer: Option<GlesTexProgram>,
+    /// Full FP16 scene-linear Rec.709 → encoded output color space.
+    pub output_encode_linear: Option<GlesTexProgram>,
     /// Full-frame scene sRGB → monitor encode (C1b).
     pub output_encode_sdr: Option<GlesTexProgram>,
-    /// Full-frame scene sRGB → monitor ICC LUT encode (C2c).
+    /// Encoded output color space → monitor ICC LUT encode (C2c).
     pub output_encode_lut: Option<GlesTexProgram>,
     /// Scene sRGB → linear scRGB (HDR working space, C3).
     pub sdr_to_linear_scrgb: Option<GlesTexProgram>,
@@ -58,8 +58,7 @@ impl ChromeShaders {
             wallpaper_tint: None,
             srgb_to_linear: None,
             client_to_scene_linear: None,
-            linear_to_srgb: None,
-            composite_linear_layer: None,
+            output_encode_linear: None,
             output_encode_sdr: None,
             output_encode_lut: None,
             sdr_to_linear_scrgb: None,
@@ -330,13 +329,8 @@ impl ChromeShaders {
             )?);
         }
 
-        if self.linear_to_srgb.is_none() {
-            self.linear_to_srgb =
-                Some(renderer.compile_custom_texture_shader(LINEAR_TO_SRGB_FRAG, &[])?);
-        }
-
-        if self.composite_linear_layer.is_none() {
-            self.composite_linear_layer = Some(renderer.compile_custom_texture_shader(
+        if self.output_encode_linear.is_none() {
+            self.output_encode_linear = Some(renderer.compile_custom_texture_shader(
                 COMPOSITE_LINEAR_LAYER_FRAG,
                 &[
                     UniformName::new("u_encode_tf", UniformType::_1f),
@@ -390,7 +384,13 @@ impl ChromeShaders {
         if self.linear_scrgb_to_pq.is_none() {
             self.linear_scrgb_to_pq = Some(renderer.compile_custom_texture_shader(
                 LINEAR_SCRGB_TO_PQ_FRAG,
-                &[UniformName::new("u_max_nits", UniformType::_1f)],
+                &[
+                    UniformName::new("u_max_nits", UniformType::_1f),
+                    UniformName::new("u_sdr_white_nits", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
             )?);
         }
 
@@ -1023,7 +1023,10 @@ void main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TOP_BAR_FRAG};
+    use super::{
+        COMPOSITE_LINEAR_LAYER_FRAG, GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TINTED_ICON_FRAG,
+        TOP_BAR_FRAG,
+    };
 
     #[test]
     fn pixel_shaders_use_smithays_vertex_varying() {
@@ -1043,6 +1046,18 @@ mod tests {
         assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
         assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
     }
+
+    #[test]
+    fn tinted_icon_outputs_premultiplied_alpha() {
+        assert!(TINTED_ICON_FRAG.contains("uniform float alpha;"));
+        assert!(TINTED_ICON_FRAG.contains("vec4(u_tint.rgb * coverage, coverage)"));
+    }
+
+    #[test]
+    fn linear_output_encode_never_discards_scanout_pixels() {
+        assert!(!COMPOSITE_LINEAR_LAYER_FRAG.contains("discard;"));
+        assert!(COMPOSITE_LINEAR_LAYER_FRAG.contains("vec4(encoded, 1.0)"));
+    }
 }
 
 const TINTED_ICON_FRAG: &str = r#"
@@ -1054,6 +1069,7 @@ varying vec2 v_coords;
 
 uniform sampler2D tex;
 uniform vec4 u_tint;
+uniform float alpha;
 
 void main() {
     vec4 src = texture2D(tex, v_coords);
@@ -1062,7 +1078,8 @@ void main() {
         discard;
     }
 
-    gl_FragColor = vec4(u_tint.rgb, src.a * u_tint.a);
+    float coverage = src.a * u_tint.a * alpha;
+    gl_FragColor = vec4(u_tint.rgb * coverage, coverage);
 }
 "#;
 
@@ -1223,12 +1240,14 @@ void main() {
 #if defined(NO_ALPHA)
     src.a = 1.0;
 #endif
-    if (src.a < 0.0001) {
-        discard;
-    }
-    vec3 straight = src.rgb / src.a;
+    // This program encodes the complete, opaque scene.  It used to composite
+    // a transparent client-only layer and retained that path's `discard`.
+    // Discarding here leaves undefined pixels in the scanout texture (seen as
+    // the large black triangle on NVIDIA).  The base pass guarantees opaque
+    // coverage, but keep the zero-alpha fallback deterministic as well.
+    vec3 straight = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
     vec3 encoded = encode_color(mul_mat3(straight));
-    gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
+    gl_FragColor = vec4(encoded, 1.0) * alpha;
 }
 "#;
 
@@ -1417,6 +1436,14 @@ precision highp float;
 varying vec2 v_coords;
 uniform float alpha;
 uniform float u_max_nits;
+uniform float u_sdr_white_nits;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
 
 float pq_oetf(float nits) {
     float L = max(nits, 0.0) / 10000.0;
@@ -1434,44 +1461,13 @@ void main() {
 #if defined(NO_ALPHA)
     src.a = 1.0;
 #endif
-    vec3 nits = src.a > 0.0001 ? max(src.rgb / src.a, vec3(0.0)) : max(src.rgb, vec3(0.0));
+    vec3 scene_linear = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
+    // The FP16 scene uses linear Rec.709 with 1.0 at SDR reference white.
+    // Convert to BT.2020 before scaling to absolute luminance for PQ.
+    vec3 nits = max(mul_mat3(scene_linear), vec3(0.0)) * u_sdr_white_nits;
     nits = min(nits, vec3(u_max_nits));
     vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
     gl_FragColor = vec4(pq * src.a, src.a) * alpha;
-}
-"#;
-
-const LINEAR_TO_SRGB_FRAG: &str = r#"
-//_DEFINES_
-
-#if defined(EXTERNAL)
-#extension GL_OES_EGL_image_external : require
-uniform samplerExternalOES tex;
-#else
-uniform sampler2D tex;
-#endif
-
-#ifdef GL_ES
-precision highp float;
-#endif
-
-varying vec2 v_coords;
-uniform float alpha;
-
-vec3 linear_to_srgb(vec3 c) {
-    bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
-    vec3 low = c * 12.92;
-    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
-    return mix(high, low, vec3(cutoff));
-}
-
-void main() {
-    vec4 src = texture2D(tex, v_coords);
-#if defined(NO_ALPHA)
-    src.a = 1.0;
-#endif
-    vec3 straight = src.a > 0.0 ? max(src.rgb / src.a, vec3(0.0)) : vec3(0.0);
-    gl_FragColor = vec4(linear_to_srgb(straight) * src.a, src.a) * alpha;
 }
 "#;
 

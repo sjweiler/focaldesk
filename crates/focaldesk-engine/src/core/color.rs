@@ -451,7 +451,12 @@ pub fn linear_to_srgb(value: f32) -> f32 {
     }
 }
 
-/// When false, keep the legacy single-pass sRGB offscreen path even if FP16 is available.
+/// Enable the FP16 scene-linear compositor unless explicitly disabled.
+///
+/// Wide-gamut output advertisement depends on this path because the legacy
+/// 8-bit sRGB intermediate cannot preserve out-of-sRGB scene values. Keep an
+/// opt-out for driver diagnosis without silently disabling color management
+/// in normal sessions.
 pub fn linear_sdr_runtime_enabled() -> bool {
     !matches!(
         std::env::var("FOCALDESK_LINEAR_SDR").ok().as_deref(),
@@ -705,6 +710,46 @@ mod tests {
     }
 
     #[test]
+    fn display_p3_round_trip_requires_unclipped_linear_scene() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+
+        let p3_red = [1.0, 0.0, 0.0];
+        let scene = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::DisplayP3,
+                scene_working_primaries(),
+                RenderingIntent::Relative,
+            ),
+            p3_red,
+        );
+        assert!(scene[0] > 1.0 || scene[1] < 0.0 || scene[2] < 0.0);
+
+        let recovered = transform(
+            scene_to_output_matrix(ColorDescription::DISPLAY_P3_SRGB, RenderingIntent::Relative),
+            scene,
+        );
+        for channel in 0..3 {
+            assert!((recovered[channel] - p3_red[channel]).abs() < 1e-4);
+        }
+
+        let clipped_scene = scene.map(|channel| channel.clamp(0.0, 1.0));
+        let clipped_result = transform(
+            scene_to_output_matrix(ColorDescription::DISPLAY_P3_SRGB, RenderingIntent::Relative),
+            clipped_scene,
+        );
+        assert!(clipped_result
+            .into_iter()
+            .zip(p3_red)
+            .any(|(actual, expected)| (actual - expected).abs() > 0.02));
+    }
+
+    #[test]
     fn identity_gamut_matrix_for_matching_primaries() {
         let m = gamut_matrix_linear_rgb(
             ColorPrimaries::Srgb,
@@ -721,10 +766,16 @@ mod tests {
 
     #[test]
     fn linear_sdr_runtime_respects_disable_env() {
-        std::env::set_var("FOCALDESK_LINEAR_SDR", "0");
-        assert!(!linear_sdr_runtime_enabled());
         std::env::remove_var("FOCALDESK_LINEAR_SDR");
         assert!(linear_sdr_runtime_enabled());
+
+        std::env::set_var("FOCALDESK_LINEAR_SDR", "1");
+        assert!(linear_sdr_runtime_enabled());
+
+        std::env::set_var("FOCALDESK_LINEAR_SDR", "0");
+        assert!(!linear_sdr_runtime_enabled());
+
+        std::env::remove_var("FOCALDESK_LINEAR_SDR");
     }
 
     #[test]

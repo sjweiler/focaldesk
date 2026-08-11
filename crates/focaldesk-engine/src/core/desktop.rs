@@ -8557,13 +8557,22 @@ impl DesktopState {
         output_id: focaldesk_types::OutputId,
         description: ColorDescription,
         icc_profile: Option<Vec<u8>>,
-        output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
+        _output_icc_lut: Option<crate::core::icc_lut::OutputIccLut>,
     ) {
-        let output_lut = output_icc_lut.or_else(|| {
+        let override_profile = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.color_profile_override)
+            .unwrap_or_default();
+        let effective_description =
+            crate::core::color::apply_output_color_profile_override(description, override_profile);
+        // Rebuild against the effective (possibly user-overridden) output
+        // space. A LUT baked with an sRGB source would strip wide-gamut values.
+        let output_lut = (|| {
             let Some(bytes) = icc_profile.as_ref() else {
                 return None;
             };
-            match crate::core::icc_lut::build_srgb_to_device_lut(bytes) {
+            match crate::core::icc_lut::build_output_to_device_lut(bytes, effective_description) {
                 Ok(lut) => Some(lut),
                 Err(err) => {
                     flog_warn!(
@@ -8574,13 +8583,10 @@ impl DesktopState {
                     None
                 }
             }
-        });
+        })();
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.base_color_description = description;
-            output.color_description = crate::core::color::apply_output_color_profile_override(
-                description,
-                output.color_profile_override,
-            );
+            output.color_description = effective_description;
             output.icc_profile = icc_profile;
             output.output_icc_lut = output_lut;
             output.icc_lut_fallback_active = false;
@@ -8686,7 +8692,7 @@ impl DesktopState {
 
     pub fn refresh_surface_color(&mut self, surface: &WlSurface) {
         let force_linear = force_linear_surfaces();
-        let mut color = with_states(surface, |states| {
+        let color = with_states(surface, |states| {
             if force_linear {
                 return SurfaceColorRenderState::for_description(
                     ColorDescription::LINEAR_SRGB,
@@ -8702,15 +8708,6 @@ impl DesktopState {
                 surface_color.current().render_state()
             }
         });
-        if let Some(widest) = self
-            .color_management_state
-            .surface_widest_descriptions
-            .get(&surface.id())
-        {
-            if primaries_wider_than(widest.primaries, color.description.primaries) {
-                color = SurfaceColorRenderState::for_description(*widest, color.intent);
-            }
-        }
         let id = Id::from_wayland_resource(surface);
         self.surface_colors.insert(id, color);
     }
@@ -9449,7 +9446,9 @@ fn chrome_profile_dir() -> PathBuf {
 }
 
 fn ai_flow_mode_from_status(status: &AiDaemonStatus) -> AiFlowMode {
-    if status.active_requests > 0 {
+    if status.pending_permissions > 0 {
+        AiFlowMode::PermissionWait
+    } else if status.active_requests > 0 {
         AiFlowMode::Thinking
     } else if status.provider_count == 0 {
         AiFlowMode::Error
@@ -9508,6 +9507,8 @@ fn chrome_command_args(use_x11: bool) -> Vec<String> {
     let ozone_platform = if use_x11 { "x11" } else { "wayland" };
     vec![
         format!("--ozone-platform={ozone_platform}"),
+        "--enable-features=WaylandWpColorManagerV1".to_string(),
+        "--force-color-profile=display-p3-d65".to_string(),
         "--disable-features=Vulkan".to_string(),
         format!("--user-data-dir={}", profile.display()),
         "--no-first-run".to_string(),
@@ -9610,7 +9611,7 @@ fn spawn_app_detached(
         let request = LaunchRequest {
             trace_id: launch_trace_id,
             app: candidate.clone(),
-            args: if cursor_like {
+            args: if chrome_like || cursor_like {
                 let mut args = chrome_command_args(prefer_x11);
                 args.extend(extra_args.clone());
                 args
@@ -9740,22 +9741,44 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_rect_to_bounds, is_browser_like, logical_damage_to_physical,
-        power_action_interaction, remove_surface_root_membership, session_power_command,
-        set_surface_root_membership, should_wait_for_lid_open_on_resume,
+        ai_flow_mode_from_status, clamp_rect_to_bounds, is_browser_like,
+        logical_damage_to_physical, power_action_interaction, remove_surface_root_membership,
+        session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
         surface_buffer_damage_to_logical, workspace_for_slot, PowerActionInteraction,
         UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
+    use focaldesk_ai::AiDaemonStatus;
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
     use focaldesk_settings_core::{ChromeLaunchItemSettings, ChromeRegionSettings};
     use focaldesk_ui::atlas::IconId;
     use focaldesk_ui::element::ChromeItem;
     use focaldesk_ui::types::UiAction;
+    use focaldesk_ui::ui_builder::AiFlowMode;
     use smithay::backend::renderer::element::Id;
     use smithay::backend::renderer::utils::SurfaceView;
     use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
     use std::collections::HashMap;
+
+    #[test]
+    fn ai_flow_status_prioritizes_required_approval() {
+        let status = AiDaemonStatus {
+            active_requests: 1,
+            pending_permissions: 1,
+            default_provider: "test".into(),
+            provider_count: 1,
+        };
+        assert_eq!(
+            ai_flow_mode_from_status(&status),
+            AiFlowMode::PermissionWait
+        );
+
+        let status = AiDaemonStatus {
+            pending_permissions: 0,
+            ..status
+        };
+        assert_eq!(ai_flow_mode_from_status(&status), AiFlowMode::Thinking);
+    }
 
     #[test]
     fn surface_damage_respects_buffer_scale() {
