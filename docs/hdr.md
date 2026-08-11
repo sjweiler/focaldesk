@@ -9,6 +9,43 @@ content handling. These paths are under active development and should not be
 treated as color-accurate or production-ready without measurement on the target
 hardware.
 
+## SDR wide gamut and 10-bit output
+
+HDR is not required to benefit from FocalDesk's color pipeline. An SDR output
+can use a monitor ICC profile, accept color-managed wide-gamut client content,
+compose in a floating-point scene buffer, and encode the completed frame for
+the monitor. This preserves colors outside sRGB when the application, profile,
+GPU, connector, and display all support them; it does not add HDR brightness or
+HDR metadata.
+
+Wide gamut and color depth describe different improvements:
+
+- Wide gamut increases the range of colors that the pipeline can represent.
+- A conventional 8-bit RGB output has 256 values per channel, or 16,777,216
+  encoded RGB combinations. A 10-bit RGB output has 1,024 values per channel,
+  or 1,073,741,824 combinations. The extra precision reduces visible banding
+  in gradients, but it does not make every application buffer 10-bit or imply
+  that a panel can visibly distinguish every combination.
+
+Capable outputs prefer a 10-bit scanout format even while HDR is disabled, so
+SDR wide-gamut color and the additional output precision can be used together.
+The complete chain still matters: a browser test can confirm that a client and
+compositor negotiated wide-gamut content, but it does not by itself prove the
+active scanout format or identify the ICC profile used for output encoding.
+
+Choose an ICC file independently for each connector in Display Settings. The
+selection is saved in `settings.json` and `displays.json`; restart the FocalDesk
+session after changing it so the compositor loads and bakes the new per-output
+ICC LUT. The display summary reports whether wide gamut is active and whether
+the ICC LUT fell back to the parametric path.
+
+FocalDesk owns color conversion in its Wayland compositor. `colormgr` reports
+the separate `colord` database and may show profiles that FocalDesk is not
+using, particularly when two similar monitors are connected. For runtime
+diagnosis, prefer the FocalDesk display summary and compositor log. A successful
+load records the output ID, monitor serial, effective primaries, ICC byte count,
+and LUT size; a failed load or encode records an explicit ICC fallback warning.
+
 The longer-term goals are:
 
 - HDR scanout
