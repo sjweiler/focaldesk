@@ -69,15 +69,17 @@ impl ImageCopyCaptureHandler for DesktopState {
 
         // On DRM, prefer zero-copy dmabuf capture for OBS / xdg-desktop-portal-wlr. SHM would
         // require a GPU readback (`copy_texture`) on every frame.
-        let shm =
-            if dma.is_some() && self.backend_kind == focaldesk_flow::keybinds::BackendKind::Drm {
-                vec![]
-            } else {
-                vec![
-                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
-                    smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
-                ]
-            };
+        let wide_gamut = portal::portal_capture_color_mode().requires_ten_bit();
+        let shm = if wide_gamut
+            || (dma.is_some() && self.backend_kind == focaldesk_flow::keybinds::BackendKind::Drm)
+        {
+            vec![]
+        } else {
+            vec![
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Argb8888,
+                smithay::reexports::wayland_server::protocol::wl_shm::Format::Xrgb8888,
+            ]
+        };
 
         Some(BufferConstraints {
             size: capture_size,

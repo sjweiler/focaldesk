@@ -46,6 +46,46 @@ diagnosis, prefer the FocalDesk display summary and compositor log. A successful
 load records the output ID, monitor serial, effective primaries, ICC byte count,
 and LUT size; a failed load or encode records an explicit ICC fallback warning.
 
+## Wide-gamut SDR recording with OBS
+
+The stock portal/OBS path remains untagged sRGB/Rec.709. FocalDesk also has an
+opt-in BT.2020 SDR capture contract for a patched capture stack:
+
+```toml
+[session_environment]
+FOCALDESK_PORTAL_COLOR = "bt2020-sdr"
+```
+
+This mode converts the FP16 compositor scene to BT.2020 with the BT.709 SDR
+transfer function and exposes only 10-bit RGB DMA-BUF capture formats. It does
+not fall back to 8-bit or SHM, because either would silently lose precision.
+The compositor also publishes the setting to portal services and logs the
+active contract and advertised formats at startup.
+
+The matching integration patches are versioned with the components tested by
+FocalDesk:
+
+- `patches/xdg-desktop-portal-wlr-0.8.1-bt2020-sdr.patch` attaches full-range
+  RGB, BT.709 transfer, and BT.2020-primary colorimetry to the PipeWire stream.
+- `patches/obs-studio-32.1.1-bt2020-sdr.patch` consumes that colorimetry,
+  converts the captured texture into OBS's linear working space, adds a
+  **Rec. 2020 (SDR)** canvas option, supports I010/P010 conversion, and writes
+  BT.2020/BT.709/BT.2020-NCL encoder and container metadata.
+
+Apply both patches to clean matching source trees with:
+
+```sh
+scripts/apply-wide-gamut-capture-patches.sh \
+  /path/to/obs-studio-32.1.1 \
+  /path/to/xdg-desktop-portal-wlr-0.8.1
+```
+
+After building and installing both, restart the FocalDesk session. In OBS,
+select **P010** (or I010), **Rec. 2020 (SDR)**, and a 10-bit HEVC or AV1
+recording encoder. Do not select Rec. 2100 PQ/HLG; this contract is SDR.
+Validate a recording with `ffprobe`: the pixel format must be 10-bit and its
+primaries, transfer, and matrix must report BT.2020, BT.709, and BT.2020-NCL.
+
 The longer-term goals are:
 
 - HDR scanout

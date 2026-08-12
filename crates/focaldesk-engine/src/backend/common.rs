@@ -626,14 +626,25 @@ fn publish_portal_environment(wayland_display: &str) {
     ensure_standard_user_dirs();
     ensure_xdpw_screencast_config();
 
+    let mut environment_names = vec!["WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"];
+    if std::env::var_os("FOCALDESK_PORTAL_COLOR").is_some() {
+        environment_names.push("FOCALDESK_PORTAL_COLOR");
+    }
     let status = std::process::Command::new("dbus-update-activation-environment")
-        .args(["--systemd", "WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP"])
+        .arg("--systemd")
+        .args(environment_names)
         .status();
 
     match status {
-        Ok(status) if status.success() => flog(format!(
-            "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=focaldesk:wlroots"
-        )),
+        Ok(status) if status.success() => {
+            let portal_color = std::env::var("FOCALDESK_PORTAL_COLOR")
+                .ok()
+                .map(|value| format!(" FOCALDESK_PORTAL_COLOR={value}"))
+                .unwrap_or_default();
+            flog(format!(
+                "published portal environment WAYLAND_DISPLAY={wayland_display} XDG_CURRENT_DESKTOP=focaldesk:wlroots{portal_color}"
+            ));
+        }
         Ok(status) => flog(format!(
             "failed to publish portal environment: dbus-update-activation-environment exited with {status}"
         )),

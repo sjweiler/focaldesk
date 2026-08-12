@@ -1,0 +1,56 @@
+diff --git a/src/screencast/pipewire_screencast.c b/src/screencast/pipewire_screencast.c
+index 603c9e0..e99e4ec 100644
+--- a/src/screencast/pipewire_screencast.c
++++ b/src/screencast/pipewire_screencast.c
+@@ -11,6 +11,8 @@
+ #include <unistd.h>
+ #include <assert.h>
+ #include <libdrm/drm_fourcc.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include "screencast.h"
+ #include "wlr_screencast.h"
+@@ -19,6 +21,26 @@
+ 
+ #define DAMAGE_REGION_COUNT 16
+ 
++static bool focaldesk_bt2020_sdr(void) {
++	const char *value = getenv("FOCALDESK_PORTAL_COLOR");
++	return value != NULL &&
++		(strcmp(value, "bt2020-sdr") == 0 ||
++		 strcmp(value, "rec2020-sdr") == 0 ||
++		 strcmp(value, "wide-sdr") == 0);
++}
++
++static void add_focaldesk_colorimetry(struct spa_pod_builder *b) {
++	if (!focaldesk_bt2020_sdr()) {
++		return;
++	}
++	spa_pod_builder_add(b,
++		SPA_FORMAT_VIDEO_colorRange, SPA_POD_Id(SPA_VIDEO_COLOR_RANGE_0_255),
++		SPA_FORMAT_VIDEO_colorMatrix, SPA_POD_Id(SPA_VIDEO_COLOR_MATRIX_RGB),
++		SPA_FORMAT_VIDEO_transferFunction, SPA_POD_Id(SPA_VIDEO_TRANSFER_BT709),
++		SPA_FORMAT_VIDEO_colorPrimaries, SPA_POD_Id(SPA_VIDEO_COLOR_PRIMARIES_BT2020),
++		0);
++}
++
+ static struct spa_pod *build_buffer(struct spa_pod_builder *b, uint32_t blocks, uint32_t size,
+ 		uint32_t stride, uint32_t datatype) {
+ 	assert(blocks > 0);
+@@ -75,6 +97,7 @@ static struct spa_pod *fixate_format(struct spa_pod_builder *b, enum spa_video_f
+ 			&SPA_FRACTION(1, 1),
+ 			&SPA_FRACTION(framerate, 1)),
+ 		0);
++	add_focaldesk_colorimetry(b);
+ 	return spa_pod_builder_pop(b, &f[0]);
+ }
+ 
+@@ -123,6 +146,7 @@ static struct spa_pod *build_format(struct spa_pod_builder *b, enum spa_video_fo
+ 			&SPA_FRACTION(1, 1),
+ 			&SPA_FRACTION(framerate, 1)),
+ 		0);
++	add_focaldesk_colorimetry(b);
+ 	return spa_pod_builder_pop(b, &f[0]);
+ }
+ 

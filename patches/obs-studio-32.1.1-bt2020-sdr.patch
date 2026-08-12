@@ -1,0 +1,686 @@
+diff --git a/frontend/data/locale/en-US.ini b/frontend/data/locale/en-US.ini
+index 3775d92..ec66565 100644
+--- a/frontend/data/locale/en-US.ini
++++ b/frontend/data/locale/en-US.ini
+@@ -1298,6 +1298,7 @@ Basic.Settings.Advanced.General.ProcessPriority.Idle="Idle"
+ Basic.Settings.Advanced.FormatWarning="Warning: Color formats other than NV12/P010 are primarily intended for recording, and are not recommended when streaming. Streaming may incur increased CPU usage due to color format conversion."
+ Basic.Settings.Advanced.FormatWarningPreciseSdr="Warning: High-precision formats are more commonly used with HDR color spaces."
+ Basic.Settings.Advanced.FormatWarning2100="Warning: Rec. 2100 should use a format with more precision."
++Basic.Settings.Advanced.FormatWarning2020SDR="Warning: Rec. 2020 SDR requires the I010 or P010 10-bit color format."
+ Basic.Settings.Advanced.Video.ColorFormat="Color Format"
+ Basic.Settings.Advanced.Video.ColorFormat.NV12="NV12 (8-bit, 4:2:0, 2 planes)"
+ Basic.Settings.Advanced.Video.ColorFormat.I420="I420 (8-bit, 4:2:0, 3 planes)"
+@@ -1311,6 +1312,7 @@ Basic.Settings.Advanced.Video.ColorSpace="Color Space"
+ Basic.Settings.Advanced.Video.ColorSpace.sRGB="sRGB"
+ Basic.Settings.Advanced.Video.ColorSpace.601="Rec. 601"
+ Basic.Settings.Advanced.Video.ColorSpace.709="Rec. 709"
++Basic.Settings.Advanced.Video.ColorSpace.2020SDR="Rec. 2020 (SDR)"
+ Basic.Settings.Advanced.Video.ColorSpace.2100PQ="Rec. 2100 (PQ)"
+ Basic.Settings.Advanced.Video.ColorSpace.2100HLG="Rec. 2100 (HLG)"
+ Basic.Settings.Advanced.Video.ColorRange="Color Range"
+diff --git a/frontend/settings/OBSBasicSettings.cpp b/frontend/settings/OBSBasicSettings.cpp
+index 2221399..3f35bb6 100644
+--- a/frontend/settings/OBSBasicSettings.cpp
++++ b/frontend/settings/OBSBasicSettings.cpp
+@@ -997,6 +997,7 @@ void OBSBasicSettings::LoadColorRanges()
+ #define CS_SRGB_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.sRGB")
+ #define CS_709_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.709")
+ #define CS_601_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.601")
++#define CS_2020SDR_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2020SDR")
+ #define CS_2100PQ_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2100PQ")
+ #define CS_2100HLG_STR QTStr("Basic.Settings.Advanced.Video.ColorSpace.2100HLG")
+ 
+@@ -1005,6 +1006,7 @@ void OBSBasicSettings::LoadColorSpaces()
+ 	ui->colorSpace->addItem(CS_SRGB_STR, "sRGB");
+ 	ui->colorSpace->addItem(CS_709_STR, "709");
+ 	ui->colorSpace->addItem(CS_601_STR, "601");
++	ui->colorSpace->addItem(CS_2020SDR_STR, "2020SDR");
+ 	ui->colorSpace->addItem(CS_2100PQ_STR, "2100PQ");
+ 	ui->colorSpace->addItem(CS_2100HLG_STR, "2100HLG");
+ }
+@@ -2484,8 +2486,17 @@ void OBSBasicSettings::UpdateColorFormatSpaceWarning()
+ {
+ 	const QString format = ui->colorFormat->currentData().toString();
+ 	switch (ui->colorSpace->currentIndex()) {
+-	case 3: /* Rec.2100 (PQ) */
+-	case 4: /* Rec.2100 (HLG) */
++	case 3: /* Rec.2020 (SDR) */
++		if ((format == "I010") || (format == "P010")) {
++			ui->advancedMsg2->clear();
++			ui->advancedMsg2->setVisible(false);
++		} else {
++			ui->advancedMsg2->setText(QTStr("Basic.Settings.Advanced.FormatWarning2020SDR"));
++			ui->advancedMsg2->setVisible(true);
++		}
++		break;
++	case 4: /* Rec.2100 (PQ) */
++	case 5: /* Rec.2100 (HLG) */
+ 		if ((format == "P010") || (format == "P216") || (format == "P416")) {
+ 			ui->advancedMsg2->clear();
+ 			ui->advancedMsg2->setVisible(false);
+diff --git a/frontend/widgets/OBSBasic.cpp b/frontend/widgets/OBSBasic.cpp
+index e3277eb..15b6ec1 100644
+--- a/frontend/widgets/OBSBasic.cpp
++++ b/frontend/widgets/OBSBasic.cpp
+@@ -1542,6 +1542,8 @@ static inline enum video_colorspace GetVideoColorSpaceFromName(const char *name)
+ 		colorspace = VIDEO_CS_601;
+ 	else if (strcmp(name, "709") == 0)
+ 		colorspace = VIDEO_CS_709;
++	else if (strcmp(name, "2020SDR") == 0)
++		colorspace = VIDEO_CS_2020_SDR;
+ 	else if (strcmp(name, "2100PQ") == 0)
+ 		colorspace = VIDEO_CS_2100_PQ;
+ 	else if (strcmp(name, "2100HLG") == 0)
+diff --git a/libobs/data/color.effect b/libobs/data/color.effect
+index 7cdcf62..bf405c8 100644
+--- a/libobs/data/color.effect
++++ b/libobs/data/color.effect
+@@ -18,6 +18,26 @@ float3 srgb_nonlinear_to_linear(float3 v)
+ 	return float3(srgb_nonlinear_to_linear_channel(v.r), srgb_nonlinear_to_linear_channel(v.g), srgb_nonlinear_to_linear_channel(v.b));
+ }
+ 
++float bt709_linear_to_nonlinear_channel(float u)
++{
++	return (u < 0.018) ? (4.5 * u) : ((1.099 * pow(max(u, 0.), 0.45)) - 0.099);
++}
++
++float3 bt709_linear_to_nonlinear(float3 v)
++{
++	return float3(bt709_linear_to_nonlinear_channel(v.r), bt709_linear_to_nonlinear_channel(v.g), bt709_linear_to_nonlinear_channel(v.b));
++}
++
++float bt709_nonlinear_to_linear_channel(float u)
++{
++	return (u < 0.081) ? (u / 4.5) : pow((u + 0.099) / 1.099, 1. / 0.45);
++}
++
++float3 bt709_nonlinear_to_linear(float3 v)
++{
++	return float3(bt709_nonlinear_to_linear_channel(v.r), bt709_nonlinear_to_linear_channel(v.g), bt709_nonlinear_to_linear_channel(v.b));
++}
++
+ float3 rec709_to_rec2020(float3 v)
+ {
+ 	float r = dot(v, float3(0.62740389593469903, 0.32928303837788370, 0.043313065687417225));
+diff --git a/libobs/data/default.effect b/libobs/data/default.effect
+index 2c7c832..3c7adae 100644
+--- a/libobs/data/default.effect
++++ b/libobs/data/default.effect
+@@ -144,6 +144,14 @@ float4 PSDrawD65P3(VertInOut vert_in) : TARGET
+     return rgba;
+ }
+ 
++float4 PSDrawBT2020SDR(VertInOut vert_in) : TARGET
++{
++	float4 rgba = image.Sample(def_sampler, vert_in.uv);
++	rgba.rgb = bt709_nonlinear_to_linear(rgba.rgb);
++	rgba.rgb = rec2020_to_rec709(rgba.rgb);
++	return rgba;
++}
++
+ technique Draw
+ {
+ 	pass
+@@ -269,3 +277,12 @@ technique DrawD65P3
+         pixel_shader  = PSDrawD65P3(vert_in);
+     }
+ }
++
++technique DrawBT2020SDR
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSDrawBT2020SDR(vert_in);
++	}
++}
+diff --git a/libobs/data/default_rect.effect b/libobs/data/default_rect.effect
+index 2abb7a3..0be4565 100644
+--- a/libobs/data/default_rect.effect
++++ b/libobs/data/default_rect.effect
+@@ -35,6 +35,14 @@ float4 PSDrawD65P3(VertInOut vert_in) : TARGET
+ 	return rgba;
+ }
+ 
++float4 PSDrawBT2020SDR(VertInOut vert_in) : TARGET
++{
++	float4 rgba = image.Sample(def_sampler, vert_in.uv);
++	rgba.rgb = bt709_nonlinear_to_linear(rgba.rgb);
++	rgba.rgb = rec2020_to_rec709(rgba.rgb);
++	return rgba;
++}
++
+ float4 PSDrawOpaque(VertInOut vert_in) : TARGET
+ {
+ 	return float4(image.Sample(def_sampler, vert_in.uv).rgb, 1.0);
+@@ -65,6 +73,15 @@ technique DrawD65P3
+ 	}
+ }
+ 
++technique DrawBT2020SDR
++{
++	pass
++	{
++		vertex_shader = VSDefault(vert_in);
++		pixel_shader  = PSDrawBT2020SDR(vert_in);
++	}
++}
++
+ technique DrawOpaque
+ {
+ 	pass
+diff --git a/libobs/data/format_conversion.effect b/libobs/data/format_conversion.effect
+index 6d1088c..9f5659f 100644
+--- a/libobs/data/format_conversion.effect
++++ b/libobs/data/format_conversion.effect
+@@ -252,6 +252,16 @@ float PS_P010_SRGB_Y(FragPos frag_in) : TARGET
+ 	return y;
+ }
+ 
++float PS_P010_2020_SDR_Y(FragPos frag_in) : TARGET
++{
++	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
++	rgb = rec709_to_rec2020(rgb);
++	rgb = bt709_linear_to_nonlinear(rgb);
++	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
++	y = floor(saturate(y) * 1023. + 0.5) * (64. / 65535.);
++	return y;
++}
++
+ float PS_P216_PQ_Y_709_2020(FragPos frag_in) : TARGET
+ {
+ 	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb * sdr_white_nits_over_maximum;
+@@ -330,6 +340,15 @@ float PS_I010_SRGB_Y(FragPos frag_in) : TARGET
+ 	return y * (1023. / 65535.);
+ }
+ 
++float PS_I010_2020_SDR_Y(FragPos frag_in) : TARGET
++{
++	float3 rgb = image.Load(int3(frag_in.pos.xy, 0)).rgb;
++	rgb = rec709_to_rec2020(rgb);
++	rgb = bt709_linear_to_nonlinear(rgb);
++	float y = dot(color_vec0.xyz, rgb) + color_vec0.w;
++	return y * (1023. / 65535.);
++}
++
+ float2 PS_UV_Wide(FragTexWide frag_in) : TARGET
+ {
+ 	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+@@ -385,6 +404,19 @@ float2 PS_P010_SRGB_UV_Wide(FragTexWide frag_in) : TARGET
+ 	return uv;
+ }
+ 
++float2 PS_P010_2020_SDR_UV_Wide(FragTexWide frag_in) : TARGET
++{
++	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
++	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
++	float3 rgb = (rgb_left + rgb_right) * 0.5;
++	rgb = rec709_to_rec2020(rgb);
++	rgb = bt709_linear_to_nonlinear(rgb);
++	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
++	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
++	float2 uv = floor(saturate(float2(u, v)) * 1023. + 0.5) * (64. / 65535.);
++	return uv;
++}
++
+ float2 PS_P216_PQ_UV_709_2020_Wide(FragTexWide frag_in) : TARGET
+ {
+ 	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
+@@ -523,6 +555,17 @@ float PS_I010_SRGB_U_Wide(FragTexWide frag_in) : TARGET
+ 	return u * (1023. / 65535.);
+ }
+ 
++float PS_I010_2020_SDR_U_Wide(FragTexWide frag_in) : TARGET
++{
++	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
++	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
++	float3 rgb = (rgb_left + rgb_right) * 0.5;
++	rgb = rec709_to_rec2020(rgb);
++	rgb = bt709_linear_to_nonlinear(rgb);
++	float u = dot(color_vec1.xyz, rgb) + color_vec1.w;
++	return u * (1023. / 65535.);
++}
++
+ float PS_I010_PQ_V_709_2020_WideWide(FragTexWideWide frag_in) : TARGET
+ {
+ 	float3 rgb_topleft = image.Sample(def_sampler, frag_in.uuvv.xz).rgb;
+@@ -559,6 +602,17 @@ float PS_I010_SRGB_V_Wide(FragTexWide frag_in) : TARGET
+ 	return v * (1023. / 65535.);
+ }
+ 
++float PS_I010_2020_SDR_V_Wide(FragTexWide frag_in) : TARGET
++{
++	float3 rgb_left = image.Sample(def_sampler, frag_in.uuv.xz).rgb;
++	float3 rgb_right = image.Sample(def_sampler, frag_in.uuv.yz).rgb;
++	float3 rgb = (rgb_left + rgb_right) * 0.5;
++	rgb = rec709_to_rec2020(rgb);
++	rgb = bt709_linear_to_nonlinear(rgb);
++	float v = dot(color_vec2.xyz, rgb) + color_vec2.w;
++	return v * (1023. / 65535.);
++}
++
+ float3 YUV_to_RGB(float3 yuv)
+ {
+ 	yuv = clamp(yuv, color_range_min, color_range_max);
+@@ -1210,6 +1264,15 @@ technique I010_SRGB_Y
+ 	}
+ }
+ 
++technique I010_2020_SDR_Y
++{
++	pass
++	{
++		vertex_shader = VSPos(id);
++		pixel_shader  = PS_I010_2020_SDR_Y(frag_in);
++	}
++}
++
+ technique I010_PQ_U
+ {
+ 	pass
+@@ -1237,6 +1300,15 @@ technique I010_SRGB_U
+ 	}
+ }
+ 
++technique I010_2020_SDR_U
++{
++	pass
++	{
++		vertex_shader = VSTexPos_Left(id);
++		pixel_shader  = PS_I010_2020_SDR_U_Wide(frag_in);
++	}
++}
++
+ technique I010_PQ_V
+ {
+ 	pass
+@@ -1264,6 +1336,15 @@ technique I010_SRGB_V
+ 	}
+ }
+ 
++technique I010_2020_SDR_V
++{
++	pass
++	{
++		vertex_shader = VSTexPos_Left(id);
++		pixel_shader  = PS_I010_2020_SDR_V_Wide(frag_in);
++	}
++}
++
+ technique P010_PQ_Y
+ {
+ 	pass
+@@ -1291,6 +1372,15 @@ technique P010_SRGB_Y
+ 	}
+ }
+ 
++technique P010_2020_SDR_Y
++{
++	pass
++	{
++		vertex_shader = VSPos(id);
++		pixel_shader  = PS_P010_2020_SDR_Y(frag_in);
++	}
++}
++
+ technique P010_PQ_UV
+ {
+ 	pass
+@@ -1318,6 +1408,15 @@ technique P010_SRGB_UV
+ 	}
+ }
+ 
++technique P010_2020_SDR_UV
++{
++	pass
++	{
++		vertex_shader = VSTexPos_Left(id);
++		pixel_shader  = PS_P010_2020_SDR_UV_Wide(frag_in);
++	}
++}
++
+ technique P216_PQ_Y
+ {
+ 	pass
+diff --git a/libobs/media-io/video-io.h b/libobs/media-io/video-io.h
+index fde6ca7..2c7e51f 100644
+--- a/libobs/media-io/video-io.h
++++ b/libobs/media-io/video-io.h
+@@ -108,6 +108,7 @@ enum video_colorspace {
+ 	VIDEO_CS_601,
+ 	VIDEO_CS_709,
+ 	VIDEO_CS_SRGB,
++	VIDEO_CS_2020_SDR,
+ 	VIDEO_CS_2100_PQ,
+ 	VIDEO_CS_2100_HLG,
+ };
+@@ -241,6 +242,8 @@ static inline const char *get_video_colorspace_name(enum video_colorspace cs)
+ 		return "Rec. 709";
+ 	case VIDEO_CS_SRGB:
+ 		return "sRGB";
++	case VIDEO_CS_2020_SDR:
++		return "Rec. 2020 (SDR)";
+ 	case VIDEO_CS_601:
+ 		return "Rec. 601";
+ 	case VIDEO_CS_2100_PQ:
+diff --git a/libobs/media-io/video-matrices.c b/libobs/media-io/video-matrices.c
+index 6617e09..7afee39 100644
+--- a/libobs/media-io/video-matrices.c
++++ b/libobs/media-io/video-matrices.c
+@@ -53,6 +53,11 @@ static struct {
+ 		0.0593f,
+ 		0.2627f,
+ 	},
++	{
++		VIDEO_CS_2020_SDR,
++		0.0593f,
++		0.2627f,
++	},
+ };
+ 
+ #define NUM_FORMATS (sizeof(format_info) / sizeof(format_info[0]))
+@@ -221,7 +226,11 @@ static bool video_format_get_parameters_for_bpc(enum video_colorspace color_spac
+ bool video_format_get_parameters(enum video_colorspace color_space, enum video_range_type range, float matrix[16],
+ 				 float range_min[3], float range_max[3])
+ {
+-	uint32_t bpc = (color_space == VIDEO_CS_2100_PQ || color_space == VIDEO_CS_2100_HLG) ? 10 : 8;
++	uint32_t bpc =
++		(color_space == VIDEO_CS_2020_SDR || color_space == VIDEO_CS_2100_PQ ||
++		 color_space == VIDEO_CS_2100_HLG)
++			? 10
++			: 8;
+ 
+ 	return video_format_get_parameters_for_bpc(color_space, range, matrix, range_min, range_max, bpc);
+ }
+diff --git a/libobs/media-io/video-scaler-ffmpeg.c b/libobs/media-io/video-scaler-ffmpeg.c
+index 90cfdc5..fd826b2 100644
+--- a/libobs/media-io/video-scaler-ffmpeg.c
++++ b/libobs/media-io/video-scaler-ffmpeg.c
+@@ -118,6 +118,7 @@ static inline const int *get_ffmpeg_coeffs(enum video_colorspace cs)
+ 		break;
+ 	case VIDEO_CS_2100_PQ:
+ 	case VIDEO_CS_2100_HLG:
++	case VIDEO_CS_2020_SDR:
+ 		colorspace = SWS_CS_BT2020;
+ 	}
+ 
+diff --git a/libobs/obs.c b/libobs/obs.c
+index e4688e6..1cf1e0e 100644
+--- a/libobs/obs.c
++++ b/libobs/obs.c
+@@ -78,7 +78,11 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
+ 		video->conversion_needed = true;
+ 		video->conversion_width_i = 1.f / (float)info->width;
+ 		video->conversion_height_i = 1.f / (float)info->height;
+-		if (info->colorspace == VIDEO_CS_2100_PQ) {
++		if (info->colorspace == VIDEO_CS_2020_SDR) {
++			video->conversion_techs[0] = "I010_2020_SDR_Y";
++			video->conversion_techs[1] = "I010_2020_SDR_U";
++			video->conversion_techs[2] = "I010_2020_SDR_V";
++		} else if (info->colorspace == VIDEO_CS_2100_PQ) {
+ 			video->conversion_techs[0] = "I010_PQ_Y";
+ 			video->conversion_techs[1] = "I010_PQ_U";
+ 			video->conversion_techs[2] = "I010_PQ_V";
+@@ -96,7 +100,10 @@ static inline void calc_gpu_conversion_sizes(struct obs_core_video_mix *video)
+ 		video->conversion_needed = true;
+ 		video->conversion_width_i = 1.f / (float)info->width;
+ 		video->conversion_height_i = 1.f / (float)info->height;
+-		if (info->colorspace == VIDEO_CS_2100_PQ) {
++		if (info->colorspace == VIDEO_CS_2020_SDR) {
++			video->conversion_techs[0] = "P010_2020_SDR_Y";
++			video->conversion_techs[1] = "P010_2020_SDR_UV";
++		} else if (info->colorspace == VIDEO_CS_2100_PQ) {
+ 			video->conversion_techs[0] = "P010_PQ_Y";
+ 			video->conversion_techs[1] = "P010_PQ_UV";
+ 		} else if (info->colorspace == VIDEO_CS_2100_HLG) {
+@@ -403,6 +410,9 @@ static bool obs_init_textures(struct obs_core_video_mix *video)
+ 
+ 	enum gs_color_space space = GS_CS_SRGB;
+ 	switch (info->colorspace) {
++	case VIDEO_CS_2020_SDR:
++		space = GS_CS_SRGB_16F;
++		break;
+ 	case VIDEO_CS_2100_PQ:
+ 	case VIDEO_CS_2100_HLG:
+ 		space = GS_CS_709_EXTENDED;
+diff --git a/plugins/linux-pipewire/pipewire.c b/plugins/linux-pipewire/pipewire.c
+index d312a18..9add2b4 100644
+--- a/plugins/linux-pipewire/pipewire.c
++++ b/plugins/linux-pipewire/pipewire.c
+@@ -638,6 +638,13 @@ static enum video_range_type video_color_range_from_spa_color_range(enum spa_vid
+ 	}
+ }
+ 
++static bool is_bt2020_sdr(const obs_pipewire_stream *obs_pw_stream)
++{
++	const struct spa_video_info_raw *raw = &obs_pw_stream->format.info.raw;
++	return raw->color_primaries == SPA_VIDEO_COLOR_PRIMARIES_BT2020 &&
++	       raw->transfer_function == SPA_VIDEO_TRANSFER_BT709 && raw->color_matrix == SPA_VIDEO_COLOR_MATRIX_RGB;
++}
++
+ static bool prepare_obs_frame(obs_pipewire_stream *obs_pw_stream, struct obs_source_frame *frame)
+ {
+ 	struct obs_pw_video_format obs_pw_video_format;
+@@ -999,6 +1006,9 @@ static void on_param_changed_cb(void *user_data, uint32_t id, const struct spa_p
+ 
+ 	blog(LOG_INFO, "[pipewire]     Framerate: %d/%d", obs_pw_stream->format.info.raw.framerate.num,
+ 	     obs_pw_stream->format.info.raw.framerate.denom);
++	blog(LOG_INFO, "[pipewire]     Colorimetry: range=%d matrix=%d transfer=%d primaries=%d",
++	     obs_pw_stream->format.info.raw.color_range, obs_pw_stream->format.info.raw.color_matrix,
++	     obs_pw_stream->format.info.raw.transfer_function, obs_pw_stream->format.info.raw.color_primaries);
+ 
+ 	/* Video crop */
+ 	pod_builder = SPA_POD_BUILDER_INIT(params_buffer, sizeof(params_buffer));
+@@ -1338,8 +1348,9 @@ void obs_pipewire_stream_video_render(obs_pipewire_stream *obs_pw_stream, gs_eff
+ 		gs_sync_destroy(acquire_sync);
+ 	}
+ 
+-	/* FIXME: Use obs_pw_stream->format.info.raw colorimetry info to handle
+-	 * textures in their corresponding color space */
++	const bool bt2020_sdr = is_bt2020_sdr(obs_pw_stream);
++	if (bt2020_sdr)
++		effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+ 	image = gs_effect_get_param_by_name(effect, "image");
+ 	gs_effect_set_texture(image, obs_pw_stream->texture);
+ 
+@@ -1358,7 +1369,19 @@ void obs_pipewire_stream_video_render(obs_pipewire_stream *obs_pw_stream, gs_eff
+ 	gs_blend_state_push();
+ 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
+ 
+-	if (has_effective_crop(obs_pw_stream)) {
++	if (bt2020_sdr) {
++		const bool previous = gs_framebuffer_srgb_enabled();
++		gs_enable_framebuffer_srgb(true);
++		while (gs_effect_loop(effect, "DrawBT2020SDR")) {
++			if (has_effective_crop(obs_pw_stream))
++				gs_draw_sprite_subregion(obs_pw_stream->texture, flip, obs_pw_stream->crop.x,
++							 obs_pw_stream->crop.y, obs_pw_stream->crop.width,
++							 obs_pw_stream->crop.height);
++			else
++				gs_draw_sprite(obs_pw_stream->texture, flip, 0, 0);
++		}
++		gs_enable_framebuffer_srgb(previous);
++	} else if (has_effective_crop(obs_pw_stream)) {
+ 		gs_draw_sprite_subregion(obs_pw_stream->texture, flip, obs_pw_stream->crop.x, obs_pw_stream->crop.y,
+ 					 obs_pw_stream->crop.width, obs_pw_stream->crop.height);
+ 	} else {
+@@ -1392,6 +1415,18 @@ void obs_pipewire_stream_video_render(obs_pipewire_stream *obs_pw_stream, gs_eff
+ 	}
+ }
+ 
++enum gs_color_space obs_pipewire_stream_get_color_space(obs_pipewire_stream *obs_pw_stream, size_t count,
++							 const enum gs_color_space *preferred_spaces)
++{
++	if (!obs_pw_stream || !is_bt2020_sdr(obs_pw_stream))
++		return GS_CS_SRGB;
++
++	for (size_t i = 0; i < count; i++)
++		if (preferred_spaces[i] == GS_CS_SRGB_16F)
++			return GS_CS_SRGB_16F;
++	return GS_CS_SRGB_16F;
++}
++
+ void obs_pipewire_stream_set_cursor_visible(obs_pipewire_stream *obs_pw_stream, bool cursor_visible)
+ {
+ 	obs_pw_stream->cursor.visible = cursor_visible;
+diff --git a/plugins/linux-pipewire/pipewire.h b/plugins/linux-pipewire/pipewire.h
+index a4437f4..677514c 100644
+--- a/plugins/linux-pipewire/pipewire.h
++++ b/plugins/linux-pipewire/pipewire.h
+@@ -55,6 +55,8 @@ void obs_pipewire_stream_hide(obs_pipewire_stream *obs_pw_stream);
+ uint32_t obs_pipewire_stream_get_width(obs_pipewire_stream *obs_pw_stream);
+ uint32_t obs_pipewire_stream_get_height(obs_pipewire_stream *obs_pw_stream);
+ void obs_pipewire_stream_video_render(obs_pipewire_stream *obs_pw_stream, gs_effect_t *effect);
++enum gs_color_space obs_pipewire_stream_get_color_space(obs_pipewire_stream *obs_pw_stream, size_t count,
++							 const enum gs_color_space *preferred_spaces);
+ 
+ void obs_pipewire_stream_set_cursor_visible(obs_pipewire_stream *obs_pw_stream, bool cursor_visible);
+ void obs_pipewire_stream_destroy(obs_pipewire_stream *obs_pw_stream);
+diff --git a/plugins/linux-pipewire/screencast-portal.c b/plugins/linux-pipewire/screencast-portal.c
+index d5fe531..b77e905 100644
+--- a/plugins/linux-pipewire/screencast-portal.c
++++ b/plugins/linux-pipewire/screencast-portal.c
+@@ -671,6 +671,15 @@ static void screencast_portal_capture_video_render(void *data, gs_effect_t *effe
+ 		obs_pipewire_stream_video_render(capture->obs_pw_stream, effect);
+ }
+ 
++static enum gs_color_space screencast_portal_capture_get_color_space(void *data, size_t count,
++							      const enum gs_color_space *preferred_spaces)
++{
++	struct screencast_portal_capture *capture = data;
++	return capture->obs_pw_stream
++		       ? obs_pipewire_stream_get_color_space(capture->obs_pw_stream, count, preferred_spaces)
++		       : GS_CS_SRGB;
++}
++
+ void screencast_portal_load(void)
+ {
+ 	uint32_t available_capture_types = get_available_capture_types();
+@@ -705,6 +714,7 @@ void screencast_portal_load(void)
+ 		.get_width = screencast_portal_capture_get_width,
+ 		.get_height = screencast_portal_capture_get_height,
+ 		.video_render = screencast_portal_capture_video_render,
++		.video_get_color_space = screencast_portal_capture_get_color_space,
+ 		.icon_type = OBS_ICON_TYPE_DESKTOP_CAPTURE,
+ 	};
+ 	if (desktop_capture_available)
+@@ -727,6 +737,7 @@ void screencast_portal_load(void)
+ 		.get_width = screencast_portal_capture_get_width,
+ 		.get_height = screencast_portal_capture_get_height,
+ 		.video_render = screencast_portal_capture_video_render,
++		.video_get_color_space = screencast_portal_capture_get_color_space,
+ 		.icon_type = OBS_ICON_TYPE_WINDOW_CAPTURE,
+ 	};
+ 	if (window_capture_available)
+@@ -749,6 +760,7 @@ void screencast_portal_load(void)
+ 		.get_width = screencast_portal_capture_get_width,
+ 		.get_height = screencast_portal_capture_get_height,
+ 		.video_render = screencast_portal_capture_video_render,
++		.video_get_color_space = screencast_portal_capture_get_color_space,
+ 		.icon_type = OBS_ICON_TYPE_DESKTOP_CAPTURE,
+ 	};
+ 	obs_register_source(&screencast_portal_capture_info);
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-output.c b/plugins/obs-ffmpeg/obs-ffmpeg-output.c
+index 9615abe..5267442 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg-output.c
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-output.c
+@@ -999,6 +999,11 @@ static bool try_connect(struct ffmpeg_output *output)
+ 		config.color_trc = AVCOL_TRC_IEC61966_2_1;
+ 		config.colorspace = AVCOL_SPC_BT709;
+ 		break;
++	case VIDEO_CS_2020_SDR:
++		config.color_primaries = AVCOL_PRI_BT2020;
++		config.color_trc = AVCOL_TRC_BT709;
++		config.colorspace = AVCOL_SPC_BT2020_NCL;
++		break;
+ 	case VIDEO_CS_2100_PQ:
+ 		config.color_primaries = AVCOL_PRI_BT2020;
+ 		config.color_trc = AVCOL_TRC_SMPTE2084;
+diff --git a/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c b/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c
+index 90cddb8..93065af 100644
+--- a/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c
++++ b/plugins/obs-ffmpeg/obs-ffmpeg-video-encoders.c
+@@ -89,6 +89,11 @@ void ffmpeg_video_encoder_update(struct ffmpeg_video_encoder *enc, int bitrate,
+ 		enc->context->color_trc = AVCOL_TRC_IEC61966_2_1;
+ 		colorspace = AVCOL_SPC_BT709;
+ 		break;
++	case VIDEO_CS_2020_SDR:
++		enc->context->color_primaries = AVCOL_PRI_BT2020;
++		enc->context->color_trc = AVCOL_TRC_BT709;
++		colorspace = AVCOL_SPC_BT2020_NCL;
++		break;
+ 	case VIDEO_CS_2100_PQ:
+ 		enc->context->color_primaries = AVCOL_PRI_BT2020;
+ 		enc->context->color_trc = AVCOL_TRC_SMPTE2084;
+diff --git a/plugins/obs-nvenc/nvenc.c b/plugins/obs-nvenc/nvenc.c
+index fb38945..0b21636 100644
+--- a/plugins/obs-nvenc/nvenc.c
++++ b/plugins/obs-nvenc/nvenc.c
+@@ -468,6 +468,11 @@ static bool init_encoder_h264(struct nvenc_data *enc, obs_data_t *settings)
+ 		vui_params->transferCharacteristics = 13;
+ 		vui_params->colourMatrix = 1;
+ 		break;
++	case VIDEO_CS_2020_SDR:
++		vui_params->colourPrimaries = 9;
++		vui_params->transferCharacteristics = 1;
++		vui_params->colourMatrix = 9;
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -572,6 +577,11 @@ static bool init_encoder_hevc(struct nvenc_data *enc, obs_data_t *settings)
+ 		vui_params->transferCharacteristics = 13;
+ 		vui_params->colourMatrix = 1;
+ 		break;
++	case VIDEO_CS_2020_SDR:
++		vui_params->colourPrimaries = 9;
++		vui_params->transferCharacteristics = 1;
++		vui_params->colourMatrix = 9;
++		break;
+ 	case VIDEO_CS_2100_PQ:
+ 		vui_params->colourPrimaries = 9;
+ 		vui_params->transferCharacteristics = 16;
+@@ -685,6 +695,11 @@ static bool init_encoder_av1(struct nvenc_data *enc, obs_data_t *settings)
+ 		av1_config->transferCharacteristics = 13;
+ 		av1_config->matrixCoefficients = 1;
+ 		break;
++	case VIDEO_CS_2020_SDR:
++		av1_config->colorPrimaries = 9;
++		av1_config->transferCharacteristics = 1;
++		av1_config->matrixCoefficients = 9;
++		break;
+ 	case VIDEO_CS_2100_PQ:
+ 		av1_config->colorPrimaries = 9;
+ 		av1_config->transferCharacteristics = 16;
+diff --git a/plugins/obs-outputs/mp4-mux-internal.h b/plugins/obs-outputs/mp4-mux-internal.h
+index 4136927..4293f4a 100644
+--- a/plugins/obs-outputs/mp4-mux-internal.h
++++ b/plugins/obs-outputs/mp4-mux-internal.h
+@@ -291,6 +291,11 @@ static inline void get_colour_information(obs_encoder_t *enc, uint16_t *pri, uin
+ 		*trc = 13; // OBSCOL_TRC_IEC61966_2_1
+ 		*spc = 1;  // OBSCOL_PRI_BT709
+ 		break;
++	case VIDEO_CS_2020_SDR:
++		*pri = 9; // OBSCOL_PRI_BT2020
++		*trc = 1; // OBSCOL_TRC_BT709
++		*spc = 9; // OBSCOL_SPC_BT2020_NCL
++		break;
+ 	case VIDEO_CS_2100_PQ:
+ 		*pri = 9;  // OBSCOL_PRI_BT2020
+ 		*trc = 16; // OBSCOL_TRC_SMPTE2084
+diff --git a/plugins/obs-outputs/rtmp-stream.c b/plugins/obs-outputs/rtmp-stream.c
+index 3f45d34..70fc6d1 100644
+--- a/plugins/obs-outputs/rtmp-stream.c
++++ b/plugins/obs-outputs/rtmp-stream.c
+@@ -887,6 +887,11 @@ static bool send_video_metadata(struct rtmp_stream *stream, size_t idx)
+ 			trc = OBSCOL_TRC_IEC61966_2_1;
+ 			spc = OBSCOL_PRI_BT709;
+ 			break;
++		case VIDEO_CS_2020_SDR:
++			pri = OBSCOL_PRI_BT2020;
++			trc = OBSCOL_PRI_BT709;
++			spc = OBSCOL_SPC_BT2020_NCL;
++			break;
+ 		case VIDEO_CS_2100_PQ:
+ 			pri = OBSCOL_PRI_BT2020;
+ 			trc = OBSCOL_TRC_SMPTE2084;

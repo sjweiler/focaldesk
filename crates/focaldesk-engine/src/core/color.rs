@@ -207,6 +207,18 @@ impl ColorDescription {
         max_fall_nits: None,
     };
 
+    /// Wide-gamut SDR capture target. The portal shader applies the precise
+    /// BT.709 OETF; `Bt1886` is the closest SDR video transfer description in
+    /// the compositor's current surface/output model.
+    pub const BT2020_SDR: Self = Self {
+        primaries: ColorPrimaries::Bt2020,
+        transfer: TransferFunction::Bt1886,
+        reference_white_nits: 80.0,
+        max_luminance_nits: 80.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+    };
+
     /// BT.2020 + PQ from EDID Type-1 static metadata (HDR scanout target).
     pub fn bt2020_pq_hdr(max_luminance_nits: f32, max_fall_nits: f32) -> Self {
         Self {

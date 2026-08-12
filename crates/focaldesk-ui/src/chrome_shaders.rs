@@ -349,6 +349,9 @@ impl ChromeShaders {
                 PORTAL_CAPTURE_SDR_FRAG,
                 &[
                     UniformName::new("u_source_peak", UniformType::_1f),
+                    UniformName::new("u_decode_srgb", UniformType::_1f),
+                    UniformName::new("u_compress_gamut", UniformType::_1f),
+                    UniformName::new("u_bt709_transfer", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
@@ -1080,6 +1083,8 @@ mod tests {
         assert!(PORTAL_CAPTURE_SDR_FRAG.contains("mapped / luminance"));
         assert!(PORTAL_CAPTURE_SDR_FRAG.contains("compress_to_rec709(linear)"));
         assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_srgb"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_bt709"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("u_compress_gamut"));
     }
 }
 
@@ -1296,6 +1301,9 @@ precision highp float;
 varying vec2 v_coords;
 uniform float alpha;
 uniform float u_source_peak;
+uniform float u_decode_srgb;
+uniform float u_compress_gamut;
+uniform float u_bt709_transfer;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -1304,6 +1312,20 @@ vec3 linear_to_srgb(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
     vec3 low = c * 12.92;
     vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow(max((c + 0.055) / 1.055, vec3(0.0)), vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 linear_to_bt709(vec3 c) {
+    bvec3 cutoff = lessThan(c, vec3(0.018));
+    vec3 low = c * 4.5;
+    vec3 high = 1.099 * pow(max(c, vec3(0.0)), vec3(0.45)) - 0.099;
     return mix(high, low, vec3(cutoff));
 }
 
@@ -1341,14 +1363,23 @@ void main() {
     src.a = 1.0;
 #endif
     vec3 scene = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
+    if (u_decode_srgb > 0.5) {
+        scene = srgb_to_linear(scene);
+    }
     vec3 linear = max(mul_mat3(scene), vec3(0.0));
     float luminance = dot(linear, vec3(0.2126, 0.7152, 0.0722));
     if (u_source_peak > 1.0 && luminance > 0.000001) {
         float mapped = tone_map_luminance(luminance, u_source_peak);
         linear *= mapped / luminance;
     }
-    linear = compress_to_rec709(linear);
-    gl_FragColor = vec4(linear_to_srgb(clamp(linear, 0.0, 1.0)), 1.0) * alpha;
+    if (u_compress_gamut > 0.5) {
+        linear = compress_to_rec709(linear);
+    }
+    linear = clamp(linear, 0.0, 1.0);
+    vec3 encoded = u_bt709_transfer > 0.5
+        ? linear_to_bt709(linear)
+        : linear_to_srgb(linear);
+    gl_FragColor = vec4(encoded, 1.0) * alpha;
 }
 "#;
 

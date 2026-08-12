@@ -2953,10 +2953,15 @@ fn portal_capture_format_priority(format: Fourcc) -> Option<usize> {
         .position(|candidate| *candidate == format)
 }
 
+fn portal_capture_format_allowed(format: Fourcc, require_ten_bit: bool) -> bool {
+    portal_capture_format_priority(format).is_some_and(|priority| !require_ten_bit || priority < 4)
+}
+
 fn dmabuf_capture_formats(format_set: &FormatSet) -> Vec<(Fourcc, Vec<Modifier>)> {
+    let require_ten_bit = crate::core::portal::portal_capture_color_mode().requires_ten_bit();
     let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
     for format in format_set.iter() {
-        if portal_capture_format_priority(format.code).is_none() {
+        if !portal_capture_format_allowed(format.code, require_ten_bit) {
             continue;
         }
         if let Some((_, modifiers)) = formats.iter_mut().find(|(code, _)| *code == format.code) {
@@ -2991,6 +2996,13 @@ mod portal_capture_format_tests {
     #[test]
     fn untagged_capture_rejects_formats_without_the_rgb_contract() {
         assert_eq!(portal_capture_format_priority(Fourcc::Nv12), None);
+    }
+
+    #[test]
+    fn wide_gamut_capture_rejects_eight_bit_and_yuv_formats() {
+        assert!(portal_capture_format_allowed(Fourcc::Xbgr2101010, true));
+        assert!(!portal_capture_format_allowed(Fourcc::Xbgr8888, true));
+        assert!(!portal_capture_format_allowed(Fourcc::Nv12, true));
     }
 }
 
@@ -3161,6 +3173,21 @@ fn device_added(
 
     let render_format_set = renderer.egl_context().dmabuf_render_formats().clone();
     data.core.state.portal_dmabuf_formats = dmabuf_capture_formats(&render_format_set);
+    let portal_color_mode = crate::core::portal::portal_capture_color_mode();
+    flog(format!(
+        "portal capture color contract: mode={portal_color_mode:?} formats={:?}",
+        data.core
+            .state
+            .portal_dmabuf_formats
+            .iter()
+            .map(|(format, _)| *format)
+            .collect::<Vec<_>>()
+    ));
+    if portal_color_mode.requires_ten_bit() && data.core.state.portal_dmabuf_formats.is_empty() {
+        flog(
+            "BT.2020 SDR portal capture unavailable: renderer exposes no 10-bit RGB DMA-BUF format",
+        );
+    }
     let render_formats = render_format_set.iter().copied().collect::<Vec<_>>();
 
     let allocator = GbmAllocator::new(

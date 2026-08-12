@@ -40,6 +40,42 @@ const PORTAL_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(66);
 pub const PORTAL_CAPTURE_COLOR: crate::core::color::ColorDescription =
     crate::core::color::ColorDescription::SRGB;
 
+/// Output color contract requested for portal capture.
+///
+/// The default remains sRGB because `ext-image-copy-capture-v1` has no color
+/// metadata. Wide-gamut mode is deliberately opt-in and is only correct when
+/// the PipeWire bridge and consumer attach and honor the matching colorimetry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PortalCaptureColorMode {
+    #[default]
+    Srgb,
+    Bt2020Sdr,
+}
+
+impl PortalCaptureColorMode {
+    pub fn from_value(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("bt2020-sdr") | Some("rec2020-sdr") | Some("wide-sdr") => Self::Bt2020Sdr,
+            _ => Self::Srgb,
+        }
+    }
+
+    pub fn color_description(self) -> crate::core::color::ColorDescription {
+        match self {
+            Self::Srgb => PORTAL_CAPTURE_COLOR,
+            Self::Bt2020Sdr => crate::core::color::ColorDescription::BT2020_SDR,
+        }
+    }
+
+    pub fn requires_ten_bit(self) -> bool {
+        self == Self::Bt2020Sdr
+    }
+}
+
+pub fn portal_capture_color_mode() -> PortalCaptureColorMode {
+    PortalCaptureColorMode::from_value(std::env::var("FOCALDESK_PORTAL_COLOR").ok().as_deref())
+}
+
 /// Pointers to objects that must be live for the duration of `dispatch_clients` only.
 #[derive(Clone, Copy)]
 pub struct PortalDispatchCtx {
@@ -71,12 +107,15 @@ pub enum PortalCaptureEncoding {
     LinearRec709,
     /// Already encoded for the untagged sRGB/Rec.709 portal contract.
     Srgb,
+    /// Already encoded for the selected portal target contract.
+    TargetEncoded,
 }
 
 #[derive(Clone, Copy)]
 struct PortalCaptureTransform<'a> {
     shader: Option<&'a GlesTexProgram>,
     source_peak: f32,
+    color_mode: PortalCaptureColorMode,
 }
 
 fn portal_capture_source_peak(output: &crate::core::desktop::OutputState) -> f32 {
@@ -442,7 +481,7 @@ fn blit_offscreen_source_to_dmabuf_scaled(
     blit_texture_to_dmabuf_scaled(
         renderer,
         imported,
-        PortalCaptureEncoding::Srgb,
+        PortalCaptureEncoding::TargetEncoded,
         source_size,
         target_size,
         transform,
@@ -521,6 +560,7 @@ fn complete_portal_frame(
     let capture_transform = PortalCaptureTransform {
         shader: capture_shader.as_ref(),
         source_peak,
+        color_mode: portal_capture_color_mode(),
     };
 
     if let Ok(mut dmabuf) = get_dmabuf(&buffer).cloned() {
@@ -794,14 +834,17 @@ fn portal_capture_program<'a>(
     encoding: PortalCaptureEncoding,
     capture_transform: PortalCaptureTransform<'a>,
 ) -> Result<(Option<&'a GlesTexProgram>, Vec<Uniform<'static>>), Box<dyn std::error::Error>> {
-    if encoding == PortalCaptureEncoding::Srgb {
+    if encoding == PortalCaptureEncoding::TargetEncoded
+        || (encoding == PortalCaptureEncoding::Srgb
+            && capture_transform.color_mode == PortalCaptureColorMode::Srgb)
+    {
         return Ok((None, Vec::new()));
     }
 
     let shader = capture_transform
         .shader
         .ok_or("tone-mapped linear-to-sRGB portal shader unavailable")?;
-    let description = PORTAL_CAPTURE_COLOR;
+    let description = capture_transform.color_mode.color_description();
     let matrix = crate::core::color::scene_to_output_matrix(
         description,
         crate::core::color::RenderingIntent::Relative,
@@ -810,6 +853,18 @@ fn portal_capture_program<'a>(
         Some(shader),
         vec![
             Uniform::new("u_source_peak", capture_transform.source_peak.max(1.0)),
+            Uniform::new(
+                "u_decode_srgb",
+                f32::from(encoding == PortalCaptureEncoding::Srgb),
+            ),
+            Uniform::new(
+                "u_compress_gamut",
+                f32::from(capture_transform.color_mode == PortalCaptureColorMode::Srgb),
+            ),
+            Uniform::new(
+                "u_bt709_transfer",
+                f32::from(capture_transform.color_mode == PortalCaptureColorMode::Bt2020Sdr),
+            ),
             Uniform::new("u_m0", matrix[0]),
             Uniform::new("u_m1", matrix[1]),
             Uniform::new("u_m2", matrix[2]),
@@ -1102,6 +1157,26 @@ mod tests {
         assert_eq!(PORTAL_CAPTURE_COLOR.transfer, TransferFunction::Srgb);
         assert_eq!(PORTAL_CAPTURE_COLOR.reference_white_nits, 80.0);
         assert_eq!(PORTAL_CAPTURE_COLOR.max_luminance_nits, 80.0);
+    }
+
+    #[test]
+    fn portal_color_mode_defaults_to_safe_untagged_srgb() {
+        assert_eq!(
+            PortalCaptureColorMode::from_value(None),
+            PortalCaptureColorMode::Srgb
+        );
+        assert_eq!(
+            PortalCaptureColorMode::from_value(Some("unknown")),
+            PortalCaptureColorMode::Srgb
+        );
+    }
+
+    #[test]
+    fn wide_sdr_mode_is_bt2020_and_requires_ten_bit() {
+        let mode = PortalCaptureColorMode::from_value(Some("bt2020-sdr"));
+        assert_eq!(mode, PortalCaptureColorMode::Bt2020Sdr);
+        assert_eq!(mode.color_description().primaries, ColorPrimaries::Bt2020);
+        assert!(mode.requires_ten_bit());
     }
 
     #[test]
