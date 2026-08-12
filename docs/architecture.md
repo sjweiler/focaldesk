@@ -43,6 +43,29 @@ regions where possible. The OpenGL ES renderer draws the scene, applies enabled
 effects and color processing, and hands the completed framebuffer to DRM/KMS
 for presentation.
 
+Portal screen capture branches from the completed compositor scene before the
+monitor-specific ICC, gamut, or transfer-function encode. The current
+`ext-image-copy-capture-v1` transport negotiates pixel formats but carries no
+color-space metadata, so FocalDesk defines its untagged portal/PipeWire contract
+as SDR sRGB/Rec.709. Scene-linear wide-gamut pixels are explicitly converted to
+that contract instead of copying a Display-P3 or PQ scanout buffer and allowing
+consumers to misinterpret it. DMA-BUF negotiation prefers supported 10-bit RGB
+formats and falls back to 8-bit RGB or SHM; direct 10-bit rendering preserves
+precision through the conversion.
+
+When HDR rendering is active, capture uses the output reference-white and peak
+luminance metadata to apply a luminance-preserving shoulder into the SDR range.
+Diffuse values below the knee remain unchanged, while highlights roll off to
+SDR white without independently clipping RGB channels. Extended-gamut values
+are then compressed toward equal-luminance Rec.709 before sRGB encoding.
+
+Tagged wide-gamut and HDR capture require an end-to-end color-description
+channel through the capture protocol, portal implementation, PipeWire format,
+and consumer. Until that exists, the stable compatibility contract remains
+sRGB/Rec.709. The scene-linear capture boundary is intentionally retained so a
+future tagged path can preserve wide gamut or HDR without sampling
+monitor-encoded pixels.
+
 Damage tracking includes output regions and Smithay's per-surface damage
 history for mapped toplevel, popup, and layer-shell trees. Synchronized
 subsurface damage is translated through buffer transforms, scaling, viewporter

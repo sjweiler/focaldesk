@@ -307,13 +307,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 present_offscreen_texture(&mut frame, offscreen, buffer_size_phys)?;
                 let _ = frame.finish()?;
 
-                publish_portal_capture_source(
-                    &mut nested.state,
-                    OutputId(1),
-                    offscreen.clone(),
-                    buffer_size_phys,
-                    now,
-                );
+                if let Some((capture_texture, encoding)) =
+                    crate::core::portal::portal_source_from_targets(&render_targets)
+                {
+                    publish_portal_capture_source(
+                        &mut nested.state,
+                        OutputId(1),
+                        capture_texture,
+                        buffer_size_phys,
+                        encoding,
+                        now,
+                    );
+                }
 
                 if portal_pending {
                     complete_pending_portal_captures_for_output(

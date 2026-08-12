@@ -21,6 +21,8 @@ pub struct ChromeShaders {
     pub client_to_scene_linear: Option<GlesTexProgram>,
     /// Full FP16 scene-linear Rec.709 → encoded output color space.
     pub output_encode_linear: Option<GlesTexProgram>,
+    /// FP16 scene-linear Rec.709 → tone-mapped SDR portal stream.
+    pub portal_capture_sdr: Option<GlesTexProgram>,
     /// Full-frame scene sRGB → monitor encode (C1b).
     pub output_encode_sdr: Option<GlesTexProgram>,
     /// Encoded output color space → monitor ICC LUT encode (C2c).
@@ -59,6 +61,7 @@ impl ChromeShaders {
             srgb_to_linear: None,
             client_to_scene_linear: None,
             output_encode_linear: None,
+            portal_capture_sdr: None,
             output_encode_sdr: None,
             output_encode_lut: None,
             sdr_to_linear_scrgb: None,
@@ -334,6 +337,18 @@ impl ChromeShaders {
                 COMPOSITE_LINEAR_LAYER_FRAG,
                 &[
                     UniformName::new("u_encode_tf", UniformType::_1f),
+                    UniformName::new("u_m0", UniformType::_3f),
+                    UniformName::new("u_m1", UniformType::_3f),
+                    UniformName::new("u_m2", UniformType::_3f),
+                ],
+            )?);
+        }
+
+        if self.portal_capture_sdr.is_none() {
+            self.portal_capture_sdr = Some(renderer.compile_custom_texture_shader(
+                PORTAL_CAPTURE_SDR_FRAG,
+                &[
+                    UniformName::new("u_source_peak", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
@@ -1024,8 +1039,8 @@ void main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPOSITE_LINEAR_LAYER_FRAG, GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TINTED_ICON_FRAG,
-        TOP_BAR_FRAG,
+        COMPOSITE_LINEAR_LAYER_FRAG, GLASS_CONTROL_FRAG, PORTAL_CAPTURE_SDR_FRAG,
+        RECESSED_BUTTON_FRAG, TINTED_ICON_FRAG, TOP_BAR_FRAG,
     };
 
     #[test]
@@ -1057,6 +1072,14 @@ mod tests {
     fn linear_output_encode_never_discards_scanout_pixels() {
         assert!(!COMPOSITE_LINEAR_LAYER_FRAG.contains("discard;"));
         assert!(COMPOSITE_LINEAR_LAYER_FRAG.contains("vec4(encoded, 1.0)"));
+    }
+
+    #[test]
+    fn portal_capture_tone_maps_luminance_before_gamut_compression() {
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("tone_map_luminance(luminance"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("mapped / luminance"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("compress_to_rec709(linear)"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_srgb"));
     }
 }
 
@@ -1248,6 +1271,84 @@ void main() {
     vec3 straight = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
     vec3 encoded = encode_color(mul_mat3(straight));
     gl_FragColor = vec4(encoded, 1.0) * alpha;
+}
+"#;
+
+/// Scene-linear Rec.709 → SDR sRGB/Rec.709 portal contract.
+///
+/// Values through the SDR knee are unchanged. HDR headroom is compressed by
+/// luminance so highlights retain hue, then extended-gamut RGB is pulled toward
+/// equal-luminance neutral before the final legal-range clamp.
+const PORTAL_CAPTURE_SDR_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform float u_source_peak;
+uniform vec3 u_m0;
+uniform vec3 u_m1;
+uniform vec3 u_m2;
+
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
+    vec3 low = c * 12.92;
+    vec3 high = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(high, low, vec3(cutoff));
+}
+
+vec3 mul_mat3(vec3 v) {
+    return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+float tone_map_luminance(float value, float source_peak) {
+    const float knee = 0.75;
+    if (source_peak <= 1.0 || value <= knee) {
+        return value;
+    }
+    float peak = max(source_peak, knee + 0.0001);
+    float denominator = 1.0 - exp(-(peak - knee) / (1.0 - knee));
+    float numerator = 1.0 - exp(-(value - knee) / (1.0 - knee));
+    return knee + (1.0 - knee) * numerator / max(denominator, 0.0001);
+}
+
+vec3 compress_to_rec709(vec3 rgb) {
+    rgb = max(rgb, vec3(0.0));
+    float maximum = max(rgb.r, max(rgb.g, rgb.b));
+    if (maximum <= 1.0) {
+        return rgb;
+    }
+    float luminance = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+    vec3 neutral = vec3(clamp(luminance, 0.0, 1.0));
+    float denominator = maximum - neutral.r;
+    float amount = denominator > 0.0001 ? (maximum - 1.0) / denominator : 1.0;
+    return mix(rgb, neutral, clamp(amount, 0.0, 1.0));
+}
+
+void main() {
+    vec4 src = texture2D(tex, v_coords);
+#if defined(NO_ALPHA)
+    src.a = 1.0;
+#endif
+    vec3 scene = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
+    vec3 linear = max(mul_mat3(scene), vec3(0.0));
+    float luminance = dot(linear, vec3(0.2126, 0.7152, 0.0722));
+    if (u_source_peak > 1.0 && luminance > 0.000001) {
+        float mapped = tone_map_luminance(luminance, u_source_peak);
+        linear *= mapped / luminance;
+    }
+    linear = compress_to_rec709(linear);
+    gl_FragColor = vec4(linear_to_srgb(clamp(linear, 0.0, 1.0)), 1.0) * alpha;
 }
 "#;
 

@@ -12,7 +12,7 @@ use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer as AllocatorBuffer;
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture, Uniform};
 use smithay::backend::renderer::{Bind, ExportMem, ImportMem, Offscreen, Renderer};
 use smithay::desktop::layer_map_for_output;
 use smithay::reexports::wayland_server::protocol::wl_shm;
@@ -22,8 +22,8 @@ use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
 use crate::core::desktop::DesktopState;
 use crate::core::linear_compositing::{
-    present_offscreen_texture, render_output_offscreen, select_hdr_offscreen_format,
-    supports_linear_sdr, LinearOffscreenTargets,
+    render_output_offscreen, select_hdr_offscreen_format, supports_linear_sdr,
+    LinearOffscreenTargets,
 };
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
@@ -34,6 +34,11 @@ use smithay::wayland::image_capture_source::ImageCaptureSource;
 use smithay::wayland::image_copy_capture::SessionRef;
 
 const PORTAL_CAPTURE_MIN_INTERVAL: Duration = Duration::from_millis(66);
+
+/// Color contract for untagged `ext-image-copy-capture-v1` streams consumed by
+/// xdg-desktop-portal-wlr and PipeWire clients such as OBS.
+pub const PORTAL_CAPTURE_COLOR: crate::core::color::ColorDescription =
+    crate::core::color::ColorDescription::SRGB;
 
 /// Pointers to objects that must be live for the duration of `dispatch_clients` only.
 #[derive(Clone, Copy)]
@@ -53,17 +58,77 @@ pub struct PortalFrameCache {
     pub captured_at: Instant,
 }
 
+/// Color interpretation of the texture exported to a portal capture client.
+///
+/// `ext-image-copy-capture-v1` negotiates pixel formats but has no color-space
+/// metadata. FocalDesk therefore treats every current portal stream as
+/// sRGB/Rec.709 and converts the canonical scene before handing pixels to the
+/// portal. This enum keeps that contract explicit and leaves room for a future
+/// tagged wide-gamut/HDR transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortalCaptureEncoding {
+    /// Linear-light Rec.709 scene values, potentially outside the SDR gamut.
+    LinearRec709,
+    /// Already encoded for the untagged sRGB/Rec.709 portal contract.
+    Srgb,
+}
+
+#[derive(Clone, Copy)]
+struct PortalCaptureTransform<'a> {
+    shader: Option<&'a GlesTexProgram>,
+    source_peak: f32,
+}
+
+fn portal_capture_source_peak(output: &crate::core::desktop::OutputState) -> f32 {
+    let hdr_scene = output.hdr_enabled || output.hdr_transition_target == Some(true);
+    portal_capture_peak(
+        hdr_scene,
+        output.color_description.reference_white_nits,
+        output.edid_hdr_max_luminance_nits,
+        output.color_description.max_luminance_nits,
+    )
+}
+
+fn portal_capture_peak(
+    hdr_scene: bool,
+    reference_white_nits: f32,
+    metadata_peak_nits: Option<f32>,
+    described_peak_nits: f32,
+) -> f32 {
+    if !hdr_scene {
+        return 1.0;
+    }
+    let reference_white = reference_white_nits.max(1.0);
+    let source_peak_nits = metadata_peak_nits
+        .filter(|peak| peak.is_finite() && *peak > reference_white)
+        .unwrap_or(described_peak_nits);
+    source_peak_nits.max(reference_white) / reference_white
+}
+
+fn tone_map_luminance(value: f32, source_peak: f32) -> f32 {
+    const KNEE: f32 = 0.75;
+    if source_peak <= 1.0 || value <= KNEE {
+        return value;
+    }
+    let peak = source_peak.max(KNEE + 0.0001);
+    let denominator = 1.0 - (-(peak - KNEE) / (1.0 - KNEE)).exp();
+    let numerator = 1.0 - (-(value - KNEE) / (1.0 - KNEE)).exp();
+    KNEE + (1.0 - KNEE) * numerator / denominator.max(0.0001)
+}
+
 /// Portal frame received during `dispatch_clients`; completed after the DRM offscreen draw.
 pub struct PendingPortalCapture {
     pub output_id: OutputId,
     pub frame: Frame,
 }
 
-/// Last DRM offscreen frame per output — portal blits this instead of re-rendering so OBS
-/// matches what the monitor shows (sidebar/topbar chrome included).
+/// Last composited frame per output before the monitor-specific color encode.
+/// Portal capture reuses it so OBS receives the same scene content (including
+/// sidebar/topbar chrome) under the portal color contract.
 pub struct PortalCaptureSource {
     pub texture: GlesTexture,
     pub size: Size<i32, Physical>,
+    pub encoding: PortalCaptureEncoding,
     pub captured_at: Instant,
 }
 
@@ -92,12 +157,13 @@ impl DesktopState {
     }
 }
 
-/// Store the latest scanout offscreen texture for portal/OBS clients on this output.
+/// Store the latest pre-output-transform texture for portal/OBS clients.
 pub fn publish_portal_capture_source(
     state: &mut DesktopState,
     output_id: OutputId,
     texture: GlesTexture,
     size: Size<i32, Physical>,
+    encoding: PortalCaptureEncoding,
     captured_at: Instant,
 ) {
     state.portal_capture_source.insert(
@@ -105,6 +171,7 @@ pub fn publish_portal_capture_source(
         PortalCaptureSource {
             texture,
             size,
+            encoding,
             captured_at,
         },
     );
@@ -153,6 +220,27 @@ fn store_portal_offscreen_targets(
     state.portal_offscreen_targets.insert(output_id, targets);
 }
 
+/// Select the compositor image before the monitor-specific output transform.
+///
+/// The FP16 scene is preferred because it retains wide-gamut precision. The
+/// legacy fallback is the compositor's original sRGB target, not the encoded
+/// scanout texture, so an ICC/P3 monitor transform is never mislabeled as sRGB.
+pub fn portal_source_from_targets(
+    targets: &LinearOffscreenTargets,
+) -> Option<(GlesTexture, PortalCaptureEncoding)> {
+    if targets.scene_linear {
+        targets
+            .linear_offscreen
+            .as_ref()
+            .map(|target| (target.texture.clone(), PortalCaptureEncoding::LinearRec709))
+    } else {
+        targets
+            .offscreen
+            .as_ref()
+            .map(|target| (target.texture.clone(), PortalCaptureEncoding::Srgb))
+    }
+}
+
 pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Option<OutputId> {
     use smithay::output::WeakOutput;
 
@@ -171,8 +259,8 @@ pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Opti
 
 /// Renders the active output into the portal client's buffer, if dispatch context is set.
 ///
-/// Frames are queued and completed after the offscreen draw so OBS receives the same pixels
-/// as the monitor (including linear SDR compositing when enabled).
+/// Frames are queued and completed after the offscreen draw so OBS receives the
+/// same composited scene as the monitor, converted to the portal color contract.
 pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id: OutputId) {
     if state.portal_dispatch_ctx.is_none() {
         frame.fail(CaptureFailureReason::Unknown);
@@ -196,7 +284,7 @@ pub(crate) fn invalidate_portal_output_state(state: &mut DesktopState) {
     state.compositor_ready = false;
 }
 
-/// True when every queued portal frame can be satisfied from the latest scanout texture.
+/// True when every queued portal frame can be satisfied from the latest composited texture.
 pub fn pending_portal_outputs_have_capture_source(state: &DesktopState) -> bool {
     state
         .pending_portal_captures
@@ -245,7 +333,7 @@ pub fn complete_pending_portal_captures(
     }
 }
 
-/// Finish portal frames for one output immediately after its offscreen draw (same pixels as monitor).
+/// Finish portal frames for one output immediately after its composited offscreen draw.
 pub fn complete_pending_portal_captures_for_output(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -284,10 +372,12 @@ pub fn complete_pending_portal_captures_for_output(
 fn blit_offscreen_source_to_dmabuf_scaled(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
+    encoding: PortalCaptureEncoding,
     source_size: Size<i32, Physical>,
     target_size: Size<i32, Physical>,
     transform: Transform,
     target_dmabuf: &mut Dmabuf,
+    capture_transform: PortalCaptureTransform<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Prefer a GPU blit into the portal dmabuf. The readback path is a fallback for drivers
     // where `render_texture_from_to` drops chrome when sourcing from an FBO texture handle.
@@ -295,9 +385,11 @@ fn blit_offscreen_source_to_dmabuf_scaled(
         match blit_texture_to_dmabuf(
             renderer,
             texture.clone(),
+            encoding,
             source_size,
             transform,
             target_dmabuf,
+            capture_transform,
         ) {
             Ok(()) => return Ok(()),
             Err(err) => flog(format!(
@@ -308,10 +400,12 @@ fn blit_offscreen_source_to_dmabuf_scaled(
         match blit_texture_to_dmabuf_scaled(
             renderer,
             texture.clone(),
+            encoding,
             source_size,
             target_size,
             transform,
             target_dmabuf,
+            capture_transform,
         ) {
             Ok(()) => return Ok(()),
             Err(err) => flog(format!(
@@ -320,7 +414,24 @@ fn blit_offscreen_source_to_dmabuf_scaled(
         }
     }
 
-    let mut bound = texture;
+    // Some GLES stacks cannot sample an FBO texture directly while rendering
+    // into an imported dmabuf. Materialize the sRGB contract first so this
+    // compatibility path never leaks linear or monitor-encoded RGB values.
+    let mut encoded = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, Buffer>::from((source_size.w, source_size.h)),
+    )?;
+    blit_capture_texture_to_texture(
+        renderer,
+        texture,
+        encoding,
+        source_size,
+        source_size,
+        Transform::Normal,
+        &mut encoded,
+        capture_transform,
+    )?;
+    let mut bound = encoded;
     let rgba = read_bound_offscreen_rgba(renderer, &mut bound, source_size)?;
     let imported = renderer.import_memory(
         &rgba,
@@ -331,10 +442,12 @@ fn blit_offscreen_source_to_dmabuf_scaled(
     blit_texture_to_dmabuf_scaled(
         renderer,
         imported,
+        PortalCaptureEncoding::Srgb,
         source_size,
         target_size,
         transform,
         target_dmabuf,
+        capture_transform,
     )
 }
 
@@ -367,6 +480,7 @@ fn complete_portal_frame(
     };
 
     let output_size = desk_output.physical_size; // real monitor size, e.g. 2560x1440
+    let source_peak = portal_capture_source_peak(desk_output);
     let stream_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h)); // OBS, e.g. 2048x1152
 
     if buffer_size.w <= 0 || buffer_size.h <= 0 {
@@ -403,6 +517,11 @@ fn complete_portal_frame(
         focaldesk_flow::keybinds::BackendKind::Winit => Transform::Flipped180,
         _ => Transform::Normal,
     };
+    let capture_shader = state.render.chrome_shaders.portal_capture_sdr.clone();
+    let capture_transform = PortalCaptureTransform {
+        shader: capture_shader.as_ref(),
+        source_peak,
+    };
 
     if let Ok(mut dmabuf) = get_dmabuf(&buffer).cloned() {
         if let Some(node) = state.dmabuf_node {
@@ -413,10 +532,12 @@ fn complete_portal_frame(
             blit_offscreen_source_to_dmabuf_scaled(
                 renderer,
                 source.texture.clone(),
+                source.encoding,
                 source.size,
                 target_size,
                 transform,
                 &mut dmabuf,
+                capture_transform,
             )
         } else {
             render_portal_output_to_dmabuf(
@@ -431,6 +552,7 @@ fn complete_portal_frame(
                 dt,
                 transform,
                 &mut dmabuf,
+                capture_transform,
             )
         };
         if let Err(err) = render_res {
@@ -449,12 +571,31 @@ fn complete_portal_frame(
 
     let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
     let rgba = if let Some(source) = state.portal_capture_source.get(&output_id) {
-        if source.size != render_size {
+        let mut capture_tex = match renderer.create_buffer(
+            Fourcc::Abgr8888,
+            Size::<i32, Buffer>::from((buffer_size.w, buffer_size.h)),
+        ) {
+            Ok(texture) => texture,
+            Err(_) => {
+                frame.fail(CaptureFailureReason::Unknown);
+                return;
+            }
+        };
+        if let Err(err) = blit_capture_texture_to_texture(
+            renderer,
+            source.texture.clone(),
+            source.encoding,
+            source.size,
+            render_size,
+            Transform::Normal,
+            &mut capture_tex,
+            capture_transform,
+        ) {
+            flog(format!("portal shm color conversion failed: {err}"));
             frame.fail(CaptureFailureReason::Unknown);
             return;
         }
-        let mut tex = source.texture.clone();
-        match read_bound_offscreen_rgba(renderer, &mut tex, render_size) {
+        match read_bound_offscreen_rgba(renderer, &mut capture_tex, render_size) {
             Ok(pixels) => pixels,
             Err(err) => {
                 flog(format!("portal shm readback failed: {err}"));
@@ -486,6 +627,7 @@ fn complete_portal_frame(
             dt,
             transform,
             &mut capture_tex,
+            capture_transform,
         );
 
         if let Err(err) = render_res {
@@ -554,7 +696,42 @@ fn render_portal_output_to_texture(
     dt: Duration,
     transform: Transform,
     target_texture: &mut GlesTexture,
+    capture_transform: PortalCaptureTransform<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (source, encoding) = render_fresh_portal_source(
+        state,
+        renderer,
+        output_id,
+        render_size,
+        ui_state,
+        scene,
+        output_state,
+        now,
+        dt,
+    )?;
+    blit_capture_texture_to_texture(
+        renderer,
+        source,
+        encoding,
+        render_size,
+        render_size,
+        transform,
+        target_texture,
+        capture_transform,
+    )
+}
+
+fn render_fresh_portal_source(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+    render_size: Size<i32, Physical>,
+    ui_state: &mut UiState<smithay::backend::renderer::gles::GlesTexture>,
+    scene: &SceneState,
+    output_state: &OutputState,
+    now: Instant,
+    dt: Duration,
+) -> Result<(GlesTexture, PortalCaptureEncoding), Box<dyn std::error::Error>> {
     let mut targets = portal_offscreen_targets_for_output(state, renderer, output_id, render_size);
     let sync = render_output_offscreen(
         state,
@@ -571,18 +748,10 @@ fn render_portal_output_to_texture(
     )?;
     renderer.wait(&sync)?;
 
-    let offscreen = targets
-        .scanout_texture()
-        .ok_or("portal offscreen missing after render")?
-        .clone();
+    let source =
+        portal_source_from_targets(&targets).ok_or("portal capture source missing after render")?;
     store_portal_offscreen_targets(state, output_id, targets);
-
-    let mut target = renderer.bind(target_texture)?;
-    let mut frame = renderer.render(&mut target, render_size, transform)?;
-    present_offscreen_texture(&mut frame, &offscreen, render_size)?;
-    let sync = frame.finish()?;
-    renderer.wait(&sync)?;
-    Ok(())
+    Ok(source)
 }
 
 fn render_portal_output_to_dmabuf(
@@ -597,14 +766,9 @@ fn render_portal_output_to_dmabuf(
     dt: Duration,
     transform: Transform,
     target_dmabuf: &mut Dmabuf,
+    capture_transform: PortalCaptureTransform<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Render to an intermediate texture (same path as the DRM monitor), then blit into the
-    // portal dmabuf. Direct draws into client-imported dmabufs miss chrome on some drivers.
-    let mut capture_tex = renderer.create_buffer(
-        Fourcc::Abgr8888,
-        Size::<i32, Buffer>::from((render_size.w, render_size.h)),
-    )?;
-    render_portal_output_to_texture(
+    let (source, encoding) = render_fresh_portal_source(
         state,
         renderer,
         output_id,
@@ -614,31 +778,77 @@ fn render_portal_output_to_dmabuf(
         output_state,
         now,
         dt,
-        transform,
-        &mut capture_tex,
     )?;
-    blit_texture_to_dmabuf(renderer, capture_tex, render_size, transform, target_dmabuf)
+    blit_texture_to_dmabuf(
+        renderer,
+        source,
+        encoding,
+        render_size,
+        transform,
+        target_dmabuf,
+        capture_transform,
+    )
 }
 
-/// Copy the DRM offscreen texture into a portal dmabuf using the same FBO readback path as
-/// internal screenshots. `render_texture_from_to` from the texture handle alone drops chrome on
-/// some GLES stacks; bound-FBO readback matches what you see on the monitor.
-fn blit_offscreen_source_to_dmabuf(
+fn portal_capture_program<'a>(
+    encoding: PortalCaptureEncoding,
+    capture_transform: PortalCaptureTransform<'a>,
+) -> Result<(Option<&'a GlesTexProgram>, Vec<Uniform<'static>>), Box<dyn std::error::Error>> {
+    if encoding == PortalCaptureEncoding::Srgb {
+        return Ok((None, Vec::new()));
+    }
+
+    let shader = capture_transform
+        .shader
+        .ok_or("tone-mapped linear-to-sRGB portal shader unavailable")?;
+    let description = PORTAL_CAPTURE_COLOR;
+    let matrix = crate::core::color::scene_to_output_matrix(
+        description,
+        crate::core::color::RenderingIntent::Relative,
+    );
+    Ok((
+        Some(shader),
+        vec![
+            Uniform::new("u_source_peak", capture_transform.source_peak.max(1.0)),
+            Uniform::new("u_m0", matrix[0]),
+            Uniform::new("u_m1", matrix[1]),
+            Uniform::new("u_m2", matrix[2]),
+        ],
+    ))
+}
+
+fn blit_capture_texture_to_texture(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
-    render_size: Size<i32, Physical>,
+    encoding: PortalCaptureEncoding,
+    source_size: Size<i32, Physical>,
+    target_size: Size<i32, Physical>,
     transform: Transform,
-    target_dmabuf: &mut Dmabuf,
+    target_texture: &mut GlesTexture,
+    capture_transform: PortalCaptureTransform<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut bound = texture;
-    let rgba = read_bound_offscreen_rgba(renderer, &mut bound, render_size)?;
-    let imported = renderer.import_memory(
-        &rgba,
-        Fourcc::Abgr8888,
-        Size::from((render_size.w, render_size.h)),
-        false,
+    let mut target = renderer.bind(target_texture)?;
+    let mut frame = renderer.render(&mut target, target_size, transform)?;
+    let dest = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), target_size);
+    let src = Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (source_size.w as f64, source_size.h as f64),
+    );
+    let (shader, uniforms) = portal_capture_program(encoding, capture_transform)?;
+    frame.render_texture_from_to(
+        &texture,
+        src,
+        dest,
+        std::slice::from_ref(&dest),
+        &[],
+        transform,
+        1.0,
+        shader,
+        &uniforms,
     )?;
-    blit_texture_to_dmabuf(renderer, imported, render_size, transform, target_dmabuf)
+    let sync = frame.finish()?;
+    renderer.wait(&sync)?;
+    Ok(())
 }
 
 fn read_bound_offscreen_rgba(
@@ -677,9 +887,11 @@ fn read_bound_offscreen_rgba(
 fn blit_texture_to_dmabuf(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
+    encoding: PortalCaptureEncoding,
     render_size: Size<i32, Physical>,
     transform: Transform,
     target_dmabuf: &mut Dmabuf,
+    capture_transform: PortalCaptureTransform<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut target = renderer.bind(target_dmabuf)?;
     let mut frame = renderer.render(&mut target, render_size, transform)?;
@@ -688,6 +900,7 @@ fn blit_texture_to_dmabuf(
         (0.0, 0.0),
         (render_size.w as f64, render_size.h as f64),
     );
+    let (shader, uniforms) = portal_capture_program(encoding, capture_transform)?;
     frame.render_texture_from_to(
         &texture,
         src,
@@ -696,8 +909,8 @@ fn blit_texture_to_dmabuf(
         &[],
         transform,
         1.0,
-        None,
-        &[],
+        shader,
+        &uniforms,
     )?;
     let sync = frame.finish()?;
     renderer.wait(&sync)?;
@@ -707,10 +920,12 @@ fn blit_texture_to_dmabuf(
 fn blit_texture_to_dmabuf_scaled(
     renderer: &mut GlesRenderer,
     texture: GlesTexture,
+    encoding: PortalCaptureEncoding,
     source_size: Size<i32, Physical>,
     target_size: Size<i32, Physical>,
     transform: Transform,
     target_dmabuf: &mut Dmabuf,
+    capture_transform: PortalCaptureTransform<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut target = renderer.bind(target_dmabuf)?;
     let mut frame = renderer.render(&mut target, target_size, transform)?;
@@ -719,6 +934,7 @@ fn blit_texture_to_dmabuf_scaled(
         (0.0, 0.0),
         (source_size.w as f64, source_size.h as f64),
     );
+    let (shader, uniforms) = portal_capture_program(encoding, capture_transform)?;
     frame.render_texture_from_to(
         &texture,
         src,
@@ -727,8 +943,8 @@ fn blit_texture_to_dmabuf_scaled(
         &[],
         transform,
         1.0,
-        None,
-        &[],
+        shader,
+        &uniforms,
     )?;
     let sync = frame.finish()?;
     renderer.wait(&sync)?;
@@ -873,4 +1089,49 @@ pub fn attach_output_to_capture_source(
     output: &smithay::output::Output,
 ) {
     source.user_data().insert_if_missing(|| output.downgrade());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::color::{ColorPrimaries, TransferFunction};
+
+    #[test]
+    fn untagged_portal_contract_is_sdr_srgb() {
+        assert_eq!(PORTAL_CAPTURE_COLOR.primaries, ColorPrimaries::Srgb);
+        assert_eq!(PORTAL_CAPTURE_COLOR.transfer, TransferFunction::Srgb);
+        assert_eq!(PORTAL_CAPTURE_COLOR.reference_white_nits, 80.0);
+        assert_eq!(PORTAL_CAPTURE_COLOR.max_luminance_nits, 80.0);
+    }
+
+    #[test]
+    fn sdr_capture_does_not_apply_a_tone_curve() {
+        assert_eq!(
+            portal_capture_peak(false, 80.0, Some(1_000.0), 1_000.0),
+            1.0
+        );
+        for value in [0.0, 0.18, 0.75, 1.0] {
+            assert_eq!(tone_map_luminance(value, 1.0), value);
+        }
+    }
+
+    #[test]
+    fn hdr_capture_preserves_diffuse_values_and_rolls_highlights_into_sdr() {
+        let peak = portal_capture_peak(true, 80.0, Some(800.0), 1_000.0);
+        assert_eq!(peak, 10.0);
+        assert_eq!(tone_map_luminance(0.75, peak), 0.75);
+
+        let white = tone_map_luminance(1.0, peak);
+        let highlight = tone_map_luminance(4.0, peak);
+        let peak_value = tone_map_luminance(peak, peak);
+        assert!(white > 0.75 && white < highlight);
+        assert!(highlight < peak_value);
+        assert!((peak_value - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
+    fn hdr_capture_peak_falls_back_to_the_color_description() {
+        assert_eq!(portal_capture_peak(true, 200.0, None, 1_000.0), 5.0);
+        assert_eq!(portal_capture_peak(true, 200.0, Some(100.0), 1_000.0), 5.0);
+    }
 }

@@ -669,8 +669,10 @@ fn present_source_texture(surface: &DrmSurfaceState) -> Option<&GlesTexture> {
     surface.render_targets.scanout_texture()
 }
 
-fn capture_source_texture(surface: &DrmSurfaceState) -> Option<&GlesTexture> {
-    surface.render_targets.scanout_texture()
+fn capture_source_texture(
+    surface: &DrmSurfaceState,
+) -> Option<(GlesTexture, crate::core::portal::PortalCaptureEncoding)> {
+    crate::core::portal::portal_source_from_targets(&surface.render_targets)
 }
 
 fn blit_rgb16(
@@ -2685,12 +2687,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         device.renderer.wait(&sync)?;
                     }
 
-                    if let Some(texture) = capture_source_texture(surface).cloned() {
+                    if let Some((texture, encoding)) = capture_source_texture(surface) {
                         crate::core::portal::publish_portal_capture_source(
                             &mut data.core.state,
                             surface.output_id,
                             texture,
                             surface.size,
+                            encoding,
                             now,
                         );
                     }
@@ -2929,9 +2932,33 @@ fn connector_name(info: &drm::control::connector::Info) -> String {
     format!("{}-{}", info.interface().as_str(), info.interface_id())
 }
 
+// ext-image-copy-capture has no color metadata. Advertise only RGB formats
+// that follow FocalDesk's explicit sRGB/Rec.709 portal contract, preferring
+// 10-bit targets so a capable PipeWire/OBS path does not quantize the FP16
+// compositor scene to 8-bit unnecessarily.
+const PORTAL_CAPTURE_FORMAT_PREFERENCE: [Fourcc; 8] = [
+    Fourcc::Xrgb2101010,
+    Fourcc::Xbgr2101010,
+    Fourcc::Argb2101010,
+    Fourcc::Abgr2101010,
+    Fourcc::Xrgb8888,
+    Fourcc::Xbgr8888,
+    Fourcc::Argb8888,
+    Fourcc::Abgr8888,
+];
+
+fn portal_capture_format_priority(format: Fourcc) -> Option<usize> {
+    PORTAL_CAPTURE_FORMAT_PREFERENCE
+        .iter()
+        .position(|candidate| *candidate == format)
+}
+
 fn dmabuf_capture_formats(format_set: &FormatSet) -> Vec<(Fourcc, Vec<Modifier>)> {
     let mut formats: Vec<(Fourcc, Vec<Modifier>)> = Vec::new();
     for format in format_set.iter() {
+        if portal_capture_format_priority(format.code).is_none() {
+            continue;
+        }
         if let Some((_, modifiers)) = formats.iter_mut().find(|(code, _)| *code == format.code) {
             if !modifiers.contains(&format.modifier) {
                 modifiers.push(format.modifier);
@@ -2941,6 +2968,30 @@ fn dmabuf_capture_formats(format_set: &FormatSet) -> Vec<(Fourcc, Vec<Modifier>)
         }
     }
     formats
+        .sort_by_key(|(format, _)| portal_capture_format_priority(*format).unwrap_or(usize::MAX));
+    formats
+}
+
+#[cfg(test)]
+mod portal_capture_format_tests {
+    use super::*;
+
+    #[test]
+    fn ten_bit_capture_formats_are_preferred_to_eight_bit() {
+        assert!(
+            portal_capture_format_priority(Fourcc::Xbgr2101010)
+                < portal_capture_format_priority(Fourcc::Xbgr8888)
+        );
+        assert!(
+            portal_capture_format_priority(Fourcc::Argb2101010)
+                < portal_capture_format_priority(Fourcc::Argb8888)
+        );
+    }
+
+    #[test]
+    fn untagged_capture_rejects_formats_without_the_rgb_contract() {
+        assert_eq!(portal_capture_format_priority(Fourcc::Nv12), None);
+    }
 }
 
 pub fn make_drm_gpu(
