@@ -11,7 +11,7 @@ use crate::atlas::{
 use crate::chrome_draw::{draw_beveled_panel, draw_recessed_button, draw_top_bar, well_icon_rect};
 use crate::chrome_layout::{build_chrome_layout_with_config, ChromeLayoutConfig};
 use crate::chrome_shaders::ChromeShaders;
-use crate::chrome_theme::{chrome_theme_from_flow_theme, ChromeTheme};
+use crate::chrome_theme::{activity_well_style, chrome_theme_from_flow_theme, ChromeTheme};
 use crate::controls::ShellControl;
 use crate::font_atlas::FontAtlas;
 use crate::svg::rasterize_svg;
@@ -327,18 +327,33 @@ impl Chrome {
                 draw_beveled_panel(frame, beveled, rect, sc, &damage, style)?;
             }
         }
-        let launcher_control = layout.topbar.flow_field;
+        let launcher_icon_well = layout.topbar.ai_button;
+        let launcher_particle_well = layout.topbar.flow_field;
         if let Some(button) = button {
-            let mut style = self.theme.button;
+            let mut button_style = self.theme.button;
             if hovered == Some(0) {
-                style.glow_strength = 0.72;
-                style.glow_radius = style.glow_radius.max(7.0);
+                button_style.glow_strength = 0.72;
+                button_style.glow_radius = button_style.glow_radius.max(7.0);
             }
-            draw_recessed_button(frame, button, launcher_control, sc, &damage, &style)?;
+            draw_recessed_button(
+                frame,
+                button,
+                launcher_icon_well,
+                sc,
+                &damage,
+                &button_style,
+            )?;
+            draw_recessed_button(
+                frame,
+                button,
+                launcher_particle_well,
+                sc,
+                &damage,
+                &activity_well_style(self.theme.button),
+            )?;
         }
-        // Match the compositor's TopbarFlowField constructor: keep the AI
-        // glyph square and cap it at 28 logical pixels inside the wide well.
-        let mut launcher_icon = centered_square(launcher_control, launcher_control.size.h.min(28));
+        let mut launcher_icon =
+            centered_square(launcher_icon_well, launcher_icon_well.size.h.min(28));
         if hovered == Some(0) {
             launcher_icon = scale_rect_about_center(launcher_icon, 1.08);
         }
@@ -356,7 +371,7 @@ impl Chrome {
             self.draw_glass_icon(
                 frame,
                 IconId::AiConsole,
-                launcher_control,
+                launcher_icon_well,
                 launcher_icon,
                 scale,
                 output_size,
@@ -366,7 +381,7 @@ impl Chrome {
         }
         self.render_icon(frame, IconId::AiConsole, launcher_icon, sc, output_size)?;
         if let Some(pulse) = pulse.filter(|pulse| pulse.control == 0) {
-            self.draw_pulse(frame, launcher_control, pulse, sc, &damage)?;
+            self.draw_pulse(frame, launcher_icon_well, pulse, sc, &damage)?;
         }
 
         for (index, (well, control)) in layout.topbar.status_wells.iter().zip(controls).enumerate()
@@ -426,7 +441,7 @@ impl Chrome {
         }
         if let Some(index) = hovered {
             let (tooltip, anchor) = if index == 0 {
-                ("Launch FocalDesk AI Console", launcher_control)
+                ("Launch FocalDesk AI Console", launcher_icon_well)
             } else if index == clock_index {
                 ("Calendar and clock", layout.topbar.clock_well)
             } else if let Some(control) = controls.get(index - 1) {
@@ -435,7 +450,7 @@ impl Chrome {
                     layout.topbar.status_wells[index - 1],
                 )
             } else {
-                ("", launcher_control)
+                ("", launcher_icon_well)
             };
             if !tooltip.is_empty() {
                 self.render_tooltip(frame, tooltip, anchor, output_size, scale, true)?;
@@ -930,10 +945,10 @@ mod tests {
     }
 
     #[test]
-    fn flow_field_icon_stays_square_in_a_wide_control() {
-        let control = Rectangle::from_loc_and_size((10, 8), (138, 44));
-        let icon = centered_square(control, control.size.h.min(28));
-        assert_eq!(icon.size, (28, 28).into());
-        assert_eq!(icon.loc, (65, 16).into());
+    fn ai_icon_is_centered_in_its_button() {
+        let icon_well = Rectangle::from_loc_and_size((10, 8), (44, 44));
+        let icon = centered_square(icon_well, icon_well.size.h.min(28));
+
+        assert_eq!(icon, Rectangle::from_loc_and_size((18, 16), (28, 28)));
     }
 }

@@ -110,7 +110,6 @@ use drm_ffi;
 use smithay::reexports::rustix::fs::OFlags;
 
 use chrono::Local;
-use image::{ImageBuffer, Rgba};
 use std::fs;
 
 use crate::backend::common::client_state_from_stream;
@@ -482,8 +481,8 @@ fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
     Ok(())
 }
 
-/// `Fourcc::Argb8888` / `GL_BGRA8_EXT` readback: GL stores bottom row first; convert to top-down RGBA for PNG.
-fn bgra_gl_bottom_left_to_png_rgba(src: &[u8], width: usize, height: usize) -> Vec<u8> {
+/// Convert bottom-up GL BGRA bytes to top-down RGBA.
+fn bgra_gl_bottom_left_to_rgba(src: &[u8], width: usize, height: usize) -> Vec<u8> {
     debug_assert_eq!(src.len(), width * height * 4);
     let stride = width * 4;
     let mut out = vec![0u8; src.len()];
@@ -507,7 +506,7 @@ fn bgra_gl_bottom_left_to_png_rgba(src: &[u8], width: usize, height: usize) -> V
 /// DRM offscreen uses [`Fourcc::Abgr8888`] (`GL_RGBA8` + `GL_RGBA` read), which tends to be
 /// reliable on GLES. `Fourcc::Argb8888` uses `GL_BGRA_EXT` readback; some stacks return zeros
 /// from FBO read despite a valid draw.
-fn copy_framebuffer_target_to_png_rgba(
+fn copy_framebuffer_target_to_rgba8(
     renderer: &mut GlesRenderer,
     target: &GlesTarget<'_>,
     width: i32,
@@ -556,43 +555,114 @@ fn copy_framebuffer_target_to_png_rgba(
             let src = renderer
                 .map_texture(&mapping)
                 .map_err(|e| anyhow!("map_texture (ARGB8888): {e}"))?;
-            Ok(bgra_gl_bottom_left_to_png_rgba(src, w, h))
+            Ok(bgra_gl_bottom_left_to_rgba(src, w, h))
         }
     }
+}
+
+fn copy_linear_scene_rgba16f(
+    renderer: &mut GlesRenderer,
+    texture: &mut GlesTexture,
+    width: i32,
+    height: i32,
+) -> Result<Vec<u8>> {
+    use smithay::backend::renderer::gles::ffi;
+
+    let mut pixels = vec![0u16; width as usize * height as usize * 4];
+    let texture_id = texture.tex_id();
+    // Binding waits for outstanding writes to the scene texture.  Attach it to
+    // a private FBO because GLES has no desktop GL `GetTexImage` equivalent.
+    let _target = renderer
+        .bind(texture)
+        .map_err(|e| anyhow!("bind FP16 screenshot target: {e}"))?;
+    renderer
+        .with_context(|gl| unsafe {
+            let mut framebuffer = 0;
+            gl.GenFramebuffers(1, &mut framebuffer);
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, framebuffer);
+            gl.FramebufferTexture2D(
+                ffi::FRAMEBUFFER,
+                ffi::COLOR_ATTACHMENT0,
+                ffi::TEXTURE_2D,
+                texture_id,
+                0,
+            );
+            let status = gl.CheckFramebufferStatus(ffi::FRAMEBUFFER);
+            gl.BindBuffer(ffi::PIXEL_PACK_BUFFER, 0);
+            gl.PixelStorei(ffi::PACK_ALIGNMENT, 1);
+            if status == ffi::FRAMEBUFFER_COMPLETE {
+                gl.ReadPixels(
+                    0,
+                    0,
+                    width,
+                    height,
+                    ffi::RGBA,
+                    ffi::HALF_FLOAT,
+                    pixels.as_mut_ptr().cast(),
+                );
+            }
+            gl.Finish();
+            let error = gl.GetError();
+            gl.BindFramebuffer(ffi::FRAMEBUFFER, 0);
+            gl.DeleteFramebuffers(1, &framebuffer);
+            (status, error)
+        })
+        .map_err(|e| anyhow!("screenshot FP16 GL state: {e}"))
+        .and_then(|(status, error)| {
+            anyhow::ensure!(
+                status == ffi::FRAMEBUFFER_COMPLETE,
+                "screenshot FP16 framebuffer incomplete: 0x{status:04x}"
+            );
+            anyhow::ensure!(
+                error == ffi::NO_ERROR,
+                "screenshot FP16 read failed: GL error 0x{error:04x}"
+            );
+            Ok(())
+        })?;
+
+    let len = pixels.len() * 2;
+    let bytes = unsafe { std::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), len) };
+    Ok(bytes.to_vec())
 }
 
 fn capture_surface_pixels(
     renderer: &mut GlesRenderer,
     surface: &mut DrmSurfaceState,
-) -> Result<Vec<u8>> {
-    let (texture, size) = if surface.render_targets.encoded_hdr {
-        let hdr = surface
+) -> Result<Vec<u16>> {
+    if surface.render_targets.scene_linear {
+        let scene = surface
             .render_targets
-            .hdr_offscreen
+            .linear_offscreen
             .as_mut()
-            .ok_or_else(|| anyhow!("HDR offscreen missing for capture"))?;
-        (&mut hdr.texture, hdr.size)
-    } else if surface.render_targets.encoded_scanout {
-        let scratch = surface
-            .render_targets
-            .encode_scratch
-            .as_mut()
-            .ok_or_else(|| anyhow!("encode scratch missing for capture"))?;
-        (&mut scratch.texture, scratch.size)
+            .ok_or_else(|| anyhow!("linear scene missing for capture"))?;
+        let raw =
+            copy_linear_scene_rgba16f(renderer, &mut scene.texture, scene.size.w, scene.size.h)?;
+        crate::core::screenshot::linear_scene_f16_to_display_p3_rgb16(
+            &raw,
+            scene.size.w as usize,
+            scene.size.h as usize,
+        )
     } else {
         let offscreen = surface
             .render_targets
             .offscreen
             .as_mut()
             .ok_or_else(|| anyhow!("offscreen texture missing for capture"))?;
-        (&mut offscreen.texture, offscreen.size)
-    };
-
-    let target = renderer
-        .bind(texture)
-        .map_err(|e| anyhow!("bind offscreen for capture: {e}"))?;
-
-    copy_framebuffer_target_to_png_rgba(renderer, &target, size.w, size.h)
+        let target = renderer
+            .bind(&mut offscreen.texture)
+            .map_err(|e| anyhow!("bind sRGB scene for capture: {e}"))?;
+        let raw = copy_framebuffer_target_to_rgba8(
+            renderer,
+            &target,
+            offscreen.size.w,
+            offscreen.size.h,
+        )?;
+        crate::core::screenshot::srgb_rgba8_to_display_p3_rgb16(
+            &raw,
+            offscreen.size.w as usize,
+            offscreen.size.h as usize,
+        )
+    }
 }
 
 fn present_source_texture(surface: &DrmSurfaceState) -> Option<&GlesTexture> {
@@ -603,11 +673,11 @@ fn capture_source_texture(surface: &DrmSurfaceState) -> Option<&GlesTexture> {
     surface.render_targets.scanout_texture()
 }
 
-fn blit_rgba(
-    dst: &mut [u8],
+fn blit_rgb16(
+    dst: &mut [u16],
     dst_width: usize,
     dst_height: usize,
-    src: &[u8],
+    src: &[u16],
     src_width: usize,
     src_height: usize,
     dst_x: usize,
@@ -617,14 +687,14 @@ fn blit_rgba(
         return Err(anyhow!("blit out of bounds"));
     }
 
-    let dst_stride = dst_width * 4;
-    let src_stride = src_width * 4;
+    let dst_stride = dst_width * 3;
+    let src_stride = src_width * 3;
 
     for row in 0..src_height {
         let src_start = row * src_stride;
         let src_end = src_start + src_stride;
 
-        let dst_start = (dst_y + row) * dst_stride + dst_x * 4;
+        let dst_start = (dst_y + row) * dst_stride + dst_x * 3;
         let dst_end = dst_start + src_stride;
 
         dst[dst_start..dst_end].copy_from_slice(&src[src_start..src_end]);
@@ -657,7 +727,7 @@ fn save_all_outputs_screenshot(
     let total_width = (max_x - min_x) as usize;
     let total_height = (max_y - min_y) as usize;
 
-    let mut desktop_pixels = vec![0u8; total_width * total_height * 4];
+    let mut desktop_pixels = vec![0u16; total_width * total_height * 3];
 
     for surface in surfaces.values_mut() {
         let pixels = capture_surface_pixels(renderer, surface)?;
@@ -667,7 +737,7 @@ fn save_all_outputs_screenshot(
         let dst_x = (surface.origin.x - min_x) as usize;
         let dst_y = (surface.origin.y - min_y) as usize;
 
-        blit_rgba(
+        blit_rgb16(
             &mut desktop_pixels,
             total_width,
             total_height,
@@ -679,7 +749,7 @@ fn save_all_outputs_screenshot(
         )?;
     }
 
-    save_rgba_png(
+    save_screenshot_png(
         total_width as i32,
         total_height as i32,
         desktop_pixels,
@@ -688,43 +758,14 @@ fn save_all_outputs_screenshot(
     )
 }
 
-fn flip_rgba_horizontal(data: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let stride = width * 4;
-    let mut out = vec![0u8; data.len()];
-
-    for y in 0..height {
-        for x in 0..width {
-            let src = y * stride + x * 4;
-            let dst = y * stride + (width - 1 - x) * 4;
-            out[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
-        }
-    }
-
-    out
-}
-
-fn flip_rgba_vertical(data: &[u8], width: usize, height: usize) -> Vec<u8> {
-    let stride = width * 4;
-    let mut out = vec![0u8; data.len()];
-
-    for y in 0..height {
-        let src = y * stride;
-        let dst = (height - 1 - y) * stride;
-        out[dst..dst + stride].copy_from_slice(&data[src..src + stride]);
-    }
-
-    out
-}
-
-fn save_rgba_png(
+fn save_screenshot_png(
     width: i32,
     height: i32,
-    pixels: Vec<u8>,
+    pixels: Vec<u16>,
     output_name: &str,
     seq: u64,
 ) -> Result<PathBuf> {
     use chrono::Local;
-    use image::{ImageBuffer, Rgba};
     use std::fs;
     use std::path::PathBuf;
 
@@ -735,14 +776,11 @@ fn save_rgba_png(
 
     fs::create_dir_all(&screenshot_dir)?;
 
-    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels)
-        .ok_or_else(|| anyhow!("failed to construct image buffer from screenshot bytes"))?;
-
     let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
     let filename = format!("focaldesk-{}-{}-{}.png", output_name, timestamp, seq);
     let path = screenshot_dir.join(filename);
 
-    image.save(&path)?;
+    crate::core::screenshot::write_display_p3_png(&path, width as u32, height as u32, &pixels)?;
     flog(&format!("Screenshot saved to {}", path.display()));
     Ok(path)
 }
@@ -757,9 +795,6 @@ fn save_offscreen_screenshot(
 
     let pixels = capture_surface_pixels(renderer, surface)?;
 
-    let image = ImageBuffer::<Rgba<u8>, _>::from_raw(size.w as u32, size.h as u32, pixels)
-        .ok_or_else(|| anyhow!("failed to construct image buffer from screenshot bytes"))?;
-
     let screenshot_dir =
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
             .join("Pictures")
@@ -771,7 +806,7 @@ fn save_offscreen_screenshot(
     let filename = format!("focaldesk-{}-{}-{}.png", output_name, timestamp, seq);
     let path = screenshot_dir.join(filename);
 
-    image.save(&path)?;
+    crate::core::screenshot::write_display_p3_png(&path, size.w as u32, size.h as u32, &pixels)?;
     Ok(path)
 }
 
@@ -952,6 +987,31 @@ fn sync_output_hdr_flags(
         output.hdr_supported,
         output.hdr_kms_applied,
     );
+}
+
+#[cfg(test)]
+mod screenshot_tests {
+    use super::bgra_gl_bottom_left_to_rgba;
+
+    #[test]
+    fn bgra_fallback_converts_channels_and_gl_row_order() {
+        let bottom_up_bgra = [
+            255, 0, 0, 255, // bottom-left: blue
+            255, 255, 255, 255, // bottom-right: white
+            0, 0, 255, 255, // top-left: red
+            0, 255, 0, 255, // top-right: green
+        ];
+
+        assert_eq!(
+            bgra_gl_bottom_left_to_rgba(&bottom_up_bgra, 2, 2),
+            [
+                255, 0, 0, 255, // top-left: red
+                0, 255, 0, 255, // top-right: green
+                0, 0, 255, 255, // bottom-left: blue
+                255, 255, 255, 255, // bottom-right: white
+            ]
+        );
+    }
 }
 
 #[cfg(test)]

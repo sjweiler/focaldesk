@@ -59,7 +59,7 @@ fn srgb_tone_curve() -> ToneCurve {
     ToneCurve::new_tabulated_float(&values)
 }
 
-fn source_profile(description: ColorDescription) -> Result<Profile, IccError> {
+pub(crate) fn source_profile(description: ColorDescription) -> Result<Profile, IccError> {
     let PrimariesChromaticity { r, g, b, w } = description.primaries.chromaticity();
     let white = CIExyY {
         x: f64::from(w[0]),

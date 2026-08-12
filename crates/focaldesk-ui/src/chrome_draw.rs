@@ -11,7 +11,7 @@ use crate::chrome::ChromeMetrics;
 use crate::chrome_layout::{ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use crate::chrome_shaders::ChromeShaders;
 use crate::chrome_theme::{
-    BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle, TopBarStyle,
+    BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle, TopBarStyle, activity_well_style,
     chrome_theme_from_flow_theme,
 };
 use crate::desktop_frame::DesktopFrameCtx;
@@ -105,22 +105,23 @@ pub fn draw_chrome_below_work_wallpaper(
         damage,
         &legacy_theme.panel_inner,
     );
-    let _ = draw_recessed_button(
-        frame,
-        button,
-        layout.topbar.flow_field,
-        frame_ctx.output_scale,
-        damage,
-        &legacy_theme.button,
-    );
-    let _ = draw_light_channel(
-        frame,
-        light,
-        inset_rect(layout.topbar.flow_field, 3),
-        frame_ctx.output_scale,
-        damage,
-        &legacy_theme.light,
-    );
+    for (well, style) in [
+        (layout.topbar.ai_button, legacy_theme.button),
+        (
+            layout.topbar.flow_field,
+            activity_well_style(legacy_theme.button),
+        ),
+    ] {
+        let _ = draw_recessed_button(frame, button, well, frame_ctx.output_scale, damage, &style);
+        let _ = draw_light_channel(
+            frame,
+            light,
+            inset_rect(well, 3),
+            frame_ctx.output_scale,
+            damage,
+            &legacy_theme.light,
+        );
+    }
     let _ = draw_beveled_panel(
         frame,
         &beveled,
@@ -307,22 +308,23 @@ pub fn draw_chrome_topbar_frame(
     ] {
         let _ = draw_beveled_panel(frame, beveled, rect, scale, damage, style);
     }
-    let _ = draw_recessed_button(
-        frame,
-        button,
-        layout.topbar.flow_field,
-        scale,
-        damage,
-        &legacy_theme.button,
-    );
-    let _ = draw_light_channel(
-        frame,
-        light,
-        inset_rect(layout.topbar.flow_field, 3),
-        scale,
-        damage,
-        &legacy_theme.light,
-    );
+    for (well, style) in [
+        (layout.topbar.ai_button, legacy_theme.button),
+        (
+            layout.topbar.flow_field,
+            activity_well_style(legacy_theme.button),
+        ),
+    ] {
+        let _ = draw_recessed_button(frame, button, well, scale, damage, &style);
+        let _ = draw_light_channel(
+            frame,
+            light,
+            inset_rect(well, 3),
+            scale,
+            damage,
+            &legacy_theme.light,
+        );
+    }
     if let Some(rect) = layout.topbar.light {
         let _ = draw_light_channel(frame, light, rect, scale, damage, &legacy_theme.light);
     }
@@ -680,20 +682,6 @@ fn draw_chrome_trim_glass_icons_impl(
                         color,
                     );
                 }
-
-                if let Some(icon_id) = el.icon {
-                    let icon_px = base_rect_logical.size.h.min(28).max(1);
-                    let icon_rect = icon_rect_in_module(base_rect_logical, icon_px);
-                    render_icon_with_tint(
-                        frame,
-                        atlas,
-                        icon_id,
-                        icon_rect,
-                        frame_ctx.output_scale,
-                        style,
-                        &tinted_icon,
-                    );
-                }
             }
             UiElementKind::Clock => {
                 use chrono::Local;
@@ -787,7 +775,10 @@ pub fn draw_flow_field(
         ),
         Uniform::new(
             "u_time",
-            (chrono::Local::now().timestamp_millis() as f32) / 1000.0,
+            (chrono::Local::now()
+                .timestamp_millis()
+                .rem_euclid(3_600_000) as f32)
+                / 1000.0,
         ),
         Uniform::new("u_mode", mode as f32),
         Uniform::new("u_energy", energy),

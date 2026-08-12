@@ -1098,14 +1098,28 @@ pub struct SidebarPulseFrame {
 #[derive(Clone, Copy, Debug)]
 pub struct TopbarPulse {
     pub output_id: OutputId,
-    pub indicator: usize,
+    pub target: TopbarPulseTarget,
     pub click_local: Point<f64, Logical>,
     pub started_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopbarPulseTarget {
+    Indicator(usize),
+    AiButton,
+}
+
+fn topbar_pulse_target_at(layout: &ChromeLayout, px: i32, py: i32) -> Option<TopbarPulseTarget> {
+    if layout.topbar.ai_button.contains((px, py)) {
+        Some(TopbarPulseTarget::AiButton)
+    } else {
+        topbar_status_well_index_at(layout, px, py).map(TopbarPulseTarget::Indicator)
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TopbarPulseFrame {
-    pub indicator: usize,
+    pub target: TopbarPulseTarget,
     pub click_local: Point<f64, Logical>,
     pub elapsed: Duration,
 }
@@ -1778,7 +1792,7 @@ impl DesktopState {
             IpcRequest::IdentifyDisplays => {
                 self.topbar_pulse = Some(TopbarPulse {
                     output_id: self.focused_output,
-                    indicator: 0,
+                    target: TopbarPulseTarget::Indicator(0),
                     click_local: (0.0, 0.0).into(),
                     started_at: Instant::now(),
                 });
@@ -2757,12 +2771,6 @@ impl DesktopState {
                 self.focused_output.0,
                 action
             );
-        }
-        if self
-            .ui_element_at_pointer_for_output(self.focused_output)
-            .is_some_and(|el| el.kind == UiElementKind::TopbarFlowField)
-        {
-            let _ = self.trigger_flow_field_pulse_at_pointer(self.focused_output);
         }
         self.queue_ui_action(action);
         true
@@ -4335,10 +4343,10 @@ impl DesktopState {
                         launch_trace_id
                     );
                 }
-                focaldesk_ui::ui_builder::TOPBAR_FLOW_FIELD_ID => {
+                focaldesk_ui::ui_builder::TOPBAR_AI_BUTTON_ID => {
                     let launch_trace_id = self.launch_app(focaldesk_ai_console_command());
                     flog_info!(
-                        "dispatch launch trace_id={} action=topbar-flow-field",
+                        "dispatch launch trace_id={} action=topbar-ai-button",
                         launch_trace_id
                     );
                 }
@@ -5579,7 +5587,7 @@ impl DesktopState {
         }
 
         Some(TopbarPulseFrame {
-            indicator: pulse.indicator,
+            target: pulse.target,
             click_local: pulse.click_local,
             elapsed,
         })
@@ -5656,7 +5664,12 @@ impl DesktopState {
     ) -> Option<Rectangle<i32, Logical>> {
         let pulse = self.topbar_pulse_for_output(output_id, now)?;
         let layout = self.chrome_layout_for_output(output_id)?;
-        layout.topbar.status_wells.get(pulse.indicator).copied()
+        match pulse.target {
+            TopbarPulseTarget::Indicator(indicator) => {
+                layout.topbar.status_wells.get(indicator).copied()
+            }
+            TopbarPulseTarget::AiButton => Some(layout.topbar.ai_button),
+        }
     }
 
     pub fn active_flow_field_pulse_damage_rect(
@@ -5715,20 +5728,22 @@ impl DesktopState {
         let Some(layout) = self.chrome_layout_for_output(output_id) else {
             return false;
         };
-        let Some(indicator) = topbar_status_well_index_at(&layout, px, py) else {
+        let Some(target) = topbar_pulse_target_at(&layout, px, py) else {
             return false;
         };
 
         self.topbar_pulse = Some(TopbarPulse {
             output_id,
-            indicator,
+            target,
             click_local: local,
             started_at: Instant::now(),
         });
 
-        if let Some(rect) = layout.topbar.status_wells.get(indicator) {
-            self.mark_output_logical_damage(output_id, *rect, 0, DamageSource::Unknown);
-        }
+        let rect = match target {
+            TopbarPulseTarget::Indicator(indicator) => layout.topbar.status_wells[indicator],
+            TopbarPulseTarget::AiButton => layout.topbar.ai_button,
+        };
+        self.mark_output_logical_damage(output_id, rect, 0, DamageSource::Unknown);
 
         true
     }
@@ -7845,9 +7860,10 @@ impl DesktopState {
                                 Some((_, UiElementKind::SidebarButton)) => {
                                     self.trigger_sidebar_pulse_at_pointer(self.focused_output)
                                 }
-                                Some((_, UiElementKind::TopbarIndicator)) => {
-                                    self.trigger_topbar_pulse_at_pointer(self.focused_output)
-                                }
+                                Some((
+                                    _,
+                                    UiElementKind::TopbarIndicator | UiElementKind::TopbarButton,
+                                )) => self.trigger_topbar_pulse_at_pointer(self.focused_output),
                                 Some((_, UiElementKind::Clock)) => {
                                     self.trigger_clock_pulse_at_pointer(self.focused_output)
                                 }
@@ -9744,8 +9760,9 @@ mod tests {
         ai_flow_mode_from_status, clamp_rect_to_bounds, is_browser_like,
         logical_damage_to_physical, power_action_interaction, remove_surface_root_membership,
         session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
-        surface_buffer_damage_to_logical, workspace_for_slot, PowerActionInteraction,
-        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        surface_buffer_damage_to_logical, topbar_pulse_target_at, workspace_for_slot,
+        PowerActionInteraction, TopbarPulseTarget, UnattendedSuspendState,
+        UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use focaldesk_ai::AiDaemonStatus;
     use focaldesk_ipc::PowerIpcRequest;
@@ -9759,6 +9776,21 @@ mod tests {
     use smithay::backend::renderer::utils::SurfaceView;
     use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
     use std::collections::HashMap;
+
+    #[test]
+    fn ai_button_has_its_own_topbar_pulse_target() {
+        let layout = super::build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+        let button = layout.topbar.ai_button;
+        let point = (
+            button.loc.x + button.size.w / 2,
+            button.loc.y + button.size.h / 2,
+        );
+
+        assert_eq!(
+            topbar_pulse_target_at(&layout, point.0, point.1),
+            Some(TopbarPulseTarget::AiButton)
+        );
+    }
 
     #[test]
     fn ai_flow_status_prioritizes_required_approval() {

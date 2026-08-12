@@ -499,7 +499,7 @@ impl ShellClient {
                     },
                 );
                 let point = (x as i32, y as i32);
-                if layout.topbar.flow_field.contains(point) {
+                if layout.topbar.ai_button.contains(point) {
                     return Some(0);
                 }
                 if let Some(status) = layout

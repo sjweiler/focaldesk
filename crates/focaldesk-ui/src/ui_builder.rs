@@ -11,6 +11,7 @@ use focaldesk_network::model::{Connectivity, NetworkIcon as NetIcon, NetworkStat
 const SIDEBAR_BASE: u32 = 1_000;
 const CLOCK_ID: u32 = 100_000;
 pub const TOPBAR_FLOW_FIELD_ID: u32 = 100_001;
+pub const TOPBAR_AI_BUTTON_ID: u32 = 100_002;
 pub const SIDEBAR_SETTINGS_ID: u32 = SIDEBAR_BASE + 1;
 pub const SIDEBAR_ADD_WORKSPACE_ID: u32 = SIDEBAR_BASE + 3;
 pub const SIDEBAR_DELETE_WORKSPACE_ID: u32 = SIDEBAR_BASE + 4;
@@ -76,14 +77,14 @@ impl AiFlowMode {
         }
     }
 
-    /// Detailed copy for hover and assistive technology.
+    /// Detailed status copy for hover and assistive technology.
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Idle => "AI ready — open Console",
-            Self::Thinking => "Thinking — open for details",
-            Self::Acting => "Working — open for progress",
-            Self::PermissionWait => "Approval needed — open Console",
-            Self::Error => "AI unavailable — check Console",
+            Self::Idle => "AI ready",
+            Self::Thinking => "AI is thinking",
+            Self::Acting => "AI is working",
+            Self::PermissionWait => "AI is waiting for approval",
+            Self::Error => "AI activity is unavailable",
         }
     }
 }
@@ -514,26 +515,38 @@ pub fn build_ui_for_output_with_options(
         .extend(Dock::layout_items(layout, sidebar_entries));
 
     let flow_mode = options.ai_flow_mode;
-    let mut flow_field = UiElement::topbar_indicator(
+    let mut ai_button = UiElement::new(
+        TOPBAR_AI_BUTTON_ID,
+        UiRect::default(),
+        UiElementKind::TopbarButton,
+        Some(IconId::AiConsole),
+        Some(UiAction::LaunchApp("focaldesk-ai-console".into())),
+    )
+    .with_accessible(AccessibleInfo::new(
+        AccessibleRole::Button,
+        "Open FocalDesk AI Console",
+    ));
+    ai_button.tooltip = Some("Open AI Console".into());
+    ai_button.bounds = layout.topbar.ai_button.into();
+    ui.elements.push(ai_button);
+
+    let mut flow_field = UiElement::new(
         TOPBAR_FLOW_FIELD_ID,
-        IconId::AiConsole,
-        flow_mode.description(),
+        UiRect::default(),
+        UiElementKind::TopbarFlowField,
+        None,
+        None,
     );
     flow_field.kind = UiElementKind::TopbarFlowField;
-    flow_field.action = Some(UiAction::LaunchApp("focaldesk-ai-console".into()));
+    flow_field.tooltip = Some(flow_mode.description().into());
     flow_field.label = Some(flow_mode.label().into());
     flow_field.accessible = Some(
-        AccessibleInfo::new(AccessibleRole::Button, "FocalDesk AI Console")
+        AccessibleInfo::new(AccessibleRole::Status, "FocalDesk AI activity")
             .description(flow_mode.description())
             .value_text(flow_mode.label())
             .live(true),
     );
-    flow_field.bounds = UiRect {
-        x: layout.topbar.flow_field.loc.x,
-        y: layout.topbar.flow_field.loc.y,
-        w: layout.topbar.flow_field.size.w,
-        h: layout.topbar.flow_field.size.h,
-    };
+    flow_field.bounds = layout.topbar.flow_field.into();
     flow_field.hover_scale = 1.0;
     flow_field.press_scale = 1.0;
     flow_field.selected = flow_selected;
@@ -583,9 +596,10 @@ mod tests {
     use crate::element::{ChromeItem, UiElement};
     use crate::ui_builder::{
         AiFlowMode, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID,
-        SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_FLOW_FIELD_ID,
-        UiAction, UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options,
-        default_status_items, sidebar_workspace_id, sidebar_workspace_number,
+        SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID,
+        TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions, VoiceCaptureStatus,
+        build_ui_for_output_with_options, default_status_items, sidebar_workspace_id,
+        sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
 
@@ -840,18 +854,26 @@ mod tests {
     }
 
     #[test]
-    fn topbar_flow_field_launches_ai_console_directly() {
-        let flow_field = build_flow_field();
+    fn bot_button_launches_console_while_flow_field_is_status_only() {
+        let (button, flow_field) = build_ai_cluster();
         assert!(matches!(
-            flow_field.action.as_ref(),
+            button.action.as_ref(),
             Some(UiAction::LaunchApp(command)) if command == "focaldesk-ai-console"
         ));
-        assert_eq!(flow_field.icon, Some(IconId::AiConsole));
-        assert_eq!(flow_field.label.as_deref(), Some("AI ready"));
+        assert_eq!(button.icon, Some(IconId::AiConsole));
+        assert_eq!(button.kind, crate::types::UiElementKind::TopbarButton);
+        assert!(button.is_accessibility_focusable());
+        assert!(flow_field.action.is_none());
+        assert_eq!(flow_field.icon, None);
         assert_eq!(
-            flow_field.tooltip.as_deref(),
-            Some("AI ready — open Console")
+            flow_field.kind,
+            crate::types::UiElementKind::TopbarFlowField
         );
+        assert!(!flow_field.is_accessibility_focusable());
+        assert_eq!(flow_field.label.as_deref(), Some("AI ready"));
+        assert_eq!(flow_field.tooltip.as_deref(), Some("AI ready"));
+        assert_eq!(button.bounds.w, button.bounds.h);
+        assert!(button.bounds.x + button.bounds.w < flow_field.bounds.x);
         assert_eq!(
             flow_field
                 .accessible
@@ -1012,15 +1034,23 @@ mod tests {
         assert!(active_camera.active);
     }
 
-    fn build_flow_field() -> UiElement {
+    fn build_ai_cluster() -> (UiElement, UiElement) {
         let output_size = smithay::utils::Size::from((1920, 1080));
         let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
         let mut ui = UiTree::default();
         build_ui_for_output_with_options(&mut ui, &layout, UiBuildOptions::default());
-        ui.elements
+        let button = ui
+            .elements
+            .iter()
+            .find(|el| el.id == TOPBAR_AI_BUTTON_ID)
+            .cloned()
+            .expect("AI Console button");
+        let flow_field = ui
+            .elements
             .iter()
             .find(|el| el.id == TOPBAR_FLOW_FIELD_ID)
             .cloned()
-            .expect("flow field")
+            .expect("flow field");
+        (button, flow_field)
     }
 }

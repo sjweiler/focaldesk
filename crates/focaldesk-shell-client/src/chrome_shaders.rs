@@ -1699,7 +1699,7 @@ gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
 
 const FLOW_FIELD_FRAG: &str = r#"
 #ifdef GL_ES
-precision mediump float;
+precision highp float;
 #endif
 
 uniform vec2  u_resolution;
@@ -1719,174 +1719,178 @@ vec2 hash21(float n) {
     return vec2(hash11(n), hash11(n + 19.19));
 }
 
-float mode_energy(float mode) {
-    if (mode < 0.5) {
-        return 0.30;
-    } else if (mode < 1.5) {
-        return 1.00;
-    } else if (mode < 2.5) {
-        return 0.90;
-    } else if (mode < 3.5) {
-        return 0.96;
-    }
-    return 1.00;
-}
-
-float motion_amp_for_mode(float mode) {
-    if (mode < 0.5) {
-        return 0.92;
-    } else if (mode < 1.5) {
-        return 1.42;
-    } else if (mode < 2.5) {
-        return 1.18;
-    } else if (mode < 3.5) {
-        return 1.48;
-    }
-    return 1.72;
-}
-
 float particle_count_for_mode(float mode) {
     if (mode < 0.5) {
-        return 40.0;
+        return 38.0;
     } else if (mode < 1.5) {
-        return 72.0;
+        return 64.0;
     } else if (mode < 2.5) {
-        return 60.0;
+        return 58.0;
     } else if (mode < 3.5) {
         return 54.0;
     }
     return 48.0;
 }
 
-vec3 mode_tint(float mode) {
+vec3 palette_a(float mode, vec3 anchor) {
     if (mode < 0.5) {
-        return vec3(0.40, 0.62, 1.00);
+        return mix(anchor, vec3(0.18, 0.48, 1.00), 0.42);
     } else if (mode < 1.5) {
-        return vec3(0.55, 0.95, 1.00);
+        return vec3(0.18, 0.88, 1.00);
     } else if (mode < 2.5) {
-        return vec3(0.44, 1.00, 0.80);
+        return vec3(0.16, 1.00, 0.72);
     } else if (mode < 3.5) {
-        return vec3(1.00, 0.74, 0.20);
+        return vec3(1.00, 0.56, 0.12);
     }
-    return vec3(1.00, 0.30, 0.30);
+    return vec3(1.00, 0.20, 0.30);
 }
 
-float pulse(float t, float freq) {
-    return 0.5 + 0.5 * sin(t * freq);
+vec3 palette_b(float mode, vec3 anchor) {
+    if (mode < 0.5) {
+        return mix(anchor, vec3(0.20, 1.00, 0.94), 0.58);
+    } else if (mode < 1.5) {
+        return vec3(0.56, 0.30, 1.00);
+    } else if (mode < 2.5) {
+        return mix(anchor, vec3(0.16, 0.66, 1.00), 0.50);
+    } else if (mode < 3.5) {
+        return vec3(1.00, 0.90, 0.34);
+    }
+    return vec3(1.00, 0.48, 0.12);
+}
+
+vec3 palette_c(float mode, vec3 anchor) {
+    if (mode < 0.5) {
+        return mix(anchor, vec3(0.66, 0.32, 1.00), 0.52);
+    } else if (mode < 1.5) {
+        return vec3(1.00, 0.24, 0.76);
+    } else if (mode < 2.5) {
+        return vec3(1.00, 0.76, 0.22);
+    } else if (mode < 3.5) {
+        return vec3(1.00, 0.38, 0.64);
+    }
+    return vec3(1.00, 0.76, 0.52);
+}
+
+vec3 particle_color(float mode, vec2 seed, vec3 anchor) {
+    vec3 a = palette_a(mode, anchor);
+    vec3 b = palette_b(mode, anchor);
+    vec3 c = palette_c(mode, anchor);
+    float lane = fract(seed.x * 1.73 + seed.y * 0.91);
+    if (lane < 0.5) {
+        return mix(a, b, smoothstep(0.0, 0.5, lane));
+    }
+    return mix(b, c, smoothstep(0.5, 1.0, lane));
+}
+
+// A compact, divergence-like procedural field. It bends every state's base
+// trajectory without requiring particle buffers or compositor-side simulation.
+vec2 flow_warp(vec2 p, float time, float seed) {
+    float x_wave = sin(p.y * 11.0 + time * 0.72 + seed * 6.0);
+    float y_wave = cos(p.x * 9.0 - time * 0.58 + seed * 8.0);
+    float cross = sin((p.x + p.y) * 7.0 + time * 0.34 + seed * 4.0);
+    return vec2(x_wave + cross * 0.45, y_wave - cross * 0.45);
 }
 
 void main() {
-    // Pixel shader is drawn into the flow-field quad only; v_coords are local 0..1.
+    // The shader is clipped to the compact top-bar activity well.
     vec2 size = max(u_rect.zw, vec2(1.0));
     vec2 local = v_coords * size;
+    vec2 uv = local / size;
 
     float mode = floor(u_mode + 0.5);
-    float energy = clamp(u_energy, 0.0, 1.0) * mode_energy(mode);
+    float energy = clamp(u_energy, 0.0, 1.0);
     float count = particle_count_for_mode(mode);
-    float motion_amp = motion_amp_for_mode(mode);
-    float speed = mix(0.03, 0.20, energy);
-    float glow = mix(0.20, 0.94, energy) * mix(0.84, 1.18, motion_amp);
-    vec3 tint = mode_tint(mode) * u_color.rgb;
-
     vec3 accum = vec3(0.0);
-    float center_y = size.y * 0.5;
-    float center_x = size.x * 0.5;
 
-    const int PARTICLES = 48;
+    const int PARTICLES = 64;
     for (int i = 0; i < PARTICLES; ++i) {
         float fi = float(i);
         float enabled = step(fi, count - 1.0);
         vec2 seed = hash21(fi * 13.37 + mode * 61.7);
-        float phase = fract(seed.x + u_time * speed + fi * 0.013);
+        float phase = fract(seed.x + u_time * mix(0.018, 0.13, energy) + fi * 0.011);
 
         float x = 0.5;
         float y = 0.5;
         float core_scale = 1.0;
         float trail = 0.0;
-        float bloom = 0.0;
-        float fracture = 0.0;
+        float halo = 0.0;
 
         if (mode < 0.5) {
-            float orbit = u_time * 0.28 + fi * 0.37 + seed.x * 6.28318;
-            x = mix(0.10, 0.90, fract(seed.x + u_time * 0.018 + fi * 0.004))
-                + sin(orbit) * 0.020 * motion_amp;
-            y = 0.20 + 0.58 * seed.y + cos(orbit * 1.27) * 0.035 * motion_amp;
-            core_scale = 1.06;
-            bloom = pulse(u_time * 0.38 + seed.x * 2.0, 0.9) * 0.85;
+            // Idle: an asymmetric, breathing nebula rather than a rigid orb.
+            float drift = fract(seed.x + u_time * 0.012 + fi * 0.003);
+            float wave = u_time * 0.24 + fi * 0.41 + seed.y * 5.0;
+            x = mix(0.06, 0.94, drift) + sin(wave) * 0.025;
+            y = 0.50 + (seed.y - 0.5) * (0.46 - 0.16 * seed.x)
+                + cos(wave * 1.17) * 0.045;
+            core_scale = 1.12;
         } else if (mode < 1.5) {
-            x = mix(-0.14, 1.12, phase);
-            y = 0.24 + 0.54 * seed.y
-                + sin(u_time * (0.95 + seed.x * 0.55) + fi * 0.31) * 0.05 * motion_amp;
-            trail = smoothstep(-18.0, 14.0, (x - 0.5) * size.x)
-                * (1.0 - abs(seed.y - 0.5) * 1.4);
-            core_scale = 0.92;
+            // Thinking: two temporary knots exchange particles through a curl.
+            float side = step(0.5, seed.x) * 2.0 - 1.0;
+            float angle = u_time * (0.70 + seed.y * 0.42) + fi * 0.67;
+            float radius = 0.025 + seed.y * 0.17;
+            x = 0.50 + side * 0.13 + cos(angle) * radius;
+            y = 0.50 + sin(angle * 1.31) * radius * 0.84;
+            x += sin(u_time * 0.46 + seed.y * 5.0) * 0.035;
+            halo = 0.75;
+            core_scale = 0.84;
         } else if (mode < 2.5) {
-            float orbit = u_time * 1.55 + fi * 0.63 + seed.x * 5.2;
-            x = 0.5 + (seed.x - 0.5) * 0.18 + cos(orbit) * 0.035 * motion_amp;
-            y = 0.5 + (seed.y - 0.5) * 0.16 + sin(orbit * 1.2) * 0.045 * motion_amp;
-            bloom = 1.0 - smoothstep(0.0, 1.0, abs(y - 0.5) * 2.4);
-            core_scale = 1.10;
+            // Working: directional ribbons make progress legible without color.
+            x = mix(-0.10, 1.10, phase);
+            float lane = floor(seed.y * 3.0);
+            float lane_y = 0.34 + lane * 0.16;
+            y = lane_y + sin(x * 8.0 + u_time * 1.35 + fi * 0.23) * 0.055;
+            trail = 0.90 - abs(seed.y - 0.5) * 0.34;
+            core_scale = 0.78;
         } else if (mode < 3.5) {
-            float rise = pulse(u_time * 2.4 + seed.x * 7.0, 1.0);
-            x = mix(0.18, 0.82, fract(seed.x + u_time * 0.06 + fi * 0.01));
-            y = 0.50 + (seed.y - 0.5) * 0.14 + (rise - 0.5) * 0.18 * motion_amp;
-            bloom = 1.0 - smoothstep(0.0, 1.0, abs((y - 0.5) / 0.18));
-            core_scale = 0.98;
-        } else {
-            float jitter = hash11(fi * 9.3 + floor(u_time * 18.0));
-            float shard = step(0.42, jitter);
-            x = mix(-0.08, 1.08, fract(seed.x + u_time * 0.10 + fi * 0.017));
-            y = 0.20 + 0.60 * seed.y
-                + sign(seed.x - 0.5) * 0.05
-                + sin(u_time * (2.6 + seed.y) + fi * 0.91) * 0.06 * motion_amp;
-            fracture = shard * (0.45 + 0.55 * step(0.68, hash11(fi * 5.7 + floor(u_time * 10.0))));
-            trail = step(0.12, fract(seed.y + u_time * 0.25)) * 0.5;
+            // Permission wait: a slow contracting halo asks for attention.
+            float angle = fi * 0.71 + seed.x * 4.0;
+            float breathe = 0.76 + 0.24 * sin(u_time * 1.45 + seed.y * 2.0);
+            float radius = (0.08 + seed.y * 0.29) * breathe;
+            x = 0.50 + cos(angle) * radius;
+            y = 0.50 + sin(angle) * radius * 0.58;
+            halo = 1.0;
             core_scale = 0.88;
+        } else {
+            // Error: split cohesion and continuous tremor, with no flashing.
+            float side = step(0.5, seed.x) * 2.0 - 1.0;
+            float tremor = sin(u_time * 3.2 + fi * 1.71);
+            x = 0.50 + side * (0.10 + seed.x * 0.36) + tremor * 0.018;
+            y = 0.50 + (seed.y - 0.5) * 0.58
+                + sin(u_time * 1.8 + fi * 0.83) * 0.035;
+            trail = 0.32;
+            core_scale = 0.72;
         }
+
+        vec2 warp = flow_warp(vec2(x, y), u_time, seed.x);
+        float warp_strength = mode < 0.5 ? 0.018 : (mode < 3.5 ? 0.026 : 0.010);
+        x += warp.x * warp_strength;
+        y += warp.y * warp_strength;
 
         vec2 particle = vec2(x * size.x, y * size.y);
         vec2 delta = local - particle;
         float dist = length(delta);
-
-        float core = exp(-(dist * dist) / (mix(170.0, 56.0, energy) * core_scale));
-        float streak = exp(-abs(delta.y) / mix(11.0, 3.8, energy))
-            * smoothstep(-18.0, 20.0, delta.x)
-            * trail;
-        float ring = exp(-pow((dist - size.y * 0.16) / max(size.y * 0.12, 1.0), 2.0));
-        float drift = (0.12 + 0.08 * sin(u_time * 0.18 + fi * 0.4)) * motion_amp;
-        float flicker = 0.70 + 0.30 * hash11(fi * 3.7 + floor(u_time * (10.0 + motion_amp * 4.0)));
-        float edge_shard = step(0.52, hash11(fi * 4.4 + floor(u_time * 14.0)));
-
-        if (mode < 0.5) {
-            float orbit_glow = 0.50 + 0.50 * sin(u_time * 0.65 + fi * 0.33);
-            accum += tint * enabled * vec3(core * 0.72 + ring * 0.14 + orbit_glow * 0.025 + bloom * 0.03);
-        } else if (mode < 1.5) {
-            accum += tint * enabled * vec3(core * 0.82 + streak * 1.85 + drift * 0.02);
-        } else if (mode < 2.5) {
-            accum += tint * enabled * vec3(core * 0.68 + ring * 0.98 + bloom * 0.20);
-        } else if (mode < 3.5) {
-            float pulse_ring = 1.0 - smoothstep(0.0, 0.12 * size.y, abs(dist - size.y * 0.10));
-            float pulse_flash = pulse(u_time * 2.2 + seed.x * 5.0, 1.0);
-            accum += tint * enabled * vec3(core * 0.34 + ring * 1.24 + pulse_ring * pulse_flash * 0.54);
-        } else {
-            accum += tint * enabled * vec3(
-                core * (0.62 + 0.64 * flicker) +
-                streak * (0.80 + 0.88 * edge_shard) +
-                fracture * 0.58 +
-                drift * 0.02
-            );
-        }
+        float core = exp(-(dist * dist) / (mix(42.0, 18.0, energy) * core_scale));
+        float streak = exp(-abs(delta.y) / mix(4.8, 2.4, energy))
+            * exp(-max(delta.x, 0.0) / 16.0) * trail;
+        float ring = exp(-pow((dist - size.y * 0.13) / max(size.y * 0.08, 1.0), 2.0));
+        float shimmer = 0.78 + 0.22 * sin(u_time * 0.82 + fi * 0.79);
+        vec3 color = particle_color(mode, seed, u_color.rgb);
+        accum += color * enabled * shimmer * (core + streak * 0.34 + ring * halo * 0.08);
     }
 
-    float density = clamp(dot(accum, vec3(0.3333)), 0.0, 1.0);
-    float normalized_x = local.x / max(size.x, 1.0);
-    float normalized_y = local.y / max(size.y, 1.0);
-    float wave = 0.5 + 0.5 * sin(normalized_x * 8.0 - u_time * 2.2 + normalized_y * 2.6);
-    float ripple = exp(-pow((normalized_y - 0.5 - 0.14 * sin(u_time * 0.85)) / 0.22, 2.0));
-    float edge = 1.0 - smoothstep(0.0, 10.0, min(min(local.x, local.y), min(size.x - local.x, size.y - local.y)));
-    float alpha = clamp(density * glow * 1.45 + edge * 0.18 + wave * ripple * 0.22, 0.0, 1.0) * u_color.a;
-
-    gl_FragColor = vec4(tint * (alpha + wave * ripple * 0.18), alpha);
+    // Exponential mapping keeps overlapping particles colorful instead of white.
+    // A little extra exposure prevents theme-colored particles from sinking into
+    // similarly hued chrome, while the shaped alpha keeps the cloud readable at
+    // its softer edges after premultiplied blending.
+    vec3 mapped = vec3(1.0) - exp(-accum * mix(0.24, 0.42, energy));
+    float luminance = dot(mapped, vec3(0.2126, 0.7152, 0.0722));
+    float boundary = smoothstep(0.0, 0.06, uv.x)
+        * smoothstep(0.0, 0.06, 1.0 - uv.x)
+        * smoothstep(0.0, 0.12, uv.y)
+        * smoothstep(0.0, 0.12, 1.0 - uv.y);
+    float alpha = smoothstep(0.008, 0.28, luminance) * 0.96
+        * boundary * u_color.a;
+    gl_FragColor = vec4(mapped * alpha, alpha);
 }
 "#;
 

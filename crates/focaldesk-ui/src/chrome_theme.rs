@@ -77,6 +77,15 @@ pub struct ButtonStyle {
     pub glow_color: [f32; 4],
 }
 
+/// A quieter recessed treatment for read-only status fields adjacent to buttons.
+pub fn activity_well_style(mut style: ButtonStyle) -> ButtonStyle {
+    style.bevel *= 0.55;
+    style.inner_shadow *= 0.65;
+    style.glow_strength = 0.0;
+    style.glow_radius = 0.0;
+    style
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct TopBarStyle {
     pub radius: f32,

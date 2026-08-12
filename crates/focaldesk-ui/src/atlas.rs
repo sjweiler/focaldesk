@@ -424,7 +424,7 @@ where
         ),
         (
             IconId::AiConsole,
-            include_bytes!("../../../assets/icons/focal-ai-console.svg"),
+            include_bytes!("../../../assets/icons/bot.svg"),
         ),
         (
             IconId::Overflow,

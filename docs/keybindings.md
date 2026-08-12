@@ -40,7 +40,8 @@ These bindings are not registered by the nested winit backend.
 | `Shift+Print` | Capture all outputs |
 
 DRM screenshots are written below `~/Pictures/Screenshots` with the output name,
-timestamp, and a sequence number in the filename.
+timestamp, and a sequence number in the filename. They are 16-bit Display P3
+PNGs with an embedded matching ICC profile.
 
 ## Workspace-slot bindings
 

@@ -45,7 +45,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
-    ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame,
+    ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget,
 };
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
@@ -3634,10 +3634,35 @@ impl RenderState {
             &legacy_theme.panel_inner,
         );
 
+        let ai_button = layout.topbar.ai_button;
+        let activity_field = layout.topbar.flow_field;
         Self::draw_recessed_button(
             frame,
             button,
-            layout.topbar.flow_field,
+            ai_button,
+            ctx.output_scale,
+            damage,
+            &legacy_theme.button,
+        );
+
+        if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
+            if pulse_frame.target == TopbarPulseTarget::AiButton {
+                let _ = Self::draw_sidebar_pulse(
+                    frame,
+                    pulse_shader,
+                    ai_button,
+                    pulse_frame.click_local,
+                    pulse_frame.elapsed,
+                    ctx.output_scale,
+                    damage,
+                );
+            }
+        }
+
+        Self::draw_recessed_button(
+            frame,
+            button,
+            activity_field,
             ctx.output_scale,
             damage,
             &legacy_theme.button,
@@ -3692,7 +3717,7 @@ impl RenderState {
             );
 
             if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
-                if pulse_frame.indicator == i {
+                if pulse_frame.target == TopbarPulseTarget::Indicator(i) {
                     let _ = Self::draw_sidebar_pulse(
                         frame,
                         pulse_shader,
@@ -4164,17 +4189,13 @@ impl RenderState {
                         };
 
                         let accent = active_theme.chrome.accent_color;
-                        let mut color = match mode {
+                        let color = match mode {
                             1 => [accent[0], accent[1], accent[2], 0.98],
                             2 => [0.94, 0.97, 1.00, 0.92],
                             3 => [1.00, 0.72, 0.18, 1.00],
                             4 => [0.98, 0.30, 0.30, 1.00],
                             _ => [accent[0] * 0.72, accent[1] * 0.90, accent[2], 0.70],
                         };
-                        if el.hovered {
-                            color[3] = (color[3] + 0.12).min(1.0);
-                        }
-
                         if let Some(program) = self.chrome_shaders.flow_field.as_ref() {
                             let _ = draw_flow_field(
                                 frame,
@@ -4186,55 +4207,6 @@ impl RenderState {
                                 energy,
                                 color,
                             );
-                        }
-
-                        let show_status = el.label.is_some() && base_rect_logical.size.w >= 88;
-                        let icon_px = base_rect_logical.size.h.min(24).max(1);
-                        let icon_rect_logical = if show_status {
-                            Rectangle::from_loc_and_size(
-                                (
-                                    base_rect_logical.loc.x + 10,
-                                    base_rect_logical.loc.y
-                                        + (base_rect_logical.size.h - icon_px) / 2,
-                                ),
-                                (icon_px, icon_px),
-                            )
-                        } else {
-                            center_rect_in(base_rect_logical, icon_px, icon_px)
-                        };
-
-                        // Let the flow field remain visible through the same captured-glass
-                        // surface used by the sidebar and status controls. The destination
-                        // icon is drawn explicitly above this material and the pulse below.
-                        if let Some(icon_id) = el.icon {
-                            let drew_glass = self
-                                .draw_glass_control(
-                                    frame,
-                                    atlas,
-                                    icon_id,
-                                    base_rect_logical,
-                                    icon_rect_logical,
-                                    ctx.output_scale,
-                                    active_theme,
-                                    el.hovered,
-                                    el.enabled,
-                                    el.active || el.selected,
-                                    output_factor,
-                                    linear_target,
-                                )
-                                .unwrap_or(false);
-                            if !drew_glass {
-                                Self::draw_icon_in_rect(
-                                    frame,
-                                    atlas,
-                                    icon_id,
-                                    icon_state,
-                                    icon_rect_logical,
-                                    ctx.output_scale,
-                                    style,
-                                    &tinted_icon,
-                                );
-                            }
                         }
 
                         if let (Some(pulse_shader), Some(pulse_frame)) =
@@ -4252,56 +4224,6 @@ impl RenderState {
                                 damage,
                                 pulse_color,
                             );
-                        }
-
-                        // Keep the destination glyph independent from the glass material.
-                        // The glass pass may etch the atlas mask subtly, but the explicit
-                        // top layer guarantees that the AI Console icon remains legible.
-                        if let Some(icon_id) = el.icon {
-                            Self::draw_icon_in_rect(
-                                frame,
-                                atlas,
-                                icon_id,
-                                icon_state,
-                                icon_rect_logical,
-                                ctx.output_scale,
-                                style,
-                                &tinted_icon,
-                            );
-                        }
-
-                        // The animation conveys energy; this label conveys meaning. Keep it
-                        // persistent so the state is understandable without hover, color, or
-                        // motion perception.
-                        if show_status {
-                            if let Some(label) = el.label.as_deref() {
-                                let label_style = style_for(
-                                    FontRole::Label,
-                                    12,
-                                    active_theme
-                                        .id
-                                        .builtin_id()
-                                        .unwrap_or(BuiltInThemeId::Eagle),
-                                );
-                                let bounds = fonts
-                                    .vertical_bounds(label, label_style)
-                                    .unwrap_or((-(label_style.size_px as i32), 0));
-                                let center_y =
-                                    base_rect_logical.loc.y + base_rect_logical.size.h / 2;
-                                let baseline_y = center_y - (bounds.0 + bounds.1) / 2;
-                                let label_x =
-                                    icon_rect_logical.loc.x + icon_rect_logical.size.w + 8;
-                                let _ = self.draw_text_cached(
-                                    frame,
-                                    fonts,
-                                    label,
-                                    label_x,
-                                    baseline_y,
-                                    label_style,
-                                    active_theme.text.title,
-                                    ctx.output_scale,
-                                );
-                            }
                         }
                     }
 

@@ -82,6 +82,7 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
     ChromeLayout {
         topbar: TopBarLayout {
             outer: sc(layout.topbar.outer),
+            ai_button: sc(layout.topbar.ai_button),
             flow_field: sc(layout.topbar.flow_field),
             inner: sc(layout.topbar.inner),
             title: sc(layout.topbar.title),
@@ -137,6 +138,7 @@ pub struct ChromeLayout<Kind = Logical> {
 #[derive(Debug, Clone)]
 pub struct TopBarLayout<Kind = Logical> {
     pub outer: Rectangle<i32, Kind>,
+    pub ai_button: Rectangle<i32, Kind>,
     pub flow_field: Rectangle<i32, Kind>,
     pub inner: Rectangle<i32, Kind>,
     pub title: Rectangle<i32, Kind>,
@@ -338,9 +340,18 @@ pub fn build_chrome_layout_with_config(
     }
     .max(1);
 
-    let flow_field = Rectangle::from_loc_and_size(
+    let ai_gap = 6;
+    let ai_button_w = status_cluster.size.h.min((flow_w - ai_gap - 1).max(1));
+    let ai_button = Rectangle::from_loc_and_size(
         (flow_left, status_cluster.loc.y),
-        (flow_w, status_cluster.size.h),
+        (ai_button_w, status_cluster.size.h),
+    );
+    let flow_field = Rectangle::from_loc_and_size(
+        (flow_left + ai_button_w + ai_gap, status_cluster.loc.y),
+        (
+            (flow_w - ai_button_w - ai_gap).max(1),
+            status_cluster.size.h,
+        ),
     );
 
     // Title gets the remaining space to the left of the cluster
@@ -425,6 +436,7 @@ pub fn build_chrome_layout_with_config(
         // Top bar
         topbar: TopBarLayout {
             outer: topbar_outer,
+            ai_button,
             flow_field,
             inner: topbar_inner,
             title: title_rect,
@@ -528,6 +540,8 @@ mod tests {
 
         assert_eq!(flow.loc.y, clock.loc.y);
         assert_eq!(flow.size.h, clock.size.h);
+        assert_eq!(layout.topbar.ai_button.loc.y, clock.loc.y);
+        assert_eq!(layout.topbar.ai_button.size.h, clock.size.h);
         assert!(
             layout
                 .topbar
@@ -535,5 +549,16 @@ mod tests {
                 .iter()
                 .all(|well| well.loc.y == flow.loc.y && well.size.h == flow.size.h)
         );
+    }
+
+    #[test]
+    fn ai_button_and_flow_field_are_separate_layout_regions() {
+        let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+
+        assert!(
+            layout.topbar.ai_button.loc.x + layout.topbar.ai_button.size.w
+                < layout.topbar.flow_field.loc.x
+        );
+        assert!(!layout.topbar.ai_button.overlaps(layout.topbar.flow_field));
     }
 }

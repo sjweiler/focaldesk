@@ -59,6 +59,8 @@ pub struct LinearOffscreenTargets {
     pub hdr_offscreen: Option<OffscreenTexture>,
     pub encoded_scanout: bool,
     pub encoded_hdr: bool,
+    /// The current frame in `linear_offscreen` is the canonical composited scene.
+    pub scene_linear: bool,
 }
 
 pub fn supports_linear_sdr(renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> bool {
@@ -869,6 +871,7 @@ fn apply_linear_output_encode(
 ) -> Result<SyncPoint> {
     targets.encoded_scanout = false;
     targets.encoded_hdr = false;
+    targets.scene_linear = true;
     let output_state = state.outputs.get(&output_id);
     let (hdr_active, hdr_kms_target) = output_state
         .map(|output| {
@@ -1016,6 +1019,7 @@ pub fn run_linear_staged_pass(
 ) -> Result<SyncPoint> {
     targets.encoded_scanout = false;
     targets.encoded_hdr = false;
+    targets.scene_linear = true;
     prepared.frame_ctx.damage = vec![Rectangle::from_loc_and_size((0, 0), buffer_size)];
 
     targets.ensure_offscreen(renderer, buffer_size)?;
@@ -1309,6 +1313,7 @@ pub fn run_sdr_pass(
 ) -> Result<SyncPoint> {
     targets.encoded_scanout = false;
     targets.encoded_hdr = false;
+    targets.scene_linear = false;
     targets.ensure_offscreen(renderer, buffer_size)?;
 
     let sync = {
