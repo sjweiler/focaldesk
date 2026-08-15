@@ -17,3 +17,9 @@ keyboard_options = ""
 #
 # [session_environment]
 # FOCALDESK_HDR_OUTPUT = "DP-3"
+#
+# To initialize only one validated HDR connector and leave every other output
+# disabled for the session, use this instead:
+# FOCALDESK_EXCLUSIVE_HDR_OUTPUT = "DP-3"
+# NVIDIA additionally requires the explicit single-output risk acknowledgement:
+# FOCALDESK_HDR_ALLOW_NVIDIA = "1"

@@ -6,6 +6,10 @@ use smithay::backend::renderer::gles::{
     GlesError, GlesPixelProgram, GlesRenderer, UniformName, UniformType,
 };
 
+// Smithay compiles custom shaders as GLSL ES 1.00. Keep one shared source for
+// both GLES 2 and GLES 3 contexts; GLES 3 implementations accept this profile.
+// The tests below guard the syntax and the optional fragment-highp fallback.
+
 pub struct ChromeShaders {
     pub beveled_panel: Option<GlesPixelProgram>,
     pub light_channel: Option<GlesPixelProgram>,
@@ -17,6 +21,9 @@ pub struct ChromeShaders {
     pub font_text: Option<GlesTexProgram>,
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
+    /// Adds display-aware wide-gamut/HDR highlights from the SDR wallpaper
+    /// texture after the retained base has been decoded into the FP16 scene.
+    pub wallpaper_creative_grade: Option<GlesTexProgram>,
     pub srgb_to_linear: Option<GlesTexProgram>,
     pub client_to_scene_linear: Option<GlesTexProgram>,
     /// Full FP16 scene-linear Rec.709 → encoded output color space.
@@ -36,13 +43,111 @@ pub struct ChromeShaders {
     pub flow_field: Option<GlesPixelProgram>,
     pub screensaver: Option<GlesPixelProgram>,
     pub glass_control: Option<GlesTexProgram>,
+    /// Display-P3-authored variants used only while drawing into the FP16
+    /// scene-linear SDR target. The legacy programs above remain the fallback.
+    pub beveled_panel_wide: Option<GlesPixelProgram>,
+    pub light_channel_wide: Option<GlesPixelProgram>,
+    pub glass_wide: Option<GlesPixelProgram>,
+    pub recessed_button_wide: Option<GlesPixelProgram>,
+    pub top_bar_wide: Option<GlesPixelProgram>,
+    pub tinted_icon_wide: Option<GlesTexProgram>,
+    pub amber_lightbar_wide: Option<GlesPixelProgram>,
+    pub font_text_wide: Option<GlesTexProgram>,
+    pub rounded_rect_wide: Option<GlesPixelProgram>,
+    pub wallpaper_tint_wide: Option<GlesTexProgram>,
+    pub pulse_wide: Option<GlesPixelProgram>,
+    pub accent_wide: Option<GlesPixelProgram>,
+    pub flow_field_wide: Option<GlesPixelProgram>,
+    pub screensaver_wide: Option<GlesPixelProgram>,
+    pub glass_control_wide: Option<GlesTexProgram>,
     glass_control_disabled: bool,
+    wide_gamut_disabled: bool,
 }
 
 impl Default for ChromeShaders {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Clone, Copy)]
+enum WideAlphaContract {
+    Straight,
+    Premultiplied,
+}
+
+/// Build a separate scene-linear wide-gamut program without changing the
+/// established shader. The original main writes colors authored in linear
+/// Display P3; this epilogue converts them to the compositor's extended
+/// linear-Rec.709 working space. Values outside 0..1 are deliberately retained
+/// for the final per-output color transform.
+fn wide_gamut_variant(source: &str, alpha_contract: WideAlphaContract) -> String {
+    // Capture the legacy result in an ordinary variable. Some GLES compilers
+    // reject reading back `gl_FragColor`, even though they accept multiple
+    // writes to it in the original program.
+    let captured = source.replace("gl_FragColor", "fd_legacy_color");
+    let renamed = captured.replacen(
+        "void main()",
+        "vec4 fd_legacy_color;\nvoid fd_legacy_main()",
+        1,
+    );
+    let straight = match alpha_contract {
+        WideAlphaContract::Straight => "fd_color.rgb",
+        WideAlphaContract::Premultiplied => {
+            "fd_color.a > 0.0001 ? fd_color.rgb / fd_color.a : fd_color.rgb"
+        }
+    };
+    format!(
+        r#"{renamed}
+
+vec3 fd_display_p3_to_scene_linear(vec3 p3) {{
+    return vec3(
+        1.224745 * p3.r - 0.224904 * p3.g,
+       -0.042058 * p3.r + 1.042081 * p3.g,
+       -0.019642 * p3.r - 0.078655 * p3.g + 1.098537 * p3.b
+    );
+}}
+
+void main() {{
+    fd_legacy_main();
+    vec4 fd_color = fd_legacy_color;
+    vec3 fd_straight = {straight};
+    vec3 fd_scene = fd_display_p3_to_scene_linear(fd_straight);
+    gl_FragColor = vec4(fd_scene * fd_color.a, fd_color.a);
+}}
+"#
+    )
+}
+
+fn wide_gamut_wallpaper_variant() -> String {
+    // The sampled wallpaper starts as linear Rec.709 after its sRGB decode.
+    // Move it into the same Display-P3 authoring coordinates as the tint before
+    // the shared wide epilogue converts the mixed result back to scene space.
+    let source = WALLPAPER_TINT_FRAG.replace(
+        "src_rgb = srgb_to_linear(src.rgb);",
+        r#"vec3 scene = srgb_to_linear(src.rgb);
+        src_rgb = vec3(
+            0.822593 * scene.r + 0.177534 * scene.g,
+            0.033200 * scene.r + 0.966784 * scene.g,
+            0.017085 * scene.r + 0.072396 * scene.g + 0.910301 * scene.b
+        );"#,
+    );
+    wide_gamut_variant(&source, WideAlphaContract::Premultiplied)
+}
+
+fn wide_gamut_glass_control_variant() -> String {
+    // The captured button background is already in scene-linear Rec.709.
+    let source = GLASS_CONTROL_FRAG.replace(
+        "vec3 background = texture2D(u_background, background_uv).rgb;",
+        r#"vec3 scene_background = texture2D(u_background, background_uv).rgb;
+    vec3 background = vec3(
+        0.822593 * scene_background.r + 0.177534 * scene_background.g,
+        0.033200 * scene_background.r + 0.966784 * scene_background.g,
+        0.017085 * scene_background.r + 0.072396 * scene_background.g
+            + 0.910301 * scene_background.b
+    );"#,
+    );
+    wide_gamut_variant(&source, WideAlphaContract::Premultiplied)
 }
 
 impl ChromeShaders {
@@ -58,6 +163,7 @@ impl ChromeShaders {
             font_text: None,
             rounded_rect: None,
             wallpaper_tint: None,
+            wallpaper_creative_grade: None,
             srgb_to_linear: None,
             client_to_scene_linear: None,
             output_encode_linear: None,
@@ -71,8 +177,46 @@ impl ChromeShaders {
             flow_field: None,
             screensaver: None,
             glass_control: None,
+            beveled_panel_wide: None,
+            light_channel_wide: None,
+            glass_wide: None,
+            recessed_button_wide: None,
+            top_bar_wide: None,
+            tinted_icon_wide: None,
+            amber_lightbar_wide: None,
+            font_text_wide: None,
+            rounded_rect_wide: None,
+            wallpaper_tint_wide: None,
+            pulse_wide: None,
+            accent_wide: None,
+            flow_field_wide: None,
+            screensaver_wide: None,
+            glass_control_wide: None,
             glass_control_disabled: false,
+            wide_gamut_disabled: false,
         }
+    }
+
+    /// True only when the complete alternate family compiled successfully.
+    /// Callers use this as an all-or-nothing switch so one frame never mixes
+    /// legacy encoded colors with Display-P3 scene-linear colors.
+    pub fn wide_gamut_ready(&self) -> bool {
+        !self.wide_gamut_disabled
+            && self.beveled_panel_wide.is_some()
+            && self.light_channel_wide.is_some()
+            && self.glass_wide.is_some()
+            && self.recessed_button_wide.is_some()
+            && self.top_bar_wide.is_some()
+            && self.tinted_icon_wide.is_some()
+            && self.amber_lightbar_wide.is_some()
+            && self.font_text_wide.is_some()
+            && self.rounded_rect_wide.is_some()
+            && self.wallpaper_tint_wide.is_some()
+            && self.pulse_wide.is_some()
+            && self.accent_wide.is_some()
+            && self.flow_field_wide.is_some()
+            && self.screensaver_wide.is_some()
+            && self.glass_control_wide.is_some()
     }
 
     /// Compile only the programs needed by the standalone layer-shell chrome.
@@ -315,6 +459,19 @@ impl ChromeShaders {
             )?);
         }
 
+        if self.wallpaper_creative_grade.is_none() {
+            self.wallpaper_creative_grade = Some(renderer.compile_custom_texture_shader(
+                WALLPAPER_CREATIVE_GRADE_FRAG,
+                &[
+                    UniformName::new("u_tint", UniformType::_4f),
+                    UniformName::new("u_texel_size", UniformType::_2f),
+                    UniformName::new("u_grade_mode", UniformType::_1f),
+                    UniformName::new("u_reference_white_nits", UniformType::_1f),
+                    UniformName::new("u_peak_nits", UniformType::_1f),
+                ],
+            )?);
+        }
+
         if self.srgb_to_linear.is_none() {
             self.srgb_to_linear =
                 Some(renderer.compile_custom_texture_shader(SRGB_TO_LINEAR_FRAG, &[])?);
@@ -325,6 +482,7 @@ impl ChromeShaders {
                 CLIENT_TO_SCENE_LINEAR_FRAG,
                 &[
                     UniformName::new("u_decode_tf", UniformType::_1f),
+                    UniformName::new("u_reference_white_nits", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
@@ -507,6 +665,215 @@ impl ChromeShaders {
                     UniformName::new("u_time", UniformType::_1f),
                 ],
             )?);
+        }
+
+        // Wide-gamut programs are deliberately optional. A driver/compiler
+        // rejection must never take down the proven SDR shader path.
+        if !self.wide_gamut_disabled && self.flow_field_wide.is_none() {
+            let result = (|| -> Result<_, GlesError> {
+                macro_rules! pixel {
+                    ($source:expr, $alpha:expr, $uniforms:expr) => {{
+                        let source = wide_gamut_variant($source, $alpha);
+                        renderer.compile_custom_pixel_shader(&source, $uniforms)?
+                    }};
+                }
+                macro_rules! texture {
+                    ($source:expr, $alpha:expr, $uniforms:expr) => {{
+                        let source = wide_gamut_variant($source, $alpha);
+                        renderer.compile_custom_texture_shader(&source, $uniforms)?
+                    }};
+                }
+
+                self.beveled_panel_wide = Some(pixel!(
+                    BEVELED_PANEL_FRAG_V2,
+                    WideAlphaContract::Straight,
+                    &[
+                        UniformName::new("u_bevel", UniformType::_1f),
+                        UniformName::new("u_softness", UniformType::_1f),
+                        UniformName::new("u_glow_width", UniformType::_1f),
+                        UniformName::new("u_glow_alpha", UniformType::_1f),
+                        UniformName::new("u_inner_shadow", UniformType::_1f),
+                        UniformName::new("u_corner_radius", UniformType::_1f),
+                        UniformName::new("u_face_color", UniformType::_4f),
+                        UniformName::new("u_light_color", UniformType::_4f),
+                        UniformName::new("u_shadow_color", UniformType::_4f),
+                        UniformName::new("u_glow_color", UniformType::_4f),
+                    ]
+                ));
+                self.light_channel_wide = Some(pixel!(
+                    LIGHT_CHANNEL_FRAG,
+                    WideAlphaContract::Straight,
+                    &[
+                        UniformName::new("u_slot_inset", UniformType::_1f),
+                        UniformName::new("u_core_inset", UniformType::_1f),
+                        UniformName::new("u_glow_radius", UniformType::_1f),
+                        UniformName::new("u_softness", UniformType::_1f),
+                        UniformName::new("u_housing_color", UniformType::_4f),
+                        UniformName::new("u_glow_color", UniformType::_4f),
+                        UniformName::new("u_core_color", UniformType::_4f),
+                    ]
+                ));
+                self.glass_wide = Some(pixel!(
+                    WORKAREA_GLASS_FRAG,
+                    WideAlphaContract::Straight,
+                    &[
+                        UniformName::new("u_size", UniformType::_2f),
+                        UniformName::new("u_opacity", UniformType::_1f),
+                        UniformName::new("u_output_factor", UniformType::_1f),
+                        UniformName::new("u_edge_width", UniformType::_1f),
+                        UniformName::new("u_edge_brightness", UniformType::_1f),
+                        UniformName::new("u_highlight_strength", UniformType::_1f),
+                        UniformName::new("u_tint", UniformType::_4f),
+                        UniformName::new("u_edge_color", UniformType::_4f),
+                        UniformName::new("u_time", UniformType::_1f),
+                    ]
+                ));
+                self.recessed_button_wide = Some(pixel!(
+                    RECESSED_BUTTON_FRAG,
+                    WideAlphaContract::Straight,
+                    &[
+                        UniformName::new("u_size", UniformType::_2f),
+                        UniformName::new("u_bevel", UniformType::_1f),
+                        UniformName::new("u_softness", UniformType::_1f),
+                        UniformName::new("u_inner_shadow", UniformType::_1f),
+                        UniformName::new("u_glow_strength", UniformType::_1f),
+                        UniformName::new("u_glow_radius", UniformType::_1f),
+                        UniformName::new("u_face_color", UniformType::_4f),
+                        UniformName::new("u_shadow_color", UniformType::_4f),
+                        UniformName::new("u_glow_color", UniformType::_4f),
+                    ]
+                ));
+                self.top_bar_wide = Some(pixel!(
+                    TOP_BAR_FRAG,
+                    WideAlphaContract::Straight,
+                    &[
+                        UniformName::new("u_size", UniformType::_2f),
+                        UniformName::new("u_radius", UniformType::_1f),
+                        UniformName::new("u_softness", UniformType::_1f),
+                        UniformName::new("u_bevel", UniformType::_1f),
+                        UniformName::new("u_highlight_strength", UniformType::_1f),
+                        UniformName::new("u_shadow_strength", UniformType::_1f),
+                        UniformName::new("u_trim_height", UniformType::_1f),
+                        UniformName::new("u_trim_brightness", UniformType::_1f),
+                        UniformName::new("u_face_color", UniformType::_4f),
+                        UniformName::new("u_edge_color", UniformType::_4f),
+                        UniformName::new("u_trim_color", UniformType::_4f),
+                    ]
+                ));
+                self.tinted_icon_wide = Some(texture!(
+                    TINTED_ICON_FRAG,
+                    WideAlphaContract::Premultiplied,
+                    &[UniformName::new("u_tint", UniformType::_4f)]
+                ));
+                self.amber_lightbar_wide = Some(pixel!(
+                    AMBER_LIGHTBAR_FRAG,
+                    WideAlphaContract::Straight,
+                    &[UniformName::new("u_color", UniformType::_4f)]
+                ));
+                self.font_text_wide = Some(texture!(
+                    FONT_TEXT_FRAG,
+                    WideAlphaContract::Premultiplied,
+                    &[UniformName::new("u_tint", UniformType::_4f)]
+                ));
+                self.rounded_rect_wide = Some(pixel!(
+                    ROUNDED_RECT_FRAG,
+                    WideAlphaContract::Premultiplied,
+                    &[
+                        UniformName::new("u_size", UniformType::_2f),
+                        UniformName::new("u_radius", UniformType::_1f),
+                        UniformName::new("u_color", UniformType::_4f),
+                    ]
+                ));
+                self.wallpaper_tint_wide = Some({
+                    let source = wide_gamut_wallpaper_variant();
+                    renderer.compile_custom_texture_shader(
+                        &source,
+                        &[
+                            UniformName::new("u_tint", UniformType::_4f),
+                            UniformName::new("u_decode_srgb", UniformType::_1f),
+                        ],
+                    )?
+                });
+                self.pulse_wide = Some(pixel!(
+                    PULSE_FRAG,
+                    WideAlphaContract::Premultiplied,
+                    &[
+                        UniformName::new("u_click_pos", UniformType::_2f),
+                        UniformName::new("u_time", UniformType::_1f),
+                        UniformName::new("u_size", UniformType::_2f),
+                        UniformName::new("u_color", UniformType::_4f),
+                    ]
+                ));
+                self.accent_wide = Some(pixel!(
+                    ACCENT_FRAG,
+                    WideAlphaContract::Premultiplied,
+                    &[
+                        UniformName::new("u_resolution", UniformType::_2f),
+                        UniformName::new("u_rect", UniformType::_4f),
+                        UniformName::new("u_accent", UniformType::_4f),
+                        UniformName::new("u_time", UniformType::_1f),
+                        UniformName::new("u_pulse", UniformType::_1f),
+                        UniformName::new("u_active", UniformType::_1f),
+                    ]
+                ));
+                self.flow_field_wide = Some(pixel!(
+                    FLOW_FIELD_FRAG,
+                    WideAlphaContract::Premultiplied,
+                    &[
+                        UniformName::new("u_resolution", UniformType::_2f),
+                        UniformName::new("u_rect", UniformType::_4f),
+                        UniformName::new("u_time", UniformType::_1f),
+                        UniformName::new("u_mode", UniformType::_1f),
+                        UniformName::new("u_energy", UniformType::_1f),
+                        UniformName::new("u_color", UniformType::_4f),
+                    ]
+                ));
+                self.screensaver_wide = Some(pixel!(
+                    SCREENSAVER_FRAG,
+                    WideAlphaContract::Straight,
+                    &[
+                        UniformName::new("u_resolution", UniformType::_2f),
+                        UniformName::new("u_time", UniformType::_1f),
+                    ]
+                ));
+                self.glass_control_wide = Some({
+                    let source = wide_gamut_glass_control_variant();
+                    renderer.compile_custom_texture_shader(
+                        &source,
+                        &[
+                            UniformName::new("u_background", UniformType::_1i),
+                            UniformName::new("u_background_uv_size", UniformType::_2f),
+                            UniformName::new("u_size", UniformType::_2f),
+                            UniformName::new("u_icon_uv_origin", UniformType::_2f),
+                            UniformName::new("u_icon_uv_size", UniformType::_2f),
+                            UniformName::new("u_icon_rect", UniformType::_4f),
+                            UniformName::new("u_icon_texel_size", UniformType::_2f),
+                            UniformName::new("u_glass_tint", UniformType::_4f),
+                            UniformName::new("u_accent_color", UniformType::_3f),
+                            UniformName::new("u_corner_radius", UniformType::_1f),
+                            UniformName::new("u_border_width", UniformType::_1f),
+                            UniformName::new("u_hover", UniformType::_1f),
+                            UniformName::new("u_pressed", UniformType::_1f),
+                            UniformName::new("u_enabled", UniformType::_1f),
+                            UniformName::new("u_active", UniformType::_1f),
+                            UniformName::new("u_warning", UniformType::_1f),
+                            UniformName::new("u_light_dir", UniformType::_3f),
+                            UniformName::new("u_opacity", UniformType::_1f),
+                            UniformName::new("u_output_factor", UniformType::_1f),
+                            UniformName::new("u_icon_strength", UniformType::_1f),
+                            UniformName::new("u_etch_depth", UniformType::_1f),
+                        ],
+                    )?
+                });
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.wide_gamut_disabled = true;
+                focaldesk_logging::flog_warn!(
+                    "wide-gamut chrome shader compile failed; retaining legacy shaders: {:?}",
+                    error
+                );
+            }
         }
 
         Ok(())
@@ -1041,10 +1408,56 @@ void main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        COMPOSITE_LINEAR_LAYER_FRAG, GLASS_CONTROL_FRAG, PORTAL_CAPTURE_SDR_FRAG,
-        RECESSED_BUTTON_FRAG, TINTED_ICON_FRAG, TOP_BAR_FRAG,
-    };
+    use super::*;
+
+    fn shader_sources() -> [&'static str; 27] {
+        [
+            BEVELED_PANEL_FRAG,
+            LIGHT_CHANNEL_FRAG,
+            CHAMFER_PANEL_FRAG,
+            CHAMFER_OLD__PANEL_FRAG,
+            BEVELED_PANEL_FRAG_V2,
+            WORKAREA_GLASS_FRAG,
+            RECESSED_BUTTON_FRAG,
+            TOP_BAR_FRAG,
+            TINTED_ICON_FRAG,
+            CLIENT_TO_SCENE_LINEAR_FRAG,
+            SRGB_TO_LINEAR_FRAG,
+            COMPOSITE_LINEAR_LAYER_FRAG,
+            PORTAL_CAPTURE_SDR_FRAG,
+            OUTPUT_ENCODE_SDR_FRAG,
+            OUTPUT_ENCODE_LUT_FRAG,
+            SDR_TO_LINEAR_SCRGB_FRAG,
+            LINEAR_SCRGB_TO_PQ_FRAG,
+            AMBER_LIGHTBAR_FRAG,
+            FONT_TEXT_FRAG,
+            ROUNDED_RECT_FRAG,
+            WALLPAPER_TINT_FRAG,
+            WALLPAPER_CREATIVE_GRADE_FRAG,
+            PULSE_FRAG,
+            ACCENT_FRAG,
+            FLOW_FIELD_FRAG,
+            SCREENSAVER_FRAG,
+            GLASS_CONTROL_FRAG,
+        ]
+    }
+
+    #[test]
+    fn shaders_stay_in_the_shared_glsl_es_100_subset() {
+        for shader in shader_sources() {
+            assert!(!shader.contains("#version"));
+            assert!(!shader.contains("layout("));
+            assert!(!shader.contains("texture("));
+            assert!(!shader.contains("out vec4"));
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(shader.contains("gl_FragColor"));
+
+            if shader.contains("precision highp float;") {
+                assert!(shader.contains("GL_FRAGMENT_PRECISION_HIGH"));
+                assert!(shader.contains("precision mediump float;"));
+            }
+        }
+    }
 
     #[test]
     fn pixel_shaders_use_smithays_vertex_varying() {
@@ -1086,6 +1499,46 @@ mod tests {
         assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_bt709"));
         assert!(PORTAL_CAPTURE_SDR_FRAG.contains("u_compress_gamut"));
     }
+
+    #[test]
+    fn wallpaper_grade_is_scene_linear_and_preserves_the_black_floor() {
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("graded - base"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("vec4((graded - base) * alpha, 0.0)"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("target_level(280.0)"));
+        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("base + vec3"));
+    }
+
+    #[test]
+    fn wide_gamut_variants_are_separate_scene_linear_programs() {
+        let legacy = FLOW_FIELD_FRAG.to_owned();
+        let wide = wide_gamut_variant(FLOW_FIELD_FRAG, WideAlphaContract::Premultiplied);
+
+        assert_eq!(legacy, FLOW_FIELD_FRAG);
+        assert!(wide.contains("void fd_legacy_main()"));
+        assert!(wide.contains("vec4 fd_legacy_color;"));
+        assert!(wide.contains("vec4 fd_color = fd_legacy_color;"));
+        assert!(wide.contains("fd_display_p3_to_scene_linear"));
+        assert!(wide.contains("fd_scene * fd_color.a"));
+        assert!(!FLOW_FIELD_FRAG.contains("fd_display_p3_to_scene_linear"));
+    }
+
+    #[test]
+    fn wide_gamut_conversion_preserves_extended_scene_values() {
+        let wide = wide_gamut_variant(AMBER_LIGHTBAR_FRAG, WideAlphaContract::Straight);
+        assert!(wide.contains("1.224745 * p3.r - 0.224904 * p3.g"));
+        assert!(!wide.contains("clamp(fd_scene"));
+    }
+
+    #[test]
+    fn sampled_scene_inputs_are_moved_into_p3_before_wide_effects() {
+        let wallpaper = wide_gamut_wallpaper_variant();
+        let glass = wide_gamut_glass_control_variant();
+        assert!(wallpaper.contains("vec3 scene = srgb_to_linear(src.rgb)"));
+        assert!(glass.contains("vec3 scene_background = texture2D"));
+        assert!(wallpaper.contains("0.822593 * scene.r"));
+        assert!(glass.contains("0.822593 * scene_background.r"));
+    }
 }
 
 const TINTED_ICON_FRAG: &str = r#"
@@ -1119,7 +1572,11 @@ const CLIENT_TO_SCENE_LINEAR_FRAG: &str = r#"
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 #if defined(EXTERNAL)
@@ -1131,6 +1588,7 @@ uniform sampler2D tex;
 varying vec2 v_coords;
 uniform float alpha;
 uniform float u_decode_tf;
+uniform float u_reference_white_nits;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -1146,6 +1604,21 @@ vec3 gamma22_to_linear(vec3 c) {
     return pow(max(c, vec3(0.0)), vec3(2.2));
 }
 
+vec3 pq_to_scene_linear(vec3 c) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    vec3 p = pow(clamp(c, 0.0, 1.0), vec3(1.0 / m2));
+    vec3 normalized_nits = pow(
+        max(p - c1, vec3(0.0)) / max(c2 - c3 * p, vec3(0.000001)),
+        vec3(1.0 / m1)
+    );
+    vec3 nits = normalized_nits * 10000.0;
+    return nits / max(u_reference_white_nits, 1.0);
+}
+
 vec3 decode_color(vec3 c) {
     if (u_decode_tf < 0.5) {
         return srgb_to_linear(c);
@@ -1153,7 +1626,10 @@ vec3 decode_color(vec3 c) {
     if (u_decode_tf < 1.5) {
         return c;
     }
-    return gamma22_to_linear(c);
+    if (u_decode_tf < 2.5) {
+        return gamma22_to_linear(c);
+    }
+    return pq_to_scene_linear(c);
 }
 
 vec3 mul_mat3(vec3 v) {
@@ -1192,7 +1668,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1228,7 +1708,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1295,7 +1779,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1395,7 +1883,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1456,7 +1948,11 @@ const OUTPUT_ENCODE_LUT_FRAG: &str = r#"
 //_DEFINES_
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 uniform sampler2D tex;
@@ -1524,7 +2020,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1562,7 +2062,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1747,6 +2251,157 @@ void main() {
 }
 "#;
 
+/// Display-aware creative re-grade for the bundled SDR wallpaper.
+///
+/// The retained wallpaper/chrome base is deliberately rendered through the
+/// reliable 8-bit path first. This program is then drawn over only the
+/// wallpaper rectangle in the FP16 scene. It outputs an additive linear-light
+/// delta (alpha zero under Smithay's ONE/ONE_MINUS_SRC_ALPHA blend), preserving
+/// the SDR base while allowing selected pixels to exceed reference white.
+const WALLPAPER_CREATIVE_GRADE_FRAG: &str = r#"
+//_DEFINES_
+
+#if defined(EXTERNAL)
+#extension GL_OES_EGL_image_external : require
+uniform samplerExternalOES tex;
+#else
+uniform sampler2D tex;
+#endif
+
+#ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+#endif
+
+varying vec2 v_coords;
+uniform float alpha;
+uniform vec4 u_tint;
+uniform vec2 u_texel_size;
+uniform float u_grade_mode; // 1 = wide-gamut SDR, 2 = HDR
+uniform float u_reference_white_nits;
+uniform float u_peak_nits;
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
+    vec3 low = c / 12.92;
+    vec3 high = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(high, low, vec3(cutoff));
+}
+
+float luminance(vec3 c) {
+    return dot(c, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec3 scene_to_p3(vec3 c) {
+    return vec3(
+        0.822593 * c.r + 0.177534 * c.g,
+        0.033200 * c.r + 0.966784 * c.g,
+        0.017085 * c.r + 0.072396 * c.g + 0.910301 * c.b
+    );
+}
+
+vec3 p3_to_scene(vec3 c) {
+    return vec3(
+        1.224745 * c.r - 0.224904 * c.g,
+       -0.042058 * c.r + 1.042081 * c.g,
+       -0.019642 * c.r - 0.078655 * c.g + 1.098537 * c.b
+    );
+}
+
+vec3 raise_to_luminance(vec3 color, float target) {
+    float y = max(luminance(color), 0.0001);
+    return color * max(1.0, target / y);
+}
+
+float target_level(float nits) {
+    return min(nits, u_peak_nits) / max(u_reference_white_nits, 1.0);
+}
+
+void main() {
+    if (u_grade_mode < 0.5) {
+        discard;
+    }
+
+    vec3 source_srgb = texture2D(tex, v_coords).rgb;
+    vec3 base_srgb = mix(source_srgb, u_tint.rgb, u_tint.a);
+    vec3 base = srgb_to_linear(base_srgb);
+    float y = luminance(base);
+
+    // Expand only the authored cyan/orange accents into P3. Background pixels
+    // remain unchanged, and the final per-output transform performs gamut map.
+    float cyan = smoothstep(0.04, 0.28, source_srgb.b - source_srgb.r)
+        * smoothstep(0.10, 0.55, source_srgb.g);
+    float orange = smoothstep(0.05, 0.32, source_srgb.r - source_srgb.b)
+        * smoothstep(0.015, 0.24, source_srgb.r - source_srgb.g);
+    float accent = max(cyan, orange);
+    vec3 p3 = scene_to_p3(base);
+    float p3_y = luminance(p3);
+    // HDR changes highlight luminance, not the diffuse wallpaper chroma.
+    // Keeping the SDR/P3 saturation avoids a mode-dependent orange cast.
+    float saturation = 1.22;
+    vec3 saturated = p3_to_scene(mix(vec3(p3_y), p3, saturation));
+    vec3 graded = mix(base, saturated, accent * 0.72);
+
+    if (u_grade_mode > 1.5) {
+        vec2 d = u_texel_size * 2.0;
+        float neighborhood = 0.25 * (
+            luminance(srgb_to_linear(texture2D(tex, v_coords + vec2(d.x, 0.0)).rgb))
+            + luminance(srgb_to_linear(texture2D(tex, v_coords - vec2(d.x, 0.0)).rgb))
+            + luminance(srgb_to_linear(texture2D(tex, v_coords + vec2(0.0, d.y)).rgb))
+            + luminance(srgb_to_linear(texture2D(tex, v_coords - vec2(0.0, d.y)).rgb))
+        );
+        float isolated = smoothstep(0.025, 0.30, y - neighborhood * 0.72);
+
+        // The source may arrive vertically flipped on different GLES import
+        // paths, so the fixed artwork masks accept both source-Y conventions.
+        float logo_y_distance = min(abs(v_coords.y - 0.545), abs(v_coords.y - 0.455));
+        float logo_x = smoothstep(0.32, 0.35, v_coords.x)
+            * (1.0 - smoothstep(0.65, 0.68, v_coords.x));
+        float logo_band = logo_x * (1.0 - smoothstep(0.055, 0.085, logo_y_distance));
+        float rim_x = smoothstep(0.30, 0.35, v_coords.x);
+        float rim_band = rim_x * smoothstep(0.035, 0.075, abs(v_coords.y - 0.5));
+
+        float max_channel = max(base.r, max(base.g, base.b));
+        float min_channel = min(base.r, min(base.g, base.b));
+        float neutral = 1.0 - smoothstep(0.025, 0.18, max_channel - min_channel);
+        float warm_pale = smoothstep(0.02, 0.22, source_srgb.r - source_srgb.b)
+            * smoothstep(0.35, 0.82, source_srgb.g);
+
+        float rim = rim_band * warm_pale * isolated;
+        float logo_white = logo_band * neutral * smoothstep(0.20, 0.72, y);
+        float star = (1.0 - logo_band) * (1.0 - rim) * isolated
+            * smoothstep(0.035, 0.48, y);
+
+        float star_nits = mix(80.0, 800.0, smoothstep(0.05, 0.85, y));
+        float rim_nits = mix(600.0, 1000.0, smoothstep(0.18, 0.82, y));
+        float cyan_nits = mix(150.0, 400.0, smoothstep(0.03, 0.60, y));
+        float orange_nits = mix(200.0, 500.0, smoothstep(0.03, 0.60, y));
+
+        vec3 highlighted = raise_to_luminance(graded, target_level(star_nits));
+        graded = mix(graded, highlighted, star);
+        highlighted = raise_to_luminance(graded, target_level(rim_nits));
+        graded = mix(graded, highlighted, rim);
+        highlighted = raise_to_luminance(graded, target_level(cyan_nits));
+        graded = mix(graded, highlighted, cyan * 0.72);
+        highlighted = raise_to_luminance(graded, target_level(orange_nits));
+        graded = mix(graded, highlighted, orange * isolated * 0.72);
+
+        // Keep the large white wordmark comfortable even though its antialiased
+        // edges also look locally highlight-like.
+        vec3 logo_grade = raise_to_luminance(base, target_level(280.0));
+        graded = mix(graded, logo_grade, logo_white);
+
+    }
+
+    // Add the creative delta to the already-decoded opaque SDR base. Alpha is
+    // intentionally zero: Smithay's premultiplied blend becomes dst + delta.
+    gl_FragColor = vec4((graded - base) * alpha, 0.0);
+}
+"#;
+
 const PULSE_FRAG: &str = r#"
 #ifdef GL_ES
 precision mediump float;
@@ -1816,7 +2471,11 @@ gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
 
 const FLOW_FIELD_FRAG: &str = r#"
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 uniform vec2  u_resolution;
@@ -1936,7 +2595,10 @@ void main() {
             // Idle: an asymmetric, breathing nebula rather than a rigid orb.
             float drift = fract(seed.x + u_time * 0.012 + fi * 0.003);
             float wave = u_time * 0.24 + fi * 0.41 + seed.y * 5.0;
-            x = mix(0.06, 0.94, drift) + sin(wave) * 0.025;
+            // Wrap beyond the clipped well so a particle fades out before it
+            // re-enters on the other side. Wrapping between visible edge
+            // positions makes otherwise-idle particles look like they blink.
+            x = mix(-0.08, 1.08, drift) + sin(wave) * 0.025;
             y = 0.50 + (seed.y - 0.5) * (0.46 - 0.16 * seed.x)
                 + cos(wave * 1.17) * 0.045;
             core_scale = 1.12;
@@ -1990,9 +2652,10 @@ void main() {
         float streak = exp(-abs(delta.y) / mix(4.8, 2.4, energy))
             * exp(-max(delta.x, 0.0) / 16.0) * trail;
         float ring = exp(-pow((dist - size.y * 0.13) / max(size.y * 0.08, 1.0), 2.0));
-        float shimmer = 0.78 + 0.22 * sin(u_time * 0.82 + fi * 0.79);
         vec3 color = particle_color(mode, seed, u_color.rgb);
-        accum += color * enabled * shimmer * (core + streak * 0.34 + ring * halo * 0.08);
+        // Motion carries the activity signal. Keeping particle luminance stable
+        // avoids an unrelated sparkle/flicker when the field is otherwise idle.
+        accum += color * enabled * (core + streak * 0.34 + ring * halo * 0.08);
     }
 
     // Exponential mapping keeps overlapping particles colorful instead of white.
@@ -2013,7 +2676,11 @@ void main() {
 
 const SCREENSAVER_FRAG: &str = r#"
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -2122,7 +2789,11 @@ const GLASS_CONTROL_FRAG: &str = r#"
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 #if defined(EXTERNAL)

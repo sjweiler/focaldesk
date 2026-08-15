@@ -50,6 +50,7 @@ pub struct EguiLayer {
 
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
+    pending_damage_pts: Option<Rect>,
     glow_painter: Option<Painter>,
     wants_pointer_input: bool,
     wants_keyboard_input: bool,
@@ -258,6 +259,7 @@ impl Default for EguiLayer {
             actions: Vec::new(),
             textures_delta: TexturesDelta::default(),
             primitives: Vec::new(),
+            pending_damage_pts: None,
             glow_painter: None,
             wants_pointer_input: false,
             wants_keyboard_input: false,
@@ -404,6 +406,63 @@ impl EguiLayer {
         self.has_open_panels() && self.owner_output == Some(output)
     }
 
+    /// Conservative physical damage covering everything egui painted most recently.
+    ///
+    /// Mesh bounds are tighter than egui's clip rectangles (which are commonly the
+    /// whole screen). Keeping the old primitives until the next UI update also makes
+    /// this useful when a panel closes: callers can damage the pixels it occupied so
+    /// the retained compositor targets restore the scene below it.
+    pub fn paint_damage_rect(
+        &mut self,
+        output_size: Size<i32, Physical>,
+        output_scale: smithay::utils::Scale<f64>,
+    ) -> Option<Rectangle<i32, Physical>> {
+        self.remember_current_paint_damage();
+        let bounds = self.pending_damage_pts.take()?;
+
+        let margin = 2.0;
+        let min_x = ((bounds.min.x - margin) as f64 * output_scale.x).floor() as i32;
+        let min_y = ((bounds.min.y - margin) as f64 * output_scale.y).floor() as i32;
+        let max_x = ((bounds.max.x + margin) as f64 * output_scale.x).ceil() as i32;
+        let max_y = ((bounds.max.y + margin) as f64 * output_scale.y).ceil() as i32;
+        let damage = Rectangle::from_loc_and_size(
+            (min_x, min_y),
+            ((max_x - min_x).max(0), (max_y - min_y).max(0)),
+        );
+        damage.intersection(Rectangle::from_loc_and_size((0, 0), output_size))
+    }
+
+    fn remember_current_paint_damage(&mut self) {
+        let mut bounds: Option<Rect> = None;
+        for clipped in &self.primitives {
+            let primitive_bounds = match &clipped.primitive {
+                Primitive::Mesh(mesh) => {
+                    let Some(first) = mesh.vertices.first() else {
+                        continue;
+                    };
+                    let mut rect = Rect::from_min_max(first.pos, first.pos);
+                    for vertex in &mesh.vertices[1..] {
+                        rect = rect.union(Rect::from_min_max(vertex.pos, vertex.pos));
+                    }
+                    rect.intersect(clipped.clip_rect)
+                }
+                Primitive::Callback(callback) => callback.rect.intersect(clipped.clip_rect),
+            };
+            if primitive_bounds.is_positive() {
+                bounds = Some(match bounds {
+                    Some(current) => current.union(primitive_bounds),
+                    None => primitive_bounds,
+                });
+            }
+        }
+        if let Some(bounds) = bounds {
+            self.pending_damage_pts = Some(match self.pending_damage_pts {
+                Some(pending) => pending.union(bounds),
+                None => bounds,
+            });
+        }
+    }
+
     pub fn open_panel(&mut self, panel: PanelKind, owner_output: OutputId) {
         let mut opened = false;
         match panel {
@@ -479,7 +538,9 @@ impl EguiLayer {
         }
 
         self.textures_delta.append(output.textures_delta);
+        self.remember_current_paint_damage();
         self.primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+        self.remember_current_paint_damage();
         self.wants_pointer_input = self.ctx.wants_pointer_input() || self.ctx.is_using_pointer();
         self.wants_keyboard_input = self.ctx.wants_keyboard_input();
     }
@@ -610,6 +671,7 @@ impl EguiLayer {
     }
 
     pub fn clear_paint(&mut self) {
+        self.remember_current_paint_damage();
         self.primitives.clear();
         self.wants_pointer_input = false;
         self.wants_keyboard_input = false;
@@ -684,7 +746,9 @@ impl EguiLayer {
             self.accessibility.update(update);
         }
         self.textures_delta.append(output.textures_delta);
+        self.remember_current_paint_damage();
         self.primitives = self.ctx.tessellate(output.shapes, output.pixels_per_point);
+        self.remember_current_paint_damage();
         self.actions.extend(actions);
         self.wants_pointer_input = self.ctx.wants_pointer_input() || self.ctx.is_using_pointer();
         self.wants_keyboard_input = self.ctx.wants_keyboard_input();
@@ -1263,5 +1327,23 @@ mod egui_vertex_layout_tests {
             node.role() == egui::accesskit::Role::Button
                 && node.label() == Some("Accessible action")
         }));
+    }
+
+    #[test]
+    fn paint_damage_uses_widget_bounds_instead_of_the_full_output() {
+        let mut layer = EguiLayer::default();
+        let panel = egui::Rect::from_min_size(egui::pos2(100.0, 80.0), egui::vec2(240.0, 160.0));
+        let mut mesh = egui::Mesh::default();
+        mesh.add_colored_rect(panel, egui::Color32::WHITE);
+        layer.primitives.push(egui::ClippedPrimitive {
+            clip_rect: egui::Rect::EVERYTHING,
+            primitive: egui::epaint::Primitive::Mesh(mesh),
+        });
+
+        let damage = layer
+            .paint_damage_rect(smithay::utils::Size::from((1920, 1080)), Scale::from(1.0))
+            .expect("painted widgets should produce damage");
+        assert!(damage.loc.x <= 100 && damage.loc.y <= 80);
+        assert!(damage.size.w < 600 && damage.size.h < 500);
     }
 }

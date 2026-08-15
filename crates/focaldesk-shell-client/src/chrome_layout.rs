@@ -81,7 +81,6 @@ pub fn scale_chrome_layout(layout: &ChromeLayout, scale: f64) -> ChromeLayout<Ph
         topbar: TopBarLayout {
             outer: sc(layout.topbar.outer),
             ai_button: sc(layout.topbar.ai_button),
-            flow_field: sc(layout.topbar.flow_field),
             inner: sc(layout.topbar.inner),
             title: sc(layout.topbar.title),
             trim: sc(layout.topbar.trim),
@@ -137,7 +136,6 @@ pub struct ChromeLayout<Kind = Logical> {
 pub struct TopBarLayout<Kind = Logical> {
     pub outer: Rectangle<i32, Kind>,
     pub ai_button: Rectangle<i32, Kind>,
-    pub flow_field: Rectangle<i32, Kind>,
     pub inner: Rectangle<i32, Kind>,
     pub title: Rectangle<i32, Kind>,
     pub trim: Rectangle<i32, Kind>,
@@ -298,8 +296,10 @@ pub fn build_chrome_layout_with_config(
     // client area and the visible glass backdrop describe the same region.
     let glass_rect = work_recess;
 
+    // Keep decorative trim in the frame above the client recess so client
+    // content updates cannot invalidate it.
     let work_trim = Some(Rectangle::from_loc_and_size(
-        (work_inner_frame.loc.x + 6, work_inner_frame.loc.y + 4),
+        (work_inner_frame.loc.x + 6, work_inner_frame.loc.y),
         ((work_inner_frame.size.w - 12).max(1), 4),
     ));
 
@@ -328,34 +328,14 @@ pub fn build_chrome_layout_with_config(
     let (status_cluster, status_wells, clock_well) =
         build_status_cluster(topbar_inner, 10, 6, 8, status_count);
 
-    let flow_left = topbar_inner.loc.x + 6;
-    let flow_gap = 10;
-    let flow_available = (status_cluster.loc.x - flow_left - flow_gap).max(0);
-    let flow_preferred = 136;
-    let flow_min = 96;
-    let flow_w = if flow_available <= flow_min {
-        flow_available
-    } else {
-        flow_available.min(flow_preferred).max(flow_min)
-    }
-    .max(1);
-
-    let ai_gap = 6;
-    let ai_button_w = status_cluster.size.h.min((flow_w - ai_gap - 1).max(1));
+    let control_left = topbar_inner.loc.x + 6;
+    let ai_button_w = status_cluster.size.h;
     let ai_button = Rectangle::from_loc_and_size(
-        (flow_left, status_cluster.loc.y),
+        (control_left, status_cluster.loc.y),
         (ai_button_w, status_cluster.size.h),
     );
-    let flow_field = Rectangle::from_loc_and_size(
-        (flow_left + ai_button_w + ai_gap, status_cluster.loc.y),
-        (
-            (flow_w - ai_button_w - ai_gap).max(1),
-            status_cluster.size.h,
-        ),
-    );
-
     // Title gets the remaining space to the left of the cluster
-    let title_left = flow_field.loc.x + flow_field.size.w + 12;
+    let title_left = ai_button.loc.x + ai_button.size.w + 12;
     let title_right = (status_cluster.loc.x - 10).max(title_left + 24);
 
     let title_rect = Rectangle::from_loc_and_size(
@@ -461,7 +441,6 @@ pub fn build_chrome_layout_with_config(
         topbar: TopBarLayout {
             outer: topbar_outer,
             ai_button,
-            flow_field,
             inner: topbar_inner,
             title: title_rect,
             trim: topbar_trim,
@@ -520,30 +499,20 @@ mod tests {
     }
 
     #[test]
-    fn flow_field_matches_status_and_clock_vertical_clearance() {
+    fn title_follows_ai_button_without_an_activity_slot() {
         let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
-        let flow = layout.topbar.flow_field;
-        let clock = layout.topbar.clock_well;
 
-        assert_eq!(flow.loc.y, clock.loc.y);
-        assert_eq!(flow.size.h, clock.size.h);
-        assert_eq!(layout.topbar.ai_button.loc.y, clock.loc.y);
-        assert_eq!(layout.topbar.ai_button.size.h, clock.size.h);
-        assert!(layout
-            .topbar
-            .status_wells
-            .iter()
-            .all(|well| well.loc.y == flow.loc.y && well.size.h == flow.size.h));
+        assert_eq!(
+            layout.topbar.title.loc.x,
+            layout.topbar.ai_button.loc.x + layout.topbar.ai_button.size.w + 12
+        );
     }
 
     #[test]
-    fn ai_button_and_flow_field_are_separate_layout_regions() {
+    fn work_trim_does_not_overlap_client_recess() {
         let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+        let trim = layout.work_area.trim.expect("default layout has work trim");
 
-        assert!(
-            layout.topbar.ai_button.loc.x + layout.topbar.ai_button.size.w
-                < layout.topbar.flow_field.loc.x
-        );
-        assert!(!layout.topbar.ai_button.overlaps(layout.topbar.flow_field));
+        assert!(!trim.overlaps(layout.work_area.recess));
     }
 }

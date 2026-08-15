@@ -515,6 +515,7 @@ fn bounded_metadata(value: &str) -> String {
 }
 
 fn runtime_display_status_value(state: &DesktopState) -> serde_json::Value {
+    let exclusive = focaldesk_settings_core::load_exclusive_hdr_state();
     let outputs: Vec<DisplayRuntimeOutputStatus> = state
         .outputs
         .values()
@@ -523,6 +524,17 @@ fn runtime_display_status_value(state: &DesktopState) -> serde_json::Value {
             icc_lut_fallback_active: output.icc_lut_fallback_active,
             wide_gamut_active: output.color_description.primaries
                 != crate::core::color::ColorPrimaries::Srgb,
+            hdr_supported: output.hdr_supported,
+            hdr_requested: output.hdr_requested,
+            hdr_active: output.hdr_enabled,
+            exclusive_hdr_phase: (exclusive.connector.as_deref()
+                == Some(output.handle.name().as_str()))
+            .then_some(exclusive.phase)
+            .unwrap_or_default(),
+            exclusive_hdr_reason: (exclusive.connector.as_deref()
+                == Some(output.handle.name().as_str()))
+            .then(|| exclusive.reason.clone())
+            .flatten(),
         })
         .collect();
     serde_json::to_value(outputs).unwrap_or(serde_json::Value::Null)
@@ -583,12 +595,17 @@ pub struct OutputState {
     /// HDR state staged for the next DRM frame. Rendering targets this state,
     /// while `hdr_kms_applied` changes only after the matching vblank.
     pub hdr_transition_target: Option<bool>,
+    /// Exclusive HDR has reached PQ KMS scanout but has not completed the
+    /// post-transition stability window exposed to Settings.
+    pub hdr_verification_pending: bool,
     pub hdr_enabled: bool,
     /// EDID Type-1 HDR static metadata (nits), when detected.
     pub edid_hdr_max_luminance_nits: Option<f32>,
     pub edid_hdr_max_fall_nits: Option<f32>,
     pub active_workspace: WorkspaceId,
     pub pending_damage: Vec<Rectangle<i32, Physical>>,
+    /// Changes whenever the retained wallpaper/chrome base may have changed.
+    pub sdr_base_generation: u64,
     pub last_sw_cursor_rect: Option<Rectangle<i32, Physical>>,
     pub base_color_description: crate::core::color::ColorDescription,
     pub color_description: crate::core::color::ColorDescription,
@@ -723,10 +740,21 @@ pub enum DamageSource {
     WindowMove,
     WindowResize,
     Cursor,
+    Egui,
+    ShaderAnimation,
     Hover,
     CommitBbox,
     FullRedrawFallback,
     Unknown,
+}
+
+impl DamageSource {
+    fn affects_sdr_base(self) -> bool {
+        matches!(
+            self,
+            DamageSource::Hover | DamageSource::FullRedrawFallback | DamageSource::Unknown
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -734,6 +762,8 @@ pub struct DamageSourceCounts {
     pub window_move: u64,
     pub window_resize: u64,
     pub cursor: u64,
+    pub egui: u64,
+    pub shader_animation: u64,
     pub hover: u64,
     pub commit_bbox: u64,
     pub full_redraw_fallback: u64,
@@ -746,6 +776,8 @@ impl DamageSourceCounts {
             DamageSource::WindowMove => self.window_move += 1,
             DamageSource::WindowResize => self.window_resize += 1,
             DamageSource::Cursor => self.cursor += 1,
+            DamageSource::Egui => self.egui += 1,
+            DamageSource::ShaderAnimation => self.shader_animation += 1,
             DamageSource::Hover => self.hover += 1,
             DamageSource::CommitBbox => self.commit_bbox += 1,
             DamageSource::FullRedrawFallback => self.full_redraw_fallback += 1,
@@ -1011,11 +1043,9 @@ pub struct DesktopState {
     damage_last_logged_surface_commit: u64,
     pub sidebar_pulse: Option<SidebarPulse>,
     pub topbar_pulse: Option<TopbarPulse>,
-    pub flow_field_pulse: Option<FlowFieldPulse>,
     pub clock_pulse: Option<ClockPulse>,
     ai_flow_mode_cache: AiFlowMode,
     ai_flow_mode_last_poll: Instant,
-    flow_field_anim_last_damage: Instant,
     pub ui_sound_player: UiSoundPlayer,
     last_sidebar_hover_sound_target: Option<(OutputId, ElementId)>,
     last_clock_text: String,
@@ -1048,7 +1078,6 @@ struct LaunchContext {
 
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
 pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
-pub(crate) const FLOW_FIELD_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 
 #[derive(Debug)]
@@ -1120,19 +1149,6 @@ fn topbar_pulse_target_at(layout: &ChromeLayout, px: i32, py: i32) -> Option<Top
 #[derive(Clone, Copy, Debug)]
 pub struct TopbarPulseFrame {
     pub target: TopbarPulseTarget,
-    pub click_local: Point<f64, Logical>,
-    pub elapsed: Duration,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct FlowFieldPulse {
-    pub output_id: OutputId,
-    pub click_local: Point<f64, Logical>,
-    pub started_at: Instant,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct FlowFieldPulseFrame {
     pub click_local: Point<f64, Logical>,
     pub elapsed: Duration,
 }
@@ -1254,16 +1270,35 @@ impl DesktopState {
         for op in ops {
             match op {
                 PendingEguiOp::OpenPanel(panel, output) => {
-                    self.render.egui.open_panel(panel, output);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    // Chrome handles the click that opens the panel before egui is
+                    // active, so egui does not see the pointer event that triggered
+                    // it. Seed the newly opened layer with the current local pointer
+                    // position; otherwise its hover/input state remains stale until
+                    // the user moves the mouse.
+                    let pointer_position = self.pointer_relative_to_output_logical(output);
+                    if let Some(desktop_output) = self.desktop_outputs.get_mut(&output) {
+                        desktop_output.egui.open_panel(panel, output);
+                        if desktop_output.egui.has_open_panels() {
+                            if let Some(position) = pointer_position {
+                                desktop_output
+                                    .egui
+                                    .handle_input(EguiInputEvent::PointerMoved { position });
+                            }
+                        }
+                        self.mark_egui_damage(output);
+                    }
                 }
                 PendingEguiOp::AddWorkspace { output, name } => {
-                    self.render.egui.open_add_workspace_dialog(output, name);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    if let Some(desktop_output) = self.desktop_outputs.get_mut(&output) {
+                        desktop_output.egui.open_add_workspace_dialog(output, name);
+                        self.mark_egui_damage(output);
+                    }
                 }
                 PendingEguiOp::DeleteWorkspace(output) => {
-                    self.render.egui.open_delete_workspace_dialog(output);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    if let Some(desktop_output) = self.desktop_outputs.get_mut(&output) {
+                        desktop_output.egui.open_delete_workspace_dialog(output);
+                        self.mark_egui_damage(output);
+                    }
                 }
             }
         }
@@ -1592,7 +1627,10 @@ impl DesktopState {
         // Force a fresh battery/AC snapshot on the next timer pass after wake.
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
         self.render.invalidate_gpu_state();
-        self.render.egui.refresh_power_status_now();
+        for output in self.desktop_outputs.values_mut() {
+            output.egui.invalidate_gpu_state();
+            output.egui.refresh_power_status_now();
+        }
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
@@ -2119,6 +2157,9 @@ impl DesktopState {
                     self.focused_output,
                 ));
             }
+            DesktopAction::Logout => {
+                self.running = false;
+            }
         }
         Ok(())
     }
@@ -2175,11 +2216,12 @@ impl DesktopState {
                 output.logical_origin = logical_origin;
                 let requested = config.hdr_requested || config.hdr_enabled;
                 output.hdr_requested = output.hdr_supported && requested;
-                output.hdr_enabled = crate::core::color::output_hdr_render_active(
-                    output.hdr_requested,
-                    output.hdr_supported,
-                    output.hdr_kms_applied,
-                );
+                output.hdr_enabled = !output.hdr_verification_pending
+                    && crate::core::color::output_hdr_render_active(
+                        output.hdr_requested,
+                        output.hdr_supported,
+                        output.hdr_kms_applied,
+                    );
                 output.color_profile_override = config.color_profile;
                 output.icc_profile_path = config.icc_profile_path.clone();
             }
@@ -2311,6 +2353,7 @@ impl DesktopState {
     }
 
     fn runtime_display_statuses(&self) -> Vec<DisplayRuntimeOutputStatus> {
+        let exclusive = focaldesk_settings_core::load_exclusive_hdr_state();
         self.outputs
             .values()
             .map(|output| DisplayRuntimeOutputStatus {
@@ -2318,6 +2361,17 @@ impl DesktopState {
                 icc_lut_fallback_active: output.icc_lut_fallback_active,
                 wide_gamut_active: output.color_description.primaries
                     != crate::core::color::ColorPrimaries::Srgb,
+                hdr_supported: output.hdr_supported,
+                hdr_requested: output.hdr_requested,
+                hdr_active: output.hdr_enabled,
+                exclusive_hdr_phase: (exclusive.connector.as_deref()
+                    == Some(output.handle.name().as_str()))
+                .then_some(exclusive.phase)
+                .unwrap_or_default(),
+                exclusive_hdr_reason: (exclusive.connector.as_deref()
+                    == Some(output.handle.name().as_str()))
+                .then(|| exclusive.reason.clone())
+                .flatten(),
             })
             .collect()
     }
@@ -2510,38 +2564,12 @@ impl DesktopState {
         }
         self.ai_flow_mode_last_poll = now;
 
-        let previous = self.ai_flow_mode_cache;
         self.ai_flow_mode_cache = match send_ai_request(&AiIpcRequest::Status) {
             Ok(AiIpcResponse::Status { status }) => ai_flow_mode_from_status(&status),
             Ok(AiIpcResponse::Error { .. }) => AiFlowMode::Error,
             Ok(_) => AiFlowMode::Error,
             Err(_) => AiFlowMode::Error,
         };
-        if self.ai_flow_mode_cache != previous {
-            self.mark_flow_field_animation_damage(true);
-        }
-    }
-
-    fn mark_flow_field_animation_damage(&mut self, force: bool) {
-        const INTERVAL: Duration = Duration::from_millis(50);
-        let now = Instant::now();
-        if !force && now.saturating_duration_since(self.flow_field_anim_last_damage) < INTERVAL {
-            return;
-        }
-        self.flow_field_anim_last_damage = now;
-
-        let rects: Vec<(OutputId, Rectangle<i32, Logical>)> = self
-            .outputs
-            .keys()
-            .filter_map(|output_id| {
-                self.chrome_layout_for_output(*output_id)
-                    .map(|layout| (*output_id, layout.topbar.flow_field))
-            })
-            .collect();
-
-        for (output_id, rect) in rects {
-            self.mark_output_logical_damage(output_id, rect, 2, DamageSource::Unknown);
-        }
     }
 
     fn ui_element_at_pointer_for_output(&self, output_id: OutputId) -> Option<&UiElement> {
@@ -2807,60 +2835,97 @@ impl DesktopState {
     }
 
     pub fn sync_egui(&mut self, frame_ctx: &DesktopFrameCtx) {
-        if !self.render.egui.has_open_panels() {
-            self.render.egui.clear_paint();
+        let output_id = frame_ctx.rendering_output;
+        let Some(desktop_output) = self.desktop_outputs.get(&output_id) else {
+            return;
+        };
+        if !desktop_output.egui.has_open_panels() {
+            self.desktop_outputs
+                .get_mut(&output_id)
+                .expect("checked above")
+                .egui
+                .clear_paint();
             return;
         }
-        self.render.egui.set_clipboard_entries(
-            self.clipboard_history
-                .entries()
-                .map(|entry| focaldesk_ui::egui_panels::ClipboardEntryView {
-                    id: entry.id,
-                    preview: entry.text.clone(),
-                })
-                .collect(),
-        );
+
+        let clipboard_entries = self
+            .clipboard_history
+            .entries()
+            .map(|entry| focaldesk_ui::egui_panels::ClipboardEntryView {
+                id: entry.id,
+                preview: entry.text.clone(),
+            })
+            .collect();
         let active_workspace = self
             .outputs
-            .get(&frame_ctx.rendering_output)
+            .get(&output_id)
             .map(|output| output.active_workspace)
             .unwrap_or(self.active_workspace);
-        self.render.egui.set_workspace_entries(
-            self.workspace_names
-                .iter()
-                .enumerate()
-                .map(
-                    |(index, name)| focaldesk_ui::egui_panels::WorkspaceEntryView {
-                        number: (index + 1) as u32,
-                        name: name.clone(),
-                        active: active_workspace.0 == (index + 1) as u32,
-                    },
-                )
-                .collect(),
-        );
-        self.render.egui.update_panels(frame_ctx);
-        for action in self.render.egui.take_actions() {
+        let workspace_entries = self
+            .workspace_names
+            .iter()
+            .enumerate()
+            .map(
+                |(index, name)| focaldesk_ui::egui_panels::WorkspaceEntryView {
+                    number: (index + 1) as u32,
+                    name: name.clone(),
+                    active: active_workspace.0 == (index + 1) as u32,
+                },
+            )
+            .collect();
+
+        let actions = {
+            let egui = &mut self
+                .desktop_outputs
+                .get_mut(&output_id)
+                .expect("checked above")
+                .egui;
+            egui.set_clipboard_entries(clipboard_entries);
+            egui.set_workspace_entries(workspace_entries);
+            egui.update_panels(frame_ctx);
+            let actions = egui.take_actions();
+            if !egui.has_open_panels() {
+                egui.clear_paint();
+            }
+            actions
+        };
+        for action in actions {
             self.queue_ui_action(action);
         }
-        if !self.render.egui.has_open_panels() {
-            self.render.egui.clear_paint();
+    }
+
+    fn mark_egui_damage(&mut self, output_id: OutputId) {
+        let output_geometry = self
+            .outputs
+            .get(&output_id)
+            .map(|output| (output.physical_size, output.scale));
+        let damage = output_geometry.and_then(|(physical_size, scale)| {
+            self.desktop_outputs
+                .get_mut(&output_id)
+                .and_then(|output| output.egui.paint_damage_rect(physical_size, scale))
+        });
+        if let Some(damage) = damage {
+            self.mark_output_damage_source(output_id, damage, DamageSource::Egui);
+        } else {
+            // Opening a panel has no previous primitives to bound. The first frame
+            // establishes retained contents; subsequent interaction is panel-local.
+            self.mark_output_full_damage(output_id, DamageSource::Egui);
         }
     }
 
     fn process_egui_actions(&mut self) {
-        if !self.render.egui.has_open_panels() {
-            return;
+        let output_ids: Vec<_> = self
+            .desktop_outputs
+            .iter()
+            .filter_map(|(id, output)| output.egui.has_open_panels().then_some(*id))
+            .collect();
+        for output_id in output_ids {
+            let Some(frame_ctx) = self.egui_frame_ctx_for_output(output_id, Instant::now()) else {
+                continue;
+            };
+            self.sync_egui(&frame_ctx);
+            self.mark_egui_damage(output_id);
         }
-        let output_id = self
-            .render
-            .egui
-            .owner_output()
-            .unwrap_or(self.focused_output);
-        let Some(frame_ctx) = self.egui_frame_ctx_for_output(output_id, Instant::now()) else {
-            return;
-        };
-        self.sync_egui(&frame_ctx);
-        self.mark_output_full_damage(output_id, DamageSource::Unknown);
     }
 
     fn egui_pointer_button(button: FlowMouseButton) -> Option<EguiPointerButton> {
@@ -3239,43 +3304,48 @@ impl DesktopState {
         Some(ch.to_string())
     }
 
+    fn egui_open_on_output(&self, output_id: OutputId) -> bool {
+        self.desktop_outputs
+            .get(&output_id)
+            .is_some_and(|output| output.egui.has_open_panels())
+    }
+
+    fn egui_wants_pointer_on_output(&self, output_id: OutputId) -> bool {
+        self.desktop_outputs
+            .get(&output_id)
+            .is_some_and(|output| output.egui.wants_pointer_input())
+    }
+
     fn handle_egui_input(&mut self, event: &FlowInputEvent) -> bool {
-        if !self.render.egui.has_open_panels() {
+        let output_id = match *event {
+            FlowInputEvent::PointerMoved { position, .. }
+            | FlowInputEvent::PointerButton { position, .. }
+            | FlowInputEvent::PointerScroll { position, .. } => self.output_under_pointer(position),
+            FlowInputEvent::PointerLeft | FlowInputEvent::Key { .. } => Some(self.focused_output),
+            _ => None,
+        };
+        let Some(output_id) = output_id else {
+            return false;
+        };
+        if !self
+            .desktop_outputs
+            .get(&output_id)
+            .is_some_and(|output| output.egui.has_open_panels())
+        {
             return false;
         }
 
-        let Some(owner_output) = self.render.egui.owner_output() else {
-            return false;
-        };
-
         let egui_event = match *event {
-            FlowInputEvent::PointerMoved { position, .. } => {
-                let Some(output_id) = self.output_under_pointer(position) else {
-                    return false;
-                };
-                if output_id != owner_output {
-                    return false;
-                }
+            FlowInputEvent::PointerMoved { .. } => {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
                 EguiInputEvent::PointerMoved { position: local }
             }
-            FlowInputEvent::PointerButton {
-                button,
-                state,
-                position,
-                ..
-            } => {
+            FlowInputEvent::PointerButton { button, state, .. } => {
                 let Some(button) = Self::egui_pointer_button(button) else {
                     return false;
                 };
-                let Some(output_id) = self.output_under_pointer(position) else {
-                    return false;
-                };
-                if output_id != owner_output {
-                    return false;
-                }
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
@@ -3286,15 +3356,7 @@ impl DesktopState {
                     modifiers: Self::egui_modifiers(self.input.modifiers),
                 }
             }
-            FlowInputEvent::PointerScroll {
-                delta, position, ..
-            } => {
-                let Some(output_id) = self.output_under_pointer(position) else {
-                    return false;
-                };
-                if output_id != owner_output {
-                    return false;
-                }
+            FlowInputEvent::PointerScroll { delta, .. } => {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
@@ -3321,22 +3383,19 @@ impl DesktopState {
                 state,
                 repeat,
                 modifiers,
-            } => {
-                if self.focused_output != owner_output {
-                    return false;
-                }
-                EguiInputEvent::Key {
-                    key: Self::egui_key(keycode),
-                    text: Self::egui_text_for_keycode(keycode, modifiers),
-                    pressed: matches!(state, FlowKeyState::Pressed),
-                    repeat,
-                    modifiers: Self::egui_modifiers(modifiers),
-                }
-            }
+            } => EguiInputEvent::Key {
+                key: Self::egui_key(keycode),
+                text: Self::egui_text_for_keycode(keycode, modifiers),
+                pressed: matches!(state, FlowKeyState::Pressed),
+                repeat,
+                modifiers: Self::egui_modifiers(modifiers),
+            },
             _ => return false,
         };
 
-        self.render.egui.handle_input(egui_event)
+        self.desktop_outputs
+            .get_mut(&output_id)
+            .is_some_and(|output| output.egui.handle_input(egui_event))
     }
 
     fn wl_pointer_time_ms() -> u32 {
@@ -3432,9 +3491,16 @@ impl DesktopState {
         rect: Rectangle<i32, Logical>,
         source: DamageSource,
     ) {
-        const WINDOW_DAMAGE_MARGIN: i32 = 24;
+        // Buffer commits already describe pixels within the mapped surface. A
+        // large shadow-sized margin lets a maximized client repaint bleed into
+        // the adjacent dock and top bar. Keep that safety margin for geometry
+        // changes, but use only the fractional-scale allowance for commits.
+        let window_damage_margin = match source {
+            DamageSource::CommitBbox => 1,
+            _ => 24,
+        };
 
-        let rect = Self::expand_logical_rect(rect, WINDOW_DAMAGE_MARGIN);
+        let rect = Self::expand_logical_rect(rect, window_damage_margin);
         let mut damage = Vec::new();
 
         for (output_id, output) in &self.outputs {
@@ -4408,7 +4474,9 @@ impl DesktopState {
 
             UiAction::SelectClipboardEntry(id) => {
                 self.restore_clipboard_entry(id);
-                self.render.egui.close_clipboard_history();
+                for output in self.desktop_outputs.values_mut() {
+                    output.egui.close_clipboard_history();
+                }
             }
 
             UiAction::ToggleSetting(setting) => {
@@ -4505,10 +4573,12 @@ impl DesktopState {
     fn dispatch_power_button_action(&mut self) {
         match self.power.power_button_action {
             PowerButtonAction::ShowPowerMenu => {
-                self.render
-                    .egui
-                    .open_panel(PanelKind::Power, self.focused_output);
-                self.mark_focused_output_full_damage(DamageSource::Unknown);
+                if let Some(output) = self.desktop_outputs.get_mut(&self.focused_output) {
+                    output
+                        .egui
+                        .open_panel(PanelKind::Power, self.focused_output);
+                }
+                self.mark_egui_damage(self.focused_output);
             }
             PowerButtonAction::Suspend => {
                 self.dispatch_power_action(
@@ -4529,7 +4599,9 @@ impl DesktopState {
     }
 
     fn lock_session(&mut self) {
-        self.render.egui.close_all_panels();
+        for output in self.desktop_outputs.values_mut() {
+            output.egui.close_all_panels();
+        }
         self.active_dialog = None;
         self.clear_client_pointer_focus(self.pointer_pos);
         self.lock_auth_generation = self.lock_auth_generation.wrapping_add(1);
@@ -4974,11 +5046,13 @@ impl DesktopState {
                 hdr_requested: false,
                 hdr_kms_applied: false,
                 hdr_transition_target: None,
+                hdr_verification_pending: false,
                 hdr_enabled: false,
                 edid_hdr_max_luminance_nits: None,
                 edid_hdr_max_fall_nits: None,
                 active_workspace: WorkspaceId(1),
                 pending_damage: vec![Rectangle::from_loc_and_size((0, 0), physical_size)],
+                sdr_base_generation: 1,
                 last_sw_cursor_rect: None,
                 base_color_description: crate::core::color::default_output_color_description(),
                 color_description: crate::core::color::default_output_color_description(),
@@ -5001,6 +5075,7 @@ impl DesktopState {
         entry.scale_factor = scale_factor;
         entry.scale = Scale::from((scale_factor, scale_factor));
         entry.pending_damage = vec![Rectangle::from_loc_and_size((0, 0), physical_size)];
+        entry.sdr_base_generation = entry.sdr_base_generation.wrapping_add(1);
         entry.last_sw_cursor_rect = None;
 
         // Optional: choose first registered output as active if needed
@@ -5597,31 +5672,6 @@ impl DesktopState {
         self.topbar_pulse_for_output(output_id, now).is_some()
     }
 
-    pub fn flow_field_pulse_for_output(
-        &self,
-        output_id: OutputId,
-        now: Instant,
-    ) -> Option<FlowFieldPulseFrame> {
-        let pulse = self.flow_field_pulse?;
-        if pulse.output_id != output_id {
-            return None;
-        }
-
-        let elapsed = now.saturating_duration_since(pulse.started_at);
-        if elapsed >= FLOW_FIELD_PULSE_DURATION {
-            return None;
-        }
-
-        Some(FlowFieldPulseFrame {
-            click_local: pulse.click_local,
-            elapsed,
-        })
-    }
-
-    pub fn output_has_active_flow_field_pulse(&self, output_id: OutputId, now: Instant) -> bool {
-        self.flow_field_pulse_for_output(output_id, now).is_some()
-    }
-
     pub fn clock_pulse_for_output(
         &self,
         output_id: OutputId,
@@ -5670,16 +5720,6 @@ impl DesktopState {
             }
             TopbarPulseTarget::AiButton => Some(layout.topbar.ai_button),
         }
-    }
-
-    pub fn active_flow_field_pulse_damage_rect(
-        &self,
-        output_id: OutputId,
-        now: Instant,
-    ) -> Option<Rectangle<i32, Logical>> {
-        self.flow_field_pulse_for_output(output_id, now)?;
-        let layout = self.chrome_layout_for_output(output_id)?;
-        Some(layout.topbar.flow_field)
     }
 
     pub fn active_clock_pulse_damage_rect(
@@ -5744,35 +5784,6 @@ impl DesktopState {
             TopbarPulseTarget::AiButton => layout.topbar.ai_button,
         };
         self.mark_output_logical_damage(output_id, rect, 0, DamageSource::Unknown);
-
-        true
-    }
-
-    fn trigger_flow_field_pulse_at_pointer(&mut self, output_id: OutputId) -> bool {
-        let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
-            return false;
-        };
-        let px = local.x.round() as i32;
-        let py = local.y.round() as i32;
-        let Some(layout) = self.chrome_layout_for_output(output_id) else {
-            return false;
-        };
-        if !layout.topbar.flow_field.contains((px, py)) {
-            return false;
-        }
-
-        self.flow_field_pulse = Some(FlowFieldPulse {
-            output_id,
-            click_local: local,
-            started_at: Instant::now(),
-        });
-
-        self.mark_output_logical_damage(
-            output_id,
-            layout.topbar.flow_field,
-            0,
-            DamageSource::Unknown,
-        );
 
         true
     }
@@ -5976,7 +5987,11 @@ impl DesktopState {
             return;
         }
 
-        if self.render.egui.has_open_panels() || self.active_dialog.is_some() {
+        if self
+            .output_under_pointer(position)
+            .is_some_and(|output_id| self.egui_open_on_output(output_id))
+            || self.active_dialog.is_some()
+        {
             return;
         }
 
@@ -6293,11 +6308,9 @@ impl DesktopState {
             damage_last_logged_surface_commit: 0,
             sidebar_pulse: None,
             topbar_pulse: None,
-            flow_field_pulse: None,
             clock_pulse: None,
             ai_flow_mode_cache: AiFlowMode::Idle,
             ai_flow_mode_last_poll: Instant::now(),
-            flow_field_anim_last_damage: Instant::now(),
             ui_sound_player: UiSoundPlayer::new(),
             last_sidebar_hover_sound_target: None,
             last_clock_text: String::new(),
@@ -7689,14 +7702,16 @@ impl DesktopState {
             FlowInputEvent::Key { keycode, state, .. } => {
                 if matches!(state, FlowKeyState::Pressed)
                     && keycode == 1
-                    && self.render.egui.has_open_panels()
+                    && self.egui_open_on_output(self.focused_output)
                 {
-                    self.render.egui.close_all_panels();
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    if let Some(output) = self.desktop_outputs.get_mut(&self.focused_output) {
+                        output.egui.close_all_panels();
+                    }
+                    self.mark_egui_damage(self.focused_output);
                     return;
                 }
                 if self.handle_egui_input(&event) {
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    self.mark_egui_damage(self.focused_output);
                     return;
                 }
                 // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
@@ -7719,16 +7734,16 @@ impl DesktopState {
                 }
                 let cursor_owner_damage = self.update_cursor_owner_damage();
                 let stale_cursor_damage = self.clear_stale_software_cursor_damage();
-                if self.render.egui.has_open_panels() {
+                if self.egui_open_on_output(self.focused_output) {
                     let _ = self.handle_egui_input(&event);
-                    if self.render.egui.wants_pointer_input() {
+                    if self.egui_wants_pointer_on_output(self.focused_output) {
                         self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
+                        self.mark_egui_damage(self.focused_output);
                         return;
                     }
                 } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    self.mark_egui_damage(self.focused_output);
                     return;
                 }
                 if self.handle_dialog_input(&event) {
@@ -7789,7 +7804,15 @@ impl DesktopState {
                     && !stale_cursor_damage
                     && !cursor_owner_damage
                 {
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    // A hardware cursor still needs a render/present cycle so KMS can move its
+                    // cursor plane, but the primary plane has not visually changed. Queue the
+                    // smallest possible cursor-classified damage instead of invalidating the
+                    // entire retained wallpaper/chrome base on every pointer motion event.
+                    self.mark_output_damage_source(
+                        self.focused_output,
+                        Rectangle::from_loc_and_size((0, 0), (1, 1)),
+                        DamageSource::Cursor,
+                    );
                 }
             }
 
@@ -7817,11 +7840,11 @@ impl DesktopState {
                 let cursor_owner_damage = self.update_cursor_owner_damage();
                 let stale_cursor_damage = self.clear_stale_software_cursor_damage();
 
-                if self.render.egui.has_open_panels() {
+                if self.egui_open_on_output(self.focused_output) {
                     let _ = self.handle_egui_input(&event);
                 } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    self.mark_egui_damage(self.focused_output);
                     return;
                 }
 
@@ -7907,16 +7930,16 @@ impl DesktopState {
                     return;
                 }
 
-                if self.render.egui.has_open_panels()
+                if self.egui_open_on_output(self.focused_output)
                     && matches!(button, FlowMouseButton::Left)
                     && matches!(state, FlowKeyState::Pressed | FlowKeyState::Released)
                 {
                     self.process_egui_actions();
                     if matches!(state, FlowKeyState::Released)
-                        && self.render.egui.wants_pointer_input()
+                        && self.egui_wants_pointer_on_output(self.focused_output)
                     {
                         self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
+                        self.mark_egui_damage(self.focused_output);
                         return;
                     }
                 }
@@ -8002,16 +8025,16 @@ impl DesktopState {
                 }
                 self.update_cursor_owner_damage();
                 self.clear_stale_software_cursor_damage();
-                if self.render.egui.has_open_panels() {
+                if self.egui_open_on_output(self.focused_output) {
                     let _ = self.handle_egui_input(&event);
-                    if self.render.egui.wants_pointer_input() {
+                    if self.egui_wants_pointer_on_output(self.focused_output) {
                         self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
+                        self.mark_egui_damage(self.focused_output);
                         return;
                     }
                 } else if self.handle_egui_input(&event) {
                     self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                    self.mark_egui_damage(self.focused_output);
                     return;
                 }
                 if self.handle_dialog_input(&event) {
@@ -8024,7 +8047,11 @@ impl DesktopState {
                     self.forward_pointer_to_clients(position);
                     self.forward_pointer_scroll(delta);
                 }
-                self.mark_focused_output_full_damage(DamageSource::Unknown);
+                if self.egui_open_on_output(self.focused_output) {
+                    self.mark_egui_damage(self.focused_output);
+                } else {
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
             }
 
             FlowInputEvent::PointerEntered => {
@@ -8165,6 +8192,7 @@ impl DesktopState {
             output.physical_size = physical_size;
             output.logical_size = logical_size;
             output.pending_damage = vec![Rectangle::from_loc_and_size((0, 0), physical_size)];
+            output.sdr_base_generation = output.sdr_base_generation.wrapping_add(1);
             output.last_sw_cursor_rect = None;
 
             output.handle.change_current_state(
@@ -8194,9 +8222,6 @@ impl DesktopState {
             || self.topbar_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < TOPBAR_PULSE_DURATION
             })
-            || self.flow_field_pulse.is_some_and(|pulse| {
-                now.saturating_duration_since(pulse.started_at) < FLOW_FIELD_PULSE_DURATION
-            })
             || self.clock_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
             })
@@ -8211,7 +8236,6 @@ impl DesktopState {
             .unwrap_or(false)
             || self.output_has_active_sidebar_pulse(output_id, now)
             || self.output_has_active_topbar_pulse(output_id, now)
-            || self.output_has_active_flow_field_pulse(output_id, now)
             || self.output_has_active_clock_pulse(output_id, now)
             || self.lock_screen.active
     }
@@ -8277,7 +8301,6 @@ impl DesktopState {
                 [
                     (output_id, layout.sidebar.outer),
                     (output_id, layout.topbar.inner),
-                    (output_id, layout.topbar.flow_field),
                 ]
             })
             .collect();
@@ -8305,6 +8328,9 @@ impl DesktopState {
             let bounds = Rectangle::from_loc_and_size((0, 0), output.physical_size);
             if let Some(clipped) = rect.intersection(bounds) {
                 output.pending_damage.push(clipped);
+                if source.affects_sdr_base() {
+                    output.sdr_base_generation = output.sdr_base_generation.wrapping_add(1);
+                }
                 self.damage_source_counts.record(source);
             }
         }
@@ -8340,7 +8366,7 @@ impl DesktopState {
         }
         self.damage_last_logged_surface_commit = surface.tree_commits;
         flog(format!(
-            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
+            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, egui={}, shader={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
             output_id,
             self.render.frame_no,
             pre_rects,
@@ -8352,6 +8378,8 @@ impl DesktopState {
             c.window_move,
             c.window_resize,
             c.cursor,
+            c.egui,
+            c.shader_animation,
             c.hover,
             c.commit_bbox,
             c.full_redraw_fallback,
@@ -8450,11 +8478,13 @@ impl DesktopState {
                     hdr_requested: false,
                     hdr_kms_applied: false,
                     hdr_transition_target: None,
+                    hdr_verification_pending: false,
                     hdr_enabled: false,
                     edid_hdr_max_luminance_nits: None,
                     edid_hdr_max_fall_nits: None,
                     active_workspace: WorkspaceId(1),
                     pending_damage: vec![Rectangle::from_loc_and_size((0, 0), size)],
+                    sdr_base_generation: 1,
                     last_sw_cursor_rect: None,
                     base_color_description: crate::core::color::default_output_color_description(),
                     color_description: crate::core::color::default_output_color_description(),
@@ -8497,7 +8527,6 @@ impl DesktopState {
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();
         self.refresh_ai_flow_mode();
-        self.mark_flow_field_animation_damage(false);
     }
 
     /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
@@ -9518,19 +9547,22 @@ fn focaldesk_ai_console_command() -> String {
         .unwrap_or_else(|| "focaldesk-ai-console".to_string())
 }
 
-fn chrome_command_args(use_x11: bool) -> Vec<String> {
+fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
     let profile = chrome_profile_dir();
     let ozone_platform = if use_x11 { "x11" } else { "wayland" };
-    vec![
+    let mut args = vec![
         format!("--ozone-platform={ozone_platform}"),
         "--enable-features=WaylandWpColorManagerV1".to_string(),
-        "--force-color-profile=display-p3-d65".to_string(),
         "--disable-features=Vulkan".to_string(),
         format!("--user-data-dir={}", profile.display()),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--new-window".to_string(),
-    ]
+    ];
+    if !hdr_output_active {
+        args.insert(2, "--force-color-profile=display-p3-d65".to_string());
+    }
+    args
 }
 
 fn chrome_launch_trace_path() -> PathBuf {
@@ -9586,6 +9618,8 @@ fn spawn_app_detached(
     let xwayland_display = launch_xwayland_display(&ctx);
     let browser_backend = ctx.browser_launch_backend;
     let prefer_x11 = matches!(browser_backend, BrowserLaunchBackend::Xwayland);
+    let hdr_output_active = focaldesk_settings_core::load_exclusive_hdr_state().phase
+        == focaldesk_settings_core::ExclusiveHdrPhase::Active;
 
     let launch_span = tracing::info_span!(
         "launch_app",
@@ -9628,7 +9662,7 @@ fn spawn_app_detached(
             trace_id: launch_trace_id,
             app: candidate.clone(),
             args: if chrome_like || cursor_like {
-                let mut args = chrome_command_args(prefer_x11);
+                let mut args = chrome_command_args(prefer_x11, hdr_output_active);
                 args.extend(extra_args.clone());
                 args
             } else {
@@ -9757,10 +9791,10 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_flow_mode_from_status, clamp_rect_to_bounds, is_browser_like,
+        ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds, is_browser_like,
         logical_damage_to_physical, power_action_interaction, remove_surface_root_membership,
         session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
-        surface_buffer_damage_to_logical, topbar_pulse_target_at, workspace_for_slot,
+        surface_buffer_damage_to_logical, topbar_pulse_target_at, workspace_for_slot, DamageSource,
         PowerActionInteraction, TopbarPulseTarget, UnattendedSuspendState,
         UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
@@ -9776,6 +9810,30 @@ mod tests {
     use smithay::backend::renderer::utils::SurfaceView;
     use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
     use std::collections::HashMap;
+
+    #[test]
+    fn only_shell_base_damage_invalidates_the_retained_sdr_base() {
+        for source in [
+            DamageSource::WindowMove,
+            DamageSource::WindowResize,
+            DamageSource::Cursor,
+            DamageSource::Egui,
+            DamageSource::ShaderAnimation,
+            DamageSource::CommitBbox,
+        ] {
+            assert!(
+                !source.affects_sdr_base(),
+                "unexpected base damage: {source:?}"
+            );
+        }
+        for source in [
+            DamageSource::Hover,
+            DamageSource::FullRedrawFallback,
+            DamageSource::Unknown,
+        ] {
+            assert!(source.affects_sdr_base(), "missed base damage: {source:?}");
+        }
+    }
 
     #[test]
     fn ai_button_has_its_own_topbar_pulse_target() {
@@ -9955,6 +10013,26 @@ mod tests {
         assert!(is_browser_like("brave-browser"));
         assert!(!is_browser_like("alacritty"));
         assert!(!is_browser_like("cursor"));
+    }
+
+    #[test]
+    fn chromium_wayland_keeps_wide_gamut_raster_target() {
+        let args = chrome_command_args(false, false);
+        assert!(args.iter().any(|arg| arg == "--ozone-platform=wayland"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
+    }
+
+    #[test]
+    fn chromium_hdr_follows_wayland_preferred_color_description() {
+        let args = chrome_command_args(false, true);
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
     }
 
     #[test]

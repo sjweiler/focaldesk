@@ -22,6 +22,43 @@ global surface map and avoid repeated hot-path allocations. Output damage is
 clipped and transitively compacted; overlapping rectangles are counted once
 before the renderer decides whether a full frame is cheaper.
 
+The staged linear-light path retains its SDR, FP16, overlay, and encoded output
+targets between frames. Compacted damage is carried through every pass; a full
+frame is used only when a target is new or resized, capture requires it, or a
+normal full-redraw condition invalidates retained contents.
+
+Color-generating shell effects have two program families. The established
+encoded-SDR shaders remain unchanged and are used by the legacy target. When the
+linear-SDR FP16 path is available, the compositor selects separate Display-P3
+variants for glow, pulse, lightbar, etched-glass, gradient, tint, wallpaper, and
+screensaver effects. Those variants convert into the extended scene-linear
+Rec.709 working space without clamping, then the normal per-output matrix,
+transfer function, and optional ICC LUT produce the monitor signal. Wide-gamut
+program compilation is all-or-nothing; a driver rejection retains the complete
+legacy family for that renderer.
+
+The encoded-SDR wallpaper/chrome base has its own per-output generation. Client
+commits, window movement/resizing, cursor updates, and egui interaction reuse the
+cached base and only decode its damaged regions into the FP16 scene. Theme,
+layout, hover, and conservatively classified changes advance the generation;
+each scanout or capture target refreshes independently when it falls behind.
+
+After that base decode, the bundled wallpaper receives a display-aware creative
+grade over only its work-area rectangle. On wide-gamut SDR outputs, cyan and
+orange artwork accents expand selectively into Display P3 while luminance stays
+SDR. On HDR10 outputs, the shader derives additive scene-linear highlight energy
+from the original sRGB texture: space remains untouched, the planet stays
+diffuse, most stars remain moderate, a few isolated stars and the illuminated
+planet rim exceed reference white, and the white wordmark is held near diffuse
+white. The grade is bounded by the output's EDID peak before the ordinary
+BT.2020/PQ output transform. It is disabled on conventional sRGB SDR outputs.
+
+Set `FOCALDESK_RENDER_TIMINGS=1` to sample the linear pipeline every 120 frames.
+Sampled frames wait for each GPU completion fence and log optional base, decode,
+client, shell-overlay, optional sRGB-overlay, and output-encode latency. The waits
+intentionally serialize only the sampled frame, so leave this disabled for normal
+use and benchmark runs.
+
 Enable **Log damage regions** in Settings or set
 `FOCALDESK_DAMAGE_DEBUG=1` to periodically log input/compacted rectangle counts,
 damaged-area percentages, fallback counts, precise/unchanged tree commits,

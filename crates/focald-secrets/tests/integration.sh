@@ -34,9 +34,11 @@ PASS=0; FAIL=0
 check() { if [ "$1" = 0 ]; then echo "PASS: $2"; PASS=$((PASS+1)); else echo "FAIL: $2"; FAIL=$((FAIL+1)); fi }
 
 UNIT=../../packaging/systemd/system/focald-secrets@.service
-SOCKET_UNIT=../../packaging/systemd/system/focald-secrets@.socket
+PATH_UNIT=../../packaging/systemd/system/focald-secrets@.path
 RUNTIME_UNIT=../../packaging/systemd/system/focaldesk-runtime-dir@.service
 USER_DROPIN=../../packaging/systemd/system/user@.service.d/90-focald-secrets.conf
+SELINUX_TE=../../packaging/selinux/focaldesk_secrets.te
+SELINUX_FC=../../packaging/selinux/focaldesk_secrets.fc
 grep -q '^Environment=FOCALD_SECRETS_REQUIRE_MLOCK=1$' "$UNIT" &&
     grep -q '^LimitMEMLOCK=384M$' "$UNIT" &&
     grep -q '^MemoryMax=512M$' "$UNIT" &&
@@ -45,16 +47,22 @@ grep -q '^Environment=FOCALD_SECRETS_REQUIRE_MLOCK=1$' "$UNIT" &&
     grep -q '^TasksMax=128$' "$UNIT"
 check $? "production unit requires locked memory and bounded resources"
 
-grep -q '^ListenStream=/run/user/%i/focaldesk/secrets.sock$' "$SOCKET_UNIT" &&
-    grep -q '^SocketUser=%i$' "$SOCKET_UNIT" &&
-    grep -q '^Requires=focaldesk-runtime-dir@%i.service$' "$SOCKET_UNIT" &&
+grep -q '^PathExists=/run/focald-secrets/%i/master$' "$PATH_UNIT" &&
+    grep -q '^Unit=focald-secrets@%i.service$' "$PATH_UNIT" &&
     grep -q '^User=%i$' "$RUNTIME_UNIT" &&
     grep -q '^ExecStart=/usr/bin/mkdir -p /run/user/%i/focaldesk$' "$RUNTIME_UNIT" &&
     grep -q '^ProtectHome=read-only$' "$RUNTIME_UNIT" &&
-    grep -q '^Service=focald-secrets@%i.service$' "$SOCKET_UNIT" &&
-    grep -q '^Wants=focald-secrets@%i.socket$' "$USER_DROPIN" &&
-    grep -q '^Requires=focald-secrets@%i.socket$' "$UNIT"
-check $? "login user manager provisions the system socket activation path"
+    grep -q '^Wants=focald-secrets@%i.path$' "$USER_DROPIN" &&
+    ! grep -q 'focald-secrets@%i.socket' "$UNIT"
+check $? "login watches the root-only credential before starting the broker"
+
+grep -q '^type focaldesk_secrets_home_t;' "$SELINUX_TE" &&
+    grep -q '^userdom_search_user_home_content(xdm_t)$' "$SELINUX_TE" &&
+    grep -q '^manage_dirs_pattern(xdm_t, focaldesk_secrets_home_t, focaldesk_secrets_home_t)$' "$SELINUX_TE" &&
+    grep -q '^manage_files_pattern(xdm_t, focaldesk_secrets_home_t, focaldesk_secrets_home_t)$' "$SELINUX_TE" &&
+    grep -q 'focaldesk/secrets\\.key\\.enc' "$SELINUX_FC" &&
+    [ ! -e ../../packaging/dbus/org.freedesktop.secrets.service ]
+check $? "Fedora packaging grants scoped PAM key access without invalid D-Bus activation"
 
 LOCK_TEST=$(mktemp -d)
 dd if=/dev/urandom of="$LOCK_TEST/key" bs=32 count=1 status=none

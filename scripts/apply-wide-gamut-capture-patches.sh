@@ -23,10 +23,25 @@ for source_dir in "$OBS_SOURCE" "$XDPW_SOURCE"; do
     fi
 done
 
-git -C "$OBS_SOURCE" apply --check "$OBS_PATCH"
-git -C "$XDPW_SOURCE" apply --check "$XDPW_PATCH"
-git -C "$OBS_SOURCE" apply "$OBS_PATCH"
-git -C "$XDPW_SOURCE" apply "$XDPW_PATCH"
+apply_patch() {
+    local source_dir="$1"
+    local patch_file="$2"
+    local component="$3"
 
-echo "Applied FocalDesk BT.2020 SDR patches. Build and install both projects,"
+    if git -C "$source_dir" apply --check "$patch_file" 2>/dev/null; then
+        git -C "$source_dir" apply "$patch_file"
+        echo "Applied $component BT.2020 SDR patch."
+    elif git -C "$source_dir" apply --reverse --check "$patch_file" 2>/dev/null; then
+        echo "$component BT.2020 SDR patch is already applied."
+    else
+        git -C "$source_dir" apply --check "$patch_file" || true
+        echo "Cannot apply $component patch cleanly in $source_dir" >&2
+        exit 1
+    fi
+}
+
+apply_patch "$OBS_SOURCE" "$OBS_PATCH" "OBS Studio"
+apply_patch "$XDPW_SOURCE" "$XDPW_PATCH" "xdg-desktop-portal-wlr"
+
+echo "FocalDesk BT.2020 SDR patches are ready. Build and install both projects,"
 echo "then enable FOCALDESK_PORTAL_COLOR=bt2020-sdr for the FocalDesk session."

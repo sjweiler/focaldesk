@@ -11,7 +11,7 @@ use crate::atlas::{
 use crate::chrome_draw::{draw_beveled_panel, draw_recessed_button, draw_top_bar, well_icon_rect};
 use crate::chrome_layout::{build_chrome_layout_with_config, ChromeLayoutConfig};
 use crate::chrome_shaders::ChromeShaders;
-use crate::chrome_theme::{activity_well_style, chrome_theme_from_flow_theme, ChromeTheme};
+use crate::chrome_theme::{chrome_theme_from_flow_theme, ChromeTheme};
 use crate::controls::ShellControl;
 use crate::font_atlas::FontAtlas;
 use crate::svg::rasterize_svg;
@@ -328,7 +328,6 @@ impl Chrome {
             }
         }
         let launcher_icon_well = layout.topbar.ai_button;
-        let launcher_particle_well = layout.topbar.flow_field;
         if let Some(button) = button {
             let mut button_style = self.theme.button;
             if hovered == Some(0) {
@@ -343,41 +342,11 @@ impl Chrome {
                 &damage,
                 &button_style,
             )?;
-            draw_recessed_button(
-                frame,
-                button,
-                launcher_particle_well,
-                sc,
-                &damage,
-                &activity_well_style(self.theme.button),
-            )?;
         }
         let mut launcher_icon =
             centered_square(launcher_icon_well, launcher_icon_well.size.h.min(28));
         if hovered == Some(0) {
             launcher_icon = scale_rect_about_center(launcher_icon, 1.08);
-        }
-        let launcher_state = ShellControl {
-            icon: IconId::AiConsole,
-            tooltip: "Launch FocalDesk AI Console".into(),
-            action: focaldesk_ipc::DesktopAction::LaunchApp {
-                app: "focaldesk-ai-console".into(),
-            },
-            selected: false,
-            active: false,
-            enabled: true,
-        };
-        if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-            self.draw_glass_icon(
-                frame,
-                IconId::AiConsole,
-                launcher_icon_well,
-                launcher_icon,
-                scale,
-                output_size,
-                hovered == Some(0),
-                &launcher_state,
-            )?;
         }
         self.render_icon(frame, IconId::AiConsole, launcher_icon, sc, output_size)?;
         if let Some(pulse) = pulse.filter(|pulse| pulse.control == 0) {
@@ -402,18 +371,6 @@ impl Chrome {
             let mut icon_rect = well_icon_rect(*well);
             if hovered == Some(control_index) {
                 icon_rect = scale_rect_about_center(icon_rect, 1.08);
-            }
-            if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-                self.draw_glass_icon(
-                    frame,
-                    control.icon,
-                    *well,
-                    icon_rect,
-                    scale,
-                    output_size,
-                    hovered == Some(control_index),
-                    control,
-                )?;
             }
             self.render_icon_alpha(
                 frame,
@@ -521,18 +478,6 @@ impl Chrome {
             let mut icon_rect = well_icon_rect(icon_well);
             if hovered == Some(index) {
                 icon_rect = scale_rect_about_center(icon_rect, 1.10);
-            }
-            if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-                self.draw_glass_icon(
-                    frame,
-                    control.icon,
-                    icon_well,
-                    icon_rect,
-                    scale,
-                    output_size,
-                    hovered == Some(index),
-                    control,
-                )?;
             }
             self.render_icon_alpha(
                 frame,

@@ -92,6 +92,51 @@ pub fn draw_recessed_button(
     )
 }
 
+/// Draw the procedural AI activity field. Particle positions, trails, warping,
+/// and state motion are all evaluated by the fragment shader; the shell only
+/// supplies the current time and static visual-state uniforms.
+pub fn draw_flow_field(
+    frame: &mut GlesFrame<'_, '_>,
+    program: &GlesPixelProgram,
+    rect: Rectangle<i32, Logical>,
+    scale: Scale<f64>,
+    damage: &[Rectangle<i32, Physical>],
+    mode: i32,
+    energy: f32,
+    color: [f32; 4],
+) -> Result<(), GlesError> {
+    let dst = to_physical_rect(rect, scale);
+    let src = Rectangle::<f64, Buffer>::from_loc_and_size(
+        (0.0, 0.0),
+        (dst.size.w as f64, dst.size.h as f64),
+    );
+    frame.render_pixel_shader_to(
+        program,
+        src,
+        dst,
+        Size::<i32, Buffer>::from((dst.size.w, dst.size.h)),
+        Some(damage),
+        1.0,
+        &[
+            Uniform::new("u_resolution", [dst.size.w as f32, dst.size.h as f32]),
+            Uniform::new(
+                "u_rect",
+                [0.0f32, 0.0f32, dst.size.w as f32, dst.size.h as f32],
+            ),
+            Uniform::new(
+                "u_time",
+                (chrono::Local::now()
+                    .timestamp_millis()
+                    .rem_euclid(3_600_000) as f32)
+                    / 1000.0,
+            ),
+            Uniform::new("u_mode", mode as f32),
+            Uniform::new("u_energy", energy),
+            Uniform::new("u_color", color),
+        ],
+    )
+}
+
 pub fn draw_beveled_panel(
     frame: &mut GlesFrame<'_, '_>,
     program: &GlesPixelProgram,

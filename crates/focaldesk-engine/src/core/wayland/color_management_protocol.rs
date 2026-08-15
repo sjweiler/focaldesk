@@ -120,6 +120,9 @@ fn send_surface_feedback_preferred_changed(
 }
 
 fn should_advertise_output_profiles(state: &DesktopState) -> bool {
+    if state.outputs.values().any(|output| output.hdr_kms_applied) {
+        return true;
+    }
     if !crate::core::color::linear_sdr_runtime_enabled() {
         return false;
     }
@@ -133,10 +136,9 @@ fn should_advertise_output_profiles(state: &DesktopState) -> bool {
 }
 
 fn output_uses_wide_gamut_description(state: &DesktopState, output_id: OutputId) -> bool {
-    state
-        .outputs
-        .get(&output_id)
-        .is_some_and(|output| output.color_description != ColorDescription::SRGB)
+    state.outputs.get(&output_id).is_some_and(|output| {
+        output.hdr_kms_applied || output.color_description != ColorDescription::SRGB
+    })
 }
 
 fn preferred_identity_for_output(state: &mut DesktopState, output_id: OutputId) -> u64 {
@@ -223,6 +225,18 @@ fn resolve_preferred_output_description(
     state: &mut DesktopState,
     output_id: OutputId,
 ) -> ColorDescription {
+    if let Some(output) = state.outputs.get(&output_id) {
+        if output.hdr_kms_applied {
+            // Client feedback describes the signal/color volume the output is
+            // actually consuming, not the delayed user-visible verification
+            // status or the SDR ICC profile used outside HDR.
+            // This is also what Chromium uses for `dynamic-range: high` and to
+            // choose an HDR video swap-chain color space.
+            let peak = output.edid_hdr_max_luminance_nits.unwrap_or(1_000.0);
+            let fall = output.edid_hdr_max_fall_nits.unwrap_or(peak);
+            return ColorDescription::bt2020_pq_hdr(peak, fall);
+        }
+    }
     let description = state.output_color_description(output_id);
     if primaries_wider_than(description.primaries, ColorPrimaries::Srgb) {
         state
@@ -375,9 +389,15 @@ pub struct ParametricCreatorState {
 struct ParametricCreatorInner {
     tf: Option<ParametricTransfer>,
     primaries: Option<ColorPrimaries>,
-    min_luminance_mcd: Option<u32>,
-    max_luminance_mcd: Option<u32>,
-    reference_luminance_mcd: Option<u32>,
+    /// Protocol units: minimum is cd/m² × 10000; maximum/reference are cd/m².
+    min_luminance_x10000: Option<u32>,
+    max_luminance_nits: Option<u32>,
+    reference_luminance_nits: Option<u32>,
+    mastering_primaries: Option<ColorPrimaries>,
+    mastering_min_luminance_x10000: Option<u32>,
+    mastering_max_luminance_nits: Option<u32>,
+    max_cll_nits: Option<u32>,
+    max_fall_nits: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -458,6 +478,7 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_tf_named(TransferFunction::Bt1886);
     manager.supported_tf_named(TransferFunction::Gamma22);
     manager.supported_tf_named(TransferFunction::ExtLinear);
+    manager.supported_tf_named(TransferFunction::St2084Pq);
     // Chromium maps gfx::ColorSpace::SRGB → WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB.
     manager.supported_tf_named(TransferFunction::Srgb);
     manager.supported_tf_named(TransferFunction::CompoundPower24);
@@ -647,11 +668,34 @@ fn init_inert_image_description_info<D>(
 }
 
 fn primary_luminance_wire_values(description: &ColorDescription) -> (u32, u32, u32) {
-    // ICC sRGB defaults: min 0.2 cd/m² (wire ×10000), max/ref unscaled cd/m².
-    let min_lum = (0.2_f32 * 10_000.0).round() as u32;
-    let max_lum = description.max_luminance_nits.round().max(1.0) as u32;
+    // Minimum is wire ×10000; maximum/reference are unscaled cd/m².
+    let pq = description.transfer == CoreTransferFunction::St2084Pq;
+    let min_nits: f32 = if pq { 0.005 } else { 0.2 };
+    let min_lum = (min_nits * 10_000.0).round() as u32;
+    // ST 2084 always encodes the absolute 0–10,000-nit signal volume. The
+    // actual display/content peak is a target-volume property and is emitted
+    // separately below. Advertising the panel peak here causes clients such
+    // as Chromium to construct a malformed PQ output color space when mapping
+    // SDR video into the HDR surface.
+    let max_lum = if pq {
+        10_000
+    } else {
+        description.max_luminance_nits.round().max(1.0) as u32
+    };
     let reference_lum = description.reference_white_nits.round().max(1.0) as u32;
     (min_lum, max_lum, reference_lum)
+}
+
+fn target_luminance_wire_values(description: &ColorDescription) -> (u32, u32) {
+    let min_nits: f32 = if description.transfer == CoreTransferFunction::St2084Pq {
+        0.005
+    } else {
+        0.2
+    };
+    (
+        (min_nits * 10_000.0).round() as u32,
+        description.max_luminance_nits.round().max(1.0) as u32,
+    )
 }
 
 fn primaries_from_wire(
@@ -690,7 +734,11 @@ fn output_advertised_description(description: ColorDescription) -> ColorDescript
     // Chrome rejects Bt1886/Gamma22/ExtLinear for internal BT709/sRGB paths ("non-power-curve").
     // Advertise sRGB-class transfer to clients; ICC LUT scanout still uses the profile TRC.
     ColorDescription {
-        transfer: CoreTransferFunction::Srgb,
+        transfer: if description.transfer == CoreTransferFunction::St2084Pq {
+            CoreTransferFunction::St2084Pq
+        } else {
+            CoreTransferFunction::Srgb
+        },
         ..description
     }
 }
@@ -752,16 +800,26 @@ fn emit_image_description_info_events(
             TransferFunction::CompoundPower24
         }
         CoreTransferFunction::Linear => TransferFunction::ExtLinear,
-        // C3d: advertise PQ named transfer when wp_color HDR is wired.
-        CoreTransferFunction::St2084Pq => TransferFunction::ExtLinear,
+        CoreTransferFunction::St2084Pq => TransferFunction::St2084Pq,
     };
     info.tf_named(tf_named);
 
-    let (min_lum, max_lum, reference_lum) = primary_luminance_wire_values(description);
-    info.luminances(min_lum, max_lum, reference_lum);
+    let (primary_min_lum, primary_max_lum, reference_lum) =
+        primary_luminance_wire_values(description);
+    info.luminances(primary_min_lum, primary_max_lum, reference_lum);
     if info.version() >= 2 {
-        // SDR: target volume equals primary volume — omit target_primaries.
-        info.target_luminance(min_lum, max_lum);
+        // The internal description's max/CLL/FALL represent the content or
+        // display target volume. PQ's primary volume remains the fixed
+        // 10,000-nit ST 2084 signal swing, while target_luminance carries the
+        // real panel/content peak.
+        let (target_min_lum, target_max_lum) = target_luminance_wire_values(description);
+        info.target_luminance(target_min_lum, target_max_lum);
+        if let Some(max_cll) = description.max_cll_nits {
+            info.target_max_cll(max_cll.round().max(1.0) as u32);
+        }
+        if let Some(max_fall) = description.max_fall_nits {
+            info.target_max_fall(max_fall.round().max(1.0) as u32);
+        }
     }
 }
 
@@ -792,6 +850,7 @@ fn build_description_from_params(
             wp_color_manager_v1::TransferFunction::Srgb
             | wp_color_manager_v1::TransferFunction::CompoundPower24 => CoreTransferFunction::Srgb,
             wp_color_manager_v1::TransferFunction::ExtLinear => CoreTransferFunction::Linear,
+            wp_color_manager_v1::TransferFunction::St2084Pq => CoreTransferFunction::St2084Pq,
             _ => return Err("unsupported named transfer function".into()),
         },
         ParametricTransfer::Power(exp) if (exp - 2.4).abs() <= 0.0001 => CoreTransferFunction::Srgb,
@@ -801,26 +860,43 @@ fn build_description_from_params(
         ParametricTransfer::Power(_) => return Err("unsupported power transfer function".into()),
     };
 
+    let default_ref_nits = if mapped_tf == CoreTransferFunction::St2084Pq {
+        203.0
+    } else {
+        80.0
+    };
     let ref_nits = creator
-        .reference_luminance_mcd
-        .map(|mcd| mcd as f32 / 10_000.0)
-        .unwrap_or(80.0);
-    let max_nits = creator
-        .max_luminance_mcd
-        .map(|mcd| mcd as f32 / 10_000.0)
-        .unwrap_or(ref_nits);
-    let _min_nits = creator
-        .min_luminance_mcd
-        .map(|mcd| mcd as f32 / 10_000.0)
-        .unwrap_or(0.0);
+        .reference_luminance_nits
+        .map(|nits| nits as f32)
+        .unwrap_or(default_ref_nits);
+    let primary_min_nits = creator
+        .min_luminance_x10000
+        .map(|value| value as f32 / 10_000.0)
+        .unwrap_or(if mapped_tf == CoreTransferFunction::St2084Pq {
+            0.005
+        } else {
+            0.2
+        });
+    let primary_max_nits = if mapped_tf == CoreTransferFunction::St2084Pq {
+        // color-management-v1 defines PQ's primary volume as a fixed
+        // 10,000-nit swing; max_lum is ignored for this transfer function.
+        primary_min_nits + 10_000.0
+    } else {
+        creator
+            .max_luminance_nits
+            .map(|nits| nits as f32)
+            .unwrap_or(ref_nits)
+    };
+    let mastering_peak = creator.mastering_max_luminance_nits.map(|nits| nits as f32);
+    let max_nits = mastering_peak.unwrap_or(primary_max_nits);
 
     Ok(ColorDescription {
         primaries,
         transfer: mapped_tf,
         reference_white_nits: ref_nits,
         max_luminance_nits: max_nits,
-        max_cll_nits: None,
-        max_fall_nits: None,
+        max_cll_nits: creator.max_cll_nits.map(|nits| nits as f32),
+        max_fall_nits: creator.max_fall_nits.map(|nits| nits as f32),
     })
 }
 
@@ -1309,7 +1385,7 @@ impl
                 reference_lum,
             } => {
                 let mut inner = creator.inner.lock().unwrap();
-                if inner.reference_luminance_mcd.is_some() {
+                if inner.reference_luminance_nits.is_some() {
                     post_creator_error(
                         resource,
                         wp_image_description_creator_params_v1::Error::AlreadySet,
@@ -1317,21 +1393,74 @@ impl
                     );
                     return;
                 }
-                inner.min_luminance_mcd = Some(min_lum);
-                inner.max_luminance_mcd = Some(max_lum);
-                inner.reference_luminance_mcd = Some(reference_lum);
+                inner.min_luminance_x10000 = Some(min_lum);
+                inner.max_luminance_nits = Some(max_lum);
+                inner.reference_luminance_nits = Some(reference_lum);
             }
             wp_image_description_creator_params_v1::Request::SetMasteringDisplayPrimaries {
-                ..
+                r_x,
+                r_y,
+                g_x,
+                g_y,
+                b_x,
+                b_y,
+                w_x,
+                w_y,
+            } => {
+                let mastering = primaries_from_wire(r_x, r_y, g_x, g_y, b_x, b_y, w_x, w_y)
+                    .map(ColorPrimaries::Custom);
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.mastering_primaries.is_some() {
+                    post_creator_error(
+                        resource,
+                        wp_image_description_creator_params_v1::Error::AlreadySet,
+                        "mastering display primaries already set",
+                    );
+                    return;
+                }
+                // Invalid custom target coordinates make the eventual image
+                // description fail instead of terminating the client here.
+                inner.mastering_primaries = mastering;
             }
-            | wp_image_description_creator_params_v1::Request::SetMasteringLuminance { .. }
-            | wp_image_description_creator_params_v1::Request::SetMaxCll { .. }
-            | wp_image_description_creator_params_v1::Request::SetMaxFall { .. } => {
-                post_creator_error(
-                    resource,
-                    wp_image_description_creator_params_v1::Error::UnsupportedFeature,
-                    "request not supported",
-                );
+            wp_image_description_creator_params_v1::Request::SetMasteringLuminance {
+                min_lum,
+                max_lum,
+            } => {
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.mastering_max_luminance_nits.is_some() {
+                    post_creator_error(
+                        resource,
+                        wp_image_description_creator_params_v1::Error::AlreadySet,
+                        "mastering luminance already set",
+                    );
+                    return;
+                }
+                inner.mastering_min_luminance_x10000 = Some(min_lum);
+                inner.mastering_max_luminance_nits = Some(max_lum);
+            }
+            wp_image_description_creator_params_v1::Request::SetMaxCll { max_cll } => {
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.max_cll_nits.is_some() {
+                    post_creator_error(
+                        resource,
+                        wp_image_description_creator_params_v1::Error::AlreadySet,
+                        "max_cll already set",
+                    );
+                    return;
+                }
+                inner.max_cll_nits = Some(max_cll);
+            }
+            wp_image_description_creator_params_v1::Request::SetMaxFall { max_fall } => {
+                let mut inner = creator.inner.lock().unwrap();
+                if inner.max_fall_nits.is_some() {
+                    post_creator_error(
+                        resource,
+                        wp_image_description_creator_params_v1::Error::AlreadySet,
+                        "max_fall already set",
+                    );
+                    return;
+                }
+                inner.max_fall_nits = Some(max_fall);
             }
             _ => {}
         }
@@ -1450,8 +1579,15 @@ impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, OutputCo
             wp_color_management_output_v1::Request::Destroy => {}
             wp_color_management_output_v1::Request::GetImageDescription { image_description } => {
                 wp_color_trace!("output get_image_description");
-                let description = state.output_color_description_for(&output_mgmt.output);
-                let icc_profile = state.output_icc_profile_for(&output_mgmt.output);
+                let output_id = state.output_id_for_space_output(&output_mgmt.output);
+                let description = output_id
+                    .map(|output_id| resolve_preferred_output_description(state, output_id))
+                    .unwrap_or_else(|| state.output_color_description_for(&output_mgmt.output));
+                // SDR ICC profiles describe the panel's SDR TRCs and must not
+                // replace a live output's parametric BT.2020/PQ description.
+                let icc_profile = (description.transfer != CoreTransferFunction::St2084Pq)
+                    .then(|| state.output_icc_profile_for(&output_mgmt.output))
+                    .flatten();
                 finish_output_image_description(
                     state,
                     data_init,
@@ -1519,10 +1655,14 @@ impl
                 }
                 let output_id = state.preferred_output_id_for_surface(&feedback.surface);
                 let description = resolve_preferred_output_description(state, output_id);
-                let icc_profile = state
-                    .outputs
-                    .get(&output_id)
-                    .and_then(|output| output.icc_profile.clone());
+                let icc_profile = (description.transfer != CoreTransferFunction::St2084Pq)
+                    .then(|| {
+                        state
+                            .outputs
+                            .get(&output_id)
+                            .and_then(|output| output.icc_profile.clone())
+                    })
+                    .flatten();
                 wp_color_trace!(
                     "surface feedback get_preferred: output={output_id:?} transfer={:?} primaries={:?}",
                     description.transfer,
@@ -1705,6 +1845,16 @@ mod tests {
     }
 
     #[test]
+    fn pq_luminance_wire_values_use_hdr_defaults() {
+        let description = ColorDescription::bt2020_pq_hdr(600.0, 400.0);
+        let (min_lum, max_lum, reference_lum) = primary_luminance_wire_values(&description);
+        assert_eq!(min_lum, 50);
+        assert_eq!(max_lum, 10_000);
+        assert_eq!(reference_lum, 203);
+        assert_eq!(super::target_luminance_wire_values(&description), (50, 600));
+    }
+
+    #[test]
     fn primaries_from_wire_uses_protocol_scale_only() {
         let ch = super::primaries_from_wire(
             648450, 330840, 230250, 701480, 155890, 66030, 345700, 358540,
@@ -1814,5 +1964,31 @@ mod tests {
             description.transfer,
             crate::core::color::TransferFunction::Srgb
         );
+    }
+
+    #[test]
+    fn parametric_pq_preserves_absolute_luminance_units_and_metadata() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::Bt2020),
+            tf: Some(super::ParametricTransfer::Named(
+                WpTransferFunction::St2084Pq,
+            )),
+            min_luminance_x10000: Some(50),
+            max_luminance_nits: Some(10_000),
+            reference_luminance_nits: Some(203),
+            mastering_max_luminance_nits: Some(1_000),
+            max_cll_nits: Some(1_000),
+            max_fall_nits: Some(400),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid PQ params");
+        assert_eq!(
+            description.transfer,
+            crate::core::color::TransferFunction::St2084Pq
+        );
+        assert_eq!(description.reference_white_nits, 203.0);
+        assert_eq!(description.max_luminance_nits, 1_000.0);
+        assert_eq!(description.max_cll_nits, Some(1_000.0));
+        assert_eq!(description.max_fall_nits, Some(400.0));
     }
 }

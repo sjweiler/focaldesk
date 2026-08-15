@@ -7,5 +7,5 @@ pub mod protocol;
 pub use client::request_launch;
 pub use constants::{DEFAULT_TIMEOUT_MS, SOCKET_BASENAME, SOCKET_ENV, socket_path};
 pub use errors::{LaunchError, Result};
-pub use policy::{chrome_command_args, is_browser_like, is_chrome_like};
+pub use policy::{chrome_command_args, chrome_hdr_mode_active, is_browser_like, is_chrome_like};
 pub use protocol::{BrowserBackend, LaunchRequest, LaunchResponse, LaunchSource};

@@ -43,10 +43,18 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let listener = Listener::bind(&cfg.socket_path, greeter_user.uid)?;
     let mut backoff = Backoff::new();
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("register SIGTERM handler")?;
 
     loop {
         // ---- Greeter phase -------------------------------------------------
-        tokio::time::sleep(backoff.next_delay()).await;
+        tokio::select! {
+            _ = tokio::time::sleep(backoff.next_delay()) => {}
+            _ = sigterm.recv() => {
+                tracing::info!("shutdown requested while waiting to start greeter");
+                return Ok(());
+            }
+        }
 
         // greetd-equivalent of `[terminal] switch = true`: make the greeter
         // VT the foreground console *before* opening its logind session so
@@ -96,7 +104,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .context("open greeter PAM session")?;
         tracing::info!(pid = greeter.pid, vt = cfg.vt, "greeter started");
 
-        let pending = match drive_greeter(&cfg, &listener, greeter).await? {
+        let pending = match drive_greeter(&cfg, &listener, greeter, &mut sigterm).await? {
             GreeterPhase::Crashed { greeter } => {
                 // Wait for the holder to close the session before
                 // retrying, so a fresh greeter never overlaps the crashed
@@ -113,6 +121,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
                 terminate_and_reap(greeter).await?;
                 pending
             }
+            GreeterPhase::Shutdown { greeter } => {
+                tracing::info!("shutdown requested while greeter owns the VT");
+                terminate_and_reap(greeter).await?;
+                return Ok(());
+            }
         };
 
         // Only now — with the greeter's seat confirmed released — does the
@@ -127,9 +140,23 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
         // ---- Session phase -------------------------------------------------
         tracing::info!(user = %authed.username, pid = authed.process.pid, "launching session");
-        match authed.process.wait().await {
-            Ok(status) => tracing::info!(?status, "session exited"),
-            Err(e) => tracing::error!(error = %e, "session process error"),
+        let shutdown_requested = tokio::select! {
+            status = authed.process.wait() => {
+                match status {
+                    Ok(status) => tracing::info!(?status, "session exited"),
+                    Err(e) => tracing::error!(error = %e, "session process error"),
+                }
+                false
+            }
+            _ = sigterm.recv() => {
+                tracing::info!("shutdown requested while user session owns the VT");
+                true
+            }
+        };
+
+        if shutdown_requested {
+            terminate_and_reap(authed.process).await?;
+            return Ok(());
         }
 
         // Waits for pam_close_session to finish before the loop repeats and
@@ -146,6 +173,9 @@ enum GreeterPhase {
         greeter: SessionProcess,
         pending: PendingSession,
     },
+    Shutdown {
+        greeter: SessionProcess,
+    },
 }
 
 /// Runs while the greeter is on screen. Multiplexes:
@@ -156,6 +186,7 @@ async fn drive_greeter(
     cfg: &Config,
     listener: &Listener,
     mut greeter: SessionProcess,
+    sigterm: &mut tokio::signal::unix::Signal,
 ) -> anyhow::Result<GreeterPhase> {
     // Accept the greeter's connection, but keep watching the process:
     // if it dies before connecting we'd otherwise hang in accept.
@@ -164,6 +195,9 @@ async fn drive_greeter(
         status = greeter.wait() => {
             tracing::warn!(?status, "greeter exited before connecting");
             return Ok(GreeterPhase::Crashed { greeter });
+        }
+        _ = sigterm.recv() => {
+            return Ok(GreeterPhase::Shutdown { greeter });
         }
     };
 
@@ -176,6 +210,10 @@ async fn drive_greeter(
 
     loop {
         tokio::select! {
+            _ = sigterm.recv() => {
+                return Ok(GreeterPhase::Shutdown { greeter });
+            }
+
             // Greeter process died (crash, or we're mid-shutdown elsewhere).
             status = greeter.wait() => {
                 tracing::warn!(?status, "greeter exited unexpectedly");

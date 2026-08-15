@@ -138,6 +138,14 @@ need both `just install-secrets-service-fedora` and
 `just install-secrets-pam-fedora`. PAM installation and key provisioning are
 documented in [Credential broker](../../docs/secrets.md).
 
+The Fedora service recipe requires `selinux-policy-devel`. It installs the
+scoped `focaldesk_secrets_home_t` policy used by the display manager's PAM hook
+to read and atomically update the wrapped key, and relabels existing Focaldesk
+secret state. The broker is deliberately not D-Bus or public-socket activated:
+a system path unit starts it only after PAM creates the root-only staged
+credential. The broker then binds its per-user client socket and claims
+`org.freedesktop.secrets`.
+
 The service must not run alongside gnome-keyring-daemon (both claim
 `org.freedesktop.secrets`); if the name is taken, focald-secrets logs an error
 and keeps serving the native surface.

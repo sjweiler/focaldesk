@@ -10,6 +10,45 @@ nested-smoke:
 nested-smoke-no-build:
     bash scripts/nested-smoke.sh --no-build
 
+# Install Fedora packages needed to compile the patched capture stack.
+install-wide-gamut-capture-build-deps:
+    sudo dnf install -y cmake git meson ninja-build
+    sudo dnf builddep -y obs-studio xdg-desktop-portal-wlr
+
+# Fetch, patch, and compile the OBS 32.1.1 wide-gamut SDR capture stack.
+build-wide-gamut-capture obs_source="target/wide-gamut-capture/obs-studio-32.1.1" xdpw_source="target/wide-gamut-capture/xdg-desktop-portal-wlr-0.8.1":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    obs_source="$(realpath -m "{{ obs_source }}")"
+    xdpw_source="$(realpath -m "{{ xdpw_source }}")"
+    if [[ ! -d "$obs_source/.git" ]]; then
+        mkdir -p "$(dirname "$obs_source")"
+        git clone --branch 32.1.1 --depth 1 --recurse-submodules --shallow-submodules \
+            https://github.com/obsproject/obs-studio.git "$obs_source"
+    fi
+    if [[ ! -d "$xdpw_source/.git" ]]; then
+        mkdir -p "$(dirname "$xdpw_source")"
+        git clone --branch v0.8.1 --depth 1 \
+            https://github.com/emersion/xdg-desktop-portal-wlr.git "$xdpw_source"
+    fi
+    bash scripts/apply-wide-gamut-capture-patches.sh "$obs_source" "$xdpw_source"
+    cmake -S "$obs_source" -B "$obs_source/build-focaldesk" -G Ninja \
+        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+        -DENABLE_AJA=OFF \
+        -DENABLE_BROWSER=OFF \
+        -DENABLE_WEBRTC=OFF
+    cmake --build "$obs_source/build-focaldesk"
+    if [[ -f "$xdpw_source/build-focaldesk/build.ninja" ]]; then
+        meson setup --reconfigure --buildtype=release \
+            "$xdpw_source/build-focaldesk" "$xdpw_source"
+    else
+        meson setup --buildtype=release \
+            "$xdpw_source/build-focaldesk" "$xdpw_source"
+    fi
+    meson compile -C "$xdpw_source/build-focaldesk"
+    echo "Built patched OBS and xdg-desktop-portal-wlr in their build-focaldesk directories."
+    echo "This recipe does not install them or replace the system packages."
+
 release-desktop:
     cargo build --release -p focaldesk-desktop
 
@@ -233,6 +272,14 @@ install-focaldm-greeter: release-focaldm-greeter
 
 install-focaldmd-fedora: release-focaldmd release-focaldm-greeter install-focaldm-pam-fedora
     sudo install -Dm755 target/release/focaldmd /usr/sbin/focaldmd
+    # pam_selinux opens the authenticated desktop in the user's SELinux
+    # domain.  The daemon must run in xdm_t for that transition to be allowed;
+    # a generic bin_t install leaves systemd running it as
+    # unconfined_service_t and every successful login fails at execve(EACCES).
+    # Fedora's SELinux policy maps /usr/sbin to /usr/bin, so semanage needs
+    # the canonical /usr/bin path even though the executable lives in sbin.
+    sudo semanage fcontext -a -t xdm_exec_t /usr/bin/focaldmd 2>/dev/null || sudo semanage fcontext -m -t xdm_exec_t /usr/bin/focaldmd
+    sudo restorecon -v /usr/sbin/focaldmd
     sudo install -Dm755 target/release/focaldm-greeter "{{focaldm_greeter_bin}}"
     sudo install -Dm644 packaging/systemd/system/focaldmd.service /usr/lib/systemd/system/focaldmd.service
     sudo install -Dm644 packaging/sysusers.d/focaldesk.conf /usr/lib/sysusers.d/focaldesk.conf
@@ -252,6 +299,17 @@ install-desktop: install-polkit
     @echo "Installed to {{desktop_bin}}:"
     @md5sum "{{desktop_bin}}"
     @bash -c 'b=$(md5sum target/release/focaldesk-desktop | cut -d" " -f1); i=$(md5sum "{{desktop_bin}}" | cut -d" " -f1); test "$b" = "$i" && echo "md5 OK: $i" || { echo "md5 MISMATCH: build=$b installed=$i" >&2; exit 1; }'
+    @if test -e /proc/driver/nvidia/version && rg -q 's2idle' /sys/power/mem_sleep; then sudo install -Dm644 packaging/systemd/sleep.conf.d/90-focaldesk-nvidia.conf /etc/systemd/sleep.conf.d/90-focaldesk-nvidia.conf; systemd-analyze cat-config systemd/sleep.conf | rg 'MemorySleepMode=s2idle'; echo "NVIDIA detected: installed the s2idle suspend workaround."; fi
+
+# Install or verify the workaround independently when troubleshooting NVIDIA
+# resume. install-desktop applies the same guarded configuration automatically;
+# other GPUs retain the platform's default sleep mode.
+install-nvidia-suspend-workaround:
+    test -e /proc/driver/nvidia/version
+    rg -q 's2idle' /sys/power/mem_sleep
+    sudo install -Dm644 packaging/systemd/sleep.conf.d/90-focaldesk-nvidia.conf /etc/systemd/sleep.conf.d/90-focaldesk-nvidia.conf
+    systemd-analyze cat-config systemd/sleep.conf | rg 'MemorySleepMode=s2idle'
+    @echo "NVIDIA suspend workaround installed; the next suspend will use s2idle."
 
 install-desktop-session:
     sudo install -Dm644 packaging/wayland-sessions/focaldesk.desktop /usr/share/wayland-sessions/focaldesk.desktop
@@ -277,31 +335,42 @@ install-runtime-dir-fedora:
     if test ! -L "/run/user/$(id -u)/focaldesk" && test -d "/run/user/$(id -u)/focaldesk" && test "$(stat -c %u "/run/user/$(id -u)/focaldesk")" != "$(id -u)"; then sudo chown --no-dereference "$(id -u):$(id -g)" "/run/user/$(id -u)/focaldesk"; sudo chmod 0700 "/run/user/$(id -u)/focaldesk"; fi
     sudo systemctl restart "focaldesk-runtime-dir@$(id -u).service"
 
-install-secrets-service-fedora: install-runtime-dir-fedora
+install-secrets-selinux-fedora:
+    test -f /usr/share/selinux/devel/Makefile || { echo "Install selinux-policy-devel first" >&2; exit 1; }
+    make -C packaging/selinux focaldesk_secrets.pp
+    sudo semodule -i packaging/selinux/focaldesk_secrets.pp
+    sudo restorecon -RFv "$HOME/.local/share/focaldesk"
+
+install-secrets-service-fedora: install-secrets-selinux-fedora install-runtime-dir-fedora
     cargo build --release -p focald-secrets
-    # Upgrade cleanup: the broker moved from the user manager to a
-    # credential-fed system-manager template. Stop and remove the old socket
-    # activation path so it cannot race the new broker for its Unix socket or
-    # D-Bus name.
+    # Upgrade cleanup: a public socket must not start the broker before PAM has
+    # staged its key. The root-only credential path now triggers startup.
     systemctl --user disable --now focald-secrets.service focald-secrets.socket || true
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focald-secrets.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focald-secrets.socket"
     sudo rm -f /usr/lib/systemd/user/focald-secrets.service
     sudo rm -f /usr/lib/systemd/user/focald-secrets.socket
     sudo rm -f /usr/lib/systemd/system/user@.service.d/90-focaldesk-memlock.conf
+    sudo systemctl stop "focald-secrets@$(id -u).socket" || true
     sudo install -Dm755 target/release/focald-secrets /usr/bin/focald-secrets
     sudo install -Dm755 target/release/focald-secrets-keytool /usr/bin/focald-secrets-keytool
     sudo install -Dm755 target/release/focald-secrets-import-gnome-keyring /usr/bin/focald-secrets-import-gnome-keyring
     sudo install -Dm644 packaging/systemd/user/focald-secrets-import-fedora.service /usr/lib/systemd/user/focald-secrets-import.service
     sudo install -Dm644 packaging/systemd/system/focald-secrets@.service /usr/lib/systemd/system/focald-secrets@.service
-    sudo install -Dm644 packaging/systemd/system/focald-secrets@.socket /usr/lib/systemd/system/focald-secrets@.socket
+    sudo install -Dm644 packaging/systemd/system/focald-secrets@.path /usr/lib/systemd/system/focald-secrets@.path
+    sudo rm -f /usr/lib/systemd/system/focald-secrets@.socket
     sudo install -Dm644 packaging/systemd/system/user@.service.d/90-focald-secrets.conf /usr/lib/systemd/system/user@.service.d/90-focald-secrets.conf
-    sudo install -Dm644 packaging/dbus/org.freedesktop.secrets.service /usr/share/dbus-1/services/org.freedesktop.secrets.service
+    # The credential-fed broker is started by its system path unit at login. A
+    # session-bus activation entry cannot address a per-UID system unit and
+    # would launch the daemon without its credential, so remove stale installs.
+    sudo rm -f /usr/share/dbus-1/services/org.freedesktop.secrets.service
+    rm -f "$HOME/.local/share/dbus-1/services/org.freedesktop.secrets.service"
     test -e /etc/focaldesk/secrets-acl.toml || sudo install -Dm644 packaging/focaldesk/secrets-acl.toml /etc/focaldesk/secrets-acl.toml
     sudo systemctl daemon-reload
-    sudo systemctl start "focald-secrets@$(id -u).socket"
+    sudo systemctl reset-failed "focald-secrets@$(id -u).service" "focald-secrets@$(id -u).socket" || true
+    sudo systemctl start "focald-secrets@$(id -u).path"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    echo "The PAM session hook unlocks focald-secrets@UID.service through its system socket"
+    echo "The PAM session hook unlocks focald-secrets@UID.service through its credential path"
 
 # Install FocalDesk's PAM module without changing the active login policy.
 install-secrets-pam-fedora:

@@ -97,6 +97,64 @@ pub enum DisplayColorProfile {
     DisplayP3,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusiveHdrPhase {
+    #[default]
+    Off,
+    Disabled,
+    Requested,
+    Starting,
+    Verifying,
+    Active,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ExclusiveHdrState {
+    pub phase: ExclusiveHdrPhase,
+    #[serde(default)]
+    pub connector: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<u32>,
+}
+
+pub fn exclusive_hdr_state_path() -> PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
+        .join("exclusive-hdr.json")
+}
+
+pub fn load_exclusive_hdr_state() -> ExclusiveHdrState {
+    std::fs::read(exclusive_hdr_state_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_exclusive_hdr_state(state: &ExclusiveHdrState) -> std::io::Result<()> {
+    let path = exclusive_hdr_state_path();
+    let Some(parent) = path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "exclusive HDR state path has no parent",
+        ));
+    };
+    std::fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("json.tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
+    std::fs::write(&temporary, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(temporary, path)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputSettings {
     pub pointer_speed: f32,
@@ -480,5 +538,18 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert_eq!(restored.workspaces.max_workspace_slots, 7);
+    }
+
+    #[test]
+    fn exclusive_hdr_state_round_trips_failure_context() {
+        let state = ExclusiveHdrState {
+            phase: ExclusiveHdrPhase::Failed,
+            connector: Some("DP-3".into()),
+            reason: Some("vblank timeout".into()),
+            session_id: Some(42),
+        };
+        let restored: ExclusiveHdrState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(restored, state);
     }
 }

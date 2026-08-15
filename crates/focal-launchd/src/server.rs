@@ -6,11 +6,12 @@ use std::process::Command;
 use std::thread;
 
 use focal_launch_shared::{
-    BrowserBackend, LaunchRequest, LaunchResponse, chrome_command_args, is_browser_like,
-    is_chrome_like, socket_path,
+    BrowserBackend, LaunchRequest, LaunchResponse, chrome_command_args, chrome_hdr_mode_active,
+    is_browser_like, is_chrome_like, socket_path,
 };
 use focaldesk_ipc::transport;
 use focaldesk_logging::log_file_path_candidates;
+use focaldesk_settings_core::{ExclusiveHdrPhase, load_exclusive_hdr_state};
 
 pub fn run() -> anyhow::Result<()> {
     let socket = socket_path()?;
@@ -59,6 +60,7 @@ fn handle_stream(stream: &mut std::os::unix::net::UnixStream) -> anyhow::Result<
 fn launch(req: LaunchRequest) -> anyhow::Result<()> {
     let browser_like = is_browser_like(&req.app);
     let chrome_like = is_chrome_like(&req.app);
+    let hdr_output_active = chrome_like && chrome_hdr_output_active();
 
     let prefer_x11 = matches!(req.browser_backend, BrowserBackend::Xwayland);
 
@@ -85,10 +87,14 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
         let profile = chrome_profile_dir();
         clear_stale_chrome_singleton(&profile);
         let profile = profile.to_string_lossy();
-        cmd.args(chrome_command_args(prefer_x11, &profile));
+        cmd.args(chrome_command_args(prefer_x11, &profile, hdr_output_active));
     }
 
-    cmd.args(req.args);
+    cmd.args(
+        req.args
+            .into_iter()
+            .filter(|arg| !(hdr_output_active && arg.starts_with("--force-color-profile="))),
+    );
 
     if chrome_like || browser_like {
         if let Some(log_path) = launch_trace_path() {
@@ -131,6 +137,17 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn chrome_hdr_output_active() -> bool {
+    let exclusive_hdr_active = load_exclusive_hdr_state().phase == ExclusiveHdrPhase::Active;
+    let hdr_render = std::env::var("FOCALDESK_HDR_RENDER").ok();
+    let hdr_kms = std::env::var("FOCALDESK_HDR").ok();
+    chrome_hdr_mode_active(
+        exclusive_hdr_active,
+        hdr_render.as_deref(),
+        hdr_kms.as_deref(),
+    )
 }
 
 fn chrome_profile_dir() -> PathBuf {

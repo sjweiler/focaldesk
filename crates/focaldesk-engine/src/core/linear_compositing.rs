@@ -28,6 +28,27 @@ use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Tex
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use std::time::{Duration, Instant};
 
+fn render_timing_sample(frame_no: u64) -> bool {
+    frame_no % 120 == 0
+        && std::env::var("FOCALDESK_RENDER_TIMINGS")
+            .ok()
+            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn record_gpu_completion(
+    renderer: &mut GlesRenderer,
+    sync: &SyncPoint,
+    label: &'static str,
+    started: Instant,
+    timings: &mut Vec<(&'static str, u128)>,
+) -> Result<()> {
+    renderer
+        .wait(sync)
+        .map_err(|err| anyhow!("wait for profiled {label} pass: {err}"))?;
+    timings.push((label, started.elapsed().as_micros()));
+    Ok(())
+}
+
 /// Opaque encoded SDR intermediate used by the legacy path and ICC LUT pass.
 pub const SDR_OFFSCREEN_FORMAT: Fourcc = Fourcc::Xbgr8888;
 /// Transparent sRGB overlay used for egui and the software cursor before they
@@ -61,6 +82,8 @@ pub struct LinearOffscreenTargets {
     pub encoded_hdr: bool,
     /// The current frame in `linear_offscreen` is the canonical composited scene.
     pub scene_linear: bool,
+    /// Generation of the retained encoded-SDR wallpaper/chrome base.
+    pub sdr_base_generation: Option<u64>,
 }
 
 pub fn supports_linear_sdr(renderer: &mut GlesRenderer, size: Size<i32, Physical>) -> bool {
@@ -84,11 +107,15 @@ pub fn supports_hdr_offscreen(renderer: &mut GlesRenderer, size: Size<i32, Physi
 }
 
 pub fn use_linear_sdr_path(
-    renderer: &mut GlesRenderer,
+    _renderer: &mut GlesRenderer,
     targets: &LinearOffscreenTargets,
-    size: Size<i32, Physical>,
+    _size: Size<i32, Physical>,
 ) -> bool {
-    linear_sdr_runtime_enabled() && targets.linear_supported && supports_linear_sdr(renderer, size)
+    // The backend probes support once when the renderer is created. Repeating
+    // `supports_linear_sdr` here would allocate and immediately drop a full-size
+    // FP16 buffer every frame. `ensure_linear_offscreen` remains the authoritative
+    // size-specific allocation check and disables this path if allocation fails.
+    linear_sdr_runtime_enabled() && targets.linear_supported
 }
 
 impl LinearOffscreenTargets {
@@ -208,6 +235,18 @@ pub fn ensure_offscreen_texture(
     Ok(())
 }
 
+fn offscreen_texture_is_valid(
+    offscreen: Option<&OffscreenTexture>,
+    size: Size<i32, Physical>,
+    format: Fourcc,
+) -> bool {
+    offscreen.is_some_and(|target| target.size == size && target.texture.format() == Some(format))
+}
+
+fn full_damage(size: Size<i32, Physical>) -> [Rectangle<i32, Physical>; 1] {
+    [Rectangle::from_loc_and_size((0, 0), size)]
+}
+
 /// Decode a premultiplied sRGB overlay and blend it into the FP16 scene.
 fn composite_srgb_overlay_onto_linear(
     renderer: &mut GlesRenderer,
@@ -215,6 +254,7 @@ fn composite_srgb_overlay_onto_linear(
     linear_scene: &mut GlesTexture,
     size: Size<i32, Physical>,
     shader: &GlesTexProgram,
+    damage: &[Rectangle<i32, Physical>],
 ) -> Result<()> {
     let mut target = renderer
         .bind(linear_scene)
@@ -228,13 +268,12 @@ fn composite_srgb_overlay_onto_linear(
         (tex_size.w as f64, tex_size.h as f64),
     );
     let dst_rect = Rectangle::<i32, Physical>::from_loc_and_size((0, 0), size);
-    let damage = [dst_rect];
     frame
         .render_texture_from_to(
             overlay,
             src_rect,
             dst_rect,
-            &damage,
+            damage,
             &[],
             Transform::Normal,
             1.0,
@@ -257,6 +296,45 @@ fn resolve_hdr_encode_state(
 ) -> (bool, bool) {
     let kms_target = selected && requested && supported && transition_target.unwrap_or(kms_applied);
     (kms_target || (selected && test_encode), kms_target)
+}
+
+fn wallpaper_grade_parameters(output: &crate::core::desktop::OutputState) -> (f32, f32, f32) {
+    use crate::core::color::{primaries_wider_than, ColorPrimaries};
+
+    let selected = crate::core::color::hdr_output_selected(&output.handle.name());
+    let test_encode = selected
+        && crate::core::color::output_hdr_pq_test_encode_active(
+            output.hdr_requested,
+            output.hdr_supported,
+            output.hdr_kms_applied,
+        );
+    let (hdr_target, _) = resolve_hdr_encode_state(
+        selected,
+        output.hdr_requested,
+        output.hdr_supported,
+        output.hdr_kms_applied,
+        output.hdr_transition_target,
+        test_encode,
+    );
+    let hdr_peak = output
+        .edid_hdr_max_luminance_nits
+        .filter(|nits| nits.is_finite() && *nits > 0.0);
+    if hdr_target {
+        if let Some(peak_nits) = hdr_peak {
+            let creative_peak = peak_nits.min(1000.0);
+            return (
+                2.0,
+                crate::core::color::hdr_reference_white_nits(creative_peak),
+                creative_peak,
+            );
+        }
+    }
+
+    if primaries_wider_than(output.color_description.primaries, ColorPrimaries::Srgb) {
+        (1.0, 80.0, 80.0)
+    } else {
+        (0.0, 80.0, 80.0)
+    }
 }
 
 pub fn apply_output_encode(
@@ -289,22 +367,19 @@ pub fn apply_output_encode(
         .unwrap_or((false, false));
     let hdr_max = output_state.and_then(|o| o.edid_hdr_max_luminance_nits);
     let hdr_fall = output_state.and_then(|o| o.edid_hdr_max_fall_nits);
-    let sdr_white_nits = output_state
-        .map(|o| o.color_description.reference_white_nits)
-        .unwrap_or(80.0);
-
     // A real KMS HDR transition must carry a PQ-encoded first frame. The
     // runtime flag remains relevant only to the userspace-only PQ lab mode.
     if hdr_active && (hdr_kms_target || hdr_render_runtime_enabled()) {
         if let Some(max_nits) = hdr_max.filter(|n| *n > 0.0) {
             if targets.hdr_supported {
+                let hdr_white_nits = crate::core::color::hdr_reference_white_nits(max_nits);
                 match apply_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
                     max_nits,
-                    sdr_white_nits,
+                    hdr_white_nits,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
@@ -354,6 +429,8 @@ pub fn apply_output_encode(
                     buffer_size,
                     lut,
                     shader,
+                    &full_damage(buffer_size),
+                    false,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
@@ -412,6 +489,7 @@ fn blit_with_shader(
     shader: &GlesTexProgram,
     uniforms: &[Uniform<'_>],
     label: &str,
+    damage: &[Rectangle<i32, Physical>],
 ) -> Result<SyncPoint> {
     let mut target = renderer
         .bind(dst)
@@ -425,13 +503,12 @@ fn blit_with_shader(
         (tex_size.w as f64, tex_size.h as f64),
     );
     let dst_rect = Rectangle::from_loc_and_size((0, 0), size);
-    let damage = [dst_rect];
     frame
         .render_texture_from_to(
             src,
             src_rect,
             dst_rect,
-            &damage,
+            damage,
             &[],
             Transform::Normal,
             1.0,
@@ -450,6 +527,7 @@ fn apply_hdr_pq_encode(
     max_nits: f32,
     sdr_white_nits: f32,
 ) -> Result<Option<SyncPoint>> {
+    let damage = full_damage(buffer_size);
     let sdr_to_scrgb = state
         .render
         .chrome_shaders
@@ -495,6 +573,7 @@ fn apply_hdr_pq_encode(
         // applies the actual output reference-white luminance exactly once.
         &[Uniform::new("u_sdr_white_nits", 80.0f32)],
         "SDR-to-linear-scRGB",
+        &damage,
     )?;
 
     let sync = blit_with_shader(
@@ -542,6 +621,7 @@ fn apply_hdr_pq_encode(
             ]
         },
         "linear-scRGB-to-PQ",
+        &damage,
     )?;
 
     targets.encoded_scanout = true;
@@ -557,6 +637,8 @@ fn apply_output_encode_lut(
     buffer_size: Size<i32, Physical>,
     lut: &crate::core::icc_lut::OutputIccLut,
     shader: &GlesTexProgram,
+    requested_damage: &[Rectangle<i32, Physical>],
+    destination_current: bool,
 ) -> Result<Option<SyncPoint>> {
     let lut_texture = state
         .render
@@ -569,6 +651,12 @@ fn apply_output_encode_lut(
         .ok_or_else(|| anyhow!("SDR offscreen missing before output encode"))?
         .texture
         .clone();
+    let target_valid = destination_current
+        && offscreen_texture_is_valid(
+            targets.encode_scratch.as_ref(),
+            buffer_size,
+            SDR_OFFSCREEN_FORMAT,
+        );
     targets.ensure_encode_scratch(renderer, buffer_size)?;
     let scratch = targets
         .encode_scratch
@@ -612,13 +700,18 @@ fn apply_output_encode_lut(
         (tex_size.w as f64, tex_size.h as f64),
     );
     let dst_rect = Rectangle::from_loc_and_size((0, 0), buffer_size);
-    let damage = [dst_rect];
+    let fallback_damage = full_damage(buffer_size);
+    let damage = if target_valid {
+        requested_damage
+    } else {
+        &fallback_damage
+    };
     frame
         .render_texture_from_to(
             &scene_texture,
             src_rect,
             dst_rect,
-            &damage,
+            damage,
             &[],
             Transform::Normal,
             1.0,
@@ -726,6 +819,8 @@ fn apply_linear_output_encode_parametric(
     output_encode: crate::core::color::ColorDescription,
     shader: &GlesTexProgram,
     intermediate_for_lut: bool,
+    requested_damage: &[Rectangle<i32, Physical>],
+    destination_current: bool,
 ) -> Result<SyncPoint> {
     let scene_texture = targets
         .linear_offscreen
@@ -733,6 +828,22 @@ fn apply_linear_output_encode_parametric(
         .ok_or_else(|| anyhow!("FP16 scene missing before output encode"))?
         .texture
         .clone();
+
+    let target_valid = if intermediate_for_lut {
+        destination_current
+            && offscreen_texture_is_valid(
+                targets.offscreen.as_ref(),
+                buffer_size,
+                SDR_OFFSCREEN_FORMAT,
+            )
+    } else {
+        destination_current
+            && offscreen_texture_is_valid(
+                targets.encode_scratch.as_ref(),
+                buffer_size,
+                SDR_OFFSCREEN_FORMAT,
+            )
+    };
 
     if intermediate_for_lut {
         targets.ensure_offscreen(renderer, buffer_size)?;
@@ -775,6 +886,12 @@ fn apply_linear_output_encode_parametric(
     } else {
         &mut targets.encode_scratch.as_mut().unwrap().texture
     };
+    let fallback_damage = full_damage(buffer_size);
+    let damage = if target_valid {
+        requested_damage
+    } else {
+        &fallback_damage
+    };
     let sync = blit_with_shader(
         renderer,
         &scene_texture,
@@ -783,6 +900,7 @@ fn apply_linear_output_encode_parametric(
         shader,
         &uniforms,
         "linear scene-to-output encode",
+        damage,
     )?;
     if !intermediate_for_lut {
         targets.encoded_scanout = true;
@@ -797,6 +915,8 @@ fn apply_linear_hdr_pq_encode(
     buffer_size: Size<i32, Physical>,
     max_nits: f32,
     sdr_white_nits: f32,
+    requested_damage: &[Rectangle<i32, Physical>],
+    destination_current: bool,
 ) -> Result<SyncPoint> {
     let shader = state
         .render
@@ -810,6 +930,10 @@ fn apply_linear_hdr_pq_encode(
         .ok_or_else(|| anyhow!("FP16 scene missing before HDR PQ encode"))?
         .texture
         .clone();
+    let target_valid = destination_current
+        && targets.hdr_format.is_some_and(|format| {
+            offscreen_texture_is_valid(targets.hdr_offscreen.as_ref(), buffer_size, format)
+        });
     targets.ensure_hdr_offscreen(renderer, buffer_size)?;
     let scene_to_bt2020 = scene_to_output_matrix(
         crate::core::color::ColorDescription::bt2020_pq_hdr(max_nits, max_nits),
@@ -848,6 +972,12 @@ fn apply_linear_hdr_pq_encode(
         .as_mut()
         .ok_or_else(|| anyhow!("HDR offscreen unavailable after allocation"))?
         .texture;
+    let fallback_damage = full_damage(buffer_size);
+    let damage = if target_valid {
+        requested_damage
+    } else {
+        &fallback_damage
+    };
     let sync = blit_with_shader(
         renderer,
         &scene_texture,
@@ -856,6 +986,7 @@ fn apply_linear_hdr_pq_encode(
         shader,
         &uniforms,
         "linear scene-to-PQ",
+        damage,
     )?;
     targets.encoded_scanout = true;
     targets.encoded_hdr = true;
@@ -868,7 +999,10 @@ fn apply_linear_output_encode(
     targets: &mut LinearOffscreenTargets,
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
 ) -> Result<SyncPoint> {
+    let previous_encoded_scanout = targets.encoded_scanout;
+    let previous_encoded_hdr = targets.encoded_hdr;
     targets.encoded_scanout = false;
     targets.encoded_hdr = false;
     targets.scene_linear = true;
@@ -893,20 +1027,19 @@ fn apply_linear_output_encode(
         })
         .unwrap_or((false, false));
     let hdr_max = output_state.and_then(|output| output.edid_hdr_max_luminance_nits);
-    let sdr_white_nits = output_state
-        .map(|output| output.color_description.reference_white_nits)
-        .unwrap_or(80.0);
-
     if hdr_active && (hdr_kms_target || hdr_render_runtime_enabled()) {
         if let Some(max_nits) = hdr_max.filter(|nits| *nits > 0.0) {
             if targets.hdr_supported {
+                let hdr_white_nits = crate::core::color::hdr_reference_white_nits(max_nits);
                 match apply_linear_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
                     max_nits,
-                    sdr_white_nits,
+                    hdr_white_nits,
+                    damage,
+                    previous_encoded_hdr,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => flog_warn!(
@@ -939,6 +1072,12 @@ fn apply_linear_output_encode(
         output_encode,
         &parametric_shader,
         use_lut,
+        damage,
+        if use_lut {
+            true
+        } else {
+            previous_encoded_scanout && !previous_encoded_hdr
+        },
     )?;
     if let (Some(lut), Some(shader)) = (lut_owned.as_ref(), lut_shader.as_ref()) {
         if use_lut {
@@ -950,6 +1089,8 @@ fn apply_linear_output_encode(
                 buffer_size,
                 lut,
                 shader,
+                damage,
+                previous_encoded_scanout && !previous_encoded_hdr,
             ) {
                 Ok(Some(lut_sync)) => sync = lut_sync,
                 Ok(None) => {}
@@ -965,6 +1106,8 @@ fn apply_linear_output_encode(
                         buffer_size,
                         output_encode,
                         &parametric_shader,
+                        false,
+                        &full_damage(buffer_size),
                         false,
                     )?;
                 }
@@ -997,11 +1140,10 @@ fn finish_with_output_encode(
 
 fn clear_offscreen(
     frame: &mut GlesFrame<'_, '_>,
-    size: Size<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
     color: Color32F,
 ) -> Result<(), GlesError> {
-    let full = Rectangle::from_loc_and_size((0, 0), size);
-    frame.clear(color, std::slice::from_ref(&full))
+    frame.clear(color, damage)
 }
 
 pub fn run_linear_staged_pass(
@@ -1017,14 +1159,40 @@ pub fn run_linear_staged_pass(
     client_to_scene: &GlesTexProgram,
     srgb_to_linear: &GlesTexProgram,
 ) -> Result<SyncPoint> {
-    targets.encoded_scanout = false;
-    targets.encoded_hdr = false;
+    // Fence waits intentionally serialize sampled frames. This reports actual GPU
+    // completion latency without penalizing normal rendering or requiring timer-query
+    // support from every GLES driver.
+    let profile_timings = render_timing_sample(prepared.frame_ctx.frame_no);
+    let mut pass_timings = Vec::with_capacity(7);
+    let needs_srgb_overlay = state
+        .desktop_outputs
+        .get(&output_id)
+        .is_some_and(|output| output.egui.has_open_panels())
+        || prepared.draw_software_cursor;
+    let retained_targets_valid = targets.scene_linear
+        && offscreen_texture_is_valid(
+            targets.offscreen.as_ref(),
+            buffer_size,
+            SDR_OFFSCREEN_FORMAT,
+        )
+        && offscreen_texture_is_valid(
+            targets.linear_offscreen.as_ref(),
+            buffer_size,
+            LINEAR_SDR_FORMAT,
+        );
+    let redraw_sdr_base = !retained_targets_valid
+        || prepared.force_sdr_base_redraw
+        || targets.sdr_base_generation != Some(prepared.sdr_base_generation);
     targets.scene_linear = true;
-    prepared.frame_ctx.damage = vec![Rectangle::from_loc_and_size((0, 0), buffer_size)];
+    if !retained_targets_valid {
+        prepared.frame_ctx.damage = full_damage(buffer_size).to_vec();
+    }
 
     targets.ensure_offscreen(renderer, buffer_size)?;
     targets.ensure_linear_offscreen(renderer, buffer_size)?;
-    targets.ensure_overlay_offscreen(renderer, buffer_size)?;
+    if needs_srgb_overlay {
+        targets.ensure_overlay_offscreen(renderer, buffer_size)?;
+    }
 
     let bg = state.theme.active_theme().background.color;
     let clear_color = Color32F::new(bg[0], bg[1], bg[2], bg[3]);
@@ -1038,7 +1206,8 @@ pub fn run_linear_staged_pass(
     // produced corrupt, black regions on real DRM/NVIDIA outputs.  Decode the
     // completed opaque base into the linear target instead; color-managed
     // clients still retain their extended gamut in the FP16 passes below.
-    {
+    if redraw_sdr_base {
+        let pass_started = Instant::now();
         let sdr = targets
             .offscreen
             .as_mut()
@@ -1049,7 +1218,7 @@ pub fn run_linear_staged_pass(
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin SDR base frame: {e}"))?;
-        clear_offscreen(&mut frame, buffer_size, clear_color)
+        clear_offscreen(&mut frame, &prepared.frame_ctx.damage, clear_color)
             .map_err(|e| anyhow!("clear SDR base target: {e}"))?;
         draw_output_stage(
             state,
@@ -1072,10 +1241,20 @@ pub fn run_linear_staged_pass(
             false,
         )
         .map_err(|err| anyhow!("{err}"))?;
-        let _sync = frame.finish()?;
+        let sync = frame.finish()?;
+        if profile_timings {
+            record_gpu_completion(renderer, &sync, "base-sdr", pass_started, &mut pass_timings)?;
+        }
+        targets.sdr_base_generation = Some(prepared.sdr_base_generation);
     }
 
     {
+        let pass_started = Instant::now();
+        let (wallpaper_grade_mode, wallpaper_reference_white, wallpaper_peak) = state
+            .outputs
+            .get(&output_id)
+            .map(wallpaper_grade_parameters)
+            .unwrap_or((0.0, 80.0, 80.0));
         let sdr_base = targets.offscreen.as_ref().unwrap().texture.clone();
         let linear = targets
             .linear_offscreen
@@ -1087,7 +1266,7 @@ pub fn run_linear_staged_pass(
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin linear base decode frame: {e}"))?;
-        clear_offscreen(&mut frame, buffer_size, transparent)
+        clear_offscreen(&mut frame, &prepared.frame_ctx.damage, transparent)
             .map_err(|e| anyhow!("clear linear base decode target: {e}"))?;
         let src_size = sdr_base.size();
         let src_rect = Rectangle::<f64, Buffer>::from_loc_and_size(
@@ -1100,7 +1279,7 @@ pub fn run_linear_staged_pass(
                 &sdr_base,
                 src_rect,
                 dst_rect,
-                std::slice::from_ref(&dst_rect),
+                &prepared.frame_ctx.damage,
                 &[],
                 Transform::Normal,
                 1.0,
@@ -1108,12 +1287,34 @@ pub fn run_linear_staged_pass(
                 &[],
             )
             .map_err(|e| anyhow!("decode SDR base into linear scene: {e}"))?;
-        let _sync = frame
+        state.render.draw_wallpaper_creative_grade(
+            &mut frame,
+            &prepared.frame_ctx,
+            prepared.layout.work_area.recess,
+            prepared.frame_ctx.output_scale,
+            state.theme.active_theme().wallpaper.clone(),
+            wallpaper_grade_mode,
+            wallpaper_reference_white,
+            wallpaper_peak,
+        );
+        let sync = frame
             .finish()
             .map_err(|e| anyhow!("finish linear base decode frame: {e}"))?;
+        if profile_timings {
+            record_gpu_completion(
+                renderer,
+                &sync,
+                "base-decode",
+                pass_started,
+                &mut pass_timings,
+            )?;
+        }
     }
 
-    let (client_elements, popup_elements) = {
+    let client_elements = build_output_client_elements(state, renderer, output_id);
+    let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    {
+        let pass_started = Instant::now();
         let linear = targets
             .linear_offscreen
             .as_mut()
@@ -1121,11 +1322,13 @@ pub fn run_linear_staged_pass(
         let mut target = renderer
             .bind(&mut linear.texture)
             .map_err(|e| anyhow!("bind linear SDR target: {e}"))?;
-        let client_elements = build_output_client_elements(state, renderer, output_id);
-        let popup_elements = build_output_popup_elements(state, renderer, output_id);
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin linear SDR frame: {e}"))?;
+
+        // Keep clients and shell overlay in separate submissions. Some DRM/GLES
+        // drivers do not reliably preserve the chrome draws when both stages share
+        // one frame after client texture imports.
         draw_output_stage(
             state,
             &mut frame,
@@ -1144,21 +1347,56 @@ pub fn run_linear_staged_pass(
             true,
         )
         .map_err(|err| anyhow!("{err}"))?;
-        let _sync = frame.finish()?;
-        (client_elements, popup_elements)
-    };
+        let sync = frame
+            .finish()
+            .map_err(|e| anyhow!("finish linear client frame: {e}"))?;
+        if profile_timings {
+            record_gpu_completion(renderer, &sync, "clients", pass_started, &mut pass_timings)?;
+        }
+    }
 
     {
+        let pass_started = Instant::now();
         let linear = targets
             .linear_offscreen
             .as_mut()
-            .ok_or_else(|| anyhow!("linear scene missing before overlay"))?;
+            .ok_or_else(|| anyhow!("linear scene missing before shell overlay"))?;
         let mut target = renderer
             .bind(&mut linear.texture)
-            .map_err(|e| anyhow!("bind linear overlay target: {e}"))?;
+            .map_err(|e| anyhow!("bind linear shell overlay target: {e}"))?;
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
-            .map_err(|e| anyhow!("begin linear overlay frame: {e}"))?;
+            .map_err(|e| anyhow!("begin linear shell overlay frame: {e}"))?;
+
+        // Chrome is retained independently from the client scene. A terminal
+        // commit wholly inside the work recess has no shell damage and therefore
+        // issues no dock/top-bar/icon/text draw calls at all.
+        if !prepared.shell_damage.is_empty() {
+            let scene_damage = std::mem::replace(
+                &mut prepared.frame_ctx.damage,
+                prepared.shell_damage.clone(),
+            );
+            let chrome_result = draw_output_stage(
+                state,
+                &mut frame,
+                prepared,
+                &client_elements,
+                &popup_elements,
+                ui_state,
+                scene,
+                output_state,
+                OutputRenderStage::ChromeOverlay,
+                ClientCompositingMode::Linear {
+                    client_to_scene: client_to_scene.clone(),
+                    srgb_to_linear: srgb_to_linear.clone(),
+                },
+                ChromeGlassPass::Skip,
+                true,
+            );
+            prepared.frame_ctx.damage = scene_damage;
+            chrome_result.map_err(|err| anyhow!("{err}"))?;
+        }
+
         draw_output_stage(
             state,
             &mut frame,
@@ -1177,56 +1415,110 @@ pub fn run_linear_staged_pass(
             true,
         )
         .map_err(|err| anyhow!("{err}"))?;
-        let _sync = frame
+        let sync = frame
             .finish()
-            .map_err(|e| anyhow!("finish linear overlay frame: {e}"))?;
+            .map_err(|e| anyhow!("finish linear shell overlay frame: {e}"))?;
+        if profile_timings {
+            record_gpu_completion(
+                renderer,
+                &sync,
+                "shell-overlay",
+                pass_started,
+                &mut pass_timings,
+            )?;
+        }
     }
 
     // egui_glow and the software cursor produce sRGB. Render them into a
     // transparent 8-bit layer, decode that layer, and blend it into FP16.
-    {
-        let overlay = targets
-            .overlay_offscreen
-            .as_mut()
-            .ok_or_else(|| anyhow!("sRGB overlay target missing"))?;
-        let mut target = renderer
-            .bind(&mut overlay.texture)
-            .map_err(|e| anyhow!("bind sRGB overlay target: {e}"))?;
-        let mut frame = renderer
-            .render(&mut target, buffer_size, Transform::Normal)
-            .map_err(|e| anyhow!("begin sRGB overlay frame: {e}"))?;
-        clear_offscreen(&mut frame, buffer_size, transparent)
-            .map_err(|e| anyhow!("clear sRGB overlay target: {e}"))?;
-        draw_output_stage(
-            state,
-            &mut frame,
-            prepared,
-            &client_elements,
-            &popup_elements,
-            ui_state,
-            scene,
-            output_state,
-            OutputRenderStage::EguiOverlay,
-            ClientCompositingMode::Sdr,
-            ChromeGlassPass::Skip,
-            false,
-        )
-        .map_err(|err| anyhow!("{err}"))?;
-        let _sync = frame
-            .finish()
-            .map_err(|e| anyhow!("finish sRGB overlay frame: {e}"))?;
+    // Most frames use neither, so avoid both full pipeline stages entirely.
+    if needs_srgb_overlay {
+        let pass_started = Instant::now();
+        {
+            let overlay = targets
+                .overlay_offscreen
+                .as_mut()
+                .ok_or_else(|| anyhow!("sRGB overlay target missing"))?;
+            let mut target = renderer
+                .bind(&mut overlay.texture)
+                .map_err(|e| anyhow!("bind sRGB overlay target: {e}"))?;
+            let mut frame = renderer
+                .render(&mut target, buffer_size, Transform::Normal)
+                .map_err(|e| anyhow!("begin sRGB overlay frame: {e}"))?;
+            clear_offscreen(&mut frame, &prepared.frame_ctx.damage, transparent)
+                .map_err(|e| anyhow!("clear sRGB overlay target: {e}"))?;
+            draw_output_stage(
+                state,
+                &mut frame,
+                prepared,
+                &client_elements,
+                &popup_elements,
+                ui_state,
+                scene,
+                output_state,
+                OutputRenderStage::EguiOverlay,
+                ClientCompositingMode::Sdr,
+                ChromeGlassPass::Skip,
+                false,
+            )
+            .map_err(|err| anyhow!("{err}"))?;
+            let sync = frame
+                .finish()
+                .map_err(|e| anyhow!("finish sRGB overlay frame: {e}"))?;
+            if profile_timings {
+                record_gpu_completion(
+                    renderer,
+                    &sync,
+                    "srgb-overlay",
+                    pass_started,
+                    &mut pass_timings,
+                )?;
+            }
+        }
+        let overlay_texture = targets.overlay_offscreen.as_ref().unwrap().texture.clone();
+        composite_srgb_overlay_onto_linear(
+            renderer,
+            &overlay_texture,
+            &mut targets.linear_offscreen.as_mut().unwrap().texture,
+            buffer_size,
+            srgb_to_linear,
+            &prepared.frame_ctx.damage,
+        )?;
     }
 
-    let overlay_texture = targets.overlay_offscreen.as_ref().unwrap().texture.clone();
-    composite_srgb_overlay_onto_linear(
+    let pass_started = Instant::now();
+    let sync = apply_linear_output_encode(
+        state,
         renderer,
-        &overlay_texture,
-        &mut targets.linear_offscreen.as_mut().unwrap().texture,
+        targets,
+        output_id,
         buffer_size,
-        srgb_to_linear,
+        &prepared.frame_ctx.damage,
     )?;
-
-    apply_linear_output_encode(state, renderer, targets, output_id, buffer_size)
+    if profile_timings {
+        record_gpu_completion(
+            renderer,
+            &sync,
+            "output-encode",
+            pass_started,
+            &mut pass_timings,
+        )?;
+        let total_us: u128 = pass_timings.iter().map(|(_, micros)| *micros).sum();
+        let stages = pass_timings
+            .iter()
+            .map(|(label, micros)| format!("{label}={micros}us"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        flog(&format!(
+            "linear render GPU-completion sample: output={:?} frame={} damage_rects={} total={}us {}",
+            output_id,
+            prepared.frame_ctx.frame_no,
+            prepared.frame_ctx.damage.len(),
+            total_us,
+            stages
+        ));
+    }
+    Ok(sync)
 }
 
 /// Render one output into the SDR offscreen target using the same linear/legacy path as scanout.
@@ -1375,6 +1667,13 @@ pub fn present_offscreen_texture(
 #[cfg(test)]
 mod tests {
     use super::resolve_hdr_encode_state;
+    use crate::core::color::hdr_reference_white_nits;
+
+    #[test]
+    fn pq_desktop_white_uses_hdr_reference_luminance() {
+        assert_eq!(hdr_reference_white_nits(600.0), 203.0);
+        assert_eq!(hdr_reference_white_nits(100.0), 100.0);
+    }
 
     #[test]
     fn pending_hdr_enable_encodes_first_frame_as_pq() {

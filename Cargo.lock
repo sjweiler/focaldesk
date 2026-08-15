@@ -1758,6 +1758,7 @@ dependencies = [
  "focal-launch-shared",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-settings-core",
  "serde",
  "serde_json",
 ]

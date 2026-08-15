@@ -45,7 +45,7 @@ use wayland_server::protocol::wl_surface::WlSurface;
 use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
-    ClockPulseFrame, FlowFieldPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget,
+    ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget,
 };
 use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
@@ -68,7 +68,6 @@ use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::dialog::{Dialog, DialogId};
 use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::dialog_layout::DialogLayout;
-use focaldesk_ui::egui_layer::EguiLayer;
 use focaldesk_ui::{UiVisualState, UiVisualStyle};
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
@@ -116,6 +115,9 @@ pub enum OutputRenderStage {
     /// Work-area glass in FP16 after the opaque base blit, before clients.
     LinearGlassUnderClients,
     Clients,
+    /// Compositor-owned dock, top-bar controls, indicators, and clock.
+    ChromeOverlay,
+    /// Client popups and transient compositor overlays above the client layer.
     Overlay,
     /// egui + software cursor only (sRGB), decoded into the linear scene before output encode.
     EguiOverlay,
@@ -207,7 +209,6 @@ pub struct RenderState {
     glass_control_background_size: (i32, i32),
     glass_control_background_linear: bool,
     glass_control_background_disabled: bool,
-    pub egui: EguiLayer,
     pub start_time: Instant,
     //pub chrome_svg: ChromeSvgCache,
     pub font_atlas_texture: Option<GlesTexture>,
@@ -233,14 +234,12 @@ pub struct RenderInputs<'a> {
     pub sidebar_hover_slot: Option<usize>, // 👈 ADD THIS
     pub sidebar_pulse: Option<SidebarPulseFrame>,
     pub topbar_pulse: Option<TopbarPulseFrame>,
-    pub flow_field_pulse: Option<FlowFieldPulseFrame>,
     pub clock_pulse: Option<ClockPulseFrame>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     /// Focus is retained by the accessibility model, while chrome rendering
     /// reads element state exclusively from the per-output components.
     pub ui_focus: Option<ElementId>,
-    pub desktop_output: &'a focaldesk_ui::desktop_output::DesktopOutput,
     pub current_workspace: WorkspaceId,
     /// A fullscreen client on this output owns the entire display, including the shell chrome.
     pub fullscreen_client: bool,
@@ -264,6 +263,7 @@ pub struct RenderInputs<'a> {
 
 pub struct RenderInputsMut<'a> {
     pub ui: &'a mut UiState<GlesTexture>,
+    pub desktop_output: &'a mut focaldesk_ui::desktop_output::DesktopOutput,
 }
 
 fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
@@ -273,6 +273,26 @@ fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
         srgb_to_linear(c[2]),
         c[3],
     ]
+}
+
+/// Linear Rec.709/sRGB scene color to linear Display P3 shader-authoring
+/// coordinates. The wide shader epilogue applies the inverse transform before
+/// blending into the FP16 scene, so existing theme colors retain their look.
+fn scene_linear_to_display_p3(c: [f32; 4]) -> [f32; 4] {
+    [
+        0.822593 * c[0] + 0.177534 * c[1],
+        0.033200 * c[0] + 0.966784 * c[1],
+        0.017085 * c[0] + 0.072396 * c[1] + 0.910301 * c[2],
+        c[3],
+    ]
+}
+
+fn bevel_style_to_display_p3(mut style: BevelStyle) -> BevelStyle {
+    style.face_color = scene_linear_to_display_p3(style.face_color);
+    style.light_color = scene_linear_to_display_p3(style.light_color);
+    style.shadow_color = scene_linear_to_display_p3(style.shadow_color);
+    style.glow_color = scene_linear_to_display_p3(style.glow_color);
+    style
 }
 
 fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
@@ -336,7 +356,8 @@ fn contiguous_runs_by_key<'a, T, K: PartialEq>(
 
 #[cfg(test)]
 mod color_run_tests {
-    use super::contiguous_runs_by_key;
+    use super::{clipped_dest_local_damage, contiguous_runs_by_key};
+    use smithay::utils::{Physical, Rectangle};
 
     #[test]
     fn alternating_color_runs_preserve_back_to_front_draw_order() {
@@ -361,6 +382,24 @@ mod color_run_tests {
             .map(|element| element.1)
             .collect::<Vec<_>>();
         assert_eq!(draw_order, vec![4, 3, 2, 1, 0]);
+    }
+
+    #[test]
+    fn retained_shader_damage_is_clipped_and_destination_local() {
+        let destination = Rectangle::<i32, Physical>::from_loc_and_size((100, 40), (80, 30));
+        let damage = [
+            Rectangle::from_loc_and_size((90, 35), (20, 20)),
+            Rectangle::from_loc_and_size((170, 60), (30, 20)),
+            Rectangle::from_loc_and_size((0, 0), (20, 20)),
+        ];
+
+        assert_eq!(
+            clipped_dest_local_damage(destination, &damage),
+            vec![
+                Rectangle::from_loc_and_size((0, 0), (10, 15)),
+                Rectangle::from_loc_and_size((70, 20), (10, 10)),
+            ]
+        );
     }
 }
 
@@ -390,6 +429,22 @@ fn to_physical_rect(
 /// Smithay pixel/texture draws expect damage in dest-local coordinates.
 fn dest_local_damage(size: Size<i32, Physical>) -> [Rectangle<i32, Physical>; 1] {
     [Rectangle::from_loc_and_size((0, 0), (size.w, size.h))]
+}
+
+/// Convert output-local damage to the destination-local coordinates expected
+/// by Smithay's pixel shader helpers.
+fn clipped_dest_local_damage(
+    dest: Rectangle<i32, Physical>,
+    damage: &[Rectangle<i32, Physical>],
+) -> Vec<Rectangle<i32, Physical>> {
+    damage
+        .iter()
+        .filter_map(|rect| rect.intersection(dest))
+        .map(|mut rect| {
+            rect.loc -= dest.loc;
+            rect
+        })
+        .collect()
 }
 
 fn ellipsize_for_width(text: &str, max_width: i32, size_px: u32) -> String {
@@ -665,7 +720,6 @@ impl RenderState {
             glass_control_background_size: (1, 1),
             glass_control_background_linear: false,
             glass_control_background_disabled: false,
-            egui: EguiLayer::default(),
             start_time: Instant::now(),
 
             font_atlas_texture: None,
@@ -1320,7 +1374,15 @@ impl RenderState {
         output_factor: f32,
         linear_target: bool,
     ) -> Result<bool, GlesError> {
-        let Some(program) = self.chrome_shaders.glass_control.clone() else {
+        let program = if linear_target && self.chrome_shaders.wide_gamut_ready() {
+            self.chrome_shaders
+                .glass_control_wide
+                .clone()
+                .or_else(|| self.chrome_shaders.glass_control.clone())
+        } else {
+            self.chrome_shaders.glass_control.clone()
+        };
+        let Some(program) = program else {
             return Ok(false);
         };
         let Some(background) = self.glass_control_background.clone() else {
@@ -1419,6 +1481,16 @@ impl RenderState {
         );
         let damage = [Rectangle::from_loc_and_size((0, 0), control.size)];
         let opacity = if enabled { 0.96 } else { 0.72 };
+        let glass_tint = if linear_target && self.chrome_shaders.wide_gamut_ready() {
+            scene_linear_to_display_p3(theme.chrome.glass_tint)
+        } else {
+            theme.chrome.glass_tint
+        };
+        let accent_color = if linear_target && self.chrome_shaders.wide_gamut_ready() {
+            scene_linear_to_display_p3(theme.chrome.accent_color)
+        } else {
+            theme.chrome.accent_color
+        };
         let result = frame.render_texture_from_to(
             &atlas.texture,
             source,
@@ -1445,14 +1517,10 @@ impl RenderState {
                     "u_icon_texel_size",
                     [1.0 / atlas_size.w as f32, 1.0 / atlas_size.h as f32],
                 ),
-                Uniform::new("u_glass_tint", theme.chrome.glass_tint),
+                Uniform::new("u_glass_tint", glass_tint),
                 Uniform::new(
                     "u_accent_color",
-                    [
-                        theme.chrome.accent_color[0],
-                        theme.chrome.accent_color[1],
-                        theme.chrome.accent_color[2],
-                    ],
+                    [accent_color[0], accent_color[1], accent_color[2]],
                 ),
                 Uniform::new(
                     "u_corner_radius",
@@ -1526,7 +1594,6 @@ impl RenderState {
         self.fonts_prewarm_done = false;
         self.output_icc_lut_gpu.clear();
         self.icc_lut_fallback_logged.clear();
-        self.egui.invalidate_gpu_state();
         self.redraw_all = true;
     }
 
@@ -1736,7 +1803,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         style: &TopBarStyle,
     ) -> Result<(), GlesError> {
         use smithay::backend::renderer::gles::Uniform;
@@ -1749,7 +1816,7 @@ impl RenderState {
         );
 
         let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
-        let damage_local = dest_local_damage(rect_physical.size);
+        let damage_local = clipped_dest_local_damage(rect_physical, damage);
 
         frame.render_pixel_shader_to(
             program,
@@ -1782,7 +1849,7 @@ impl RenderState {
         button: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         style: &ButtonStyle,
     ) {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -1793,7 +1860,7 @@ impl RenderState {
         );
 
         let buffer_size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
-        let damage_local = dest_local_damage(rect_physical.size);
+        let damage_local = clipped_dest_local_damage(rect_physical, damage);
 
         let _ = frame.render_pixel_shader_to(
             button,
@@ -1838,8 +1905,7 @@ impl RenderState {
         client_compositing: &ClientCompositingMode,
         surface_colors: &std::collections::HashMap<Id, SurfaceColorRenderState>,
     ) -> Result<(), GlesError> {
-        let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
-        let damage = std::slice::from_ref(&full);
+        let damage = &ctx.damage;
 
         match client_compositing {
             ClientCompositingMode::Linear {
@@ -1857,6 +1923,10 @@ impl RenderState {
                         Uniform::new(
                             "u_decode_tf",
                             color.description.transfer.decode_mode() as u32 as f32,
+                        ),
+                        Uniform::new(
+                            "u_reference_white_nits",
+                            color.description.reference_white_nits.max(1.0),
                         ),
                         Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
                         Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
@@ -2026,21 +2096,10 @@ impl RenderState {
                 flip_egui_y: inputs.flip_egui_y,
                 portal_capture: inputs.ctx.portal_capture,
             };
-            let full_output_damage = [Rectangle::<i32, Physical>::from_loc_and_size(
-                (0, 0),
-                Size::<i32, Physical>::from(inputs.ctx.output_size),
-            )];
-            let egui_damage = if self.egui.is_open_on_output(inputs.ctx.rendering_output)
-                || inputs.ctx.portal_capture
-            {
-                &full_output_damage[..]
-            } else {
-                &inputs.ctx.damage[..]
-            };
-            self.egui.render(
+            muts.desktop_output.egui.render(
                 frame,
                 &egui_frame_ctx,
-                egui_damage,
+                &inputs.ctx.damage,
                 &self.chrome_shaders,
                 inputs.theme,
             )?;
@@ -2050,7 +2109,12 @@ impl RenderState {
             return Ok(());
         }
 
-        if !inputs.fullscreen_client && inputs.draw_internal_chrome {
+        if matches!(
+            stage,
+            OutputRenderStage::All | OutputRenderStage::ChromeOverlay
+        ) && !inputs.fullscreen_client
+            && inputs.draw_internal_chrome
+        {
             self.draw_chrome_trim_glass_icons(
                 frame,
                 inputs.ctx,
@@ -2059,14 +2123,17 @@ impl RenderState {
                 inputs.metrics,
                 muts.ui,
                 inputs.ui_focus,
-                inputs.desktop_output,
+                muts.desktop_output,
                 inputs.current_workspace,
                 inputs.fonts,
-                inputs.flow_field_pulse,
                 inputs.notification_unread_count,
                 theme,
                 inputs.client_compositing.ui_textures_linear(),
             );
+        }
+
+        if matches!(stage, OutputRenderStage::ChromeOverlay) {
+            return Ok(());
         }
 
         self.draw_popup_elements(
@@ -2105,7 +2172,9 @@ impl RenderState {
             )?;
         }
 
-        if let Err(err) = self.draw_active_output_glow(frame, inputs.ctx, theme) {
+        let wide_gamut = inputs.client_compositing.ui_textures_linear()
+            && self.chrome_shaders.wide_gamut_ready();
+        if let Err(err) = self.draw_active_output_glow(frame, inputs.ctx, theme, wide_gamut) {
             error!(
                 target: "focaldesk",
                 session_id = session_id(),
@@ -2114,7 +2183,14 @@ impl RenderState {
             );
         }
 
-        self.draw_lock_screen(frame, inputs.ctx, inputs.lock_screen, inputs.fonts, theme)?;
+        self.draw_lock_screen(
+            frame,
+            inputs.ctx,
+            inputs.lock_screen,
+            inputs.fonts,
+            theme,
+            wide_gamut,
+        )?;
 
         if inputs.defer_egui_to_sdr {
             return Ok(());
@@ -2131,21 +2207,10 @@ impl RenderState {
             flip_egui_y: inputs.flip_egui_y,
             portal_capture: inputs.ctx.portal_capture,
         };
-        let full_output_damage = [Rectangle::<i32, Physical>::from_loc_and_size(
-            (0, 0),
-            Size::<i32, Physical>::from(inputs.ctx.output_size),
-        )];
-        let egui_damage = if self.egui.is_open_on_output(inputs.ctx.rendering_output)
-            || inputs.ctx.portal_capture
-        {
-            &full_output_damage[..]
-        } else {
-            &inputs.ctx.damage[..]
-        };
-        self.egui.render(
+        muts.desktop_output.egui.render(
             frame,
             &egui_frame_ctx,
-            egui_damage,
+            &inputs.ctx.damage,
             &self.chrome_shaders,
             theme,
         )?;
@@ -2237,6 +2302,7 @@ impl RenderState {
         lock: &LockScreenSnapshot,
         fonts: &FontSystem,
         theme: &FlowTheme,
+        wide_gamut: bool,
     ) -> Result<(), GlesError> {
         if !lock.active {
             return Ok(());
@@ -2250,7 +2316,7 @@ impl RenderState {
             &[full_physical],
             [0.005, 0.008, 0.014, 0.72],
         )?;
-        self.draw_screensaver_background(frame, ctx, full_physical)?;
+        self.draw_screensaver_background(frame, ctx, full_physical, wide_gamut)?;
 
         let logical_w = (f64::from(ctx.output_size.0) / ctx.output_scale.x).round() as i32;
         let logical_h = (f64::from(ctx.output_size.1) / ctx.output_scale.y).round() as i32;
@@ -2286,7 +2352,12 @@ impl RenderState {
         );
         self.draw_rounded_rect(frame, trim_rect, ctx.output_scale, 2.0, trim)?;
 
-        if let (Some(program), Some(pulse)) = (self.chrome_shaders.pulse.as_ref(), lock.pulse) {
+        let pulse_program = if wide_gamut {
+            self.chrome_shaders.pulse_wide.as_ref()
+        } else {
+            self.chrome_shaders.pulse.as_ref()
+        };
+        if let (Some(program), Some(pulse)) = (pulse_program, lock.pulse) {
             let color = match pulse.kind {
                 LockPulseKind::Rejected => [0.78, 0.02, 0.02, 0.92],
                 LockPulseKind::Accepted => [0.35, 1.0, 0.28, 0.86],
@@ -2418,8 +2489,14 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         dst: Rectangle<i32, Physical>,
+        wide_gamut: bool,
     ) -> Result<(), GlesError> {
-        let Some(program) = self.chrome_shaders.screensaver.as_ref() else {
+        let program = if wide_gamut {
+            self.chrome_shaders.screensaver_wide.as_ref()
+        } else {
+            self.chrome_shaders.screensaver.as_ref()
+        };
+        let Some(program) = program else {
             return Ok(());
         };
 
@@ -2452,12 +2529,18 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         theme: &FlowTheme,
+        wide_gamut: bool,
     ) -> Result<(), GlesError> {
         if ctx.active_output != ctx.rendering_output {
             return Ok(());
         }
 
-        let Some(program) = self.chrome_shaders.accent.as_ref() else {
+        let program = if wide_gamut {
+            self.chrome_shaders.accent_wide.as_ref()
+        } else {
+            self.chrome_shaders.accent.as_ref()
+        };
+        let Some(program) = program else {
             return Ok(());
         };
 
@@ -2466,9 +2549,20 @@ impl RenderState {
         let src = Rectangle::<f64, Buffer>::from_size(
             (f64::from(output_size.w), f64::from(output_size.h)).into(),
         );
-        let damage = std::slice::from_ref(&dst);
+        // This pass runs on a retained scene target. Never modify pixels outside
+        // the frame's advertised damage: the output encode/present stages update
+        // only that same region, so wider draws become visible later as seemingly
+        // unrelated client or pointer damage reaches those pixels.
+        let damage = &ctx.damage;
+        if damage.is_empty() {
+            return Ok(());
+        }
 
-        let mut accent = theme.chrome.accent_color;
+        let mut accent = if wide_gamut {
+            scene_linear_to_display_p3(theme.chrome.accent_color)
+        } else {
+            theme.chrome.accent_color
+        };
         accent[3] = 1.0;
         let elapsed = ctx.now.duration_since(self.start_time).as_secs_f32();
 
@@ -2776,23 +2870,31 @@ impl RenderState {
         inputs: &RenderInputs<'_>,
         theme: &FlowTheme,
     ) -> Result<(), GlesError> {
-        let Some(glass) = self.chrome_shaders.glass.as_ref() else {
+        let wide_gamut = matches!(
+            inputs.chrome_glass_pass,
+            ChromeGlassPass::LinearUnderClients
+        ) && self.chrome_shaders.wide_gamut_ready();
+        let glass = if wide_gamut {
+            self.chrome_shaders.glass_wide.as_ref()
+        } else {
+            self.chrome_shaders.glass.as_ref()
+        };
+        let Some(glass) = glass else {
             return Ok(());
         };
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
-        let style = legacy_theme.glass;
-        let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
-            Point::<i32, Physical>::from((0, 0)),
-            Size::<i32, Physical>::from(inputs.ctx.output_size),
-        );
-        let damage = &[fullscreen_rect];
+        let mut style = legacy_theme.glass;
+        if wide_gamut {
+            style.tint = scene_linear_to_display_p3(style.tint);
+            style.edge_color = scene_linear_to_display_p3(style.edge_color);
+        }
         self.draw_workarea_glass(
             frame,
             inputs.ctx,
             glass,
             inputs.layout.work_area.glass,
             inputs.ctx.output_scale,
-            damage,
+            &inputs.ctx.damage,
             &style,
         )
     }
@@ -2804,7 +2906,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         style: &GlassStyle,
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -2814,7 +2916,10 @@ impl RenderState {
         );
         let dst_rect_physical = rect_physical;
         let size = Size::from((rect_physical.size.w, rect_physical.size.h));
-        let damage_local = dest_local_damage(rect_physical.size);
+        let damage_local = clipped_dest_local_damage(rect_physical, damage);
+        if damage_local.is_empty() {
+            return Ok(());
+        }
 
         let t = ctx.now.duration_since(self.start_time).as_secs_f32();
 
@@ -2848,7 +2953,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         style: &BevelStyle,
     ) -> Result<(), GlesError> {
         Self::draw_beveled_panel_with_radius(
@@ -2856,7 +2961,7 @@ impl RenderState {
             program,
             rect_logical,
             scale,
-            _damage,
+            damage,
             style,
             0.0,
         )
@@ -2867,7 +2972,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         style: &BevelStyle,
         corner_radius: f32,
     ) -> Result<(), GlesError> {
@@ -2878,7 +2983,7 @@ impl RenderState {
         );
         let dst_rect_physical = rect_physical;
         let size = Size::from((rect_physical.size.w, rect_physical.size.h));
-        let damage_local = dest_local_damage(rect_physical.size);
+        let damage_local = clipped_dest_local_damage(rect_physical, damage);
 
         let uniforms = [
             Uniform::new("u_bevel", style.bevel),
@@ -2912,7 +3017,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
         style: &LightChannelStyle,
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
@@ -2923,7 +3028,10 @@ impl RenderState {
             (rect_physical.size.w as f64, rect_physical.size.h as f64),
         );
         let size = Size::from((rect_physical.size.w, rect_physical.size.h));
-        let damage_local = dest_local_damage(rect_physical.size);
+        let damage_local = clipped_dest_local_damage(rect_physical, damage);
+        if damage_local.is_empty() {
+            return Ok(());
+        }
 
         let uniforms = [
             Uniform::new("u_slot_inset", style.slot_inset),
@@ -3073,7 +3181,7 @@ impl RenderState {
     pub fn draw_wallpaper_in_rect(
         &self,
         frame: &mut GlesFrame<'_, '_>,
-        _ctx: &FrameCtx,
+        ctx: &FrameCtx,
         target_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
         theme: WallpaperTheme,
@@ -3114,7 +3222,10 @@ impl RenderState {
         //    RenderState::rect_apply_flipped180(dst_world, (ctx.output_size.0, ctx.output_size.1));
         let dst = dst_world;
 
-        let damage_local = dest_local_damage(dst.size);
+        let damage_local = clipped_dest_local_damage(dst, &ctx.damage);
+        if damage_local.is_empty() {
+            return;
+        }
 
         let tw = src.w as f64;
         let th = src.h as f64;
@@ -3128,8 +3239,15 @@ impl RenderState {
                 .into(),
         );
 
+        let wide_gamut =
+            client_compositing.ui_textures_linear() && self.chrome_shaders.wide_gamut_ready();
+        let tint = if wide_gamut {
+            scene_linear_to_display_p3(theme.tint_color)
+        } else {
+            theme.tint_color
+        };
         let uniforms = [
-            Uniform::new("u_tint", theme.tint_color),
+            Uniform::new("u_tint", tint),
             Uniform::new(
                 "u_decode_srgb",
                 if client_compositing.ui_textures_linear() {
@@ -3140,6 +3258,12 @@ impl RenderState {
             ),
         ];
 
+        let wallpaper_program = if wide_gamut {
+            self.chrome_shaders.wallpaper_tint_wide.as_ref()
+        } else {
+            self.chrome_shaders.wallpaper_tint.as_ref()
+        };
+
         frame
             .render_texture_from_to(
                 tex,
@@ -3149,10 +3273,104 @@ impl RenderState {
                 &[],
                 Transform::Normal,
                 1.0,
-                self.chrome_shaders.wallpaper_tint.as_ref(),
+                wallpaper_program,
                 &uniforms,
             )
             .unwrap();
+    }
+
+    /// Overlay the bundled wallpaper's wide-gamut/HDR creative highlights in
+    /// the FP16 scene. The ordinary SDR wallpaper remains the visual base, so
+    /// this pass is a no-op on an sRGB SDR output and never raises its blacks.
+    pub fn draw_wallpaper_creative_grade(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        target_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+        theme: WallpaperTheme,
+        grade_mode: f32,
+        reference_white_nits: f32,
+        peak_nits: f32,
+    ) {
+        use crate::core::wallpaper::{compute_wallpaper_blit, RectI, SizeI, WallpaperMode};
+        use smithay::backend::renderer::gles::Uniform;
+
+        let Some(texture) = self.wallpaper_texture.as_ref() else {
+            return;
+        };
+        let Some(program) = self.chrome_shaders.wallpaper_creative_grade.as_ref() else {
+            return;
+        };
+
+        if grade_mode < 0.5 {
+            return;
+        }
+
+        let target_physical = to_physical_rect(target_logical, scale);
+        let source_size = texture.size();
+        let Some(blit) = compute_wallpaper_blit(
+            SizeI {
+                w: source_size.w,
+                h: source_size.h,
+            },
+            RectI {
+                x: target_physical.loc.x,
+                y: target_physical.loc.y,
+                w: target_physical.size.w,
+                h: target_physical.size.h,
+            },
+            WallpaperMode::Fill,
+        ) else {
+            return;
+        };
+
+        let destination: Rectangle<i32, Physical> = Rectangle::new(
+            (blit.dst.x, blit.dst.y).into(),
+            (blit.dst.w, blit.dst.h).into(),
+        );
+        let damage = clipped_dest_local_damage(destination, &ctx.damage);
+        if damage.is_empty() {
+            return;
+        }
+
+        let width = source_size.w as f64;
+        let height = source_size.h as f64;
+        let source: Rectangle<f64, Buffer> = Rectangle::new(
+            (blit.uv.u0 as f64 * width, blit.uv.v0 as f64 * height).into(),
+            (
+                (blit.uv.u1 - blit.uv.u0) as f64 * width,
+                (blit.uv.v1 - blit.uv.v0) as f64 * height,
+            )
+                .into(),
+        );
+        let uniforms = [
+            Uniform::new("u_tint", theme.tint_color),
+            Uniform::new(
+                "u_texel_size",
+                [
+                    1.0f32 / source_size.w.max(1) as f32,
+                    1.0f32 / source_size.h.max(1) as f32,
+                ],
+            ),
+            Uniform::new("u_grade_mode", grade_mode),
+            Uniform::new("u_reference_white_nits", reference_white_nits),
+            Uniform::new("u_peak_nits", peak_nits),
+        ];
+
+        if let Err(err) = frame.render_texture_from_to(
+            texture,
+            source,
+            destination,
+            &damage,
+            &[],
+            Transform::Normal,
+            1.0,
+            Some(program),
+            &uniforms,
+        ) {
+            flog_error!("wallpaper creative grade draw failed: {err}");
+        }
     }
 
     /// Build client render elements for one output using smithay's Space region logic.
@@ -3391,23 +3609,34 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         ctx: &FrameCtx,
         layout: &ChromeLayoutLogical,
+        wide_gamut: bool,
     ) {
         if ctx.active_output != ctx.rendering_output {
             return;
         }
 
-        let Some(program) = self.chrome_shaders.amber_lightbar.as_ref() else {
+        let program = if wide_gamut && self.chrome_shaders.wide_gamut_ready() {
+            self.chrome_shaders
+                .amber_lightbar_wide
+                .as_ref()
+                .or(self.chrome_shaders.amber_lightbar.as_ref())
+        } else {
+            self.chrome_shaders.amber_lightbar.as_ref()
+        };
+        let Some(program) = program else {
             return;
         };
 
         let bar_rect_logical =
             Rectangle::from_loc_and_size(layout.topbar.outer.loc, (layout.topbar.outer.size.w, 10));
 
-        let full = Rectangle::from_loc_and_size((0, 0), ctx.output_size);
-        let damage = std::slice::from_ref(&full);
-
-        let _ =
-            Self::draw_amber_lightbar(frame, program, bar_rect_logical, ctx.output_scale, damage);
+        let _ = Self::draw_amber_lightbar(
+            frame,
+            program,
+            bar_rect_logical,
+            ctx.output_scale,
+            &ctx.damage,
+        );
     }
 
     fn draw_amber_lightbar(
@@ -3415,7 +3644,7 @@ impl RenderState {
         program: &GlesPixelProgram,
         rect_logical: Rectangle<i32, Logical>,
         scale: Scale<f64>,
-        _damage: &[Rectangle<i32, Physical>],
+        damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), GlesError> {
         let rect_physical = to_physical_rect(rect_logical, scale);
         let src_rect = Rectangle::<f64, Buffer>::from_loc_and_size(
@@ -3424,7 +3653,10 @@ impl RenderState {
         );
 
         let size = Size::<i32, Buffer>::from((rect_physical.size.w, rect_physical.size.h));
-        let damage_local = dest_local_damage(rect_physical.size);
+        let damage_local = clipped_dest_local_damage(rect_physical, damage);
+        if damage_local.is_empty() {
+            return Ok(());
+        }
 
         frame.render_pixel_shader_to(
             program,
@@ -3452,8 +3684,7 @@ impl RenderState {
         use smithay::backend::renderer::element::Element;
         use smithay::backend::renderer::gles::Uniform;
 
-        let full = smithay::utils::Rectangle::from_loc_and_size((0, 0), ctx.output_size);
-        let damage = std::slice::from_ref(&full);
+        let damage = &ctx.damage;
 
         let ClientCompositingMode::Linear {
             client_to_scene, ..
@@ -3481,6 +3712,10 @@ impl RenderState {
                 Uniform::new(
                     "u_decode_tf",
                     color.description.transfer.decode_mode() as u32 as f32,
+                ),
+                Uniform::new(
+                    "u_reference_white_nits",
+                    color.description.reference_white_nits.max(1.0),
                 ),
                 Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
                 Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
@@ -3537,11 +3772,7 @@ impl RenderState {
 
         let pulse = self.chrome_shaders.pulse.as_ref();
 
-        let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
-            Point::<i32, Physical>::from((0, 0)),
-            Size::<i32, Physical>::from(ctx.output_size),
-        );
-        let damage = &[fullscreen_rect];
+        let damage = &ctx.damage;
 
         //
         // 1. STRUCTURAL SHELL
@@ -3635,7 +3866,6 @@ impl RenderState {
         );
 
         let ai_button = layout.topbar.ai_button;
-        let activity_field = layout.topbar.flow_field;
         Self::draw_recessed_button(
             frame,
             button,
@@ -3658,24 +3888,6 @@ impl RenderState {
                 );
             }
         }
-
-        Self::draw_recessed_button(
-            frame,
-            button,
-            activity_field,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.button,
-        );
-
-        let _ = Self::draw_light_channel(
-            frame,
-            light,
-            inset_rect(layout.topbar.flow_field, 3),
-            ctx.output_scale,
-            damage,
-            &legacy_theme.light,
-        );
 
         let _ = Self::draw_beveled_panel(
             frame,
@@ -3903,37 +4115,58 @@ impl RenderState {
         desktop_output: &focaldesk_ui::desktop_output::DesktopOutput,
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
-        flow_field_pulse: Option<FlowFieldPulseFrame>,
         notification_unread_count: usize,
         theme: &FlowTheme,
         linear_target: bool,
     ) {
+        let wide_gamut = linear_target && self.chrome_shaders.wide_gamut_ready();
         let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
 
-        let beveled = self
-            .chrome_shaders
-            .beveled_panel
-            .clone()
-            .expect("beveled_panel shader not compiled");
+        let beveled = if wide_gamut {
+            self.chrome_shaders
+                .beveled_panel_wide
+                .clone()
+                .or_else(|| self.chrome_shaders.beveled_panel.clone())
+        } else {
+            self.chrome_shaders.beveled_panel.clone()
+        }
+        .expect("beveled_panel shader not compiled");
 
         let fullscreen_rect: Rectangle<i32, Physical> = Rectangle::from_loc_and_size(
             Point::<i32, Physical>::from((0, 0)),
             Size::<i32, Physical>::from(ctx.output_size),
         );
-        let damage = &[fullscreen_rect];
+        let damage = &ctx.damage;
+        let damage_intersects = |rect: Rectangle<i32, Logical>| {
+            let rect = rect.to_physical_precise_round(ctx.output_scale);
+            damage.iter().any(|damaged| damaged.overlaps(rect))
+        };
 
-        if let Some(rect) = layout.work_area.trim {
+        if let Some(rect) = layout
+            .work_area
+            .trim
+            .filter(|rect| damage_intersects(*rect))
+        {
+            let trim_style = if wide_gamut {
+                bevel_style_to_display_p3(legacy_theme.trim)
+            } else {
+                legacy_theme.trim
+            };
             let _ = Self::draw_beveled_panel(
                 frame,
                 &beveled,
                 rect,
                 ctx.output_scale,
                 damage,
-                &legacy_theme.trim,
+                &trim_style,
             );
         }
 
-        self.draw_active_lightbar(frame, ctx, layout);
+        let lightbar_rect =
+            Rectangle::from_loc_and_size(layout.topbar.outer.loc, (layout.topbar.outer.size.w, 10));
+        if damage_intersects(lightbar_rect) {
+            self.draw_active_lightbar(frame, ctx, layout, wide_gamut);
+        }
 
         if let Some(atlas) = ui_state.chrome.atlas.as_ref() {
             let icon_px = metrics.icon_base_px as i32;
@@ -3953,25 +4186,39 @@ impl RenderState {
             let workspace_number = current_workspace.0 as usize;
             let active_theme = theme;
 
-            let _ = self.draw_topbar_identity(
-                frame,
-                fonts,
-                layout,
-                "FOCALDESK",
-                output_number,
-                workspace_number,
-                active_theme,
-                ctx.output_scale,
-            );
+            if damage_intersects(layout.topbar.title) {
+                let _ = self.draw_topbar_identity(
+                    frame,
+                    fonts,
+                    layout,
+                    "FOCALDESK",
+                    output_number,
+                    workspace_number,
+                    active_theme,
+                    ctx.output_scale,
+                );
+            }
 
-            let tinted_icon = self
-                .chrome_shaders
-                .tinted_icon
-                .clone()
-                .expect("glass shader not compiled");
+            let tinted_icon = if wide_gamut {
+                self.chrome_shaders
+                    .tinted_icon_wide
+                    .clone()
+                    .or_else(|| self.chrome_shaders.tinted_icon.clone())
+            } else {
+                self.chrome_shaders.tinted_icon.clone()
+            }
+            .expect("glass shader not compiled");
 
             for el in desktop_output.chrome_elements() {
                 if !el.visible {
+                    continue;
+                }
+
+                let element_rect = Rectangle::<i32, Logical>::from_loc_and_size(
+                    (el.bounds.x, el.bounds.y),
+                    (el.bounds.w, el.bounds.h),
+                );
+                if !damage_intersects(element_rect) {
                     continue;
                 }
 
@@ -3988,10 +4235,7 @@ impl RenderState {
                     }
                 };
 
-                let base_rect_logical = Rectangle::<i32, Logical>::from_loc_and_size(
-                    (el.bounds.x, el.bounds.y),
-                    (el.bounds.w, el.bounds.h),
-                );
+                let base_rect_logical = element_rect;
 
                 // center-based scaling
 
@@ -4009,6 +4253,9 @@ impl RenderState {
 
                 let state = el.visual_state();
                 let mut style = themed_icon_style(active_theme, state);
+                if wide_gamut {
+                    style.tint = scene_linear_to_display_p3(style.tint);
+                }
 
                 let is_active_output =
                     ctx.rendering_output == ctx.active_output || ctx.portal_capture;
@@ -4047,48 +4294,31 @@ impl RenderState {
                                 );
                             }
                             let control_rect_logical = inset_rect(base_rect_logical, 3);
-                            let drew_glass = self
-                                .draw_glass_control(
-                                    frame,
-                                    atlas,
-                                    icon_id,
-                                    control_rect_logical,
-                                    icon_rect_logical,
-                                    ctx.output_scale,
-                                    active_theme,
-                                    el.hovered,
-                                    el.enabled,
-                                    el.active || el.selected,
-                                    output_factor,
-                                    linear_target,
-                                )
-                                .unwrap_or(false);
-                            if !drew_glass {
-                                if el.selected || el.active {
-                                    let selected_style = selected_sidebar_style(
-                                        active_theme,
-                                        el.hovered || el.active,
-                                    );
-                                    let _ = Self::draw_beveled_panel(
-                                        frame,
-                                        &beveled,
-                                        control_rect_logical,
-                                        ctx.output_scale,
-                                        damage,
-                                        &selected_style,
-                                    );
+                            if el.selected || el.active {
+                                let mut selected_style =
+                                    selected_sidebar_style(active_theme, el.hovered || el.active);
+                                if wide_gamut {
+                                    selected_style = bevel_style_to_display_p3(selected_style);
                                 }
-                                Self::draw_icon_in_rect(
+                                let _ = Self::draw_beveled_panel(
                                     frame,
-                                    atlas,
-                                    icon_id,
-                                    icon_state,
-                                    icon_rect_logical,
+                                    &beveled,
+                                    control_rect_logical,
                                     ctx.output_scale,
-                                    style,
-                                    &tinted_icon,
+                                    damage,
+                                    &selected_style,
                                 );
                             }
+                            Self::draw_icon_in_rect(
+                                frame,
+                                atlas,
+                                icon_id,
+                                icon_state,
+                                icon_rect_logical,
+                                ctx.output_scale,
+                                style,
+                                &tinted_icon,
+                            );
                             if el.id == focaldesk_ui::ui_builder::TOPBAR_NOTIFICATIONS_ID
                                 && notification_unread_count > 0
                             {
@@ -4132,34 +4362,16 @@ impl RenderState {
                     UiElementKind::TopbarIndicator | UiElementKind::TopbarButton => {
                         if let Some(icon_id) = el.icon {
                             let icon_rect_logical = well_icon_rect(base_rect_logical);
-                            let drew_glass = self
-                                .draw_glass_control(
-                                    frame,
-                                    atlas,
-                                    icon_id,
-                                    base_rect_logical,
-                                    icon_rect_logical,
-                                    ctx.output_scale,
-                                    active_theme,
-                                    el.hovered,
-                                    el.enabled,
-                                    el.active || el.selected,
-                                    output_factor,
-                                    linear_target,
-                                )
-                                .unwrap_or(false);
-                            if !drew_glass {
-                                Self::draw_icon_in_rect(
-                                    frame,
-                                    atlas,
-                                    icon_id,
-                                    icon_state,
-                                    icon_rect_logical,
-                                    ctx.output_scale,
-                                    style,
-                                    &tinted_icon,
-                                );
-                            }
+                            Self::draw_icon_in_rect(
+                                frame,
+                                atlas,
+                                icon_id,
+                                icon_state,
+                                icon_rect_logical,
+                                ctx.output_scale,
+                                style,
+                                &tinted_icon,
+                            );
                         }
                     }
 
@@ -4188,7 +4400,11 @@ impl RenderState {
                             0.40
                         };
 
-                        let accent = active_theme.chrome.accent_color;
+                        let accent = if wide_gamut {
+                            scene_linear_to_display_p3(active_theme.chrome.accent_color)
+                        } else {
+                            active_theme.chrome.accent_color
+                        };
                         let color = match mode {
                             1 => [accent[0], accent[1], accent[2], 0.98],
                             2 => [0.94, 0.97, 1.00, 0.92],
@@ -4196,7 +4412,15 @@ impl RenderState {
                             4 => [0.98, 0.30, 0.30, 1.00],
                             _ => [accent[0] * 0.72, accent[1] * 0.90, accent[2], 0.70],
                         };
-                        if let Some(program) = self.chrome_shaders.flow_field.as_ref() {
+                        let flow_program = if wide_gamut {
+                            self.chrome_shaders
+                                .flow_field_wide
+                                .as_ref()
+                                .or(self.chrome_shaders.flow_field.as_ref())
+                        } else {
+                            self.chrome_shaders.flow_field.as_ref()
+                        };
+                        if let Some(program) = flow_program {
                             let _ = draw_flow_field(
                                 frame,
                                 program,
@@ -4206,23 +4430,6 @@ impl RenderState {
                                 mode,
                                 energy,
                                 color,
-                            );
-                        }
-
-                        if let (Some(pulse_shader), Some(pulse_frame)) =
-                            (self.chrome_shaders.pulse.as_ref(), flow_field_pulse)
-                        {
-                            let pulse_color =
-                                [color[0].max(0.6), color[1].max(0.7), color[2].max(0.9), 1.0];
-                            let _ = Self::draw_pulse(
-                                frame,
-                                pulse_shader,
-                                base_rect_logical,
-                                pulse_frame.click_local,
-                                pulse_frame.elapsed,
-                                ctx.output_scale,
-                                damage,
-                                pulse_color,
                             );
                         }
                     }

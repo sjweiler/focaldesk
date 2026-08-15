@@ -2,7 +2,7 @@
 Description=Prepare FocalDesk runtime directory for UID %i
 Requires=user-runtime-dir@%i.service
 After=user-runtime-dir@%i.service
-Before=focald-secrets@%i.socket
+Before=focald-secrets@%i.service
 PartOf=user@%i.service
 
 [Service]

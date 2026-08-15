@@ -168,6 +168,18 @@ pub struct ColorDescription {
     pub max_fall_nits: Option<f32>,
 }
 
+/// Diffuse/graphics white used when placing SDR desktop content in an HDR PQ signal.
+///
+/// ITU-R BT.2408 maps SDR reference white to 203 cd/m² in the PQ container. Keep
+/// this separate from the 80-nit reference carried by an SDR output profile: that
+/// profile describes the source scene, not the luminance of white on an HDR output.
+pub const HDR_REFERENCE_WHITE_NITS: f32 = 203.0;
+
+/// HDR reference white, bounded for displays that report a lower usable peak.
+pub fn hdr_reference_white_nits(max_luminance_nits: f32) -> f32 {
+    HDR_REFERENCE_WHITE_NITS.min(max_luminance_nits.max(1.0))
+}
+
 impl ColorDescription {
     /// Wayland surfaces without an image description are sRGB by definition.
     pub const SRGB: Self = Self {
@@ -224,7 +236,7 @@ impl ColorDescription {
         Self {
             primaries: ColorPrimaries::Bt2020,
             transfer: TransferFunction::St2084Pq,
-            reference_white_nits: 203.0,
+            reference_white_nits: hdr_reference_white_nits(max_luminance_nits),
             max_luminance_nits,
             max_cll_nits: Some(max_luminance_nits),
             max_fall_nits: Some(max_fall_nits),
@@ -516,9 +528,12 @@ pub fn hdr_kms_env_forced() -> bool {
 /// unset or empty selector allows every output whose normal HDR preference is
 /// enabled; otherwise connector names must match exactly (for example `DP-3`).
 pub fn hdr_output_selected(output_name: &str) -> bool {
-    hdr_output_selected_with_selector(
+    let hdr_selector = normalized_env_value("FOCALDESK_HDR_OUTPUT");
+    let exclusive_selector = exclusive_hdr_output_selector();
+    hdr_output_selected_with_selectors(
         output_name,
-        std::env::var("FOCALDESK_HDR_OUTPUT").ok().as_deref(),
+        hdr_selector.as_deref(),
+        exclusive_selector.as_deref(),
     )
 }
 
@@ -529,9 +544,58 @@ fn hdr_output_selected_with_selector(output_name: &str, selector: Option<&str>) 
         .is_none_or(|selector| selector == output_name)
 }
 
+fn hdr_output_selected_with_selectors(
+    output_name: &str,
+    hdr_selector: Option<&str>,
+    exclusive_selector: Option<&str>,
+) -> bool {
+    let selector = exclusive_selector
+        .map(str::trim)
+        .filter(|selector| !selector.is_empty())
+        .or_else(|| {
+            hdr_selector
+                .map(str::trim)
+                .filter(|selector| !selector.is_empty())
+        });
+    hdr_output_selected_with_selector(output_name, selector)
+}
+
+fn normalized_env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Exact connector selected for the session-start-only exclusive HDR mode.
+///
+/// The DRM backend validates this selector before removing any other output
+/// from the active topology. Keeping the parser here also lets the normal HDR
+/// safety filter constrain KMS changes to the same connector.
+pub fn exclusive_hdr_output_selector() -> Option<String> {
+    let state = focaldesk_settings_core::load_exclusive_hdr_state();
+    if state.phase == focaldesk_settings_core::ExclusiveHdrPhase::Disabled {
+        return None;
+    }
+    normalized_env_value("FOCALDESK_EXCLUSIVE_HDR_OUTPUT").or_else(|| {
+        (state.phase != focaldesk_settings_core::ExclusiveHdrPhase::Off)
+            .then_some(state.connector)
+            .flatten()
+    })
+}
+
 /// Whether the DRM loop may attempt live KMS HDR commits.
 pub fn hdr_runtime_may_apply_kms(any_output_hdr_requested: bool) -> bool {
-    if hdr_kms_env_blocked() {
+    let exclusive_attempt_failed = focaldesk_settings_core::load_exclusive_hdr_state().phase
+        == focaldesk_settings_core::ExclusiveHdrPhase::Failed;
+    hdr_runtime_may_apply_kms_with_state(any_output_hdr_requested, exclusive_attempt_failed)
+}
+
+fn hdr_runtime_may_apply_kms_with_state(
+    any_output_hdr_requested: bool,
+    exclusive_attempt_failed: bool,
+) -> bool {
+    if hdr_kms_env_blocked() || exclusive_attempt_failed {
         return false;
     }
     hdr_kms_env_forced() || any_output_hdr_requested
@@ -677,10 +741,11 @@ mod tests {
 
         std::env::set_var("FOCALDESK_HDR", "0");
         assert!(!output_hdr_render_active(true, true, true));
-        assert!(!hdr_runtime_may_apply_kms(true));
+        assert!(!hdr_runtime_may_apply_kms_with_state(true, false));
         std::env::remove_var("FOCALDESK_HDR");
 
-        assert!(hdr_runtime_may_apply_kms(true));
+        assert!(hdr_runtime_may_apply_kms_with_state(true, false));
+        assert!(!hdr_runtime_may_apply_kms_with_state(true, true));
         assert!(!output_hdr_render_active(false, true, true));
         assert!(!output_hdr_render_active(true, false, true));
     }
@@ -691,6 +756,25 @@ mod tests {
         assert!(hdr_output_selected_with_selector("DP-3", Some("")));
         assert!(hdr_output_selected_with_selector("DP-3", Some(" DP-3 ")));
         assert!(!hdr_output_selected_with_selector("DP-4", Some("DP-3")));
+    }
+
+    #[test]
+    fn exclusive_selector_takes_precedence_over_general_hdr_selector() {
+        assert!(!hdr_output_selected_with_selectors(
+            "DP-3",
+            Some("DP-3"),
+            Some("HDMI-A-1")
+        ));
+        assert!(hdr_output_selected_with_selectors(
+            "HDMI-A-1",
+            Some("DP-3"),
+            Some("HDMI-A-1")
+        ));
+        assert!(hdr_output_selected_with_selectors(
+            "HDMI-A-1",
+            Some(""),
+            Some(" HDMI-A-1 ")
+        ));
     }
 
     #[test]

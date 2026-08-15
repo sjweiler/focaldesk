@@ -382,10 +382,17 @@ fn run_session_holder_child<C: ConversationHandler>(
 
     match unsafe { nix::unistd::fork() } {
         Ok(ForkResult::Child) => {
-            // The exec'd program inherits none of this: no PAM handle, and
-            // the pipes are O_CLOEXEC so they close across the exec below.
-            drop(session);
-            drop(ctx);
+            // `session` and `ctx` were duplicated by fork.  The holder owns
+            // the one and only close_session/pam_end lifecycle; dropping the
+            // child's copies here would run pam_close_session before exec and
+            // make logind remove the session while the compositor is still
+            // alive.  That allowed a later login to launch a second
+            // compositor on the same VT/DRM device.  Leak the duplicated PAM
+            // handles in this short-lived pre-exec child; exec replaces the
+            // address space immediately and the holder closes its originals
+            // after the real session process exits.
+            std::mem::forget(session);
+            std::mem::forget(ctx);
             exec_into(
                 &exec.program,
                 &env,

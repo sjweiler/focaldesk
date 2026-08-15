@@ -5,8 +5,8 @@ use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
     send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
-    send_settings_request, watch_desktop_keys, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
-    PowerIpcRequest, PowerIpcResponse,
+    send_settings_request, watch_desktop_keys, DesktopAction, DisplayRuntimeOutputStatus,
+    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse,
 };
 use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
 use focaldesk_logging::{init_default_logging, session_id};
@@ -14,7 +14,8 @@ use focaldesk_permissions::{
     PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
 };
 use focaldesk_settings_core::{
-    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile,
+    load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
+    BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, ExclusiveHdrPhase, ExclusiveHdrState,
     LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
@@ -179,6 +180,10 @@ struct DisplayConfig {
     icc_lut_fallback_active: bool,
     #[serde(skip)]
     wide_gamut_active: bool,
+    #[serde(skip)]
+    exclusive_hdr_phase: ExclusiveHdrPhase,
+    #[serde(skip)]
+    exclusive_hdr_reason: Option<String>,
 }
 
 fn save_displays(displays: &[DisplayConfig]) {
@@ -443,6 +448,29 @@ fn hdr_status_subtitle(hdr_requested: bool, hdr_enabled: bool) -> &'static str {
         "Requested, but inactive"
     } else {
         "Off"
+    }
+}
+
+fn exclusive_hdr_status_text(phase: ExclusiveHdrPhase, reason: Option<&str>) -> String {
+    match phase {
+        ExclusiveHdrPhase::Off => {
+            "Restarts into HDR10 on this display and disables every other monitor".to_string()
+        }
+        ExclusiveHdrPhase::Disabled => "Exclusive HDR10 is disabled".to_string(),
+        ExclusiveHdrPhase::Requested => reason
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| "Exclusive HDR10 is armed for the next session".to_string()),
+        ExclusiveHdrPhase::Starting => "Starting in exclusive SDR safety mode…".to_string(),
+        ExclusiveHdrPhase::Verifying => {
+            "Verifying HDR10 metadata and stable PQ scanout…".to_string()
+        }
+        ExclusiveHdrPhase::Active => {
+            "HDR10 verified active; other monitors are disabled".to_string()
+        }
+        ExclusiveHdrPhase::Failed => format!(
+            "Previous attempt failed: {}",
+            reason.unwrap_or("unknown safety check failure")
+        ),
     }
 }
 
@@ -1654,6 +1682,132 @@ fn connected_display_row(
                 save_display_change(&displays, &area, &row, index);
             });
         }
+
+        let exclusive_state = load_exclusive_hdr_state();
+        let exclusive_phase = (exclusive_state.connector.as_deref() == Some(display.name.as_str()))
+            .then_some(exclusive_state.phase)
+            .unwrap_or_default();
+        let exclusive_row = adw::ActionRow::new();
+        exclusive_row.set_title("Experimental exclusive HDR10");
+        exclusive_row.set_subtitle(&exclusive_hdr_status_text(
+            exclusive_phase,
+            exclusive_state.reason.as_deref(),
+        ));
+        let exclusive_button = gtk::Button::with_label(match exclusive_phase {
+            ExclusiveHdrPhase::Active => "Disable & Restart",
+            ExclusiveHdrPhase::Requested if exclusive_state.reason.is_some() => "Log Out Manually",
+            ExclusiveHdrPhase::Requested | ExclusiveHdrPhase::Starting => "Restarting…",
+            ExclusiveHdrPhase::Verifying => "Verifying…",
+            _ => "Restart & Try HDR10",
+        });
+        exclusive_button.add_css_class("destructive-action");
+        exclusive_button.set_valign(gtk::Align::Center);
+        exclusive_button.set_sensitive(!matches!(
+            exclusive_phase,
+            ExclusiveHdrPhase::Requested
+                | ExclusiveHdrPhase::Starting
+                | ExclusiveHdrPhase::Verifying
+        ));
+        exclusive_row.add_suffix(&exclusive_button);
+        row.add_row(&exclusive_row);
+
+        {
+            let connector = display.name.clone();
+            let exclusive_row = exclusive_row.clone();
+            let exclusive_button = exclusive_button.clone();
+            exclusive_button.clone().connect_clicked(move |_| {
+                let current = load_exclusive_hdr_state();
+                let disabling = current.connector.as_deref() == Some(connector.as_str())
+                    && matches!(current.phase, ExclusiveHdrPhase::Active);
+                let next = if disabling {
+                    ExclusiveHdrState {
+                        phase: ExclusiveHdrPhase::Disabled,
+                        connector: Some(connector.clone()),
+                        reason: None,
+                        session_id: None,
+                    }
+                } else {
+                    ExclusiveHdrState {
+                        phase: ExclusiveHdrPhase::Requested,
+                        connector: Some(connector.clone()),
+                        reason: None,
+                        session_id: None,
+                    }
+                };
+                match save_exclusive_hdr_state(&next) {
+                    Ok(()) => {
+                        exclusive_row.set_subtitle(if disabling {
+                            "Normal multi-monitor SDR is armed for the next session"
+                        } else {
+                            "Restarting into guarded exclusive HDR10 verification…"
+                        });
+                        exclusive_button.set_sensitive(false);
+                        let response = send_desktop_request(&IpcRequest::ExecuteDesktopAction {
+                            action: DesktopAction::Logout,
+                        });
+                        if !matches!(response, Ok(IpcResponse::Ok)) {
+                            let reason = format!(
+                                "HDR10 is armed, but automatic restart was unavailable ({response:?}). Log out once manually to load the updated compositor."
+                            );
+                            let mut awaiting_logout = next.clone();
+                            awaiting_logout.reason = Some(reason.clone());
+                            if let Err(err) = save_exclusive_hdr_state(&awaiting_logout) {
+                                exclusive_row.set_subtitle(&format!(
+                                    "{reason} Could not save restart status: {err}"
+                                ));
+                            } else {
+                                exclusive_row.set_subtitle(&reason);
+                                exclusive_button.set_label("Log Out Manually");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        exclusive_row
+                            .set_subtitle(&format!("Could not arm exclusive HDR10: {err}"));
+                    }
+                }
+            });
+        }
+
+        {
+            let connector = display.name.clone();
+            let exclusive_row = exclusive_row.clone();
+            let exclusive_button = exclusive_button.clone();
+            let hdr_row = hdr_row.clone();
+            glib::timeout_add_local(Duration::from_millis(250), move || {
+                let state = load_exclusive_hdr_state();
+                let phase = (state.connector.as_deref() == Some(connector.as_str()))
+                    .then_some(state.phase)
+                    .unwrap_or_default();
+                exclusive_row
+                    .set_subtitle(&exclusive_hdr_status_text(phase, state.reason.as_deref()));
+                exclusive_button.set_label(match phase {
+                    ExclusiveHdrPhase::Active => "Disable & Restart",
+                    ExclusiveHdrPhase::Requested if state.reason.is_some() => "Log Out Manually",
+                    ExclusiveHdrPhase::Requested | ExclusiveHdrPhase::Starting => "Restarting…",
+                    ExclusiveHdrPhase::Verifying => "Verifying…",
+                    _ => "Restart & Try HDR10",
+                });
+                exclusive_button.set_sensitive(!matches!(
+                    phase,
+                    ExclusiveHdrPhase::Requested
+                        | ExclusiveHdrPhase::Starting
+                        | ExclusiveHdrPhase::Verifying
+                ));
+                match phase {
+                    ExclusiveHdrPhase::Requested | ExclusiveHdrPhase::Starting => {
+                        hdr_row.set_subtitle("Starting exclusive HDR10…")
+                    }
+                    ExclusiveHdrPhase::Verifying => {
+                        hdr_row.set_subtitle("Verifying HDR10 stability…")
+                    }
+                    ExclusiveHdrPhase::Active => hdr_row.set_subtitle("Active now"),
+                    ExclusiveHdrPhase::Failed => hdr_row.set_subtitle("Failed; restored safe SDR"),
+                    ExclusiveHdrPhase::Off | ExclusiveHdrPhase::Disabled => {}
+                }
+                glib::ControlFlow::Continue
+            });
+        }
     }
 
     let color_row = adw::ActionRow::new();
@@ -1983,6 +2137,25 @@ fn apply_runtime_statuses(
             .as_ref()
             .map(|status| status.wide_gamut_active)
             .unwrap_or(false);
+        let hdr_supported = status
+            .as_ref()
+            .map(|status| status.hdr_supported)
+            .unwrap_or(display.hdr_supported);
+        let hdr_requested = status
+            .as_ref()
+            .map(|status| status.hdr_requested)
+            .unwrap_or(display.hdr_requested);
+        let hdr_enabled = status
+            .as_ref()
+            .map(|status| status.hdr_active)
+            .unwrap_or(false);
+        let exclusive_hdr_phase = status
+            .as_ref()
+            .map(|status| status.exclusive_hdr_phase)
+            .unwrap_or_default();
+        let exclusive_hdr_reason = status
+            .as_ref()
+            .and_then(|status| status.exclusive_hdr_reason.clone());
 
         if display.icc_lut_fallback_active != fallback_active {
             display.icc_lut_fallback_active = fallback_active;
@@ -1990,6 +2163,11 @@ fn apply_runtime_statuses(
         if display.wide_gamut_active != wide_gamut_active {
             display.wide_gamut_active = wide_gamut_active;
         }
+        display.hdr_supported = hdr_supported;
+        display.hdr_requested = hdr_requested;
+        display.hdr_enabled = hdr_enabled;
+        display.exclusive_hdr_phase = exclusive_hdr_phase;
+        display.exclusive_hdr_reason = exclusive_hdr_reason;
     }
 }
 
@@ -5321,6 +5499,8 @@ mod tests {
             hdr_enabled: false,
             icc_lut_fallback_active: false,
             wide_gamut_active: false,
+            exclusive_hdr_phase: ExclusiveHdrPhase::Off,
+            exclusive_hdr_reason: None,
         };
 
         let output = output_config_from_display(&display);

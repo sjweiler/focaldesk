@@ -11,7 +11,7 @@ use crate::chrome::ChromeMetrics;
 use crate::chrome_layout::{ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use crate::chrome_shaders::ChromeShaders;
 use crate::chrome_theme::{
-    BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle, TopBarStyle, activity_well_style,
+    BevelStyle, ButtonStyle, GlassStyle, LightChannelStyle, TopBarStyle,
     chrome_theme_from_flow_theme,
 };
 use crate::desktop_frame::DesktopFrameCtx;
@@ -105,13 +105,7 @@ pub fn draw_chrome_below_work_wallpaper(
         damage,
         &legacy_theme.panel_inner,
     );
-    for (well, style) in [
-        (layout.topbar.ai_button, legacy_theme.button),
-        (
-            layout.topbar.flow_field,
-            activity_well_style(legacy_theme.button),
-        ),
-    ] {
+    for (well, style) in [(layout.topbar.ai_button, legacy_theme.button)] {
         let _ = draw_recessed_button(frame, button, well, frame_ctx.output_scale, damage, &style);
         let _ = draw_light_channel(
             frame,
@@ -308,13 +302,7 @@ pub fn draw_chrome_topbar_frame(
     ] {
         let _ = draw_beveled_panel(frame, beveled, rect, scale, damage, style);
     }
-    for (well, style) in [
-        (layout.topbar.ai_button, legacy_theme.button),
-        (
-            layout.topbar.flow_field,
-            activity_well_style(legacy_theme.button),
-        ),
-    ] {
+    for (well, style) in [(layout.topbar.ai_button, legacy_theme.button)] {
         let _ = draw_recessed_button(frame, button, well, scale, damage, &style);
         let _ = draw_light_channel(
             frame,

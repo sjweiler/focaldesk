@@ -9,6 +9,14 @@ content handling. These paths are under active development and should not be
 treated as color-accurate or production-ready without measurement on the target
 hardware.
 
+The bundled wallpaper is re-graded during FP16 composition rather than converted
+to a nominal 10-bit asset. Its SDR texture remains the common source for SDR,
+wide-gamut SDR, and HDR10. HDR composition selectively raises stars, cyan/orange
+accents, and the thin planet rim above diffuse white, scales those highlights to
+the detected display peak (up to the artwork's 1,000-nit creative ceiling), and
+leaves the dark space background at its original black floor. The final output
+stage still owns BT.2020 conversion and ST 2084 encoding.
+
 ## SDR wide gamut and 10-bit output
 
 HDR is not required to benefit from FocalDesk's color pipeline. An SDR output
@@ -72,7 +80,19 @@ FocalDesk:
   **Rec. 2020 (SDR)** canvas option, supports I010/P010 conversion, and writes
   BT.2020/BT.709/BT.2020-NCL encoder and container metadata.
 
-Apply both patches to clean matching source trees with:
+Apply both patches and compile clean matching source trees with:
+
+```sh
+just install-wide-gamut-capture-build-deps
+just build-wide-gamut-capture
+```
+
+The dependency recipe targets Fedora and requires `sudo`. The build recipe
+itself does not require root. By default it fetches the tested releases below
+`target/wide-gamut-capture` and creates a `build-focaldesk` directory in each
+source tree. Existing clean source trees can instead be supplied as the two
+recipe arguments. The recipe does not install the resulting binaries. To apply
+the patches without building, use:
 
 ```sh
 scripts/apply-wide-gamut-capture-patches.sh \
@@ -94,10 +114,12 @@ The longer-term goals are:
 - Future native HDR Wayland applications
 - Color-managed desktop rendering
 
-NVIDIA and multi-output paths have additional safeguards because some
-combinations have caused failed or frozen atomic commits during development.
-Diagnostic overrides exist in the codebase, but they are intentionally not
-recommended as general user configuration.
+Live NVIDIA KMS HDR transitions remain blocked in normal and multi-output
+topologies because testing produced GPU Xid 56 faults, flip-event timeouts, and
+frozen scanout. Atomic commit success and connector-property readback did not
+reliably indicate that the display pipeline survived. The explicit
+`FOCALDESK_HDR_ALLOW_NVIDIA=1` override is honored only by the guarded exclusive
+single-output mode described below.
 
 For a controlled multi-monitor test, enable HDR for the intended display in
 Display Settings and select its connector in the compositor environment. When
@@ -121,10 +143,83 @@ PQ render path and live KMS HDR changes. It does not enable HDR by itself or
 modify the saved display preference. Find connector names in `displays.json` or
 the compositor's output-detection log. An unknown name selects no output.
 
+### Session-start exclusive HDR mode
+
+In Display Settings, expand an HDR-capable monitor and press **Restart & Try
+HDR10** under **Experimental exclusive HDR10**. The destructive action records
+a one-shot request and logs out the current session. Administrators can select
+the same exact connector in the session environment:
+
+```toml
+[session_environment]
+FOCALDESK_EXCLUSIVE_HDR_OUTPUT = "DP-3"
+```
+
+This experimental mode is applied only while the DRM backend starts or rebuilds
+after a connector hotplug. It automatically requests HDR on the selected output;
+the ordinary Display Settings HDR switch does not also need to be enabled. The
+exclusive selector takes precedence over `FOCALDESK_HDR_OUTPUT` when both are
+present.
+
+Before disabling another output, FocalDesk requires the selected connector to
+be connected, have a mode and usable CRTC, expose the HDR10 connector controls
+and EDID metadata, permit 10-bit link depth, and pass the driver safety policy.
+It then initializes that connector first and verifies the HDR working and
+scanout formats. If either preflight fails, all connected outputs remain active
+and the exclusive selector prevents HDR from being attempted on a different
+connector.
+
+HDR-requested outputs use their preferred/native resolution at the fastest
+advertised refresh no greater than 120 Hz. This conservative default avoids
+selecting a high-refresh timing that fits at 8 bpc but exceeds the connector's
+payload budget when HDR requires a 10-bpc link. SDR outputs continue to use the
+ordinary EDID-preferred mode.
+
+Exclusive mode attaches BT.2020, HDR10 metadata, and any available 10-bpc link
+control to Smithay's pending connector state before the first real scanout
+commit. The first framebuffer is PQ encoded, so the initial atomic modeset
+contains the mode, connector, 10-bit primary plane, HDR properties, and PQ
+framebuffer together. No baseline SDR frame is submitted on the exclusive
+output. After that initial commit passes connector-property readback, the output
+remains in a **Verifying** state for at least five seconds and 300 successfully
+submitted PQ frames. FocalDesk reports HDR active only after both gates complete.
+
+An encode failure, property mismatch, failed frame, or watchdog timeout records
+the attempt as failed, rolls KMS back to SDR when the GPU is still responsive,
+and rebuilds the ordinary all-output topology. The state lives at
+`$XDG_STATE_HOME/focaldesk/exclusive-hdr.json`. If the compositor or GPU dies
+before it can recover, the unfinished state blocks an automatic retry at the
+next login and starts with all outputs in SDR. Display Settings shows the saved
+failure reason and allows an explicit retry.
+
+On NVIDIA, exclusive mode additionally requires:
+
+```toml
+FOCALDESK_HDR_ALLOW_NVIDIA = "1"
+```
+
+This does not permit NVIDIA HDR with multiple active outputs. A complete GPU
+wedge can prevent in-session recovery, so keep the text-console recovery path
+below available during testing.
+
+This is a restart-backed Windows-style topology switch, not a live KMS switch.
+Use **Disable & Restart** after HDR verifies active to restore the normal
+multi-monitor topology. The button's disabled state overrides a persistent
+`FOCALDESK_EXCLUSIVE_HDR_OUTPUT` environment selection.
+
 Capable outputs prefer a 10-bit scanout format during initialization and keep
-that format for SDR and HDR. The HDR toggle changes PQ rendering, BT.2020
-colorspace, and metadata together on one frame; it does not change the live
-scanout format or force the connector's `max bpc` property.
+that format for SDR and HDR. Ordinary live HDR toggles require three
+successfully submitted baseline SDR frames before changing the connector's
+BT.2020 colorspace, HDR metadata, PQ rendering, and `max bpc` when that connector
+property is available. Exclusive startup mode instead includes those properties
+in the initial modeset and submits PQ from its first real frame. Neither path
+changes the selected scanout buffer format after initialization. Drivers that
+manage link depth without a `max bpc` property must initialize a 10-bit KMS
+scanout format.
+After the completion event, FocalDesk reads the connector properties back and
+only reports HDR active when the colorspace is BT.2020, the metadata blob is
+active, and any exposed `max bpc` property reads at least 10. A partial or
+unverifiable transition clears the saved HDR request and stages an SDR rollback.
 
 ## Recovering from a frozen HDR session
 

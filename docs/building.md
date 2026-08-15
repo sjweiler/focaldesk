@@ -185,6 +185,10 @@ These recipes install:
 - `/usr/share/wayland-sessions/focaldesk.desktop`
 - `/usr/lib/systemd/user/focaldesk-session.target`
 
+On NVIDIA systems that support `s2idle`, `install-desktop` also installs the
+FocalDesk sleep configuration selecting it. This avoids known S3/deep-resume
+failures that leave the NVIDIA GPU context or KMS scanout unusable.
+
 Log out, select **FocalDesk** in the display manager, and sign in. Keep a known
 working session installed so you can recover from compositor or driver failures.
 

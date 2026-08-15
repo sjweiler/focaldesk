@@ -62,8 +62,9 @@ that opens Settings.
 
 Each connected display has a persistent `DesktopOutput` UI model owned by the
 compositor's desktop state. The model owns that display's topbar, dock,
-workarea, dialogs, overlays, and chrome rendering resources. Layout rebuilds
-synchronize the compatibility `UiTree` projection into the model; input and
+workarea, dialogs, overlays (including an independent egui layer), and chrome
+rendering resources. Layout rebuilds synchronize the compatibility `UiTree`
+projection into the model; input and
 rendering then read the same output-owned component state instead of keeping a
 second set of compositor-side chrome components.
 

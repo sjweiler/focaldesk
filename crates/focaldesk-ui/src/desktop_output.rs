@@ -505,3 +505,36 @@ impl DesktopOutput {
         self.workarea.hit_test(point)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::PanelKind;
+
+    fn output(id: u64) -> DesktopOutput {
+        DesktopOutput::new(
+            OutputId(id),
+            DesktopOutputConfig {
+                show_topbar: true,
+                show_sidebar: true,
+                theme_id: FlowThemeId::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn egui_panel_state_is_independent_per_output() {
+        let mut first = output(1);
+        let mut second = output(2);
+
+        first.egui.open_panel(PanelKind::Settings, first.output_id);
+        second.egui.open_panel(PanelKind::Power, second.output_id);
+
+        assert!(first.egui.is_open_on_output(first.output_id));
+        assert!(second.egui.is_open_on_output(second.output_id));
+
+        first.egui.close_all_panels();
+        assert!(!first.egui.has_open_panels());
+        assert!(second.egui.has_open_panels());
+    }
+}

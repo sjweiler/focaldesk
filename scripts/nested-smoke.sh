@@ -233,13 +233,6 @@ if [[ -n "$CLIENT" ]]; then
         )"
         echo "damage_metrics=$DAMAGE_METRICS" >>"$ARTIFACTS/summary.txt"
         pass "precise surface-tree damage exercised"
-    elif [[ "${FOCALDESK_LINEAR_SDR:-0}" =~ ^(1|true|yes|on)$ ]]; then
-        # The staged FP16 compositor currently promotes damage to the full
-        # output before its base, client, overlay, and encode passes. Precise
-        # surface-tree damage is therefore a legacy-path assertion, not a
-        # failure of the linear smoke test.
-        echo "SKIP precise surface-tree damage (linear SDR uses full-output damage)" \
-            | tee -a "$ARTIFACTS/summary.txt"
     else
         fail "native client did not exercise precise surface-tree damage"
     fi

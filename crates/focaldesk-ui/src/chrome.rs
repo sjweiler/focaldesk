@@ -9,7 +9,7 @@ use crate::atlas::{IconAtlas, IconId, build_icon_atlas, render_atlas_icon};
 use crate::chrome_draw::{draw_beveled_panel, draw_recessed_button, draw_top_bar, well_icon_rect};
 use crate::chrome_layout::{ChromeLayoutConfig, build_chrome_layout_with_config};
 use crate::chrome_shaders::ChromeShaders;
-use crate::chrome_theme::{ChromeTheme, activity_well_style, chrome_theme_from_flow_theme};
+use crate::chrome_theme::{ChromeTheme, chrome_theme_from_flow_theme};
 use crate::font_atlas::FontAtlas;
 use crate::svg::rasterize_svg;
 use focaldesk_themes::FlowTheme;
@@ -295,28 +295,9 @@ impl Chrome {
                 &damage,
                 &self.theme.button,
             );
-            let activity_style = activity_well_style(self.theme.button);
-            let _ = draw_recessed_button(
-                frame,
-                button,
-                layout.topbar.flow_field,
-                sc,
-                &damage,
-                &activity_style,
-            );
         }
         let launcher_control = layout.topbar.ai_button;
         let launcher_icon = well_icon_rect(launcher_control);
-        if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-            let _ = self.draw_glass_icon(
-                frame,
-                IconId::AiConsole,
-                launcher_control,
-                launcher_icon,
-                scale,
-                output_size,
-            );
-        }
         if let (Some(atlas), Some(entry)) = (
             self.atlas.as_ref(),
             self.atlas.as_ref().and_then(|a| a.get(IconId::AiConsole)),
@@ -412,13 +393,6 @@ impl Chrome {
                 );
             }
             let icon_rect = well_icon_rect(slot.icon_well);
-            if self.shaders.glass_control.is_some() && self.glass_background.is_some() {
-                if let Err(error) =
-                    self.draw_glass_icon(frame, icon, slot.icon_well, icon_rect, scale, output_size)
-                {
-                    eprintln!("focal dock glass icon {icon:?}: {error}");
-                }
-            }
             if let (Some(atlas), Some(entry)) = (
                 self.atlas.as_ref(),
                 self.atlas.as_ref().and_then(|a| a.get(icon)),

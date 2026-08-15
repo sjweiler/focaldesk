@@ -11,3 +11,4 @@ serde_json = "1"
 
 focal-launch-shared = { path = "../focal-launch-shared" }
 focaldesk-ipc = { path = "../focaldesk-ipc" }
+focaldesk-settings-core = { path = "../focaldesk-settings-core" }

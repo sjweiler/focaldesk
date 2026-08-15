@@ -6,6 +6,10 @@ use smithay::backend::renderer::gles::{
     GlesError, GlesPixelProgram, GlesRenderer, UniformName, UniformType,
 };
 
+// Smithay compiles custom shaders as GLSL ES 1.00. Keep one shared source for
+// both GLES 2 and GLES 3 contexts; GLES 3 implementations accept this profile.
+// The tests below guard the syntax and the optional fragment-highp fallback.
+
 pub struct ChromeShaders {
     pub beveled_panel: Option<GlesPixelProgram>,
     pub light_channel: Option<GlesPixelProgram>,
@@ -335,6 +339,7 @@ impl ChromeShaders {
                 CLIENT_TO_SCENE_LINEAR_FRAG,
                 &[
                     UniformName::new("u_decode_tf", UniformType::_1f),
+                    UniformName::new("u_reference_white_nits", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
@@ -1026,7 +1031,55 @@ void main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{GLASS_CONTROL_FRAG, RECESSED_BUTTON_FRAG, TINTED_ICON_FRAG, TOP_BAR_FRAG};
+    use super::*;
+
+    fn shader_sources() -> [&'static str; 26] {
+        [
+            BEVELED_PANEL_FRAG,
+            LIGHT_CHANNEL_FRAG,
+            CHAMFER_PANEL_FRAG,
+            CHAMFER_OLD__PANEL_FRAG,
+            BEVELED_PANEL_FRAG_V2,
+            WORKAREA_GLASS_FRAG,
+            RECESSED_BUTTON_FRAG,
+            TOP_BAR_FRAG,
+            TINTED_ICON_FRAG,
+            CLIENT_TO_SCENE_LINEAR_FRAG,
+            SRGB_TO_LINEAR_FRAG,
+            COMPOSITE_LINEAR_LAYER_FRAG,
+            OUTPUT_ENCODE_SDR_FRAG,
+            OUTPUT_ENCODE_LUT_FRAG,
+            SDR_TO_LINEAR_SCRGB_FRAG,
+            LINEAR_SCRGB_TO_PQ_FRAG,
+            LINEAR_TO_SRGB_FRAG,
+            AMBER_LIGHTBAR_FRAG,
+            FONT_TEXT_FRAG,
+            ROUNDED_RECT_FRAG,
+            WALLPAPER_TINT_FRAG,
+            PULSE_FRAG,
+            ACCENT_FRAG,
+            FLOW_FIELD_FRAG,
+            SCREENSAVER_FRAG,
+            GLASS_CONTROL_FRAG,
+        ]
+    }
+
+    #[test]
+    fn shaders_stay_in_the_shared_glsl_es_100_subset() {
+        for shader in shader_sources() {
+            assert!(!shader.contains("#version"));
+            assert!(!shader.contains("layout("));
+            assert!(!shader.contains("texture("));
+            assert!(!shader.contains("out vec4"));
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(shader.contains("gl_FragColor"));
+
+            if shader.contains("precision highp float;") {
+                assert!(shader.contains("GL_FRAGMENT_PRECISION_HIGH"));
+                assert!(shader.contains("precision mediump float;"));
+            }
+        }
+    }
 
     #[test]
     fn pixel_shaders_use_smithays_vertex_varying() {
@@ -1085,7 +1138,11 @@ const CLIENT_TO_SCENE_LINEAR_FRAG: &str = r#"
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 #if defined(EXTERNAL)
@@ -1097,6 +1154,7 @@ uniform sampler2D tex;
 varying vec2 v_coords;
 uniform float alpha;
 uniform float u_decode_tf;
+uniform float u_reference_white_nits;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -1112,6 +1170,21 @@ vec3 gamma22_to_linear(vec3 c) {
     return pow(max(c, vec3(0.0)), vec3(2.2));
 }
 
+vec3 pq_to_scene_linear(vec3 c) {
+    const float m1 = 2610.0 / 16384.0;
+    const float m2 = 2523.0 / 32.0;
+    const float c1 = 3424.0 / 4096.0;
+    const float c2 = 2413.0 / 128.0;
+    const float c3 = 2392.0 / 128.0;
+    vec3 p = pow(clamp(c, 0.0, 1.0), vec3(1.0 / m2));
+    vec3 normalized_nits = pow(
+        max(p - c1, vec3(0.0)) / max(c2 - c3 * p, vec3(0.000001)),
+        vec3(1.0 / m1)
+    );
+    vec3 nits = normalized_nits * 10000.0;
+    return nits / max(u_reference_white_nits, 1.0);
+}
+
 vec3 decode_color(vec3 c) {
     if (u_decode_tf < 0.5) {
         return srgb_to_linear(c);
@@ -1119,7 +1192,10 @@ vec3 decode_color(vec3 c) {
     if (u_decode_tf < 1.5) {
         return c;
     }
-    return gamma22_to_linear(c);
+    if (u_decode_tf < 2.5) {
+        return gamma22_to_linear(c);
+    }
+    return pq_to_scene_linear(c);
 }
 
 vec3 mul_mat3(vec3 v) {
@@ -1158,7 +1234,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1194,7 +1274,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1255,7 +1339,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1316,7 +1404,11 @@ const OUTPUT_ENCODE_LUT_FRAG: &str = r#"
 //_DEFINES_
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 uniform sampler2D tex;
@@ -1384,7 +1476,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1422,7 +1518,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1463,7 +1563,11 @@ uniform sampler2D tex;
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -1699,7 +1803,11 @@ gl_FragColor = vec4(u_accent.rgb * out_alpha, out_alpha);
 
 const FLOW_FIELD_FRAG: &str = r#"
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 uniform vec2  u_resolution;
@@ -1819,7 +1927,10 @@ void main() {
             // Idle: an asymmetric, breathing nebula rather than a rigid orb.
             float drift = fract(seed.x + u_time * 0.012 + fi * 0.003);
             float wave = u_time * 0.24 + fi * 0.41 + seed.y * 5.0;
-            x = mix(0.06, 0.94, drift) + sin(wave) * 0.025;
+            // Wrap beyond the clipped well so a particle fades out before it
+            // re-enters on the other side. Wrapping between visible edge
+            // positions makes otherwise-idle particles look like they blink.
+            x = mix(-0.08, 1.08, drift) + sin(wave) * 0.025;
             y = 0.50 + (seed.y - 0.5) * (0.46 - 0.16 * seed.x)
                 + cos(wave * 1.17) * 0.045;
             core_scale = 1.12;
@@ -1873,9 +1984,10 @@ void main() {
         float streak = exp(-abs(delta.y) / mix(4.8, 2.4, energy))
             * exp(-max(delta.x, 0.0) / 16.0) * trail;
         float ring = exp(-pow((dist - size.y * 0.13) / max(size.y * 0.08, 1.0), 2.0));
-        float shimmer = 0.78 + 0.22 * sin(u_time * 0.82 + fi * 0.79);
         vec3 color = particle_color(mode, seed, u_color.rgb);
-        accum += color * enabled * shimmer * (core + streak * 0.34 + ring * halo * 0.08);
+        // Motion carries the activity signal. Keeping particle luminance stable
+        // avoids an unrelated sparkle/flicker when the field is otherwise idle.
+        accum += color * enabled * (core + streak * 0.34 + ring * halo * 0.08);
     }
 
     // Exponential mapping keeps overlapping particles colorful instead of white.
@@ -1896,7 +2008,11 @@ void main() {
 
 const SCREENSAVER_FRAG: &str = r#"
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 varying vec2 v_coords;
@@ -2005,7 +2121,11 @@ const GLASS_CONTROL_FRAG: &str = r#"
 #endif
 
 #ifdef GL_ES
+#ifdef GL_FRAGMENT_PRECISION_HIGH
 precision highp float;
+#else
+precision mediump float;
+#endif
 #endif
 
 #if defined(EXTERNAL)

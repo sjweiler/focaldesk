@@ -8,7 +8,7 @@ pub mod transport;
 
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
-use focaldesk_settings_core::{OutputConfig, Settings};
+use focaldesk_settings_core::{ExclusiveHdrPhase, OutputConfig, Settings};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -102,6 +102,7 @@ pub enum DesktopAction {
     CreateWorkspace,
     DeleteWorkspace,
     OpenCalendarPanel,
+    Logout,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,6 +147,16 @@ pub struct DisplayRuntimeOutputStatus {
     pub icc_lut_fallback_active: bool,
     #[serde(default)]
     pub wide_gamut_active: bool,
+    #[serde(default)]
+    pub hdr_supported: bool,
+    #[serde(default)]
+    pub hdr_requested: bool,
+    #[serde(default)]
+    pub hdr_active: bool,
+    #[serde(default)]
+    pub exclusive_hdr_phase: ExclusiveHdrPhase,
+    #[serde(default)]
+    pub exclusive_hdr_reason: Option<String>,
 }
 
 /// MCP and diagnostic consumers receive this typed projection rather than

@@ -119,7 +119,10 @@ struct PortalCaptureTransform<'a> {
 }
 
 fn portal_capture_source_peak(output: &crate::core::desktop::OutputState) -> f32 {
-    let hdr_scene = output.hdr_enabled || output.hdr_transition_target == Some(true);
+    // `hdr_enabled` is withheld while exclusive HDR completes its post-KMS
+    // stability window. Scanout and capture must still follow the live PQ KMS
+    // state during that verification period.
+    let hdr_scene = output.hdr_kms_applied || output.hdr_transition_target == Some(true);
     portal_capture_peak(
         hdr_scene,
         output.color_description.reference_white_nits,

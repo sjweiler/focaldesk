@@ -90,9 +90,10 @@ just install-focaldm-pam-fedora
 ```
 
 The policy uses `pam_focald_secrets.so` after `pam_systemd.so` to stage a
-root-only credential and connect to `focald-secrets@$UID.socket`. The socket
-starts with `user@$UID.service` and activates the broker without a privileged
-process launch from the PAM stack. The hook waits for a broker ping before
+root-only credential. A system path unit watches that credential and starts the
+broker only after the key exists; the broker then creates the per-user client
+socket. This prevents ordinary desktop clients from activating a keyless
+broker before PAM has unlocked it. The hook waits for a broker ping before
 removing the staged credential. Focaldesk then owns
 `org.freedesktop.secrets`, so Chrome and other Secret Service clients use the
 Focaldesk store without a second keyring prompt.
@@ -101,6 +102,13 @@ The first successful login creates a random store key and wraps it under an
 Argon2id-derived key (64 MiB, three iterations, one lane). Existing
 PBKDF2-based `FKEY1` files are accepted and atomically upgraded to `FKEY2` after
 a successful login. All failure paths are optional and do not deny login.
+
+On Fedora, install `selinux-policy-devel` before running
+`just install-secrets-service-fedora`. The recipe installs and applies the
+`focaldesk_secrets_home_t` policy required for the `xdm_t` PAM process to read
+and atomically replace the wrapped key. It also removes obsolete Secret Service
+D-Bus activation metadata; `focald-secrets@UID.path` starts the
+credential-fed broker during login.
 
 Distribution PAM stacks differ; the packaged policy targets Fedora's
 `password-auth` and `postlogin` stacks. On other distributions, add

@@ -584,11 +584,11 @@ fn encrypted_store_exists(user: &UserInfo) -> bool {
 }
 
 fn start_system_broker(uid: libc::uid_t) -> std::io::Result<()> {
-    // user@.service starts the system socket instance. Connecting to that
-    // socket activates the broker without executing systemctl from PAM (which
-    // is denied after pam_selinux installs its one-shot exec context). A real
-    // ping, rather than connect(2) alone, proves that the daemon loaded the
-    // staged credential before the PAM hook removes it.
+    // PID 1 watches the staged credential and starts the broker, which binds
+    // this socket itself. Polling avoids executing systemctl from PAM (denied
+    // after pam_selinux installs its one-shot exec context). A real ping,
+    // rather than connect(2) alone, proves that the daemon loaded the staged
+    // credential before the PAM hook removes it.
     const PING: &[u8] = br#"{"op":"ping"}"#;
     let socket = PathBuf::from(format!("/run/user/{uid}/focaldesk/secrets.sock"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(16);

@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::output::Output;
-use smithay::utils::{Logical, Physical, Rectangle, Size};
+use smithay::utils::{Logical, Physical, Rectangle, Scale, Size};
 
 use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
 use crate::core::desktop::DesktopState;
@@ -25,8 +25,14 @@ use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 
 pub struct PreparedOutput {
     pub frame_ctx: FrameCtx,
+    /// Portion of frame damage that intersects compositor-owned chrome.
+    /// Client-only updates in the work recess leave this empty, allowing the
+    /// expensive icon/text overlay to remain retained.
+    pub shell_damage: Vec<Rectangle<i32, Physical>>,
     pub layout: ChromeLayout,
     pub draw_software_cursor: bool,
+    pub sdr_base_generation: u64,
+    pub force_sdr_base_redraw: bool,
 }
 
 fn rect_area(rect: Rectangle<i32, Physical>) -> i64 {
@@ -100,10 +106,8 @@ fn compact_damage(
 ) -> Vec<Rectangle<i32, Physical>> {
     const MERGE_MARGIN: i32 = 4;
     const MAX_RECTS: usize = 8;
-    const FULL_DAMAGE_PERCENT: i64 = 45;
 
     let full = Rectangle::from_loc_and_size((0, 0), output_size);
-    let output_area = rect_area(full).max(1);
     let mut rects: Vec<Rectangle<i32, Physical>> = Vec::with_capacity(damage.len().min(MAX_RECTS));
 
     for rect in damage {
@@ -130,14 +134,7 @@ fn compact_damage(
     }
 
     if rects.is_empty() {
-        return vec![full];
-    }
-
-    // The insertion pass coalesces overlapping/nearby rectangles transitively, so this sum is
-    // actual covered area rather than an overlap-inflated estimate.
-    let total_area: i64 = rects.iter().copied().map(rect_area).sum();
-    if total_area * 100 >= output_area * FULL_DAMAGE_PERCENT {
-        return vec![full];
+        return Vec::new();
     }
 
     if rects.len() > MAX_RECTS {
@@ -147,6 +144,34 @@ fn compact_damage(
     }
 
     rects
+}
+
+fn shell_overlay_damage(
+    damage: &[Rectangle<i32, Physical>],
+    layout: &ChromeLayout,
+    output_scale: Scale<f64>,
+    output_size: Size<i32, Physical>,
+) -> Vec<Rectangle<i32, Physical>> {
+    let mut shell_regions = vec![layout.topbar.outer, layout.sidebar.outer];
+    if let Some(trim) = layout.work_area.trim {
+        shell_regions.push(trim);
+    }
+
+    let intersections: Vec<_> = shell_regions
+        .into_iter()
+        .map(|rect| rect.to_physical_precise_round(output_scale))
+        .flat_map(|shell| {
+            damage
+                .iter()
+                .filter_map(move |rect| rect.intersection(shell))
+        })
+        .collect();
+
+    if intersections.is_empty() {
+        Vec::new()
+    } else {
+        compact_damage(&intersections, output_size)
+    }
 }
 
 pub fn prepare_output(
@@ -211,15 +236,6 @@ pub fn prepare_output(
         );
     }
 
-    if let Some(rect) = state.active_flow_field_pulse_damage_rect(output_id, now) {
-        state.mark_output_logical_damage(
-            output_id,
-            rect,
-            0,
-            crate::core::desktop::DamageSource::Unknown,
-        );
-    }
-
     if let Some(rect) = state.active_clock_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(
             output_id,
@@ -237,7 +253,7 @@ pub fn prepare_output(
             .pending_damage
             .clone();
         let full_damage = Rectangle::from_loc_and_size((0, 0), buffer_size);
-        if force_full_damage || state.render.redraw_all || pending_damage.is_empty() {
+        if force_full_damage || state.render.redraw_all {
             if state.render.redraw_all {
                 state.record_damage_source(crate::core::desktop::DamageSource::FullRedrawFallback);
             }
@@ -294,6 +310,8 @@ pub fn prepare_output(
         state.fonts.atlas_dirty = false;
     }
 
+    let shell_damage = shell_overlay_damage(&frame_damage, &layout, output_scale, buffer_size);
+
     let frame_ctx = FrameCtx {
         output_size: (buffer_size.w, buffer_size.h),
         output_scale,
@@ -331,8 +349,15 @@ pub fn prepare_output(
 
     Ok(PreparedOutput {
         frame_ctx,
+        shell_damage,
         layout,
         draw_software_cursor,
+        sdr_base_generation: state
+            .outputs
+            .get(&output_id)
+            .map(|output| output.sdr_base_generation)
+            .unwrap_or(0),
+        force_sdr_base_redraw: state.render.redraw_all,
     })
 }
 
@@ -609,9 +634,9 @@ pub fn draw_output_stage(
             | crate::core::render::OutputRenderStage::Base
             | crate::core::render::OutputRenderStage::Overlay
     ) && state
-        .render
-        .egui
-        .is_open_on_output(prepared.frame_ctx.rendering_output)
+        .desktop_outputs
+        .get(&prepared.frame_ctx.rendering_output)
+        .is_some_and(|output| output.egui.has_open_panels())
     {
         state.sync_egui(&egui_frame_ctx);
     }
@@ -659,18 +684,10 @@ pub fn draw_output_stage(
             .sidebar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         topbar_pulse: state
             .topbar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
-        flow_field_pulse: state.flow_field_pulse_for_output(
-            prepared.frame_ctx.rendering_output,
-            prepared.frame_ctx.now,
-        ),
         clock_pulse: state
             .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         draw_software_cursor: prepared.draw_software_cursor,
         ui_focus: state.ui.focused,
-        desktop_output: state
-            .desktop_outputs
-            .get(&prepared.frame_ctx.rendering_output)
-            .expect("desktop output UI missing for output"),
         current_workspace: active_workspace,
         fullscreen_client,
         draw_internal_chrome,
@@ -689,7 +706,14 @@ pub fn draw_output_stage(
         surface_colors: &state.surface_colors,
     };
 
-    let muts = RenderInputsMut { ui: ui_state };
+    let desktop_output = state
+        .desktop_outputs
+        .get_mut(&prepared.frame_ctx.rendering_output)
+        .expect("desktop output UI missing for output");
+    let muts = RenderInputsMut {
+        ui: ui_state,
+        desktop_output,
+    };
 
     state.render.render_stage(frame, inputs, muts, stage)?;
     Ok(())
@@ -698,6 +722,13 @@ pub fn draw_output_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_damage_keeps_an_empty_frame_empty() {
+        let output_size = Size::<i32, Physical>::from((100, 100));
+
+        assert!(compact_damage(&[], output_size).is_empty());
+    }
 
     #[test]
     fn compact_damage_merges_nearby_rects() {
@@ -716,19 +747,60 @@ mod tests {
     }
 
     #[test]
-    fn compact_damage_uses_full_output_for_large_area() {
+    fn compact_damage_does_not_widen_a_large_client_region_to_the_output() {
         let output_size = Size::<i32, Physical>::from((100, 100));
         let damage = [Rectangle::from_loc_and_size((0, 0), (80, 60))];
 
         let compacted = compact_damage(&damage, output_size);
 
-        assert_eq!(
-            compacted,
-            vec![Rectangle::<i32, Physical>::from_loc_and_size(
-                (0, 0),
-                output_size
-            )]
-        );
+        assert_eq!(compacted, damage);
+        assert!(!is_full_damage(&compacted, output_size));
+    }
+
+    #[test]
+    fn terminal_and_flow_damage_do_not_invalidate_unrelated_chrome() {
+        let output_size = Size::<i32, Physical>::from((1920, 1080));
+        let terminal = Rectangle::from_loc_and_size((96, 96), (1720, 920));
+        let flow_field = Rectangle::from_loc_and_size((720, 20), (480, 48));
+
+        let compacted = compact_damage(&[terminal, flow_field], output_size);
+
+        assert_eq!(compacted.len(), 2);
+        assert!(!is_full_damage(&compacted, output_size));
+        assert!(compacted.contains(&terminal));
+        assert!(compacted.contains(&flow_field));
+        assert!(compacted.iter().all(|rect| !rect.contains((40, 540))));
+    }
+
+    #[test]
+    fn client_recess_damage_does_not_invalidate_shell_chrome() {
+        let logical_size = Size::<i32, Logical>::from((1920, 1080));
+        let output_size = Size::<i32, Physical>::from((1920, 1080));
+        let layout = build_chrome_layout(logical_size, 64, 76);
+        let terminal = layout
+            .work_area
+            .recess
+            .to_physical_precise_round(Scale::from((1.0, 1.0)));
+
+        let shell =
+            shell_overlay_damage(&[terminal], &layout, Scale::from((1.0, 1.0)), output_size);
+
+        assert!(shell.is_empty());
+    }
+
+    #[test]
+    fn mixed_client_and_ai_button_damage_redraws_only_that_chrome() {
+        let logical_size = Size::<i32, Logical>::from((1920, 1080));
+        let output_size = Size::<i32, Physical>::from((1920, 1080));
+        let layout = build_chrome_layout(logical_size, 64, 76);
+        let scale = Scale::from((1.0, 1.0));
+        let terminal = layout.work_area.recess.to_physical_precise_round(scale);
+        let ai_button = layout.topbar.ai_button.to_physical_precise_round(scale);
+
+        let shell = shell_overlay_damage(&[terminal, ai_button], &layout, scale, output_size);
+
+        assert_eq!(shell.len(), 1);
+        assert!(shell.contains(&ai_button));
     }
 
     #[test]
@@ -749,7 +821,7 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_damage_does_not_inflate_full_frame_threshold() {
+    fn overlapping_damage_is_coalesced_without_widening() {
         let output_size = Size::<i32, Physical>::from((100, 100));
         let repeated = Rectangle::from_loc_and_size((10, 10), (60, 50));
 

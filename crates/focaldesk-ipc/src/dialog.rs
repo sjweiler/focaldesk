@@ -4,12 +4,17 @@ use std::{
     os::unix::net::UnixStream,
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 use crate::transport;
 
 pub const DIALOG_SOCKET_NAME: &str = "dialog.sock";
 pub const DIALOG_SOCKET_ENV: &str = "FOCALDESK_DIALOG_SOCKET_PATH";
+/// Dialogs wait for a person, so the normal five-second IPC timeout is much too
+/// short. Keep a finite bound for abandoned brokers while allowing password
+/// managers and accessibility input enough time to answer.
+const DIALOG_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DialogIpcRequest {
@@ -64,6 +69,9 @@ pub fn send_dialog_request(request: &DialogIpcRequest) -> Result<DialogIpcRespon
     let mut stream = UnixStream::connect(&path)
         .map_err(|err| format!("could not connect to {}: {err}", path.display()))?;
     transport::configure_stream(&stream).map_err(|err| err.to_string())?;
+    stream
+        .set_read_timeout(Some(DIALOG_RESPONSE_TIMEOUT))
+        .map_err(|err| err.to_string())?;
     let json = transport::encode_message(request)?;
 
     stream.write_all(&json).map_err(|err| err.to_string())?;

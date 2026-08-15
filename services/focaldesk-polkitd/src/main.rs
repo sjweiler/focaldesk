@@ -35,6 +35,13 @@ enum AgentError {
 
 struct AuthenticationAgent;
 
+#[derive(Debug)]
+enum AuthenticationOutcome {
+    Authorized,
+    Rejected,
+    Failed(String),
+}
+
 #[dbus_interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl AuthenticationAgent {
     /// Per `org.freedesktop.PolicyKit1.AuthenticationAgent`: polkitd calls this and blocks until
@@ -70,25 +77,22 @@ impl AuthenticationAgent {
             ));
         };
 
-        let gained_authorization =
-            run_agent_session(identity_str, cookie.clone(), message, icon_name)
-                .await
-                .unwrap_or_else(|err| {
-                    flog_error!("polkit agent session failed: {err}");
-                    false
-                });
-
-        if !gained_authorization {
-            return Err(AgentError::Cancelled(
-                "authentication was cancelled or failed".into(),
-            ));
+        match run_agent_session(identity_str, cookie.clone(), message, icon_name).await {
+            Ok(AuthenticationOutcome::Authorized) => {
+                // PolkitAgentSession's helper reports successful authentication
+                // to polkitd as part of the conversation. Do not send a duplicate
+                // AuthenticationAgentResponse2 here.
+                Ok(())
+            }
+            Ok(AuthenticationOutcome::Rejected) => Err(AgentError::Cancelled(
+                "authentication was cancelled or rejected".into(),
+            )),
+            Ok(AuthenticationOutcome::Failed(message)) => Err(AgentError::Failed(message)),
+            Err(err) => {
+                flog_error!("polkit agent session failed: {err}");
+                Err(AgentError::Failed(err.to_string()))
+            }
         }
-
-        // PolkitAgentSession's helper reports the successful authentication to
-        // polkitd as part of the conversation. Sending AuthenticationAgentResponse2
-        // again here duplicates that handoff and causes the original request to be
-        // rejected even though PAM accepted the password.
-        Ok(())
     }
 
     async fn cancel_authentication(&self, cookie: String) {
@@ -118,7 +122,7 @@ async fn run_agent_session(
     cookie: String,
     message: String,
     icon_name: String,
-) -> Result<bool> {
+) -> Result<AuthenticationOutcome> {
     flog_info!("polkit agent session: dispatching to glib thread, identity={identity_str}");
     let outcome = glib::MainContext::default()
         .spawn_from_within(move || async move {
@@ -126,13 +130,17 @@ async fn run_agent_session(
 
             let Ok(Some(identity)) = polkit::Identity::from_string(&identity_str) else {
                 flog_error!("failed to parse polkit identity {identity_str}");
-                return false;
+                return AuthenticationOutcome::Failed(format!(
+                    "failed to parse polkit identity {identity_str}"
+                ));
             };
             flog_info!("polkit agent session: identity parsed, constructing Session");
 
             let session = polkit_agent::Session::new(&identity, &cookie);
-            let (done_tx, done_rx) = futures_channel::oneshot::channel::<bool>();
+            let (done_tx, done_rx) =
+                futures_channel::oneshot::channel::<AuthenticationOutcome>();
             let done_tx = Rc::new(RefCell::new(Some(done_tx)));
+            let conversation_failure = Rc::new(RefCell::new(None::<String>));
 
             session.connect_show_info(|_, text| flog_info!("polkit: {text}"));
             session.connect_show_error(|_, text| flog_warn!("polkit: {text}"));
@@ -140,6 +148,7 @@ async fn run_agent_session(
             {
                 let message = message.clone();
                 let icon_name = icon_name.clone();
+                let conversation_failure = conversation_failure.clone();
                 session.connect_request(move |session, prompt, echo_on| {
                     flog_info!("polkit agent session: request signal fired, prompt={prompt:?} echo_on={echo_on}");
                     let request_id = next_request_id();
@@ -168,17 +177,41 @@ async fn run_agent_session(
                         Ok(DialogIpcResponse::PolkitAuthAnswer {
                             answer: Some(text), ..
                         }) => session.response(&text),
-                        _ => session.cancel(),
+                        Ok(DialogIpcResponse::PolkitAuthAnswer { answer: None, .. }) => {
+                            session.cancel()
+                        }
+                        Ok(DialogIpcResponse::Error { message }) => {
+                            *conversation_failure.borrow_mut() = Some(message);
+                            session.cancel();
+                        }
+                        Ok(other) => {
+                            *conversation_failure.borrow_mut() =
+                                Some(format!("unexpected dialog response: {other:?}"));
+                            session.cancel();
+                        }
+                        Err(err) => {
+                            *conversation_failure.borrow_mut() =
+                                Some(format!("dialog IPC failed: {err}"));
+                            session.cancel();
+                        }
                     }
                 });
             }
 
             {
                 let done_tx = done_tx.clone();
+                let conversation_failure = conversation_failure.clone();
                 session.connect_completed(move |_session, gained_authorization| {
                     flog_info!("polkit agent session: completed signal fired, gained_authorization={gained_authorization}");
                     if let Some(tx) = done_tx.borrow_mut().take() {
-                        let _ = tx.send(gained_authorization);
+                        let outcome = if gained_authorization {
+                            AuthenticationOutcome::Authorized
+                        } else if let Some(message) = conversation_failure.borrow_mut().take() {
+                            AuthenticationOutcome::Failed(message)
+                        } else {
+                            AuthenticationOutcome::Rejected
+                        };
+                        let _ = tx.send(outcome);
                     }
                 });
             }
@@ -186,8 +219,12 @@ async fn run_agent_session(
             flog_info!("polkit agent session: calling Session::initiate()");
             session.initiate();
             flog_info!("polkit agent session: initiate() returned, awaiting completion");
-            let result = done_rx.await.unwrap_or(false);
-            flog_info!("polkit agent session: done_rx resolved, gained_authorization={result}");
+            let result = done_rx.await.unwrap_or_else(|_| {
+                AuthenticationOutcome::Failed(
+                    "authentication session ended without a result".to_string(),
+                )
+            });
+            flog_info!("polkit agent session: done_rx resolved, outcome={result:?}");
             result
         })
         .await

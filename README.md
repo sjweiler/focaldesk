@@ -247,6 +247,8 @@ just install-desktop-session
 
 That recipe builds a release binary and installs it to
 `/usr/local/bin/focaldesk-desktop` (same path as the Wayland session `Exec=`).
+On NVIDIA systems that expose `s2idle`, it also selects that suspend mode to
+avoid stale GPU contexts and dead scanout after firmware S3/deep resume.
 Re-run `just install-desktop-session` after changing the session file.
 
 To build and install the file manager prototype:

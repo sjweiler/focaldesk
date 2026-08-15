@@ -2,9 +2,9 @@
 // Full session/udev/scanout should follow the Smithay anvil `udev` backend pattern.
 
 use crate::backend::common::{
-    bootstrap_compositor_core, drain_session_sleep_notifications, is_nonfatal_wayland_io_error,
-    physical_size_mm_from_pixels, refresh_portal_services, spawn_session_sleep_watch,
-    stop_focaldesk_session_target,
+    bootstrap_compositor_core, is_nonfatal_wayland_io_error, physical_size_mm_from_pixels,
+    refresh_portal_services, spawn_session_sleep_watch, stop_focaldesk_session_target,
+    SessionSleepEvent,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
@@ -29,7 +29,10 @@ use smithay::backend::renderer::element::{
 
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::flog_warn;
-use focaldesk_settings_core::DisplayColorProfile;
+use focaldesk_settings_core::{
+    load_exclusive_hdr_state, save_exclusive_hdr_state, DisplayColorProfile, ExclusiveHdrPhase,
+    ExclusiveHdrState,
+};
 
 // DRM/KMS backend for FocalDesk.
 //
@@ -65,7 +68,11 @@ use smithay::{
     backend::{
         allocator::{gbm::GbmAllocator, gbm::GbmBufferFlags, Fourcc, Modifier},
         drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
-        egl::{self, context::ContextPriority, EGLContext},
+        egl::{
+            self,
+            context::{ContextPriority, GlAttributes, PixelFormatRequirements},
+            EGLContext,
+        },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             element::solid::SolidColorRenderElement,
@@ -185,7 +192,11 @@ impl HdrSupport {
         self.edid_hdr_static_metadata && self.edid_pq
     }
 
-    pub(crate) fn can_enable(&self) -> bool {
+    /// Whether the connector exposes the controls and EDID data needed to
+    /// signal HDR10.  Link depth is checked separately because some drivers
+    /// (notably NVIDIA DRM) do not expose a writable `max bpc` property and
+    /// instead derive link depth from the active primary-plane format.
+    pub(crate) fn can_signal_hdr10(&self) -> bool {
         self.has_hdr_metadata_property
             && self.has_bt2020_colorspace
             && self.edid_hdr_static_metadata
@@ -194,8 +205,21 @@ impl HdrSupport {
             && self.edid_hdr_metadata.is_some()
     }
 
+    pub(crate) fn can_enable(&self, ten_bit_scanout_active: bool) -> bool {
+        self.can_signal_hdr10() && ten_bit_scanout_active && self.bpc_control_allows_ten_bit()
+    }
+
     fn has_connector_controls(&self) -> bool {
         self.has_hdr_metadata_property || self.has_bt2020_colorspace
+    }
+
+    /// An absent `max bpc` property means the driver manages link depth.  In
+    /// that case a successfully initialized 10-bit KMS scanout is the proof we
+    /// use.  If the property does exist, its range must include 10 bpc.
+    fn bpc_control_allows_ten_bit(&self) -> bool {
+        self.max_bpc
+            .as_ref()
+            .is_none_or(|range| range.min <= 10 && range.max >= 10)
     }
 }
 
@@ -281,8 +305,21 @@ pub struct DrmSurfaceState {
     pub hdr_metadata_blob: Option<u64>,
     pub hdr_enabled_applied: bool,
     pub hdr_transition_target: Option<bool>,
+    /// The pending HDR state was attached before this output's first commit,
+    /// so the transition completion is the initial modeset rather than a live
+    /// connector-property update.
+    pub hdr_initial_modeset_pending: bool,
     pub hdr_render_supported: bool,
     pub frame_queued_at: Option<Instant>,
+    /// Number of consecutive baseline vblanks observed since output setup.
+    /// Live HDR is not staged until the SDR scanout path has proved healthy.
+    pub stable_vblank_count: u8,
+    /// Successful PQ vblanks completed after connector readback. User-visible
+    /// HDR remains in "verifying" until this reaches `HDR_VERIFY_VBLANKS`.
+    pub hdr_verify_vblank_count: u16,
+    /// Start of the exclusive HDR verification window. Requiring elapsed time
+    /// as well as frames prevents high-refresh displays from passing instantly.
+    pub hdr_verify_started_at: Option<Instant>,
     /// Deadline for a pending HDR-transition commit to resolve via vblank.
     /// Only set when an HDR enable/disable transition was just queued; a
     /// stall past this deadline means the driver never delivered the
@@ -315,6 +352,15 @@ const DRM_SCANOUT_FORMAT_PREFERENCE: [Fourcc; 6] = [
     Fourcc::Argb8888,
 ];
 const HDR_FRAME_TIMEOUT: Duration = Duration::from_secs(2);
+const HDR_MIN_STABLE_VBLANKS: u8 = 3;
+/// Keep submitting and completing HDR frames for roughly five seconds at the
+/// minimum supported refresh before exposing the output as verified-active.
+const HDR_VERIFY_VBLANKS: u16 = 300;
+const HDR_VERIFY_DURATION: Duration = Duration::from_secs(5);
+/// Conservative default for HDR links. High-refresh modes can fit at 8 bpc but
+/// exceed the same connector's payload budget once the driver switches to a
+/// 10-bpc link. Prefer the native-resolution mode at or below this limit.
+const HDR_SAFE_MAX_REFRESH_HZ: u32 = 120;
 /// Bound any queued DRM frame, not only HDR property transitions. A connector
 /// disappearing between commit and vblank otherwise leaves the CRTC skipped forever.
 const DRM_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -335,6 +381,184 @@ fn hdr_commit_stalled(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
 
+fn hdr_active_status_verified(
+    render_active: bool,
+    exclusive_output: bool,
+    verification_complete: bool,
+) -> bool {
+    render_active && (!exclusive_output || verification_complete)
+}
+
+fn hdr_verification_complete(
+    verified_vblanks: u16,
+    started_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    verified_vblanks >= HDR_VERIFY_VBLANKS
+        && started_at.is_some_and(|started_at| {
+            now.saturating_duration_since(started_at) >= HDR_VERIFY_DURATION
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DrmModeCandidate {
+    width: u16,
+    height: u16,
+    refresh_hz: u32,
+    preferred: bool,
+}
+
+fn select_drm_mode_index(candidates: &[DrmModeCandidate], hdr_requested: bool) -> Option<usize> {
+    let default_index = candidates
+        .iter()
+        .position(|candidate| candidate.preferred)
+        .or((!candidates.is_empty()).then_some(0))?;
+    if !hdr_requested {
+        return Some(default_index);
+    }
+
+    let default = candidates[default_index];
+    let within_hdr_limit = |candidate: &&DrmModeCandidate| {
+        (1..=HDR_SAFE_MAX_REFRESH_HZ).contains(&candidate.refresh_hz)
+    };
+
+    // Preserve the preferred/native resolution and select its fastest safe
+    // refresh. Nearly every HDR display advertises 60 Hz, with gaming displays
+    // commonly also advertising 100 or 120 Hz.
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            candidate.width == default.width
+                && candidate.height == default.height
+                && within_hdr_limit(candidate)
+        })
+        .max_by_key(|(_, candidate)| candidate.refresh_hz)
+        .map(|(index, _)| index)
+        // If the preferred resolution has no safe timing, retain the largest
+        // advertised resolution that does rather than silently exceeding the
+        // HDR refresh ceiling.
+        .or_else(|| {
+            candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| within_hdr_limit(candidate))
+                .max_by_key(|(_, candidate)| {
+                    (
+                        u32::from(candidate.width) * u32::from(candidate.height),
+                        candidate.refresh_hz,
+                    )
+                })
+                .map(|(index, _)| index)
+        })
+        .or(Some(default_index))
+}
+
+fn select_connector_mode(modes: &[Mode], hdr_requested: bool) -> Option<Mode> {
+    let candidates: Vec<_> = modes
+        .iter()
+        .map(|mode| {
+            let (width, height) = mode.size();
+            DrmModeCandidate {
+                width,
+                height,
+                refresh_hz: mode.vrefresh(),
+                preferred: mode
+                    .mode_type()
+                    .contains(drm::control::ModeTypeFlags::PREFERRED),
+            }
+        })
+        .collect();
+    select_drm_mode_index(&candidates, hdr_requested).map(|index| modes[index])
+}
+
+fn select_exclusive_hdr_target(
+    selector: Option<&str>,
+    candidates: &[(String, bool)],
+) -> std::result::Result<Option<String>, String> {
+    let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let Some((name, capable)) = candidates.iter().find(|(name, _)| name == selector) else {
+        return Err(format!("connector {selector:?} is not connected"));
+    };
+    if !capable {
+        return Err(format!(
+            "connector {selector:?} does not pass the preflight HDR safety checks"
+        ));
+    }
+    Ok(Some(name.clone()))
+}
+
+fn persist_exclusive_hdr_phase(
+    phase: ExclusiveHdrPhase,
+    connector: Option<&str>,
+    reason: Option<&str>,
+) {
+    let state = ExclusiveHdrState {
+        phase,
+        connector: connector.map(str::to_string),
+        reason: reason.map(str::to_string),
+        session_id: matches!(
+            phase,
+            ExclusiveHdrPhase::Starting
+                | ExclusiveHdrPhase::Verifying
+                | ExclusiveHdrPhase::Active
+                | ExclusiveHdrPhase::Failed
+        )
+        .then_some(std::process::id()),
+    };
+    if let Err(err) = save_exclusive_hdr_state(&state) {
+        flog_warn!("Failed to persist exclusive HDR state {phase:?}: {err}");
+    }
+}
+
+fn prepare_exclusive_hdr_attempt(selector: Option<String>) -> Option<String> {
+    let mut state = load_exclusive_hdr_state();
+    let state_selector = matches!(
+        state.phase,
+        ExclusiveHdrPhase::Requested
+            | ExclusiveHdrPhase::Starting
+            | ExclusiveHdrPhase::Verifying
+            | ExclusiveHdrPhase::Active
+    )
+    .then(|| state.connector.clone())
+    .flatten();
+    let selector = selector.or(state_selector)?;
+    let same_process = state.session_id == Some(std::process::id());
+
+    match state.phase {
+        ExclusiveHdrPhase::Failed => {
+            flog_warn!(
+                "Exclusive HDR is fail-safe blocked on {}: {}",
+                state.connector.as_deref().unwrap_or(&selector),
+                state.reason.as_deref().unwrap_or("previous attempt failed")
+            );
+            return None;
+        }
+        ExclusiveHdrPhase::Starting | ExclusiveHdrPhase::Verifying | ExclusiveHdrPhase::Active
+            if !same_process =>
+        {
+            let reason = format!(
+                "previous exclusive HDR session ended without a clean shutdown during {:?}",
+                state.phase
+            );
+            state.phase = ExclusiveHdrPhase::Failed;
+            state.reason = Some(reason.clone());
+            state.session_id = Some(std::process::id());
+            if let Err(err) = save_exclusive_hdr_state(&state) {
+                flog_warn!("Failed to persist interrupted exclusive HDR attempt: {err}");
+            }
+            flog_warn!("Exclusive HDR fail-safe blocked: {reason}");
+            return None;
+        }
+        _ => {}
+    }
+
+    persist_exclusive_hdr_phase(ExclusiveHdrPhase::Starting, Some(&selector), None);
+    Some(selector)
+}
+
 /// Per-DRM-device backend state.
 pub struct DrmDeviceState {
     pub registration_token: RegistrationToken,
@@ -344,6 +568,9 @@ pub struct DrmDeviceState {
     pub gbm: GbmDevice<DrmDeviceFd>,
     pub drm_output_manager: FlowDrmOutputManager,
     pub surfaces: HashMap<drm::control::crtc::Handle, DrmSurfaceState>,
+    /// Connector retained by the session-start-only exclusive HDR mode. When
+    /// absent, every usable connected connector belongs to the active topology.
+    pub exclusive_hdr_output: Option<String>,
 }
 
 /// Whole backend state for tty/udev/libinput/drm.
@@ -359,6 +586,15 @@ pub(crate) struct DrmLoopData {
     pub backend: DrmBackend,
     pub libinput: Libinput,
     pub session_active: bool,
+    /// A resume can be announced by login1 before libseat has returned DRM
+    /// ownership. Keep the session paused until the existing DRM output
+    /// managers can be activated again.
+    pub resume_pending: bool,
+    pub resume_retry_at: Option<Instant>,
+    /// Device rebuilds requested from inside a DRM event callback after an
+    /// exclusive HDR validation failure. Rebuilding with failed persistent
+    /// state restores the ordinary all-output SDR topology.
+    pub exclusive_hdr_recovery_nodes: Vec<DrmNode>,
     pub should_stop: bool,
 }
 
@@ -859,6 +1095,14 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
         if info.state() != drm::control::connector::State::Connected {
             continue;
         }
+        let output_name = connector_name(&info);
+        if device
+            .exclusive_hdr_output
+            .as_deref()
+            .is_some_and(|selected| selected != output_name)
+        {
+            continue;
+        }
         connected.insert(*connector);
 
         let Some(surface) = device
@@ -869,15 +1113,16 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
             return Ok(true);
         };
 
-        let selected_mode = info
-            .modes()
-            .iter()
-            .find(|mode| {
-                mode.mode_type()
-                    .contains(drm::control::ModeTypeFlags::PREFERRED)
-            })
-            .or_else(|| info.modes().first());
-        if selected_mode.is_none_or(|mode| {
+        let hdr_mode_requested = device
+            .exclusive_hdr_output
+            .as_deref()
+            .is_some_and(|selected| selected == output_name)
+            || state
+                .outputs
+                .get(&surface.output_id)
+                .is_some_and(|output| output.hdr_requested && output.hdr_supported);
+        let selected_mode = select_connector_mode(info.modes(), hdr_mode_requested);
+        if selected_mode.as_ref().is_none_or(|mode| {
             let (width, height) = mode.size();
             surface.mode.size != Size::from((i32::from(width), i32::from(height)))
                 || surface.mode.refresh != (mode.vrefresh() as i32).max(60) * 1000
@@ -931,6 +1176,89 @@ fn reinitialize_drm_device(
     Ok(())
 }
 
+fn pause_drm_session(data: &mut DrmLoopData, reason: &str) {
+    data.resume_pending = true;
+    data.resume_retry_at = None;
+
+    if !data.session_active {
+        return;
+    }
+
+    // Keep this at warning level so production journals retain the exact
+    // suspend/resume ordering.  Resume failures are impossible to diagnose if
+    // the last visible compositor event predates PrepareForSleep(true).
+    flog_warn!("Pausing DRM session ({reason})");
+    data.core.state.handle_session_suspend();
+    data.session_active = false;
+    data.libinput.suspend();
+    for device in data.backend.devices.values_mut() {
+        device.drm_output_manager.pause();
+    }
+}
+
+fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
+    // PrepareForSleep(false) is delivered on a separate D-Bus connection and
+    // can win the race with libseat's ActivateSession. Defer until libseat has
+    // restored ownership; activating a paused DRM manager before that point
+    // cannot succeed.
+    if !data.backend.session.is_active() {
+        flog_warn!("Deferring DRM resume until libseat returns device ownership ({reason})");
+        data.resume_pending = true;
+        data.resume_retry_at = Some(Instant::now() + Duration::from_millis(250));
+        return;
+    }
+
+    if data.session_active && !data.resume_pending {
+        flog(&format!(
+            "Ignoring duplicate DRM resume notification ({reason})"
+        ));
+        return;
+    }
+
+    flog_warn!("Resuming DRM session ({reason})");
+    data.session_active = false;
+    if let Err(err) = data.libinput.resume() {
+        flog(&format!("Failed to resume libinput: {err:?}"));
+    }
+
+    // libseat keeps ownership of every device opened through the session and
+    // restores those file descriptors before ActivateSession is emitted. Do
+    // not close and reopen them here: requesting the same device from libseat
+    // a second time fails with EINVAL on seatd/libseat, and removing the old
+    // device first also destroys the only output state that can be resumed.
+    // Smithay's intended suspend/resume pair is DrmOutputManager::pause() and
+    // DrmOutputManager::activate().
+    let mut all_devices_ready = true;
+    if data.backend.devices.is_empty() {
+        flog_warn!("No DRM devices are available after resume; scheduling retry");
+        all_devices_ready = false;
+    }
+    for (node, device) in &mut data.backend.devices {
+        if let Err(err) = device.drm_output_manager.lock().activate(false) {
+            flog_warn!(
+                "Failed to reactivate DRM device {:?} after resume: {err}; scheduling retry",
+                node
+            );
+            all_devices_ready = false;
+        }
+    }
+
+    if !all_devices_ready {
+        data.resume_retry_at = Some(Instant::now() + Duration::from_millis(250));
+        return;
+    }
+
+    data.resume_pending = false;
+    data.resume_retry_at = None;
+    data.core.state.handle_session_resume();
+    // RenderState::invalidate_gpu_state() (called above via
+    // handle_session_resume) only covers caches owned by DesktopState.
+    data.core.ui_state.chrome.invalidate_gpu_state();
+    data.core.last_now = Instant::now();
+    data.core.state.mark_redraw();
+    data.session_active = true;
+}
+
 /// Live KMS HDR application is compiled in but remains runtime opt-in. NVIDIA also
 /// requires FOCALDESK_HDR_ALLOW_NVIDIA=1 because dual-head commits have frozen before.
 const HDR_LIVE_KMS_APPLY_ENABLED: bool = true;
@@ -954,15 +1282,20 @@ fn hdr_driver_allows_output_with_override(gpu_vendor_id: Option<u32>, allow_nvid
     gpu_vendor_id != Some(PCI_VENDOR_NVIDIA) || allow_nvidia
 }
 
-/// NVIDIA + two or more connected heads: live KMS HDR has wedged sessions before.
-/// Requires explicit `FOCALDESK_HDR_NVIDIA_DUAL=1` (and `FOCALDESK_HDR_ALLOW_NVIDIA=1`).
-fn nvidia_dual_head_kms_hdr_blocked(gpu_vendor_id: Option<u32>, connected_outputs: usize) -> bool {
-    gpu_vendor_id == Some(PCI_VENDOR_NVIDIA)
-        && connected_outputs > 1
-        && !matches!(
-            std::env::var("FOCALDESK_HDR_NVIDIA_DUAL").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        )
+/// NVIDIA HDR remains blocked for normal/multi-output topologies. The explicit
+/// driver override is honored only after exclusive mode has reduced KMS to one
+/// validated connector and armed crash-safe persistent recovery.
+fn nvidia_kms_hdr_blocked(gpu_vendor_id: Option<u32>, exclusive_output: bool) -> bool {
+    let allow_nvidia = hdr_driver_allows_output(gpu_vendor_id);
+    nvidia_kms_hdr_blocked_with_override(gpu_vendor_id, exclusive_output, allow_nvidia)
+}
+
+fn nvidia_kms_hdr_blocked_with_override(
+    gpu_vendor_id: Option<u32>,
+    exclusive_output: bool,
+    driver_allowed: bool,
+) -> bool {
+    gpu_vendor_id == Some(PCI_VENDOR_NVIDIA) && !(exclusive_output && driver_allowed)
 }
 
 /// Sync `OutputState` HDR flags from EDID/KMS detection and persisted config.
@@ -977,6 +1310,7 @@ fn sync_output_hdr_flags(
     // override. `hdr_output_capable` and the commit path enforce that policy.
     output.hdr_supported = support.is_detected();
     output.hdr_requested = hdr_requested_from_config && output.hdr_supported;
+    output.hdr_verification_pending = false;
     if let Some(meta) = support.edid_hdr_metadata.as_ref() {
         output.edid_hdr_max_luminance_nits = Some(meta.max_luminance as f32);
         output.edid_hdr_max_fall_nits = Some(meta.max_fall as f32);
@@ -1019,14 +1353,17 @@ mod screenshot_tests {
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, hdr_commit_stalled,
+        configured_display_hdr_requested, hdr_active_status_verified, hdr_commit_stalled,
         hdr_detection::parse_edid_hdr_support, hdr_driver_allows_output_with_override,
-        merge_disconnected_display_configs, queued_frame_stalled, DisplayConfig, DisplayTransform,
-        EdidHdrMetadata, DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT,
-        HDR_SCANOUT_FORMATS, PCI_VENDOR_NVIDIA,
+        hdr_verification_complete, merge_disconnected_display_configs,
+        nvidia_kms_hdr_blocked_with_override, queued_frame_stalled, select_drm_mode_index,
+        select_exclusive_hdr_target, DisplayConfig, DisplayTransform, DrmModeCandidate,
+        EdidHdrMetadata, HdrBpcRange, HdrSupport, DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE,
+        HDR_FRAME_TIMEOUT, HDR_SAFE_MAX_REFRESH_HZ, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
+        HDR_VERIFY_VBLANKS, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::DisplayColorProfile;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
         DisplayConfig {
@@ -1064,6 +1401,21 @@ mod hdr_tests {
     }
 
     #[test]
+    fn exclusive_hdr_target_requires_an_exact_capable_connector() {
+        let candidates = vec![("DP-3".to_string(), true), ("HDMI-A-1".to_string(), false)];
+        assert_eq!(
+            select_exclusive_hdr_target(Some(" DP-3 "), &candidates).unwrap(),
+            Some("DP-3".to_string())
+        );
+        assert!(select_exclusive_hdr_target(Some("DP-4"), &candidates).is_err());
+        assert!(select_exclusive_hdr_target(Some("HDMI-A-1"), &candidates).is_err());
+        assert_eq!(
+            select_exclusive_hdr_target(None, &candidates).unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn lost_vblank_is_bounded_even_outside_an_hdr_transition() {
         let queued_at = Instant::now();
         assert!(!queued_frame_stalled(
@@ -1085,6 +1437,30 @@ mod hdr_tests {
     }
 
     #[test]
+    fn exclusive_hdr_is_not_reported_active_before_stability_window() {
+        let started_at = Instant::now();
+        assert!(!hdr_verification_complete(
+            HDR_VERIFY_VBLANKS - 1,
+            Some(started_at),
+            started_at + HDR_VERIFY_DURATION
+        ));
+        assert!(!hdr_verification_complete(
+            HDR_VERIFY_VBLANKS,
+            Some(started_at),
+            started_at + HDR_VERIFY_DURATION - Duration::from_millis(1)
+        ));
+        assert!(hdr_verification_complete(
+            HDR_VERIFY_VBLANKS,
+            Some(started_at),
+            started_at + HDR_VERIFY_DURATION
+        ));
+        assert!(!hdr_active_status_verified(true, true, false));
+        assert!(hdr_active_status_verified(true, true, true));
+        assert!(hdr_active_status_verified(true, false, false));
+        assert!(!hdr_active_status_verified(false, true, true));
+    }
+
+    #[test]
     fn scanout_preferences_try_ten_bit_before_sdr_fallbacks() {
         assert!(DRM_SCANOUT_FORMAT_PREFERENCE[..4]
             .iter()
@@ -1092,6 +1468,108 @@ mod hdr_tests {
         assert!(DRM_SCANOUT_FORMAT_PREFERENCE[4..]
             .iter()
             .all(|format| !HDR_SCANOUT_FORMATS.contains(format)));
+    }
+
+    #[test]
+    fn hdr_mode_selection_caps_native_resolution_at_120_hz() {
+        let candidates = [
+            DrmModeCandidate {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 165,
+                preferred: true,
+            },
+            DrmModeCandidate {
+                width: 2560,
+                height: 1440,
+                refresh_hz: HDR_SAFE_MAX_REFRESH_HZ,
+                preferred: false,
+            },
+            DrmModeCandidate {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 60,
+                preferred: false,
+            },
+        ];
+
+        assert_eq!(select_drm_mode_index(&candidates, false), Some(0));
+        assert_eq!(select_drm_mode_index(&candidates, true), Some(1));
+    }
+
+    #[test]
+    fn hdr_mode_selection_never_chooses_faster_mode_when_safe_mode_exists() {
+        let candidates = [
+            DrmModeCandidate {
+                width: 3840,
+                height: 2160,
+                refresh_hz: 144,
+                preferred: true,
+            },
+            DrmModeCandidate {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 120,
+                preferred: false,
+            },
+            DrmModeCandidate {
+                width: 3840,
+                height: 2160,
+                refresh_hz: 60,
+                preferred: false,
+            },
+        ];
+
+        assert_eq!(select_drm_mode_index(&candidates, true), Some(2));
+    }
+
+    #[test]
+    fn nvidia_hdr_override_is_limited_to_exclusive_mode() {
+        assert!(nvidia_kms_hdr_blocked_with_override(
+            Some(PCI_VENDOR_NVIDIA),
+            false,
+            true
+        ));
+        assert!(nvidia_kms_hdr_blocked_with_override(
+            Some(PCI_VENDOR_NVIDIA),
+            true,
+            false
+        ));
+        assert!(!nvidia_kms_hdr_blocked_with_override(
+            Some(PCI_VENDOR_NVIDIA),
+            true,
+            true
+        ));
+        assert!(!nvidia_kms_hdr_blocked_with_override(
+            Some(0x1002),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn hdr_capability_accepts_driver_managed_bpc_with_ten_bit_scanout() {
+        let mut support = HdrSupport {
+            has_hdr_metadata_property: true,
+            has_bt2020_colorspace: true,
+            edid_hdr_static_metadata: true,
+            edid_static_metadata_type1: true,
+            edid_pq: true,
+            edid_hdr_metadata: Some(EdidHdrMetadata {
+                display_primaries: [(1, 1); 3],
+                white_point: (1, 1),
+                max_luminance: 1_000,
+                min_luminance: 1,
+                max_fall: 400,
+            }),
+            ..HdrSupport::default()
+        };
+        assert!(!support.can_enable(false));
+        assert!(support.can_enable(true));
+        support.max_bpc = Some(HdrBpcRange { min: 8, max: 8 });
+        assert!(!support.can_enable(true));
+        support.max_bpc = Some(HdrBpcRange { min: 8, max: 12 });
+        assert!(support.can_enable(true));
     }
 
     #[test]
@@ -1176,10 +1654,9 @@ fn hdr_output_capable(
     ten_bit_scanout_active: bool,
     gpu_vendor_id: Option<u32>,
 ) -> bool {
-    hdr_support.can_enable()
+    hdr_support.can_enable(ten_bit_scanout_active)
         && hdr_offscreen_format.is_some()
         && hdr_working_format.is_some()
-        && ten_bit_scanout_active
         && hdr_driver_allows_output(gpu_vendor_id)
 }
 
@@ -1618,6 +2095,100 @@ mod hdr_detection {
     pub(crate) mod hdr_kms {
         use super::*;
 
+        #[derive(Debug)]
+        pub(crate) struct ConnectorHdrSnapshot {
+            colorspace: Option<String>,
+            max_bpc: Option<u64>,
+            metadata_blob: Option<u64>,
+        }
+
+        impl ConnectorHdrSnapshot {
+            fn validate(
+                &self,
+                hdr_enabled: bool,
+                require_max_bpc_readback: bool,
+            ) -> Result<(), anyhow::Error> {
+                let colorspace = self
+                    .colorspace
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("connector Colorspace property is missing"))?;
+                match self.max_bpc {
+                    Some(max_bpc) if max_bpc < 10 => {
+                        return Err(anyhow!(
+                            "connector max bpc read back as {max_bpc}, expected at least 10"
+                        ));
+                    }
+                    None if require_max_bpc_readback => {
+                        return Err(anyhow!("connector max bpc property is missing"));
+                    }
+                    _ => {}
+                }
+
+                let metadata_blob = self
+                    .metadata_blob
+                    .ok_or_else(|| anyhow!("connector HDR_OUTPUT_METADATA property is missing"))?;
+                if hdr_enabled {
+                    if !colorspace.contains("BT2020") {
+                        return Err(anyhow!(
+                            "connector Colorspace read back as {colorspace}, expected BT2020"
+                        ));
+                    }
+                    if metadata_blob == 0 {
+                        return Err(anyhow!("connector HDR metadata read back as disabled"));
+                    }
+                } else {
+                    if colorspace.contains("BT2020") {
+                        return Err(anyhow!(
+                            "connector Colorspace remained {colorspace} after SDR transition"
+                        ));
+                    }
+                    if metadata_blob != 0 {
+                        return Err(anyhow!(
+                            "connector HDR metadata blob {metadata_blob} remained active after SDR transition"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        pub(crate) fn validate_connector_hdr_state(
+            device: &impl drm::control::Device,
+            connector: connector::Handle,
+            hdr_enabled: bool,
+            require_max_bpc_readback: bool,
+        ) -> Result<ConnectorHdrSnapshot, anyhow::Error> {
+            let props = device.get_properties(connector).map_err(|err| {
+                anyhow!("failed to read connector properties after HDR commit: {err}")
+            })?;
+            let mut snapshot = ConnectorHdrSnapshot {
+                colorspace: None,
+                max_bpc: None,
+                metadata_blob: None,
+            };
+
+            for (prop, raw_value) in props.iter() {
+                let Ok(info) = device.get_property(*prop) else {
+                    continue;
+                };
+                match info.name().to_string_lossy().as_ref() {
+                    "Colorspace" => {
+                        if let property::ValueType::Enum(values) = info.value_type() {
+                            snapshot.colorspace = values
+                                .get_value_from_raw_value(*raw_value)
+                                .map(|value| value.name().to_string_lossy().into_owned());
+                        }
+                    }
+                    "max bpc" => snapshot.max_bpc = Some(*raw_value),
+                    "HDR_OUTPUT_METADATA" => snapshot.metadata_blob = Some(*raw_value),
+                    _ => {}
+                }
+            }
+
+            snapshot.validate(hdr_enabled, require_max_bpc_readback)?;
+            Ok(snapshot)
+        }
+
         pub(crate) fn log_connector_hdr_properties(
             device: &impl drm::control::Device,
             connector: connector::Handle,
@@ -1713,7 +2284,7 @@ mod hdr_detection {
             device: &impl drm::control::Device,
             support: &HdrSupport,
         ) -> Result<u64, anyhow::Error> {
-            if !support.can_enable() {
+            if !support.can_signal_hdr10() {
                 return Err(anyhow!(
                     "HDR metadata requested without complete HDR support"
                 ));
@@ -1804,7 +2375,7 @@ mod hdr_detection {
             hdr_enabled: bool,
             hdr_metadata_blob: Option<u64>,
         ) -> Result<Option<HdrState>, anyhow::Error> {
-            if hdr_enabled && (!support.can_enable() || hdr_metadata_blob.is_none()) {
+            if hdr_enabled && (!support.can_signal_hdr10() || hdr_metadata_blob.is_none()) {
                 return Ok(None);
             }
 
@@ -1827,6 +2398,23 @@ mod hdr_detection {
                 let name = info.name().to_string_lossy();
 
                 match name.as_ref() {
+                    "max bpc" => {
+                        if support.bpc_control_allows_ten_bit() {
+                            // Do not reduce a link that was already configured
+                            // above 10 bpc, but raise an 8-bpc default as part of
+                            // the same atomic transaction as colorspace and HDR
+                            // metadata. A 10-bit framebuffer alone does not set
+                            // the DisplayPort link depth.
+                            state.max_bpc = Some(
+                                support
+                                    .current_max_bpc
+                                    .unwrap_or(10)
+                                    .max(10)
+                                    .min(support.max_bpc.as_ref().unwrap().max),
+                            );
+                            changed = true;
+                        }
+                    }
                     "Colorspace" => {
                         if let Some(value) = select_colorspace_value(&info, support, hdr_enabled) {
                             state.colorspace = Some(value);
@@ -1878,6 +2466,59 @@ mod hdr_detection {
                 .map_err(|err| anyhow!("failed to queue HDR connector state: {err}"))?;
 
             Ok(true)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use super::ConnectorHdrSnapshot;
+
+            #[test]
+            fn validates_complete_hdr_property_readback() {
+                let snapshot = ConnectorHdrSnapshot {
+                    colorspace: Some("BT2020_RGB".into()),
+                    max_bpc: Some(10),
+                    metadata_blob: Some(42),
+                };
+                assert!(snapshot.validate(true, true).is_ok());
+            }
+
+            #[test]
+            fn rejects_partial_hdr_property_readback() {
+                let eight_bit = ConnectorHdrSnapshot {
+                    colorspace: Some("BT2020_RGB".into()),
+                    max_bpc: Some(8),
+                    metadata_blob: Some(42),
+                };
+                assert!(eight_bit.validate(true, true).is_err());
+
+                let missing_metadata = ConnectorHdrSnapshot {
+                    colorspace: Some("BT2020_RGB".into()),
+                    max_bpc: Some(10),
+                    metadata_blob: Some(0),
+                };
+                assert!(missing_metadata.validate(true, true).is_err());
+            }
+
+            #[test]
+            fn accepts_driver_managed_bpc_after_ten_bit_scanout_probe() {
+                let snapshot = ConnectorHdrSnapshot {
+                    colorspace: Some("BT2020_RGB".into()),
+                    max_bpc: None,
+                    metadata_blob: Some(42),
+                };
+                assert!(snapshot.validate(true, false).is_ok());
+                assert!(snapshot.validate(true, true).is_err());
+            }
+
+            #[test]
+            fn validates_sdr_rollback_readback() {
+                let snapshot = ConnectorHdrSnapshot {
+                    colorspace: Some("Default".into()),
+                    max_bpc: Some(10),
+                    metadata_blob: Some(0),
+                };
+                assert!(snapshot.validate(false, true).is_ok());
+            }
         }
     }
 }
@@ -2077,6 +2718,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         },
         libinput,
         session_active: session.is_active(),
+        resume_pending: false,
+        resume_retry_at: None,
+        exclusive_hdr_recovery_nodes: Vec::new(),
         should_stop: false,
     };
 
@@ -2128,61 +2772,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         })?;
     }
 
-    let session_handle = loop_handle.clone();
     let _session_token =
         loop_handle.insert_source(notifier, move |event, _, data| match event {
             SessionEvent::PauseSession => {
-                flog("Pausing DRM session");
-                data.session_active = false;
-                data.libinput.suspend();
-                for device in data.backend.devices.values_mut() {
-                    device.drm_output_manager.pause();
-                }
+                pause_drm_session(data, "libseat PauseSession");
             }
             SessionEvent::ActivateSession => {
-                flog("Resuming DRM session");
-                if let Err(err) = data.libinput.resume() {
-                    flog(&format!("Failed to resume libinput: {err:?}"));
-                }
-
-                let drm_nodes: Vec<_> = data.backend.devices.keys().copied().collect();
-                // After suspend, some GPUs come back in a half-initialized state.
-                // Rebuild each DRM device so output activation does not depend on
-                // whatever state the kernel/seat backend happened to preserve.
-                std::thread::sleep(Duration::from_millis(100));
-                let mut all_devices_ready = true;
-                for node in drm_nodes {
-                    if let Err(err) = reinitialize_drm_device(data, &session_handle, node) {
-                        flog(&format!(
-                            "Failed to rebuild DRM device {:?} after resume: {err}; retrying",
-                            node
-                        ));
-                        std::thread::sleep(Duration::from_millis(100));
-                        if let Err(retry_err) = reinitialize_drm_device(data, &session_handle, node)
-                        {
-                            flog(&format!(
-                                "Failed to rebuild DRM device {:?} after resume retry: {retry_err}; \
-                                 leaving session paused rather than rendering against a broken device",
-                                node
-                            ));
-                            all_devices_ready = false;
-                        }
-                    }
-                }
-
-                data.core.state.handle_session_resume();
-                // RenderState::invalidate_gpu_state() (called above via
-                // handle_session_resume) only covers caches owned by DesktopState.
-                // The icon atlas lives in the sibling `ui_state`, so it needs its
-                // own reset or the sidebar/topbar icons stay blank after resume.
-                data.core.ui_state.chrome.invalidate_gpu_state();
-                data.core.last_now = Instant::now();
-                data.core.state.mark_redraw();
-                // Only resume rendering once every device is actually back and holding
-                // DRM master; otherwise the next frame's page flip fails permission
-                // checks and takes the whole compositor down (session_active stays
-                // false, so a later ActivateSession/udev Changed event can retry).
-                data.session_active = all_devices_ready;
+                resume_drm_session(data, "libseat ActivateSession");
             }
         })?;
     let sleep_notifications = spawn_session_sleep_watch().ok();
@@ -2287,7 +2883,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     while !data.should_stop && data.core.state.running {
         if let Some(rx) = sleep_notifications.as_ref() {
-            drain_session_sleep_notifications(rx, &mut data.core.state);
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    SessionSleepEvent::GoingToSleep => {
+                        pause_drm_session(&mut data, "login1 PrepareForSleep(true)");
+                    }
+                    SessionSleepEvent::WokeUp => {
+                        resume_drm_session(&mut data, "login1 PrepareForSleep(false)");
+                    }
+                }
+            }
+        }
+
+        if data.resume_pending
+            && data
+                .resume_retry_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            resume_drm_session(&mut data, "deferred resume retry");
         }
 
         #[cfg(feature = "xwayland")]
@@ -2306,6 +2919,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.process_lock_timers();
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+        let exclusive_recovery_nodes = std::mem::take(&mut data.exclusive_hdr_recovery_nodes);
+        for node in exclusive_recovery_nodes {
+            flog_warn!(
+                "Rebuilding DRM device {node:?} to restore all outputs after exclusive HDR failure"
+            );
+            if let Err(err) = reinitialize_drm_device(&mut data, &loop_handle, node) {
+                flog_warn!("Failed to restore SDR output topology on {node:?}: {err}");
+            }
+        }
         data.core.state.process_deferred_ui_and_launches();
 
         if !data.session_active {
@@ -2380,10 +3002,38 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .retain(|session| session.alive());
         let portal_pending = crate::core::portal::portal_capture_pending(&data.core.state);
         let portal_needs_composite = crate::core::portal::portal_needs_composite(&data.core.state);
+        // A DRM page-flip event is delivered only for a frame that we actually
+        // submit.  Merely damaging the output from the previous vblank callback
+        // is not sufficient to keep a static desktop rendering: the retained
+        // renderer may already have made its render/no-render decision for that
+        // dispatch.  Explicitly carry verification into the main-loop render
+        // decision and damage the selected output until the bounded PQ window
+        // completes.
+        let verifying_hdr_outputs: Vec<_> = data
+            .backend
+            .devices
+            .values()
+            .flat_map(|device| {
+                let exclusive_hdr_output = device.exclusive_hdr_output.as_deref();
+                device.surfaces.values().filter_map(move |surface| {
+                    let is_exclusive = exclusive_hdr_output == Some(surface.output.name().as_str());
+                    (surface.hdr_enabled_applied
+                        && is_exclusive
+                        && surface.hdr_verify_started_at.is_some())
+                    .then_some(surface.output_id)
+                })
+            })
+            .collect();
+        for output_id in &verifying_hdr_outputs {
+            data.core
+                .state
+                .mark_output_full_damage(*output_id, DamageSource::Unknown);
+        }
         let should_render = data.core.state.needs_redraw()
             || screenshot_output.is_some()
             || data.core.state.screenshot_all_requested
-            || portal_needs_composite;
+            || portal_needs_composite
+            || !verifying_hdr_outputs.is_empty();
 
         // Watchdog for any stalled DRM frame: runs every tick regardless of `should_render`,
         // since a frozen output produces no further damage to wake it up.
@@ -2415,6 +3065,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     disable_persisted_hdr_request(&surface.output.name());
                     if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
                         output.hdr_requested = false;
+                        output.hdr_verification_pending = false;
                         output.hdr_enabled = false;
                     }
                 } else {
@@ -2424,8 +3075,21 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         DRM_FRAME_TIMEOUT
                     );
                 }
+                if device.exclusive_hdr_output.as_deref() == Some(surface.output.name().as_str()) {
+                    let reason = if hdr_stalled {
+                        "HDR KMS transition timed out without a vblank"
+                    } else {
+                        "HDR verification frame timed out"
+                    };
+                    persist_exclusive_hdr_phase(
+                        ExclusiveHdrPhase::Failed,
+                        Some(surface.output.name().as_str()),
+                        Some(reason),
+                    );
+                }
                 surface.hdr_commit_deadline = None;
                 surface.hdr_transition_target = None;
+                surface.hdr_initial_modeset_pending = false;
                 if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
                     output.hdr_transition_target = None;
                 }
@@ -2462,7 +3126,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
             for (_node, device) in data.backend.devices.iter_mut() {
                 let gpu_vendor_id = device.gpu_vendor_id;
-                let connected_outputs = device.surfaces.len();
+                let exclusive_hdr_output = device.exclusive_hdr_output.clone();
+                let all_outputs_stable = device.surfaces.values().all(|surface| {
+                    surface.stable_vblank_count >= HDR_MIN_STABLE_VBLANKS
+                        && surface.frame_queued_at.is_none()
+                });
                 for (_crtc, surface) in device.surfaces.iter_mut() {
                     if surface.frame_queued_at.is_some() {
                         // Wait for the matching vblank before preparing another buffer for this
@@ -2526,13 +3194,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     if surface.hdr_transition_target.is_none()
                         && hdr_target != surface.hdr_enabled_applied
                     {
-                        if hdr_target
-                            && nvidia_dual_head_kms_hdr_blocked(gpu_vendor_id, connected_outputs)
+                        if hdr_target && !all_outputs_stable {
+                            // Keep producing baseline SDR frames until this
+                            // device's complete output topology has
+                            // demonstrated a healthy event path. In particular,
+                            // do not stack HDR connector changes directly onto
+                            // the initial modesets while another CRTC is still
+                            // waiting for its first successful presentations.
+                            data.core.state.mark_redraw();
+                        } else if hdr_target
+                            && nvidia_kms_hdr_blocked(
+                                gpu_vendor_id,
+                                exclusive_hdr_output.as_deref()
+                                    == Some(surface.output.name().as_str()),
+                            )
                         {
                             if !surface.hdr_dual_block_logged {
                                 surface.hdr_dual_block_logged = true;
                                 flog_warn!(
-                                    "HDR KMS blocked on {}: NVIDIA dual-head (set FOCALDESK_HDR_ALLOW_NVIDIA=1 and FOCALDESK_HDR_NVIDIA_DUAL=1 to enable)",
+                                    "HDR KMS blocked on {}: NVIDIA requires an exclusive output plus FOCALDESK_HDR_ALLOW_NVIDIA=1",
                                     surface.output.name()
                                 );
                             }
@@ -2542,6 +3222,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             hdr_target,
                         ) {
                             surface.hdr_transition_target = Some(hdr_target);
+                            surface.hdr_initial_modeset_pending = false;
                             surface.hdr_commit_deadline = Some(now + HDR_FRAME_TIMEOUT);
                             if let Some(output) =
                                 data.core.state.outputs.get_mut(&surface.output_id)
@@ -2556,15 +3237,36 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             data.core.state.outputs.get_mut(&surface.output_id)
                         {
                             output.hdr_transition_target = None;
+                            if exclusive_hdr_output.as_deref()
+                                == Some(surface.output.name().as_str())
+                            {
+                                persist_exclusive_hdr_phase(
+                                    ExclusiveHdrPhase::Failed,
+                                    Some(surface.output.name().as_str()),
+                                    Some("HDR connector state could not be staged"),
+                                );
+                                surface.hdr_commit_deadline = Some(now);
+                            }
                         }
                     }
 
                     if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
                         output.hdr_kms_applied = surface.hdr_enabled_applied;
-                        output.hdr_enabled = crate::core::color::output_hdr_render_active(
+                        let render_active = crate::core::color::output_hdr_render_active(
                             output.hdr_requested,
                             output.hdr_supported,
                             output.hdr_kms_applied,
+                        );
+                        let exclusive_output =
+                            exclusive_hdr_output.as_deref() == Some(surface.output.name().as_str());
+                        let verification_pending = render_active
+                            && exclusive_output
+                            && surface.hdr_verify_started_at.is_some();
+                        output.hdr_verification_pending = verification_pending;
+                        output.hdr_enabled = hdr_active_status_verified(
+                            render_active,
+                            exclusive_output,
+                            !verification_pending,
                         );
                     }
 
@@ -2654,8 +3356,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         ) {
                             Ok(true) => {
                                 surface.hdr_transition_target = None;
-                                surface.hdr_commit_deadline = None;
+                                surface.hdr_initial_modeset_pending = false;
                                 surface.hdr_render_supported = false;
+                                if exclusive_hdr_output.as_deref()
+                                    == Some(surface.output.name().as_str())
+                                {
+                                    persist_exclusive_hdr_phase(
+                                        ExclusiveHdrPhase::Failed,
+                                        Some(surface.output.name().as_str()),
+                                        Some("PQ first-frame encoding failed"),
+                                    );
+                                    surface.hdr_commit_deadline = Some(now);
+                                } else {
+                                    surface.hdr_commit_deadline = None;
+                                }
                                 if let Some(output) =
                                     data.core.state.outputs.get_mut(&surface.output_id)
                                 {
@@ -2680,12 +3394,40 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
-                    if use_linear_sdr && surface.render_targets.linear_offscreen.is_some() {
-                        surface.present_damage.reset();
+                    let exclusive_hdr_frame = surface.hdr_enabled_applied
+                        && exclusive_hdr_output.as_deref() == Some(surface.output.name().as_str());
+                    if exclusive_hdr_frame && !surface.render_targets.encoded_hdr {
+                        flog_warn!(
+                            "Exclusive HDR PQ encoding stopped during verification on {}; staging SDR rollback",
+                            surface.output.name()
+                        );
+                        persist_exclusive_hdr_phase(
+                            ExclusiveHdrPhase::Failed,
+                            Some(surface.output.name().as_str()),
+                            Some("PQ encoding failed during HDR verification"),
+                        );
+                        disable_persisted_hdr_request(&surface.output.name());
+                        if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
+                            output.hdr_requested = false;
+                            output.hdr_verification_pending = false;
+                            output.hdr_enabled = false;
+                        }
+                        data.core.state.mark_redraw();
+                        continue;
                     }
-                    if portal_needs_composite || portal_output_pending {
-                        device.renderer.wait(&sync)?;
-                    }
+                    // `run_linear_staged_pass` finishes several dependent FBO
+                    // submissions and returns the fence for the final encode.
+                    // The texture is sampled again below by `render_frame`.
+                    // Waiting only for capture consumers leaves that hand-off
+                    // racy on the direct NVIDIA path: early base pixels are
+                    // visible, while later client/egui regions can present as a
+                    // solid blue rectangle. Screenshots did not contain the
+                    // artifact because their readback happened to wait first.
+                    //
+                    // Smithay does not receive this producer fence through the
+                    // TextureRenderElement, so make the dependency explicit
+                    // before either capture or scanout samples the texture.
+                    device.renderer.wait(&sync)?;
 
                     if let Some((texture, encoding)) = capture_source_texture(surface) {
                         crate::core::portal::publish_portal_capture_source(
@@ -2752,14 +3494,35 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         (0.0, 0.0),
                         (surface.size.w as f64, surface.size.h as f64),
                     );
-                    surface
-                        .present_damage
-                        .add(prepared.frame_ctx.damage.iter().map(|rect| {
-                            Rectangle::<i32, Buffer>::from_loc_and_size(
-                                (rect.loc.x, rect.loc.y),
-                                (rect.size.w, rect.size.h),
-                            )
-                        }));
+                    let force_hdr_verification_present =
+                        exclusive_hdr_frame && surface.hdr_verify_started_at.is_some();
+                    let present_frame_damage: Vec<Rectangle<i32, Buffer>> =
+                        if force_hdr_verification_present {
+                            // The FP16/PQ targets are retained textures. Resetting the
+                            // DamageBag every frame made its commit counter repeatedly
+                            // return to 1, so Smithay compared commit 1 with commit 1,
+                            // classified the frame as empty, and never queued another
+                            // page flip for the HDR verifier to count. Keep the damage
+                            // history monotonic and explicitly damage the full scanout
+                            // while verification needs a real presentation.
+                            vec![Rectangle::from_loc_and_size(
+                                (0, 0),
+                                (surface.size.w, surface.size.h),
+                            )]
+                        } else {
+                            prepared
+                                .frame_ctx
+                                .damage
+                                .iter()
+                                .map(|rect| {
+                                    Rectangle::<i32, Buffer>::from_loc_and_size(
+                                        (rect.loc.x, rect.loc.y),
+                                        (rect.size.w, rect.size.h),
+                                    )
+                                })
+                                .collect()
+                        };
+                    surface.present_damage.add(present_frame_damage);
                     let present_damage = surface.present_damage.snapshot();
 
                     let texture_elem = TextureRenderElement::from_texture_with_damage(
@@ -2923,6 +3686,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     // there's nothing to clean up in those cases. Stop the session target so
     // the per-domain helper daemons (`WantedBy=focaldesk-session.target`) are
     // torn down cleanly rather than left running orphaned until next login.
+    let exclusive_state = load_exclusive_hdr_state();
+    if exclusive_state.session_id == Some(std::process::id()) {
+        match exclusive_state.phase {
+            ExclusiveHdrPhase::Active => persist_exclusive_hdr_phase(
+                ExclusiveHdrPhase::Requested,
+                exclusive_state.connector.as_deref(),
+                None,
+            ),
+            ExclusiveHdrPhase::Starting | ExclusiveHdrPhase::Verifying => {
+                persist_exclusive_hdr_phase(
+                    ExclusiveHdrPhase::Failed,
+                    exclusive_state.connector.as_deref(),
+                    Some("session exited before exclusive HDR verification completed"),
+                );
+            }
+            _ => {}
+        }
+    }
     stop_focaldesk_session_target();
 
     Ok(())
@@ -3136,10 +3917,48 @@ fn device_added(
             .or(Some(node))
     };
 
-    let egl_context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
-        .context("Failed to create EGLContext for DRM node")?;
-    let mut renderer = unsafe { GlesRenderer::new(egl_context) }
-        .context("Failed to create GLES renderer for DRM node")?;
+    // Prefer GLES 3 for core synchronization and framebuffer capabilities.  Keep
+    // the former configless GLES 2 context as a compatibility fallback: asking
+    // Smithay for an explicit GL version also requires selecting an EGLConfig,
+    // which some older or unusual DRM drivers may reject.
+    let preferred_context = EGLContext::new_with_config_and_priority(
+        &egl_display,
+        GlAttributes {
+            version: (3, 0),
+            profile: None,
+            debug: cfg!(debug_assertions),
+            vsync: false,
+        },
+        PixelFormatRequirements::_8_bit(),
+        ContextPriority::High,
+    );
+
+    let mut renderer = match preferred_context {
+        Ok(context) => match unsafe { GlesRenderer::new(context) } {
+            Ok(renderer) => {
+                flog("Created preferred OpenGL ES 3.0 context for DRM renderer");
+                renderer
+            }
+            Err(err) => {
+                flog(&format!(
+                    "OpenGL ES 3.0 DRM renderer initialization failed ({err:?}); falling back to OpenGL ES 2.0"
+                ));
+                let context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
+                    .context("Failed to create fallback OpenGL ES 2.0 context for DRM node")?;
+                unsafe { GlesRenderer::new(context) }
+                    .context("Failed to create fallback OpenGL ES 2.0 renderer for DRM node")?
+            }
+        },
+        Err(err) => {
+            flog(&format!(
+                "OpenGL ES 3.0 DRM context unavailable ({err:?}); falling back to OpenGL ES 2.0"
+            ));
+            let context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
+                .context("Failed to create fallback OpenGL ES 2.0 context for DRM node")?;
+            unsafe { GlesRenderer::new(context) }
+                .context("Failed to create fallback OpenGL ES 2.0 renderer for DRM node")?
+        }
+    };
 
     match renderer.bind_wl_display(&data.core.display.handle()) {
         Ok(_) => flog("EGL Wayland display bound for DRM renderer"),
@@ -3212,6 +4031,74 @@ fn device_added(
         .resource_handles()
         .context("Failed to get DRM resources")?;
 
+    let exclusive_selector =
+        prepare_exclusive_hdr_attempt(crate::core::color::exclusive_hdr_output_selector());
+    let mut exclusive_candidates = Vec::new();
+    for conn in res.connectors() {
+        let info = drm_output_manager
+            .device()
+            .get_connector(*conn, false)
+            .context("Failed to inspect connector for exclusive HDR preflight")?;
+        if info.state() != drm::control::connector::State::Connected {
+            continue;
+        }
+        let name = connector_name(&info);
+        let edid = connector_edid(drm_output_manager.device(), *conn);
+        let support = hdr_detection::connector_hdr_support(
+            drm_output_manager.device(),
+            *conn,
+            edid.as_deref(),
+        );
+        let has_crtc = info.encoders().iter().any(|encoder| {
+            drm_output_manager
+                .device()
+                .get_encoder(*encoder)
+                .ok()
+                .is_some_and(|encoder| !res.filter_crtcs(encoder.possible_crtcs()).is_empty())
+        });
+        let capable = !info.modes().is_empty()
+            && has_crtc
+            && support.can_signal_hdr10()
+            && support.bpc_control_allows_ten_bit()
+            && hdr_driver_allows_output(gpu_vendor_id);
+        exclusive_candidates.push((name, capable));
+    }
+
+    let mut exclusive_hdr_output = match select_exclusive_hdr_target(
+        exclusive_selector.as_deref(),
+        &exclusive_candidates,
+    ) {
+        Ok(target) => target,
+        Err(reason) => {
+            flog_warn!(
+                "Exclusive HDR preflight failed: {reason}; keeping all connected outputs active in SDR"
+            );
+            persist_exclusive_hdr_phase(
+                ExclusiveHdrPhase::Failed,
+                exclusive_selector.as_deref(),
+                Some(&reason),
+            );
+            None
+        }
+    };
+    if let Some(target) = exclusive_hdr_output.as_deref() {
+        flog_warn!(
+            "Exclusive HDR preflight accepted connector {target}; other outputs will remain disabled for this session"
+        );
+    }
+
+    let mut connector_handles = res.connectors().to_vec();
+    connector_handles.sort_by_key(|conn| {
+        let name = drm_output_manager
+            .device()
+            .get_connector(*conn, false)
+            .ok()
+            .map(|info| connector_name(&info));
+        exclusive_hdr_output
+            .as_ref()
+            .is_none_or(|selected| name.as_ref() != Some(selected))
+    });
+
     let mut used_crtcs = std::collections::HashSet::new();
     let mut initialized_one = false;
 
@@ -3220,7 +4107,7 @@ fn device_added(
     let mut next_x = 0;
     let configured_displays = load_display_config();
 
-    for conn in res.connectors() {
+    for conn in &connector_handles {
         let info = drm_output_manager
             .device()
             .get_connector(*conn, false)
@@ -3232,6 +4119,16 @@ fn device_added(
 
         //flog(&format!("Found connected connector: {:?}", conn));
         let name = connector_name(&info);
+
+        if exclusive_hdr_output
+            .as_deref()
+            .is_some_and(|selected| selected != name)
+        {
+            flog(&format!(
+                "Exclusive HDR: leaving connected output {name} disabled"
+            ));
+            continue;
+        }
 
         let connector_size = info.size();
         flog(&format!(
@@ -3256,22 +4153,33 @@ fn device_added(
             ));
         }
 
-        let mode = info
-            .modes()
-            .iter()
-            .find(|m| {
-                m.mode_type()
-                    .contains(drm::control::ModeTypeFlags::PREFERRED)
-            })
-            .cloned()
-            .or_else(|| info.modes().first().cloned());
+        let output_name = name.clone();
+        let edid = connector_edid(drm_output_manager.device(), *conn);
+        let hdr_support = hdr_detection::connector_hdr_support(
+            drm_output_manager.device(),
+            *conn,
+            edid.as_deref(),
+        );
+        hdr_detection::log_hdr_support(&output_name, &hdr_support);
+        let hdr_requested_config = exclusive_hdr_output.as_deref() == Some(output_name.as_str())
+            || configured_display_hdr_requested(&configured_displays, &output_name);
+        let hdr_safe_mode_requested = hdr_requested_config
+            && hdr_support.can_signal_hdr10()
+            && hdr_support.bpc_control_allows_ten_bit();
+        let mode = select_connector_mode(info.modes(), hdr_safe_mode_requested);
 
         if let Some(mode) = mode {
             let (w, h) = mode.size();
 
-            flog(&format!("Selected mode: {}x{} @ {}", w, h, mode.vrefresh()));
-
-            let output_name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+            if hdr_safe_mode_requested {
+                flog_warn!(
+                    "HDR safe mode selected: output={output_name} mode={w}x{h}@{}Hz ceiling={}Hz",
+                    mode.vrefresh(),
+                    HDR_SAFE_MAX_REFRESH_HZ,
+                );
+            } else {
+                flog(&format!("Selected mode: {}x{} @ {}", w, h, mode.vrefresh()));
+            }
 
             let fallback_mm =
                 physical_size_mm_from_pixels(Size::<i32, Physical>::from((w as i32, h as i32)));
@@ -3281,15 +4189,6 @@ fn device_added(
                 .map(|(mm_w, mm_h)| (mm_w as i32, mm_h as i32))
                 .unwrap_or(fallback_mm);
 
-            let edid = connector_edid(drm_output_manager.device(), *conn);
-            let hdr_support = hdr_detection::connector_hdr_support(
-                drm_output_manager.device(),
-                *conn,
-                edid.as_deref(),
-            );
-            hdr_detection::log_hdr_support(&output_name, &hdr_support);
-            let hdr_requested_config =
-                configured_display_hdr_requested(&configured_displays, &output_name);
             let edid_identity = edid.as_deref().and_then(parse_edid_identity);
             let make = edid_identity
                 .as_ref()
@@ -3455,9 +4354,33 @@ fn device_added(
                 ten_bit_scanout_active,
                 gpu_vendor_id,
             );
-            flog(&format!(
-                "HDR render capability: output={output_name} supported={hdr_render_supported} ten_bit_scanout={ten_bit_scanout_active}"
-            ));
+            if exclusive_hdr_output.as_deref() == Some(output_name.as_str())
+                && !hdr_render_supported
+            {
+                flog_warn!(
+                    "Exclusive HDR runtime probe failed on {output_name}; keeping all connected outputs active in SDR"
+                );
+                persist_exclusive_hdr_phase(
+                    ExclusiveHdrPhase::Failed,
+                    Some(&output_name),
+                    Some("HDR renderer or 10-bit runtime probe failed"),
+                );
+                exclusive_hdr_output = None;
+            }
+            let driver_allowed = hdr_driver_allows_output(gpu_vendor_id);
+            flog_warn!(
+                "HDR capability: output={output_name} operational={hdr_render_supported} metadata_property={} bt2020_colorspace={} max_bpc={:?} current_max_bpc={:?} driver_managed_bpc={} edid_hdr={} edid_type1={} edid_pq={} edid_metadata={} fp16_working={} pq_target={hdr_format:?} ten_bit_scanout={ten_bit_scanout_active} scanout_format={scanout_format:?} driver_allowed={driver_allowed}",
+                hdr_support.has_hdr_metadata_property,
+                hdr_support.has_bt2020_colorspace,
+                hdr_support.max_bpc,
+                hdr_support.current_max_bpc,
+                hdr_support.max_bpc.is_none(),
+                hdr_support.edid_hdr_static_metadata,
+                hdr_support.edid_static_metadata_type1,
+                hdr_support.edid_pq,
+                hdr_support.edid_hdr_metadata.is_some(),
+                hdr_working_format.is_some(),
+            );
 
             //let offscreen = OffscreenOutput {
             //    size: tex_phys_size,
@@ -3505,34 +4428,110 @@ fn device_added(
                 data.core.state.primary_output = output_id;
             }
 
-            surfaces.insert(
-                crtc,
-                DrmSurfaceState {
-                    connector: *conn,
-                    output,
-                    mode: wl_mode,
-                    size: Size::<i32, Physical>::from((w as i32, h as i32)),
-                    output_id: output_id,
-                    origin,
-                    present_render_id: Id::new(),
-                    present_damage: DamageBag::default(),
-                    render_targets: LinearOffscreenTargets {
-                        linear_supported: linear_sdr_supported,
-                        hdr_supported: hdr_offscreen_supported,
-                        hdr_format,
-                        ..LinearOffscreenTargets::default()
-                    },
-                    hdr_support,
-                    hdr_metadata_blob: None,
-                    hdr_enabled_applied: false,
-                    hdr_transition_target: None,
-                    hdr_render_supported,
-                    frame_queued_at: None,
-                    hdr_commit_deadline: None,
-                    hdr_dual_block_logged: false,
-                    drm_output,
+            let mut surface = DrmSurfaceState {
+                connector: *conn,
+                output,
+                mode: wl_mode,
+                size: Size::<i32, Physical>::from((w as i32, h as i32)),
+                output_id,
+                origin,
+                present_render_id: Id::new(),
+                present_damage: DamageBag::default(),
+                render_targets: LinearOffscreenTargets {
+                    linear_supported: linear_sdr_supported,
+                    hdr_supported: hdr_offscreen_supported,
+                    hdr_format,
+                    ..LinearOffscreenTargets::default()
                 },
-            );
+                hdr_support,
+                hdr_metadata_blob: None,
+                hdr_enabled_applied: false,
+                hdr_transition_target: None,
+                hdr_initial_modeset_pending: false,
+                hdr_render_supported,
+                frame_queued_at: None,
+                stable_vblank_count: 0,
+                hdr_verify_vblank_count: 0,
+                hdr_verify_started_at: None,
+                hdr_commit_deadline: None,
+                hdr_dual_block_logged: false,
+                drm_output,
+            };
+
+            // Exclusive HDR is a startup topology, not a live toggle. Smithay
+            // has created the pending CRTC/mode/connector state above, but no
+            // real commit has occurred yet. Attach BT.2020 and the HDR10
+            // metadata now so the first PQ framebuffer, primary-plane format,
+            // mode, connector, and HDR properties are submitted atomically.
+            // Ordinary HDR requests deliberately continue through the
+            // baseline-SDR/live-transition path in the render loop.
+            if exclusive_hdr_output.as_deref() == Some(output_name.as_str())
+                && surface.hdr_render_supported
+            {
+                let initial_hdr = hdr_detection::hdr_kms::ensure_hdr_metadata_blob(
+                    drm_output_manager.device(),
+                    &surface.hdr_support,
+                    &mut surface.hdr_metadata_blob,
+                )
+                .and_then(|blob| {
+                    hdr_detection::hdr_kms::configure_smithay_hdr_state(
+                        &surface,
+                        drm_output_manager.device(),
+                        true,
+                        Some(blob),
+                    )
+                });
+
+                match initial_hdr {
+                    Ok(true) => {
+                        surface.hdr_transition_target = Some(true);
+                        surface.hdr_initial_modeset_pending = true;
+                        surface.hdr_commit_deadline = Some(Instant::now() + HDR_FRAME_TIMEOUT);
+                        if let Some(output) = data.core.state.outputs.get_mut(&output_id) {
+                            output.hdr_transition_target = Some(true);
+                        }
+                        data.core.state.mark_redraw();
+                        flog_warn!(
+                            "Exclusive HDR initial modeset armed on {output_name}: first scanout will be PQ with BT.2020 and HDR10 metadata"
+                        );
+                    }
+                    Ok(false) => {
+                        let reason =
+                            "HDR connector state could not be attached to the initial modeset";
+                        flog_warn!(
+                            "Exclusive HDR initial modeset failed on {output_name}: {reason}; restoring the ordinary SDR topology"
+                        );
+                        persist_exclusive_hdr_phase(
+                            ExclusiveHdrPhase::Failed,
+                            Some(&output_name),
+                            Some(reason),
+                        );
+                        exclusive_hdr_output = None;
+                        if let Some(output) = data.core.state.outputs.get_mut(&output_id) {
+                            output.hdr_requested = false;
+                            output.hdr_transition_target = None;
+                        }
+                    }
+                    Err(err) => {
+                        let reason = format!("HDR initial modeset setup failed: {err}");
+                        flog_warn!(
+                            "Exclusive HDR initial modeset failed on {output_name}: {err}; restoring the ordinary SDR topology"
+                        );
+                        persist_exclusive_hdr_phase(
+                            ExclusiveHdrPhase::Failed,
+                            Some(&output_name),
+                            Some(&reason),
+                        );
+                        exclusive_hdr_output = None;
+                        if let Some(output) = data.core.state.outputs.get_mut(&output_id) {
+                            output.hdr_requested = false;
+                            output.hdr_transition_target = None;
+                        }
+                    }
+                }
+            }
+
+            surfaces.insert(crtc, surface);
             id += 1;
             next_x = next_x.max(origin.x + logical_size.w);
             flog("Output initialized (Wayland + DRM)");
@@ -3550,35 +4549,235 @@ fn device_added(
     let registration_token =
         loop_handle.insert_source(notifier, move |event, _, state| match event {
             DrmEvent::VBlank(crtc) => {
+                let mut recover_exclusive = false;
                 if let Some(device) = state.backend.devices.get_mut(&node) {
-                    if let Some(surface) = device.surfaces.get_mut(&crtc) {
-                        if let Err(err) = surface.drm_output.frame_submitted() {
+                    let exclusive_hdr_output = device.exclusive_hdr_output.clone();
+                    let DrmDeviceState {
+                        drm_output_manager,
+                        surfaces,
+                        ..
+                    } = device;
+                    if let Some(surface) = surfaces.get_mut(&crtc) {
+                        let submitted = surface.drm_output.frame_submitted();
+                        if let Err(err) = &submitted {
+                            surface.stable_vblank_count = 0;
                             flog(&format!(
                                 "frame_submitted failed on {:?}/{:?}: {}",
                                 node, crtc, err
                             ));
+                            if exclusive_hdr_output.as_deref()
+                                == Some(surface.output.name().as_str())
+                                && surface.hdr_enabled_applied
+                            {
+                                persist_exclusive_hdr_phase(
+                                    ExclusiveHdrPhase::Failed,
+                                    Some(surface.output.name().as_str()),
+                                    Some("frame submission failed during HDR verification"),
+                                );
+                                recover_exclusive = true;
+                            }
                         }
                         surface.frame_queued_at = None;
                         surface.hdr_commit_deadline = None;
                         if let Some(hdr_target) = surface.hdr_transition_target.take() {
-                            surface.hdr_enabled_applied = hdr_target;
-                            if let Some(output) =
-                                state.core.state.outputs.get_mut(&surface.output_id)
-                            {
-                                output.hdr_transition_target = None;
-                                output.hdr_kms_applied = hdr_target;
-                                output.hdr_enabled = crate::core::color::output_hdr_render_active(
-                                    output.hdr_requested,
-                                    output.hdr_supported,
-                                    output.hdr_kms_applied,
-                                );
+                            let initial_modeset = surface.hdr_initial_modeset_pending;
+                            surface.hdr_initial_modeset_pending = false;
+                            let validation = submitted.map_err(anyhow::Error::from).and_then(|_| {
+                                hdr_detection::hdr_kms::validate_connector_hdr_state(
+                                    drm_output_manager.device(),
+                                    surface.connector,
+                                    hdr_target,
+                                    surface.hdr_support.max_bpc.is_some(),
+                                )
+                            });
+                            match validation {
+                                Ok(snapshot) => {
+                                    surface.hdr_enabled_applied = hdr_target;
+                                    let verification_required = hdr_target
+                                        && exclusive_hdr_output.as_deref()
+                                            == Some(surface.output.name().as_str());
+                                    if verification_required {
+                                        surface.hdr_verify_vblank_count = 0;
+                                        surface.hdr_verify_started_at = Some(Instant::now());
+                                        persist_exclusive_hdr_phase(
+                                            ExclusiveHdrPhase::Verifying,
+                                            Some(surface.output.name().as_str()),
+                                            None,
+                                        );
+                                        state
+                                            .core
+                                            .state
+                                            .notify_runtime_display_status_changes();
+                                    } else {
+                                        surface.hdr_verify_vblank_count = 0;
+                                        surface.hdr_verify_started_at = None;
+                                    }
+                                    if let Some(output) =
+                                        state.core.state.outputs.get_mut(&surface.output_id)
+                                    {
+                                        output.hdr_transition_target = None;
+                                        output.hdr_kms_applied = hdr_target;
+                                        let render_active =
+                                            crate::core::color::output_hdr_render_active(
+                                                output.hdr_requested,
+                                                output.hdr_supported,
+                                                output.hdr_kms_applied,
+                                            );
+                                        output.hdr_verification_pending = verification_required;
+                                        output.hdr_enabled = hdr_active_status_verified(
+                                            render_active,
+                                            verification_required,
+                                            !verification_required,
+                                        );
+                                    }
+                                    crate::core::wayland::color_management_protocol::notify_preferred_color_changed(
+                                        &mut state.core.state,
+                                    );
+                                    flog_warn!(
+                                        "HDR KMS {} validated on {}: active={hdr_target} properties={snapshot:?}",
+                                        if initial_modeset {
+                                            "initial modeset"
+                                        } else {
+                                            "live transition"
+                                        },
+                                        surface.output.name(),
+                                    );
+                                    if !hdr_target
+                                        && exclusive_hdr_output.as_deref()
+                                            == Some(surface.output.name().as_str())
+                                        && load_exclusive_hdr_state().phase
+                                            == ExclusiveHdrPhase::Failed
+                                    {
+                                        recover_exclusive = true;
+                                    }
+                                    if verification_required {
+                                        // A scheduler wakeup without scene damage can be
+                                        // coalesced by the retained renderer, leaving no frame
+                                        // to submit and therefore no vblank to count. Force a
+                                        // real scanout frame throughout the bounded verification
+                                        // window.
+                                        state.core.state.mark_output_full_damage(
+                                            surface.output_id,
+                                            DamageSource::Unknown,
+                                        );
+                                    }
+                                }
+                                Err(err) => {
+                                    // Treat a partial or unverifiable property
+                                    // application as unsafe. Mark the internal
+                                    // state active solely to force an SDR reset
+                                    // transaction on the next frame; userspace
+                                    // rendering remains SDR throughout rollback.
+                                    flog_warn!(
+                                        "HDR KMS transition validation failed on {}: {err}; disabling HDR and staging SDR rollback",
+                                        surface.output.name()
+                                    );
+                                    disable_persisted_hdr_request(&surface.output.name());
+                                    if exclusive_hdr_output.as_deref()
+                                        == Some(surface.output.name().as_str())
+                                    {
+                                        persist_exclusive_hdr_phase(
+                                            ExclusiveHdrPhase::Failed,
+                                            Some(surface.output.name().as_str()),
+                                            Some(&format!(
+                                                "HDR connector readback failed: {err}"
+                                            )),
+                                        );
+                                        recover_exclusive = true;
+                                    }
+                                    surface.hdr_enabled_applied = true;
+                                    if let Some(output) =
+                                        state.core.state.outputs.get_mut(&surface.output_id)
+                                    {
+                                        output.hdr_requested = false;
+                                        output.hdr_transition_target = None;
+                                        output.hdr_kms_applied = false;
+                                        output.hdr_verification_pending = false;
+                                        output.hdr_enabled = false;
+                                    }
+                                    state.core.state.mark_redraw();
+                                }
                             }
-                            flog_warn!(
-                                "HDR KMS transition confirmed on {}: active={hdr_target}",
-                                surface.output.name()
-                            );
+                        } else if submitted.is_ok() {
+                            let baseline_was_still_warming =
+                                surface.stable_vblank_count < HDR_MIN_STABLE_VBLANKS;
+                            surface.stable_vblank_count = surface
+                                .stable_vblank_count
+                                .saturating_add(1)
+                                .min(HDR_MIN_STABLE_VBLANKS);
+                            if baseline_was_still_warming {
+                                state.core.state.mark_redraw();
+                            }
+
+                            let now = Instant::now();
+                            let verifying = surface.hdr_enabled_applied
+                                && exclusive_hdr_output.as_deref()
+                                    == Some(surface.output.name().as_str())
+                                && surface.hdr_verify_started_at.is_some();
+                            if verifying {
+                                surface.hdr_verify_vblank_count =
+                                    surface.hdr_verify_vblank_count.saturating_add(1);
+                                if surface.hdr_verify_vblank_count % 60 == 0 {
+                                    flog_warn!(
+                                        "Exclusive HDR verification progress on {}: {}/{} successful PQ vblanks",
+                                        surface.output.name(),
+                                        surface.hdr_verify_vblank_count,
+                                        HDR_VERIFY_VBLANKS
+                                    );
+                                }
+                                let verification_complete = hdr_verification_complete(
+                                    surface.hdr_verify_vblank_count,
+                                    surface.hdr_verify_started_at,
+                                    now,
+                                );
+                                if verification_complete {
+                                    // `Some` is the authoritative in-progress marker. Clear it
+                                    // only from the vblank callback that proves the final PQ
+                                    // frame was actually presented; a wall-clock check in the
+                                    // render loop must not stop one frame too early.
+                                    surface.hdr_verify_started_at = None;
+                                    if let Some(output) =
+                                        state.core.state.outputs.get_mut(&surface.output_id)
+                                    {
+                                        let render_active =
+                                            crate::core::color::output_hdr_render_active(
+                                                output.hdr_requested,
+                                                output.hdr_supported,
+                                                output.hdr_kms_applied,
+                                            );
+                                        output.hdr_verification_pending = false;
+                                        output.hdr_enabled =
+                                            hdr_active_status_verified(render_active, true, true);
+                                    }
+                                    persist_exclusive_hdr_phase(
+                                        ExclusiveHdrPhase::Active,
+                                        Some(surface.output.name().as_str()),
+                                        None,
+                                    );
+                                    crate::core::wayland::color_management_protocol::notify_preferred_color_changed(
+                                        &mut state.core.state,
+                                    );
+                                    state.core.state.notify_runtime_display_status_changes();
+                                    flog_warn!(
+                                        "Exclusive HDR verified active on {} after at least {:?} and {} successful PQ vblanks",
+                                        surface.output.name(),
+                                        HDR_VERIFY_DURATION,
+                                        HDR_VERIFY_VBLANKS
+                                    );
+                                } else {
+                                    state.core.state.mark_output_full_damage(
+                                        surface.output_id,
+                                        DamageSource::Unknown,
+                                    );
+                                }
+                            }
                         }
                     }
+                }
+                if recover_exclusive
+                    && !state.exclusive_hdr_recovery_nodes.contains(&node)
+                {
+                    state.exclusive_hdr_recovery_nodes.push(node);
                 }
             }
             DrmEvent::Error(err) => {
@@ -3605,6 +4804,7 @@ fn device_added(
         gbm: gbm.clone(),
         drm_output_manager,
         surfaces,
+        exclusive_hdr_output,
     };
 
     let displays = collect_display_configs(&temp_device, &data.core, &configured_displays);

@@ -10,7 +10,6 @@ use focaldesk_network::model::{Connectivity, NetworkIcon as NetIcon, NetworkStat
 
 const SIDEBAR_BASE: u32 = 1_000;
 const CLOCK_ID: u32 = 100_000;
-pub const TOPBAR_FLOW_FIELD_ID: u32 = 100_001;
 pub const TOPBAR_AI_BUTTON_ID: u32 = 100_002;
 pub const SIDEBAR_SETTINGS_ID: u32 = SIDEBAR_BASE + 1;
 pub const SIDEBAR_ADD_WORKSPACE_ID: u32 = SIDEBAR_BASE + 3;
@@ -498,14 +497,6 @@ pub fn build_ui_for_output_with_options(
 ) {
     ui.elements.clear();
 
-    let (flow_selected, flow_active, flow_enabled) = match options.ai_flow_mode {
-        AiFlowMode::Idle => (false, false, true),
-        AiFlowMode::Thinking => (true, false, true),
-        AiFlowMode::Acting => (false, true, true),
-        AiFlowMode::PermissionWait => (true, true, true),
-        AiFlowMode::Error => (false, false, false),
-    };
-
     let sidebar_entries = options
         .sidebar_items
         .clone()
@@ -514,7 +505,6 @@ pub fn build_ui_for_output_with_options(
     ui.elements
         .extend(Dock::layout_items(layout, sidebar_entries));
 
-    let flow_mode = options.ai_flow_mode;
     let mut ai_button = UiElement::new(
         TOPBAR_AI_BUTTON_ID,
         UiRect::default(),
@@ -529,30 +519,6 @@ pub fn build_ui_for_output_with_options(
     ai_button.tooltip = Some("Open AI Console".into());
     ai_button.bounds = layout.topbar.ai_button.into();
     ui.elements.push(ai_button);
-
-    let mut flow_field = UiElement::new(
-        TOPBAR_FLOW_FIELD_ID,
-        UiRect::default(),
-        UiElementKind::TopbarFlowField,
-        None,
-        None,
-    );
-    flow_field.kind = UiElementKind::TopbarFlowField;
-    flow_field.tooltip = Some(flow_mode.description().into());
-    flow_field.label = Some(flow_mode.label().into());
-    flow_field.accessible = Some(
-        AccessibleInfo::new(AccessibleRole::Status, "FocalDesk AI activity")
-            .description(flow_mode.description())
-            .value_text(flow_mode.label())
-            .live(true),
-    );
-    flow_field.bounds = layout.topbar.flow_field.into();
-    flow_field.hover_scale = 1.0;
-    flow_field.press_scale = 1.0;
-    flow_field.selected = flow_selected;
-    flow_field.active = flow_active;
-    flow_field.enabled = flow_enabled;
-    ui.elements.push(flow_field);
 
     let status_items = options
         .status_items
@@ -595,11 +561,10 @@ mod tests {
     use crate::atlas::IconId;
     use crate::element::{ChromeItem, UiElement};
     use crate::ui_builder::{
-        AiFlowMode, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID,
-        SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID,
-        TOPBAR_FLOW_FIELD_ID, UiAction, UiBuildOptions, VoiceCaptureStatus,
-        build_ui_for_output_with_options, default_status_items, sidebar_workspace_id,
-        sidebar_workspace_number,
+        SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID,
+        SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID, UiAction,
+        UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options, default_status_items,
+        sidebar_workspace_id, sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
 
@@ -854,8 +819,8 @@ mod tests {
     }
 
     #[test]
-    fn bot_button_launches_console_while_flow_field_is_status_only() {
-        let (button, flow_field) = build_ai_cluster();
+    fn bot_button_launches_console() {
+        let button = build_ai_button();
         assert!(matches!(
             button.action.as_ref(),
             Some(UiAction::LaunchApp(command)) if command == "focaldesk-ai-console"
@@ -863,62 +828,7 @@ mod tests {
         assert_eq!(button.icon, Some(IconId::AiConsole));
         assert_eq!(button.kind, crate::types::UiElementKind::TopbarButton);
         assert!(button.is_accessibility_focusable());
-        assert!(flow_field.action.is_none());
-        assert_eq!(flow_field.icon, None);
-        assert_eq!(
-            flow_field.kind,
-            crate::types::UiElementKind::TopbarFlowField
-        );
-        assert!(!flow_field.is_accessibility_focusable());
-        assert_eq!(flow_field.label.as_deref(), Some("AI ready"));
-        assert_eq!(flow_field.tooltip.as_deref(), Some("AI ready"));
         assert_eq!(button.bounds.w, button.bounds.h);
-        assert!(button.bounds.x + button.bounds.w < flow_field.bounds.x);
-        assert_eq!(
-            flow_field
-                .accessible
-                .as_ref()
-                .and_then(|info| info.value_text.as_deref()),
-            Some("AI ready")
-        );
-        assert!(flow_field.accessible.as_ref().is_some_and(|info| info.live));
-    }
-
-    #[test]
-    fn flow_field_exposes_plain_language_copy_for_every_ai_state() {
-        let cases = [
-            (AiFlowMode::Idle, "AI ready"),
-            (AiFlowMode::Thinking, "Thinking"),
-            (AiFlowMode::Acting, "Working"),
-            (AiFlowMode::PermissionWait, "Approval needed"),
-            (AiFlowMode::Error, "AI unavailable"),
-        ];
-
-        for (mode, expected) in cases {
-            let output_size = smithay::utils::Size::from((1920, 1080));
-            let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
-            let mut ui = UiTree::default();
-            build_ui_for_output_with_options(
-                &mut ui,
-                &layout,
-                UiBuildOptions {
-                    ai_flow_mode: mode,
-                    ..UiBuildOptions::default()
-                },
-            );
-            let flow = ui
-                .elements
-                .iter()
-                .find(|element| element.id == TOPBAR_FLOW_FIELD_ID)
-                .expect("flow field");
-            assert_eq!(flow.label.as_deref(), Some(expected));
-            assert_eq!(
-                flow.accessible
-                    .as_ref()
-                    .and_then(|info| info.value_text.as_deref()),
-                Some(expected)
-            );
-        }
     }
 
     #[test]
@@ -1034,23 +944,15 @@ mod tests {
         assert!(active_camera.active);
     }
 
-    fn build_ai_cluster() -> (UiElement, UiElement) {
+    fn build_ai_button() -> UiElement {
         let output_size = smithay::utils::Size::from((1920, 1080));
         let layout = crate::chrome_layout::build_chrome_layout(output_size, 64, 76);
         let mut ui = UiTree::default();
         build_ui_for_output_with_options(&mut ui, &layout, UiBuildOptions::default());
-        let button = ui
-            .elements
+        ui.elements
             .iter()
             .find(|el| el.id == TOPBAR_AI_BUTTON_ID)
             .cloned()
-            .expect("AI Console button");
-        let flow_field = ui
-            .elements
-            .iter()
-            .find(|el| el.id == TOPBAR_FLOW_FIELD_ID)
-            .cloned()
-            .expect("flow field");
-        (button, flow_field)
+            .expect("AI Console button")
     }
 }
