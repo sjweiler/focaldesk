@@ -938,6 +938,8 @@ pub struct DesktopState {
     idle_suspend_triggered: bool,
     unattended_suspend_state: Option<UnattendedSuspendState>,
     deferred_power_action: Option<(PowerIpcRequest, &'static str)>,
+    pending_hdr_safe_action: Option<HdrSafeSessionAction>,
+    hdr_outputs_to_restore_after_resume: Vec<OutputId>,
     low_battery_triggered: bool,
     lid_close_triggered: bool,
     last_lid_state: Option<bool>,
@@ -1065,6 +1067,17 @@ pub struct DesktopState {
 enum PowerActionInteraction {
     Interactive,
     NonInteractive,
+}
+
+#[derive(Debug)]
+enum HdrSafeSessionAction {
+    Logout,
+    Power {
+        action: PowerIpcRequest,
+        context: &'static str,
+        interaction: PowerActionInteraction,
+        restore_after_resume: Vec<OutputId>,
+    },
 }
 
 #[derive(Clone)]
@@ -1427,7 +1440,11 @@ impl DesktopState {
             if pulse.kind == LockPulseKind::Accepted && elapsed >= LOCK_PULSE_DURATION {
                 self.lock_screen.unlock();
                 if let Some((action, context)) = self.deferred_power_action.take() {
-                    power_service_command(action, context, PowerActionInteraction::Interactive);
+                    self.request_hdr_safe_power_action(
+                        action,
+                        context,
+                        PowerActionInteraction::Interactive,
+                    );
                 }
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 return;
@@ -1627,6 +1644,11 @@ impl DesktopState {
         // Force a fresh battery/AC snapshot on the next timer pass after wake.
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
         self.render.invalidate_gpu_state();
+        for output_id in self.hdr_outputs_to_restore_after_resume.drain(..) {
+            if let Some(output) = self.outputs.get_mut(&output_id) {
+                output.hdr_requested = output.hdr_supported;
+            }
+        }
         for output in self.desktop_outputs.values_mut() {
             output.egui.invalidate_gpu_state();
             output.egui.refresh_power_status_now();
@@ -2158,7 +2180,7 @@ impl DesktopState {
                 ));
             }
             DesktopAction::Logout => {
-                self.running = false;
+                self.request_hdr_safe_logout();
             }
         }
         Ok(())
@@ -4551,7 +4573,7 @@ impl DesktopState {
                 if self.privacy.clear_notification_history_on_logout {
                     let _ = send_notification_request(&NotificationIpcRequest::ClearHistory);
                 }
-                self.running = false;
+                self.request_hdr_safe_logout();
             }
             focaldesk_ui::types::SystemCommand::Restart => {
                 self.dispatch_power_action(
@@ -4636,7 +4658,7 @@ impl DesktopState {
         // logind will perform them if already authorized and reject them
         // otherwise, leaving the configured policy as the source of authority.
         if interaction == PowerActionInteraction::NonInteractive {
-            power_service_command(action, context, interaction);
+            self.request_hdr_safe_power_action(action, context, interaction);
             return;
         }
 
@@ -4669,7 +4691,90 @@ impl DesktopState {
             }
         }
 
-        power_service_command(action, context, interaction);
+        self.request_hdr_safe_power_action(action, context, interaction);
+    }
+
+    fn hdr_rollback_needed(&self) -> bool {
+        self.outputs
+            .values()
+            .any(|output| output.hdr_kms_applied || output.hdr_transition_target == Some(true))
+    }
+
+    fn begin_hdr_rollback(&mut self) {
+        for output in self.outputs.values_mut() {
+            output.hdr_requested = false;
+            output.hdr_verification_pending = false;
+            output.hdr_enabled = false;
+        }
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        self.mark_redraw();
+    }
+
+    fn request_hdr_safe_logout(&mut self) {
+        if !self.hdr_rollback_needed() {
+            self.running = false;
+            return;
+        }
+        self.pending_hdr_safe_action = Some(HdrSafeSessionAction::Logout);
+        self.begin_hdr_rollback();
+        flog_warn!("HDR is active; deferring logout until SDR scanout is confirmed");
+    }
+
+    fn request_hdr_safe_power_action(
+        &mut self,
+        action: PowerIpcRequest,
+        context: &'static str,
+        interaction: PowerActionInteraction,
+    ) {
+        if !self.hdr_rollback_needed() {
+            power_service_command(action, context, interaction);
+            return;
+        }
+        let restore_after_resume = if matches!(
+            action,
+            PowerIpcRequest::Suspend | PowerIpcRequest::Hibernate
+        ) {
+            self.outputs
+                .iter()
+                .filter_map(|(id, output)| output.hdr_requested.then_some(*id))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.pending_hdr_safe_action = Some(HdrSafeSessionAction::Power {
+            action,
+            context,
+            interaction,
+            restore_after_resume,
+        });
+        self.begin_hdr_rollback();
+        flog_warn!("HDR is active; deferring {context} until SDR scanout is confirmed");
+    }
+
+    /// Complete a session action only after the DRM vblank callback has
+    /// confirmed that no connector remains in HDR or in a KMS transition.
+    pub(crate) fn process_hdr_safe_session_action(&mut self) {
+        if self.pending_hdr_safe_action.is_none()
+            || self
+                .outputs
+                .values()
+                .any(|output| output.hdr_kms_applied || output.hdr_transition_target.is_some())
+        {
+            return;
+        }
+
+        match self.pending_hdr_safe_action.take().unwrap() {
+            HdrSafeSessionAction::Logout => self.running = false,
+            HdrSafeSessionAction::Power {
+                action,
+                context,
+                interaction,
+                restore_after_resume,
+            } => {
+                self.hdr_outputs_to_restore_after_resume = restore_after_resume;
+                power_service_command(action, context, interaction);
+            }
+        }
     }
 
     fn submit_lock_password(&mut self) {
@@ -6244,6 +6349,8 @@ impl DesktopState {
             idle_suspend_triggered: false,
             unattended_suspend_state: None,
             deferred_power_action: None,
+            pending_hdr_safe_action: None,
+            hdr_outputs_to_restore_after_resume: Vec::new(),
             low_battery_triggered: false,
             lid_close_triggered: false,
             last_lid_state: None,
@@ -8722,13 +8829,26 @@ impl DesktopState {
         output_id: focaldesk_types::OutputId,
         override_profile: DisplayColorProfile,
     ) {
+        let (base_description, icc_profile) = self
+            .outputs
+            .get(&output_id)
+            .map(|output| (output.base_color_description, output.icc_profile.clone()))
+            .unwrap_or((ColorDescription::SRGB, None));
+        let effective_description = crate::core::color::apply_output_color_profile_override(
+            base_description,
+            override_profile,
+        );
+        let output_lut = icc_profile.as_deref().and_then(|bytes| {
+            crate::core::icc_lut::build_output_to_device_lut(bytes, effective_description).ok()
+        });
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.color_profile_override = override_profile;
-            output.color_description = crate::core::color::apply_output_color_profile_override(
-                output.base_color_description,
-                override_profile,
-            );
+            output.color_description = effective_description;
+            output.output_icc_lut = output_lut;
+            output.icc_lut_fallback_active = false;
         }
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        self.mark_redraw();
         self.notify_runtime_display_status_changes();
         crate::core::wayland::color_management_protocol::note_output_color_resolved(
             self, output_id,
@@ -9547,7 +9667,7 @@ fn focaldesk_ai_console_command() -> String {
         .unwrap_or_else(|| "focaldesk-ai-console".to_string())
 }
 
-fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
+fn chrome_command_args(use_x11: bool, _hdr_output_active: bool) -> Vec<String> {
     let profile = chrome_profile_dir();
     let ozone_platform = if use_x11 { "x11" } else { "wayland" };
     let mut args = vec![
@@ -9559,9 +9679,10 @@ fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
         "--no-default-browser-check".to_string(),
         "--new-window".to_string(),
     ];
-    if !hdr_output_active {
-        args.insert(2, "--force-color-profile=display-p3-d65".to_string());
-    }
+    // Chrome's forced HDR10 raster path flattens P3 web content on Wayland.
+    // Preserve a tagged P3 client buffer and let the compositor encode the
+    // FP16 scene into BT.2020/PQ when the output itself is HDR10.
+    args.insert(2, "--force-color-profile=display-p3-d65".to_string());
     args
 }
 
@@ -10028,11 +10149,12 @@ mod tests {
     }
 
     #[test]
-    fn chromium_hdr_follows_wayland_preferred_color_description() {
+    fn chromium_hdr_preserves_display_p3_raster_gamut() {
         let args = chrome_command_args(false, true);
-        assert!(!args
+        assert!(args
             .iter()
             .any(|arg| arg == "--force-color-profile=display-p3-d65"));
+        assert!(!args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
     }
 
     #[test]

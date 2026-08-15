@@ -48,7 +48,7 @@ pub fn chrome_hdr_mode_active(
 pub fn chrome_command_args(
     use_x11: bool,
     profile_dir: &str,
-    hdr_output_active: bool,
+    _hdr_output_active: bool,
 ) -> Vec<String> {
     let ozone = if use_x11 { "x11" } else { "wayland" };
 
@@ -67,22 +67,13 @@ pub fn chrome_command_args(
         "--new-window".into(),
     ];
 
-    if hdr_output_active {
-        // Chromium's automatic Wayland output selection can allocate a
-        // BT.2020/PQ surface while retaining an SDR raster target. That makes
-        // CSS/ICC wide-gamut content collapse before FocalDesk receives the
-        // buffer and also leaves SDR video on a less consistent HDR mapping
-        // path. Use Chromium's native HDR10 profile so raster, video, and the
-        // wp_color surface description agree on BT.2020/PQ.
-        args.insert(2, "--force-color-profile=hdr10".into());
-    } else {
-        // Keep Chromium's SDR raster target wide-gamut. On Linux/Wayland
-        // Chromium can negotiate a P3 surface while still flattening ICC-tagged
-        // images through an sRGB raster target, which makes the wide-gamut.com
-        // W test disappear. FocalDesk consumes the tagged P3 buffer and applies
-        // the final per-output conversion.
-        args.insert(2, "--force-color-profile=display-p3-d65".into());
-    }
+    // Keep Chromium's raster target in Display P3 in both SDR and HDR output
+    // modes. Chromium's forced `hdr10` Linux/Wayland raster path advertises a
+    // BT.2020/PQ surface but flattens ICC/CSS P3 content before submitting the
+    // buffer (the wide-gamut.com W test disappears). FocalDesk already decodes
+    // tagged P3 clients into its FP16 scene and performs the final P3 -> output
+    // conversion, including BT.2020/PQ encode on an HDR10 connector.
+    args.insert(2, "--force-color-profile=display-p3-d65".into());
 
     args
 }
@@ -106,14 +97,13 @@ mod tests {
     }
 
     #[test]
-    fn chrome_hdr_launch_uses_hdr10_raster_profile() {
+    fn chrome_hdr_launch_preserves_display_p3_raster_gamut() {
         let args = chrome_command_args(false, "/tmp/focaldesk-chrome-test", true);
         assert!(
-            !args
-                .iter()
+            args.iter()
                 .any(|arg| arg == "--force-color-profile=display-p3-d65")
         );
-        assert!(args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
+        assert!(!args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
         assert!(
             args.iter()
                 .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1")

@@ -1506,6 +1506,8 @@ mod tests {
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("vec4((graded - base) * alpha, 0.0)"));
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("target_level(280.0)"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight = cyan * isolated"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight * 0.72"));
         assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("base + vec3"));
     }
 
@@ -2374,6 +2376,11 @@ void main() {
         float logo_white = logo_band * neutral * smoothstep(0.20, 0.72, y);
         float star = (1.0 - logo_band) * (1.0 - rim) * isolated
             * smoothstep(0.035, 0.48, y);
+        // The authored cyan artwork shares its hue with broad regions of the
+        // blue space gradient. Requiring local isolation keeps that diffuse
+        // background at its SDR luminance while still promoting cyan stars,
+        // strokes, and other compact details into HDR headroom.
+        float cyan_highlight = cyan * isolated;
 
         float star_nits = mix(80.0, 800.0, smoothstep(0.05, 0.85, y));
         float rim_nits = mix(600.0, 1000.0, smoothstep(0.18, 0.82, y));
@@ -2385,7 +2392,7 @@ void main() {
         highlighted = raise_to_luminance(graded, target_level(rim_nits));
         graded = mix(graded, highlighted, rim);
         highlighted = raise_to_luminance(graded, target_level(cyan_nits));
-        graded = mix(graded, highlighted, cyan * 0.72);
+        graded = mix(graded, highlighted, cyan_highlight * 0.72);
         highlighted = raise_to_luminance(graded, target_level(orange_nits));
         graded = mix(graded, highlighted, orange * isolated * 0.72);
 

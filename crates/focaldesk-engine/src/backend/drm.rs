@@ -357,10 +357,11 @@ const HDR_MIN_STABLE_VBLANKS: u8 = 3;
 /// minimum supported refresh before exposing the output as verified-active.
 const HDR_VERIFY_VBLANKS: u16 = 300;
 const HDR_VERIFY_DURATION: Duration = Duration::from_secs(5);
-/// Conservative default for HDR links. High-refresh modes can fit at 8 bpc but
-/// exceed the same connector's payload budget once the driver switches to a
-/// 10-bpc link. Prefer the native-resolution mode at or below this limit.
-const HDR_SAFE_MAX_REFRESH_HZ: u32 = 120;
+/// Keep SDR and HDR on the same conservative timing. High-refresh modes can fit
+/// at 8 bpc but exceed the same connector's payload budget once the driver
+/// switches to a 10-bpc link. Prefer the native-resolution mode at or below
+/// this limit so an HDR transition does not also require a refresh-rate change.
+const OUTPUT_MAX_REFRESH_HZ: u32 = 120;
 /// Bound any queued DRM frame, not only HDR property transitions. A connector
 /// disappearing between commit and vblank otherwise leaves the CRTC skipped forever.
 const DRM_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
@@ -408,41 +409,37 @@ struct DrmModeCandidate {
     preferred: bool,
 }
 
-fn select_drm_mode_index(candidates: &[DrmModeCandidate], hdr_requested: bool) -> Option<usize> {
+fn select_drm_mode_index(candidates: &[DrmModeCandidate]) -> Option<usize> {
     let default_index = candidates
         .iter()
         .position(|candidate| candidate.preferred)
         .or((!candidates.is_empty()).then_some(0))?;
-    if !hdr_requested {
-        return Some(default_index);
-    }
 
     let default = candidates[default_index];
-    let within_hdr_limit = |candidate: &&DrmModeCandidate| {
-        (1..=HDR_SAFE_MAX_REFRESH_HZ).contains(&candidate.refresh_hz)
-    };
+    let within_refresh_limit =
+        |candidate: &&DrmModeCandidate| (1..=OUTPUT_MAX_REFRESH_HZ).contains(&candidate.refresh_hz);
 
-    // Preserve the preferred/native resolution and select its fastest safe
-    // refresh. Nearly every HDR display advertises 60 Hz, with gaming displays
-    // commonly also advertising 100 or 120 Hz.
+    // Preserve the preferred/native resolution and select its fastest timing
+    // within the shared SDR/HDR limit. Nearly every display advertises 60 Hz,
+    // with gaming displays commonly also advertising 100 or 120 Hz.
     candidates
         .iter()
         .enumerate()
         .filter(|(_, candidate)| {
             candidate.width == default.width
                 && candidate.height == default.height
-                && within_hdr_limit(candidate)
+                && within_refresh_limit(candidate)
         })
         .max_by_key(|(_, candidate)| candidate.refresh_hz)
         .map(|(index, _)| index)
         // If the preferred resolution has no safe timing, retain the largest
         // advertised resolution that does rather than silently exceeding the
-        // HDR refresh ceiling.
+        // shared refresh ceiling.
         .or_else(|| {
             candidates
                 .iter()
                 .enumerate()
-                .filter(|(_, candidate)| within_hdr_limit(candidate))
+                .filter(|(_, candidate)| within_refresh_limit(candidate))
                 .max_by_key(|(_, candidate)| {
                     (
                         u32::from(candidate.width) * u32::from(candidate.height),
@@ -454,7 +451,7 @@ fn select_drm_mode_index(candidates: &[DrmModeCandidate], hdr_requested: bool) -
         .or(Some(default_index))
 }
 
-fn select_connector_mode(modes: &[Mode], hdr_requested: bool) -> Option<Mode> {
+fn select_connector_mode(modes: &[Mode]) -> Option<Mode> {
     let candidates: Vec<_> = modes
         .iter()
         .map(|mode| {
@@ -469,7 +466,7 @@ fn select_connector_mode(modes: &[Mode], hdr_requested: bool) -> Option<Mode> {
             }
         })
         .collect();
-    select_drm_mode_index(&candidates, hdr_requested).map(|index| modes[index])
+    select_drm_mode_index(&candidates).map(|index| modes[index])
 }
 
 fn select_exclusive_hdr_target(
@@ -1113,15 +1110,7 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
             return Ok(true);
         };
 
-        let hdr_mode_requested = device
-            .exclusive_hdr_output
-            .as_deref()
-            .is_some_and(|selected| selected == output_name)
-            || state
-                .outputs
-                .get(&surface.output_id)
-                .is_some_and(|output| output.hdr_requested && output.hdr_supported);
-        let selected_mode = select_connector_mode(info.modes(), hdr_mode_requested);
+        let selected_mode = select_connector_mode(info.modes());
         if selected_mode.as_ref().is_none_or(|mode| {
             let (width, height) = mode.size();
             surface.mode.size != Size::from((i32::from(width), i32::from(height)))
@@ -1260,7 +1249,7 @@ fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
 }
 
 /// Live KMS HDR application is compiled in but remains runtime opt-in. NVIDIA also
-/// requires FOCALDESK_HDR_ALLOW_NVIDIA=1 because dual-head commits have frozen before.
+/// requires explicit driver and topology overrides because earlier commits froze.
 const HDR_LIVE_KMS_APPLY_ENABLED: bool = true;
 
 /// Live scanout/connector HDR changes honor the settings toggle. Set `FOCALDESK_HDR=0` to block.
@@ -1282,20 +1271,35 @@ fn hdr_driver_allows_output_with_override(gpu_vendor_id: Option<u32>, allow_nvid
     gpu_vendor_id != Some(PCI_VENDOR_NVIDIA) || allow_nvidia
 }
 
-/// NVIDIA HDR remains blocked for normal/multi-output topologies. The explicit
-/// driver override is honored only after exclusive mode has reduced KMS to one
-/// validated connector and armed crash-safe persistent recovery.
+fn nvidia_dual_head_hdr_allowed() -> bool {
+    matches!(
+        std::env::var("FOCALDESK_HDR_NVIDIA_DUAL").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// NVIDIA HDR requires the driver override in every topology. Non-exclusive
+/// topologies additionally require an explicit dual-head override so ordinary
+/// sessions do not inherit the risk of live multi-output KMS changes.
 fn nvidia_kms_hdr_blocked(gpu_vendor_id: Option<u32>, exclusive_output: bool) -> bool {
-    let allow_nvidia = hdr_driver_allows_output(gpu_vendor_id);
-    nvidia_kms_hdr_blocked_with_override(gpu_vendor_id, exclusive_output, allow_nvidia)
+    let driver_allowed = hdr_driver_allows_output(gpu_vendor_id);
+    let dual_head_allowed = nvidia_dual_head_hdr_allowed();
+    nvidia_kms_hdr_blocked_with_override(
+        gpu_vendor_id,
+        exclusive_output,
+        driver_allowed,
+        dual_head_allowed,
+    )
 }
 
 fn nvidia_kms_hdr_blocked_with_override(
     gpu_vendor_id: Option<u32>,
     exclusive_output: bool,
     driver_allowed: bool,
+    dual_head_allowed: bool,
 ) -> bool {
-    gpu_vendor_id == Some(PCI_VENDOR_NVIDIA) && !(exclusive_output && driver_allowed)
+    gpu_vendor_id == Some(PCI_VENDOR_NVIDIA)
+        && (!driver_allowed || (!exclusive_output && !dual_head_allowed))
 }
 
 /// Sync `OutputState` HDR flags from EDID/KMS detection and persisted config.
@@ -1359,8 +1363,8 @@ mod hdr_tests {
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled, select_drm_mode_index,
         select_exclusive_hdr_target, DisplayConfig, DisplayTransform, DrmModeCandidate,
         EdidHdrMetadata, HdrBpcRange, HdrSupport, DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE,
-        HDR_FRAME_TIMEOUT, HDR_SAFE_MAX_REFRESH_HZ, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
-        HDR_VERIFY_VBLANKS, PCI_VENDOR_NVIDIA,
+        HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS,
+        OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::DisplayColorProfile;
     use std::time::{Duration, Instant};
@@ -1471,7 +1475,7 @@ mod hdr_tests {
     }
 
     #[test]
-    fn hdr_mode_selection_caps_native_resolution_at_120_hz() {
+    fn output_mode_selection_caps_native_resolution_at_120_hz() {
         let candidates = [
             DrmModeCandidate {
                 width: 2560,
@@ -1482,7 +1486,7 @@ mod hdr_tests {
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
-                refresh_hz: HDR_SAFE_MAX_REFRESH_HZ,
+                refresh_hz: OUTPUT_MAX_REFRESH_HZ,
                 preferred: false,
             },
             DrmModeCandidate {
@@ -1493,12 +1497,11 @@ mod hdr_tests {
             },
         ];
 
-        assert_eq!(select_drm_mode_index(&candidates, false), Some(0));
-        assert_eq!(select_drm_mode_index(&candidates, true), Some(1));
+        assert_eq!(select_drm_mode_index(&candidates), Some(1));
     }
 
     #[test]
-    fn hdr_mode_selection_never_chooses_faster_mode_when_safe_mode_exists() {
+    fn output_mode_selection_never_chooses_faster_mode_when_safe_mode_exists() {
         let candidates = [
             DrmModeCandidate {
                 width: 3840,
@@ -1520,30 +1523,40 @@ mod hdr_tests {
             },
         ];
 
-        assert_eq!(select_drm_mode_index(&candidates, true), Some(2));
+        assert_eq!(select_drm_mode_index(&candidates), Some(2));
     }
 
     #[test]
-    fn nvidia_hdr_override_is_limited_to_exclusive_mode() {
+    fn nvidia_hdr_requires_explicit_driver_and_topology_overrides() {
         assert!(nvidia_kms_hdr_blocked_with_override(
             Some(PCI_VENDOR_NVIDIA),
             false,
-            true
+            true,
+            false,
         ));
         assert!(nvidia_kms_hdr_blocked_with_override(
             Some(PCI_VENDOR_NVIDIA),
             true,
-            false
+            false,
+            true,
         ));
         assert!(!nvidia_kms_hdr_blocked_with_override(
             Some(PCI_VENDOR_NVIDIA),
             true,
-            true
+            true,
+            false,
+        ));
+        assert!(!nvidia_kms_hdr_blocked_with_override(
+            Some(PCI_VENDOR_NVIDIA),
+            false,
+            true,
+            true,
         ));
         assert!(!nvidia_kms_hdr_blocked_with_override(
             Some(0x1002),
             false,
-            false
+            false,
+            false,
         ));
     }
 
@@ -2928,6 +2941,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 flog_warn!("Failed to restore SDR output topology on {node:?}: {err}");
             }
         }
+        data.core.state.process_hdr_safe_session_action();
         data.core.state.process_deferred_ui_and_launches();
 
         if !data.session_active {
@@ -3212,7 +3226,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             if !surface.hdr_dual_block_logged {
                                 surface.hdr_dual_block_logged = true;
                                 flog_warn!(
-                                    "HDR KMS blocked on {}: NVIDIA requires an exclusive output plus FOCALDESK_HDR_ALLOW_NVIDIA=1",
+                                    "HDR KMS blocked on {}: NVIDIA requires FOCALDESK_HDR_ALLOW_NVIDIA=1 and non-exclusive topologies also require FOCALDESK_HDR_NVIDIA_DUAL=1",
                                     surface.output.name()
                                 );
                             }
@@ -4166,7 +4180,7 @@ fn device_added(
         let hdr_safe_mode_requested = hdr_requested_config
             && hdr_support.can_signal_hdr10()
             && hdr_support.bpc_control_allows_ten_bit();
-        let mode = select_connector_mode(info.modes(), hdr_safe_mode_requested);
+        let mode = select_connector_mode(info.modes());
 
         if let Some(mode) = mode {
             let (w, h) = mode.size();
@@ -4175,7 +4189,7 @@ fn device_added(
                 flog_warn!(
                     "HDR safe mode selected: output={output_name} mode={w}x{h}@{}Hz ceiling={}Hz",
                     mode.vrefresh(),
-                    HDR_SAFE_MAX_REFRESH_HZ,
+                    OUTPUT_MAX_REFRESH_HZ,
                 );
             } else {
                 flog(&format!("Selected mode: {}x{} @ {}", w, h, mode.vrefresh()));

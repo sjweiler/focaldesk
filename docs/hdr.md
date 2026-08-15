@@ -114,12 +114,33 @@ The longer-term goals are:
 - Future native HDR Wayland applications
 - Color-managed desktop rendering
 
-Live NVIDIA KMS HDR transitions remain blocked in normal and multi-output
-topologies because testing produced GPU Xid 56 faults, flip-event timeouts, and
-frozen scanout. Atomic commit success and connector-property readback did not
-reliably indicate that the display pipeline survived. The explicit
-`FOCALDESK_HDR_ALLOW_NVIDIA=1` override is honored only by the guarded exclusive
-single-output mode described below.
+Live NVIDIA KMS HDR transitions are guarded because earlier testing produced GPU
+Xid 56 faults, flip-event timeouts, and frozen scanout. Atomic commit success and
+connector-property readback did not reliably indicate that the display pipeline
+survived. NVIDIA always requires `FOCALDESK_HDR_ALLOW_NVIDIA=1`. Normal and
+multi-output topologies additionally require `FOCALDESK_HDR_NVIDIA_DUAL=1`;
+without both overrides, the compositor leaves the requested outputs in SDR.
+
+For a guarded NVIDIA multi-output test, configure both overrides in the session
+environment:
+
+```toml
+[session_environment]
+FOCALDESK_HDR_ALLOW_NVIDIA = "1"
+FOCALDESK_HDR_NVIDIA_DUAL = "1"
+```
+
+Do not set `FOCALDESK_EXCLUSIVE_HDR_OUTPUT` for this test. Remove
+`FOCALDESK_HDR_OUTPUT` as well to permit every HDR-requested connector, or set it
+to one exact connector to test one HDR output while the other outputs stay in
+SDR. The frame watchdog, connector-property validation, persisted request
+disable, and SDR rollback remain active.
+
+Display Settings also provides **Apply Requested HDR10** under **Experimental
+HDR10**. First enable **HDR output request** on each intended display, then use
+the red apply button. HDR10 is requested only on those enabled, capable outputs;
+every unrequested output remains active in SDR and the output topology is left
+unchanged.
 
 For a controlled multi-monitor test, enable HDR for the intended display in
 Display Settings and select its connector in the compositor environment. When
@@ -169,11 +190,11 @@ scanout formats. If either preflight fails, all connected outputs remain active
 and the exclusive selector prevents HDR from being attempted on a different
 connector.
 
-HDR-requested outputs use their preferred/native resolution at the fastest
-advertised refresh no greater than 120 Hz. This conservative default avoids
-selecting a high-refresh timing that fits at 8 bpc but exceeds the connector's
-payload budget when HDR requires a 10-bpc link. SDR outputs continue to use the
-ordinary EDID-preferred mode.
+All outputs use their preferred/native resolution at the fastest advertised
+refresh no greater than 120 Hz. Keeping the SDR and HDR timings identical avoids
+adding a refresh-rate modeset to HDR transitions, while the conservative ceiling
+also avoids selecting a timing that fits at 8 bpc but exceeds the connector's
+payload budget when HDR requires a 10-bpc link.
 
 Exclusive mode attaches BT.2020, HDR10 metadata, and any available 10-bpc link
 control to Smithay's pending connector state before the first real scanout
@@ -198,7 +219,8 @@ On NVIDIA, exclusive mode additionally requires:
 FOCALDESK_HDR_ALLOW_NVIDIA = "1"
 ```
 
-This does not permit NVIDIA HDR with multiple active outputs. A complete GPU
+By itself this does not permit NVIDIA HDR with multiple active outputs; that
+also requires `FOCALDESK_HDR_NVIDIA_DUAL=1` as described above. A complete GPU
 wedge can prevent in-session recovery, so keep the text-console recovery path
 below available during testing.
 

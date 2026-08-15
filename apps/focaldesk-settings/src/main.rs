@@ -186,7 +186,11 @@ struct DisplayConfig {
     exclusive_hdr_reason: Option<String>,
 }
 
-fn save_displays(displays: &[DisplayConfig]) {
+fn display_outputs(displays: &[DisplayConfig]) -> Vec<OutputConfig> {
+    displays.iter().map(output_config_from_display).collect()
+}
+
+fn persist_displays(displays: &[DisplayConfig]) {
     let path = displays_path();
 
     if let Some(parent) = path.parent() {
@@ -197,9 +201,11 @@ fn save_displays(displays: &[DisplayConfig]) {
         let _ = std::fs::write(path, text);
     }
 
-    let outputs = displays.iter().map(output_config_from_display).collect();
+    let request = IpcRequest::SetDisplays {
+        outputs: display_outputs(displays),
+    };
 
-    match send_settings_request(&IpcRequest::SetDisplays { outputs }) {
+    match send_settings_request(&request) {
         Ok(IpcResponse::Ok) => {}
         Ok(IpcResponse::Error { message }) => {
             warn!(
@@ -225,6 +231,29 @@ fn save_displays(displays: &[DisplayConfig]) {
                 "settings IPC unavailable; saved display config directly"
             );
         }
+    }
+}
+
+fn apply_displays_to_desktop(displays: &[DisplayConfig]) -> Result<(), String> {
+    match send_desktop_request(&IpcRequest::SetDisplays {
+        outputs: display_outputs(displays),
+    }) {
+        Ok(IpcResponse::Ok) => Ok(()),
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected desktop display response: {other:?}")),
+        Err(err) => Err(err),
+    }
+}
+
+fn save_displays(displays: &[DisplayConfig]) {
+    persist_displays(displays);
+    if let Err(err) = apply_displays_to_desktop(displays) {
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            error = %err,
+            "desktop display IPC unavailable; persisted display config for the next session"
+        );
     }
 }
 
@@ -449,6 +478,33 @@ fn hdr_status_subtitle(hdr_requested: bool, hdr_enabled: bool) -> &'static str {
     } else {
         "Off"
     }
+}
+
+fn refresh_all_outputs_hdr_control(
+    displays: &[DisplayConfig],
+    row: &adw::ActionRow,
+    button: &gtk::Button,
+) {
+    let active_capable = displays
+        .iter()
+        .filter(|display| display.enabled && display.hdr_supported)
+        .collect::<Vec<_>>();
+    let requested = active_capable
+        .iter()
+        .filter(|display| display.hdr_requested)
+        .count();
+    let subtitle = if active_capable.is_empty() {
+        "No active HDR10-capable displays were detected".to_string()
+    } else if requested == 0 {
+        "Turn on HDR output request for one or more displays first".to_string()
+    } else {
+        format!(
+            "Apply HDR10 to {requested} requested display{}; every unrequested output stays active in SDR",
+            if requested == 1 { "" } else { "s" }
+        )
+    };
+    row.set_subtitle(&subtitle);
+    button.set_sensitive(requested > 0);
 }
 
 fn exclusive_hdr_status_text(phase: ExclusiveHdrPhase, reason: Option<&str>) -> String {
@@ -1492,6 +1548,11 @@ fn connected_display_row(
     displays: Rc<RefCell<Vec<DisplayConfig>>>,
     area: gtk::DrawingArea,
     row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>>,
+    hdr_switch_registry: Rc<RefCell<HashMap<String, gtk::Switch>>>,
+    bulk_hdr_update: Rc<Cell<bool>>,
+    hdr_requests_dirty: Rc<Cell<bool>>,
+    all_hdr_row: adw::ActionRow,
+    all_hdr_button: gtk::Button,
     parent: adw::ApplicationWindow,
 ) -> adw::ExpanderRow {
     let display = displays.borrow()[index].clone();
@@ -1659,6 +1720,9 @@ fn connected_display_row(
         ));
         let hdr = gtk::Switch::new();
         hdr.set_active(display.hdr_requested || display.hdr_enabled);
+        hdr_switch_registry
+            .borrow_mut()
+            .insert(display.name.clone(), hdr.clone());
         hdr_row.add_suffix(&hdr);
         hdr_row.set_activatable_widget(Some(&hdr));
         row.add_row(&hdr_row);
@@ -1668,7 +1732,14 @@ fn connected_display_row(
             let area = area.clone();
             let row = row.clone();
             let hdr_row = hdr_row.clone();
+            let bulk_hdr_update = bulk_hdr_update.clone();
+            let hdr_requests_dirty = hdr_requests_dirty.clone();
+            let all_hdr_row = all_hdr_row.clone();
+            let all_hdr_button = all_hdr_button.clone();
             hdr.connect_active_notify(move |switch| {
+                if bulk_hdr_update.get() {
+                    return;
+                }
                 if let Some(display) = displays.borrow_mut().get_mut(index) {
                     display.hdr_requested = display.hdr_supported && switch.is_active();
                     if !display.hdr_requested {
@@ -1679,7 +1750,13 @@ fn connected_display_row(
                         display.hdr_enabled,
                     ));
                 }
-                save_display_change(&displays, &area, &row, index);
+                persist_displays(&displays.borrow());
+                area.queue_draw();
+                if let Some(display) = displays.borrow().get(index) {
+                    row.set_subtitle(&display_summary(display));
+                }
+                hdr_requests_dirty.set(true);
+                refresh_all_outputs_hdr_control(&displays.borrow(), &all_hdr_row, &all_hdr_button);
             });
         }
 
@@ -2122,6 +2199,7 @@ fn load_display_runtime_statuses() -> Vec<DisplayRuntimeOutputStatus> {
 fn apply_runtime_statuses(
     displays: &Rc<RefCell<Vec<DisplayConfig>>>,
     statuses: &[DisplayRuntimeOutputStatus],
+    preserve_staged_hdr_requests: bool,
 ) {
     let mut displays_ref = displays.borrow_mut();
     for display in displays_ref.iter_mut() {
@@ -2164,7 +2242,9 @@ fn apply_runtime_statuses(
             display.wide_gamut_active = wide_gamut_active;
         }
         display.hdr_supported = hdr_supported;
-        display.hdr_requested = hdr_requested;
+        if !preserve_staged_hdr_requests {
+            display.hdr_requested = hdr_requested;
+        }
         display.hdr_enabled = hdr_enabled;
         display.exclusive_hdr_phase = exclusive_hdr_phase;
         display.exclusive_hdr_reason = exclusive_hdr_reason;
@@ -5260,6 +5340,26 @@ fn displays_page(
     let detected_displays = Rc::new(RefCell::new(load_displays()));
     let row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    let hdr_switch_registry: Rc<RefCell<HashMap<String, gtk::Switch>>> =
+        Rc::new(RefCell::new(HashMap::new()));
+    let bulk_hdr_update = Rc::new(Cell::new(false));
+    let hdr_requests_dirty = Rc::new(Cell::new(false));
+
+    let all_hdr_group = adw::PreferencesGroup::new();
+    all_hdr_group.set_title("Experimental HDR10");
+    all_hdr_group.set_description(Some(
+        "Choose displays with their HDR output request switches, then apply HDR10 without changing the output topology",
+    ));
+    let all_hdr_row = adw::ActionRow::new();
+    all_hdr_row.set_title("Requested HDR10 outputs");
+    let all_hdr_button = gtk::Button::with_label("Apply Requested HDR10");
+    all_hdr_button.set_hexpand(true);
+    all_hdr_button.set_halign(gtk::Align::Fill);
+    all_hdr_button.set_height_request(48);
+    all_hdr_button.add_css_class("destructive-action");
+    refresh_all_outputs_hdr_control(&detected_displays.borrow(), &all_hdr_row, &all_hdr_button);
+    all_hdr_group.add(&all_hdr_row);
+    all_hdr_group.add(&all_hdr_button);
     let arrangement_group = adw::PreferencesGroup::new();
     arrangement_group.set_title("Arrangement");
     arrangement_group.set_description(Some(
@@ -5287,12 +5387,54 @@ fn displays_page(
                 detected_displays.clone(),
                 area.clone(),
                 row_registry.clone(),
+                hdr_switch_registry.clone(),
+                bulk_hdr_update.clone(),
+                hdr_requests_dirty.clone(),
+                all_hdr_row.clone(),
+                all_hdr_button.clone(),
                 window.clone(),
             );
             outputs_group.add(&row);
         }
     }
     page.add(&outputs_group);
+    page.add(&all_hdr_group);
+
+    {
+        let displays = detected_displays.clone();
+        let area = area.clone();
+        let row_registry = row_registry.clone();
+        let hdr_requests_dirty = hdr_requests_dirty.clone();
+        let all_hdr_row = all_hdr_row.clone();
+        let all_hdr_button_for_handler = all_hdr_button.clone();
+        all_hdr_button.connect_clicked(move |_| {
+            for display in displays.borrow().iter() {
+                if let Some(row) = row_registry.borrow().get(&display.name) {
+                    row.set_subtitle(&display_summary(display));
+                }
+            }
+
+            // Submit the complete topology unchanged. The compositor reads
+            // each output's individual HDR request and leaves every other
+            // enabled output in SDR.
+            persist_displays(&displays.borrow());
+            match apply_displays_to_desktop(&displays.borrow()) {
+                Ok(()) => {
+                    hdr_requests_dirty.set(false);
+                    all_hdr_row.set_subtitle(
+                        "HDR10 request sent to focaldesk-desktop; waiting for KMS validation…",
+                    );
+                }
+                Err(err) => {
+                    all_hdr_row.set_subtitle(&format!(
+                        "Could not apply HDR10 through focaldesk-desktop: {err}"
+                    ));
+                }
+            }
+            area.queue_draw();
+            all_hdr_button_for_handler.set_sensitive(true);
+        });
+    }
 
     // Layout group
     let layout_group = adw::PreferencesGroup::new();
@@ -5422,15 +5564,21 @@ fn displays_page(
 
     {
         let runtime_statuses = load_display_runtime_statuses();
-        apply_runtime_statuses(&detected_displays, &runtime_statuses);
+        apply_runtime_statuses(&detected_displays, &runtime_statuses, false);
         for display in detected_displays.borrow().iter() {
             if let Some(row) = row_registry.borrow().get(&display.name) {
                 row.set_subtitle(&display_summary(display));
             }
         }
+        refresh_all_outputs_hdr_control(&detected_displays.borrow(), &all_hdr_row, &all_hdr_button);
 
         let displays = detected_displays.clone();
         let row_registry = row_registry.clone();
+        let hdr_switch_registry = hdr_switch_registry.clone();
+        let bulk_hdr_update = bulk_hdr_update.clone();
+        let hdr_requests_dirty = hdr_requests_dirty.clone();
+        let all_hdr_row = all_hdr_row.clone();
+        let all_hdr_button = all_hdr_button.clone();
         let rx = start_config_watch(&["displays.runtime"]);
         glib::timeout_add_local(Duration::from_millis(100), move || {
             while let Ok(event) = rx.try_recv() {
@@ -5441,12 +5589,18 @@ fn displays_page(
                 let statuses =
                     serde_json::from_value::<Vec<DisplayRuntimeOutputStatus>>(event.value)
                         .unwrap_or_default();
-                apply_runtime_statuses(&displays, &statuses);
+                apply_runtime_statuses(&displays, &statuses, hdr_requests_dirty.get());
+                bulk_hdr_update.set(true);
                 for display in displays.borrow().iter() {
                     if let Some(row) = row_registry.borrow().get(&display.name) {
                         row.set_subtitle(&display_summary(display));
                     }
+                    if let Some(switch) = hdr_switch_registry.borrow().get(&display.name) {
+                        set_switch_if_changed(switch, display.hdr_requested || display.hdr_enabled);
+                    }
                 }
+                bulk_hdr_update.set(false);
+                refresh_all_outputs_hdr_control(&displays.borrow(), &all_hdr_row, &all_hdr_button);
             }
 
             glib::ControlFlow::Continue

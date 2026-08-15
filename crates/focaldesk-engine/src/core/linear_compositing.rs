@@ -76,6 +76,13 @@ pub struct LinearOffscreenTargets {
     pub overlay_offscreen: Option<OffscreenTexture>,
     /// Ping-pong target for full-frame output encode (C1b/C2c SDR).
     pub encode_scratch: Option<OffscreenTexture>,
+    /// Encoded output-space intermediate consumed by the ICC LUT pass.
+    ///
+    /// This must not alias `offscreen`: the linear renderer retains the SDR
+    /// wallpaper/chrome base there and only redraws it when its generation
+    /// changes. Reusing that texture for a damage-limited LUT pass corrupts
+    /// the retained base and can expose uninitialized blue rectangles.
+    pub lut_intermediate: Option<OffscreenTexture>,
     /// PQ-encoded HDR scanout buffer (C3b).
     pub hdr_offscreen: Option<OffscreenTexture>,
     pub encoded_scanout: bool,
@@ -178,6 +185,19 @@ impl LinearOffscreenTargets {
         ensure_offscreen_texture(
             renderer,
             &mut self.encode_scratch,
+            size,
+            SDR_OFFSCREEN_FORMAT,
+        )
+    }
+
+    pub fn ensure_lut_intermediate(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+    ) -> Result<(), GlesError> {
+        ensure_offscreen_texture(
+            renderer,
+            &mut self.lut_intermediate,
             size,
             SDR_OFFSCREEN_FORMAT,
         )
@@ -431,6 +451,7 @@ pub fn apply_output_encode(
                     shader,
                     &full_damage(buffer_size),
                     false,
+                    false,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
@@ -639,18 +660,28 @@ fn apply_output_encode_lut(
     shader: &GlesTexProgram,
     requested_damage: &[Rectangle<i32, Physical>],
     destination_current: bool,
+    source_is_lut_intermediate: bool,
 ) -> Result<Option<SyncPoint>> {
     let lut_texture = state
         .render
         .ensure_output_icc_lut_texture(renderer, output_id, lut)
         .map_err(|e| anyhow!("upload ICC LUT atlas: {e}"))?;
 
-    let scene_texture = targets
-        .offscreen
-        .as_ref()
-        .ok_or_else(|| anyhow!("SDR offscreen missing before output encode"))?
-        .texture
-        .clone();
+    let scene_texture = if source_is_lut_intermediate {
+        targets
+            .lut_intermediate
+            .as_ref()
+            .ok_or_else(|| anyhow!("LUT intermediate missing before output encode"))?
+            .texture
+            .clone()
+    } else {
+        targets
+            .offscreen
+            .as_ref()
+            .ok_or_else(|| anyhow!("SDR offscreen missing before output encode"))?
+            .texture
+            .clone()
+    };
     let target_valid = destination_current
         && offscreen_texture_is_valid(
             targets.encode_scratch.as_ref(),
@@ -832,7 +863,7 @@ fn apply_linear_output_encode_parametric(
     let target_valid = if intermediate_for_lut {
         destination_current
             && offscreen_texture_is_valid(
-                targets.offscreen.as_ref(),
+                targets.lut_intermediate.as_ref(),
                 buffer_size,
                 SDR_OFFSCREEN_FORMAT,
             )
@@ -846,7 +877,7 @@ fn apply_linear_output_encode_parametric(
     };
 
     if intermediate_for_lut {
-        targets.ensure_offscreen(renderer, buffer_size)?;
+        targets.ensure_lut_intermediate(renderer, buffer_size)?;
     } else {
         targets.ensure_encode_scratch(renderer, buffer_size)?;
     }
@@ -882,7 +913,7 @@ fn apply_linear_output_encode_parametric(
     ];
 
     let destination = if intermediate_for_lut {
-        &mut targets.offscreen.as_mut().unwrap().texture
+        &mut targets.lut_intermediate.as_mut().unwrap().texture
     } else {
         &mut targets.encode_scratch.as_mut().unwrap().texture
     };
@@ -1073,11 +1104,7 @@ fn apply_linear_output_encode(
         &parametric_shader,
         use_lut,
         damage,
-        if use_lut {
-            true
-        } else {
-            previous_encoded_scanout && !previous_encoded_hdr
-        },
+        previous_encoded_scanout && !previous_encoded_hdr,
     )?;
     if let (Some(lut), Some(shader)) = (lut_owned.as_ref(), lut_shader.as_ref()) {
         if use_lut {
@@ -1091,6 +1118,7 @@ fn apply_linear_output_encode(
                 shader,
                 damage,
                 previous_encoded_scanout && !previous_encoded_hdr,
+                true,
             ) {
                 Ok(Some(lut_sync)) => sync = lut_sync,
                 Ok(None) => {}

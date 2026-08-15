@@ -120,7 +120,6 @@ pub struct OutputColorSnapshot {
     pub custom_path: Option<String>,
     pub old_description: ColorDescription,
     pub old_icc: Option<Vec<u8>>,
-    pub old_lut: Option<OutputIccLut>,
 }
 
 /// Resolved color update to apply on the compositor thread.
@@ -144,7 +143,6 @@ pub fn collect_output_color_snapshots(state: &DesktopState) -> Vec<OutputColorSn
             custom_path: output.icc_profile_path.clone(),
             old_description: output.base_color_description,
             old_icc: output.icc_profile.clone(),
-            old_lut: output.output_icc_lut.clone(),
         })
         .collect()
 }
@@ -201,10 +199,11 @@ pub fn compute_output_color_updates(snapshots: Vec<OutputColorSnapshot>) -> Vec<
             continue;
         };
 
-        if description != snapshot.old_description
-            || icc != snapshot.old_icc
-            || lut != snapshot.old_lut
-        {
+        // The compositor rebuilds the LUT against the effective user-selected
+        // output description. The resolver's LUT is baked against the base
+        // ICC description, so comparing the two causes every refresh to look
+        // changed whenever an sRGB/P3 override is active.
+        if description != snapshot.old_description || icc != snapshot.old_icc {
             updates.push(OutputColorUpdate {
                 output_id: snapshot.output_id,
                 description,
