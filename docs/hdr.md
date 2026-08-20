@@ -9,13 +9,31 @@ content handling. These paths are under active development and should not be
 treated as color-accurate or production-ready without measurement on the target
 hardware.
 
+## Known working configuration
+
+As of August 20, 2026, HDR10 has been observed working in a native FocalDesk
+session on Fedora 44 with the proprietary NVIDIA 595 driver series, including
+HDR content in Google Chrome. This is a successful compatibility result, not a
+blanket support guarantee: the GPU model, display, connector, mode, kernel,
+Chrome version, FocalDesk revision, and single- or multi-output topology can all
+affect the result.
+
+For a reproducible compatibility report, record those details together with the
+driver's complete version and whether Chrome was running as a native Wayland or
+XWayland client. See [Compatibility Testing](compatibility-testing.md#hardware-result-record).
+
 The bundled wallpaper is re-graded during FP16 composition rather than converted
 to a nominal 10-bit asset. Its SDR texture remains the common source for SDR,
-wide-gamut SDR, and HDR10. HDR composition selectively raises stars, cyan/orange
-accents, and the thin planet rim above diffuse white, scales those highlights to
-the detected display peak (up to the artwork's 1,000-nit creative ceiling), and
-leaves the dark space background at its original black floor. The final output
-stage still owns BT.2020 conversion and ST 2084 encoding.
+wide-gamut SDR, and HDR10. HDR10 composition keeps diffuse wallpaper at the
+203-nit BT.2408 reference white, then applies a modest lift to isolated stars,
+cyan/orange accents, and the planet rim inside the panel's real headroom. That
+authored ceiling is about 450 nits on DisplayHDR 400-class VA panels: they
+cannot reproduce 800–1000 nit spectacle, and inventing it only clips or trips
+the monitor's global tone map. The dark space background stays at its original
+black floor. The final output stage still owns BT.2020 conversion and ST 2084
+encoding. KMS HDR static metadata signals 203-nit BT.2408 SDR/graphics white
+as MaxFALL and 450 nits as MaxCLL / mastering peak, rather than the Type-1
+EDID values (often 409 / ~300) that make these ASUS panels over-compress.
 
 ## SDR wide gamut and 10-bit output
 
@@ -114,12 +132,52 @@ The longer-term goals are:
 - Future native HDR Wayland applications
 - Color-managed desktop rendering
 
-Live NVIDIA KMS HDR transitions are guarded because earlier testing produced GPU
-Xid 56 faults, flip-event timeouts, and frozen scanout. Atomic commit success and
-connector-property readback did not reliably indicate that the display pipeline
-survived. NVIDIA always requires `FOCALDESK_HDR_ALLOW_NVIDIA=1`. Normal and
-multi-output topologies additionally require `FOCALDESK_HDR_NVIDIA_DUAL=1`;
-without both overrides, the compositor leaves the requested outputs in SDR.
+## Monitor color gamut
+
+Each monitor has an independent **Color gamut** setting in Display Settings:
+
+- **Auto** uses the resolved ICC/EDID monitor profile.
+- **sRGB** constrains SDR output and wide-gamut SDR content to sRGB.
+- **Display P3** uses Display P3 as the SDR output space.
+
+This setting does not replace the output dynamic-range choice. When HDR10 is
+active, scanout is always encoded and signaled as 10-bit BT.2020 with ST 2084
+PQ. Tagged sRGB and Display P3 surfaces are decoded into the scene-linear FP16
+working buffer, converted from scene Rec.709 primaries to BT.2020, and only then
+PQ encoded.
+
+Chromium's HDR10 path copies the compositor preferred description onto the
+window. HDR Chrome sessions must not use `--force-color-profile=scrgb-linear`:
+that profile's BT.709 primaries make Blink report `color-gamut: srgb`, so
+wide-gamut CSS such as the new-tab shortcut circles disappears. SDR and
+linear-SDR sessions keep `--force-color-profile=display-p3-d65`. HDR10 scanout
+stays BT.2020/PQ. The preferred description for P3-class panels is Display P3
+with extended sRGB (Chrome's HDR raster: 1.0 is paper white). Advertising PQ
+on 8-bit windows made the W-test reds clip together and broke still shading.
+Named BT.2020 panels still prefer BT.2020+PQ. Blink reports `color-gamut: p3`
+for HDR, not `rec2020`. PQ encode maps the scene into Display P3 D65 then
+BT.2020. `ext_srgb` is still advertised so clients that actually use extended
+sRGB can tag it directly. 8-bit `AB24` is decoded as Display P3 sRGB-HDR, not
+ST.2084; 10-bit packed RGB can keep PQ. Decode dithers those 8-bit
+sRGB-HDR samples so video skies do not stair-step into purple and blue
+slabs; it cannot invent the missing codes. FP16 surfaces tagged PQ decode as
+Rec.709 linear HDR. linux-dmabuf feedback prefers FP16 and 10-bit RGB so
+Chrome can upgrade off 8-bit. The factory ICC white is often warm and is not
+used for HDR. PQ scanout tone-maps highlight luminance into about 450 nits of
+DisplayHDR 400-class headroom instead of clipping R, G, and B independently,
+so near-white clouds stay white instead of turning magenta or cyan. Channel
+values may exceed that luminance peak: Rec.2020 blue's Y weight is only
+0.0593, and treating 450 nits as a per-channel cap crushes sky and UI blues.
+
+Live NVIDIA KMS HDR transitions remain guarded because testing with older driver
+and system combinations produced GPU Xid 56 faults, flip-event timeouts, and
+frozen scanout. The successful Fedora 44/NVIDIA 595 result above is encouraging,
+but does not establish that every GPU and output topology is safe. Atomic commit
+success and connector-property readback did not reliably indicate that the
+display pipeline survived on the affected combinations. NVIDIA therefore still
+requires `FOCALDESK_HDR_ALLOW_NVIDIA=1`. Normal and multi-output topologies
+additionally require `FOCALDESK_HDR_NVIDIA_DUAL=1`; without both overrides, the
+compositor leaves the requested outputs in SDR.
 
 For a guarded NVIDIA multi-output test, configure both overrides in the session
 environment:
@@ -137,10 +195,18 @@ SDR. The frame watchdog, connector-property validation, persisted request
 disable, and SDR rollback remain active.
 
 Display Settings also provides **Apply Requested HDR10** under **Experimental
-HDR10**. First enable **HDR output request** on each intended display, then use
-the red apply button. HDR10 is requested only on those enabled, capable outputs;
-every unrequested output remains active in SDR and the output topology is left
-unchanged.
+HDR10**. Enable **HDR output request** on at least one display, then use the red
+apply button. FocalDesk requests HDR10 on every enabled capable output so
+identical panels share BT.2020/PQ. Mixed HDR10 and SDR+ICC will not match: the
+HDR head is D65 PQ while the SDR head keeps its ICC white point, and Chrome
+switches to scRGB whenever any output has live HDR. `FOCALDESK_HDR_OUTPUT` and
+**Restart & Try HDR10** remain the one-head test paths. The output topology is
+left unchanged.
+
+A failed exclusive HDR attempt blocks only automatic exclusive retry. It does
+not persist-disable that connector's ordinary `hdr_requested` flag, because that
+would leave the other head in HDR10 after exclusive mode restores the dual-head
+topology.
 
 For a controlled multi-monitor test, enable HDR for the intended display in
 Display Settings and select its connector in the compositor environment. When
@@ -208,10 +274,14 @@ submitted PQ frames. FocalDesk reports HDR active only after both gates complete
 An encode failure, property mismatch, failed frame, or watchdog timeout records
 the attempt as failed, rolls KMS back to SDR when the GPU is still responsive,
 and rebuilds the ordinary all-output topology. The state lives at
-`$XDG_STATE_HOME/focaldesk/exclusive-hdr.json`. If the compositor or GPU dies
-before it can recover, the unfinished state blocks an automatic retry at the
-next login and starts with all outputs in SDR. Display Settings shows the saved
-failure reason and allows an explicit retry.
+`$XDG_STATE_HOME/focaldesk/exclusive-hdr.json`. A failed exclusive attempt
+blocks only automatic exclusive retry. It does not clear a saved `hdr_requested`
+preference on that connector. **Apply Requested HDR10** and dual-head NVIDIA HDR
+still apply on the next login so both panels can share HDR10. If exclusive HDR was
+already verified Active, logout, restart, and shutdown re-arm that request so
+the next session can enter HDR10 again. An unfinished Starting/Verifying
+attempt still fail-safes to SDR after a crash. Display Settings shows the saved
+failure reason and allows an explicit exclusive retry.
 
 On NVIDIA, exclusive mode additionally requires:
 

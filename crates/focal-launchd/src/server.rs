@@ -60,7 +60,9 @@ fn handle_stream(stream: &mut std::os::unix::net::UnixStream) -> anyhow::Result<
 fn launch(req: LaunchRequest) -> anyhow::Result<()> {
     let browser_like = is_browser_like(&req.app);
     let chrome_like = is_chrome_like(&req.app);
-    let hdr_output_active = chrome_like && chrome_hdr_output_active();
+    // Prefer the compositor's per-launch state. The environment fallback is
+    // retained for standalone launchd clients that predate this field.
+    let hdr_output_active = chrome_like && (req.hdr_output_active || chrome_hdr_output_active());
 
     let prefer_x11 = matches!(req.browser_backend, BrowserBackend::Xwayland);
 

@@ -48,7 +48,7 @@ pub fn chrome_hdr_mode_active(
 pub fn chrome_command_args(
     use_x11: bool,
     profile_dir: &str,
-    _hdr_output_active: bool,
+    hdr_output_active: bool,
 ) -> Vec<String> {
     let ozone = if use_x11 { "x11" } else { "wayland" };
 
@@ -67,13 +67,15 @@ pub fn chrome_command_args(
         "--new-window".into(),
     ];
 
-    // Keep Chromium's raster target in Display P3 in both SDR and HDR output
-    // modes. Chromium's forced `hdr10` Linux/Wayland raster path advertises a
-    // BT.2020/PQ surface but flattens ICC/CSS P3 content before submitting the
-    // buffer (the wide-gamut.com W test disappears). FocalDesk already decodes
-    // tagged P3 clients into its FP16 scene and performs the final P3 -> output
-    // conversion, including BT.2020/PQ encode on an HDR10 connector.
-    args.insert(2, "--force-color-profile=display-p3-d65".into());
+    // SDR: force Display P3 so Blink's `color-gamut: p3` matches and wide-gamut
+    // CSS (Chrome NTP shortcut circles) draws. HDR: do not force scrgb-linear.
+    // That profile uses BT.709 primaries, so `color-gamut: p3` fails even though
+    // the output is BT.2020/PQ. Chrome still tags HDR buffers with
+    // `create_windows_scrgb` (80-nit unit white, extended linear) when the
+    // compositor advertises that feature.
+    if !hdr_output_active {
+        args.insert(2, "--force-color-profile=display-p3-d65".into());
+    }
 
     args
 }
@@ -97,11 +99,12 @@ mod tests {
     }
 
     #[test]
-    fn chrome_hdr_launch_preserves_display_p3_raster_gamut() {
+    fn chrome_hdr_launch_follows_wp_color_preferred_gamut() {
         let args = chrome_command_args(false, "/tmp/focaldesk-chrome-test", true);
         assert!(
-            args.iter()
-                .any(|arg| arg == "--force-color-profile=display-p3-d65")
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--force-color-profile="))
         );
         assert!(!args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
         assert!(

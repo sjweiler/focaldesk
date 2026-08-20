@@ -21,8 +21,9 @@ pub struct ChromeShaders {
     pub font_text: Option<GlesTexProgram>,
     pub rounded_rect: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
-    /// Adds display-aware wide-gamut/HDR highlights from the SDR wallpaper
-    /// texture after the retained base has been decoded into the FP16 scene.
+    /// Adds wide-gamut SDR accents and conservative HDR10 highlight lifts
+    /// from the SDR wallpaper after the retained base is decoded into the
+    /// FP16 scene.
     pub wallpaper_creative_grade: Option<GlesTexProgram>,
     pub srgb_to_linear: Option<GlesTexProgram>,
     pub client_to_scene_linear: Option<GlesTexProgram>,
@@ -483,9 +484,11 @@ impl ChromeShaders {
                 &[
                     UniformName::new("u_decode_tf", UniformType::_1f),
                     UniformName::new("u_reference_white_nits", UniformType::_1f),
+                    UniformName::new("u_linear_to_scene_scale", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
+                    UniformName::new("u_src_bits", UniformType::_1f),
                 ],
             )?);
         }
@@ -566,6 +569,10 @@ impl ChromeShaders {
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
+                    UniformName::new("u_p0", UniformType::_3f),
+                    UniformName::new("u_p1", UniformType::_3f),
+                    UniformName::new("u_p2", UniformType::_3f),
+                    UniformName::new("u_panel_luma", UniformType::_3f),
                 ],
             )?);
         }
@@ -1501,13 +1508,33 @@ mod tests {
     }
 
     #[test]
+    fn hdr_pq_encode_tone_maps_luminance_instead_of_per_channel_clip() {
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("tone_map_nits(y, 10000.0, u_max_nits"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.8)"));
+        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("min(white, display_peak * 0.9)"));
+        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.9)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mapped / y"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(10000.0))"));
+        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("u_max_nits / peak_channel"));
+        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(u_max_nits))"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("compress_to_panel_gamut"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
+    }
+
+    #[test]
     fn wallpaper_grade_is_scene_linear_and_preserves_the_black_floor() {
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("graded - base"));
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("vec4((graded - base) * alpha, 0.0)"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("target_level(280.0)"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight = cyan * isolated"));
+        assert!(
+            WALLPAPER_CREATIVE_GRADE_FRAG
+                .contains("usable_peak = min(u_peak_nits, u_reference_white_nits * 2.0)")
+        );
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("target_level(u_reference_white_nits)"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("p3_luminance(p3)"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("0.228975, 0.691739, 0.079287"));
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight * 0.72"));
+        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
+        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(80.0, 800.0"));
         assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("base + vec3"));
     }
 
@@ -1530,6 +1557,16 @@ mod tests {
         let wide = wide_gamut_variant(AMBER_LIGHTBAR_FRAG, WideAlphaContract::Straight);
         assert!(wide.contains("1.224745 * p3.r - 0.224904 * p3.g"));
         assert!(!wide.contains("clamp(fd_scene"));
+    }
+
+    #[test]
+    fn client_decode_preserves_scrgb_gamut_and_applies_white_scale() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return c * u_linear_to_scene_scale;"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("if (!extended_range)"));
+        assert!(!CLIENT_TO_SCENE_LINEAR_FRAG.contains("straight = max(straight, vec3(0.0))"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_src_bits"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither_code_value"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither * step"));
     }
 
     #[test]
@@ -1591,9 +1628,11 @@ varying vec2 v_coords;
 uniform float alpha;
 uniform float u_decode_tf;
 uniform float u_reference_white_nits;
+uniform float u_linear_to_scene_scale;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
+uniform float u_src_bits;
 
 vec3 srgb_to_linear(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
@@ -1621,17 +1660,32 @@ vec3 pq_to_scene_linear(vec3 c) {
     return nits / max(u_reference_white_nits, 1.0);
 }
 
+vec3 dither_code_value(vec3 c) {
+    // 8-bit HDR windows (PQ or sRGB-HDR) have 256 steps. Ordered dither in
+    // code value hides purple/blue sky slabs; it cannot recover missing bits.
+    if (u_src_bits <= 1.0) {
+        return c;
+    }
+    float step = 1.0 / (exp2(u_src_bits) - 1.0);
+    float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
+    return c + vec3(dither * step);
+}
+
 vec3 decode_color(vec3 c) {
+    c = dither_code_value(c);
     if (u_decode_tf < 0.5) {
         return srgb_to_linear(c);
     }
     if (u_decode_tf < 1.5) {
-        return c;
+        return c * u_linear_to_scene_scale;
     }
     if (u_decode_tf < 2.5) {
         return gamma22_to_linear(c);
     }
-    return pq_to_scene_linear(c);
+    if (u_decode_tf < 3.5) {
+        return pq_to_scene_linear(c);
+    }
+    return srgb_to_linear(c);
 }
 
 vec3 mul_mat3(vec3 v) {
@@ -1647,11 +1701,11 @@ void main() {
         discard;
     }
     vec3 straight = src.rgb / src.a;
-    // ExtLinear (wp_color wide gamut): preserve scRGB headroom above 1.0 in the FP16 scene.
-    bool extended_linear = u_decode_tf >= 0.5 && u_decode_tf < 1.5;
-    if (extended_linear) {
-        straight = max(straight, vec3(0.0));
-    } else {
+    // ExtLinear (Windows-scRGB) and extended sRGB (Chromium SRGB_HDR) keep
+    // negatives and values above 1.0 for wide-gamut / HDR headroom.
+    bool extended_range =
+        (u_decode_tf >= 0.5 && u_decode_tf < 1.5) || u_decode_tf >= 3.5;
+    if (!extended_range) {
         straight = clamp(straight, 0.0, 1.0);
     }
     vec3 linear = mul_mat3(decode_color(straight));
@@ -2078,9 +2132,39 @@ uniform float u_sdr_white_nits;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
+uniform vec3 u_p0;
+uniform vec3 u_p1;
+uniform vec3 u_p2;
+uniform vec3 u_panel_luma;
 
 vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+vec3 mul_panel_to_bt2020(vec3 v) {
+    return vec3(dot(u_p0, v), dot(u_p1, v), dot(u_p2, v));
+}
+
+// Pull Rec.2020-only colors into this output's ICC/EDID volume. In-gamut
+// P3/sRGB stays put. A near-Rec.2020 panel never hits the negative branch.
+vec3 compress_to_panel_gamut(vec3 rgb) {
+    float minc = min(rgb.r, min(rgb.g, rgb.b));
+    if (minc >= 0.0) {
+        return rgb;
+    }
+    float y = max(dot(rgb, u_panel_luma), 0.0);
+    vec3 dest = vec3(y);
+    float t = 0.0;
+    if (rgb.r < 0.0 && abs(rgb.r - dest.r) > 0.000001) {
+        t = max(t, rgb.r / (rgb.r - dest.r));
+    }
+    if (rgb.g < 0.0 && abs(rgb.g - dest.g) > 0.000001) {
+        t = max(t, rgb.g / (rgb.g - dest.g));
+    }
+    if (rgb.b < 0.0 && abs(rgb.b - dest.b) > 0.000001) {
+        t = max(t, rgb.b / (rgb.b - dest.b));
+    }
+    return mix(rgb, dest, clamp(t, 0.0, 1.0));
 }
 
 float pq_oetf(float nits) {
@@ -2094,16 +2178,44 @@ float pq_oetf(float nits) {
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
+float bt2020_luminance(vec3 nits) {
+    return dot(nits, vec3(0.2627, 0.6780, 0.0593));
+}
+
+// Keep graphics white and most in-range HDR. Roll from 80% of panel peak
+// so 400 nit content is not crushed from paper white, while extremes still
+// compress. A per-channel min() of the same values turns clouds magenta.
+float tone_map_nits(float value, float source_peak, float display_peak, float white) {
+    float knee = max(white, display_peak * 0.8);
+    if (value <= knee || display_peak <= knee) {
+        return min(value, display_peak);
+    }
+    float peak = max(source_peak, knee + 0.0001);
+    float range = max(display_peak - knee, 0.0001);
+    float denominator = 1.0 - exp(-(peak - knee) / range);
+    float numerator = 1.0 - exp(-(value - knee) / range);
+    return knee + range * numerator / max(denominator, 0.0001);
+}
+
 void main() {
     vec4 src = texture2D(tex, v_coords);
 #if defined(NO_ALPHA)
     src.a = 1.0;
 #endif
     vec3 scene_linear = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
-    // The FP16 scene uses linear Rec.709 with 1.0 at SDR reference white.
-    // Convert to BT.2020 before scaling to absolute luminance for PQ.
-    vec3 nits = max(mul_mat3(scene_linear), vec3(0.0)) * u_sdr_white_nits;
-    nits = min(nits, vec3(u_max_nits));
+    // Scene Rec.709 → panel volume → BT.2020 PQ. HDR10 on the wire stays
+    // Rec.2020; out-of-gamut colors are mapped like Windows WDDM.
+    vec3 panel = compress_to_panel_gamut(mul_mat3(scene_linear));
+    vec3 nits = max(mul_panel_to_bt2020(panel), vec3(0.0)) * u_sdr_white_nits;
+    float y = bt2020_luminance(nits);
+    if (y > 0.0001) {
+        float mapped = tone_map_nits(y, 10000.0, u_max_nits, u_sdr_white_nits);
+        nits *= mapped / y;
+    }
+    // PQ legal range is 0–10,000 nits per channel. Do not also clamp each
+    // channel to the panel luminance peak: Rec.2020 blue's Y weight is 0.0593,
+    // so a 400 nit sky has ~6,700 nits in B and that scale would leave ~27 nits.
+    nits = min(nits, vec3(10000.0));
     vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
     gl_FragColor = vec4(pq * src.a, src.a) * alpha;
 }
@@ -2297,6 +2409,10 @@ float luminance(vec3 c) {
     return dot(c, vec3(0.2126, 0.7152, 0.0722));
 }
 
+float p3_luminance(vec3 c) {
+    return dot(c, vec3(0.228975, 0.691739, 0.079287));
+}
+
 vec3 scene_to_p3(vec3 c) {
     return vec3(
         0.822593 * c.r + 0.177534 * c.g,
@@ -2340,7 +2456,7 @@ void main() {
         * smoothstep(0.015, 0.24, source_srgb.r - source_srgb.g);
     float accent = max(cyan, orange);
     vec3 p3 = scene_to_p3(base);
-    float p3_y = luminance(p3);
+    float p3_y = p3_luminance(p3);
     // HDR changes highlight luminance, not the diffuse wallpaper chroma.
     // Keeping the SDR/P3 saturation avoids a mode-dependent orange cast.
     float saturation = 1.22;
@@ -2382,10 +2498,15 @@ void main() {
         // strokes, and other compact details into HDR headroom.
         float cyan_highlight = cyan * isolated;
 
-        float star_nits = mix(80.0, 800.0, smoothstep(0.05, 0.85, y));
-        float rim_nits = mix(600.0, 1000.0, smoothstep(0.18, 0.82, y));
-        float cyan_nits = mix(150.0, 400.0, smoothstep(0.03, 0.60, y));
-        float orange_nits = mix(200.0, 500.0, smoothstep(0.03, 0.60, y));
+        // Conservative HDR10: use the panel's real headroom instead of
+        // inventing 800–1000 nit spectacle. DisplayHDR 400-class VA panels
+        // (about 450 nits usable) clip or globally tone-map those targets.
+        // Diffuse wallpaper stays at reference white; isolated accents get a modest lift.
+        float usable_peak = min(u_peak_nits, u_reference_white_nits * 2.0);
+        float star_nits = mix(u_reference_white_nits, usable_peak * 0.85, smoothstep(0.05, 0.85, y));
+        float rim_nits = mix(u_reference_white_nits * 1.1, usable_peak, smoothstep(0.18, 0.82, y));
+        float cyan_nits = mix(u_reference_white_nits, usable_peak * 0.70, smoothstep(0.03, 0.60, y));
+        float orange_nits = mix(u_reference_white_nits, usable_peak * 0.75, smoothstep(0.03, 0.60, y));
 
         vec3 highlighted = raise_to_luminance(graded, target_level(star_nits));
         graded = mix(graded, highlighted, star);
@@ -2396,9 +2517,9 @@ void main() {
         highlighted = raise_to_luminance(graded, target_level(orange_nits));
         graded = mix(graded, highlighted, orange * isolated * 0.72);
 
-        // Keep the large white wordmark comfortable even though its antialiased
-        // edges also look locally highlight-like.
-        vec3 logo_grade = raise_to_luminance(base, target_level(280.0));
+        // Keep the large white wordmark at graphics white even though its
+        // antialiased edges also look locally highlight-like.
+        vec3 logo_grade = raise_to_luminance(base, target_level(u_reference_white_nits));
         graded = mix(graded, logo_grade, logo_white);
 
     }

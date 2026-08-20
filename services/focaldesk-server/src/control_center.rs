@@ -715,6 +715,7 @@ fn read_journal_logs() -> Vec<LogEntry> {
             "--unit=focaldesk-desktop.service",
             "--unit=focaldesk-powerd.service",
             "--unit=focaldesk-notificationsd.service",
+            "--unit=focaldesk-updatesd.service",
             "--unit=focaldesk-controlsd.service",
             "--unit=focald-secrets.service",
         ])

@@ -24,6 +24,7 @@ FocalDesk Compositor / Shell UI
         ├── focal-launchd
         ├── focaldesk-powerd
         ├── focaldesk-notificationsd
+        ├── focaldesk-updatesd
         ├── focaldesk-dialogd
         └── focaldesk-controlsd
 
@@ -31,6 +32,7 @@ Services
 - launch requests
 - power snapshot / suspend / hibernate / reboot
 - notifications queue / visibility
+- system update checks / install requests
 - AI permission prompts
 - portal chooser prompts
 - wifi, bluetooth, and audio controls
@@ -83,6 +85,18 @@ Responsibilities may include:
 - Accepting notification requests
 - Expiring timed notifications
 - Returning visible notification snapshots to the compositor
+
+### focaldesk-updatesd
+
+`focaldesk-updatesd` owns package-update discovery and install jobs so the
+compositor never runs PackageKit or DNF on the render thread.
+
+Responsibilities may include:
+
+- Checking for updates on a background worker
+- Caching package name, version, and description
+- Installing selected or all updates via PackageKit or `pkexec dnf`
+- Posting a notification when new updates appear
 
 ### focaldesk-dialogd
 

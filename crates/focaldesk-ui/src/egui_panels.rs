@@ -1,7 +1,12 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::{SettingKey, SystemCommand, UiAction};
 use chrono::{Datelike, Local, NaiveDate};
-use focaldesk_ipc::{NotificationIpcRequest, NotificationIpcResponse, send_notification_request};
+use focaldesk_ipc::{
+    NotificationIpcRequest, NotificationIpcResponse, UpdateIpcRequest, UpdateIpcResponse,
+    send_notification_request, send_update_request,
+};
+use focaldesk_updates::UpdateSnapshot;
+use std::collections::HashSet;
 pub mod settings;
 
 pub use settings::SettingsPanel;
@@ -145,6 +150,212 @@ impl EguiPanelView for NotificationHistoryPanel {
                     }
                 }
             });
+        self.open = open;
+    }
+}
+
+pub struct UpdatesPanel {
+    pub open: bool,
+    snapshot: UpdateSnapshot,
+    selected: HashSet<String>,
+    last_poll: std::time::Instant,
+    requested_refresh: bool,
+}
+
+impl Default for UpdatesPanel {
+    fn default() -> Self {
+        Self {
+            open: false,
+            snapshot: UpdateSnapshot::default(),
+            selected: HashSet::new(),
+            last_poll: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            requested_refresh: false,
+        }
+    }
+}
+
+impl EguiPanelView for UpdatesPanel {
+    fn title(&self) -> &'static str {
+        "Updates"
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        _actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            self.requested_refresh = false;
+            return;
+        }
+        if !self.requested_refresh {
+            let _ = send_update_request(&UpdateIpcRequest::Refresh {
+                refresh_metadata: false,
+            });
+            self.requested_refresh = true;
+        }
+        let poll_every = if self.snapshot.checking || self.snapshot.installing {
+            std::time::Duration::from_millis(400)
+        } else {
+            std::time::Duration::from_millis(800)
+        };
+        if frame_ctx.now.saturating_duration_since(self.last_poll) >= poll_every {
+            self.last_poll = frame_ctx.now;
+            if let Ok(UpdateIpcResponse::State { snapshot }) =
+                send_update_request(&UpdateIpcRequest::GetState)
+            {
+                let ids: HashSet<String> = snapshot
+                    .packages
+                    .iter()
+                    .map(|package| package.id.clone())
+                    .collect();
+                let previous_ids: HashSet<String> = self
+                    .snapshot
+                    .packages
+                    .iter()
+                    .map(|package| package.id.clone())
+                    .collect();
+                if ids != previous_ids {
+                    self.selected.retain(|id| ids.contains(id));
+                    if self.selected.is_empty() {
+                        self.selected = ids;
+                    }
+                }
+                self.snapshot = snapshot;
+            }
+        }
+
+        let mut open = self.open;
+        let mut install_ids: Option<Vec<String>> = None;
+        let mut install_all = false;
+        let mut refresh_metadata = false;
+        let mut select_all = false;
+        let mut select_none = false;
+        let busy = self.snapshot.checking || self.snapshot.installing;
+        let available = self.snapshot.packages.len();
+        let selected_count = self.selected.len();
+
+        egui::Window::new(self.title())
+            .default_pos(egui::pos2(
+                (frame_ctx.work.loc.x + frame_ctx.work.size.w - 420) as f32,
+                (frame_ctx.work.loc.y + 24) as f32,
+            ))
+            .default_width(400.0)
+            .default_height(480.0)
+            .resizable(true)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("System updates");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_enabled_ui(!busy, |ui| {
+                            if ui.button("Refresh").clicked() {
+                                refresh_metadata = true;
+                            }
+                        });
+                    });
+                });
+                if let Some(progress) = &self.snapshot.progress {
+                    ui.label(progress);
+                } else if available == 0 {
+                    ui.label("No updates available.");
+                } else {
+                    ui.label(format!("{available} update(s) available"));
+                }
+                if let Some(error) = &self.snapshot.last_error {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), error);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!busy && available > 0, |ui| {
+                        if ui.button("Select all").clicked() {
+                            select_all = true;
+                        }
+                        if ui.button("Select none").clicked() {
+                            select_none = true;
+                        }
+                    });
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        if self.snapshot.packages.is_empty() && !busy {
+                            ui.label("Your system is up to date.");
+                        }
+                        for package in &self.snapshot.packages {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    let mut checked = self.selected.contains(&package.id);
+                                    if ui
+                                        .add_enabled(!busy, egui::Checkbox::new(&mut checked, ""))
+                                        .changed()
+                                    {
+                                        if checked {
+                                            self.selected.insert(package.id.clone());
+                                        } else {
+                                            self.selected.remove(&package.id);
+                                        }
+                                    }
+                                    ui.vertical(|ui| {
+                                        ui.strong(package.display_title());
+                                        let meta = [package.arch.as_str(), package.repo.as_str()]
+                                            .into_iter()
+                                            .filter(|part| !part.is_empty())
+                                            .collect::<Vec<_>>()
+                                            .join(" · ");
+                                        if !meta.is_empty() {
+                                            ui.weak(meta);
+                                        }
+                                        if let Some(detail) = package.detail_text() {
+                                            ui.label(detail);
+                                        }
+                                    });
+                                });
+                            });
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!busy && selected_count > 0, |ui| {
+                        if ui
+                            .button(format!("Install selected ({selected_count})"))
+                            .clicked()
+                        {
+                            install_ids = Some(self.selected.iter().cloned().collect());
+                        }
+                    });
+                    ui.add_enabled_ui(!busy && available > 0, |ui| {
+                        if ui.button("Install all").clicked() {
+                            install_all = true;
+                        }
+                    });
+                });
+            });
+
+        if select_all {
+            self.selected = self
+                .snapshot
+                .packages
+                .iter()
+                .map(|package| package.id.clone())
+                .collect();
+        }
+        if select_none {
+            self.selected.clear();
+        }
+        if refresh_metadata {
+            let _ = send_update_request(&UpdateIpcRequest::Refresh {
+                refresh_metadata: true,
+            });
+        }
+        if let Some(ids) = install_ids {
+            let _ = send_update_request(&UpdateIpcRequest::Install { ids });
+        }
+        if install_all {
+            let _ = send_update_request(&UpdateIpcRequest::InstallAll);
+        }
         self.open = open;
     }
 }

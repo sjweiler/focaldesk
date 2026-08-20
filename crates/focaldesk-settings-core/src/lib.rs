@@ -110,6 +110,19 @@ pub enum ExclusiveHdrPhase {
     Failed,
 }
 
+impl ExclusiveHdrPhase {
+    /// Live exclusive-HDR phases that may select a connector.
+    ///
+    /// `Failed` is a latch against automatic exclusive retry. It must not keep
+    /// selecting a connector or block ordinary Apply Requested HDR10.
+    pub fn selects_output(self) -> bool {
+        matches!(
+            self,
+            Self::Requested | Self::Starting | Self::Verifying | Self::Active
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ExclusiveHdrState {
     pub phase: ExclusiveHdrPhase,
@@ -153,6 +166,21 @@ pub fn save_exclusive_hdr_state(state: &ExclusiveHdrState) -> std::io::Result<()
         std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
     }
     std::fs::rename(temporary, path)
+}
+
+/// Keep a successful exclusive HDR request armed across logout, restart, and
+/// shutdown. Those session edges often kill the compositor before the DRM
+/// loop can rewrite `Active` back to `Requested`, which previously latched
+/// `Failed` and made the next Apply Requested HDR10 do nothing.
+pub fn rearm_exclusive_hdr_for_next_session() {
+    let mut state = load_exclusive_hdr_state();
+    if !state.phase.selects_output() {
+        return;
+    }
+    state.phase = ExclusiveHdrPhase::Requested;
+    state.reason = None;
+    state.session_id = None;
+    let _ = save_exclusive_hdr_state(&state);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -538,6 +566,15 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert_eq!(restored.workspaces.max_workspace_slots, 7);
+    }
+
+    #[test]
+    fn exclusive_failed_phase_does_not_keep_selecting_a_connector() {
+        assert!(ExclusiveHdrPhase::Requested.selects_output());
+        assert!(ExclusiveHdrPhase::Active.selects_output());
+        assert!(!ExclusiveHdrPhase::Failed.selects_output());
+        assert!(!ExclusiveHdrPhase::Disabled.selects_output());
+        assert!(!ExclusiveHdrPhase::Off.selects_output());
     }
 
     #[test]

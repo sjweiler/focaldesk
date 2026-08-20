@@ -9,7 +9,7 @@ pub const NESTED_DEFAULT_SIDEBAR_W: i32 = 76;
 pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 12;
 /// Matches the compositor's built-in status collection. Standalone shell
 /// clients pass their live control-vector length at runtime.
-pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 9;
+pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChromeLayoutConfig {

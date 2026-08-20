@@ -252,6 +252,7 @@ pub struct RenderInputs<'a> {
     pub theme: &'a FlowTheme,
     pub notifications: &'a [NotificationSnapshot],
     pub notification_unread_count: usize,
+    pub update_available_count: usize,
     pub lock_screen: &'a LockScreenSnapshot,
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
@@ -1928,9 +1929,14 @@ impl RenderState {
                             "u_reference_white_nits",
                             color.description.reference_white_nits.max(1.0),
                         ),
+                        Uniform::new(
+                            "u_linear_to_scene_scale",
+                            color.description.linear_to_scene_scale(),
+                        ),
                         Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
                         Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
                         Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
+                        Uniform::new("u_src_bits", color.pq_src_bits),
                     ];
                     frame.override_default_tex_program(client_to_scene.clone(), uniforms);
                     let result = draw_render_elements(frame, ctx.output_scale.x, run, damage);
@@ -2127,6 +2133,7 @@ impl RenderState {
                 inputs.current_workspace,
                 inputs.fonts,
                 inputs.notification_unread_count,
+                inputs.update_available_count,
                 theme,
                 inputs.client_compositing.ui_textures_linear(),
             );
@@ -3279,9 +3286,10 @@ impl RenderState {
             .unwrap();
     }
 
-    /// Overlay the bundled wallpaper's wide-gamut/HDR creative highlights in
-    /// the FP16 scene. The ordinary SDR wallpaper remains the visual base, so
-    /// this pass is a no-op on an sRGB SDR output and never raises its blacks.
+    /// Overlay the bundled wallpaper's wide-gamut accents and conservative
+    /// HDR10 highlight lifts in the FP16 scene. The ordinary SDR wallpaper
+    /// remains the visual base, so this pass is a no-op on an sRGB SDR output
+    /// and never raises its blacks.
     pub fn draw_wallpaper_creative_grade(
         &self,
         frame: &mut GlesFrame<'_, '_>,
@@ -3717,9 +3725,14 @@ impl RenderState {
                     "u_reference_white_nits",
                     color.description.reference_white_nits.max(1.0),
                 ),
+                Uniform::new(
+                    "u_linear_to_scene_scale",
+                    color.description.linear_to_scene_scale(),
+                ),
                 Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
                 Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
                 Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
+                Uniform::new("u_src_bits", color.pq_src_bits),
             ];
             frame.override_default_tex_program(client_to_scene.clone(), uniforms);
             let result = draw_render_elements(frame, ctx.output_scale.x, run, damage);
@@ -4116,6 +4129,7 @@ impl RenderState {
         current_workspace: WorkspaceId,
         fonts: &FontSystem,
         notification_unread_count: usize,
+        update_available_count: usize,
         theme: &FlowTheme,
         linear_target: bool,
     ) {
@@ -4372,6 +4386,49 @@ impl RenderState {
                                 style,
                                 &tinted_icon,
                             );
+                            let badge_count =
+                                if el.id == focaldesk_ui::ui_builder::TOPBAR_NOTIFICATIONS_ID {
+                                    notification_unread_count
+                                } else if el.id == focaldesk_ui::ui_builder::TOPBAR_UPDATES_ID {
+                                    update_available_count
+                                } else {
+                                    0
+                                };
+                            if badge_count > 0 {
+                                let count = badge_count.min(99).to_string();
+                                let badge = Rectangle::from_loc_and_size(
+                                    (
+                                        base_rect_logical.loc.x + base_rect_logical.size.w - 16,
+                                        base_rect_logical.loc.y + 4,
+                                    ),
+                                    (18, 14),
+                                );
+                                let _ = self.draw_rounded_rect(
+                                    frame,
+                                    badge,
+                                    ctx.output_scale,
+                                    6.0,
+                                    active_theme.chrome.accent_color,
+                                );
+                                let badge_style = style_for(
+                                    FontRole::Meta,
+                                    11,
+                                    active_theme
+                                        .id
+                                        .builtin_id()
+                                        .unwrap_or(BuiltInThemeId::Eagle),
+                                );
+                                let _ = self.draw_text_cached(
+                                    frame,
+                                    fonts,
+                                    &count,
+                                    badge.loc.x + 5,
+                                    badge.loc.y + 11,
+                                    badge_style,
+                                    active_theme.text.title,
+                                    ctx.output_scale,
+                                );
+                            }
                         }
                     }
 

@@ -95,6 +95,21 @@ pub fn panel_controls(shell: &ShellSnapshot) -> Vec<ShellControl> {
         .selected(shell.notification_unread_count > 0)
         .active(shell.notification_unread_count > 0),
         ShellControl::new(
+            IconId::Updates,
+            if shell.update_busy {
+                "Installing or checking system updates…".into()
+            } else if shell.update_available_count == 0 {
+                "System updates: up to date".into()
+            } else if shell.update_available_count == 1 {
+                "1 system update available".into()
+            } else {
+                format!("{} system updates available", shell.update_available_count)
+            },
+            DesktopAction::OpenUpdatesPanel,
+        )
+        .selected(shell.update_available_count > 0)
+        .active(shell.update_busy || shell.update_available_count > 0),
+        ShellControl::new(
             IconId::SpeakerOff,
             if shell.do_not_disturb {
                 "Do Not Disturb: on"
@@ -264,18 +279,22 @@ mod tests {
             ..ShellSnapshot::default()
         };
         let controls = panel_controls(&shell);
-        assert_eq!(controls.len(), 8);
+        assert_eq!(controls.len(), 9);
         assert!(controls[0].selected);
         assert!(controls[3].active);
-        assert!(controls[4].active);
-        assert!(!controls[5].enabled);
+        assert!(controls[5].active);
         assert!(!controls[6].enabled);
+        assert!(!controls[7].enabled);
         assert!(matches!(
             controls[3].action,
             DesktopAction::OpenNotificationsPanel
         ));
         assert!(matches!(
             controls[4].action,
+            DesktopAction::OpenUpdatesPanel
+        ));
+        assert!(matches!(
+            controls[5].action,
             DesktopAction::ToggleDoNotDisturb
         ));
         assert!(matches!(

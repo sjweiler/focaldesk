@@ -53,7 +53,7 @@ release.
 | Workspaces and multi-monitor layout | Working, with ongoing edge-case work |
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
-| HDR and color management | Experimental and hardware-dependent |
+| HDR and color management | Experimental and hardware-dependent; HDR10 verified on Fedora 44 with NVIDIA 595, including Google Chrome ([details](docs/hdr.md#known-working-configuration)) |
 | Settings, file manager, launcher, and AI console | Usable prototypes |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |
@@ -322,6 +322,7 @@ That installs and enables:
 - `focal-launchd`
 - `focaldesk-powerd`
 - `focaldesk-notificationsd`
+- `focaldesk-updatesd`
 - `focaldesk-dialogd`
 - `focaldesk-controlsd`
 - `focaldesk-settingsd`

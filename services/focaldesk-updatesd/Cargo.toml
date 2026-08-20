@@ -1,0 +1,18 @@
+[package]
+name = "focaldesk-updatesd"
+version = "0.1.0"
+edition = "2024"
+description = "FocalDesk system update notification daemon"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-updatesd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+focaldesk-updates = { path = "../../crates/focaldesk-updates" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

@@ -27,6 +27,7 @@ focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-resources = { path = "../focaldesk-resources" }
 focaldesk-cursor = { path = "../focaldesk-cursor" }
 focaldesk-notifications = { path = "../focaldesk-notifications" }
+focaldesk-updates = { path = "../focaldesk-updates" }
 focaldesk-settings-core = { path = "../focaldesk-settings-core" }
 focaldesk-ipc = { path = "../focaldesk-ipc" }
 focaldesk-themes = { path = "../focaldesk-themes" }
@@ -44,7 +45,7 @@ zbus = "3"
 tokio = { version = "1", features = ["rt"] }
 accesskit = "0.24.1"
 accesskit_unix = "0.22.1"
-pipewire = "0.8"
+pipewire = "0.10"
 egui = "0.31"
 # Optional backend deps you control (examples)
 winit = { version = "0.30", optional = true }

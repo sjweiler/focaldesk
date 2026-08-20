@@ -60,6 +60,7 @@ pub enum IconId {
     Speaker,
     SpeakerOff,
     Notifications,
+    Updates,
     FocalDeskLabel,
     Power,
     HDR,
@@ -161,6 +162,7 @@ impl IconId {
             "speaker" => Self::Speaker,
             "speaker_off" => Self::SpeakerOff,
             "notifications" | "notification" => Self::Notifications,
+            "updates" | "update" => Self::Updates,
             "power" => Self::Power,
             "hdr" => Self::HDR,
             "browser" => Self::Browser,
@@ -685,6 +687,10 @@ where
         (
             IconId::Notifications,
             include_bytes!("../../../assets/svg/notifications.svg"),
+        ),
+        (
+            IconId::Updates,
+            include_bytes!("../../../assets/svg/updates.svg"),
         ),
         (
             IconId::Browser,

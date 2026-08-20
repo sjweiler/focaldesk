@@ -1,0 +1,14 @@
+[Unit]
+Description=FocalDesk system updates daemon
+PartOf=focaldesk-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focaldesk-updatesd
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=focaldesk-session.target

@@ -81,6 +81,7 @@ pub fn parse_icc_profile(data: &[u8]) -> Result<ParsedIccProfile, IccError> {
         max_luminance_nits,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: false,
     };
     let output_lut = icc_lut::build_output_to_device_lut(data, description).ok();
 
@@ -268,6 +269,7 @@ pub fn color_description_from_edid(edid: &[u8]) -> Option<ColorDescription> {
         max_luminance_nits: 80.0,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: false,
     })
 }
 

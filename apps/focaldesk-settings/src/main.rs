@@ -497,14 +497,37 @@ fn refresh_all_outputs_hdr_control(
         "No active HDR10-capable displays were detected".to_string()
     } else if requested == 0 {
         "Turn on HDR output request for one or more displays first".to_string()
+    } else if requested < active_capable.len() {
+        format!(
+            "Apply HDR10 to all {} capable displays so they share the same encode; mixed HDR10/SDR will not match",
+            active_capable.len()
+        )
     } else {
         format!(
-            "Apply HDR10 to {requested} requested display{}; every unrequested output stays active in SDR",
-            if requested == 1 { "" } else { "s" }
+            "Apply HDR10 to {} capable display{}",
+            active_capable.len(),
+            if active_capable.len() == 1 { "" } else { "s" }
         )
     };
     row.set_subtitle(&subtitle);
     button.set_sensitive(requested > 0);
+}
+
+fn align_hdr_requests_across_capable_outputs(displays: &mut [DisplayConfig]) -> bool {
+    let any_requested = displays
+        .iter()
+        .any(|display| display.enabled && display.hdr_supported && display.hdr_requested);
+    if !any_requested {
+        return false;
+    }
+    let mut changed = false;
+    for display in displays.iter_mut() {
+        if display.enabled && display.hdr_supported && !display.hdr_requested {
+            display.hdr_requested = true;
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn exclusive_hdr_status_text(phase: ExclusiveHdrPhase, reason: Option<&str>) -> String {
@@ -1888,8 +1911,9 @@ fn connected_display_row(
     }
 
     let color_row = adw::ActionRow::new();
-    color_row.set_title("Color profile");
-    color_row.set_subtitle("Choose the output profile the compositor should advertise");
+    color_row.set_title("Color gamut");
+    color_row
+        .set_subtitle("Auto uses the monitor profile; sRGB and Display P3 override SDR color only");
     let color_dropdown = dropdown_from_strings(
         DISPLAY_COLOR_PROFILE_OPTIONS,
         display_color_profile_index(display.color_profile),
@@ -4174,9 +4198,14 @@ fn chrome_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     for (title, id) in [
         ("Network", 100),
         ("Bluetooth", 101),
-        ("Audio and microphone", 102),
+        ("Audio", 102),
         ("HDR display status", 103),
         ("Power", 104),
+        ("Camera", 105),
+        ("Do Not Disturb", 106),
+        ("Notifications", 107),
+        ("Microphone", 108),
+        ("System updates", 109),
     ] {
         let active = !settings.borrow().chrome.topbar.hidden.contains(&id);
         let toggle = add_switch_row(&topbar, title, None, active);
@@ -4190,7 +4219,11 @@ fn chrome_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
-    let topbar_order = add_entry_row(&topbar, "Indicator order", "100, 101, 102, 103, 104");
+    let topbar_order = add_entry_row(
+        &topbar,
+        "Indicator order",
+        "100, 101, 102, 108, 107, 109, 106, 105, 103, 104",
+    );
     topbar_order.set_text(
         &settings
             .borrow()
@@ -5348,7 +5381,7 @@ fn displays_page(
     let all_hdr_group = adw::PreferencesGroup::new();
     all_hdr_group.set_title("Experimental HDR10");
     all_hdr_group.set_description(Some(
-        "Choose displays with their HDR output request switches, then apply HDR10 without changing the output topology",
+        "HDR10 must be applied to every enabled capable display so identical panels match. Mixed HDR10 and SDR will not look the same.",
     ));
     let all_hdr_row = adw::ActionRow::new();
     all_hdr_row.set_title("Requested HDR10 outputs");
@@ -5404,19 +5437,27 @@ fn displays_page(
         let displays = detected_displays.clone();
         let area = area.clone();
         let row_registry = row_registry.clone();
+        let hdr_switch_registry = hdr_switch_registry.clone();
+        let bulk_hdr_update = bulk_hdr_update.clone();
         let hdr_requests_dirty = hdr_requests_dirty.clone();
         let all_hdr_row = all_hdr_row.clone();
         let all_hdr_button_for_handler = all_hdr_button.clone();
         all_hdr_button.connect_clicked(move |_| {
+            {
+                let mut displays = displays.borrow_mut();
+                align_hdr_requests_across_capable_outputs(&mut displays);
+            }
+            bulk_hdr_update.set(true);
             for display in displays.borrow().iter() {
                 if let Some(row) = row_registry.borrow().get(&display.name) {
                     row.set_subtitle(&display_summary(display));
                 }
+                if let Some(switch) = hdr_switch_registry.borrow().get(&display.name) {
+                    set_switch_if_changed(switch, display.hdr_requested || display.hdr_enabled);
+                }
             }
+            bulk_hdr_update.set(false);
 
-            // Submit the complete topology unchanged. The compositor reads
-            // each output's individual HDR request and leaves every other
-            // enabled output in SDR.
             persist_displays(&displays.borrow());
             match apply_displays_to_desktop(&displays.borrow()) {
                 Ok(()) => {
@@ -5661,5 +5702,49 @@ mod tests {
 
         assert!(output.hdr_requested);
         assert!(!output.hdr_enabled);
+    }
+
+    fn test_display(name: &str, hdr_requested: bool) -> DisplayConfig {
+        DisplayConfig {
+            name: name.to_string(),
+            enabled: true,
+            mode_width: 2560,
+            mode_height: 1440,
+            refresh_mhz: 120_000,
+            scale: 1.0,
+            logical_x: 0,
+            logical_y: 0,
+            physical_width_mm: None,
+            physical_height_mm: None,
+            primary: name == "DP-3",
+            transform: "Normal".to_string(),
+            color_profile: DisplayColorProfile::Auto,
+            icc_profile_path: None,
+            hdr_supported: true,
+            hdr_requested,
+            hdr_enabled: false,
+            icc_lut_fallback_active: false,
+            wide_gamut_active: false,
+            exclusive_hdr_phase: ExclusiveHdrPhase::Off,
+            exclusive_hdr_reason: None,
+        }
+    }
+
+    #[test]
+    fn apply_hdr10_requests_every_capable_sibling() {
+        let mut displays = vec![test_display("DP-3", false), test_display("DP-4", true)];
+        assert!(align_hdr_requests_across_capable_outputs(&mut displays));
+        assert!(displays.iter().all(|display| display.hdr_requested));
+
+        let mut already_aligned = vec![test_display("DP-3", true), test_display("DP-4", true)];
+        assert!(!align_hdr_requests_across_capable_outputs(
+            &mut already_aligned
+        ));
+
+        let mut none_requested = vec![test_display("DP-3", false), test_display("DP-4", false)];
+        assert!(!align_hdr_requests_across_capable_outputs(
+            &mut none_requested
+        ));
+        assert!(none_requested.iter().all(|display| !display.hdr_requested));
     }
 }

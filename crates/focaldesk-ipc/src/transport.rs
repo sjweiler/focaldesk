@@ -77,6 +77,7 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-cli",
         "focaldesk-ai-console",
         "focaldesk-mcp",
+        "focaldesk-updatesd",
     ],
     allowed_units: &["focaldesk-automation.service"],
 };
@@ -85,6 +86,12 @@ pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "power",
     allowed_executables: &["focaldesk-desktop", "focaldesk-settings"],
     allowed_units: &[],
+};
+
+pub const UPDATES_POLICY: PeerPolicy<'static> = PeerPolicy {
+    endpoint: "updates",
+    allowed_executables: &["focaldesk-desktop", "focaldesk-cli", "focaldesk-updatesd"],
+    allowed_units: &["focaldesk-updatesd.service"],
 };
 
 pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {

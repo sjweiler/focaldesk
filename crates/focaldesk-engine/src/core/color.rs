@@ -124,6 +124,8 @@ pub enum TransferFunction {
     Linear,
     /// SMPTE ST 2084 perceptual quantizer (HDR PQ scanout).
     St2084Pq,
+    /// Piecewise sRGB extended above 1.0 (Wayland `ext_srgb`, Chromium `SRGB_HDR`).
+    SrgbHdr,
 }
 
 /// Shader decode mode sent as `u_decode_tf`.
@@ -134,6 +136,7 @@ pub enum TransferDecodeMode {
     LinearPassThrough = 1,
     Gamma22 = 2,
     St2084Pq = 3,
+    SrgbHdrExtended = 4,
 }
 
 impl TransferFunction {
@@ -143,13 +146,14 @@ impl TransferFunction {
             Self::Gamma22 => TransferDecodeMode::Gamma22,
             Self::Linear => TransferDecodeMode::LinearPassThrough,
             Self::St2084Pq => TransferDecodeMode::St2084Pq,
+            Self::SrgbHdr => TransferDecodeMode::SrgbHdrExtended,
         }
     }
 
     /// Electrical encoding applied when writing the KMS framebuffer.
     pub fn encode_mode(self) -> TransferDecodeMode {
         match self {
-            Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
+            Self::Srgb | Self::Bt1886 | Self::SrgbHdr => TransferDecodeMode::SrgbPiecewise,
             Self::Gamma22 => TransferDecodeMode::Gamma22,
             Self::Linear => TransferDecodeMode::SrgbPiecewise,
             Self::St2084Pq => TransferDecodeMode::St2084Pq,
@@ -166,6 +170,9 @@ pub struct ColorDescription {
     pub max_luminance_nits: f32,
     pub max_cll_nits: Option<f32>,
     pub max_fall_nits: Option<f32>,
+    /// `create_windows_scrgb` stimulus: R=G=B=1.0 is 80 cd/m², not paper white.
+    /// Parametric ExtLinear with a 203-nit reference is a different encoding.
+    pub windows_scrgb_stimulus: bool,
 }
 
 /// Diffuse/graphics white used when placing SDR desktop content in an HDR PQ signal.
@@ -180,6 +187,59 @@ pub fn hdr_reference_white_nits(max_luminance_nits: f32) -> f32 {
     HDR_REFERENCE_WHITE_NITS.min(max_luminance_nits.max(1.0))
 }
 
+/// DisplayHDR 400-class ceiling for authored HDR10 highlight energy.
+///
+/// ASUS VG32VQR-class VA panels advertise HDR10 and about 450 nits usable
+/// peak, but they have no local dimming. Inventing 800–1000 nit highlights
+/// only clips or trips the monitor's global tone map. Type-1 EDID often
+/// quantizes that peak to 409 nits; encode and KMS metadata use 450 so the
+/// panel's tone map matches the PQ we actually send.
+pub const HDR_CONSERVATIVE_PEAK_NITS: f32 = 450.0;
+
+/// Usable HDR10 peak for encode, preferred client volume, and KMS metadata.
+///
+/// DisplayHDR 400 EDID commonly reports ~409 nits. These ASUS VA panels still
+/// reach about 450, so values at or below that ceiling are raised to 450.
+/// Brighter EDID peaks stay capped at [`HDR_CONSERVATIVE_PEAK_NITS`].
+pub fn hdr_conservative_peak_nits(max_luminance_nits: f32) -> f32 {
+    let _ = max_luminance_nits.max(1.0);
+    HDR_CONSERVATIVE_PEAK_NITS
+}
+
+/// CTA-861 Type-1 has no SDR-white field. MaxFALL carries BT.2408 graphics
+/// white so the monitor's global tone map treats desktop average as paper
+/// white instead of a full-frame 450-nit peak.
+pub fn hdr10_kms_max_luminance_nits() -> u16 {
+    HDR_CONSERVATIVE_PEAK_NITS.round() as u16
+}
+
+pub fn hdr10_kms_max_cll_nits() -> u16 {
+    hdr10_kms_max_luminance_nits()
+}
+
+pub fn hdr10_kms_max_fall_nits() -> u16 {
+    HDR_REFERENCE_WHITE_NITS.round() as u16
+}
+
+/// PQ-encode luminance map: keep graphics white and most in-range HDR.
+///
+/// Rolling from paper white with a 10,000 nit source crushed 400 nit content
+/// on a 450 nit panel. Starting at 80% of peak keeps those values, and still
+/// compresses extremes so 8-bit PQ clouds do not posterize into magenta.
+pub fn tone_map_hdr_nits(value: f32, source_peak: f32, display_peak: f32, white: f32) -> f32 {
+    let display_peak = display_peak.max(1.0);
+    let white = white.max(1.0).min(display_peak);
+    let knee = white.max(display_peak * 0.8);
+    if value <= knee || display_peak <= knee {
+        return value.min(display_peak);
+    }
+    let peak = source_peak.max(knee + 0.0001);
+    let range = (display_peak - knee).max(0.0001);
+    let denominator = 1.0 - (-(peak - knee) / range).exp();
+    let numerator = 1.0 - (-(value - knee) / range).exp();
+    knee + range * numerator / denominator.max(0.0001)
+}
+
 impl ColorDescription {
     /// Wayland surfaces without an image description are sRGB by definition.
     pub const SRGB: Self = Self {
@@ -189,6 +249,7 @@ impl ColorDescription {
         max_luminance_nits: 80.0,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: false,
     };
 
     pub const LINEAR_SRGB: Self = Self {
@@ -198,9 +259,11 @@ impl ColorDescription {
         max_luminance_nits: 80.0,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: false,
     };
 
-    /// Windows-scRGB (`create_windows_scrgb`): sRGB primaries, extended linear, 203 nits ref white.
+    /// Windows-scRGB (`create_windows_scrgb`): sRGB primaries, extended linear.
+    /// Sample 1.0 is 80 cd/m²; assumed graphics white is 2.5375 (203 cd/m²).
     pub const WINDOWS_SCRGB: Self = Self {
         primaries: ColorPrimaries::Srgb,
         transfer: TransferFunction::Linear,
@@ -208,6 +271,7 @@ impl ColorDescription {
         max_luminance_nits: 10_000.0,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: true,
     };
 
     pub const DISPLAY_P3_SRGB: Self = Self {
@@ -217,6 +281,57 @@ impl ColorDescription {
         max_luminance_nits: 80.0,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: false,
+    };
+
+    /// Chrome's Wayland HDR raster space: Display P3, extended sRGB, 1.0 = paper white.
+    pub const DISPLAY_P3_SRGB_HDR: Self = Self {
+        primaries: ColorPrimaries::DisplayP3,
+        transfer: TransferFunction::SrgbHdr,
+        reference_white_nits: HDR_REFERENCE_WHITE_NITS,
+        max_luminance_nits: 10_000.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+        windows_scrgb_stimulus: false,
+    };
+
+    /// Linear BT.2020 with sample 1.0 as paper white. Chrome tags FP16 windows
+    /// as HDR10 PQ but stores linear BT.2020, not ST.2084 and not Display P3.
+    pub const BT2020_LINEAR_HDR: Self = Self {
+        primaries: ColorPrimaries::Bt2020,
+        transfer: TransferFunction::Linear,
+        reference_white_nits: HDR_REFERENCE_WHITE_NITS,
+        max_luminance_nits: 10_000.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+        windows_scrgb_stimulus: false,
+    };
+
+    /// BT.2020 with extended sRGB. Chrome's FP16 HDR window often still has
+    /// the sRGB OETF in the samples; linear decode leaves reds orange.
+    pub const BT2020_SRGB_HDR: Self = Self {
+        primaries: ColorPrimaries::Bt2020,
+        transfer: TransferFunction::SrgbHdr,
+        reference_white_nits: HDR_REFERENCE_WHITE_NITS,
+        max_luminance_nits: 10_000.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+        windows_scrgb_stimulus: false,
+    };
+
+    /// Extended linear Rec.709 with sample 1.0 as paper white.
+    ///
+    /// Chrome's Wayland HDR raster is scRGB-shaped (709 primaries, values
+    /// outside 0–1 for P3) even when it tags the window BT.2020/PQ. This is
+    /// not Windows-scRGB: 1.0 is 203 nits, not 80.
+    pub const SCRGB_LINEAR_HDR: Self = Self {
+        primaries: ColorPrimaries::Srgb,
+        transfer: TransferFunction::Linear,
+        reference_white_nits: HDR_REFERENCE_WHITE_NITS,
+        max_luminance_nits: 10_000.0,
+        max_cll_nits: None,
+        max_fall_nits: None,
+        windows_scrgb_stimulus: false,
     };
 
     /// Wide-gamut SDR capture target. The portal shader applies the precise
@@ -229,7 +344,55 @@ impl ColorDescription {
         max_luminance_nits: 80.0,
         max_cll_nits: None,
         max_fall_nits: None,
+        windows_scrgb_stimulus: false,
     };
+
+    /// Display P3 + PQ. Kept for named P3 HDR10 surfaces; P3-class preferred
+    /// descriptions use `DISPLAY_P3_SRGB_HDR` because Chrome's 8-bit window
+    /// cannot carry ST.2084. Scanout is still BT.2020/PQ.
+    pub fn display_p3_pq_hdr(max_luminance_nits: f32, max_fall_nits: f32) -> Self {
+        Self {
+            primaries: ColorPrimaries::DisplayP3,
+            transfer: TransferFunction::St2084Pq,
+            reference_white_nits: hdr_reference_white_nits(max_luminance_nits),
+            max_luminance_nits,
+            max_cll_nits: Some(max_luminance_nits),
+            max_fall_nits: Some(max_fall_nits),
+            windows_scrgb_stimulus: false,
+        }
+    }
+
+    /// HDR preferred description for clients.
+    ///
+    /// Chrome rasters HDR in Display P3 with extended sRGB (1.0 = paper white).
+    /// 8-bit windows cannot carry ST.2084, so P3-class panels advertise that
+    /// raster space. PQ-tagging 8-bit P3 made the W nearly disappear (both
+    /// reds clip to the same peak) and crushed SDR/HDR stills. Scanout is
+    /// still BT.2020/PQ. Named BT.2020 panels keep BT.2020+PQ.
+    pub fn hdr_preferred_from_panel(
+        panel: Self,
+        max_luminance_nits: f32,
+        max_fall_nits: f32,
+    ) -> Self {
+        let peak = hdr_conservative_peak_nits(max_luminance_nits);
+        let white = hdr_reference_white_nits(peak);
+        let _ = max_fall_nits;
+        match panel.primaries {
+            ColorPrimaries::Bt2020 => {
+                let mut hdr = Self::bt2020_pq_hdr(peak, white);
+                hdr.max_cll_nits = Some(peak);
+                hdr.max_fall_nits = Some(white);
+                hdr
+            }
+            _ => {
+                let mut hdr = Self::DISPLAY_P3_SRGB_HDR;
+                hdr.max_luminance_nits = peak;
+                hdr.max_cll_nits = Some(peak);
+                hdr.max_fall_nits = Some(white);
+                hdr
+            }
+        }
+    }
 
     /// BT.2020 + PQ from EDID Type-1 static metadata (HDR scanout target).
     pub fn bt2020_pq_hdr(max_luminance_nits: f32, max_fall_nits: f32) -> Self {
@@ -240,8 +403,77 @@ impl ColorDescription {
             max_luminance_nits,
             max_cll_nits: Some(max_luminance_nits),
             max_fall_nits: Some(max_fall_nits),
+            windows_scrgb_stimulus: false,
         }
     }
+
+    /// Windows-scRGB stimulus encoding from `create_windows_scrgb` or an
+    /// equivalent parametric ExtLinear description.
+    ///
+    /// This is not ordinary sRGB: sample 1.0 is 80 cd/m², graphics white is
+    /// 203 cd/m² (sample 2.5375), values may be negative, and values above 1.0
+    /// are HDR headroom. The compositor must keep those samples linear.
+    pub fn is_windows_scrgb(self) -> bool {
+        self.windows_scrgb_stimulus
+    }
+
+    /// Scale decoded linear samples into the scene convention where 1.0 is
+    /// reference white.
+    ///
+    /// Windows-scRGB is unusual: sample value 1.0 means 80 cd/m², while its
+    /// assumed reference white is sample value 2.5375 (203 cd/m²). Other
+    /// linear descriptions in the current model already use 1.0 as reference
+    /// white and therefore need no adjustment.
+    pub fn linear_to_scene_scale(self) -> f32 {
+        if self.is_windows_scrgb() {
+            80.0 / HDR_REFERENCE_WHITE_NITS
+        } else {
+            1.0
+        }
+    }
+}
+
+/// Pixel packing of a client `wl_buffer`, used to catch image descriptions that
+/// do not match the samples actually uploaded.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ClientBufferEncoding {
+    #[default]
+    Unknown,
+    Unorm8,
+    Unorm10,
+    Float16,
+}
+
+/// Chrome's 8-bit HDR window is Display P3 with an sRGB-style transfer, even
+/// when it copies a PQ tag. PQ-decoding those samples clips both W-test reds
+/// to the same peak and wrecks still shading. 10-bit packed RGB can be real
+/// HDR10. FP16 tagged PQ is linear Rec.709, not ST.2084.
+pub fn sanitize_tagged_client_description(
+    description: ColorDescription,
+    buffer: ClientBufferEncoding,
+) -> ColorDescription {
+    match buffer {
+        ClientBufferEncoding::Float16 if description.transfer == TransferFunction::St2084Pq => {
+            ColorDescription::SCRGB_LINEAR_HDR
+        }
+        ClientBufferEncoding::Unorm8 | ClientBufferEncoding::Unknown
+            if matches!(
+                description.transfer,
+                TransferFunction::St2084Pq | TransferFunction::SrgbHdr
+            ) =>
+        {
+            ColorDescription::DISPLAY_P3_SRGB_HDR
+        }
+        _ => description,
+    }
+}
+
+/// Preferred client descriptions that must stay parametric (no SDR ICC file).
+pub fn is_hdr_client_preferred_transfer(transfer: TransferFunction) -> bool {
+    matches!(
+        transfer,
+        TransferFunction::St2084Pq | TransferFunction::SrgbHdr
+    )
 }
 
 impl Default for ColorDescription {
@@ -265,6 +497,10 @@ pub struct SurfaceColorRenderState {
     pub intent: RenderingIntent,
     /// Row-major 3×3: linear client RGB → scene-linear Rec.709.
     pub client_to_scene: [[f32; 3]; 3],
+    /// Encoded-source bit depth for decode dither. Chrome's HDR window is
+    /// still `AB24`, whether tagged PQ or `SrgbHdr`; 10-bit/FP16 leave this
+    /// at 0.
+    pub pq_src_bits: f32,
 }
 
 impl SurfaceColorRenderState {
@@ -275,7 +511,23 @@ impl SurfaceColorRenderState {
             description,
             intent,
             client_to_scene,
+            pq_src_bits: 0.0,
         }
+    }
+
+    pub fn with_buffer_encoding(mut self, encoding: ClientBufferEncoding) -> Self {
+        // Sanitize remaps 8-bit PQ to SrgbHdr, and Chrome 151 tags that
+        // transfer itself. Either way the samples are 8-bit, so skies
+        // posterize into purple/blue slabs unless we dither in code value.
+        let eight_bit_hdr = matches!(
+            encoding,
+            ClientBufferEncoding::Unorm8 | ClientBufferEncoding::Unknown
+        ) && matches!(
+            self.description.transfer,
+            TransferFunction::St2084Pq | TransferFunction::SrgbHdr
+        );
+        self.pq_src_bits = if eight_bit_hdr { 8.0 } else { 0.0 };
+        self
     }
 
     pub fn srgb_default() -> Self {
@@ -352,8 +604,9 @@ pub fn kms_scanout_encode_description(
     hdr_max_fall_nits: Option<f32>,
 ) -> ColorDescription {
     if hdr_active {
-        if let (Some(max), Some(fall)) = (hdr_max_luminance_nits, hdr_max_fall_nits) {
-            return ColorDescription::bt2020_pq_hdr(max, fall);
+        if let (Some(max), Some(_fall)) = (hdr_max_luminance_nits, hdr_max_fall_nits) {
+            let peak = hdr_conservative_peak_nits(max);
+            return ColorDescription::bt2020_pq_hdr(peak, hdr_reference_white_nits(peak));
         }
     }
     output
@@ -392,6 +645,34 @@ pub fn gamut_matrix_linear_rgb(
     let m_dst = primaries_to_rgb_to_xyz(dst.chromaticity());
     let inv_dst = invert_3x3(m_dst);
     multiply_3x3(inv_dst, m_src)
+}
+
+/// Destination primaries for HDR10 gamut mapping.
+///
+/// P3-class panels (named P3 or a factory ICC) map into Display P3 D65 so the
+/// wide-gamut W stays in-gamut and HDR white stays D65. Swapping only the ICC
+/// white without adapting the RGB xy distorts that volume and turns the W
+/// orange and HDR clouds magenta. A missing ICC does not crush P3 into sRGB.
+/// A named BT.2020 panel is a no-op.
+pub fn hdr10_encode_panel_primaries(panel: ColorPrimaries) -> ColorPrimaries {
+    match panel {
+        ColorPrimaries::Srgb | ColorPrimaries::Bt2020 => ColorPrimaries::Bt2020,
+        ColorPrimaries::DisplayP3 | ColorPrimaries::Custom(_) => ColorPrimaries::DisplayP3,
+    }
+}
+
+/// Scene Rec.709 → panel RGB, panel RGB → BT.2020, and panel luminance coeffs.
+pub fn hdr10_pq_encode_transforms(
+    panel: ColorPrimaries,
+) -> ([[f32; 3]; 3], [[f32; 3]; 3], [f32; 3]) {
+    let dest = hdr10_encode_panel_primaries(panel);
+    let scene_to_panel =
+        gamut_matrix_linear_rgb(scene_working_primaries(), dest, RenderingIntent::Relative);
+    let panel_to_bt2020 =
+        gamut_matrix_linear_rgb(dest, ColorPrimaries::Bt2020, RenderingIntent::Relative);
+    let xyz = primaries_to_rgb_to_xyz(dest.chromaticity());
+    let luma = [xyz[1][0], xyz[1][1], xyz[1][2]];
+    (scene_to_panel, panel_to_bt2020, luma)
 }
 
 /// Row-major 3×3: scene-linear Rec.709 → linear output primaries.
@@ -522,6 +803,39 @@ pub fn hdr_kms_env_forced() -> bool {
     )
 }
 
+/// NVIDIA live KMS HDR with more than one active output.
+pub fn hdr_nvidia_dual_enabled() -> bool {
+    matches!(
+        std::env::var("FOCALDESK_HDR_NVIDIA_DUAL").ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// `FOCALDESK_HDR_OUTPUT` is set to one exact connector for a mixed HDR/SDR test.
+pub fn hdr_output_selector_active() -> bool {
+    normalized_env_value("FOCALDESK_HDR_OUTPUT").is_some()
+}
+
+/// Sibling HDR-capable panels must share HDR10 or share SDR.
+///
+/// Mixing HDR10 PQ on one head with SDR+ICC on the other makes identical
+/// monitors look different (warm ICC vs D65 PQ). Chrome also switches to
+/// scRGB whenever any output has live HDR, so the SDR head is wrong too.
+/// Exclusive HDR and `FOCALDESK_HDR_OUTPUT` keep one-head test topologies.
+pub fn matching_hdr_request(
+    nvidia_dual: bool,
+    exclusive_topology: bool,
+    single_output_selector: bool,
+    this_hdr10_capable: bool,
+    this_requested: bool,
+    any_capable_requested: bool,
+) -> bool {
+    if exclusive_topology || single_output_selector || !this_hdr10_capable {
+        return this_requested;
+    }
+    (nvidia_dual && any_capable_requested) || this_requested
+}
+
 /// Limit experimental HDR rendering and KMS changes to one connector.
 ///
 /// This is a development safety rail, not a persistent display preference. An
@@ -578,24 +892,25 @@ pub fn exclusive_hdr_output_selector() -> Option<String> {
         return None;
     }
     normalized_env_value("FOCALDESK_EXCLUSIVE_HDR_OUTPUT").or_else(|| {
-        (state.phase != focaldesk_settings_core::ExclusiveHdrPhase::Off)
+        state
+            .phase
+            .selects_output()
             .then_some(state.connector)
             .flatten()
     })
 }
 
 /// Whether the DRM loop may attempt live KMS HDR commits.
+///
+/// A previous exclusive-HDR failure only blocks automatic exclusive retry. It
+/// must not prevent Apply Requested HDR10 or a persisted `hdr_requested` flag
+/// from applying after logout, suspend, restart, or shutdown.
 pub fn hdr_runtime_may_apply_kms(any_output_hdr_requested: bool) -> bool {
-    let exclusive_attempt_failed = focaldesk_settings_core::load_exclusive_hdr_state().phase
-        == focaldesk_settings_core::ExclusiveHdrPhase::Failed;
-    hdr_runtime_may_apply_kms_with_state(any_output_hdr_requested, exclusive_attempt_failed)
+    hdr_runtime_may_apply_kms_with_state(any_output_hdr_requested)
 }
 
-fn hdr_runtime_may_apply_kms_with_state(
-    any_output_hdr_requested: bool,
-    exclusive_attempt_failed: bool,
-) -> bool {
-    if hdr_kms_env_blocked() || exclusive_attempt_failed {
+fn hdr_runtime_may_apply_kms_with_state(any_output_hdr_requested: bool) -> bool {
+    if hdr_kms_env_blocked() {
         return false;
     }
     hdr_kms_env_forced() || any_output_hdr_requested
@@ -723,7 +1038,467 @@ mod tests {
         let hdr = kms_scanout_encode_description(sdr, true, Some(600.0), Some(400.0));
         assert_eq!(hdr.primaries, ColorPrimaries::Bt2020);
         assert_eq!(hdr.transfer, TransferFunction::St2084Pq);
-        assert_eq!(hdr.max_luminance_nits, 600.0);
+        assert_eq!(hdr.max_luminance_nits, HDR_CONSERVATIVE_PEAK_NITS);
+        close(hdr.reference_white_nits, HDR_REFERENCE_WHITE_NITS, 0.0);
+        assert_eq!(hdr.max_fall_nits, Some(HDR_REFERENCE_WHITE_NITS));
+    }
+
+    #[test]
+    fn monitor_gamut_override_does_not_replace_hdr10_scanout_space() {
+        for profile in [
+            DisplayColorProfile::Auto,
+            DisplayColorProfile::Srgb,
+            DisplayColorProfile::DisplayP3,
+        ] {
+            let sdr =
+                apply_output_color_profile_override(ColorDescription::DISPLAY_P3_SRGB, profile);
+            let hdr = kms_scanout_encode_description(sdr, true, Some(1_000.0), Some(400.0));
+            assert_eq!(hdr.primaries, ColorPrimaries::Bt2020);
+            assert_eq!(hdr.transfer, TransferFunction::St2084Pq);
+        }
+    }
+
+    #[test]
+    fn display_p3_surface_survives_scene_to_bt2020_hdr_conversion() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+
+        let p3_red = [1.0, 0.0, 0.0];
+        let p3_to_scene = gamut_matrix_linear_rgb(
+            ColorPrimaries::DisplayP3,
+            scene_working_primaries(),
+            RenderingIntent::Relative,
+        );
+        let scene_to_bt2020 = gamut_matrix_linear_rgb(
+            scene_working_primaries(),
+            ColorPrimaries::Bt2020,
+            RenderingIntent::Relative,
+        );
+        let direct_p3_to_bt2020 = gamut_matrix_linear_rgb(
+            ColorPrimaries::DisplayP3,
+            ColorPrimaries::Bt2020,
+            RenderingIntent::Relative,
+        );
+        let through_scene = transform(scene_to_bt2020, transform(p3_to_scene, p3_red));
+        let direct = transform(direct_p3_to_bt2020, p3_red);
+
+        for channel in 0..3 {
+            close(through_scene[channel], direct[channel], 1e-4);
+        }
+        assert!(through_scene[0] > through_scene[1]);
+        assert!(through_scene[1] > through_scene[2]);
+    }
+
+    #[test]
+    fn windows_scrgb_anchors_eighty_nits_and_hdr_reference_white() {
+        let scale = ColorDescription::WINDOWS_SCRGB.linear_to_scene_scale();
+        assert!(ColorDescription::WINDOWS_SCRGB.is_windows_scrgb());
+        assert!(!ColorDescription::LINEAR_SRGB.is_windows_scrgb());
+        assert!(!ColorDescription::SRGB.is_windows_scrgb());
+        close(1.0 * scale * HDR_REFERENCE_WHITE_NITS, 80.0, 1e-5);
+        close(2.5375 * scale, 1.0, 1e-5);
+        close(
+            ColorDescription::LINEAR_SRGB.linear_to_scene_scale(),
+            1.0,
+            0.0,
+        );
+    }
+
+    #[test]
+    fn pq_tagged_chrome_buffers_decode_as_scrgb_linear_hdr() {
+        let claimed = ColorDescription::bt2020_pq_hdr(409.0, 400.0);
+        let fp16 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Float16);
+        assert!(!fp16.is_windows_scrgb());
+        assert_eq!(fp16, ColorDescription::SCRGB_LINEAR_HDR);
+        assert_eq!(fp16.primaries, ColorPrimaries::Srgb);
+        assert_eq!(fp16.transfer, TransferFunction::Linear);
+        close(fp16.linear_to_scene_scale(), 1.0, 0.0);
+
+        let pq10 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm10);
+        assert_eq!(pq10.transfer, TransferFunction::St2084Pq);
+        assert_eq!(pq10.primaries, ColorPrimaries::Bt2020);
+
+        let unorm8 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm8);
+        assert_eq!(unorm8.transfer, TransferFunction::SrgbHdr);
+        assert_eq!(unorm8.primaries, ColorPrimaries::DisplayP3);
+        assert!(!unorm8.is_windows_scrgb());
+    }
+
+    #[test]
+    fn eight_bit_pq_windows_enable_decode_dither() {
+        let pq = ColorDescription::bt2020_pq_hdr(450.0, 400.0);
+        let eight = SurfaceColorRenderState::for_description(pq, RenderingIntent::Relative)
+            .with_buffer_encoding(ClientBufferEncoding::Unorm8);
+        assert_eq!(eight.pq_src_bits, 8.0);
+        let ten = SurfaceColorRenderState::for_description(pq, RenderingIntent::Relative)
+            .with_buffer_encoding(ClientBufferEncoding::Unorm10);
+        assert_eq!(ten.pq_src_bits, 0.0);
+
+        let chrome = sanitize_tagged_client_description(pq, ClientBufferEncoding::Unorm8);
+        let chrome_eight =
+            SurfaceColorRenderState::for_description(chrome, RenderingIntent::Relative)
+                .with_buffer_encoding(ClientBufferEncoding::Unorm8);
+        assert_eq!(chrome.transfer, TransferFunction::SrgbHdr);
+        assert_eq!(chrome_eight.pq_src_bits, 8.0);
+
+        let tagged = SurfaceColorRenderState::for_description(
+            ColorDescription::DISPLAY_P3_SRGB_HDR,
+            RenderingIntent::Relative,
+        )
+        .with_buffer_encoding(ClientBufferEncoding::Unorm8);
+        assert_eq!(tagged.pq_src_bits, 8.0);
+    }
+
+    #[test]
+    fn bt2020_linear_keeps_srgb_red_from_turning_orange() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+
+        let srgb_red_in_bt2020 = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::Srgb,
+                ColorPrimaries::Bt2020,
+                RenderingIntent::Relative,
+            ),
+            [1.0, 0.0, 0.0],
+        );
+        let through_tagged = transform(
+            SurfaceColorRenderState::for_description(
+                ColorDescription::BT2020_LINEAR_HDR,
+                RenderingIntent::Relative,
+            )
+            .client_to_scene,
+            srgb_red_in_bt2020,
+        );
+        let through_p3 = transform(
+            SurfaceColorRenderState::for_description(
+                ColorDescription::DISPLAY_P3_SRGB_HDR,
+                RenderingIntent::Relative,
+            )
+            .client_to_scene,
+            srgb_red_in_bt2020,
+        );
+        let back_to_2020 = gamut_matrix_linear_rgb(
+            scene_working_primaries(),
+            ColorPrimaries::Bt2020,
+            RenderingIntent::Relative,
+        );
+        let tagged_out = transform(back_to_2020, through_tagged);
+        let p3_out = transform(back_to_2020, through_p3);
+
+        close(tagged_out[0], srgb_red_in_bt2020[0], 1e-4);
+        close(tagged_out[1], srgb_red_in_bt2020[1], 1e-4);
+        assert!(p3_out[1] / p3_out[0] > tagged_out[1] / tagged_out[0] + 0.05);
+    }
+
+    #[test]
+    fn scrgb_linear_hdr_encodes_srgb_red_as_bt2020_red_not_bt2020_primary() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+
+        let scene = SurfaceColorRenderState::for_description(
+            ColorDescription::SCRGB_LINEAR_HDR,
+            RenderingIntent::Relative,
+        )
+        .client_to_scene;
+        let to_2020 = gamut_matrix_linear_rgb(
+            scene_working_primaries(),
+            ColorPrimaries::Bt2020,
+            RenderingIntent::Relative,
+        );
+        let out = transform(to_2020, transform(scene, [1.0, 0.0, 0.0]));
+        let srgb_red_in_bt2020 = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::Srgb,
+                ColorPrimaries::Bt2020,
+                RenderingIntent::Relative,
+            ),
+            [1.0, 0.0, 0.0],
+        );
+        close(out[0], srgb_red_in_bt2020[0], 1e-4);
+        close(out[1], srgb_red_in_bt2020[1], 1e-4);
+        assert!(out[0] < 0.75);
+        assert!(out[1] > 0.04);
+    }
+
+    #[test]
+    fn srgb_encoded_bt2020_red_needs_srgb_decode_to_stay_red() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+
+        let linear_2020 = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::Srgb,
+                ColorPrimaries::Bt2020,
+                RenderingIntent::Relative,
+            ),
+            [1.0, 0.0, 0.0],
+        );
+        let encoded = [
+            linear_to_srgb(linear_2020[0]),
+            linear_to_srgb(linear_2020[1]),
+            linear_to_srgb(linear_2020[2]),
+        ];
+        let decoded = [
+            srgb_to_linear(encoded[0]),
+            srgb_to_linear(encoded[1]),
+            srgb_to_linear(encoded[2]),
+        ];
+        assert!(encoded[1] / encoded[0] > 0.25);
+        assert!(decoded[1] / decoded[0] < 0.15);
+        close(decoded[0], linear_2020[0], 1e-5);
+        close(decoded[1], linear_2020[1], 1e-5);
+    }
+
+    #[test]
+    fn parametric_ext_linear_is_not_windows_scrgb_stimulus() {
+        let description = ColorDescription {
+            primaries: ColorPrimaries::Srgb,
+            transfer: TransferFunction::Linear,
+            reference_white_nits: 203.0,
+            max_luminance_nits: 10_000.0,
+            max_cll_nits: None,
+            max_fall_nits: None,
+            windows_scrgb_stimulus: false,
+        };
+        assert!(!description.is_windows_scrgb());
+        close(description.linear_to_scene_scale(), 1.0, 0.0);
+    }
+
+    #[test]
+    fn hdr_preferred_uses_p3_srgb_hdr_on_p3_class_panels() {
+        let panel = ColorDescription {
+            primaries: ColorPrimaries::Custom(PrimariesChromaticity {
+                r: [0.6780116, 0.31299728],
+                g: [0.2830347, 0.6479949],
+                b: [0.14802192, 0.067950554],
+                w: [0.34569982, 0.35850027],
+            }),
+            transfer: TransferFunction::Srgb,
+            reference_white_nits: 80.0,
+            max_luminance_nits: 80.0,
+            max_cll_nits: None,
+            max_fall_nits: None,
+            windows_scrgb_stimulus: false,
+        };
+        let preferred = ColorDescription::hdr_preferred_from_panel(panel, 409.0, 400.0);
+        assert_eq!(preferred.transfer, TransferFunction::SrgbHdr);
+        assert_eq!(preferred.primaries, ColorPrimaries::DisplayP3);
+        close(
+            preferred.reference_white_nits,
+            HDR_REFERENCE_WHITE_NITS,
+            0.0,
+        );
+        close(
+            preferred.max_luminance_nits,
+            HDR_CONSERVATIVE_PEAK_NITS,
+            0.0,
+        );
+        assert_eq!(preferred.max_cll_nits, Some(HDR_CONSERVATIVE_PEAK_NITS));
+        assert_eq!(preferred.max_fall_nits, Some(HDR_REFERENCE_WHITE_NITS));
+        let rec2020_panel = ColorDescription {
+            primaries: ColorPrimaries::Bt2020,
+            ..panel
+        };
+        let rec2020_preferred =
+            ColorDescription::hdr_preferred_from_panel(rec2020_panel, 1_000.0, 400.0);
+        assert_eq!(rec2020_preferred.primaries, ColorPrimaries::Bt2020);
+        assert_eq!(rec2020_preferred.transfer, TransferFunction::St2084Pq);
+        close(
+            rec2020_preferred.max_luminance_nits,
+            HDR_CONSERVATIVE_PEAK_NITS,
+            0.0,
+        );
+        close(
+            rec2020_preferred.reference_white_nits,
+            HDR_REFERENCE_WHITE_NITS,
+            0.0,
+        );
+        assert_eq!(
+            hdr10_encode_panel_primaries(panel.primaries),
+            ColorPrimaries::DisplayP3
+        );
+        assert_eq!(
+            hdr10_encode_panel_primaries(ColorPrimaries::Srgb),
+            ColorPrimaries::Bt2020
+        );
+        assert_eq!(
+            hdr10_encode_panel_primaries(ColorPrimaries::Bt2020),
+            ColorPrimaries::Bt2020
+        );
+    }
+
+    #[test]
+    fn hdr10_gamut_map_keeps_p3_red_and_pulls_rec2020_green_into_panel() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+        fn compress(rgb: [f32; 3], luma: [f32; 3]) -> [f32; 3] {
+            let minc = rgb[0].min(rgb[1]).min(rgb[2]);
+            if minc >= 0.0 {
+                return rgb;
+            }
+            let y = (luma[0] * rgb[0] + luma[1] * rgb[1] + luma[2] * rgb[2]).max(0.0);
+            let dest = [y, y, y];
+            let mut t = 0.0f32;
+            for i in 0..3 {
+                let denom = rgb[i] - dest[i];
+                if rgb[i] < 0.0 && denom.abs() > 1e-6 {
+                    t = t.max(rgb[i] / denom);
+                }
+            }
+            t = t.clamp(0.0, 1.0);
+            [
+                rgb[0] + t * (dest[0] - rgb[0]),
+                rgb[1] + t * (dest[1] - rgb[1]),
+                rgb[2] + t * (dest[2] - rgb[2]),
+            ]
+        }
+
+        let (scene_to_p3, _, p3_luma) = hdr10_pq_encode_transforms(ColorPrimaries::DisplayP3);
+
+        let p3_red_scene = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::DisplayP3,
+                scene_working_primaries(),
+                RenderingIntent::Relative,
+            ),
+            [1.0, 0.0, 0.0],
+        );
+        let p3_red_panel = transform(scene_to_p3, p3_red_scene);
+        assert!(p3_red_panel.iter().all(|c| *c >= -1e-4));
+
+        let rec2020_green_scene = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::Bt2020,
+                scene_working_primaries(),
+                RenderingIntent::Relative,
+            ),
+            [0.0, 1.0, 0.0],
+        );
+        let rec2020_green_panel = transform(scene_to_p3, rec2020_green_scene);
+        assert!(rec2020_green_panel.iter().any(|c| *c < 0.0));
+        let mapped = compress(rec2020_green_panel, p3_luma);
+        assert!(mapped.iter().all(|c| *c >= -1e-4));
+    }
+
+    #[test]
+    fn hdr10_highlights_stay_inside_displayhdr_450_headroom() {
+        assert_eq!(
+            hdr_conservative_peak_nits(350.0),
+            HDR_CONSERVATIVE_PEAK_NITS
+        );
+        assert_eq!(
+            hdr_conservative_peak_nits(409.0),
+            HDR_CONSERVATIVE_PEAK_NITS
+        );
+        assert_eq!(
+            hdr_conservative_peak_nits(450.0),
+            HDR_CONSERVATIVE_PEAK_NITS
+        );
+        assert_eq!(
+            hdr_conservative_peak_nits(1_000.0),
+            HDR_CONSERVATIVE_PEAK_NITS
+        );
+        assert_eq!(hdr_reference_white_nits(409.0), HDR_REFERENCE_WHITE_NITS);
+        assert_eq!(hdr10_kms_max_luminance_nits(), 450);
+        assert_eq!(hdr10_kms_max_cll_nits(), 450);
+        assert_eq!(hdr10_kms_max_fall_nits(), 203);
+    }
+
+    #[test]
+    fn hdr10_tone_map_keeps_in_range_highlights() {
+        let paper = tone_map_hdr_nits(203.0, 10_000.0, 450.0, 203.0);
+        close(paper, 203.0, 0.5);
+        let in_range = tone_map_hdr_nits(400.0, 10_000.0, 450.0, 203.0);
+        assert!(
+            in_range > 380.0,
+            "400 nit HDR must stay near 400, got {in_range}"
+        );
+        assert!(in_range <= 450.0);
+        let peak = tone_map_hdr_nits(10_000.0, 10_000.0, 450.0, 203.0);
+        close(peak, 450.0, 1.0);
+        let over = tone_map_hdr_nits(1_000.0, 10_000.0, 450.0, 203.0);
+        assert!(over > 405.0);
+        assert!(over <= 450.0);
+    }
+
+    #[test]
+    fn hdr10_rec2020_blue_channel_may_exceed_luminance_peak() {
+        // A 400 nit Rec.2020 primary blue has Y=400 and B=400/0.0593 ≈ 6,745 nits.
+        // Scaling B down to a 450 nit panel peak would leave ~27 nits of luminance.
+        let y = 400.0f32;
+        let b_channel = y / 0.0593;
+        assert!(b_channel > 6_000.0);
+        let crushed = y * (450.0 / b_channel);
+        assert!(crushed < 40.0);
+        let mapped = tone_map_hdr_nits(y, 10_000.0, 450.0, 203.0);
+        assert!(mapped > 380.0);
+        assert!(mapped <= 450.0);
+    }
+
+    #[test]
+    fn hdr10_d65_white_survives_warm_icc_panel() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+        let warm = ColorPrimaries::Custom(PrimariesChromaticity {
+            r: [0.6780116, 0.31299728],
+            g: [0.2830347, 0.6479949],
+            b: [0.14802192, 0.067950554],
+            w: [0.34569982, 0.35850027],
+        });
+        assert_eq!(
+            hdr10_encode_panel_primaries(warm),
+            ColorPrimaries::DisplayP3
+        );
+        let (scene_to_panel, panel_to_bt2020, _) = hdr10_pq_encode_transforms(warm);
+        let bt2020 = transform(panel_to_bt2020, transform(scene_to_panel, [1.0, 1.0, 1.0]));
+        close(bt2020[0], 1.0, 0.02);
+        close(bt2020[1], 1.0, 0.02);
+        close(bt2020[2], 1.0, 0.02);
+
+        let p3_red_scene = transform(
+            gamut_matrix_linear_rgb(
+                ColorPrimaries::DisplayP3,
+                scene_working_primaries(),
+                RenderingIntent::Relative,
+            ),
+            [1.0, 0.0, 0.0],
+        );
+        let p3_red_panel = transform(scene_to_panel, p3_red_scene);
+        assert!(
+            p3_red_panel.iter().all(|c| *c >= -1e-4),
+            "P3 red must stay in-gamut for the W test, got {p3_red_panel:?}"
+        );
     }
 
     #[test]
@@ -741,11 +1516,11 @@ mod tests {
 
         std::env::set_var("FOCALDESK_HDR", "0");
         assert!(!output_hdr_render_active(true, true, true));
-        assert!(!hdr_runtime_may_apply_kms_with_state(true, false));
+        assert!(!hdr_runtime_may_apply_kms_with_state(true));
         std::env::remove_var("FOCALDESK_HDR");
 
-        assert!(hdr_runtime_may_apply_kms_with_state(true, false));
-        assert!(!hdr_runtime_may_apply_kms_with_state(true, true));
+        assert!(hdr_runtime_may_apply_kms_with_state(true));
+        assert!(!hdr_runtime_may_apply_kms_with_state(false));
         assert!(!output_hdr_render_active(false, true, true));
         assert!(!output_hdr_render_active(true, false, true));
     }
@@ -756,6 +1531,28 @@ mod tests {
         assert!(hdr_output_selected_with_selector("DP-3", Some("")));
         assert!(hdr_output_selected_with_selector("DP-3", Some(" DP-3 ")));
         assert!(!hdr_output_selected_with_selector("DP-4", Some("DP-3")));
+    }
+
+    #[test]
+    fn nvidia_dual_hdr_requests_every_capable_sibling() {
+        assert!(matching_hdr_request(true, false, false, true, false, true));
+        assert!(!matching_hdr_request(
+            true, false, false, true, false, false
+        ));
+        assert!(!matching_hdr_request(true, true, false, true, false, true));
+        assert!(!matching_hdr_request(true, false, true, true, false, true));
+        assert!(!matching_hdr_request(
+            true, false, false, false, false, true
+        ));
+        assert!(matching_hdr_request(false, false, false, true, true, false));
+    }
+
+    #[test]
+    fn exclusive_failed_state_does_not_keep_selecting_a_connector() {
+        use focaldesk_settings_core::ExclusiveHdrPhase;
+        assert!(!ExclusiveHdrPhase::Failed.selects_output());
+        assert!(hdr_output_selected_with_selectors("DP-3", None, None));
+        assert!(hdr_output_selected_with_selectors("DP-4", None, None));
     }
 
     #[test]

@@ -698,6 +698,7 @@ pub fn draw_output_stage(
         theme: state.theme.active_theme(),
         notifications: &notifications,
         notification_unread_count: state.notification_unread_count,
+        update_available_count: state.update_state.available_count(),
         lock_screen: &lock_screen,
         flip_egui_y: state.backend_kind == BackendKind::Drm,
         client_compositing,

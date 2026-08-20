@@ -38,6 +38,8 @@ version numbers where practical.
 
 ### Changed
 
+- Documented a successful Fedora 44 and NVIDIA 595-series HDR10 configuration,
+  including Google Chrome, while retaining the experimental NVIDIA safeguards.
 - Clarified experimental and planned feature claims, including subsurface
   damage tracking, HDR, capture, AI, and automation.
 - Provisioned the pinned native Vosk library in CI so workspace tests can link

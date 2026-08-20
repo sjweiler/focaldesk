@@ -46,11 +46,11 @@ each scanout or capture target refreshes independently when it falls behind.
 After that base decode, the bundled wallpaper receives a display-aware creative
 grade over only its work-area rectangle. On wide-gamut SDR outputs, cyan and
 orange artwork accents expand selectively into Display P3 while luminance stays
-SDR. On HDR10 outputs, the shader derives additive scene-linear highlight energy
-from the original sRGB texture: space remains untouched, the planet stays
-diffuse, most stars remain moderate, a few isolated stars and the illuminated
-planet rim exceed reference white, and the white wordmark is held near diffuse
-white. The grade is bounded by the output's EDID peak before the ordinary
+SDR. On HDR10 outputs, the shader keeps diffuse wallpaper at reference white
+and applies a conservative lift to isolated stars, accents, and the planet rim
+inside DisplayHDR 400-class headroom (about 450 nits). It does not manufacture 800–1000 nit
+highlights. The white wordmark stays at graphics white, and the grade is
+bounded at 450 nits before the ordinary
 BT.2020/PQ output transform. It is disabled on conventional sRGB SDR outputs.
 
 Set `FOCALDESK_RENDER_TIMINGS=1` to sample the linear pipeline every 120 frames.

@@ -14,6 +14,7 @@ pub enum PanelKind {
     Workspaces,
     ClipboardHistory,
     NotificationHistory,
+    Updates,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -18,8 +18,9 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    force_linear_surfaces, primaries_wider_than, ColorDescription, RenderingIntent,
-    SurfaceColorRenderState, SurfaceColorState,
+    force_linear_surfaces, primaries_wider_than, sanitize_tagged_client_description,
+    ClientBufferEncoding, ColorDescription, RenderingIntent, SurfaceColorRenderState,
+    SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
@@ -72,10 +73,11 @@ use focaldesk_flow::Keybinds;
 use focaldesk_flow::ModMask;
 use focaldesk_ipc::{
     desktop_socket_path, send_control_request, send_notification_request, send_power_request,
-    transport, ControlIpcRequest, ControlIpcResponse, ControlSetting, DesktopAction,
-    DesktopDirection, DesktopSnapshot, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
-    NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
-    PowerIpcResponse, RenderingStatus, SessionStatus, WindowSnapshot, WorkspaceSnapshot,
+    send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
+    DesktopAction, DesktopDirection, DesktopSnapshot, DisplayRuntimeOutputStatus, IpcRequest,
+    IpcResponse, NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
+    PowerIpcResponse, RenderingStatus, SessionStatus, UpdateIpcRequest, UpdateIpcResponse,
+    WindowSnapshot, WorkspaceSnapshot,
 };
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
@@ -85,16 +87,17 @@ use focaldesk_power::{
     PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
 };
 use focaldesk_settings_core::{
-    load_settings, AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings,
-    DebugLogLevel, DebugSettings, DisplayColorProfile, LidCloseAction, LowBatteryAction,
-    OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings, PrivacySettings,
-    WorkspaceSettings,
+    load_settings, rearm_exclusive_hdr_for_next_session, AppSettings, BrowserLaunchBackend,
+    ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings, DisplayColorProfile,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
+    PowerSettings, PrivacySettings, WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::element::ChromeItem;
+use focaldesk_updates::UpdateSnapshot;
 use indexmap::IndexMap;
 use smithay::delegate_dispatch2;
 use smithay::input::keyboard::FilterResult;
@@ -230,6 +233,21 @@ fn poll_network_state() -> NetworkState {
             Err(_) => NetworkState::default(),
         }
     })
+}
+
+fn poll_update_state() -> UpdateSnapshot {
+    match send_update_request(&UpdateIpcRequest::GetState) {
+        Ok(UpdateIpcResponse::State { snapshot }) => snapshot,
+        Ok(UpdateIpcResponse::Error { message }) => {
+            flog_warn!("update state request rejected: {message}");
+            UpdateSnapshot::default()
+        }
+        Ok(other) => {
+            flog_warn!("unexpected update state response: {other:?}");
+            UpdateSnapshot::default()
+        }
+        Err(_) => UpdateSnapshot::default(),
+    }
 }
 
 fn clamp_rect_to_bounds(
@@ -967,6 +985,11 @@ pub struct DesktopState {
     network_state_rx: mpsc::Receiver<NetworkState>,
     network_state_in_flight: bool,
     last_network_state_poll_at: Instant,
+    pub(crate) update_state: UpdateSnapshot,
+    update_state_tx: mpsc::Sender<UpdateSnapshot>,
+    update_state_rx: mpsc::Receiver<UpdateSnapshot>,
+    update_state_in_flight: bool,
+    last_update_state_poll_at: Instant,
     /// In-progress interactive XDG move/resize driven by nested (winit) pointer events.
     pub toplevel_pointer: Option<ToplevelPointerInteraction>,
     pub(crate) dnd_cursor_phase: Option<Arc<AtomicU8>>,
@@ -1087,6 +1110,10 @@ struct LaunchContext {
     xwayland_display: Option<String>,
     browser_launch_backend: BrowserLaunchBackend,
     backend_kind: BackendKind,
+    /// True once any output is rendering, or is about to render, a PQ frame.
+    /// Browser launch policy must follow live compositor state rather than the
+    /// persisted exclusive-HDR state, which does not cover normal HDR toggles.
+    hdr_output_active: bool,
 }
 
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
@@ -1177,6 +1204,83 @@ pub struct ClockPulse {
 pub struct ClockPulseFrame {
     pub click_local: Point<f64, Logical>,
     pub elapsed: Duration,
+}
+
+fn client_buffer_encoding(
+    states: &smithay::wayland::compositor::SurfaceData,
+) -> ClientBufferEncoding {
+    use smithay::wayland::compositor::{BufferAssignment, SurfaceAttributes};
+
+    let mut attrs = states.cached_state.get::<SurfaceAttributes>();
+    if let Some(BufferAssignment::NewBuffer(buffer)) = attrs.pending().buffer.as_ref() {
+        return encoding_from_assigned_buffer(buffer);
+    }
+    if let Some(BufferAssignment::NewBuffer(buffer)) = attrs.current().buffer.as_ref() {
+        return encoding_from_assigned_buffer(buffer);
+    }
+    ClientBufferEncoding::Unknown
+}
+
+fn encoding_from_assigned_buffer(
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+) -> ClientBufferEncoding {
+    use smithay::backend::allocator::Buffer as SmithayBuffer;
+    use smithay::wayland::dmabuf::get_dmabuf;
+
+    if let Ok(dmabuf) = get_dmabuf(buffer) {
+        let code = SmithayBuffer::format(dmabuf).code;
+        let encoding = encoding_from_fourcc(code);
+        log_client_buffer_fourcc_once(code, encoding);
+        encoding
+    } else {
+        ClientBufferEncoding::Unorm8
+    }
+}
+
+fn log_client_buffer_fourcc_once(code: Fourcc, encoding: ClientBufferEncoding) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let key = format!("{code:?}:{encoding:?}");
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if seen.insert(key) {
+        focaldesk_logging::flog_warn!(
+            "wp color client buffer fourcc={code:?} encoding={encoding:?}"
+        );
+    }
+}
+
+fn encoding_from_fourcc(code: Fourcc) -> ClientBufferEncoding {
+    match code {
+        Fourcc::Abgr16161616f | Fourcc::Argb16161616f => ClientBufferEncoding::Float16,
+        Fourcc::Abgr2101010 | Fourcc::Argb2101010 | Fourcc::Xbgr2101010 | Fourcc::Xrgb2101010 => {
+            ClientBufferEncoding::Unorm10
+        }
+        Fourcc::Abgr8888 | Fourcc::Argb8888 | Fourcc::Xbgr8888 | Fourcc::Xrgb8888 => {
+            ClientBufferEncoding::Unorm8
+        }
+        other => {
+            let name = format!("{other:?}");
+            if name.contains("16161616") {
+                ClientBufferEncoding::Float16
+            } else if name.contains("2101010")
+                || name.contains("1010102")
+                || name.contains("P010")
+                || name.contains("P012")
+                || name.contains("NV12")
+            {
+                ClientBufferEncoding::Unorm10
+            } else if name.contains("8888") || name.contains("AB24") || name.contains("XB24") {
+                ClientBufferEncoding::Unorm8
+            } else {
+                ClientBufferEncoding::Unknown
+            }
+        }
+    }
 }
 
 impl DesktopState {
@@ -1357,6 +1461,10 @@ impl DesktopState {
             xwayland_display: self.xwayland_display.clone(),
             browser_launch_backend: self.apps.browser_launch_backend,
             backend_kind: self.backend_kind,
+            hdr_output_active: self
+                .outputs
+                .values()
+                .any(|output| output.hdr_kms_applied || output.hdr_transition_target == Some(true)),
         };
         let apps: Vec<(u64, String, Vec<String>)> = self.pending_app_launches.drain(..).collect();
         for (launch_trace_id, app, args) in apps {
@@ -1622,6 +1730,39 @@ impl DesktopState {
                 .is_err()
             {
                 self.network_state_in_flight = false;
+            }
+        }
+    }
+
+    pub fn process_update_state_timers(&mut self) {
+        while let Ok(state) = self.update_state_rx.try_recv() {
+            self.update_state_in_flight = false;
+            if self.update_state != state {
+                self.update_state = state;
+                self.mark_all_outputs_full_damage(DamageSource::Unknown);
+            }
+        }
+
+        let now = Instant::now();
+        let interval = if self.update_state.checking || self.update_state.installing {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(10)
+        };
+        if !self.update_state_in_flight
+            && now.saturating_duration_since(self.last_update_state_poll_at) >= interval
+        {
+            self.last_update_state_poll_at = now;
+            self.update_state_in_flight = true;
+            let result_tx = self.update_state_tx.clone();
+            if thread::Builder::new()
+                .name("focaldesk-update-state".to_string())
+                .spawn(move || {
+                    let _ = result_tx.send(poll_update_state());
+                })
+                .is_err()
+            {
+                self.update_state_in_flight = false;
             }
         }
     }
@@ -2004,6 +2145,8 @@ impl DesktopState {
                 workspace_count: self.workspace_names.len(),
                 do_not_disturb: self.do_not_disturb,
                 notification_unread_count: self.notification_unread_count,
+                update_available_count: self.update_state.available_count(),
+                update_busy: self.update_state.checking || self.update_state.installing,
                 network_carrier: self.network_state.has_carrier,
                 wifi_signal_percent: self
                     .network_state
@@ -2158,6 +2301,12 @@ impl DesktopState {
                     self.focused_output,
                 ));
             }
+            DesktopAction::OpenUpdatesPanel => {
+                self.pending_egui_ops.push(PendingEguiOp::OpenPanel(
+                    focaldesk_ui::types::PanelKind::Updates,
+                    self.focused_output,
+                ));
+            }
             DesktopAction::ToggleDoNotDisturb => {
                 let enabled = !self.do_not_disturb;
                 self.set_system_setting(focaldesk_ui::types::SettingKey::DoNotDisturb, enabled);
@@ -2203,6 +2352,21 @@ impl DesktopState {
             .flatten();
         let mut changed = false;
         let mut unmatched = Vec::new();
+        let any_capable_requested = outputs.iter().any(|config| {
+            self.outputs.values().any(|output| {
+                output.handle.name() == config.connector
+                    && output.hdr_supported
+                    && (config.hdr_requested || config.hdr_enabled)
+            })
+        });
+        let promote_matching_hdr = crate::core::color::matching_hdr_request(
+            crate::core::color::hdr_nvidia_dual_enabled(),
+            false,
+            crate::core::color::hdr_output_selector_active(),
+            true,
+            false,
+            any_capable_requested,
+        );
 
         for config in outputs {
             let output_id = self
@@ -2236,7 +2400,7 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
-                let requested = config.hdr_requested || config.hdr_enabled;
+                let requested = config.hdr_requested || config.hdr_enabled || promote_matching_hdr;
                 output.hdr_requested = output.hdr_supported && requested;
                 output.hdr_enabled = !output.hdr_verification_pending
                     && crate::core::color::output_hdr_render_active(
@@ -2682,6 +2846,8 @@ impl DesktopState {
             do_not_disturb: self.do_not_disturb,
             notification_unread: self.notification_unread,
             notification_unread_count: self.notification_unread_count,
+            update_available_count: self.update_state.available_count(),
+            update_busy: self.update_state.checking || self.update_state.installing,
             network_state: self.network_state.clone(),
             workspace_count: self.workspace_names.len(),
             max_workspace_slots: self.workspaces.max_workspace_slots as usize,
@@ -4711,6 +4877,7 @@ impl DesktopState {
     }
 
     fn request_hdr_safe_logout(&mut self) {
+        rearm_exclusive_hdr_for_next_session();
         if !self.hdr_rollback_needed() {
             self.running = false;
             return;
@@ -4726,6 +4893,12 @@ impl DesktopState {
         context: &'static str,
         interaction: PowerActionInteraction,
     ) {
+        if !matches!(
+            action,
+            PowerIpcRequest::Suspend | PowerIpcRequest::Hibernate
+        ) {
+            rearm_exclusive_hdr_for_next_session();
+        }
         if !self.hdr_rollback_needed() {
             power_service_command(action, context, interaction);
             return;
@@ -6256,6 +6429,7 @@ impl DesktopState {
         let (voice_capture_status_tx, voice_capture_status_rx) = mpsc::channel();
         let (camera_status_tx, camera_status_rx) = mpsc::channel();
         let (network_state_tx, network_state_rx) = mpsc::channel();
+        let (update_state_tx, update_state_rx) = mpsc::channel();
         let (lock_auth_tx, lock_auth_rx) = mpsc::channel();
         let state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
@@ -6378,6 +6552,11 @@ impl DesktopState {
             network_state_rx,
             network_state_in_flight: false,
             last_network_state_poll_at: Instant::now() - Duration::from_secs(3),
+            update_state: UpdateSnapshot::default(),
+            update_state_tx,
+            update_state_rx,
+            update_state_in_flight: false,
+            last_update_state_poll_at: Instant::now() - Duration::from_secs(10),
             unmapped_windows: Vec::new(),
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
@@ -8864,13 +9043,20 @@ impl DesktopState {
                     RenderingIntent::Perceptual,
                 );
             }
+            let encoding = client_buffer_encoding(states);
             let mut surface_color = states.cached_state.get::<SurfaceColorState>();
             if let Some(desc) = surface_color.pending().description {
+                let desc = sanitize_tagged_client_description(desc, encoding);
                 SurfaceColorRenderState::for_description(desc, surface_color.pending().intent)
+                    .with_buffer_encoding(encoding)
             } else {
                 // Do not call `effective_surface_render_state` here: it would re-lock the same
                 // `SurfaceColorState` mutex and deadlock the compositor on the first commit.
-                surface_color.current().render_state()
+                let current = surface_color.current();
+                let desc =
+                    sanitize_tagged_client_description(current.effective_description(), encoding);
+                SurfaceColorRenderState::for_description(desc, current.intent)
+                    .with_buffer_encoding(encoding)
             }
         });
         let id = Id::from_wayland_resource(surface);
@@ -9667,7 +9853,7 @@ fn focaldesk_ai_console_command() -> String {
         .unwrap_or_else(|| "focaldesk-ai-console".to_string())
 }
 
-fn chrome_command_args(use_x11: bool, _hdr_output_active: bool) -> Vec<String> {
+fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
     let profile = chrome_profile_dir();
     let ozone_platform = if use_x11 { "x11" } else { "wayland" };
     let mut args = vec![
@@ -9679,10 +9865,13 @@ fn chrome_command_args(use_x11: bool, _hdr_output_active: bool) -> Vec<String> {
         "--no-default-browser-check".to_string(),
         "--new-window".to_string(),
     ];
-    // Chrome's forced HDR10 raster path flattens P3 web content on Wayland.
-    // Preserve a tagged P3 client buffer and let the compositor encode the
-    // FP16 scene into BT.2020/PQ when the output itself is HDR10.
-    args.insert(2, "--force-color-profile=display-p3-d65".to_string());
+    // HDR Chromium must follow wp_color preferred BT.2020/PQ so
+    // `color-gamut: p3` stays true (NTP shortcut circles). Forcing
+    // scrgb-linear advertises BT.709 primaries and drops that CSS.
+    // Chrome still tags HDR buffers with create_windows_scrgb.
+    if !hdr_output_active {
+        args.insert(2, "--force-color-profile=display-p3-d65".to_string());
+    }
     args
 }
 
@@ -9739,8 +9928,7 @@ fn spawn_app_detached(
     let xwayland_display = launch_xwayland_display(&ctx);
     let browser_backend = ctx.browser_launch_backend;
     let prefer_x11 = matches!(browser_backend, BrowserLaunchBackend::Xwayland);
-    let hdr_output_active = focaldesk_settings_core::load_exclusive_hdr_state().phase
-        == focaldesk_settings_core::ExclusiveHdrPhase::Active;
+    let hdr_output_active = ctx.hdr_output_active;
 
     let launch_span = tracing::info_span!(
         "launch_app",
@@ -9792,6 +9980,7 @@ fn spawn_app_detached(
             wayland_display: ctx.client_wayland_display.clone(),
             xwayland_display: xwayland_display.map(|display| display.to_string()),
             browser_backend: browser_backend_for_launch(browser_backend),
+            hdr_output_active,
             source: LaunchSource::Ui,
         };
 
@@ -10149,11 +10338,11 @@ mod tests {
     }
 
     #[test]
-    fn chromium_hdr_preserves_display_p3_raster_gamut() {
+    fn chromium_hdr_follows_wp_color_preferred_gamut() {
         let args = chrome_command_args(false, true);
-        assert!(args
+        assert!(!args
             .iter()
-            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
+            .any(|arg| arg.starts_with("--force-color-profile=")));
         assert!(!args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
     }
 

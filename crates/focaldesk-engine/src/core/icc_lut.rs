@@ -84,7 +84,9 @@ pub(crate) fn source_profile(description: ColorDescription) -> Result<Profile, I
         },
     };
     let curve = match description.transfer {
-        TransferFunction::Srgb | TransferFunction::Bt1886 => srgb_tone_curve(),
+        TransferFunction::Srgb | TransferFunction::SrgbHdr | TransferFunction::Bt1886 => {
+            srgb_tone_curve()
+        }
         TransferFunction::Gamma22 => ToneCurve::new(2.2),
         TransferFunction::Linear => ToneCurve::new(1.0),
         TransferFunction::St2084Pq => return Err(IccError::Invalid("PQ ICC LUT source")),

@@ -6,8 +6,9 @@ use crate::core::backend_render::{
     prepare_output, PreparedOutput,
 };
 use crate::core::color::{
-    hdr_render_runtime_enabled, kms_scanout_encode_description, linear_sdr_runtime_enabled,
-    output_encode_scanout_needed, scene_to_output_matrix, RenderingIntent,
+    hdr10_pq_encode_transforms, hdr_render_runtime_enabled, kms_scanout_encode_description,
+    linear_sdr_runtime_enabled, output_encode_scanout_needed, scene_to_output_matrix,
+    ColorPrimaries, RenderingIntent,
 };
 use crate::core::desktop::DesktopState;
 use crate::core::icc_lut::icc_lut_shader_enabled;
@@ -341,7 +342,7 @@ fn wallpaper_grade_parameters(output: &crate::core::desktop::OutputState) -> (f3
         .filter(|nits| nits.is_finite() && *nits > 0.0);
     if hdr_target {
         if let Some(peak_nits) = hdr_peak {
-            let creative_peak = peak_nits.min(1000.0);
+            let creative_peak = crate::core::color::hdr_conservative_peak_nits(peak_nits);
             return (
                 2.0,
                 crate::core::color::hdr_reference_white_nits(creative_peak),
@@ -393,13 +394,15 @@ pub fn apply_output_encode(
         if let Some(max_nits) = hdr_max.filter(|n| *n > 0.0) {
             if targets.hdr_supported {
                 let hdr_white_nits = crate::core::color::hdr_reference_white_nits(max_nits);
+                let encode_nits = crate::core::color::hdr_conservative_peak_nits(max_nits);
                 match apply_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
-                    max_nits,
+                    encode_nits,
                     hdr_white_nits,
+                    output_hdr_panel_primaries(state, output_id),
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
@@ -540,6 +543,33 @@ fn blit_with_shader(
     frame.finish().map_err(|e| anyhow!("finish {label}: {e}"))
 }
 
+fn hdr_pq_shader_uniforms(
+    panel: ColorPrimaries,
+    max_nits: f32,
+    sdr_white_nits: f32,
+) -> Vec<Uniform<'static>> {
+    let (scene_to_panel, panel_to_bt2020, luma) = hdr10_pq_encode_transforms(panel);
+    vec![
+        Uniform::new("u_max_nits", max_nits),
+        Uniform::new("u_sdr_white_nits", sdr_white_nits),
+        Uniform::new("u_m0", scene_to_panel[0]),
+        Uniform::new("u_m1", scene_to_panel[1]),
+        Uniform::new("u_m2", scene_to_panel[2]),
+        Uniform::new("u_p0", panel_to_bt2020[0]),
+        Uniform::new("u_p1", panel_to_bt2020[1]),
+        Uniform::new("u_p2", panel_to_bt2020[2]),
+        Uniform::new("u_panel_luma", luma),
+    ]
+}
+
+fn output_hdr_panel_primaries(state: &DesktopState, output_id: OutputId) -> ColorPrimaries {
+    state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.color_description.primaries)
+        .unwrap_or(ColorPrimaries::Bt2020)
+}
+
 fn apply_hdr_pq_encode(
     state: &DesktopState,
     renderer: &mut GlesRenderer,
@@ -547,6 +577,7 @@ fn apply_hdr_pq_encode(
     buffer_size: Size<i32, Physical>,
     max_nits: f32,
     sdr_white_nits: f32,
+    panel: ColorPrimaries,
 ) -> Result<Option<SyncPoint>> {
     let damage = full_damage(buffer_size);
     let sdr_to_scrgb = state
@@ -607,40 +638,7 @@ fn apply_hdr_pq_encode(
             .texture,
         buffer_size,
         scrgb_to_pq,
-        &{
-            let scene_to_bt2020 = scene_to_output_matrix(
-                crate::core::color::ColorDescription::bt2020_pq_hdr(max_nits, max_nits),
-                RenderingIntent::Relative,
-            );
-            [
-                Uniform::new("u_max_nits", max_nits),
-                Uniform::new("u_sdr_white_nits", sdr_white_nits),
-                Uniform::new(
-                    "u_m0",
-                    [
-                        scene_to_bt2020[0][0],
-                        scene_to_bt2020[0][1],
-                        scene_to_bt2020[0][2],
-                    ],
-                ),
-                Uniform::new(
-                    "u_m1",
-                    [
-                        scene_to_bt2020[1][0],
-                        scene_to_bt2020[1][1],
-                        scene_to_bt2020[1][2],
-                    ],
-                ),
-                Uniform::new(
-                    "u_m2",
-                    [
-                        scene_to_bt2020[2][0],
-                        scene_to_bt2020[2][1],
-                        scene_to_bt2020[2][2],
-                    ],
-                ),
-            ]
-        },
+        &hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits),
         "linear-scRGB-to-PQ",
         &damage,
     )?;
@@ -948,6 +946,7 @@ fn apply_linear_hdr_pq_encode(
     sdr_white_nits: f32,
     requested_damage: &[Rectangle<i32, Physical>],
     destination_current: bool,
+    panel: ColorPrimaries,
 ) -> Result<SyncPoint> {
     let shader = state
         .render
@@ -966,38 +965,7 @@ fn apply_linear_hdr_pq_encode(
             offscreen_texture_is_valid(targets.hdr_offscreen.as_ref(), buffer_size, format)
         });
     targets.ensure_hdr_offscreen(renderer, buffer_size)?;
-    let scene_to_bt2020 = scene_to_output_matrix(
-        crate::core::color::ColorDescription::bt2020_pq_hdr(max_nits, max_nits),
-        RenderingIntent::Relative,
-    );
-    let uniforms = vec![
-        Uniform::new("u_max_nits", max_nits),
-        Uniform::new("u_sdr_white_nits", sdr_white_nits),
-        Uniform::new(
-            "u_m0",
-            [
-                scene_to_bt2020[0][0],
-                scene_to_bt2020[0][1],
-                scene_to_bt2020[0][2],
-            ],
-        ),
-        Uniform::new(
-            "u_m1",
-            [
-                scene_to_bt2020[1][0],
-                scene_to_bt2020[1][1],
-                scene_to_bt2020[1][2],
-            ],
-        ),
-        Uniform::new(
-            "u_m2",
-            [
-                scene_to_bt2020[2][0],
-                scene_to_bt2020[2][1],
-                scene_to_bt2020[2][2],
-            ],
-        ),
-    ];
+    let uniforms = hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits);
     let destination = &mut targets
         .hdr_offscreen
         .as_mut()
@@ -1062,15 +1030,17 @@ fn apply_linear_output_encode(
         if let Some(max_nits) = hdr_max.filter(|nits| *nits > 0.0) {
             if targets.hdr_supported {
                 let hdr_white_nits = crate::core::color::hdr_reference_white_nits(max_nits);
+                let encode_nits = crate::core::color::hdr_conservative_peak_nits(max_nits);
                 match apply_linear_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
-                    max_nits,
+                    encode_nits,
                     hdr_white_nits,
                     damage,
                     previous_encoded_hdr,
+                    output_hdr_panel_primaries(state, output_id),
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => flog_warn!(
@@ -1701,6 +1671,10 @@ mod tests {
     fn pq_desktop_white_uses_hdr_reference_luminance() {
         assert_eq!(hdr_reference_white_nits(600.0), 203.0);
         assert_eq!(hdr_reference_white_nits(100.0), 100.0);
+        assert_eq!(
+            crate::core::color::hdr_conservative_peak_nits(1_000.0),
+            crate::core::color::HDR_CONSERVATIVE_PEAK_NITS
+        );
     }
 
     #[test]

@@ -376,6 +376,8 @@ struct PanelWidgets {
     network_image: gtk::Image,
     notifications_button: gtk::Button,
     notifications_image: gtk::Image,
+    updates_button: gtk::Button,
+    updates_image: gtk::Image,
     dnd_button: gtk::Button,
     dnd_image: gtk::Image,
     battery: gtk::Label,
@@ -500,6 +502,13 @@ fn build_panel(
         || send_action(DesktopAction::OpenNotificationsPanel),
     );
     status_cluster.append(&notifications_button);
+    let (updates_button, updates_image) = glass_icon_button(
+        "software-update-available-symbolic",
+        "System updates",
+        "panel-status-button",
+        || send_action(DesktopAction::OpenUpdatesPanel),
+    );
+    status_cluster.append(&updates_button);
     let (dnd_button, dnd_image) = glass_icon_button(
         "notifications-disabled-symbolic",
         "Do Not Disturb",
@@ -559,6 +568,8 @@ fn build_panel(
         network_image,
         notifications_button,
         notifications_image,
+        updates_button,
+        updates_image,
         dnd_button,
         dnd_image,
         battery,
@@ -626,6 +637,34 @@ fn update_panel(widgets: &PanelWidgets, snapshot: &DesktopSnapshot) {
         &widgets.notifications_button,
         snapshot.shell.notification_unread_count > 0,
     );
+    widgets
+        .updates_image
+        .set_icon_name(Some(if snapshot.shell.update_busy {
+            "emblem-synchronizing-symbolic"
+        } else if snapshot.shell.update_available_count > 0 {
+            "software-update-available-symbolic"
+        } else {
+            "software-update-available-symbolic"
+        }));
+    set_button_active(
+        &widgets.updates_button,
+        snapshot.shell.update_available_count > 0 || snapshot.shell.update_busy,
+    );
+    let updates_tooltip = if snapshot.shell.update_busy {
+        "Installing or checking system updates…".to_string()
+    } else if snapshot.shell.update_available_count == 0 {
+        "System updates: up to date".to_string()
+    } else if snapshot.shell.update_available_count == 1 {
+        "1 system update available".to_string()
+    } else {
+        format!(
+            "{} system updates available",
+            snapshot.shell.update_available_count
+        )
+    };
+    widgets
+        .updates_button
+        .set_tooltip_text(Some(&updates_tooltip));
     widgets
         .dnd_image
         .set_icon_name(Some(if snapshot.shell.do_not_disturb {

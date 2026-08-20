@@ -10,6 +10,8 @@ pub struct LaunchRequest {
     pub wayland_display: String,
     pub xwayland_display: Option<String>,
     pub browser_backend: BrowserBackend,
+    /// Whether the compositor has an HDR output for this launch.
+    pub hdr_output_active: bool,
     pub source: LaunchSource,
 }
 

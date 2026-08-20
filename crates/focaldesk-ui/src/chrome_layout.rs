@@ -10,7 +10,7 @@ pub const DEFAULT_SIDEBAR_SLOT_COUNT: usize = 12;
 /// Number of built-in status indicators. Runtime/custom collections override
 /// this through `ChromeLayoutConfig::status_item_count` and are only limited by
 /// the available output width.
-pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 9;
+pub const DEFAULT_TOPBAR_STATUS_COUNT: usize = 10;
 pub const SIDEBAR_CORNER_RADIUS: f32 = 16.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

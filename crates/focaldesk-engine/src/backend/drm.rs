@@ -487,6 +487,35 @@ fn select_exclusive_hdr_target(
     Ok(Some(name.clone()))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExclusiveHdrPrepareDecision {
+    Start,
+    Rearm,
+    Skip,
+    SkipUnclean,
+}
+
+fn exclusive_hdr_prepare_decision(
+    phase: ExclusiveHdrPhase,
+    same_process: bool,
+) -> ExclusiveHdrPrepareDecision {
+    match phase {
+        ExclusiveHdrPhase::Failed | ExclusiveHdrPhase::Disabled | ExclusiveHdrPhase::Off => {
+            ExclusiveHdrPrepareDecision::Skip
+        }
+        ExclusiveHdrPhase::Requested => ExclusiveHdrPrepareDecision::Start,
+        ExclusiveHdrPhase::Starting | ExclusiveHdrPhase::Verifying | ExclusiveHdrPhase::Active
+            if same_process =>
+        {
+            ExclusiveHdrPrepareDecision::Start
+        }
+        ExclusiveHdrPhase::Active => ExclusiveHdrPrepareDecision::Rearm,
+        ExclusiveHdrPhase::Starting | ExclusiveHdrPhase::Verifying => {
+            ExclusiveHdrPrepareDecision::SkipUnclean
+        }
+    }
+}
+
 fn persist_exclusive_hdr_phase(
     phase: ExclusiveHdrPhase,
     connector: Option<&str>,
@@ -512,30 +541,26 @@ fn persist_exclusive_hdr_phase(
 
 fn prepare_exclusive_hdr_attempt(selector: Option<String>) -> Option<String> {
     let mut state = load_exclusive_hdr_state();
-    let state_selector = matches!(
-        state.phase,
-        ExclusiveHdrPhase::Requested
-            | ExclusiveHdrPhase::Starting
-            | ExclusiveHdrPhase::Verifying
-            | ExclusiveHdrPhase::Active
-    )
-    .then(|| state.connector.clone())
-    .flatten();
+    let state_selector = state
+        .phase
+        .selects_output()
+        .then(|| state.connector.clone())
+        .flatten();
     let selector = selector.or(state_selector)?;
     let same_process = state.session_id == Some(std::process::id());
 
-    match state.phase {
-        ExclusiveHdrPhase::Failed => {
-            flog_warn!(
-                "Exclusive HDR is fail-safe blocked on {}: {}",
-                state.connector.as_deref().unwrap_or(&selector),
-                state.reason.as_deref().unwrap_or("previous attempt failed")
-            );
+    match exclusive_hdr_prepare_decision(state.phase, same_process) {
+        ExclusiveHdrPrepareDecision::Skip => {
+            if state.phase == ExclusiveHdrPhase::Failed {
+                flog_warn!(
+                    "Exclusive HDR is fail-safe blocked on {}: {}",
+                    state.connector.as_deref().unwrap_or(&selector),
+                    state.reason.as_deref().unwrap_or("previous attempt failed")
+                );
+            }
             return None;
         }
-        ExclusiveHdrPhase::Starting | ExclusiveHdrPhase::Verifying | ExclusiveHdrPhase::Active
-            if !same_process =>
-        {
+        ExclusiveHdrPrepareDecision::SkipUnclean => {
             let reason = format!(
                 "previous exclusive HDR session ended without a clean shutdown during {:?}",
                 state.phase
@@ -549,7 +574,12 @@ fn prepare_exclusive_hdr_attempt(selector: Option<String>) -> Option<String> {
             flog_warn!("Exclusive HDR fail-safe blocked: {reason}");
             return None;
         }
-        _ => {}
+        ExclusiveHdrPrepareDecision::Rearm => {
+            flog_warn!(
+                "Previous exclusive HDR session on {selector} ended while Active; re-arming for this login"
+            );
+        }
+        ExclusiveHdrPrepareDecision::Start => {}
     }
 
     persist_exclusive_hdr_phase(ExclusiveHdrPhase::Starting, Some(&selector), None);
@@ -671,6 +701,24 @@ fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> b
         .unwrap_or(false)
 }
 
+/// Remember that exclusive HDR verified on this connector so the next ordinary
+/// session can Apply Requested HDR10 even if exclusive mode is not re-armed.
+fn enable_persisted_hdr_request(output_name: &str) {
+    let mut displays = load_display_config();
+    let mut changed = false;
+    for display in displays.iter_mut() {
+        if display.name == output_name && !display.hdr_requested {
+            display.hdr_requested = true;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(err) = write_display_config(&displays) {
+            flog_warn!("Failed to persist HDR request for {output_name}: {err}");
+        }
+    }
+}
+
 /// Persist that `name` should not auto-request HDR again (used after a stalled HDR commit
 /// forces recovery). The user can still re-enable HDR explicitly through settings.
 fn disable_persisted_hdr_request(output_name: &str) {
@@ -688,6 +736,62 @@ fn disable_persisted_hdr_request(output_name: &str) {
             flog_warn!("Failed to persist HDR auto-disable for {output_name}: {err}");
         }
     }
+}
+
+fn disable_all_persisted_hdr_requests() {
+    let mut displays = load_display_config();
+    let mut changed = false;
+    for display in displays.iter_mut() {
+        if display.hdr_requested || display.hdr_enabled {
+            display.hdr_requested = false;
+            display.hdr_enabled = false;
+            changed = true;
+        }
+    }
+    if changed {
+        if let Err(err) = write_display_config(&displays) {
+            flog_warn!("Failed to persist HDR auto-disable for all outputs: {err}");
+        }
+    }
+}
+
+/// Exclusive HDR failures latch `Failed` and restore the ordinary topology.
+/// Persist-disabling only the exclusive connector leaves sibling outputs in
+/// HDR10 while this one falls back to SDR+ICC, so identical panels no longer
+/// match. Ordinary NVIDIA dual-head failures disable every request instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HdrFailurePersist {
+    KeepRequest,
+    DisableOne,
+    DisableAll,
+}
+
+fn hdr_failure_persist_action(
+    exclusive_output: Option<&str>,
+    failed_output: &str,
+    nvidia_dual: bool,
+) -> HdrFailurePersist {
+    if exclusive_output == Some(failed_output) {
+        HdrFailurePersist::KeepRequest
+    } else if nvidia_dual {
+        HdrFailurePersist::DisableAll
+    } else {
+        HdrFailurePersist::DisableOne
+    }
+}
+
+fn apply_persisted_hdr_failure(action: HdrFailurePersist, failed_output: &str) {
+    match action {
+        HdrFailurePersist::KeepRequest => {}
+        HdrFailurePersist::DisableOne => disable_persisted_hdr_request(failed_output),
+        HdrFailurePersist::DisableAll => disable_all_persisted_hdr_requests(),
+    }
+}
+
+fn clear_runtime_hdr_request(output: &mut crate::core::desktop::OutputState) {
+    output.hdr_requested = false;
+    output.hdr_verification_pending = false;
+    output.hdr_enabled = false;
 }
 
 fn configured_display_color_profile(displays: &[DisplayConfig], name: &str) -> DisplayColorProfile {
@@ -1272,10 +1376,7 @@ fn hdr_driver_allows_output_with_override(gpu_vendor_id: Option<u32>, allow_nvid
 }
 
 fn nvidia_dual_head_hdr_allowed() -> bool {
-    matches!(
-        std::env::var("FOCALDESK_HDR_NVIDIA_DUAL").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
+    crate::core::color::hdr_nvidia_dual_enabled()
 }
 
 /// NVIDIA HDR requires the driver override in every topology. Non-exclusive
@@ -1357,16 +1458,17 @@ mod screenshot_tests {
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, hdr_active_status_verified, hdr_commit_stalled,
-        hdr_detection::parse_edid_hdr_support, hdr_driver_allows_output_with_override,
+        configured_display_hdr_requested, exclusive_hdr_prepare_decision,
+        hdr_active_status_verified, hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
+        hdr_driver_allows_output_with_override, hdr_failure_persist_action,
         hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled, select_drm_mode_index,
         select_exclusive_hdr_target, DisplayConfig, DisplayTransform, DrmModeCandidate,
-        EdidHdrMetadata, HdrBpcRange, HdrSupport, DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE,
-        HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS,
-        OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
+        EdidHdrMetadata, ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport,
+        DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS,
+        HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
-    use focaldesk_settings_core::DisplayColorProfile;
+    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase};
     use std::time::{Duration, Instant};
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -1402,6 +1504,46 @@ mod hdr_tests {
             &[display_config(false, true)],
             "DP-1"
         ));
+    }
+
+    #[test]
+    fn exclusive_hdr_failure_keeps_ordinary_hdr_request() {
+        assert_eq!(
+            hdr_failure_persist_action(Some("DP-3"), "DP-3", true),
+            HdrFailurePersist::KeepRequest
+        );
+        assert_eq!(
+            hdr_failure_persist_action(None, "DP-3", true),
+            HdrFailurePersist::DisableAll
+        );
+        assert_eq!(
+            hdr_failure_persist_action(None, "DP-3", false),
+            HdrFailurePersist::DisableOne
+        );
+    }
+
+    #[test]
+    fn exclusive_hdr_rearms_active_state_after_restart_or_shutdown() {
+        assert_eq!(
+            exclusive_hdr_prepare_decision(ExclusiveHdrPhase::Active, false),
+            ExclusiveHdrPrepareDecision::Rearm
+        );
+        assert_eq!(
+            exclusive_hdr_prepare_decision(ExclusiveHdrPhase::Requested, false),
+            ExclusiveHdrPrepareDecision::Start
+        );
+        assert_eq!(
+            exclusive_hdr_prepare_decision(ExclusiveHdrPhase::Failed, false),
+            ExclusiveHdrPrepareDecision::Skip
+        );
+        assert_eq!(
+            exclusive_hdr_prepare_decision(ExclusiveHdrPhase::Verifying, false),
+            ExclusiveHdrPrepareDecision::SkipUnclean
+        );
+        assert_eq!(
+            exclusive_hdr_prepare_decision(ExclusiveHdrPhase::Active, true),
+            ExclusiveHdrPrepareDecision::Start
+        );
     }
 
     #[test]
@@ -2273,16 +2415,19 @@ mod hdr_detection {
             let metadata = support
                 .edid_hdr_metadata
                 .expect("HDR metadata blob requires parsed EDID Type 1 metadata");
+            let max_luminance = crate::core::color::hdr10_kms_max_luminance_nits();
+            let max_cll = crate::core::color::hdr10_kms_max_cll_nits();
+            let max_fall = crate::core::color::hdr10_kms_max_fall_nits();
 
             let infoframe = drm_ffi::hdr_metadata_infoframe {
                 eotf: HDMI_EOTF_SMPTE_ST2084,
                 metadata_type: HDMI_STATIC_METADATA_TYPE1,
                 display_primaries: metadata.display_primaries.map(|(x, y)| hdr_point(x, y)),
                 white_point: hdr_white_point(metadata.white_point.0, metadata.white_point.1),
-                max_display_mastering_luminance: metadata.max_luminance,
+                max_display_mastering_luminance: max_luminance,
                 min_display_mastering_luminance: metadata.min_luminance,
-                max_cll: metadata.max_luminance,
-                max_fall: metadata.max_fall,
+                max_cll,
+                max_fall,
             };
 
             drm_ffi::hdr_output_metadata {
@@ -2338,6 +2483,15 @@ mod hdr_detection {
 
             let created = create_hdr_metadata_blob(device, support)?;
             *blob = Some(created);
+            flog(&format!(
+                "HDR10 KMS metadata blob={created} max_luminance={} max_cll={} max_fall={} (SDR white) min_mastering={:?}",
+                crate::core::color::hdr10_kms_max_luminance_nits(),
+                crate::core::color::hdr10_kms_max_cll_nits(),
+                crate::core::color::hdr10_kms_max_fall_nits(),
+                support
+                    .edid_hdr_metadata
+                    .map(|metadata| metadata.min_luminance)
+            ));
             Ok(created)
         }
 
@@ -2929,6 +3083,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.process_power_timers();
         data.core.state.process_media_device_timers();
         data.core.state.process_network_state_timers();
+        data.core.state.process_update_state_timers();
         data.core.state.process_lock_timers();
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
@@ -3059,6 +3214,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         // after a failed session resume.
         let mut stalled_nodes: Vec<DrmNode> = Vec::new();
         for (node, device) in data.backend.devices.iter_mut() {
+            let exclusive_hdr_output = device.exclusive_hdr_output.clone();
+            let nvidia_dual = nvidia_dual_head_hdr_allowed();
             for surface in device.surfaces.values_mut() {
                 // The HDR deadline is armed when connector state changes, before
                 // render_frame/queue_frame. Keep watching it even when
@@ -3071,16 +3228,40 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     continue;
                 }
                 if hdr_stalled {
-                    flog_warn!(
-                        "HDR commit stalled on {} past {:?} with no vblank; disabling HDR and reinitializing the device to recover scanout",
-                        surface.output.name(),
-                        HDR_FRAME_TIMEOUT
-                    );
-                    disable_persisted_hdr_request(&surface.output.name());
-                    if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
-                        output.hdr_requested = false;
-                        output.hdr_verification_pending = false;
-                        output.hdr_enabled = false;
+                    let disabling = surface.hdr_transition_target == Some(false)
+                        || data
+                            .core
+                            .state
+                            .outputs
+                            .get(&surface.output_id)
+                            .is_some_and(|output| !output.hdr_requested);
+                    if disabling {
+                        flog_warn!(
+                            "HDR disable commit stalled on {} past {:?}; recovering scanout without latching exclusive failure",
+                            surface.output.name(),
+                            HDR_FRAME_TIMEOUT
+                        );
+                    } else {
+                        flog_warn!(
+                            "HDR commit stalled on {} past {:?} with no vblank; disabling HDR and reinitializing the device to recover scanout",
+                            surface.output.name(),
+                            HDR_FRAME_TIMEOUT
+                        );
+                        let persist = hdr_failure_persist_action(
+                            exclusive_hdr_output.as_deref(),
+                            surface.output.name().as_str(),
+                            nvidia_dual,
+                        );
+                        apply_persisted_hdr_failure(persist, surface.output.name().as_str());
+                        if persist == HdrFailurePersist::DisableAll {
+                            for output in data.core.state.outputs.values_mut() {
+                                clear_runtime_hdr_request(output);
+                            }
+                        } else if let Some(output) =
+                            data.core.state.outputs.get_mut(&surface.output_id)
+                        {
+                            clear_runtime_hdr_request(output);
+                        }
                     }
                 } else {
                     flog_warn!(
@@ -3089,7 +3270,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         DRM_FRAME_TIMEOUT
                     );
                 }
-                if device.exclusive_hdr_output.as_deref() == Some(surface.output.name().as_str()) {
+                let disabling = surface.hdr_transition_target == Some(false)
+                    || data
+                        .core
+                        .state
+                        .outputs
+                        .get(&surface.output_id)
+                        .is_some_and(|output| !output.hdr_requested);
+                if !disabling
+                    && device.exclusive_hdr_output.as_deref()
+                        == Some(surface.output.name().as_str())
+                {
                     let reason = if hdr_stalled {
                         "HDR KMS transition timed out without a vblank"
                     } else {
@@ -3412,7 +3603,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         && exclusive_hdr_output.as_deref() == Some(surface.output.name().as_str());
                     if exclusive_hdr_frame && !surface.render_targets.encoded_hdr {
                         flog_warn!(
-                            "Exclusive HDR PQ encoding stopped during verification on {}; staging SDR rollback",
+                            "Exclusive HDR PQ encoding stopped during verification on {}; staging SDR rollback without clearing the ordinary HDR request",
                             surface.output.name()
                         );
                         persist_exclusive_hdr_phase(
@@ -3420,11 +3611,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             Some(surface.output.name().as_str()),
                             Some("PQ encoding failed during HDR verification"),
                         );
-                        disable_persisted_hdr_request(&surface.output.name());
                         if let Some(output) = data.core.state.outputs.get_mut(&surface.output_id) {
-                            output.hdr_requested = false;
-                            output.hdr_verification_pending = false;
-                            output.hdr_enabled = false;
+                            clear_runtime_hdr_request(output);
                         }
                         data.core.state.mark_redraw();
                         continue;
@@ -3983,10 +4171,42 @@ fn device_added(
 
     if data.core.state.dmabuf_global.is_none() {
         let dmabuf_node = render_node_for_gpu.unwrap_or(node);
-        let default_feedback =
-            DmabufFeedbackBuilder::new(dmabuf_node.dev_id(), renderer.dmabuf_formats())
-                .build()
-                .context("Failed to build linux-dmabuf feedback")?;
+        let dmabuf_formats = renderer.dmabuf_formats();
+        let hdr_client_formats = dmabuf_formats
+            .iter()
+            .copied()
+            .filter(|format| {
+                matches!(
+                    format.code,
+                    Fourcc::Abgr16161616f
+                        | Fourcc::Argb16161616f
+                        | Fourcc::Abgr2101010
+                        | Fourcc::Argb2101010
+                        | Fourcc::Xbgr2101010
+                        | Fourcc::Xrgb2101010
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut feedback_builder =
+            DmabufFeedbackBuilder::new(dmabuf_node.dev_id(), dmabuf_formats.iter().copied());
+        if !hdr_client_formats.is_empty() {
+            use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
+            feedback_builder = feedback_builder.add_preference_tranche(
+                dmabuf_node.dev_id(),
+                Some(TrancheFlags::Scanout),
+                hdr_client_formats.iter().copied(),
+            );
+            flog(format!(
+                "linux-dmabuf prefers HDR client formats: {:?}",
+                hdr_client_formats
+                    .iter()
+                    .map(|format| format.code)
+                    .collect::<Vec<_>>()
+            ));
+        }
+        let default_feedback = feedback_builder
+            .build()
+            .context("Failed to build linux-dmabuf feedback")?;
         let global = data
             .core
             .state
@@ -4120,6 +4340,9 @@ fn device_added(
 
     let mut next_x = 0;
     let configured_displays = load_display_config();
+    let any_capable_hdr_requested = exclusive_candidates.iter().any(|(name, capable)| {
+        *capable && configured_display_hdr_requested(&configured_displays, name)
+    });
 
     for conn in &connector_handles {
         let info = drm_output_manager
@@ -4175,8 +4398,23 @@ fn device_added(
             edid.as_deref(),
         );
         hdr_detection::log_hdr_support(&output_name, &hdr_support);
+        let hdr_requested_from_config =
+            configured_display_hdr_requested(&configured_displays, &output_name);
         let hdr_requested_config = exclusive_hdr_output.as_deref() == Some(output_name.as_str())
-            || configured_display_hdr_requested(&configured_displays, &output_name);
+            || crate::core::color::matching_hdr_request(
+                nvidia_dual_head_hdr_allowed(),
+                exclusive_hdr_output.is_some(),
+                crate::core::color::hdr_output_selector_active(),
+                hdr_support.can_signal_hdr10() && hdr_support.bpc_control_allows_ten_bit(),
+                hdr_requested_from_config,
+                any_capable_hdr_requested,
+            );
+        if hdr_requested_config && !hdr_requested_from_config {
+            flog_warn!(
+                "HDR10 matching: requesting {output_name} so sibling HDR-capable outputs share the same PQ encode"
+            );
+            enable_persisted_hdr_request(&output_name);
+        }
         let hdr_safe_mode_requested = hdr_requested_config
             && hdr_support.can_signal_hdr10()
             && hdr_support.bpc_control_allows_ten_bit();
@@ -4686,7 +4924,15 @@ fn device_added(
                                         "HDR KMS transition validation failed on {}: {err}; disabling HDR and staging SDR rollback",
                                         surface.output.name()
                                     );
-                                    disable_persisted_hdr_request(&surface.output.name());
+                                    let persist = hdr_failure_persist_action(
+                                        exclusive_hdr_output.as_deref(),
+                                        surface.output.name().as_str(),
+                                        nvidia_dual_head_hdr_allowed(),
+                                    );
+                                    apply_persisted_hdr_failure(
+                                        persist,
+                                        surface.output.name().as_str(),
+                                    );
                                     if exclusive_hdr_output.as_deref()
                                         == Some(surface.output.name().as_str())
                                     {
@@ -4700,14 +4946,18 @@ fn device_added(
                                         recover_exclusive = true;
                                     }
                                     surface.hdr_enabled_applied = true;
-                                    if let Some(output) =
+                                    if persist == HdrFailurePersist::DisableAll {
+                                        for output in state.core.state.outputs.values_mut() {
+                                            output.hdr_transition_target = None;
+                                            output.hdr_kms_applied = false;
+                                            clear_runtime_hdr_request(output);
+                                        }
+                                    } else if let Some(output) =
                                         state.core.state.outputs.get_mut(&surface.output_id)
                                     {
-                                        output.hdr_requested = false;
                                         output.hdr_transition_target = None;
                                         output.hdr_kms_applied = false;
-                                        output.hdr_verification_pending = false;
-                                        output.hdr_enabled = false;
+                                        clear_runtime_hdr_request(output);
                                     }
                                     state.core.state.mark_redraw();
                                 }
@@ -4768,6 +5018,7 @@ fn device_added(
                                         Some(surface.output.name().as_str()),
                                         None,
                                     );
+                                    enable_persisted_hdr_request(surface.output.name().as_str());
                                     crate::core::wayland::color_management_protocol::notify_preferred_color_changed(
                                         &mut state.core.state,
                                     );

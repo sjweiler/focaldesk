@@ -13,6 +13,7 @@ serde_json = "1"
 focaldesk-settings-core = { path = "../focaldesk-settings-core" }
 focaldesk-power = { path = "../focaldesk-power" }
 focaldesk-notifications = { path = "../focaldesk-notifications" }
+focaldesk-updates = { path = "../focaldesk-updates" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-config = { path = "../focaldesk-config" }
 tracing = { workspace = true }

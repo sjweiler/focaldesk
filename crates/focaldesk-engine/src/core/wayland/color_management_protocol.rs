@@ -227,14 +227,15 @@ fn resolve_preferred_output_description(
 ) -> ColorDescription {
     if let Some(output) = state.outputs.get(&output_id) {
         if output.hdr_kms_applied {
-            // Client feedback describes the signal/color volume the output is
-            // actually consuming, not the delayed user-visible verification
-            // status or the SDR ICC profile used outside HDR.
-            // This is also what Chromium uses for `dynamic-range: high` and to
-            // choose an HDR video swap-chain color space.
+            // Chrome rasters HDR in P3 + extended sRGB. 8-bit windows cannot
+            // carry PQ, so prefer that raster space on P3-class panels.
             let peak = output.edid_hdr_max_luminance_nits.unwrap_or(1_000.0);
             let fall = output.edid_hdr_max_fall_nits.unwrap_or(peak);
-            return ColorDescription::bt2020_pq_hdr(peak, fall);
+            return ColorDescription::hdr_preferred_from_panel(
+                output.color_description,
+                peak,
+                fall,
+            );
         }
     }
     let description = state.output_color_description(output_id);
@@ -479,8 +480,11 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_tf_named(TransferFunction::Gamma22);
     manager.supported_tf_named(TransferFunction::ExtLinear);
     manager.supported_tf_named(TransferFunction::St2084Pq);
-    // Chromium maps gfx::ColorSpace::SRGB → WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB.
+    // Chromium maps gfx::ColorSpace::SRGB → WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB
+    // and SRGB_HDR → EXT_SRGB. Without ExtSrgb it copies the preferred PQ
+    // description onto linear/sRGB-HDR window buffers.
     manager.supported_tf_named(TransferFunction::Srgb);
+    manager.supported_tf_named(TransferFunction::ExtSrgb);
     manager.supported_tf_named(TransferFunction::CompoundPower24);
 
     manager.supported_primaries_named(Primaries::Srgb);
@@ -670,19 +674,28 @@ fn init_inert_image_description_info<D>(
 fn primary_luminance_wire_values(description: &ColorDescription) -> (u32, u32, u32) {
     // Minimum is wire ×10000; maximum/reference are unscaled cd/m².
     let pq = description.transfer == CoreTransferFunction::St2084Pq;
+    let hdr_volume = crate::core::color::is_hdr_client_preferred_transfer(description.transfer)
+        || description.is_windows_scrgb();
     let min_nits: f32 = if pq { 0.005 } else { 0.2 };
     let min_lum = (min_nits * 10_000.0).round() as u32;
-    // ST 2084 always encodes the absolute 0–10,000-nit signal volume. The
+    // ST 2084 and extended sRGB advertise a 10,000-nit signal volume. The
     // actual display/content peak is a target-volume property and is emitted
     // separately below. Advertising the panel peak here causes clients such
-    // as Chromium to construct a malformed PQ output color space when mapping
+    // as Chromium to construct a malformed HDR output color space when mapping
     // SDR video into the HDR surface.
-    let max_lum = if pq {
+    let max_lum = if hdr_volume {
         10_000
     } else {
         description.max_luminance_nits.round().max(1.0) as u32
     };
-    let reference_lum = description.reference_white_nits.round().max(1.0) as u32;
+    // Windows-scRGB unit white is 80 cd/m². Assumed graphics white (203 nits)
+    // is sample 2.5375 and must not be advertised as the luminance of (1,1,1),
+    // or Chromium maps SDR images as if 1.0 were paper white.
+    let reference_lum = if description.is_windows_scrgb() {
+        80
+    } else {
+        description.reference_white_nits.round().max(1.0) as u32
+    };
     (min_lum, max_lum, reference_lum)
 }
 
@@ -723,9 +736,15 @@ fn primaries_from_wire(
 
 fn sanitize_client_color_description(
     _state: &DesktopState,
-    _surface: &WlSurface,
+    surface: &WlSurface,
     description: ColorDescription,
 ) -> ColorDescription {
+    if description.transfer == CoreTransferFunction::St2084Pq {
+        flog_warn!(
+            "wp color: surface={:?} tagged PQ; 8-bit decodes as P3 sRGB-HDR, 10-bit keeps PQ, FP16 decodes as Rec.709 linear HDR",
+            surface.id()
+        );
+    }
     description
 }
 
@@ -734,8 +753,8 @@ fn output_advertised_description(description: ColorDescription) -> ColorDescript
     // Chrome rejects Bt1886/Gamma22/ExtLinear for internal BT709/sRGB paths ("non-power-curve").
     // Advertise sRGB-class transfer to clients; ICC LUT scanout still uses the profile TRC.
     ColorDescription {
-        transfer: if description.transfer == CoreTransferFunction::St2084Pq {
-            CoreTransferFunction::St2084Pq
+        transfer: if crate::core::color::is_hdr_client_preferred_transfer(description.transfer) {
+            description.transfer
         } else {
             CoreTransferFunction::Srgb
         },
@@ -796,6 +815,7 @@ fn emit_image_description_info_events(
 
     let tf_named = match description.transfer {
         CoreTransferFunction::Srgb => TransferFunction::Srgb,
+        CoreTransferFunction::SrgbHdr => TransferFunction::ExtSrgb,
         CoreTransferFunction::Bt1886 | CoreTransferFunction::Gamma22 => {
             TransferFunction::CompoundPower24
         }
@@ -807,11 +827,30 @@ fn emit_image_description_info_events(
     let (primary_min_lum, primary_max_lum, reference_lum) =
         primary_luminance_wire_values(description);
     info.luminances(primary_min_lum, primary_max_lum, reference_lum);
+    if info.version() >= 2
+        && crate::core::color::is_hdr_client_preferred_transfer(description.transfer)
+    {
+        // Chromium uses target primaries to construct the HDR display
+        // color volume. Omitting this event leaves its HDR target
+        // metadata incomplete, which can collapse P3 content and produce
+        // an incorrect paper-white mapping.
+        let target = description.primaries.chromaticity();
+        info.target_primaries(
+            (target.r[0] * 1_000_000.0).round() as i32,
+            (target.r[1] * 1_000_000.0).round() as i32,
+            (target.g[0] * 1_000_000.0).round() as i32,
+            (target.g[1] * 1_000_000.0).round() as i32,
+            (target.b[0] * 1_000_000.0).round() as i32,
+            (target.b[1] * 1_000_000.0).round() as i32,
+            (target.w[0] * 1_000_000.0).round() as i32,
+            (target.w[1] * 1_000_000.0).round() as i32,
+        );
+    }
+    // The internal description's max/CLL/FALL represent the content or
+    // display target volume. PQ's primary volume remains the fixed
+    // 10,000-nit ST 2084 signal swing, while target_luminance carries the
+    // real panel/content peak.
     if info.version() >= 2 {
-        // The internal description's max/CLL/FALL represent the content or
-        // display target volume. PQ's primary volume remains the fixed
-        // 10,000-nit ST 2084 signal swing, while target_luminance carries the
-        // real panel/content peak.
         let (target_min_lum, target_max_lum) = target_luminance_wire_values(description);
         info.target_luminance(target_min_lum, target_max_lum);
         if let Some(max_cll) = description.max_cll_nits {
@@ -849,6 +888,7 @@ fn build_description_from_params(
             wp_color_manager_v1::TransferFunction::Gamma22 => CoreTransferFunction::Gamma22,
             wp_color_manager_v1::TransferFunction::Srgb
             | wp_color_manager_v1::TransferFunction::CompoundPower24 => CoreTransferFunction::Srgb,
+            wp_color_manager_v1::TransferFunction::ExtSrgb => CoreTransferFunction::SrgbHdr,
             wp_color_manager_v1::TransferFunction::ExtLinear => CoreTransferFunction::Linear,
             wp_color_manager_v1::TransferFunction::St2084Pq => CoreTransferFunction::St2084Pq,
             _ => return Err("unsupported named transfer function".into()),
@@ -860,7 +900,9 @@ fn build_description_from_params(
         ParametricTransfer::Power(_) => return Err("unsupported power transfer function".into()),
     };
 
-    let default_ref_nits = if mapped_tf == CoreTransferFunction::St2084Pq {
+    let default_ref_nits = if mapped_tf == CoreTransferFunction::St2084Pq
+        || mapped_tf == CoreTransferFunction::SrgbHdr
+    {
         203.0
     } else {
         80.0
@@ -897,6 +939,10 @@ fn build_description_from_params(
         max_luminance_nits: max_nits,
         max_cll_nits: creator.max_cll_nits.map(|nits| nits as f32),
         max_fall_nits: creator.max_fall_nits.map(|nits| nits as f32),
+        windows_scrgb_stimulus: mapped_tf == CoreTransferFunction::Linear
+            && matches!(primaries, crate::core::color::ColorPrimaries::Srgb)
+            && (ref_nits - 80.0).abs() <= 1.0
+            && max_nits >= 1_000.0,
     })
 }
 
@@ -1096,7 +1142,7 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState {
                     data_init,
                     image_description,
                     ColorDescription::WINDOWS_SCRGB,
-                    true,
+                    false,
                     None,
                     false,
                     None,
@@ -1585,9 +1631,10 @@ impl Dispatch<wp_color_management_output_v1::WpColorManagementOutputV1, OutputCo
                     .unwrap_or_else(|| state.output_color_description_for(&output_mgmt.output));
                 // SDR ICC profiles describe the panel's SDR TRCs and must not
                 // replace a live output's parametric BT.2020/PQ description.
-                let icc_profile = (description.transfer != CoreTransferFunction::St2084Pq)
-                    .then(|| state.output_icc_profile_for(&output_mgmt.output))
-                    .flatten();
+                let icc_profile =
+                    (!crate::core::color::is_hdr_client_preferred_transfer(description.transfer))
+                        .then(|| state.output_icc_profile_for(&output_mgmt.output))
+                        .flatten();
                 finish_output_image_description(
                     state,
                     data_init,
@@ -1655,14 +1702,15 @@ impl
                 }
                 let output_id = state.preferred_output_id_for_surface(&feedback.surface);
                 let description = resolve_preferred_output_description(state, output_id);
-                let icc_profile = (description.transfer != CoreTransferFunction::St2084Pq)
-                    .then(|| {
-                        state
-                            .outputs
-                            .get(&output_id)
-                            .and_then(|output| output.icc_profile.clone())
-                    })
-                    .flatten();
+                let icc_profile =
+                    (!crate::core::color::is_hdr_client_preferred_transfer(description.transfer))
+                        .then(|| {
+                            state
+                                .outputs
+                                .get(&output_id)
+                                .and_then(|output| output.icc_profile.clone())
+                        })
+                        .flatten();
                 wp_color_trace!(
                     "surface feedback get_preferred: output={output_id:?} transfer={:?} primaries={:?}",
                     description.transfer,
@@ -1905,6 +1953,15 @@ mod tests {
     }
 
     #[test]
+    fn windows_scrgb_wire_luminances_keep_unit_white_at_eighty_nits() {
+        let (_min, max, reference) =
+            super::primary_luminance_wire_values(&ColorDescription::WINDOWS_SCRGB);
+        assert_eq!(reference, 80);
+        assert_eq!(max, 10_000);
+        assert!(ColorDescription::WINDOWS_SCRGB.is_windows_scrgb());
+    }
+
+    #[test]
     fn output_without_icc_uses_canonical_sdr_advertisement_flag() {
         let data = super::ImageDescriptionData {
             identity: 1,
@@ -1933,6 +1990,20 @@ mod tests {
     }
 
     #[test]
+    fn hdr_preferred_ext_srgb_is_not_collapsed_to_sdr_srgb() {
+        let advertised =
+            super::output_advertised_description(ColorDescription::DISPLAY_P3_SRGB_HDR);
+        assert_eq!(
+            advertised.transfer,
+            crate::core::color::TransferFunction::SrgbHdr
+        );
+        assert_eq!(
+            advertised.primaries,
+            crate::core::color::ColorPrimaries::DisplayP3
+        );
+    }
+
+    #[test]
     fn parametric_ext_linear_is_preserved_for_client_surfaces() {
         let creator = super::ParametricCreatorInner {
             primaries: Some(crate::core::color::ColorPrimaries::Srgb),
@@ -1945,6 +2016,26 @@ mod tests {
         assert_eq!(
             description.transfer,
             crate::core::color::TransferFunction::Linear
+        );
+        assert!(!description.is_windows_scrgb());
+    }
+
+    #[test]
+    fn parametric_ext_linear_eighty_nit_unit_is_windows_scrgb() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::Srgb),
+            tf: Some(super::ParametricTransfer::Named(
+                WpTransferFunction::ExtLinear,
+            )),
+            reference_luminance_nits: Some(80),
+            max_luminance_nits: Some(10_000),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid params");
+        assert!(description.is_windows_scrgb());
+        assert_eq!(
+            description.linear_to_scene_scale(),
+            80.0 / crate::core::color::HDR_REFERENCE_WHITE_NITS
         );
     }
 
@@ -1964,6 +2055,28 @@ mod tests {
             description.transfer,
             crate::core::color::TransferFunction::Srgb
         );
+    }
+
+    #[test]
+    fn parametric_ext_srgb_maps_to_srgb_hdr() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::DisplayP3),
+            tf: Some(super::ParametricTransfer::Named(
+                WpTransferFunction::ExtSrgb,
+            )),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid params");
+        assert_eq!(
+            description.primaries,
+            crate::core::color::ColorPrimaries::DisplayP3
+        );
+        assert_eq!(
+            description.transfer,
+            crate::core::color::TransferFunction::SrgbHdr
+        );
+        assert!(!description.is_windows_scrgb());
+        assert_eq!(description.linear_to_scene_scale(), 1.0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod notifications;
 pub mod power;
 pub mod settings;
 pub mod transport;
+pub mod updates;
 
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
@@ -98,6 +99,7 @@ pub enum DesktopAction {
     MoveWindowToWorkspace { window_id: u32, workspace: u32 },
     OpenSettingsPanel { panel: String },
     OpenNotificationsPanel,
+    OpenUpdatesPanel,
     ToggleDoNotDisturb,
     CreateWorkspace,
     DeleteWorkspace,
@@ -179,6 +181,10 @@ pub struct ShellSnapshot {
     pub workspace_count: usize,
     pub do_not_disturb: bool,
     pub notification_unread_count: usize,
+    #[serde(default)]
+    pub update_available_count: usize,
+    #[serde(default)]
+    pub update_busy: bool,
     pub network_carrier: bool,
     pub wifi_signal_percent: Option<u8>,
     pub battery_percent: Option<u8>,
@@ -360,3 +366,7 @@ pub use power::{
     send_power_request, serve_power_ipc,
 };
 pub use settings::serve_settings_ipc;
+pub use updates::{
+    UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME, UpdateIpcRequest, UpdateIpcResponse,
+    send_update_request, serve_update_ipc, updates_socket_path,
+};

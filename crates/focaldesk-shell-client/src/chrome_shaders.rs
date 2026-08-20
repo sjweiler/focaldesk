@@ -1211,11 +1211,10 @@ void main() {
         discard;
     }
     vec3 straight = src.rgb / src.a;
-    // ExtLinear (wp_color wide gamut): preserve scRGB headroom above 1.0 in the FP16 scene.
+    // ExtLinear (including Windows-scRGB) uses negative components as well as
+    // headroom above 1.0 to represent colors outside the sRGB gamut.
     bool extended_linear = u_decode_tf >= 0.5 && u_decode_tf < 1.5;
-    if (extended_linear) {
-        straight = max(straight, vec3(0.0));
-    } else {
+    if (!extended_linear) {
         straight = clamp(straight, 0.0, 1.0);
     }
     vec3 linear = mul_mat3(decode_color(straight));

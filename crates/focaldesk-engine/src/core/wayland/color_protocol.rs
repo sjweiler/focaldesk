@@ -194,6 +194,7 @@ impl Dispatch<focaldesk_surface_color_v1::FocaldeskSurfaceColorV1, SurfaceColorT
                         ..ColorDescription::SRGB
                     },
                     TransferFunction::St2084Pq => return,
+                    TransferFunction::SrgbHdr => ColorDescription::DISPLAY_P3_SRGB_HDR,
                 };
                 set_pending_description(&tag.surface, Some(description));
                 flog(format!(

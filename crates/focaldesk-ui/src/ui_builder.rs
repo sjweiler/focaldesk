@@ -31,6 +31,7 @@ pub const TOPBAR_CAMERA_ID: u32 = 105;
 pub const TOPBAR_DND_ID: u32 = 106;
 pub const TOPBAR_NOTIFICATIONS_ID: u32 = 107;
 pub const TOPBAR_MICROPHONE_ID: u32 = 108;
+pub const TOPBAR_UPDATES_ID: u32 = 109;
 
 // Workspace buttons get dynamically assigned IDs instead of fixed per-slot
 // consts, since the number of individually displayed workspace buttons is
@@ -110,6 +111,8 @@ pub struct UiBuildOptions {
     pub do_not_disturb: bool,
     pub notification_unread: bool,
     pub notification_unread_count: usize,
+    pub update_available_count: usize,
+    pub update_busy: bool,
     pub network_state: NetworkState,
     pub workspace_count: usize,
     /// Max number of workspace buttons shown individually before they
@@ -139,6 +142,8 @@ impl Default for UiBuildOptions {
             do_not_disturb: false,
             notification_unread: false,
             notification_unread_count: 0,
+            update_available_count: 0,
+            update_busy: false,
             network_state: NetworkState::default(),
             workspace_count: 1,
             max_workspace_slots: 4,
@@ -172,6 +177,18 @@ impl UiBuildOptions {
                 .map(|items| items.iter().filter(|item| item.visible).count())
                 .unwrap_or(DEFAULT_SIDEBAR_SLOT_COUNT),
         }
+    }
+}
+
+fn update_tooltip(count: usize, busy: bool) -> String {
+    if busy {
+        "Installing or checking system updates…".to_string()
+    } else if count == 0 {
+        "System updates: up to date".to_string()
+    } else if count == 1 {
+        "1 system update available".to_string()
+    } else {
+        format!("{count} system updates available")
     }
 }
 
@@ -331,6 +348,14 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
         )
         .selected(options.notification_unread)
         .active(options.notification_unread),
+        ChromeItem::new(
+            TOPBAR_UPDATES_ID,
+            IconId::Updates,
+            update_tooltip(options.update_available_count, options.update_busy),
+            UiAction::OpenPanel(PanelKind::Updates),
+        )
+        .selected(options.update_available_count > 0)
+        .active(options.update_busy || options.update_available_count > 0),
         ChromeItem::new(
             TOPBAR_DND_ID,
             IconId::SpeakerOff,
@@ -562,9 +587,9 @@ mod tests {
     use crate::element::{ChromeItem, UiElement};
     use crate::ui_builder::{
         SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID,
-        SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID, UiAction,
-        UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options, default_status_items,
-        sidebar_workspace_id, sidebar_workspace_number,
+        SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID, TOPBAR_UPDATES_ID,
+        UiAction, UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options,
+        default_status_items, sidebar_workspace_id, sidebar_workspace_number,
     };
     use crate::uitree::UiTree;
 
@@ -816,6 +841,41 @@ mod tests {
         );
         assert_eq!(hdr_tooltip(true, false, false), "HDR supported (off)");
         assert_eq!(hdr_tooltip(false, true, true), "HDR not detected");
+    }
+
+    #[test]
+    fn updates_indicator_opens_updates_panel_and_badges_count() {
+        let output_size = smithay::utils::Size::from((1920, 1080));
+        let options = UiBuildOptions {
+            update_available_count: 3,
+            update_busy: false,
+            ..UiBuildOptions::default()
+        };
+        let layout = crate::chrome_layout::build_chrome_layout_with_config(
+            output_size,
+            64,
+            76,
+            options.layout_config(),
+        );
+        let mut ui = UiTree::default();
+        build_ui_for_output_with_options(&mut ui, &layout, options);
+
+        let updates = ui
+            .elements
+            .iter()
+            .find(|element| element.id == TOPBAR_UPDATES_ID)
+            .expect("updates indicator");
+        assert_eq!(updates.icon, Some(IconId::Updates));
+        assert_eq!(
+            updates.tooltip.as_deref(),
+            Some("3 system updates available")
+        );
+        assert!(updates.selected);
+        assert!(updates.active);
+        assert!(matches!(
+            updates.action,
+            Some(UiAction::OpenPanel(crate::types::PanelKind::Updates))
+        ));
     }
 
     #[test]
