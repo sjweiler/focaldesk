@@ -1533,6 +1533,8 @@ mod tests {
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("p3_luminance(p3)"));
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("0.228975, 0.691739, 0.079287"));
         assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight * 0.72"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("neutral_highlight = 1.0 - accent"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("neutral_highlight * isolated"));
         assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
         assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(80.0, 800.0"));
         assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("base + vec3"));
@@ -1661,8 +1663,9 @@ vec3 pq_to_scene_linear(vec3 c) {
 }
 
 vec3 dither_code_value(vec3 c) {
-    // 8-bit HDR windows (PQ or sRGB-HDR) have 256 steps. Ordered dither in
-    // code value hides purple/blue sky slabs; it cannot recover missing bits.
+    // 8-bit client surfaces have 256 steps regardless of their transfer tag.
+    // Ordered dither in code value hides dark ramps promoted into HDR10; it
+    // cannot recover detail that was absent from the client buffer.
     if (u_src_bits <= 1.0) {
         return c;
     }
@@ -2490,7 +2493,11 @@ void main() {
 
         float rim = rim_band * warm_pale * isolated;
         float logo_white = logo_band * neutral * smoothstep(0.20, 0.72, y);
-        float star = (1.0 - logo_band) * (1.0 - rim) * isolated
+        // Colored accents have dedicated targets below. Excluding them from
+        // the generic highlight pass avoids promoting orange twice, which can
+        // push it into the output gamut compressor and change its appearance.
+        float neutral_highlight = 1.0 - accent;
+        float star = (1.0 - logo_band) * (1.0 - rim) * neutral_highlight * isolated
             * smoothstep(0.035, 0.48, y);
         // The authored cyan artwork shares its hue with broad regions of the
         // blue space gradient. Requiring local isolation keeps that diffuse

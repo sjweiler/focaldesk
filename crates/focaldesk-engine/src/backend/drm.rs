@@ -4340,10 +4340,6 @@ fn device_added(
 
     let mut next_x = 0;
     let configured_displays = load_display_config();
-    let any_capable_hdr_requested = exclusive_candidates.iter().any(|(name, capable)| {
-        *capable && configured_display_hdr_requested(&configured_displays, name)
-    });
-
     for conn in &connector_handles {
         let info = drm_output_manager
             .device()
@@ -4401,20 +4397,7 @@ fn device_added(
         let hdr_requested_from_config =
             configured_display_hdr_requested(&configured_displays, &output_name);
         let hdr_requested_config = exclusive_hdr_output.as_deref() == Some(output_name.as_str())
-            || crate::core::color::matching_hdr_request(
-                nvidia_dual_head_hdr_allowed(),
-                exclusive_hdr_output.is_some(),
-                crate::core::color::hdr_output_selector_active(),
-                hdr_support.can_signal_hdr10() && hdr_support.bpc_control_allows_ten_bit(),
-                hdr_requested_from_config,
-                any_capable_hdr_requested,
-            );
-        if hdr_requested_config && !hdr_requested_from_config {
-            flog_warn!(
-                "HDR10 matching: requesting {output_name} so sibling HDR-capable outputs share the same PQ encode"
-            );
-            enable_persisted_hdr_request(&output_name);
-        }
+            || hdr_requested_from_config;
         let hdr_safe_mode_requested = hdr_requested_config
             && hdr_support.can_signal_hdr10()
             && hdr_support.bpc_control_allows_ten_bit();

@@ -38,6 +38,8 @@ version numbers where practical.
 
 ### Changed
 
+- NVIDIA multi-output HDR permission now preserves each monitor's independent
+  HDR/SDR request instead of promoting every capable sibling to HDR10.
 - Documented a successful Fedora 44 and NVIDIA 595-series HDR10 configuration,
   including Google Chrome, while retaining the experimental NVIDIA safeguards.
 - Clarified experimental and planned feature claims, including subsurface

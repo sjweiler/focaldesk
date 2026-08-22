@@ -195,18 +195,17 @@ SDR. The frame watchdog, connector-property validation, persisted request
 disable, and SDR rollback remain active.
 
 Display Settings also provides **Apply Requested HDR10** under **Experimental
-HDR10**. Enable **HDR output request** on at least one display, then use the red
-apply button. FocalDesk requests HDR10 on every enabled capable output so
-identical panels share BT.2020/PQ. Mixed HDR10 and SDR+ICC will not match: the
-HDR head is D65 PQ while the SDR head keeps its ICC white point, and Chrome
-switches to scRGB whenever any output has live HDR. `FOCALDESK_HDR_OUTPUT` and
-**Restart & Try HDR10** remain the one-head test paths. The output topology is
-left unchanged.
+HDR10**. Enable **HDR output request** on each display that should use HDR10,
+then use the red apply button. Requests are independent: capable requested
+outputs use BT.2020/PQ while unrequested outputs remain SDR. Mixed HDR10 and
+SDR+ICC will not visually match by default: the HDR head is D65 PQ while the SDR
+head keeps its ICC white point, and Chrome switches to scRGB whenever any output
+has live HDR. The compositor still applies the appropriate per-output transform.
+`FOCALDESK_HDR_OUTPUT` and **Restart & Try HDR10** remain the one-head test paths.
+The output topology is left unchanged.
 
 A failed exclusive HDR attempt blocks only automatic exclusive retry. It does
-not persist-disable that connector's ordinary `hdr_requested` flag, because that
-would leave the other head in HDR10 after exclusive mode restores the dual-head
-topology.
+not persist-disable that connector's ordinary `hdr_requested` flag.
 
 For a controlled multi-monitor test, enable HDR for the intended display in
 Display Settings and select its connector in the compositor environment. When
@@ -277,7 +276,7 @@ and rebuilds the ordinary all-output topology. The state lives at
 `$XDG_STATE_HOME/focaldesk/exclusive-hdr.json`. A failed exclusive attempt
 blocks only automatic exclusive retry. It does not clear a saved `hdr_requested`
 preference on that connector. **Apply Requested HDR10** and dual-head NVIDIA HDR
-still apply on the next login so both panels can share HDR10. If exclusive HDR was
+still apply the saved per-output requests on the next login. If exclusive HDR was
 already verified Active, logout, restart, and shutdown re-arm that request so
 the next session can enter HDR10 again. An unfinished Starting/Verifying
 attempt still fail-safes to SDR after a crash. Display Settings shows the saved

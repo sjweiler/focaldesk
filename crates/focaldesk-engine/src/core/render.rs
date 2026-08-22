@@ -145,6 +145,7 @@ pub enum ClientCompositingMode {
     Linear {
         client_to_scene: GlesTexProgram,
         srgb_to_linear: GlesTexProgram,
+        dither_8bit_sources: bool,
     },
 }
 
@@ -1910,7 +1911,9 @@ impl RenderState {
 
         match client_compositing {
             ClientCompositingMode::Linear {
-                client_to_scene, ..
+                client_to_scene,
+                dither_8bit_sources,
+                ..
             } => {
                 let runs = contiguous_runs_by_key(elements, |elem| {
                     surface_colors
@@ -1936,7 +1939,14 @@ impl RenderState {
                         Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
                         Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
                         Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
-                        Uniform::new("u_src_bits", color.pq_src_bits),
+                        Uniform::new(
+                            "u_src_bits",
+                            if *dither_8bit_sources {
+                                color.src_bits
+                            } else {
+                                0.0
+                            },
+                        ),
                     ];
                     frame.override_default_tex_program(client_to_scene.clone(), uniforms);
                     let result = draw_render_elements(frame, ctx.output_scale.x, run, damage);
@@ -3695,7 +3705,9 @@ impl RenderState {
         let damage = &ctx.damage;
 
         let ClientCompositingMode::Linear {
-            client_to_scene, ..
+            client_to_scene,
+            dither_8bit_sources,
+            ..
         } = client_compositing
         else {
             if let ClientCompositingMode::LinearUi { srgb_to_linear } = client_compositing {
@@ -3732,7 +3744,14 @@ impl RenderState {
                 Uniform::new("u_m0", [m[0][0], m[0][1], m[0][2]]),
                 Uniform::new("u_m1", [m[1][0], m[1][1], m[1][2]]),
                 Uniform::new("u_m2", [m[2][0], m[2][1], m[2][2]]),
-                Uniform::new("u_src_bits", color.pq_src_bits),
+                Uniform::new(
+                    "u_src_bits",
+                    if *dither_8bit_sources {
+                        color.src_bits
+                    } else {
+                        0.0
+                    },
+                ),
             ];
             frame.override_default_tex_program(client_to_scene.clone(), uniforms);
             let result = draw_render_elements(frame, ctx.output_scale.x, run, damage);

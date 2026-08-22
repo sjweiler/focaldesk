@@ -53,6 +53,7 @@ gl = "0.14.0"
 fontdue = "0.9"
 chrono.workspace = true
 image.workspace = true
+png.workspace = true
 glow.workspace = true
 libc = "0.2"
 lcms2 = "6.1.1"

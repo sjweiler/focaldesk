@@ -2352,22 +2352,6 @@ impl DesktopState {
             .flatten();
         let mut changed = false;
         let mut unmatched = Vec::new();
-        let any_capable_requested = outputs.iter().any(|config| {
-            self.outputs.values().any(|output| {
-                output.handle.name() == config.connector
-                    && output.hdr_supported
-                    && (config.hdr_requested || config.hdr_enabled)
-            })
-        });
-        let promote_matching_hdr = crate::core::color::matching_hdr_request(
-            crate::core::color::hdr_nvidia_dual_enabled(),
-            false,
-            crate::core::color::hdr_output_selector_active(),
-            true,
-            false,
-            any_capable_requested,
-        );
-
         for config in outputs {
             let output_id = self
                 .outputs
@@ -2400,7 +2384,7 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
-                let requested = config.hdr_requested || config.hdr_enabled || promote_matching_hdr;
+                let requested = config.hdr_requested || config.hdr_enabled;
                 output.hdr_requested = output.hdr_supported && requested;
                 output.hdr_enabled = !output.hdr_verification_pending
                     && crate::core::color::output_hdr_render_active(

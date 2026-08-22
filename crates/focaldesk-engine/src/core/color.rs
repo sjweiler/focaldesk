@@ -497,10 +497,9 @@ pub struct SurfaceColorRenderState {
     pub intent: RenderingIntent,
     /// Row-major 3×3: linear client RGB → scene-linear Rec.709.
     pub client_to_scene: [[f32; 3]; 3],
-    /// Encoded-source bit depth for decode dither. Chrome's HDR window is
-    /// still `AB24`, whether tagged PQ or `SrgbHdr`; 10-bit/FP16 leave this
-    /// at 0.
-    pub pq_src_bits: f32,
+    /// Encoded-source bit depth for decode dither. GTK and Chrome commonly
+    /// submit `AB24`; 10-bit/FP16 sources leave this at 0.
+    pub src_bits: f32,
 }
 
 impl SurfaceColorRenderState {
@@ -511,22 +510,19 @@ impl SurfaceColorRenderState {
             description,
             intent,
             client_to_scene,
-            pq_src_bits: 0.0,
+            src_bits: 0.0,
         }
     }
 
     pub fn with_buffer_encoding(mut self, encoding: ClientBufferEncoding) -> Self {
-        // Sanitize remaps 8-bit PQ to SrgbHdr, and Chrome 151 tags that
-        // transfer itself. Either way the samples are 8-bit, so skies
-        // posterize into purple/blue slabs unless we dither in code value.
-        let eight_bit_hdr = matches!(
-            encoding,
-            ClientBufferEncoding::Unorm8 | ClientBufferEncoding::Unknown
-        ) && matches!(
-            self.description.transfer,
-            TransferFunction::St2084Pq | TransferFunction::SrgbHdr
-        );
-        self.pq_src_bits = if eight_bit_hdr { 8.0 } else { 0.0 };
+        // Record the packing independently of the tagged transfer. Ordinary
+        // 8-bit sRGB GTK gradients need decode dither too when promoted to
+        // HDR10; the render path gates the dither off for SDR outputs.
+        self.src_bits = if encoding == ClientBufferEncoding::Unorm8 {
+            8.0
+        } else {
+            0.0
+        };
         self
     }
 
@@ -814,26 +810,6 @@ pub fn hdr_nvidia_dual_enabled() -> bool {
 /// `FOCALDESK_HDR_OUTPUT` is set to one exact connector for a mixed HDR/SDR test.
 pub fn hdr_output_selector_active() -> bool {
     normalized_env_value("FOCALDESK_HDR_OUTPUT").is_some()
-}
-
-/// Sibling HDR-capable panels must share HDR10 or share SDR.
-///
-/// Mixing HDR10 PQ on one head with SDR+ICC on the other makes identical
-/// monitors look different (warm ICC vs D65 PQ). Chrome also switches to
-/// scRGB whenever any output has live HDR, so the SDR head is wrong too.
-/// Exclusive HDR and `FOCALDESK_HDR_OUTPUT` keep one-head test topologies.
-pub fn matching_hdr_request(
-    nvidia_dual: bool,
-    exclusive_topology: bool,
-    single_output_selector: bool,
-    this_hdr10_capable: bool,
-    this_requested: bool,
-    any_capable_requested: bool,
-) -> bool {
-    if exclusive_topology || single_output_selector || !this_hdr10_capable {
-        return this_requested;
-    }
-    (nvidia_dual && any_capable_requested) || this_requested
 }
 
 /// Limit experimental HDR rendering and KMS changes to one connector.
@@ -1130,28 +1106,35 @@ mod tests {
     }
 
     #[test]
-    fn eight_bit_pq_windows_enable_decode_dither() {
+    fn eight_bit_clients_enable_decode_dither() {
         let pq = ColorDescription::bt2020_pq_hdr(450.0, 400.0);
         let eight = SurfaceColorRenderState::for_description(pq, RenderingIntent::Relative)
             .with_buffer_encoding(ClientBufferEncoding::Unorm8);
-        assert_eq!(eight.pq_src_bits, 8.0);
+        assert_eq!(eight.src_bits, 8.0);
         let ten = SurfaceColorRenderState::for_description(pq, RenderingIntent::Relative)
             .with_buffer_encoding(ClientBufferEncoding::Unorm10);
-        assert_eq!(ten.pq_src_bits, 0.0);
+        assert_eq!(ten.src_bits, 0.0);
+
+        let gtk = SurfaceColorRenderState::for_description(
+            ColorDescription::SRGB,
+            RenderingIntent::Perceptual,
+        )
+        .with_buffer_encoding(ClientBufferEncoding::Unorm8);
+        assert_eq!(gtk.src_bits, 8.0);
 
         let chrome = sanitize_tagged_client_description(pq, ClientBufferEncoding::Unorm8);
         let chrome_eight =
             SurfaceColorRenderState::for_description(chrome, RenderingIntent::Relative)
                 .with_buffer_encoding(ClientBufferEncoding::Unorm8);
         assert_eq!(chrome.transfer, TransferFunction::SrgbHdr);
-        assert_eq!(chrome_eight.pq_src_bits, 8.0);
+        assert_eq!(chrome_eight.src_bits, 8.0);
 
         let tagged = SurfaceColorRenderState::for_description(
             ColorDescription::DISPLAY_P3_SRGB_HDR,
             RenderingIntent::Relative,
         )
         .with_buffer_encoding(ClientBufferEncoding::Unorm8);
-        assert_eq!(tagged.pq_src_bits, 8.0);
+        assert_eq!(tagged.src_bits, 8.0);
     }
 
     #[test]
@@ -1531,20 +1514,6 @@ mod tests {
         assert!(hdr_output_selected_with_selector("DP-3", Some("")));
         assert!(hdr_output_selected_with_selector("DP-3", Some(" DP-3 ")));
         assert!(!hdr_output_selected_with_selector("DP-4", Some("DP-3")));
-    }
-
-    #[test]
-    fn nvidia_dual_hdr_requests_every_capable_sibling() {
-        assert!(matching_hdr_request(true, false, false, true, false, true));
-        assert!(!matching_hdr_request(
-            true, false, false, true, false, false
-        ));
-        assert!(!matching_hdr_request(true, true, false, true, false, true));
-        assert!(!matching_hdr_request(true, false, true, true, false, true));
-        assert!(!matching_hdr_request(
-            true, false, false, false, false, true
-        ));
-        assert!(matching_hdr_request(false, false, false, true, true, false));
     }
 
     #[test]

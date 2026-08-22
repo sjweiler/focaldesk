@@ -1162,6 +1162,28 @@ pub fn run_linear_staged_pass(
     // support from every GLES driver.
     let profile_timings = render_timing_sample(prepared.frame_ctx.frame_no);
     let mut pass_timings = Vec::with_capacity(7);
+    let dither_8bit_sources = state
+        .outputs
+        .get(&output_id)
+        .map(|output| {
+            let selected = crate::core::color::hdr_output_selected(&output.handle.name());
+            let test_encode = selected
+                && crate::core::color::output_hdr_pq_test_encode_active(
+                    output.hdr_requested,
+                    output.hdr_supported,
+                    output.hdr_kms_applied,
+                );
+            let (hdr_active, hdr_kms_target) = resolve_hdr_encode_state(
+                selected,
+                output.hdr_requested,
+                output.hdr_supported,
+                output.hdr_kms_applied,
+                output.hdr_transition_target,
+                test_encode,
+            );
+            hdr_active && (hdr_kms_target || hdr_render_runtime_enabled())
+        })
+        .unwrap_or(false);
     let needs_srgb_overlay = state
         .desktop_outputs
         .get(&output_id)
@@ -1340,6 +1362,7 @@ pub fn run_linear_staged_pass(
             ClientCompositingMode::Linear {
                 client_to_scene: client_to_scene.clone(),
                 srgb_to_linear: srgb_to_linear.clone(),
+                dither_8bit_sources,
             },
             ChromeGlassPass::Skip,
             true,
@@ -1387,6 +1410,7 @@ pub fn run_linear_staged_pass(
                 ClientCompositingMode::Linear {
                     client_to_scene: client_to_scene.clone(),
                     srgb_to_linear: srgb_to_linear.clone(),
+                    dither_8bit_sources,
                 },
                 ChromeGlassPass::Skip,
                 true,
@@ -1408,6 +1432,7 @@ pub fn run_linear_staged_pass(
             ClientCompositingMode::Linear {
                 client_to_scene: client_to_scene.clone(),
                 srgb_to_linear: srgb_to_linear.clone(),
+                dither_8bit_sources,
             },
             ChromeGlassPass::Skip,
             true,

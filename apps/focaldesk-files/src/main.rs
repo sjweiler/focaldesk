@@ -549,6 +549,11 @@ fn create_file_manager_page(
 ) -> FileManager {
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
+    // GTK renders its CSS gradients into the client's 8-bit buffer.  Dark
+    // title-bar ramps therefore arrive at the compositor already quantized
+    // and remain visibly banded when expanded to HDR.  Keep this surface flat;
+    // the shared border and inset highlight still separate it from the view.
+    header.add_css_class("files-titlebar");
     header.set_show_title(false);
     header.set_show_start_title_buttons(false);
     header.set_show_end_title_buttons(false);
@@ -888,6 +893,10 @@ impl FileManager {
             }
             .column-header {
                 padding: 0 10px 4px 46px;
+            }
+            window.focaldesk-app headerbar.files-titlebar {
+                background-image: none;
+                background-color: @fd_app_surface_raised;
             }
             ",
         );
