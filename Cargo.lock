@@ -2534,6 +2534,7 @@ name = "focaldmd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bindgen 0.69.5",
  "libc",
  "nix 0.29.0",
  "pam-client",
