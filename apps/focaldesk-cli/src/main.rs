@@ -1,11 +1,14 @@
 use anyhow::{Context, bail};
-use focaldesk_ai::providers::OllamaProvider;
-use focaldesk_ai::{AiIpcRequest, AiIpcResponse, AiProvider, ChatRequest, send_ai_request};
+use focaldesk_ai::{
+    AgentRequest, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatRequest, send_ai_request,
+    stream_ai_chat,
+};
 use focaldesk_diagnostics::{DiagnosticsOptions, collect_diagnostics};
 use focaldesk_ipc::{
     IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
     send_notification_request,
 };
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
@@ -130,7 +133,7 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
         "chat" => {
             let mut provider = None;
             let mut model = None;
-            let mut allow_fallback = !env_flag_enabled("FOCALDESK_CLI_NO_FALLBACK");
+            let mut stream = false;
             let mut prompt_parts = Vec::new();
 
             while let Some(arg) = args.next() {
@@ -141,9 +144,7 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
                     "--model" => {
                         model = Some(args.next().context("--model requires a value")?);
                     }
-                    "--no-fallback" => {
-                        allow_fallback = false;
-                    }
+                    "--stream" => stream = true,
                     _ => prompt_parts.push(arg),
                 }
             }
@@ -156,7 +157,11 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
             request.provider = provider;
             request.model = model;
 
-            let execution = chat_via_ipc_or_ollama(request, allow_fallback)?;
+            if stream {
+                return chat_stream_via_ipc(request);
+            }
+
+            let execution = chat_via_ipc(request)?;
             eprintln!(
                 "[ai] path={} provider={} model={}",
                 execution.path,
@@ -173,6 +178,79 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        "agent" => {
+            let mut provider = None;
+            let mut model = None;
+            let mut objective_parts = Vec::new();
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--provider" => {
+                        provider = Some(args.next().context("--provider requires a value")?);
+                    }
+                    "--model" => {
+                        model = Some(args.next().context("--model requires a value")?);
+                    }
+                    _ => objective_parts.push(arg),
+                }
+            }
+            if objective_parts.is_empty() {
+                bail!("ai agent requires an objective");
+            }
+            match send_ai_request(&AiIpcRequest::RunAgent {
+                request: AgentRequest {
+                    objective: objective_parts.join(" "),
+                    provider,
+                    model,
+                },
+            })? {
+                AiIpcResponse::Agent { response } => {
+                    eprintln!(
+                        "[ai-agent] provider={} model={} tools={}",
+                        response.provider,
+                        response.model.as_deref().unwrap_or("-"),
+                        response.steps.len()
+                    );
+                    let output = render_ai_output(&response.answer);
+                    if !output.is_empty() {
+                        print!("{output}");
+                    }
+                    if let Some(confirmation) = response.confirmation {
+                        eprintln!(
+                            "[ai-agent] pending action: {} {}",
+                            confirmation.tool, confirmation.arguments
+                        );
+                        eprintln!(
+                            "[ai-agent] approve before {} with: focaldesk-cli ai confirm {}",
+                            confirmation.expires_at_unix, confirmation.plan_id
+                        );
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "confirm" | "deny" => {
+            let approved = command == "confirm";
+            let plan_id = args
+                .next()
+                .with_context(|| format!("ai {command} requires a plan id"))?;
+            if args.next().is_some() {
+                bail!("ai {command} accepts exactly one plan id");
+            }
+            match send_ai_request(&AiIpcRequest::ConfirmAgentAction { plan_id, approved })? {
+                AiIpcResponse::AgentAction { response } => {
+                    if response.executed {
+                        println!("executed {}", response.tool);
+                    } else {
+                        println!("denied {}", response.tool);
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
         other => bail!("unknown ai command: {other}"),
     }
 }
@@ -183,9 +261,10 @@ fn print_usage() {
     eprintln!("  focaldesk-cli identify-displays");
     eprintln!("  focaldesk-cli diagnostics [--output <archive.tar.gz>] [--no-logs]");
     eprintln!("  focaldesk-cli ai providers");
-    eprintln!(
-        "  focaldesk-cli ai chat [--provider <id>] [--model <model>] [--no-fallback] <prompt...>"
-    );
+    eprintln!("  focaldesk-cli ai chat [--stream] [--provider <id>] [--model <model>] <prompt...>");
+    eprintln!("  focaldesk-cli ai agent [--provider <id>] [--model <model>] <objective...>");
+    eprintln!("  focaldesk-cli ai confirm <plan-id>");
+    eprintln!("  focaldesk-cli ai deny <plan-id>");
 }
 
 fn render_ai_output(content: &str) -> String {
@@ -243,83 +322,58 @@ struct AiExecution {
     content: String,
 }
 
-fn chat_via_ipc_or_ollama(
-    request: ChatRequest,
-    allow_fallback: bool,
-) -> anyhow::Result<AiExecution> {
-    let fallback_to_ollama =
-        allow_fallback && request.provider.as_deref().unwrap_or("ollama") == "ollama";
-
-    match send_ai_request(&AiIpcRequest::Chat {
-        request: request.clone(),
-    }) {
+fn chat_via_ipc(request: ChatRequest) -> anyhow::Result<AiExecution> {
+    match send_ai_request(&AiIpcRequest::Chat { request }) {
         Ok(AiIpcResponse::Chat { response }) => Ok(AiExecution {
             path: "ipc",
             provider: response.provider,
             model: response.model,
             content: response.content,
         }),
-        Ok(AiIpcResponse::Error { message })
-            if fallback_to_ollama && is_ollama_daemon_error(&message) =>
-        {
-            eprintln!("[ai] ipc returned ollama error; falling back to direct ollama");
-            direct_ollama_chat(request)
-        }
         Ok(AiIpcResponse::Error { message }) => bail!(message),
         Ok(other) => bail!("unexpected AI response: {other:?}"),
-        Err(err) if fallback_to_ollama && is_ipc_connection_error(&err) => {
-            eprintln!("[ai] ipc unavailable; falling back to direct ollama");
-            direct_ollama_chat(request)
-        }
-        Err(err) => Err(err),
-    }
-}
-
-fn env_flag_enabled(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
+        Err(err) => Err(err).context(
+            "AI chat requires focaldesk-server so requests remain permission-gated and audited",
         ),
-        Err(_) => false,
     }
 }
 
-fn is_ipc_connection_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string();
-    message.contains("could not connect to AI IPC socket")
-        || message.contains("Operation not permitted")
-        || message.contains("Connection refused")
-        || message.contains("No such file or directory")
-}
-
-fn is_ollama_daemon_error(message: &str) -> bool {
-    message.contains("no model configured for Ollama provider")
-        || message.contains("Ollama returned HTTP")
-        || message.contains("failed to parse Ollama chat response")
-        || message.contains("Ollama chat request failed")
-}
-
-fn direct_ollama_chat(request: ChatRequest) -> anyhow::Result<AiExecution> {
-    let base_url = std::env::var("FOCALDESK_OLLAMA_BASE_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434".into());
-    let requested_model = request.model.clone();
-    let provider = OllamaProvider::new(base_url, None)?;
-    let runtime = tokio::runtime::Runtime::new().context("failed to create async runtime")?;
-
-    let response = runtime.block_on(async move { provider.chat(request).await })?;
-    let chosen_model = response
-        .model
-        .as_deref()
-        .or(requested_model.as_deref())
-        .unwrap_or("<unknown>");
-
-    Ok(AiExecution {
-        path: "direct-ollama",
-        provider: "ollama".into(),
-        model: Some(chosen_model.to_string()),
-        content: response.content,
-    })
+fn chat_stream_via_ipc(request: ChatRequest) -> anyhow::Result<()> {
+    let mut printed = false;
+    let mut ends_with_newline = false;
+    let result = stream_ai_chat(request, |event| {
+        match event {
+            AiStreamEvent::Started {
+                provider, model, ..
+            } => {
+                eprintln!(
+                    "[ai] path=ipc-stream provider={} model={}",
+                    provider,
+                    model.as_deref().unwrap_or("-")
+                );
+            }
+            AiStreamEvent::Delta { content, .. } => {
+                let output = strip_terminal_sequences(&content);
+                if !output.is_empty() {
+                    print!("{output}");
+                    io::stdout().flush().context("flush streamed AI output")?;
+                    printed = true;
+                    ends_with_newline = output.ends_with('\n');
+                }
+            }
+            AiStreamEvent::Completed { .. } => {
+                if printed && !ends_with_newline {
+                    println!();
+                }
+            }
+            AiStreamEvent::Failed { message, .. } => bail!(message),
+            AiStreamEvent::Cancelled { .. } => bail!("AI stream was cancelled"),
+        }
+        Ok(())
+    });
+    result
+        .map(|_| ())
+        .context("streaming AI chat requires a protocol-v2 focaldesk-server")
 }
 
 fn strip_terminal_sequences(input: &str) -> String {

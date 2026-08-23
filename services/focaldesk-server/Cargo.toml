@@ -13,6 +13,7 @@ path = "src/main.rs"
 focaldesk-ai = { path = "../../crates/focaldesk-ai" }
 focaldesk-memory = { path = "../../crates/focaldesk-memory" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
+focaldesk-mcp = { path = "../focaldesk-mcp" }
 
 focaldesk-engine = { path = "../../crates/focaldesk-engine" }
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
@@ -22,6 +23,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Error handling and logging
 anyhow = { workspace = true }
+async-trait = "0.1"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 

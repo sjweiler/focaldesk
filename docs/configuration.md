@@ -112,6 +112,22 @@ screenshots, issue reports, logs, or shared configuration.
 See [Credential broker](secrets.md) for installation, login-key provisioning,
 ACLs, and commands for storing provider keys.
 
+## AI memory lifecycle
+
+The local sqlite-vec memory database defaults to 90-day retention and a
+10,000-record capacity. `FOCALDESK_MEMORY_RETENTION_DAYS` accepts `0` to
+disable expiration or a value up to 36,500 days.
+`FOCALDESK_MEMORY_MAX_ENTRIES` accepts `0` for unlimited capacity or a value up
+to 1,000,000. Invalid or excessive values prevent the memory backend from
+starting instead of silently selecting a different policy. Expired records and
+the oldest over-capacity records are removed automatically.
+
+Schema migrations are transactional. The active retention window is reapplied
+from every record's original creation time whenever the store opens, including
+schema-v1 records. Vector dimensions must still match, and databases from newer
+unsupported schema versions are opened fail-closed. Back up `memory.db` before
+downgrading FocalDesk.
+
 ## Logs and state
 
 See [Troubleshooting](troubleshooting.md#logs) for log locations. AI memory,

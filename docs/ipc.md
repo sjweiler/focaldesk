@@ -254,10 +254,60 @@ Typed JSON requests and responses use a versioned envelope:
 }
 ```
 
-Version 1 is the only supported version. Missing or unsupported versions are
-rejected explicitly rather than being interpreted as a different request
-shape. Requests are limited to 1 MiB and ordinary blocking connections use
-five-second read and write timeouts.
+### AI protocol compatibility
+
+The AI socket uses the standard transport envelope above and places an
+AI-specific v2 envelope in its payload:
+
+```json
+{
+  "protocol_version": 1,
+  "payload": {
+    "ai_protocol_version": 2,
+    "request_id": "1234-9",
+    "payload": { "type": "Status" }
+  }
+}
+```
+
+Request IDs are echoed in responses and clients reject mismatches. IDs are
+limited to 64 ASCII letters, digits, hyphens, or underscores. AI requests are
+limited to 256 KiB and responses to 512 KiB, within the transport-wide 1 MiB
+limit.
+
+For rolling upgrades, the daemon also accepts the former bare AI request as
+legacy protocol v1 and responds in that same form. A v2 client retries once
+with v1 only when an older daemon explicitly reports that the v2 payload was
+invalid before executing it. Unsupported explicit AI versions receive an
+error containing the supported version. This compatibility path is temporary
+and should be removed only at a documented breaking release.
+
+Streaming chat is v2-only. A `ChatStream` request keeps its connection open
+and receives newline-delimited v2 response envelopes whose payloads contain
+`started`, `delta`, and exactly one terminal `completed`, `failed`, or
+`cancelled` event. Both the envelope and event carry the original request ID,
+and clients reject either mismatch. Every frame and the accumulated response
+are bounded to 512 KiB. `CancelStream` is sent over a separate connection so
+the stream remains readable until the daemon emits its terminal event.
+
+The AI `Status` response includes an in-memory telemetry snapshot for every
+registered provider. Counters cover logical requests, successes, failures,
+cancellations, timeouts, retries, latency, byte totals, and token usage when a
+provider reports it. Telemetry contains only bounded error summaries and is
+reset when the daemon restarts; prompts and response bodies are never stored in
+the snapshot.
+
+AI memory lifecycle operations are also part of v2. `MemoryStatus` reports the
+schema version, current record count, retention window, capacity, and oldest
+and newest record timestamps. `ClearMemory` atomically deletes relational and
+vector rows and returns the number removed. `Forget` and `ClearMemory` require
+a fresh native one-shot confirmation; legacy or persisted chat approval is not
+accepted as destructive-data consent.
+
+The outer transport remains at version 1. Missing or unsupported outer
+versions are rejected explicitly rather than being interpreted as a different
+request shape. Requests are limited to 1 MiB. Ordinary blocking connections
+use five-second read and write timeouts.
 
 Sockets normally live below `$XDG_RUNTIME_DIR/focaldesk`. The directory is
 required to be owned by the current user with mode `0700`; sockets use mode

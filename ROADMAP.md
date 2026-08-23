@@ -26,6 +26,22 @@ truth for what is usable today.
 - Continue HDR, wide-gamut, ICC, and SDR-composition validation.
 - Expand hardware-cursor, direct-scanout, multi-GPU, and presentation testing.
 
+## AI integration milestones
+
+- [x] Route console and CLI chat through the private AI service endpoint.
+- [x] Support Ollama, OpenAI, Anthropic, and configurable vLLM providers.
+- [x] Load cloud credentials through the native secrets broker.
+- [x] Gate model requests with native prompts, persisted decisions, and revocation.
+- [x] Provide opt-in semantic memory with remember, recall, and forget operations.
+- [x] Provide a capability-gated, audited MCP desktop-tool catalog.
+- [x] Implement a typed, bounded agent loop for desktop inspection and action proposals.
+- [x] Require expiring plans and native one-shot confirmation for model-selected desktop mutations.
+- [x] Version the AI IPC contract with request IDs and a legacy migration path.
+- [x] Add bounded streaming responses and cancellation across Ollama, AI IPC, CLI, and Console.
+- [x] Add bounded provider retries and provider telemetry.
+- [x] Define and implement AI memory retention, bulk deletion, and migration policy.
+- [x] Add deterministic provider-contract and agent-loop integration tests.
+
 ## Desktop experience
 
 - Expand the completed workspace-slot controls with overview thumbnails and

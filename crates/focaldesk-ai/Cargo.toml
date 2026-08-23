@@ -11,12 +11,14 @@ focaldesk-memory = { path = "../focaldesk-memory" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-ipc = { path = "../focaldesk-ipc" }
 focaldesk-secrets-client = { path = "../focaldesk-secrets-client" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+futures-util = "0.3"
+rand = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 tracing = { workspace = true }
-tokio = { version = "1", features = ["io-util", "net", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "sync", "time"] }
 zeroize = { workspace = true }
 
 [dev-dependencies]

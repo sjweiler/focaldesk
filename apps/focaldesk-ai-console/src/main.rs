@@ -1,7 +1,8 @@
 use anyhow::Context;
 use focaldesk_ai::{
-    AiDaemonStatus, AiIpcRequest, AiIpcResponse, ChatMessage, ChatRequest, MemoryId, ProviderInfo,
-    ProviderModelInfo, SearchHit, send_ai_request,
+    AiDaemonStatus, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatMessage, ChatRequest, MemoryId,
+    MemoryStatus, ProviderInfo, ProviderModelInfo, ProviderTelemetry, SearchHit, cancel_ai_stream,
+    send_ai_request, stream_ai_chat,
 };
 use focaldesk_config::load_config;
 use focaldesk_gtk::{StateKind, StateView, StatusBanner};
@@ -40,6 +41,12 @@ struct Conversation {
     messages: Vec<String>,
 }
 
+#[derive(Clone)]
+struct ChatStreamControls {
+    stop_button: Button,
+    active_request_id: Rc<RefCell<Option<String>>>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct AppState {
     active_conversation: usize,
@@ -50,6 +57,8 @@ struct AppState {
     show_timestamps: bool,
     auto_scroll: bool,
     verbose_output: bool,
+    #[serde(default)]
+    use_memory: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -141,6 +150,7 @@ impl Default for AppState {
             show_timestamps: true,
             auto_scroll: true,
             verbose_output: false,
+            use_memory: false,
         }
     }
 }
@@ -450,6 +460,12 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         .build();
 
     let send = Button::with_label("Send");
+    let stop = Button::with_label("Stop");
+    stop.set_sensitive(false);
+    let stream_controls = ChatStreamControls {
+        stop_button: stop.clone(),
+        active_request_id: Rc::new(RefCell::new(None)),
+    };
     let voice_button = Button::with_label("Voice");
 
     let stack = gtk4::Stack::new();
@@ -609,6 +625,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
             composer.clone(),
             entry.clone(),
             send.clone(),
+            stream_controls.clone(),
             active_nav.clone(),
             nav_buttons.clone(),
             state.clone(),
@@ -638,6 +655,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
     let conversation_detail_clone = conversation_detail.clone();
     let log_buffer_clone = log_buffer.clone();
     let send_button = send.clone();
+    let stream_controls_for_send = stream_controls.clone();
     send.connect_clicked(move |_| {
         let text = entry_clone.text().to_string();
         if text.trim().is_empty() {
@@ -649,6 +667,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
             conversation_detail_clone.clone(),
             entry_clone.clone(),
             send_button.clone(),
+            stream_controls_for_send.clone(),
             log_buffer_clone.clone(),
             text,
             "manual chat",
@@ -662,6 +681,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         let conversation_detail = conversation_detail.clone();
         let entry = entry.clone();
         let send_button = send.clone();
+        let stream_controls = stream_controls.clone();
         let log_buffer = log_buffer.clone();
         entry.connect_activate(move |entry| {
             let text = entry.text().to_string();
@@ -674,11 +694,53 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
                 conversation_detail.clone(),
                 entry.clone(),
                 send_button.clone(),
+                stream_controls.clone(),
                 log_buffer.clone(),
                 text,
                 "manual chat",
                 None,
             );
+        });
+    }
+
+    {
+        let active_request_id = stream_controls.active_request_id.clone();
+        let stop_button = stop.clone();
+        let log_buffer = log_buffer.clone();
+        stop.connect_clicked(move |_| {
+            let Some(request_id) = active_request_id.borrow().clone() else {
+                return;
+            };
+            stop_button.set_sensitive(false);
+            append_log(&log_buffer, "[chat] cancellation requested");
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(cancel_ai_stream(&request_id));
+            });
+            let active_request_id = active_request_id.clone();
+            let stop_button = stop_button.clone();
+            let log_buffer = log_buffer.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(true)) => ControlFlow::Break,
+                Ok(Ok(false)) => {
+                    append_log(&log_buffer, "[chat] stream already finished");
+                    ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    append_log(&log_buffer, &format!("[chat] cancellation failed: {err}"));
+                    if active_request_id.borrow().is_some() {
+                        stop_button.set_sensitive(true);
+                    }
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if active_request_id.borrow().is_some() {
+                        stop_button.set_sensitive(true);
+                    }
+                    ControlFlow::Break
+                }
+            });
         });
     }
 
@@ -766,6 +828,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
     composer.append(&composer_status_label);
     composer.append(&entry);
     composer.append(&voice_button);
+    composer.append(&stop);
     composer.append(&send);
 
     stack.add_titled(&new_chat_workspace, Some("new-chat"), "New Chat");
@@ -1222,6 +1285,46 @@ fn provider_label(provider: &ProviderInfo) -> String {
     format!("{} ({}, {})", provider.id, provider.kind, model)
 }
 
+fn provider_health(telemetry: &ProviderTelemetry) -> &'static str {
+    if telemetry.requests == 0 {
+        "idle"
+    } else if telemetry.last_failure_at_unix > telemetry.last_success_at_unix {
+        "degraded"
+    } else {
+        "healthy"
+    }
+}
+
+fn provider_telemetry_text(telemetry: Option<&ProviderTelemetry>) -> String {
+    let Some(telemetry) = telemetry else {
+        return "Health: telemetry unavailable".to_string();
+    };
+    let average_latency = if telemetry.requests == 0 {
+        0
+    } else {
+        telemetry.total_latency_ms / telemetry.requests
+    };
+    let mut text = format!(
+        "Health: {}\nRequests: {} ({} succeeded, {} failed, {} cancelled)\nRetries: {} · Timeouts: {} · Average latency: {} ms\nTraffic: {} bytes in / {} bytes out\nReported tokens: {} in / {} out",
+        provider_health(telemetry),
+        telemetry.requests,
+        telemetry.successes,
+        telemetry.failures,
+        telemetry.cancellations,
+        telemetry.retries,
+        telemetry.timeouts,
+        average_latency,
+        telemetry.input_bytes,
+        telemetry.output_bytes,
+        telemetry.input_tokens,
+        telemetry.output_tokens,
+    );
+    if let Some(error) = telemetry.last_error.as_deref() {
+        text.push_str(&format!("\nLast error: {error}"));
+    }
+    text
+}
+
 fn build_providers_page(
     store: Rc<RefCell<PersistedState>>,
     runtime: Rc<RefCell<AiConsoleRuntime>>,
@@ -1408,6 +1511,23 @@ fn refresh_providers_page_view(view: Rc<ProvidersPage>) {
             .as_ref()
             .map(|status| format!("Active requests: {}", status.active_requests))
             .unwrap_or_else(|| "Daemon status unavailable".to_string()),
+        runtime_snapshot
+            .status
+            .as_ref()
+            .map(|status| {
+                let retries = status
+                    .provider_telemetry
+                    .iter()
+                    .map(|telemetry| telemetry.retries)
+                    .sum::<u64>();
+                let failures = status
+                    .provider_telemetry
+                    .iter()
+                    .map(|telemetry| telemetry.failures)
+                    .sum::<u64>();
+                format!("Provider retries: {retries} · failures: {failures}")
+            })
+            .unwrap_or_else(|| "Provider telemetry unavailable".to_string()),
     ]));
 
     if let Some(error) = runtime_snapshot.load_error.as_ref() {
@@ -1432,6 +1552,12 @@ fn refresh_providers_page_view(view: Rc<ProvidersPage>) {
         let row = Box::new(Orientation::Vertical, 6);
         row.add_css_class("item-card");
         let models = provider_models_for(&runtime_snapshot, &provider.id);
+        let telemetry = runtime_snapshot.status.as_ref().and_then(|status| {
+            status
+                .provider_telemetry
+                .iter()
+                .find(|telemetry| telemetry.provider == provider.id)
+        });
         let model_text = if models.is_empty() {
             "Installed models: none listed".to_string()
         } else {
@@ -1450,9 +1576,10 @@ fn refresh_providers_page_view(view: Rc<ProvidersPage>) {
         title.add_css_class("item-title");
 
         let details = Label::new(Some(&format!(
-            "Base URL: {}\n{}",
+            "Base URL: {}\n{}\n{}",
             provider.base_url.as_deref().unwrap_or("-"),
-            model_text
+            model_text,
+            provider_telemetry_text(telemetry),
         )));
         details.set_xalign(0.0);
         details.set_wrap(true);
@@ -1504,6 +1631,7 @@ fn tools_page(
     _composer: Box,
     entry: Entry,
     send_button: Button,
+    stream_controls: ChatStreamControls,
     active_nav: Rc<std::cell::RefCell<String>>,
     nav_buttons: Rc<std::cell::RefCell<Vec<Button>>>,
     store: Rc<RefCell<PersistedState>>,
@@ -1538,6 +1666,7 @@ fn tools_page(
         let stack = stack.clone();
         let entry = entry.clone();
         let send_button = send_button.clone();
+        let stream_controls = stream_controls.clone();
         let prompt_text = prompt.to_string();
         let store = store.clone();
         let log_buffer = log_buffer.clone();
@@ -1549,6 +1678,7 @@ fn tools_page(
                 conversation_detail.clone(),
                 entry.clone(),
                 send_button.clone(),
+                stream_controls.clone(),
                 log_buffer.clone(),
                 prompt_text.clone(),
                 label,
@@ -1655,14 +1785,6 @@ fn append_log(buffer: &TextBuffer, line: &str) {
     buffer.insert(&mut end, &format!("{line}\n"));
 }
 
-fn send_chat_request(request: ChatRequest) -> anyhow::Result<String> {
-    match send_ai_request(&AiIpcRequest::Chat { request })? {
-        focaldesk_ai::AiIpcResponse::Chat { response } => Ok(response.content),
-        focaldesk_ai::AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
-        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
-    }
-}
-
 const MEMORY_RECALL_TOP_K: usize = 5;
 
 fn send_remember_request(text: String, metadata: serde_json::Value) -> anyhow::Result<MemoryId> {
@@ -1676,6 +1798,30 @@ fn send_remember_request(text: String, metadata: serde_json::Value) -> anyhow::R
 fn send_recall_request(query: String, top_k: usize) -> anyhow::Result<Vec<SearchHit>> {
     match send_ai_request(&AiIpcRequest::Recall { query, top_k })? {
         AiIpcResponse::Recalled { hits } => Ok(hits),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
+fn send_forget_request(id: MemoryId) -> anyhow::Result<()> {
+    match send_ai_request(&AiIpcRequest::Forget { id })? {
+        AiIpcResponse::Forgotten { id: forgotten } if forgotten == id => Ok(()),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
+fn send_memory_status_request() -> anyhow::Result<MemoryStatus> {
+    match send_ai_request(&AiIpcRequest::MemoryStatus)? {
+        AiIpcResponse::MemoryStatus { status } => Ok(status),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
+fn send_clear_memory_request() -> anyhow::Result<usize> {
+    match send_ai_request(&AiIpcRequest::ClearMemory)? {
+        AiIpcResponse::MemoryCleared { deleted } => Ok(deleted),
         AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
     }
@@ -1818,12 +1964,13 @@ fn dispatch_chat_request_async(
     conversation_detail: Box,
     entry: Entry,
     send_button: Button,
+    stream_controls: ChatStreamControls,
     log_buffer: TextBuffer,
     prompt_text: String,
     source_label: &str,
     quick_prompts_page: Option<Rc<QuickPromptsPage>>,
 ) {
-    if prompt_text.trim().is_empty() {
+    if prompt_text.trim().is_empty() || !send_button.is_sensitive() {
         return;
     }
 
@@ -1872,6 +2019,8 @@ fn dispatch_chat_request_async(
     }
 
     send_button.set_sensitive(false);
+    stream_controls.stop_button.set_sensitive(false);
+    *stream_controls.active_request_id.borrow_mut() = None;
     entry.set_text("");
     append_log(
         &log_buffer,
@@ -1881,10 +2030,16 @@ fn dispatch_chat_request_async(
         ),
     );
 
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::channel::<Result<AiStreamEvent, String>>();
     thread::spawn(move || {
-        let result = send_chat_request(request);
-        let _ = tx.send(result);
+        let event_tx = tx.clone();
+        if let Err(err) = stream_ai_chat(request, move |event| {
+            event_tx
+                .send(Ok(event))
+                .map_err(|_| anyhow::anyhow!("chat UI disconnected"))
+        }) {
+            let _ = tx.send(Err(err.to_string()));
+        }
     });
 
     let state_for_result = state.clone();
@@ -1897,10 +2052,28 @@ fn dispatch_chat_request_async(
     let model_for_result = model;
     let source_label_for_result = source_label.clone();
     let quick_prompts_page_for_result = quick_prompts_page.clone();
+    let stream_controls_for_result = stream_controls.clone();
+    let mut accumulated = String::new();
     glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
-        Ok(Ok(reply)) => {
+        Ok(Ok(AiStreamEvent::Started { request_id, .. })) => {
+            *stream_controls_for_result.active_request_id.borrow_mut() = Some(request_id);
+            stream_controls_for_result.stop_button.set_sensitive(true);
+            ControlFlow::Continue
+        }
+        Ok(Ok(AiStreamEvent::Delta { content, .. })) => {
+            accumulated.push_str(&content);
             let mut store = state_for_result.borrow_mut();
-            apply_ai_reply(&mut store, active_idx, &reply, "Recently updated");
+            set_latest_ai_reply(&mut store, active_idx, &accumulated, "Streaming response");
+            render_active_conversation(&chat_view_for_result, &store);
+            if let Some(conversation) = store.conversations.get(active_idx).cloned() {
+                render_conversation_panel(&detail_for_result, &conversation, "Active conversation");
+            }
+            ControlFlow::Continue
+        }
+        Ok(Ok(AiStreamEvent::Completed { response, .. })) => {
+            let reply = response.content;
+            let mut store = state_for_result.borrow_mut();
+            set_latest_ai_reply(&mut store, active_idx, &reply, "Recently updated");
             persist_state(&store);
             render_active_conversation(&chat_view_for_result, &store);
             if let Some(conversation) = store.conversations.get(active_idx).cloned() {
@@ -1925,13 +2098,16 @@ fn dispatch_chat_request_async(
                 refresh_quick_prompts_page_view(view.clone());
             }
             send_button_for_result.set_sensitive(true);
+            stream_controls_for_result.stop_button.set_sensitive(false);
+            *stream_controls_for_result.active_request_id.borrow_mut() = None;
             entry_for_result.set_text("");
             ControlFlow::Break
         }
-        Ok(Err(err)) => {
+        Ok(Ok(AiStreamEvent::Failed { message, .. })) | Ok(Err(message)) => {
+            let err = message;
             let error_message = format!("AI backend error: {err}");
             let mut store = state_for_result.borrow_mut();
-            apply_ai_reply(&mut store, active_idx, &error_message, "Backend error");
+            set_latest_ai_reply(&mut store, active_idx, &error_message, "Backend error");
             persist_state(&store);
             render_active_conversation(&chat_view_for_result, &store);
             if let Some(conversation) = store.conversations.get(active_idx).cloned() {
@@ -1950,7 +2126,37 @@ fn dispatch_chat_request_async(
                 refresh_quick_prompts_page_view(view.clone());
             }
             send_button_for_result.set_sensitive(true);
+            stream_controls_for_result.stop_button.set_sensitive(false);
+            *stream_controls_for_result.active_request_id.borrow_mut() = None;
             entry_for_result.set_text("");
+            ControlFlow::Break
+        }
+        Ok(Ok(AiStreamEvent::Cancelled { .. })) => {
+            let reply = if accumulated.is_empty() {
+                "[response cancelled]".to_string()
+            } else {
+                accumulated.clone()
+            };
+            let mut store = state_for_result.borrow_mut();
+            set_latest_ai_reply(&mut store, active_idx, &reply, "Response cancelled");
+            persist_state(&store);
+            render_active_conversation(&chat_view_for_result, &store);
+            if let Some(conversation) = store.conversations.get(active_idx).cloned() {
+                render_conversation_panel(&detail_for_result, &conversation, "Active conversation");
+            }
+            append_log(&log_buffer_for_result, "[chat] response cancelled");
+            if let Some(view) = quick_prompts_page_for_result.as_ref() {
+                {
+                    let mut prompt_state = view.state.borrow_mut();
+                    prompt_state.last_response = None;
+                    prompt_state.last_error = Some("response cancelled".to_string());
+                    prompt_state.in_flight = false;
+                }
+                refresh_quick_prompts_page_view(view.clone());
+            }
+            send_button_for_result.set_sensitive(true);
+            stream_controls_for_result.stop_button.set_sensitive(false);
+            *stream_controls_for_result.active_request_id.borrow_mut() = None;
             ControlFlow::Break
         }
         Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
@@ -1971,19 +2177,17 @@ fn dispatch_chat_request_async(
                 refresh_quick_prompts_page_view(view.clone());
             }
             send_button_for_result.set_sensitive(true);
+            stream_controls_for_result.stop_button.set_sensitive(false);
+            *stream_controls_for_result.active_request_id.borrow_mut() = None;
             ControlFlow::Break
         }
     });
 }
 
-fn apply_ai_reply(store: &mut PersistedState, active_idx: usize, reply: &str, summary: &str) {
+fn set_latest_ai_reply(store: &mut PersistedState, active_idx: usize, reply: &str, summary: &str) {
     if let Some(conversation) = store.conversations.get_mut(active_idx) {
         if let Some(last_message) = conversation.messages.last_mut() {
-            if last_message == "AI: [pending response from daemon]" {
-                *last_message = format!("AI: {reply}");
-            } else {
-                conversation.messages.push(format!("AI: {reply}"));
-            }
+            *last_message = format!("AI: {reply}");
         } else {
             conversation.messages.push(format!("AI: {reply}"));
         }
@@ -2032,7 +2236,7 @@ fn build_chat_request(
         messages,
         temperature: None,
         max_tokens: None,
-        use_memory: false,
+        use_memory: store.app_state.use_memory,
     }
 }
 
@@ -2310,6 +2514,27 @@ fn conversations_page(
     page
 }
 
+fn memory_status_lines(status: &MemoryStatus) -> Vec<String> {
+    vec![
+        format!("AI memory records: {}", status.entry_count),
+        format!("Storage schema: v{}", status.schema_version),
+        format!(
+            "Retention: {}",
+            status
+                .retention_days
+                .map(|days| format!("{days} days"))
+                .unwrap_or_else(|| "disabled".to_string())
+        ),
+        format!(
+            "Capacity: {}",
+            status
+                .max_entries
+                .map(|entries| format!("{entries} records"))
+                .unwrap_or_else(|| "unlimited".to_string())
+        ),
+    ]
+}
+
 fn memory_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Box {
     let page = section_shell("Memory", "Pinned facts and working notes");
     let snapshot = store.borrow();
@@ -2327,6 +2552,93 @@ fn memory_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Bo
         }
     }
     page.append(&notes_box);
+    let recall_results = Box::new(Orientation::Vertical, 6);
+
+    let lifecycle_box = Box::new(Orientation::Vertical, 6);
+    lifecycle_box.append(&note_card("Loading memory lifecycle policy..."));
+    page.append(&lifecycle_box);
+
+    {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(send_memory_status_request());
+        });
+        let lifecycle_box = lifecycle_box.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+            Ok(Ok(status)) => {
+                clear_box(&lifecycle_box);
+                lifecycle_box.append(&info_card(&memory_status_lines(&status)));
+                ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                clear_box(&lifecycle_box);
+                lifecycle_box.append(&note_card(&format!("Memory status unavailable: {err}")));
+                ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => ControlFlow::Break,
+        });
+    }
+
+    let clear_all = Button::with_label("Clear all AI memory");
+    clear_all.add_css_class("sidebar-button");
+    {
+        let clear_button = clear_all.clone();
+        let store = store.clone();
+        let notes_box = notes_box.clone();
+        let recall_results = recall_results.clone();
+        let lifecycle_box = lifecycle_box.clone();
+        let log_buffer = log_buffer.clone();
+        clear_all.connect_clicked(move |_| {
+            clear_button.set_sensitive(false);
+            append_log(&log_buffer, "[memory] bulk deletion requested");
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let result = send_clear_memory_request().and_then(|deleted| {
+                    send_memory_status_request().map(|status| (deleted, status))
+                });
+                let _ = tx.send(result);
+            });
+
+            let clear_button = clear_button.clone();
+            let store = store.clone();
+            let notes_box = notes_box.clone();
+            let recall_results = recall_results.clone();
+            let lifecycle_box = lifecycle_box.clone();
+            let log_buffer = log_buffer.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok((deleted, status))) => {
+                    {
+                        let mut state = store.borrow_mut();
+                        state.app_state.memory_notes.clear();
+                        persist_state(&state);
+                    }
+                    clear_box(&notes_box);
+                    clear_box(&recall_results);
+                    clear_box(&lifecycle_box);
+                    lifecycle_box.append(&info_card(&memory_status_lines(&status)));
+                    append_log(
+                        &log_buffer,
+                        &format!("[memory] permanently deleted {deleted} memory record(s)"),
+                    );
+                    clear_button.set_sensitive(true);
+                    ControlFlow::Break
+                }
+                Ok(Err(err)) => {
+                    append_log(&log_buffer, &format!("[memory] clear failed: {err}"));
+                    clear_button.set_sensitive(true);
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    append_log(&log_buffer, "[memory] clear request disconnected");
+                    clear_button.set_sensitive(true);
+                    ControlFlow::Break
+                }
+            });
+        });
+    }
+    page.append(&clear_all);
 
     let entry = Entry::builder()
         .placeholder_text("Add memory note")
@@ -2405,8 +2717,6 @@ fn memory_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Bo
         .hexpand(true)
         .build();
     let recall_button = Button::with_label("Recall");
-    let recall_results = Box::new(Orientation::Vertical, 6);
-
     {
         let recall_entry_clone = recall_entry.clone();
         let recall_results = recall_results.clone();
@@ -2440,7 +2750,8 @@ fn memory_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Bo
                         recall_results_for_result.append(&note_card("No matching memories found."));
                     } else {
                         for hit in &hits {
-                            recall_results_for_result.append(&recall_hit_card(hit));
+                            recall_results_for_result
+                                .append(&recall_hit_card(hit, log_buffer_for_result.clone()));
                         }
                     }
                     append_log(
@@ -2489,6 +2800,7 @@ fn settings_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> 
         format!("Show timestamps: {}", snapshot.show_timestamps),
         format!("Auto-scroll chat: {}", snapshot.auto_scroll),
         format!("Verbose output: {}", snapshot.verbose_output),
+        format!("Use memory in chat: {}", snapshot.use_memory),
     ]));
 
     for (label, active) in [
@@ -2496,6 +2808,7 @@ fn settings_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> 
         ("Show timestamps", snapshot.show_timestamps),
         ("Auto-scroll chat", snapshot.auto_scroll),
         ("Verbose tool output", snapshot.verbose_output),
+        ("Use memory in chat", snapshot.use_memory),
     ] {
         page.append(&toggle_row(
             label,
@@ -2545,7 +2858,7 @@ fn note_card(text: &str) -> Box {
     card
 }
 
-fn recall_hit_card(hit: &SearchHit) -> Box {
+fn recall_hit_card(hit: &SearchHit, log_buffer: TextBuffer) -> Box {
     let card = Box::new(Orientation::Vertical, 4);
     card.add_css_class("item-card");
 
@@ -2559,6 +2872,42 @@ fn recall_hit_card(hit: &SearchHit) -> Box {
     meta_label.set_xalign(0.0);
     meta_label.add_css_class("item-meta");
     card.append(&meta_label);
+
+    let forget = Button::with_label("Forget");
+    forget.add_css_class("sidebar-button");
+    let id = hit.record.id;
+    let card_for_result = card.clone();
+    let forget_for_click = forget.clone();
+    forget.connect_clicked(move |_| {
+        forget_for_click.set_sensitive(false);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(send_forget_request(id));
+        });
+
+        let card = card_for_result.clone();
+        let forget = forget_for_click.clone();
+        let log_buffer = log_buffer.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+            Ok(Ok(())) => {
+                card.set_visible(false);
+                append_log(&log_buffer, &format!("[memory] forgot memory id {id}"));
+                ControlFlow::Break
+            }
+            Ok(Err(err)) => {
+                forget.set_sensitive(true);
+                append_log(&log_buffer, &format!("[memory] forget failed: {err}"));
+                ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                forget.set_sensitive(true);
+                append_log(&log_buffer, "[memory] forget request disconnected");
+                ControlFlow::Break
+            }
+        });
+    });
+    card.append(&forget);
 
     card
 }
@@ -2604,6 +2953,7 @@ fn toggle_row(
             "Show timestamps" => state.app_state.show_timestamps = value,
             "Auto-scroll chat" => state.app_state.auto_scroll = value,
             "Verbose tool output" => state.app_state.verbose_output = value,
+            "Use memory in chat" => state.app_state.use_memory = value,
             _ => {}
         }
         persist_state(&state);
@@ -3057,5 +3407,14 @@ mod tests {
         assert!(contents.contains(&"Conversation: Resolved thread"));
         assert!(contents.contains(&"isolated"));
         assert!(!contents.contains(&"contaminated"));
+    }
+
+    #[test]
+    fn chat_request_uses_memory_only_when_enabled() {
+        let mut store = PersistedState::default();
+        assert!(!build_chat_request(&store, 0, "current").use_memory);
+
+        store.app_state.use_memory = true;
+        assert!(build_chat_request(&store, 0, "current").use_memory);
     }
 }

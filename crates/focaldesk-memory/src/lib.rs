@@ -13,7 +13,7 @@ mod types;
 
 pub use embedding::{EmbeddingProvider, OllamaEmbeddingProvider};
 pub use store::MemoryStore;
-pub use types::{MemoryId, MemoryRecord, SearchHit};
+pub use types::{MemoryId, MemoryPolicy, MemoryRecord, MemoryStatus, SearchHit};
 
 use anyhow::Result;
 use serde_json::Value;
@@ -49,5 +49,13 @@ impl MemoryService {
 
     pub async fn forget(&self, id: MemoryId) -> Result<()> {
         self.store.forget(id).await
+    }
+
+    pub async fn clear(&self) -> Result<usize> {
+        self.store.clear().await
+    }
+
+    pub async fn status(&self) -> Result<MemoryStatus> {
+        self.store.status().await
     }
 }

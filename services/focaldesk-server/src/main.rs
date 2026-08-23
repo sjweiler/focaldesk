@@ -4,8 +4,10 @@ use focaldesk_ai::{serve_ai_ipc, Agent, AiService};
 use focaldesk_logging::flog_info;
 use std::sync::Arc;
 
+mod ai_tools;
 mod control_center;
 
+use ai_tools::McpAgentTools;
 use control_center::{control_center_socket_path, serve_control_center_ipc};
 
 #[tokio::main]
@@ -17,7 +19,7 @@ async fn main() -> Result<()> {
     let agent = Agent::new("ipc server".to_string());
     flog_info!("Initialized agent: {}", agent.name);
 
-    let ai_service = Arc::new(AiService::from_env()?);
+    let ai_service = Arc::new(AiService::from_env()?.with_tool_executor(Arc::new(McpAgentTools)));
     flog_info!(
         "AI IPC listening on {}; default provider: {}; providers: {}",
         focaldesk_ai::ai_socket_path()?.display(),

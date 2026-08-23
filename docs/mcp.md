@@ -130,3 +130,18 @@ Power, session termination, display reconfiguration, file modification,
 service restarts, and credential operations are intentionally outside this
 initial catalog. Adding any of them requires a separately reviewed policy,
 authorization, confirmation, and audit design.
+
+## Built-in AI agent
+
+`focaldesk-server` exposes the catalog to the built-in AI planner. This path
+does not emulate an MCP client or inherit `FOCALDESK_MCP_CAPABILITIES`. Plans
+are strict JSON and contain at most four calls. Read-only calls are validated
+against the same schemas before the typed IPC backend runs them, and their
+results are bounded before model synthesis.
+
+At most one mutating tool may appear, as the final plan step. It is not run
+during planning. The daemon stores its exact name and arguments under a random
+192-bit ID for two minutes. A separate confirmation request consumes that plan,
+shows a non-persistent native prompt, and only then invokes the confirmed MCP
+executor. The executor injects its own confirmation marker. Model-generated
+`confirmed` fields are rejected and never treated as user consent.

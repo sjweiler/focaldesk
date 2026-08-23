@@ -10,6 +10,15 @@ version numbers where practical.
 
 ### Added
 
+- Added bounded transient AI-provider retries and in-memory provider health
+  telemetry for latency, outcomes, cancellations, traffic, and reported token
+  usage, surfaced in the AI Console Providers page.
+- Added transactional AI-memory schema migration, default 90-day/10,000-record
+  lifecycle limits, automatic pruning, lifecycle status, and fresh-confirmed
+  individual or bulk deletion from the AI Console.
+- Added deterministic, network-independent wire-contract tests for OpenAI,
+  Anthropic, Ollama, and vLLM providers plus bounded agent-loop integration
+  coverage for synthesis, failures, mutation proposals, expiry, and replay.
 - Project status matrix and annotated architecture documentation.
 - Build, configuration, keybinding, troubleshooting, and roadmap documentation.
 - Contribution and issue-reporting templates.

@@ -84,6 +84,14 @@ pub struct ChatResponse {
     pub provider: String,
     pub model: Option<String>,
     pub content: String,
+    #[serde(default)]
+    pub usage: Option<TokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +108,26 @@ pub struct ProviderModelInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProviderTelemetry {
+    pub provider: String,
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub cancellations: u64,
+    pub timeouts: u64,
+    pub retries: u64,
+    pub input_bytes: u64,
+    pub output_bytes: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_latency_ms: u64,
+    pub last_latency_ms: Option<u64>,
+    pub last_success_at_unix: Option<u64>,
+    pub last_failure_at_unix: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AiDaemonStatus {
     pub active_requests: u32,
     /// Requests currently blocked on an interactive AI permission decision.
@@ -107,4 +135,31 @@ pub struct AiDaemonStatus {
     pub pending_permissions: u32,
     pub default_provider: String,
     pub provider_count: usize,
+    #[serde(default)]
+    pub provider_telemetry: Vec<ProviderTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AiStreamEvent {
+    Started {
+        request_id: String,
+        provider: String,
+        model: Option<String>,
+    },
+    Delta {
+        request_id: String,
+        content: String,
+    },
+    Completed {
+        request_id: String,
+        response: ChatResponse,
+    },
+    Failed {
+        request_id: String,
+        message: String,
+    },
+    Cancelled {
+        request_id: String,
+    },
 }

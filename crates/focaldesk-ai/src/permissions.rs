@@ -197,12 +197,9 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
             "AI permission path has no parent",
         )
     })?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let nonce = rand::random::<u64>();
     let temp = parent.join(format!(
-        ".ai-permissions-{}-{stamp}.tmp",
+        ".ai-permissions-{}-{nonce:016x}.tmp",
         std::process::id()
     ));
     let mut file = fs::OpenOptions::new()
@@ -708,6 +705,46 @@ pub(crate) fn authorize_ai_chat(
         prompt_message,
         allow_persistent,
     )
+}
+
+/// Require a fresh, one-shot approval for an exact model-proposed desktop
+/// mutation or destructive AI-data operation. This deliberately bypasses
+/// saved AI-chat grants and environment allow modes: prior consent to use a
+/// model is not consent to change desktop state or delete stored data.
+pub(crate) fn confirm_ai_action(tool: &str, title: &str, message: &str) -> anyhow::Result<()> {
+    let resource = match tool {
+        "focus_window" | "move_window_to_workspace" => PermissionResource::RemoteInput,
+        "show_notification" => PermissionResource::Notifications,
+        "open_settings_panel" | "forget_memory" | "clear_memory" => PermissionResource::AiChat,
+        _ => {
+            return Err(anyhow::anyhow!(
+                "AI action is not eligible for confirmation: {tool}"
+            ));
+        }
+    };
+    let request = PermissionRequest {
+        app: AppMetadata {
+            identity: app_identity(),
+            pid: Some(std::process::id()),
+            window_title: Some("focaldesk AI action".into()),
+            sandboxed: false,
+        },
+        resource,
+        target: PermissionTarget::Named(tool.to_string()),
+    };
+    let response = prompt_from_desktop_or_terminal(&request, title, message, false)
+        .ok_or_else(|| anyhow::anyhow!("native AI action confirmation is unavailable"))?;
+    tracing::info!(
+        target: "focaldesk.ai",
+        tool,
+        decision = ?response.decision,
+        "one-shot AI action confirmation resolved"
+    );
+    if response.decision == PermissionDecision::Allow {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("AI action was denied by the user"))
+    }
 }
 
 #[cfg(test)]

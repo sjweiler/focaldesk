@@ -350,6 +350,117 @@ fn validate_arguments(tool: &ToolDefinition, arguments: &Value) -> Result<(), St
     Ok(())
 }
 
+/// Execute one catalogued read-only tool without going through the stdio MCP
+/// lifecycle. This is used by the in-session AI agent and deliberately refuses
+/// every mutating tool, regardless of capabilities or model-supplied fields.
+pub fn execute_read_only_tool<B: Backend>(
+    backend: &B,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let catalog = tool_catalog();
+    let tool = catalog
+        .iter()
+        .find(|tool| tool.name == name)
+        .ok_or_else(|| format!("unknown tool: {name}"))?;
+    let started = Instant::now();
+    let parameter_names = arguments
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    if tool.policy.mutability != Mutability::ReadOnly {
+        audit(
+            tool,
+            "denied",
+            false,
+            started,
+            &parameter_names,
+            Some("agent_read_only_boundary"),
+        );
+        return Err(format!("agent cannot execute mutating tool: {name}"));
+    }
+    if let Err(message) = validate_arguments(tool, arguments) {
+        audit(
+            tool,
+            "denied",
+            false,
+            started,
+            &parameter_names,
+            Some("invalid_arguments"),
+        );
+        return Err(message);
+    }
+
+    let result = backend.call(name, arguments);
+    audit(
+        tool,
+        "allowed",
+        result.is_ok(),
+        started,
+        &parameter_names,
+        result.as_ref().err().map(|_| "backend_error"),
+    );
+    result
+}
+
+/// Execute one mutating tool after the caller has obtained trusted one-shot
+/// confirmation. The confirmation flag is injected here; model output is not
+/// accepted as proof of approval.
+pub fn execute_confirmed_tool<B: Backend>(
+    backend: &B,
+    name: &str,
+    arguments: &Value,
+) -> Result<Value, String> {
+    let catalog = tool_catalog();
+    let tool = catalog
+        .iter()
+        .find(|tool| tool.name == name)
+        .ok_or_else(|| format!("unknown tool: {name}"))?;
+    let started = Instant::now();
+    if tool.policy.mutability != Mutability::Mutating {
+        return Err(format!(
+            "confirmed action path requires a mutating tool: {name}"
+        ));
+    }
+    let mut arguments = arguments
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "tool arguments must be an object".to_string())?;
+    if arguments.contains_key("confirmed") {
+        return Err("model-proposed arguments must not contain `confirmed`".to_string());
+    }
+    if tool.policy.confirmation == Confirmation::Required {
+        arguments.insert("confirmed".into(), Value::Bool(true));
+    }
+    let arguments = Value::Object(arguments);
+    let parameter_names = arguments
+        .as_object()
+        .map(|object| object.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if let Err(message) = validate_arguments(tool, &arguments) {
+        audit(
+            tool,
+            "denied",
+            false,
+            started,
+            &parameter_names,
+            Some("invalid_arguments"),
+        );
+        return Err(message);
+    }
+    let result = backend.call(name, &arguments);
+    audit(
+        tool,
+        "allowed_after_native_confirmation",
+        result.is_ok(),
+        started,
+        &parameter_names,
+        result.as_ref().err().map(|_| "backend_error"),
+    );
+    result
+}
+
 fn capabilities_from_env() -> HashSet<String> {
     std::env::var("FOCALDESK_MCP_CAPABILITIES")
         .unwrap_or_default()
@@ -502,6 +613,37 @@ mod tests {
         let mut server = ready_server(&[]);
         let response = server.handle(tool_call("list_outputs", json!({}))).unwrap();
         assert_eq!(response["result"]["isError"], false);
+    }
+
+    #[test]
+    fn embedded_agent_executor_has_a_hard_read_only_boundary() {
+        let backend = MockBackend::default();
+        let value = execute_read_only_tool(&backend, "list_outputs", &json!({})).unwrap();
+        assert_eq!(value["called"], "list_outputs");
+
+        let error = execute_read_only_tool(
+            &backend,
+            "focus_window",
+            &json!({"window_id": 7, "confirmed": true}),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot execute mutating tool"));
+        assert_eq!(backend.calls.lock().unwrap().as_slice(), ["list_outputs"]);
+    }
+
+    #[test]
+    fn confirmed_executor_injects_confirmation_and_rejects_model_confirmation() {
+        let backend = MockBackend::default();
+        execute_confirmed_tool(&backend, "focus_window", &json!({"window_id": 7})).unwrap();
+        assert_eq!(backend.calls.lock().unwrap().as_slice(), ["focus_window"]);
+
+        let error = execute_confirmed_tool(
+            &backend,
+            "focus_window",
+            &json!({"window_id": 7, "confirmed": true}),
+        )
+        .unwrap_err();
+        assert!(error.contains("must not contain"));
     }
 
     #[test]

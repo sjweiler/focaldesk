@@ -10165,6 +10165,7 @@ mod tests {
             pending_permissions: 1,
             default_provider: "test".into(),
             provider_count: 1,
+            provider_telemetry: Vec::new(),
         };
         assert_eq!(
             ai_flow_mode_from_status(&status),

@@ -1868,6 +1868,8 @@ dependencies = [
  "focaldesk-memory",
  "focaldesk-permissions",
  "focaldesk-secrets-client",
+ "futures-util",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
@@ -1933,7 +1935,6 @@ dependencies = [
  "focaldesk-ai",
  "focaldesk-diagnostics",
  "focaldesk-ipc",
- "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2339,11 +2340,13 @@ name = "focaldesk-server"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "focaldesk-ai",
  "focaldesk-engine",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-mcp",
  "focaldesk-memory",
  "libc",
  "serde",
@@ -5610,6 +5613,7 @@ dependencies = [
  "base64",
  "bytes",
  "futures-core",
+ "futures-util",
  "http",
  "http-body",
  "http-body-util",
@@ -5629,12 +5633,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots 1.0.7",
 ]
@@ -6699,6 +6705,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokio-util"
+version = "0.7.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2efa149fe76073d6e8fd97ef4f4eca7b67f599660115591483572e406e165594"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7373,6 +7392,19 @@ dependencies = [
  "indexmap",
  "wasm-encoder",
  "wasmparser",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

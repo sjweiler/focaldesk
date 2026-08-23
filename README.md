@@ -288,10 +288,42 @@ for included data, privacy behavior, output options, and crash-report locations.
 The background server exposes AI chat over the local IPC socket used by
 `focaldesk-cli ai ...`.
 
+CLI chat does not connect to model providers directly. If the background
+server is unavailable, the command fails explicitly so no request can bypass
+the normal permission and audit path.
+
 The socket path resolves from `FOCALDESK_AI_SOCKET` first, then
 `$XDG_RUNTIME_DIR/focaldesk/focaldesk-ai.sock` inside a user session. The
 service refuses to start without a user runtime directory instead of falling
 back to the shared `/tmp` namespace.
+
+AI IPC v2 adds request IDs and AI-specific payload limits inside the standard
+FocalDesk transport envelope. During the migration window, the daemon accepts
+legacy v1 bare payloads and mirrors their response format. New clients retry a
+request once in legacy form only when an older daemon explicitly rejects the
+v2 envelope before dispatch.
+
+Protocol v2 also supports bounded streaming frames with started, delta,
+completed, failed, and cancelled events. Ollama streams tokens natively;
+providers without a streaming transport emit a compatible single delta. The
+AI Console streams replies into the transcript and exposes a **Stop** button.
+CLI users can opt in with:
+
+```sh
+focaldesk-cli ai chat --stream "Summarize my current task"
+```
+
+Closing a streaming client cancels provider work when the daemon detects the
+disconnect, and an explicit cancellation request can stop a stream by its
+request ID.
+
+Provider calls use one 120-second deadline and at most three attempts.
+FocalDesk retries only typed transient transport failures, HTTP 408/425/429,
+timeouts, and HTTP 5xx responses, using capped exponential backoff with jitter.
+Authentication errors, invalid requests, permission denials, cancellations,
+protocol failures, and streams that already emitted output are never retried.
+The Console Providers page reports health, latency, retries, failures,
+cancellations, byte totals, and provider-reported token usage after refresh.
 
 By default the AI service asks the compositor to show a native approval modal,
 logs each request, and records the decision through the normal FocalDesk
@@ -304,6 +336,56 @@ You can tighten or relax the permission gate with:
 - `FOCALDESK_AI_PERMISSION=allow-session` to allow chat for the current session
 - `FOCALDESK_AI_PERMISSION=allow-persistent` to persist the allow decision on disk across restarts
 - `FOCALDESK_AI_PERMISSION=deny` to block AI chat
+
+The AI Console can opt individual chats into contextual memory from its
+Settings page. Memory storage and search use the same permission boundary as
+chat because embedding may contact the configured Ollama-compatible endpoint.
+Recalled entries can be permanently removed with the **Forget** action.
+The Memory page also shows the active lifecycle policy and provides a
+fresh-confirmation **Clear all AI memory** action.
+
+AI memory uses schema version 2, expires new records after 90 days by default,
+and retains at most 10,000 records. Expired and over-capacity records are
+pruned on startup and during normal memory operations. The configured
+retention window is reapplied from each record's original creation time when
+the store opens. Existing schema-v1 records are migrated transactionally. A
+database created by a newer unsupported schema is
+rejected rather than modified. Configure the limits with:
+
+- `FOCALDESK_MEMORY_RETENTION_DAYS`; set it to `0` to disable expiration.
+- `FOCALDESK_MEMORY_MAX_ENTRIES`; set it to `0` for no entry-count limit.
+
+Individual and bulk deletion always require fresh native approval; saved AI
+chat permission does not authorize deleting stored memory.
+
+The CLI can also run a bounded desktop agent:
+
+```sh
+focaldesk-cli ai agent "Which applications and workspaces are currently open?"
+```
+
+The planner may request at most four tool calls and must return a strict JSON
+plan. Read-only tools execute through the audited MCP backend. A mutating tool
+is stored without execution under a random plan ID that expires after two
+minutes. Requesting approval opens a fresh native modal containing the exact
+stored arguments; approval is one-shot and cannot be remembered:
+
+```sh
+focaldesk-cli ai confirm <plan-id>
+# or discard it without opening a prompt
+focaldesk-cli ai deny <plan-id>
+```
+
+The daemon removes a plan before prompting to prevent replay. Model-generated
+confirmation fields are rejected and never count as user consent.
+
+Provider and agent regressions are covered by deterministic tests. Provider
+tests use loopback-only one-shot HTTP fixtures for the OpenAI, Anthropic,
+Ollama, and vLLM wire contracts; they require no API credentials, internet
+access, or locally installed model service. Agent integration tests use a
+scripted provider and recorded tools to cover complete synthesis, bounded
+results, invalid plans, failures, mutation proposals, denial, expiry, and
+replay prevention.
 
 ## Systemd Services
 
