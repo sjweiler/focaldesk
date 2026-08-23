@@ -1082,6 +1082,21 @@ mod tests {
     }
 
     #[test]
+    fn client_linear_decode_uses_hdr_dither_and_scene_scale_uniforms() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("uniform float u_src_bits;"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("decode_dither(gl_FragCoord.xy)"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("uniform float u_linear_to_scene_scale;"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG
+            .contains("decode_color(straight) * u_linear_to_scene_scale"));
+    }
+
+    #[test]
+    fn pq_output_dithers_to_ten_bit_code_values() {
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither(gl_FragCoord.xy)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("/ 1023.0"));
+    }
+
+    #[test]
     fn pixel_shaders_use_smithays_vertex_varying() {
         for shader in [RECESSED_BUTTON_FRAG, TOP_BAR_FRAG] {
             assert!(shader.contains("varying vec2 v_coords;"));
@@ -1155,6 +1170,8 @@ varying vec2 v_coords;
 uniform float alpha;
 uniform float u_decode_tf;
 uniform float u_reference_white_nits;
+uniform float u_linear_to_scene_scale;
+uniform float u_src_bits;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -1202,6 +1219,12 @@ vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
 }
 
+float decode_dither(vec2 pixel) {
+    // Stable per-pixel noise breaks up source-code-value contours without
+    // introducing temporal shimmer in video or desktop gradients.
+    return fract(sin(dot(floor(pixel), vec2(12.9898, 78.233))) * 43758.5453) - 0.5;
+}
+
 void main() {
     vec4 src = texture2D(tex, v_coords);
 #if defined(NO_ALPHA)
@@ -1215,9 +1238,13 @@ void main() {
     // headroom above 1.0 to represent colors outside the sRGB gamut.
     bool extended_linear = u_decode_tf >= 0.5 && u_decode_tf < 1.5;
     if (!extended_linear) {
+        if (u_src_bits > 0.5) {
+            float code_step = 1.0 / (exp2(u_src_bits) - 1.0);
+            straight += vec3(decode_dither(gl_FragCoord.xy) * code_step);
+        }
         straight = clamp(straight, 0.0, 1.0);
     }
-    vec3 linear = mul_mat3(decode_color(straight));
+    vec3 linear = mul_mat3(decode_color(straight) * u_linear_to_scene_scale);
     gl_FragColor = vec4(linear * src.a, src.a) * alpha;
 }
 "#;
@@ -1539,6 +1566,13 @@ float pq_oetf(float nits) {
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
+float pq_output_dither(vec2 pixel) {
+    // Stable, zero-mean noise in [-0.5, 0.5) PQ code values. Applying it
+    // after the transfer function masks contours introduced at the 10-bit
+    // scanout boundary without changing average luminance or adding chroma.
+    return fract(52.9829189 * fract(dot(floor(pixel), vec2(0.06711056, 0.00583715)))) - 0.5;
+}
+
 void main() {
     vec4 src = texture2D(tex, v_coords);
 #if defined(NO_ALPHA)
@@ -1547,6 +1581,7 @@ void main() {
     vec3 nits = src.a > 0.0001 ? max(src.rgb / src.a, vec3(0.0)) : max(src.rgb, vec3(0.0));
     nits = min(nits, vec3(u_max_nits));
     vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
+    pq = clamp(pq + vec3(pq_output_dither(gl_FragCoord.xy) / 1023.0), 0.0, 1.0);
     gl_FragColor = vec4(pq * src.a, src.a) * alpha;
 }
 "#;

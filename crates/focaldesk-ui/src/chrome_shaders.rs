@@ -1519,6 +1519,8 @@ mod tests {
         assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(u_max_nits))"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("compress_to_panel_gamut"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither(gl_FragCoord.xy)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("/ 1023.0"));
     }
 
     #[test]
@@ -2181,6 +2183,13 @@ float pq_oetf(float nits) {
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
+float pq_output_dither(vec2 pixel) {
+    // Stable, zero-mean noise in [-0.5, 0.5) PQ code values. Apply it after
+    // ST 2084 so the final 10-bit quantization does not expose contours from
+    // the otherwise floating-point composition and tone-map passes.
+    return fract(52.9829189 * fract(dot(floor(pixel), vec2(0.06711056, 0.00583715)))) - 0.5;
+}
+
 float bt2020_luminance(vec3 nits) {
     return dot(nits, vec3(0.2627, 0.6780, 0.0593));
 }
@@ -2220,6 +2229,7 @@ void main() {
     // so a 400 nit sky has ~6,700 nits in B and that scale would leave ~27 nits.
     nits = min(nits, vec3(10000.0));
     vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
+    pq = clamp(pq + vec3(pq_output_dither(gl_FragCoord.xy) / 1023.0), 0.0, 1.0);
     gl_FragColor = vec4(pq * src.a, src.a) * alpha;
 }
 "#;

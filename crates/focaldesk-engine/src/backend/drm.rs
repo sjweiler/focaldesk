@@ -378,6 +378,19 @@ fn queued_frame_stalled(queued_at: Instant, now: Instant) -> bool {
     now.saturating_duration_since(queued_at) >= DRM_FRAME_TIMEOUT
 }
 
+fn reset_surface_timing_after_resume(
+    frame_queued_at: &mut Option<Instant>,
+    hdr_commit_deadline: &mut Option<Instant>,
+    hdr_transition_pending: bool,
+    now: Instant,
+) {
+    // DrmOutputManager::activate() drops Smithay's pre-suspend queued frame and
+    // forces the next render to submit a fresh modeset. Mirror that reset in
+    // our scheduler or it will keep waiting for a vblank that can never arrive.
+    *frame_queued_at = None;
+    *hdr_commit_deadline = hdr_transition_pending.then_some(now + HDR_FRAME_TIMEOUT);
+}
+
 fn hdr_commit_stalled(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
@@ -1341,6 +1354,19 @@ fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
         return;
     }
 
+    let resumed_at = Instant::now();
+    for device in data.backend.devices.values_mut() {
+        for surface in device.surfaces.values_mut() {
+            reset_surface_timing_after_resume(
+                &mut surface.frame_queued_at,
+                &mut surface.hdr_commit_deadline,
+                surface.hdr_transition_target.is_some(),
+                resumed_at,
+            );
+            surface.stable_vblank_count = 0;
+        }
+    }
+
     data.resume_pending = false;
     data.resume_retry_at = None;
     data.core.state.handle_session_resume();
@@ -1462,11 +1488,12 @@ mod hdr_tests {
         hdr_active_status_verified, hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
         hdr_driver_allows_output_with_override, hdr_failure_persist_action,
         hdr_verification_complete, merge_disconnected_display_configs,
-        nvidia_kms_hdr_blocked_with_override, queued_frame_stalled, select_drm_mode_index,
-        select_exclusive_hdr_target, DisplayConfig, DisplayTransform, DrmModeCandidate,
-        EdidHdrMetadata, ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport,
-        DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS,
-        HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
+        nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
+        reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
+        DisplayConfig, DisplayTransform, DrmModeCandidate, EdidHdrMetadata,
+        ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT,
+        DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
+        HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase};
     use std::time::{Duration, Instant};
@@ -1572,6 +1599,21 @@ mod hdr_tests {
             queued_at,
             queued_at + DRM_FRAME_TIMEOUT
         ));
+    }
+
+    #[test]
+    fn resume_drops_the_pre_suspend_frame_and_rearms_hdr_timing() {
+        let resumed_at = Instant::now();
+        let mut queued_at = Some(resumed_at - DRM_FRAME_TIMEOUT);
+        let mut hdr_deadline = Some(resumed_at - HDR_FRAME_TIMEOUT);
+
+        reset_surface_timing_after_resume(&mut queued_at, &mut hdr_deadline, true, resumed_at);
+
+        assert_eq!(queued_at, None);
+        assert_eq!(hdr_deadline, Some(resumed_at + HDR_FRAME_TIMEOUT));
+
+        reset_surface_timing_after_resume(&mut queued_at, &mut hdr_deadline, false, resumed_at);
+        assert_eq!(hdr_deadline, None);
     }
 
     #[test]

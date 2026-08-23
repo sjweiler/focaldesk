@@ -1260,9 +1260,11 @@ fn encoding_from_fourcc(code: Fourcc) -> ClientBufferEncoding {
         Fourcc::Abgr2101010 | Fourcc::Argb2101010 | Fourcc::Xbgr2101010 | Fourcc::Xrgb2101010 => {
             ClientBufferEncoding::Unorm10
         }
-        Fourcc::Abgr8888 | Fourcc::Argb8888 | Fourcc::Xbgr8888 | Fourcc::Xrgb8888 => {
-            ClientBufferEncoding::Unorm8
-        }
+        Fourcc::Abgr8888
+        | Fourcc::Argb8888
+        | Fourcc::Xbgr8888
+        | Fourcc::Xrgb8888
+        | Fourcc::Nv12 => ClientBufferEncoding::Unorm8,
         other => {
             let name = format!("{other:?}");
             if name.contains("16161616") {
@@ -1271,7 +1273,6 @@ fn encoding_from_fourcc(code: Fourcc) -> ClientBufferEncoding {
                 || name.contains("1010102")
                 || name.contains("P010")
                 || name.contains("P012")
-                || name.contains("NV12")
             {
                 ClientBufferEncoding::Unorm10
             } else if name.contains("8888") || name.contains("AB24") || name.contains("XB24") {
@@ -10085,10 +10086,11 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds, is_browser_like,
-        logical_damage_to_physical, power_action_interaction, remove_surface_root_membership,
-        session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
-        surface_buffer_damage_to_logical, topbar_pulse_target_at, workspace_for_slot, DamageSource,
+        ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds, encoding_from_fourcc,
+        is_browser_like, logical_damage_to_physical, power_action_interaction,
+        remove_surface_root_membership, session_power_command, set_surface_root_membership,
+        should_wait_for_lid_open_on_resume, surface_buffer_damage_to_logical,
+        topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding, DamageSource, Fourcc,
         PowerActionInteraction, TopbarPulseTarget, UnattendedSuspendState,
         UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
@@ -10104,6 +10106,18 @@ mod tests {
     use smithay::backend::renderer::utils::SurfaceView;
     use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
     use std::collections::HashMap;
+
+    #[test]
+    fn chromium_nv12_video_is_classified_as_eight_bit() {
+        assert_eq!(
+            encoding_from_fourcc(Fourcc::Nv12),
+            ClientBufferEncoding::Unorm8
+        );
+        assert_eq!(
+            encoding_from_fourcc(Fourcc::P010),
+            ClientBufferEncoding::Unorm10
+        );
+    }
 
     #[test]
     fn only_shell_base_damage_invalidates_the_retained_sdr_base() {
