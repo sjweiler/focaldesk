@@ -137,12 +137,14 @@ pub enum TransferDecodeMode {
     Gamma22 = 2,
     St2084Pq = 3,
     SrgbHdrExtended = 4,
+    Bt1886 = 5,
 }
 
 impl TransferFunction {
     pub fn decode_mode(self) -> TransferDecodeMode {
         match self {
-            Self::Srgb | Self::Bt1886 => TransferDecodeMode::SrgbPiecewise,
+            Self::Srgb => TransferDecodeMode::SrgbPiecewise,
+            Self::Bt1886 => TransferDecodeMode::Bt1886,
             Self::Gamma22 => TransferDecodeMode::Gamma22,
             Self::Linear => TransferDecodeMode::LinearPassThrough,
             Self::St2084Pq => TransferDecodeMode::St2084Pq,
@@ -913,6 +915,19 @@ pub fn output_hdr_pq_test_encode_active(
     hdr_requested && hdr_supported && hdr_render_runtime_enabled() && !hdr_kms_applied
 }
 
+/// Replace an active HDR output with an absolute-nits calibration pattern.
+///
+/// This is deliberately session-scoped and unavailable through persistent
+/// display settings so an ordinary desktop cannot accidentally save it.
+pub fn hdr_calibration_pattern_enabled() -> bool {
+    matches!(
+        std::env::var("FOCALDESK_HDR_CALIBRATION_PATTERN")
+            .ok()
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// When false, do not advertise `wp_color_management_v1`.
 pub fn wp_color_management_enabled() -> bool {
     !matches!(
@@ -987,6 +1002,24 @@ mod tests {
         for encoded in [0.0, 0.003, 0.04045, 0.18, 0.5, 1.0] {
             close(linear_to_srgb(srgb_to_linear(encoded)), encoded, 1e-6);
         }
+    }
+
+    #[test]
+    fn bt1886_uses_its_own_client_decode_mode() {
+        assert_eq!(
+            TransferFunction::Bt1886.decode_mode(),
+            TransferDecodeMode::Bt1886
+        );
+        assert_ne!(
+            TransferFunction::Bt1886.decode_mode(),
+            TransferFunction::Srgb.decode_mode()
+        );
+        // Output encoding remains on the established SDR path; this change is
+        // deliberately limited to correctly interpreting tagged clients.
+        assert_eq!(
+            TransferFunction::Bt1886.encode_mode(),
+            TransferDecodeMode::SrgbPiecewise
+        );
     }
 
     #[test]

@@ -32,6 +32,8 @@ pub enum FontRole {
 pub struct TextStyle {
     pub font: FontId,
     pub size_px: u32,
+    /// Tracking in 1/64 logical pixels. Fixed point keeps the style hashable.
+    pub letter_spacing_64: i16,
 }
 
 #[derive(Clone, Debug)]
@@ -291,7 +293,7 @@ impl FontSystem {
             let Some(glyph) = self.glyph((style.font, style.size_px, ch)) else {
                 continue;
             };
-            w += glyph.advance.round() as i32;
+            w += (glyph.advance + f32::from(style.letter_spacing_64) / 64.0).round() as i32;
         }
         w
     }
@@ -422,7 +424,11 @@ pub fn style_for(role: FontRole, size_px: u32, theme: BuiltInThemeId) -> TextSty
         },
     };
 
-    TextStyle { font, size_px }
+    TextStyle {
+        font,
+        size_px,
+        letter_spacing_64: 0,
+    }
 }
 
 #[cfg(test)]

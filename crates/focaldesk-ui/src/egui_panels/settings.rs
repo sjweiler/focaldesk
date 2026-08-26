@@ -644,6 +644,13 @@ impl SettingsPanel {
 
         changed |= ui
             .checkbox(
+                &mut self.config.appearance.work_area_glass,
+                "Work-area glass",
+            )
+            .changed();
+
+        changed |= ui
+            .checkbox(
                 &mut self.config.appearance.output_focus_glow,
                 "Output focus glow",
             )

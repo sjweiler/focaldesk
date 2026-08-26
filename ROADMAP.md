@@ -52,6 +52,27 @@ truth for what is usable today.
   handling, lock screen, and accessibility behavior.
 - Improve first-run setup, recovery, and uninstall workflows.
 
+## Theme editor phases
+
+The editor authoring phases below are implemented. Compositor-native gradient
+rendering remains outstanding: gradient sources round-trip through TOML and
+packages and render in the editor, but the compositor currently samples a
+representative color. See the [Theme Editor guide](docs/theme-editor.md) for the
+current workflow and limitations.
+
+1. sRGB saturation/value square with a separate hue slider.
+2. Display P3 gamut mode using the same picker.
+3. sRGB gamut boundary while editing Display P3 colors.
+4. Optional hue ring replacing the slider, without changing color semantics.
+5. Solid, linear-gradient, and radial-gradient editing with per-stop colors.
+6. SDR/HDR dynamic-range selection and an independent HDR luminance control.
+7. TOML save/load for custom themes, with validation and unsaved-change tracking.
+8. Debounced live preview, apply, and revert through versioned compositor IPC.
+9. Wallpaper assets, fit/tint controls, and safely installable theme packaging.
+10. Semantic surface tokens, inherited interaction states, and a simultaneous state-matrix preview.
+11. Compositor renderer parity for semantic states, geometry, typography,
+    wallpaper processing, HDR intent, capability reporting, and contrast audits.
+
 ## Services and security
 
 - Version IPC messages and document compatibility expectations.

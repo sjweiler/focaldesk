@@ -35,6 +35,31 @@ encoding. KMS HDR static metadata signals 203-nit BT.2408 SDR/graphics white
 as MaxFALL and 450 nits as MaxCLL / mastering peak, rather than the Type-1
 EDID values (often 409 / ~300) that make these ASUS panels over-compress.
 
+## HDR appearance tuning
+
+Each HDR-capable connector has an **HDR appearance tuning** section in Display
+Settings. Its controls affect only the final FP16 scene-to-BT.2020/PQ shader;
+they do not enable HDR, change a display mode, or submit KMS connector
+properties. Reference white and highlight roll-off remain bounded by the
+current 203/450-nit HDR10 metadata contract. Saturation is applied in the
+resolved panel gamut while preserving luminance, and midtone gamma shapes only
+the SDR range while keeping black and reference white fixed.
+
+Moving a control or selecting the **Neutral (BT.2408)**, **Bright room**, or
+**Punchy OLED** preset starts a live 15-second preview. Choose **Keep** to save
+the values for that connector, allow the preview to expire to restore the saved
+profile, or choose **Reset** to preview the neutral 203-nit white, 450-nit peak,
+1.00 saturation, and 1.00 midtone gamma. Invalid, non-finite, or out-of-range
+values are rejected by both IPC and the compositor before render state changes.
+
+For output-path measurements, start a session with
+`FOCALDESK_HDR_CALIBRATION_PATTERN=1`. An active HDR output is replaced with
+100-, 203-, and 300-nit neutral patches, a configured-peak patch, equal-200-nit
+BT.2020 red/green/blue patches, and a zero-to-peak neutral ramp. The diagnostic
+pattern bypasses appearance saturation and midtone shaping but still uses the
+normal highlight roll-off, ST 2084 encode, and 10-bit output dither. It is an
+environment-only diagnostic and is never persisted in display settings.
+
 ## SDR wide gamut and 10-bit output
 
 HDR is not required to benefit from FocalDesk's color pipeline. An SDR output

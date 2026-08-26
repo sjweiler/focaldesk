@@ -13,7 +13,8 @@ use crate::core::color::{
 use crate::core::desktop::DesktopState;
 use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::render::{
-    ChromeGlassPass, ClientCompositingMode, FlowRenderElement, OutputRenderStage,
+    work_area_glass_style, ChromeGlassPass, ClientCompositingMode, FlowRenderElement, GlassStyle,
+    OutputRenderStage,
 };
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
@@ -25,7 +26,7 @@ use smithay::backend::renderer::gles::{
     ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::sync::SyncPoint;
-use smithay::backend::renderer::{Bind, Color32F, Frame, Offscreen, Renderer, Texture};
+use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Offscreen, Renderer, Texture};
 use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
 use std::time::{Duration, Instant};
 
@@ -75,6 +76,11 @@ pub struct LinearOffscreenTargets {
     pub offscreen: Option<OffscreenTexture>,
     pub linear_offscreen: Option<OffscreenTexture>,
     pub overlay_offscreen: Option<OffscreenTexture>,
+    /// CPU-generated premultiplied RGBA8 work-area glass, sampled only through
+    /// Smithay's stock texture program on drivers that reject the procedural quad.
+    pub(crate) glass_texture: Option<GlesTexture>,
+    pub(crate) glass_texture_size: Option<Size<i32, Physical>>,
+    pub(crate) glass_texture_style: Option<GlassStyle>,
     /// Ping-pong target for full-frame output encode (C1b/C2c SDR).
     pub encode_scratch: Option<OffscreenTexture>,
     /// Encoded output-space intermediate consumed by the ICC LUT pass.
@@ -341,13 +347,9 @@ fn wallpaper_grade_parameters(output: &crate::core::desktop::OutputState) -> (f3
         .edid_hdr_max_luminance_nits
         .filter(|nits| nits.is_finite() && *nits > 0.0);
     if hdr_target {
-        if let Some(peak_nits) = hdr_peak {
-            let creative_peak = crate::core::color::hdr_conservative_peak_nits(peak_nits);
-            return (
-                2.0,
-                crate::core::color::hdr_reference_white_nits(creative_peak),
-                creative_peak,
-            );
+        if hdr_peak.is_some() {
+            let appearance = output.hdr_appearance.validate().unwrap_or_default();
+            return (2.0, appearance.reference_white_nits, appearance.peak_nits);
         }
     }
 
@@ -391,18 +393,21 @@ pub fn apply_output_encode(
     // A real KMS HDR transition must carry a PQ-encoded first frame. The
     // runtime flag remains relevant only to the userspace-only PQ lab mode.
     if hdr_active && (hdr_kms_target || hdr_render_runtime_enabled()) {
-        if let Some(max_nits) = hdr_max.filter(|n| *n > 0.0) {
+        if hdr_max.is_some_and(|nits| nits > 0.0) {
             if targets.hdr_supported {
-                let hdr_white_nits = crate::core::color::hdr_reference_white_nits(max_nits);
-                let encode_nits = crate::core::color::hdr_conservative_peak_nits(max_nits);
+                let appearance = output_state
+                    .map(|output| output.hdr_appearance.validate().unwrap_or_default())
+                    .unwrap_or_default();
                 match apply_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
-                    encode_nits,
-                    hdr_white_nits,
+                    appearance.peak_nits,
+                    appearance.reference_white_nits,
                     output_hdr_panel_primaries(state, output_id),
+                    appearance.saturation,
+                    appearance.midtone_gamma,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
@@ -547,11 +552,19 @@ fn hdr_pq_shader_uniforms(
     panel: ColorPrimaries,
     max_nits: f32,
     sdr_white_nits: f32,
+    saturation: f32,
+    midtone_gamma: f32,
 ) -> Vec<Uniform<'static>> {
     let (scene_to_panel, panel_to_bt2020, luma) = hdr10_pq_encode_transforms(panel);
     vec![
         Uniform::new("u_max_nits", max_nits),
         Uniform::new("u_sdr_white_nits", sdr_white_nits),
+        Uniform::new("u_saturation", saturation),
+        Uniform::new("u_midtone_gamma", midtone_gamma),
+        Uniform::new(
+            "u_calibration_pattern",
+            crate::core::color::hdr_calibration_pattern_enabled() as u8 as f32,
+        ),
         Uniform::new("u_m0", scene_to_panel[0]),
         Uniform::new("u_m1", scene_to_panel[1]),
         Uniform::new("u_m2", scene_to_panel[2]),
@@ -578,6 +591,8 @@ fn apply_hdr_pq_encode(
     max_nits: f32,
     sdr_white_nits: f32,
     panel: ColorPrimaries,
+    saturation: f32,
+    midtone_gamma: f32,
 ) -> Result<Option<SyncPoint>> {
     let damage = full_damage(buffer_size);
     let sdr_to_scrgb = state
@@ -638,7 +653,7 @@ fn apply_hdr_pq_encode(
             .texture,
         buffer_size,
         scrgb_to_pq,
-        &hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits),
+        &hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits, saturation, midtone_gamma),
         "linear-scRGB-to-PQ",
         &damage,
     )?;
@@ -947,6 +962,8 @@ fn apply_linear_hdr_pq_encode(
     requested_damage: &[Rectangle<i32, Physical>],
     destination_current: bool,
     panel: ColorPrimaries,
+    saturation: f32,
+    midtone_gamma: f32,
 ) -> Result<SyncPoint> {
     let shader = state
         .render
@@ -965,7 +982,8 @@ fn apply_linear_hdr_pq_encode(
             offscreen_texture_is_valid(targets.hdr_offscreen.as_ref(), buffer_size, format)
         });
     targets.ensure_hdr_offscreen(renderer, buffer_size)?;
-    let uniforms = hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits);
+    let uniforms =
+        hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits, saturation, midtone_gamma);
     let destination = &mut targets
         .hdr_offscreen
         .as_mut()
@@ -1027,20 +1045,23 @@ fn apply_linear_output_encode(
         .unwrap_or((false, false));
     let hdr_max = output_state.and_then(|output| output.edid_hdr_max_luminance_nits);
     if hdr_active && (hdr_kms_target || hdr_render_runtime_enabled()) {
-        if let Some(max_nits) = hdr_max.filter(|nits| *nits > 0.0) {
+        if hdr_max.is_some_and(|nits| nits > 0.0) {
             if targets.hdr_supported {
-                let hdr_white_nits = crate::core::color::hdr_reference_white_nits(max_nits);
-                let encode_nits = crate::core::color::hdr_conservative_peak_nits(max_nits);
+                let appearance = output_state
+                    .map(|output| output.hdr_appearance.validate().unwrap_or_default())
+                    .unwrap_or_default();
                 match apply_linear_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
-                    encode_nits,
-                    hdr_white_nits,
+                    appearance.peak_nits,
+                    appearance.reference_white_nits,
                     damage,
                     previous_encoded_hdr,
                     output_hdr_panel_primaries(state, output_id),
+                    appearance.saturation,
+                    appearance.midtone_gamma,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => flog_warn!(
@@ -1144,6 +1165,76 @@ fn clear_offscreen(
     frame.clear(color, damage)
 }
 
+fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
+    let t = ((value - edge0) / (edge1 - edge0).max(f32::EPSILON)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Generate the cosmetic glass once on the CPU. The resulting premultiplied
+/// RGBA8 texture is drawn with Smithay's proven stock texture program; no
+/// procedural shader or custom full-screen quad reaches the NVIDIA path.
+fn work_area_glass_pixels(size: Size<i32, Physical>, style: GlassStyle, time: f32) -> Vec<u8> {
+    let width = size.w.max(1);
+    let height = size.h.max(1);
+    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+
+    for y in 0..height {
+        let uv_y = (y as f32 + 0.5) / height as f32;
+        for x in 0..width {
+            let uv_x = (x as f32 + 0.5) / width as f32;
+            let p_x = uv_x * width as f32;
+            let p_y = uv_y * height as f32;
+            let left = smoothstep(0.0, style.edge_width, p_x);
+            let right = smoothstep(0.0, style.edge_width, width as f32 - p_x);
+            let top = smoothstep(0.0, style.edge_width, p_y);
+            let bottom = smoothstep(0.0, style.edge_width, height as f32 - p_y);
+            let e = left.min(right).min(top).min(bottom);
+            let edge = 1.0 - e;
+
+            let diag = uv_x * 0.75 + uv_y * 0.25;
+            let highlight = (smoothstep(0.20, 0.52, diag) - smoothstep(0.52, 0.88, diag))
+                * style.highlight_strength
+                * 0.18;
+            let top_band =
+                smoothstep(0.0, 0.08, uv_y) * (1.0 - smoothstep(0.08, 0.24, uv_y)) * 0.05;
+            let shimmer_wave = 0.5 + 0.5 * ((uv_x * 0.85 + uv_y * 0.35) * 10.0 - time * 0.10).sin();
+            let shimmer = smoothstep(0.80, 0.98, shimmer_wave) * 0.007;
+            let body_gradient = 0.985 + (1.015 - 0.985) * (1.0 - uv_y);
+            let inner_edge = 1.0 - smoothstep(0.03, 0.18, e);
+            let bezel_distance = p_x
+                .min(width as f32 - p_x)
+                .min(p_y.min(height as f32 - p_y));
+            let bezel = 1.0 - smoothstep(0.0, 2.5, bezel_distance);
+            let noise_seed = (x as f32 * 12.9898 + y as f32 * 78.233).sin() * 43758.547;
+            let noise = noise_seed - noise_seed.floor();
+
+            let mut color = [0.0f32; 3];
+            for channel in 0..3 {
+                let value = style.tint[channel] * 0.06 * body_gradient
+                    + style.edge_color[channel] * edge * style.edge_brightness * 0.35
+                    + highlight
+                    + top_band
+                    + shimmer
+                    - inner_edge * 0.035
+                    - bezel * 0.025
+                    + (noise - 0.5) * 0.0025;
+                color[channel] = value.max(0.0).powf(0.97);
+            }
+            let glass_alpha = (style.opacity
+                + edge * 0.025
+                + highlight * 0.08
+                + top_band * 0.12
+                + shimmer * 0.08)
+                .clamp(0.0, 0.10);
+            for channel in color {
+                pixels.push((channel * glass_alpha * 255.0).round().clamp(0.0, 255.0) as u8);
+            }
+            pixels.push((glass_alpha * 255.0).round() as u8);
+        }
+    }
+    pixels
+}
+
 pub fn run_linear_staged_pass(
     state: &mut DesktopState,
     renderer: &mut GlesRenderer,
@@ -1219,6 +1310,59 @@ pub fn run_linear_staged_pass(
     let transparent = Color32F::new(0.0, 0.0, 0.0, 0.0);
     let empty_clients: [FlowRenderElement; 0] = [];
     let empty_popups: [FlowRenderElement; 0] = [];
+    let glass_rect: Rectangle<i32, Physical> = prepared
+        .layout
+        .work_area
+        .glass
+        .to_physical_precise_round(prepared.frame_ctx.output_scale);
+    let internal_chrome = state
+        .outputs
+        .get(&output_id)
+        .map(|output| {
+            !crate::core::wayland::trusted_shell::reservation_for_output(&output.handle).is_active()
+        })
+        .unwrap_or(true);
+    let active_workspace = state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.active_workspace)
+        .unwrap_or_else(|| state.focused_workspace());
+    let fullscreen_client = state.windows.iter().any(|window| {
+        window.mapped
+            && !window.minimized
+            && window.fullscreen
+            && window.workspace == active_workspace
+            && window.output == Some(output_id)
+    });
+    let glass_enabled = state.work_area_glass_enabled()
+        && internal_chrome
+        && !fullscreen_client
+        && glass_rect.size.w > 0
+        && glass_rect.size.h > 0;
+    if glass_enabled
+        && (targets.glass_texture.is_none()
+            || targets.glass_texture_size != Some(glass_rect.size)
+            || targets.glass_texture_style
+                != Some(work_area_glass_style(state.theme.active_theme())))
+    {
+        let style = work_area_glass_style(state.theme.active_theme());
+        let pixels = work_area_glass_pixels(glass_rect.size, style, 0.0);
+        targets.glass_texture = Some(
+            renderer
+                .import_memory(
+                    &pixels,
+                    Fourcc::Abgr8888,
+                    Size::<i32, Buffer>::from((glass_rect.size.w, glass_rect.size.h)),
+                    false,
+                )
+                .map_err(|err| anyhow!("upload work-area glass texture: {err}"))?,
+        );
+        targets.glass_texture_size = Some(glass_rect.size);
+        targets.glass_texture_style = Some(style);
+    }
+    let glass_texture = glass_enabled
+        .then(|| targets.glass_texture.clone())
+        .flatten();
 
     // Keep the shell base on its established encoded-sRGB rendering path.  In
     // particular, the wallpaper texture and several chrome pixel shaders are
@@ -1251,16 +1395,43 @@ pub fn run_linear_staged_pass(
             output_state,
             OutputRenderStage::Base,
             ClientCompositingMode::Sdr,
-            // The shell base is intentionally completed in the known-good SDR
-            // target before the full-frame decode.  Keep the work-area glass in
-            // that pass too: drawing its pixel shader separately into the FP16
-            // target produces an incomplete diagonal quad on the direct NVIDIA
-            // path.  Clients are still rendered later in scene-linear space and
-            // therefore remain above the glass.
-            ChromeGlassPass::InBaseSdr,
+            // A stock texture draw adds the CPU-generated glass below. Keep the
+            // procedural pixel-shader quad off the direct NVIDIA path.
+            ChromeGlassPass::Skip,
             false,
         )
         .map_err(|err| anyhow!("{err}"))?;
+        if let Some(glass_texture) = glass_texture.as_ref() {
+            let glass_damage: Vec<Rectangle<i32, Physical>> = prepared
+                .frame_ctx
+                .damage
+                .iter()
+                .filter_map(|rect| rect.intersection(glass_rect))
+                .map(|mut rect| {
+                    rect.loc -= glass_rect.loc;
+                    rect
+                })
+                .collect();
+            if !glass_damage.is_empty() {
+                let texture_size = glass_texture.size();
+                frame
+                    .render_texture_from_to(
+                        glass_texture,
+                        Rectangle::<f64, Buffer>::from_loc_and_size(
+                            (0.0, 0.0),
+                            (texture_size.w as f64, texture_size.h as f64),
+                        ),
+                        glass_rect,
+                        &glass_damage,
+                        &[],
+                        Transform::Normal,
+                        1.0,
+                        None,
+                        &[],
+                    )
+                    .map_err(|err| anyhow!("draw work-area glass texture: {err}"))?;
+            }
+        }
         let sync = frame.finish()?;
         if profile_timings {
             record_gpu_completion(renderer, &sync, "base-sdr", pass_started, &mut pass_timings)?;
@@ -1689,8 +1860,30 @@ pub fn present_offscreen_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_hdr_encode_state;
+    use super::{resolve_hdr_encode_state, work_area_glass_pixels};
     use crate::core::color::hdr_reference_white_nits;
+    use crate::core::render::GlassStyle;
+    use smithay::utils::{Physical, Size};
+
+    #[test]
+    fn cpu_glass_texture_is_premultiplied_rgba() {
+        let pixels = work_area_glass_pixels(
+            Size::<i32, Physical>::from((8, 6)),
+            GlassStyle {
+                opacity: 0.08,
+                edge_width: 2.0,
+                edge_brightness: 0.75,
+                highlight_strength: 0.10,
+                tint: [0.035, 0.085, 0.20, 1.0],
+                edge_color: [0.30, 0.55, 0.95, 0.14],
+            },
+            0.0,
+        );
+        assert_eq!(pixels.len(), 8 * 6 * 4);
+        assert!(pixels
+            .chunks_exact(4)
+            .all(|pixel| { pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3] }));
+    }
 
     #[test]
     fn pq_desktop_white_uses_hdr_reference_luminance() {

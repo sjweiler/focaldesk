@@ -76,8 +76,8 @@ use focaldesk_ipc::{
     send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
     DesktopAction, DesktopDirection, DesktopSnapshot, DisplayRuntimeOutputStatus, IpcRequest,
     IpcResponse, NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
-    PowerIpcResponse, RenderingStatus, SessionStatus, UpdateIpcRequest, UpdateIpcResponse,
-    WindowSnapshot, WorkspaceSnapshot,
+    PowerIpcResponse, RenderingStatus, SessionStatus, ThemeEditorCommand, UpdateIpcRequest,
+    UpdateIpcResponse, WindowSnapshot, WorkspaceSnapshot, THEME_EDITOR_PROTOCOL_VERSION,
 };
 use focaldesk_logging::session_id;
 use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
@@ -89,8 +89,8 @@ use focaldesk_power::{
 use focaldesk_settings_core::{
     load_settings, rearm_exclusive_hdr_for_next_session, AppSettings, BrowserLaunchBackend,
     ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings, DisplayColorProfile,
-    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
-    PowerSettings, PrivacySettings, WorkspaceSettings,
+    HdrAppearance, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
+    PowerButtonAction, PowerSettings, PrivacySettings, WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::atlas::IconId;
@@ -501,7 +501,7 @@ fn write_ipc_response(stream: &mut UnixStream, response: IpcResponse) {
 
 fn theme_id_from_config(config: &FocalDeskConfig) -> FlowThemeId {
     match config.appearance.theme.as_str() {
-        "Eagle" | "" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
+        "Default" | "Eagle" | "" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
         "Moonbase" => FlowThemeId::BuiltIn(BuiltInThemeId::Moonbase),
         "Classic" => FlowThemeId::BuiltIn(BuiltInThemeId::Classic),
         other => FlowThemeId::Custom(other.to_string()),
@@ -617,6 +617,9 @@ pub struct OutputState {
     /// post-transition stability window exposed to Settings.
     pub hdr_verification_pending: bool,
     pub hdr_enabled: bool,
+    /// Creative parameters for the final PQ shader only. This never controls
+    /// whether KMS HDR is requested or active.
+    pub hdr_appearance: HdrAppearance,
     /// EDID Type-1 HDR static metadata (nits), when detected.
     pub edid_hdr_max_luminance_nits: Option<f32>,
     pub edid_hdr_max_fall_nits: Option<f32>,
@@ -2041,12 +2044,94 @@ impl DesktopState {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),
             },
+            IpcRequest::SetHdrAppearance {
+                connector,
+                appearance,
+            } => match self.set_hdr_appearance(&connector, appearance) {
+                Ok(()) => Some(IpcResponse::Ok),
+                Err(message) => Some(IpcResponse::Error { message }),
+            },
             IpcRequest::GetDisplayRuntimeStatus => Some(IpcResponse::DisplayRuntimeStatus {
                 outputs: self.runtime_display_statuses(),
             }),
             IpcRequest::GetDesktopSnapshot => Some(IpcResponse::DesktopSnapshot {
                 snapshot: self.desktop_snapshot(),
             }),
+            IpcRequest::GetThemeEditorStatus { protocol_version } => {
+                if protocol_version != THEME_EDITOR_PROTOCOL_VERSION {
+                    Some(IpcResponse::Error {
+                        message: format!(
+                            "unsupported theme editor protocol version {protocol_version}; supported version is {THEME_EDITOR_PROTOCOL_VERSION}"
+                        ),
+                    })
+                } else {
+                    Some(IpcResponse::ThemeEditorStatus {
+                        protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
+                        preview_active: self.theme.editor_preview_active(),
+                        applied_revision: self.theme.editor_revision(),
+                        gradient_rendering: false,
+                        semantic_rendering: true,
+                        wallpaper_processing: true,
+                        layout_metrics: true,
+                        typography_metrics: true,
+                        contrast_issue_count: self
+                            .theme
+                            .active_theme()
+                            .semantic
+                            .as_ref()
+                            .map_or(0, |semantic| semantic.contrast_issues().len()),
+                    })
+                }
+            }
+            IpcRequest::ThemeEditor {
+                protocol_version,
+                command,
+            } => {
+                if protocol_version != THEME_EDITOR_PROTOCOL_VERSION {
+                    return Some(IpcResponse::Error {
+                        message: format!(
+                            "unsupported theme editor protocol version {protocol_version}; supported version is {THEME_EDITOR_PROTOCOL_VERSION}"
+                        ),
+                    });
+                }
+                let result = match command {
+                    ThemeEditorCommand::Preview { document } => {
+                        self.theme.preview_editor_document(&document).map(|_| ())
+                    }
+                    ThemeEditorCommand::Apply { document } => {
+                        self.theme.apply_editor_document(&document).map(|_| ())
+                    }
+                    ThemeEditorCommand::Revert => {
+                        self.theme.revert_editor_preview();
+                        Ok(())
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        self.render.fonts_prewarm_done = false;
+                        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                        Some(IpcResponse::ThemeEditorStatus {
+                            protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
+                            preview_active: self.theme.editor_preview_active(),
+                            applied_revision: self.theme.editor_revision(),
+                            gradient_rendering: false,
+                            semantic_rendering: true,
+                            wallpaper_processing: true,
+                            layout_metrics: true,
+                            typography_metrics: true,
+                            contrast_issue_count: self
+                                .theme
+                                .active_theme()
+                                .semantic
+                                .as_ref()
+                                .map_or(0, |semantic| semantic.contrast_issues().len()),
+                        })
+                    }
+                    Err(error) => Some(IpcResponse::Error {
+                        message: error.to_string(),
+                    }),
+                }
+            }
             IpcRequest::GetPowerSnapshot => Some(IpcResponse::Error {
                 message: "request is handled by focaldesk-powerd".to_string(),
             }),
@@ -2348,6 +2433,11 @@ impl DesktopState {
     }
 
     fn apply_display_configs(&mut self, outputs: Vec<OutputConfig>) -> Result<(), String> {
+        for config in &outputs {
+            config.hdr_appearance.validate().map_err(|message| {
+                format!("invalid HDR appearance for {}: {message}", config.connector)
+            })?;
+        }
         let single_output_id = (self.outputs.len() == 1 && outputs.len() == 1)
             .then(|| self.outputs.keys().copied().next())
             .flatten();
@@ -2393,6 +2483,7 @@ impl DesktopState {
                         output.hdr_supported,
                         output.hdr_kms_applied,
                     );
+                output.hdr_appearance = config.hdr_appearance;
                 output.color_profile_override = config.color_profile;
                 output.icc_profile_path = config.icc_profile_path.clone();
             }
@@ -2437,6 +2528,27 @@ impl DesktopState {
             );
         }
 
+        Ok(())
+    }
+
+    fn set_hdr_appearance(
+        &mut self,
+        connector: &str,
+        appearance: HdrAppearance,
+    ) -> Result<(), String> {
+        let appearance = appearance
+            .validate()
+            .map_err(|message| format!("invalid HDR appearance for {connector}: {message}"))?;
+        let Some(output) = self
+            .outputs
+            .values_mut()
+            .find(|output| output.handle.name() == connector)
+        else {
+            return Err(format!("unknown display connector: {connector}"));
+        };
+        output.hdr_appearance = appearance;
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        self.mark_redraw();
         Ok(())
     }
 
@@ -2569,10 +2681,22 @@ impl DesktopState {
     fn apply_config(&mut self, config: FocalDeskConfig) {
         let old_theme_id = self.theme.active_theme().id.clone();
         let new_theme_id = theme_id_from_config(&config);
+        let use_system_default = matches!(config.appearance.theme.as_str(), "" | "Default");
 
-        self.theme.set_builtin(new_theme_id.clone());
-
-        if old_theme_id != new_theme_id {
+        if old_theme_id != new_theme_id || use_system_default {
+            self.theme.set_builtin(new_theme_id.clone());
+            if use_system_default {
+                match focaldesk_themes::ThemeDocument::load(std::path::Path::new(
+                    focaldesk_themes::SYSTEM_DEFAULT_THEME_PATH,
+                )) {
+                    Ok(document) => {
+                        if let Err(err) = self.theme.apply_editor_document(&document) {
+                            flog_error!("failed to apply system default theme: {err}");
+                        }
+                    }
+                    Err(err) => flog_error!("failed to load system default theme: {err}"),
+                }
+            }
             if let Some(theme_id) = new_theme_id.builtin_id() {
                 if let Err(err) = self.fonts.reload_for_theme(theme_id) {
                     flog_error!("failed to reload fonts for theme {:?}: {err}", theme_id);
@@ -2583,7 +2707,17 @@ impl DesktopState {
             self.render.font_atlas_texture = None;
         }
 
+        // Appearance changes can alter the retained encoded-SDR base (including
+        // the CPU-generated work-area glass texture), so damage alone is not
+        // sufficient: force that base to be rebuilt before the FP16 decode.
+        for output in self.outputs.values_mut() {
+            output.sdr_base_generation = output.sdr_base_generation.wrapping_add(1);
+        }
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn work_area_glass_enabled(&self) -> bool {
+        self.settings_ipc_config.appearance.work_area_glass
     }
 
     fn apply_power_settings(&self) {
@@ -2863,15 +2997,25 @@ impl DesktopState {
         let options = self.ui_build_options_for_output(output_id)?;
         let trusted_shell =
             crate::core::wayland::trusted_shell::reservation_for_output(&output.handle);
+        let semantic_layout = self
+            .theme
+            .active_theme()
+            .semantic
+            .as_ref()
+            .map(|theme| &theme.layout);
         let topbar_h = if trusted_shell.top > 0 {
             trusted_shell.top
         } else {
-            self.chrome.metrics.topbar_h
+            semantic_layout.map_or(self.chrome.metrics.topbar_h, |layout| {
+                layout.bar_height.round() as i32
+            })
         };
         let sidebar_w = if trusted_shell.left > 0 {
             trusted_shell.left
         } else {
-            self.chrome.metrics.sidebar_w
+            semantic_layout.map_or(self.chrome.metrics.sidebar_w, |layout| {
+                layout.dock_width.round() as i32
+            })
         };
         Some(build_chrome_layout_with_config(
             output.logical_size,
@@ -5311,6 +5455,7 @@ impl DesktopState {
                 hdr_transition_target: None,
                 hdr_verification_pending: false,
                 hdr_enabled: false,
+                hdr_appearance: HdrAppearance::default(),
                 edid_hdr_max_luminance_nits: None,
                 edid_hdr_max_fall_nits: None,
                 active_workspace: WorkspaceId(1),
@@ -8751,6 +8896,7 @@ impl DesktopState {
                     hdr_transition_target: None,
                     hdr_verification_pending: false,
                     hdr_enabled: false,
+                    hdr_appearance: HdrAppearance::default(),
                     edid_hdr_max_luminance_nits: None,
                     edid_hdr_max_fall_nits: None,
                     active_workspace: WorkspaceId(1),

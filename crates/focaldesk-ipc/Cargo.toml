@@ -16,6 +16,7 @@ focaldesk-notifications = { path = "../focaldesk-notifications" }
 focaldesk-updates = { path = "../focaldesk-updates" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-config = { path = "../focaldesk-config" }
+focaldesk-themes = { path = "../focaldesk-themes" }
 tracing = { workspace = true }
 nix = { workspace = true, features = ["socket", "user"] }
 libc = { workspace = true }

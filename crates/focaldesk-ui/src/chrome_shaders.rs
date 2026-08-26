@@ -456,6 +456,9 @@ impl ChromeShaders {
                 &[
                     UniformName::new("u_tint", UniformType::_4f),
                     UniformName::new("u_decode_srgb", UniformType::_1f),
+                    UniformName::new("u_texel_size", UniformType::_2f),
+                    UniformName::new("u_blur_radius", UniformType::_1f),
+                    UniformName::new("u_saturation", UniformType::_1f),
                 ],
             )?);
         }
@@ -566,6 +569,9 @@ impl ChromeShaders {
                 &[
                     UniformName::new("u_max_nits", UniformType::_1f),
                     UniformName::new("u_sdr_white_nits", UniformType::_1f),
+                    UniformName::new("u_saturation", UniformType::_1f),
+                    UniformName::new("u_midtone_gamma", UniformType::_1f),
+                    UniformName::new("u_calibration_pattern", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
@@ -798,6 +804,9 @@ impl ChromeShaders {
                         &[
                             UniformName::new("u_tint", UniformType::_4f),
                             UniformName::new("u_decode_srgb", UniformType::_1f),
+                            UniformName::new("u_texel_size", UniformType::_2f),
+                            UniformName::new("u_blur_radius", UniformType::_1f),
+                            UniformName::new("u_saturation", UniformType::_1f),
                         ],
                     )?
                 });
@@ -1521,6 +1530,15 @@ mod tests {
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither(gl_FragCoord.xy)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("/ 1023.0"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_saturation"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_midtone_gamma"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_calibration_pattern"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(panel - vec3(panel_y)) * u_saturation"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pow(normalized, u_midtone_gamma)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("calibration_pattern_nits(v_coords)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.2627"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.6780"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.0593"));
     }
 
     #[test]
@@ -1571,6 +1589,13 @@ mod tests {
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_src_bits"));
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither_code_value"));
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither * step"));
+    }
+
+    #[test]
+    fn client_decode_keeps_bt1886_distinct_from_piecewise_srgb() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 bt1886_to_linear(vec3 c)"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return bt1886_to_linear(c);"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_decode_tf >= 3.5 && u_decode_tf < 4.5"));
     }
 
     #[test]
@@ -1649,6 +1674,12 @@ vec3 gamma22_to_linear(vec3 c) {
     return pow(max(c, vec3(0.0)), vec3(2.2));
 }
 
+vec3 bt1886_to_linear(vec3 c) {
+    // BT.1886 with a zero display-black offset reduces to a 2.4 power curve.
+    // Keep it distinct from sRGB's piecewise toe for tagged video surfaces.
+    return pow(max(c, vec3(0.0)), vec3(2.4));
+}
+
 vec3 pq_to_scene_linear(vec3 c) {
     const float m1 = 2610.0 / 16384.0;
     const float m2 = 2523.0 / 32.0;
@@ -1690,7 +1721,10 @@ vec3 decode_color(vec3 c) {
     if (u_decode_tf < 3.5) {
         return pq_to_scene_linear(c);
     }
-    return srgb_to_linear(c);
+    if (u_decode_tf < 4.5) {
+        return srgb_to_linear(c);
+    }
+    return bt1886_to_linear(c);
 }
 
 vec3 mul_mat3(vec3 v) {
@@ -1709,7 +1743,8 @@ void main() {
     // ExtLinear (Windows-scRGB) and extended sRGB (Chromium SRGB_HDR) keep
     // negatives and values above 1.0 for wide-gamut / HDR headroom.
     bool extended_range =
-        (u_decode_tf >= 0.5 && u_decode_tf < 1.5) || u_decode_tf >= 3.5;
+        (u_decode_tf >= 0.5 && u_decode_tf < 1.5) ||
+        (u_decode_tf >= 3.5 && u_decode_tf < 4.5);
     if (!extended_range) {
         straight = clamp(straight, 0.0, 1.0);
     }
@@ -1751,8 +1786,6 @@ void main() {
 #if defined(NO_ALPHA)
     src.a = 1.0;
 #endif
-    // Wayland alpha buffers are premultiplied. Decode the straight color, then
-    // premultiply again so Smithay's ONE/ONE_MINUS_SRC_ALPHA blend remains valid.
     vec3 straight = src.a > 0.0 ? clamp(src.rgb / src.a, 0.0, 1.0) : vec3(0.0);
     gl_FragColor = vec4(srgb_to_linear(straight) * src.a, src.a) * alpha;
 }
@@ -2134,6 +2167,9 @@ varying vec2 v_coords;
 uniform float alpha;
 uniform float u_max_nits;
 uniform float u_sdr_white_nits;
+uniform float u_saturation;
+uniform float u_midtone_gamma;
+uniform float u_calibration_pattern;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -2194,6 +2230,37 @@ float bt2020_luminance(vec3 nits) {
     return dot(nits, vec3(0.2627, 0.6780, 0.0593));
 }
 
+vec3 calibration_pattern_nits(vec2 coords) {
+    // Upper half: fixed 100/203/300-nit neutrals and the configured peak.
+    // Lower half: equal-200-nit BT.2020 primaries plus a 0-to-peak ramp.
+    // Primary channel values exceed their luminance by the reciprocal luma
+    // coefficient; that is expected for a true equal-luminance stimulus.
+    if (coords.y < 0.5) {
+        float gray_nits;
+        if (coords.x < 0.25) {
+            gray_nits = 100.0;
+        } else if (coords.x < 0.5) {
+            gray_nits = 203.0;
+        } else if (coords.x < 0.75) {
+            gray_nits = 300.0;
+        } else {
+            gray_nits = u_max_nits;
+        }
+        return vec3(gray_nits);
+    }
+    if (coords.x < 0.25) {
+        return vec3(200.0 / 0.2627, 0.0, 0.0);
+    }
+    if (coords.x < 0.5) {
+        return vec3(0.0, 200.0 / 0.6780, 0.0);
+    }
+    if (coords.x < 0.75) {
+        return vec3(0.0, 0.0, 200.0 / 0.0593);
+    }
+    float ramp = clamp((coords.x - 0.75) * 4.0, 0.0, 1.0);
+    return vec3(ramp * u_max_nits);
+}
+
 // Keep graphics white and most in-range HDR. Roll from 80% of panel peak
 // so 400 nit content is not crushed from paper white, while extremes still
 // compress. A per-channel min() of the same values turns clouds magenta.
@@ -2215,12 +2282,32 @@ void main() {
     src.a = 1.0;
 #endif
     vec3 scene_linear = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
-    // Scene Rec.709 → panel volume → BT.2020 PQ. HDR10 on the wire stays
-    // Rec.2020; out-of-gamut colors are mapped like Windows WDDM.
-    vec3 panel = compress_to_panel_gamut(mul_mat3(scene_linear));
-    vec3 nits = max(mul_panel_to_bt2020(panel), vec3(0.0)) * u_sdr_white_nits;
+    bool calibration = u_calibration_pattern > 0.5;
+    vec3 nits;
+    if (calibration) {
+        // The pattern is already absolute linear BT.2020. Bypass the creative
+        // controls so a measurement does not depend on the current preset.
+        nits = calibration_pattern_nits(v_coords);
+    } else {
+        // Scene Rec.709 → panel volume → BT.2020 PQ. HDR10 on the wire stays
+        // Rec.2020; out-of-gamut colors are mapped like Windows WDDM.
+        vec3 panel = compress_to_panel_gamut(mul_mat3(scene_linear));
+        float panel_y = max(dot(panel, u_panel_luma), 0.0);
+        panel = compress_to_panel_gamut(
+            vec3(panel_y) + (panel - vec3(panel_y)) * u_saturation
+        );
+        nits = max(mul_panel_to_bt2020(panel), vec3(0.0)) * u_sdr_white_nits;
+    }
     float y = bt2020_luminance(nits);
     if (y > 0.0001) {
+        // Shape only the SDR range, keeping black and reference white fixed.
+        // Values above reference white retain their authored HDR luminance.
+        if (!calibration && y < u_sdr_white_nits) {
+            float normalized = clamp(y / u_sdr_white_nits, 0.0, 1.0);
+            float shaped = pow(normalized, u_midtone_gamma) * u_sdr_white_nits;
+            nits *= shaped / y;
+            y = shaped;
+        }
         float mapped = tone_map_nits(y, 10000.0, u_max_nits, u_sdr_white_nits);
         nits *= mapped / y;
     }
@@ -2230,7 +2317,8 @@ void main() {
     nits = min(nits, vec3(10000.0));
     vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
     pq = clamp(pq + vec3(pq_output_dither(gl_FragCoord.xy) / 1023.0), 0.0, 1.0);
-    gl_FragColor = vec4(pq * src.a, src.a) * alpha;
+    float output_alpha = calibration ? 1.0 : src.a;
+    gl_FragColor = vec4(pq * output_alpha, output_alpha) * alpha;
 }
 "#;
 
@@ -2354,6 +2442,9 @@ precision mediump float;
 uniform sampler2D tex;
 uniform vec4 u_tint;
 uniform float u_decode_srgb;
+uniform vec2 u_texel_size;
+uniform float u_blur_radius;
+uniform float u_saturation;
 
 varying vec2 v_coords;
 
@@ -2365,12 +2456,24 @@ vec3 srgb_to_linear(vec3 c) {
 }
 
 void main() {
-    vec4 src = texture2D(tex, v_coords);
+    vec2 offset = u_texel_size * min(max(u_blur_radius, 0.0), 64.0);
+    vec4 src = texture2D(tex, v_coords) * 0.20;
+    src += texture2D(tex, v_coords + vec2(offset.x, 0.0)) * 0.12;
+    src += texture2D(tex, v_coords - vec2(offset.x, 0.0)) * 0.12;
+    src += texture2D(tex, v_coords + vec2(0.0, offset.y)) * 0.12;
+    src += texture2D(tex, v_coords - vec2(0.0, offset.y)) * 0.12;
+    src += texture2D(tex, v_coords + offset) * 0.08;
+    src += texture2D(tex, v_coords - offset) * 0.08;
+    src += texture2D(tex, v_coords + vec2(offset.x, -offset.y)) * 0.08;
+    src += texture2D(tex, v_coords + vec2(-offset.x, offset.y)) * 0.08;
 
     vec3 src_rgb = src.rgb;
     if (u_decode_srgb > 0.5) {
         src_rgb = srgb_to_linear(src.rgb);
     }
+
+    float luminance = dot(src_rgb, vec3(0.2126, 0.7152, 0.0722));
+    src_rgb = mix(vec3(luminance), src_rgb, clamp(u_saturation, 0.0, 2.0));
 
     vec3 rgb = mix(src_rgb, u_tint.rgb, u_tint.a);
 

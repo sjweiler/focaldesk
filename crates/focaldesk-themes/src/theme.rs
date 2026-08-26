@@ -33,6 +33,15 @@ pub struct FlowTheme {
     pub text: TextTheme,
     pub icons: IconTheme,
 
+    /// Full-fidelity editor theme. Older custom themes and built-ins continue
+    /// to use the legacy fields above until an editor document is previewed.
+    #[serde(default)]
+    pub semantic: Option<crate::SemanticTheme>,
+    /// Runtime-only marker set when the compositor prepares a theme for a
+    /// linear FP16 target. Theme files always deserialize into the SDR path.
+    #[serde(skip)]
+    pub semantic_colors_linear: bool,
+
     pub spacing: i32,
     pub density: UiDensity,
     pub animation_speed: f32,
@@ -49,8 +58,18 @@ pub struct BackgroundTheme {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WallpaperTheme {
     pub path: Option<String>,
+    #[serde(default)]
+    pub fit: crate::ThemeWallpaperFit,
     pub tint_color: [f32; 4],
     pub dim: f32,
+    #[serde(default)]
+    pub blur: f32,
+    #[serde(default = "default_wallpaper_saturation")]
+    pub saturation: f32,
+}
+
+fn default_wallpaper_saturation() -> f32 {
+    1.0
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

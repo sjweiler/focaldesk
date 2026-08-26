@@ -49,12 +49,12 @@ use crate::core::ui_state::UiState;
 use crate::core::wayland::client::ClientState;
 use crate::core::OutputState;
 use crate::core::SceneState;
-use focaldesk_config::FocalDeskConfig;
+use focaldesk_config::configured_theme;
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_settings_core::load_settings;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
-use focaldesk_themes::ThemeManager;
+use focaldesk_themes::{ThemeDocument, ThemeManager, SYSTEM_DEFAULT_THEME_PATH};
 use smithay::wayland::xdg_activation::XdgActivationState;
 #[cfg(feature = "xwayland")]
 use smithay::wayland::xwayland_shell::XWaylandShellState;
@@ -877,24 +877,41 @@ pub(crate) fn bootstrap_compositor_core(
     let chrome = Chrome::new(ChromeMetrics::default());
     let xdg_activation_state = XdgActivationState::new::<DesktopState>(&dh);
 
-    let config = FocalDeskConfig::load().unwrap_or_default();
+    let configured_theme = configured_theme().filter(|theme| !theme.trim().is_empty());
+    let use_system_default = configured_theme
+        .as_deref()
+        .is_none_or(|theme| theme == "Default");
+    flog_info!("FOCALDESK selected theme_id = {:?}", configured_theme);
 
-    let theme_id = if config.appearance.theme.is_empty() {
-        "Eagle".to_string()
-    } else {
-        config.appearance.theme.clone()
-    };
-
-    flog_info!("FOCALDESK selected theme_id = {:?}", theme_id);
-
-    let theme_id = match config.appearance.theme.as_str() {
+    let theme_id = match configured_theme.as_deref().unwrap_or("") {
         "Eagle" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
         "Moonbase" => FlowThemeId::BuiltIn(BuiltInThemeId::Moonbase),
         "Classic" => FlowThemeId::BuiltIn(BuiltInThemeId::Classic),
+        "" | "Default" => FlowThemeId::BuiltIn(BuiltInThemeId::Eagle),
         other => FlowThemeId::Custom(other.to_string()),
     };
 
-    let theme_manager = ThemeManager::new(theme_id);
+    let mut theme_manager = ThemeManager::new(theme_id);
+    if use_system_default {
+        match ThemeDocument::load(std::path::Path::new(SYSTEM_DEFAULT_THEME_PATH)) {
+            Ok(document) => match theme_manager.apply_editor_document(&document) {
+                Ok(_) => flog_info!(
+                    "FOCALDESK loaded system default theme from {}",
+                    SYSTEM_DEFAULT_THEME_PATH
+                ),
+                Err(err) => warn!(
+                    path = SYSTEM_DEFAULT_THEME_PATH,
+                    error = %err,
+                    "failed to apply system default theme; using built-in Eagle"
+                ),
+            },
+            Err(err) => warn!(
+                path = SYSTEM_DEFAULT_THEME_PATH,
+                error = %err,
+                "system default theme unavailable; using built-in Eagle"
+            ),
+        }
+    }
     let mut keybinds = Keybinds::with_defaults(backend);
     for warning in keybinds.apply_overrides(
         settings

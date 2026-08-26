@@ -31,7 +31,7 @@ use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::flog_warn;
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, save_exclusive_hdr_state, DisplayColorProfile, ExclusiveHdrPhase,
-    ExclusiveHdrState,
+    ExclusiveHdrState, HdrAppearance,
 };
 
 // DRM/KMS backend for FocalDesk.
@@ -150,6 +150,8 @@ pub struct DisplayConfig {
     pub hdr_requested: bool,
     #[serde(default)]
     pub hdr_enabled: bool,
+    #[serde(default)]
+    pub hdr_appearance: HdrAppearance,
     #[serde(default)]
     pub color_profile: DisplayColorProfile,
     #[serde(default)]
@@ -812,6 +814,15 @@ fn configured_display_color_profile(displays: &[DisplayConfig], name: &str) -> D
         .iter()
         .find(|display| display.name == name)
         .map(|display| display.color_profile)
+        .unwrap_or_default()
+}
+
+fn configured_hdr_appearance(displays: &[DisplayConfig], name: &str) -> HdrAppearance {
+    displays
+        .iter()
+        .find(|display| display.name == name)
+        .map(|display| display.hdr_appearance)
+        .and_then(|appearance| appearance.validate().ok())
         .unwrap_or_default()
 }
 
@@ -1495,7 +1506,7 @@ mod hdr_tests {
         DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
         HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
-    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase};
+    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance};
     use std::time::{Duration, Instant};
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -1515,6 +1526,7 @@ mod hdr_tests {
             hdr_supported: true,
             hdr_requested,
             hdr_enabled,
+            hdr_appearance: HdrAppearance::default(),
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
         }
@@ -1995,6 +2007,7 @@ pub(crate) fn collect_display_configs(
                 .is_some_and(|display| display.primary);
         }
         let color_profile = configured_display_color_profile(configured_displays, &output_name);
+        let hdr_appearance = configured_hdr_appearance(configured_displays, &output_name);
         let icc_profile_path = configured_displays
             .iter()
             .find(|display| display.name == output_name)
@@ -2023,6 +2036,7 @@ pub(crate) fn collect_display_configs(
             hdr_supported,
             hdr_requested,
             hdr_enabled,
+            hdr_appearance,
             color_profile,
             icc_profile_path,
         });
@@ -4682,6 +4696,7 @@ fn device_added(
             );
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
                 sync_output_hdr_flags(out, &hdr_support, hdr_requested_config);
+                out.hdr_appearance = configured_hdr_appearance(&configured_displays, &output_name);
             }
 
             data.core.state.set_output_monitor_identity(

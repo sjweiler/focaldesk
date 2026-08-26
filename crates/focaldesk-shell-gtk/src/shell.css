@@ -29,7 +29,7 @@ window.focal-dock-window > .focal-dock {
   border: 1px solid @fd_shell_rim;
   background-color: @fd_shell_surface_raised;
   background-image: linear-gradient(to bottom right, @fd_shell_glass_top, @fd_shell_glass_mid 48%, @fd_shell_glass_bottom);
-  color: @fd_shell_icon;
+  color: @fd_shell_dock_icon;
   box-shadow: inset 0 1px @fd_shell_highlight, inset 1px 0 @fd_shell_highlight, 0 2px 4px @fd_shell_shadow;
 }
 

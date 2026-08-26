@@ -20,6 +20,7 @@ pub struct AppearanceConfig {
     pub font_scale: f64,
     pub output_focus_glow: bool,
     pub shader_chrome: bool,
+    pub work_area_glass: bool,
 }
 
 impl FocalDeskConfig {
@@ -35,11 +36,12 @@ impl FocalDeskConfig {
 impl Default for AppearanceConfig {
     fn default() -> Self {
         Self {
-            theme: "Eagle".into(),
+            theme: "Default".into(),
             glow_strength: 0.75,
             font_scale: 1.0,
             output_focus_glow: true,
             shader_chrome: true,
+            work_area_glass: true,
         }
     }
 }
@@ -132,6 +134,25 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// Returns the theme explicitly selected in the user's configuration.
+///
+/// This intentionally differs from [`load_config`]: a missing, unreadable, or
+/// partial configuration returns `None` instead of the built-in configuration
+/// default, allowing the compositor to use its system-installed default theme.
+pub fn configured_theme() -> Option<String> {
+    let text = fs::read_to_string(config_path()).ok()?;
+    configured_theme_from_toml(&text)
+}
+
+fn configured_theme_from_toml(text: &str) -> Option<String> {
+    let value: toml::Value = toml::from_str(&text).ok()?;
+    value
+        .get("appearance")?
+        .get("theme")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 pub fn load_config() -> FocalDeskConfig {
     let path = config_path();
 
@@ -177,6 +198,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn partial_config_without_theme_has_no_explicit_theme() {
+        assert_eq!(
+            configured_theme_from_toml("[appearance]\nfont_scale = 1.25\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn configured_theme_returns_explicit_selection() {
+        assert_eq!(
+            configured_theme_from_toml("[appearance]\ntheme = \"Classic\"\n"),
+            Some("Classic".to_string())
+        );
+    }
+
+    #[test]
     fn older_partial_config_gets_shell_defaults() {
         let config: FocalDeskConfig = toml::from_str(
             r#"
@@ -191,6 +228,7 @@ mod tests {
         .expect("parse partial configuration");
 
         assert_eq!(config.shell.style, ShellStyle::Attached);
+        assert!(config.appearance.work_area_glass);
         assert_eq!(config.panel.position, PanelPosition::Top);
         assert_eq!(config.dock.position, DockPosition::Left);
         assert_eq!(config.dock.size, DockSize::Normal);

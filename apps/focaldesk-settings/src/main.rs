@@ -6,7 +6,8 @@ use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
     send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
     send_settings_request, watch_desktop_keys, DesktopAction, DisplayRuntimeOutputStatus,
-    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse,
+    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse, ThemeEditorCommand,
+    THEME_EDITOR_PROTOCOL_VERSION,
 };
 use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
 use focaldesk_logging::{init_default_logging, session_id};
@@ -16,10 +17,16 @@ use focaldesk_permissions::{
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
     BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, ExclusiveHdrPhase, ExclusiveHdrState,
-    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
+    HdrAppearance, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
+    PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
-use focaldesk_themes::{gtk_app_css, gtk_app_prefers_dark, theme_by_name, GtkAppThemeOptions};
+use focaldesk_themes::{
+    gtk_app_css, gtk_app_prefers_dark, theme_by_name, GradientInterpolation, GradientStop,
+    GtkAppThemeOptions, InteractionState, SemanticTheme, SurfaceStyle, ThemeColor, ThemeColorSpace,
+    ThemeDocument, ThemeDynamicRange, ThemePackage, ThemePaint, ThemePaintIntent, ThemeWallpaper,
+    ThemeWallpaperFit,
+};
 
 use gtk::cairo;
 use gtk::glib;
@@ -51,7 +58,7 @@ const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("266 %", 2.6666667),
 ];
 
-const THEME_OPTIONS: &[&str] = &["Eagle", "Moonbase", "Classic"];
+const THEME_OPTIONS: &[&str] = &["Default", "Eagle", "Moonbase", "Classic"];
 const ORIENTATION_OPTIONS: &[&str] = &[
     "Landscape",
     "Portrait Right",
@@ -74,6 +81,9 @@ const LOW_BATTERY_OPTIONS: &[&str] = &["Notify only", "Suspend", "Hibernate", "P
 const PERFORMANCE_MODE_OPTIONS: &[&str] = &["Balanced", "Performance", "Power saver"];
 const BROWSER_LAUNCH_BACKEND_OPTIONS: &[&str] = &["Auto", "Wayland", "XWayland"];
 const DISPLAY_COLOR_PROFILE_OPTIONS: &[&str] = &["Auto", "sRGB", "Display P3"];
+const HDR_APPEARANCE_PRESET_OPTIONS: &[&str] =
+    &["Neutral (BT.2408)", "Bright room", "Punchy OLED", "Custom"];
+const HDR_APPEARANCE_CUSTOM_PRESET: u32 = 3;
 const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("launch_terminal", "Open terminal", "Super+Enter"),
     ("launch_browser", "Open browser", "Super+B"),
@@ -172,6 +182,8 @@ struct DisplayConfig {
     hdr_requested: bool,
     #[serde(default)]
     hdr_enabled: bool,
+    #[serde(default)]
+    hdr_appearance: HdrAppearance,
     #[serde(default)]
     color_profile: DisplayColorProfile,
     #[serde(default)]
@@ -272,6 +284,20 @@ fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
         icc_profile_path: display.icc_profile_path.clone(),
         hdr_requested: display.hdr_requested,
         hdr_enabled: display.hdr_enabled,
+        hdr_appearance: display.hdr_appearance,
+    }
+}
+
+fn set_live_hdr_appearance(connector: &str, appearance: HdrAppearance) -> Result<(), String> {
+    appearance.validate().map_err(ToString::to_string)?;
+    match send_desktop_request(&IpcRequest::SetHdrAppearance {
+        connector: connector.to_string(),
+        appearance,
+    }) {
+        Ok(IpcResponse::Ok) => Ok(()),
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected HDR appearance response: {other:?}")),
+        Err(err) => Err(err),
     }
 }
 
@@ -435,7 +461,13 @@ fn load_displays() -> Vec<DisplayConfig> {
     let path = displays_path();
 
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
+        Ok(text) => {
+            let mut displays: Vec<DisplayConfig> = serde_json::from_str(&text).unwrap_or_default();
+            for display in &mut displays {
+                display.hdr_appearance = display.hdr_appearance.validate().unwrap_or_default();
+            }
+            displays
+        }
         Err(_) => vec![],
     }
 }
@@ -1566,6 +1598,363 @@ fn save_display_change(
     }
 }
 
+#[derive(Clone, Copy)]
+enum HdrAppearanceField {
+    ReferenceWhite,
+    Peak,
+    Saturation,
+    MidtoneGamma,
+}
+
+fn hdr_appearance_preset(selected: u32) -> Option<HdrAppearance> {
+    match selected {
+        0 => Some(HdrAppearance::default()),
+        1 => Some(HdrAppearance {
+            reference_white_nits: 250.0,
+            peak_nits: 450.0,
+            saturation: 1.0,
+            midtone_gamma: 0.90,
+        }),
+        2 => Some(HdrAppearance {
+            reference_white_nits: 203.0,
+            peak_nits: 450.0,
+            saturation: 1.10,
+            midtone_gamma: 1.10,
+        }),
+        _ => None,
+    }
+}
+
+fn hdr_appearance_preset_index(appearance: HdrAppearance) -> u32 {
+    (0..HDR_APPEARANCE_CUSTOM_PRESET)
+        .find(|selected| hdr_appearance_preset(*selected) == Some(appearance))
+        .unwrap_or(HDR_APPEARANCE_CUSTOM_PRESET)
+}
+
+fn hdr_tuning_scale(min: f64, max: f64, step: f64, value: f32, digits: i32) -> gtk::Scale {
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, min, max, step);
+    scale.set_value(f64::from(value));
+    scale.set_digits(digits);
+    scale.set_draw_value(true);
+    scale.set_value_pos(gtk::PositionType::Right);
+    scale.set_size_request(300, -1);
+    scale
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_hdr_appearance_preview(
+    connector: &str,
+    appearance: HdrAppearance,
+    confirmed: Rc<RefCell<HdrAppearance>>,
+    draft: Rc<RefCell<HdrAppearance>>,
+    generation: Rc<Cell<u64>>,
+    suppress: Rc<Cell<bool>>,
+    status: adw::ActionRow,
+    reference_white: gtk::Scale,
+    peak: gtk::Scale,
+    saturation: gtk::Scale,
+    midtone_gamma: gtk::Scale,
+    preset: gtk::DropDown,
+) {
+    if let Err(message) = appearance.validate() {
+        status.set_subtitle(&format!("Not previewed: {message}"));
+        return;
+    }
+    if let Err(message) = set_live_hdr_appearance(connector, appearance) {
+        status.set_subtitle(&format!("Preview unavailable: {message}"));
+        return;
+    }
+
+    let preview_generation = generation.get().wrapping_add(1);
+    generation.set(preview_generation);
+    status.set_subtitle("Previewing live for 15 seconds; choose Keep to save");
+
+    let connector = connector.to_string();
+    glib::timeout_add_local_once(Duration::from_secs(15), move || {
+        if generation.get() != preview_generation {
+            return;
+        }
+        let rollback = *confirmed.borrow();
+        if let Err(message) = set_live_hdr_appearance(&connector, rollback) {
+            status.set_subtitle(&format!(
+                "Could not restore saved HDR appearance: {message}"
+            ));
+            return;
+        }
+        suppress.set(true);
+        *draft.borrow_mut() = rollback;
+        preset.set_selected(hdr_appearance_preset_index(rollback));
+        reference_white.set_value(f64::from(rollback.reference_white_nits));
+        peak.set_value(f64::from(rollback.peak_nits));
+        saturation.set_value(f64::from(rollback.saturation));
+        midtone_gamma.set_value(f64::from(rollback.midtone_gamma));
+        suppress.set(false);
+        generation.set(preview_generation.wrapping_add(1));
+        status.set_subtitle("Preview expired; restored the saved values");
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_hdr_appearance_scale(
+    scale: &gtk::Scale,
+    field: HdrAppearanceField,
+    connector: String,
+    confirmed: Rc<RefCell<HdrAppearance>>,
+    draft: Rc<RefCell<HdrAppearance>>,
+    generation: Rc<Cell<u64>>,
+    suppress: Rc<Cell<bool>>,
+    status: adw::ActionRow,
+    reference_white: gtk::Scale,
+    peak: gtk::Scale,
+    saturation: gtk::Scale,
+    midtone_gamma: gtk::Scale,
+    preset: gtk::DropDown,
+) {
+    scale.connect_value_changed(move |scale| {
+        if suppress.get() {
+            return;
+        }
+        let mut appearance = *draft.borrow();
+        let value = scale.value() as f32;
+        match field {
+            HdrAppearanceField::ReferenceWhite => {
+                appearance.reference_white_nits = value;
+                if appearance.peak_nits < value {
+                    appearance.peak_nits = value;
+                    suppress.set(true);
+                    peak.set_value(f64::from(value));
+                    suppress.set(false);
+                }
+            }
+            HdrAppearanceField::Peak => {
+                appearance.peak_nits = value;
+                if appearance.reference_white_nits > value {
+                    appearance.reference_white_nits = value;
+                    suppress.set(true);
+                    reference_white.set_value(f64::from(value));
+                    suppress.set(false);
+                }
+            }
+            HdrAppearanceField::Saturation => appearance.saturation = value,
+            HdrAppearanceField::MidtoneGamma => appearance.midtone_gamma = value,
+        }
+        *draft.borrow_mut() = appearance;
+        suppress.set(true);
+        preset.set_selected(HDR_APPEARANCE_CUSTOM_PRESET);
+        suppress.set(false);
+        start_hdr_appearance_preview(
+            &connector,
+            appearance,
+            confirmed.clone(),
+            draft.clone(),
+            generation.clone(),
+            suppress.clone(),
+            status.clone(),
+            reference_white.clone(),
+            peak.clone(),
+            saturation.clone(),
+            midtone_gamma.clone(),
+            preset.clone(),
+        );
+    });
+}
+
+fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -> adw::ExpanderRow {
+    let display = displays.borrow()[index].clone();
+    let connector = display.name.clone();
+    let initial = display.hdr_appearance.validate().unwrap_or_default();
+    let confirmed = Rc::new(RefCell::new(initial));
+    let draft = Rc::new(RefCell::new(initial));
+    let generation = Rc::new(Cell::new(0u64));
+    let suppress = Rc::new(Cell::new(false));
+
+    let section = adw::ExpanderRow::new();
+    section.set_title("HDR appearance tuning");
+    section.set_subtitle("Final PQ shader only; does not change HDR signaling or display modes");
+
+    let reference_white = hdr_tuning_scale(80.0, 450.0, 1.0, initial.reference_white_nits, 0);
+    let peak = hdr_tuning_scale(203.0, 450.0, 1.0, initial.peak_nits, 0);
+    let saturation = hdr_tuning_scale(0.75, 1.25, 0.01, initial.saturation, 2);
+    let midtone_gamma = hdr_tuning_scale(0.70, 1.50, 0.01, initial.midtone_gamma, 2);
+    let preset = gtk::DropDown::from_strings(HDR_APPEARANCE_PRESET_OPTIONS);
+    preset.set_selected(hdr_appearance_preset_index(initial));
+
+    let preset_row = adw::ActionRow::new();
+    preset_row.set_title("Preset");
+    preset_row.set_subtitle("Conservative starting points; selecting one starts a safe preview");
+    preset_row.add_suffix(&preset);
+    section.add_row(&preset_row);
+
+    for (title, subtitle, control) in [
+        (
+            "Reference white",
+            "Diffuse desktop white in nits; neutral default is 203",
+            &reference_white,
+        ),
+        (
+            "Peak luminance",
+            "Highlight roll-off target in nits; bounded by current HDR10 metadata",
+            &peak,
+        ),
+        (
+            "Saturation",
+            "Luminance-preserving panel-gamut adjustment; 1.00 is neutral",
+            &saturation,
+        ),
+        (
+            "Midtone gamma",
+            "Shapes SDR-range midtones while preserving black and white; 1.00 is neutral",
+            &midtone_gamma,
+        ),
+    ] {
+        let row = adw::ActionRow::new();
+        row.set_title(title);
+        row.set_subtitle(subtitle);
+        row.add_suffix(control);
+        section.add_row(&row);
+    }
+
+    let status = adw::ActionRow::new();
+    status.set_title("Preview safety");
+    status.set_subtitle("Changes restore automatically after 15 seconds unless kept");
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let reset = gtk::Button::with_label("Reset");
+    let keep = gtk::Button::with_label("Keep");
+    keep.add_css_class("suggested-action");
+    buttons.append(&reset);
+    buttons.append(&keep);
+    status.add_suffix(&buttons);
+    section.add_row(&status);
+
+    for (scale, field) in [
+        (&reference_white, HdrAppearanceField::ReferenceWhite),
+        (&peak, HdrAppearanceField::Peak),
+        (&saturation, HdrAppearanceField::Saturation),
+        (&midtone_gamma, HdrAppearanceField::MidtoneGamma),
+    ] {
+        connect_hdr_appearance_scale(
+            scale,
+            field,
+            connector.clone(),
+            confirmed.clone(),
+            draft.clone(),
+            generation.clone(),
+            suppress.clone(),
+            status.clone(),
+            reference_white.clone(),
+            peak.clone(),
+            saturation.clone(),
+            midtone_gamma.clone(),
+            preset.clone(),
+        );
+    }
+
+    {
+        let connector = connector.clone();
+        let confirmed = confirmed.clone();
+        let draft = draft.clone();
+        let generation = generation.clone();
+        let suppress = suppress.clone();
+        let status = status.clone();
+        let reference_white = reference_white.clone();
+        let peak = peak.clone();
+        let saturation = saturation.clone();
+        let midtone_gamma = midtone_gamma.clone();
+        preset.connect_selected_notify(move |preset| {
+            if suppress.get() {
+                return;
+            }
+            let Some(appearance) = hdr_appearance_preset(preset.selected()) else {
+                return;
+            };
+            suppress.set(true);
+            *draft.borrow_mut() = appearance;
+            reference_white.set_value(f64::from(appearance.reference_white_nits));
+            peak.set_value(f64::from(appearance.peak_nits));
+            saturation.set_value(f64::from(appearance.saturation));
+            midtone_gamma.set_value(f64::from(appearance.midtone_gamma));
+            suppress.set(false);
+            start_hdr_appearance_preview(
+                &connector,
+                appearance,
+                confirmed.clone(),
+                draft.clone(),
+                generation.clone(),
+                suppress.clone(),
+                status.clone(),
+                reference_white.clone(),
+                peak.clone(),
+                saturation.clone(),
+                midtone_gamma.clone(),
+                preset.clone(),
+            );
+        });
+    }
+
+    {
+        let connector = connector.clone();
+        let confirmed = confirmed.clone();
+        let draft = draft.clone();
+        let generation = generation.clone();
+        let suppress = suppress.clone();
+        let status = status.clone();
+        let reference_white = reference_white.clone();
+        let peak = peak.clone();
+        let saturation = saturation.clone();
+        let midtone_gamma = midtone_gamma.clone();
+        let preset = preset.clone();
+        reset.connect_clicked(move |_| {
+            let defaults = HdrAppearance::default();
+            suppress.set(true);
+            *draft.borrow_mut() = defaults;
+            preset.set_selected(0);
+            reference_white.set_value(f64::from(defaults.reference_white_nits));
+            peak.set_value(f64::from(defaults.peak_nits));
+            saturation.set_value(f64::from(defaults.saturation));
+            midtone_gamma.set_value(f64::from(defaults.midtone_gamma));
+            suppress.set(false);
+            start_hdr_appearance_preview(
+                &connector,
+                defaults,
+                confirmed.clone(),
+                draft.clone(),
+                generation.clone(),
+                suppress.clone(),
+                status.clone(),
+                reference_white.clone(),
+                peak.clone(),
+                saturation.clone(),
+                midtone_gamma.clone(),
+                preset.clone(),
+            );
+        });
+    }
+
+    {
+        let displays = displays.clone();
+        let confirmed = confirmed.clone();
+        let draft = draft.clone();
+        let generation = generation.clone();
+        let status = status.clone();
+        keep.connect_clicked(move |_| {
+            let appearance = *draft.borrow();
+            if let Err(message) = appearance.validate() {
+                status.set_subtitle(&format!("Cannot save: {message}"));
+                return;
+            }
+            generation.set(generation.get().wrapping_add(1));
+            *confirmed.borrow_mut() = appearance;
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.hdr_appearance = appearance;
+            }
+            persist_displays(&displays.borrow());
+            status.set_subtitle("Saved for this display");
+        });
+    }
+
+    section
+}
+
 fn connected_display_row(
     index: usize,
     displays: Rc<RefCell<Vec<DisplayConfig>>>,
@@ -1782,6 +2171,8 @@ fn connected_display_row(
                 refresh_all_outputs_hdr_control(&displays.borrow(), &all_hdr_row, &all_hdr_button);
             });
         }
+
+        row.add_row(&hdr_appearance_row(index, displays.clone()));
 
         let exclusive_state = load_exclusive_hdr_state();
         let exclusive_phase = (exclusive_state.connector.as_deref() == Some(display.name.as_str()))
@@ -2388,6 +2779,7 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
 
     let panel_names = [
         "Appearance",
+        "Theme Editor",
         "Network",
         "Bluetooth",
         "Printers",
@@ -2430,6 +2822,7 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
         "Appearance".to_string(),
         appearance_page(config.clone(), settings.clone()),
     );
+    pages.insert("Theme Editor".to_string(), theme_editor_page());
     pages.insert("Network".to_string(), network_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Printers".to_string(), printers_page());
@@ -2482,6 +2875,3418 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
     window.present();
 }
 
+#[derive(Debug, Clone)]
+struct ThemeEditorColor {
+    space: ThemeColorSpace,
+    cached_srgb: Option<ThemeColor>,
+    cached_display_p3: Option<ThemeColor>,
+}
+
+impl ThemeEditorColor {
+    fn new(color: ThemeColor) -> Self {
+        Self {
+            space: color.space,
+            cached_srgb: (color.space == ThemeColorSpace::Srgb).then_some(color),
+            cached_display_p3: (color.space == ThemeColorSpace::DisplayP3).then_some(color),
+        }
+    }
+
+    fn color(&self) -> ThemeColor {
+        match self.space {
+            ThemeColorSpace::Srgb => self.cached_srgb.expect("active sRGB color must be cached"),
+            ThemeColorSpace::DisplayP3 => self
+                .cached_display_p3
+                .expect("active Display P3 color must be cached"),
+            ThemeColorSpace::Rec2020 => unreachable!("Rec.2020 is not exposed in Phase 6"),
+        }
+    }
+
+    fn store(&mut self, color: ThemeColor) {
+        self.space = color.space;
+        match color.space {
+            ThemeColorSpace::Srgb => self.cached_srgb = Some(color),
+            ThemeColorSpace::DisplayP3 => self.cached_display_p3 = Some(color),
+            ThemeColorSpace::Rec2020 => unreachable!("Rec.2020 is not exposed in Phase 6"),
+        }
+    }
+
+    fn switch_space(&mut self, target: ThemeColorSpace) -> ThemeColor {
+        let current = self.color();
+        let target_color = match target {
+            ThemeColorSpace::Srgb => self
+                .cached_srgb
+                .unwrap_or_else(|| current.converted_to(ThemeColorSpace::Srgb)),
+            ThemeColorSpace::DisplayP3 => self
+                .cached_display_p3
+                .unwrap_or_else(|| current.converted_to(ThemeColorSpace::DisplayP3)),
+            ThemeColorSpace::Rec2020 => unreachable!("Rec.2020 is not exposed in Phase 6"),
+        };
+        self.store(target_color);
+        target_color
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ThemeEditorStop {
+    position: f32,
+    color: ThemeEditorColor,
+}
+
+#[derive(Debug, Clone)]
+struct ThemeEditorDraft {
+    theme_name: String,
+    wallpaper: ThemeWallpaper,
+    semantic: SemanticTheme,
+    mode: u32,
+    hue: f64,
+    saturation: f64,
+    value: f64,
+    alpha: f64,
+    active_color: ThemeEditorColor,
+    solid_color: ThemeEditorColor,
+    stops: Vec<ThemeEditorStop>,
+    selected_stop: usize,
+    interpolation_space: ThemeColorSpace,
+    linear_angle: f64,
+    radial_center: (f64, f64),
+    radial_radius: f64,
+    dynamic_range: ThemeDynamicRange,
+    hdr_luminance_nits: f64,
+}
+
+impl ThemeEditorDraft {
+    fn new(hue: f64, saturation: f64, value: f64, alpha: f64) -> Self {
+        let [r, g, b] = hsv_to_rgb(hue, saturation, value);
+        let srgb = ThemeColor::srgb(
+            srgb_decode(r) as f32,
+            srgb_decode(g) as f32,
+            srgb_decode(b) as f32,
+            alpha as f32,
+        );
+        let solid_color = ThemeEditorColor::new(srgb);
+        let second = ThemeColor::srgb(0.035, 0.012, 0.180, 1.0);
+        Self {
+            theme_name: "Untitled Theme".to_string(),
+            wallpaper: ThemeWallpaper::default(),
+            semantic: SemanticTheme::default(),
+            mode: 0,
+            hue,
+            saturation,
+            value,
+            alpha,
+            active_color: solid_color.clone(),
+            solid_color: solid_color.clone(),
+            stops: vec![
+                ThemeEditorStop {
+                    position: 0.0,
+                    color: solid_color,
+                },
+                ThemeEditorStop {
+                    position: 1.0,
+                    color: ThemeEditorColor::new(second),
+                },
+            ],
+            selected_stop: 0,
+            interpolation_space: ThemeColorSpace::Srgb,
+            linear_angle: 135.0,
+            radial_center: (0.5, 0.5),
+            radial_radius: 0.75,
+            dynamic_range: ThemeDynamicRange::Sdr,
+            hdr_luminance_nits: 1_000.0,
+        }
+    }
+
+    fn space(&self) -> ThemeColorSpace {
+        self.active_color.space
+    }
+
+    fn current_color(&self) -> ThemeColor {
+        let [r, g, b] = hsv_to_rgb(self.hue, self.saturation, self.value);
+        ThemeColor::new(
+            self.space(),
+            srgb_decode(r) as f32,
+            srgb_decode(g) as f32,
+            srgb_decode(b) as f32,
+            self.alpha as f32,
+        )
+    }
+
+    fn commit_current_color(&mut self) {
+        let color = self.current_color();
+        self.active_color.store(color);
+        if self.mode == 0 {
+            self.solid_color = self.active_color.clone();
+        } else if let Some(stop) = self.stops.get_mut(self.selected_stop) {
+            stop.color = self.active_color.clone();
+        }
+    }
+
+    fn switch_space(&mut self, target: ThemeColorSpace) {
+        if self.space() == target {
+            return;
+        }
+        self.commit_current_color();
+        let mut active = self.active_color.clone();
+        let color = active.switch_space(target);
+        self.active_color = active;
+        self.load_picker_color(color);
+        self.commit_current_color();
+    }
+
+    fn load_picker_color(&mut self, color: ThemeColor) {
+        let (hue, saturation, value) = rgb_to_hsv([
+            srgb_encode(color.r).clamp(0.0, 1.0),
+            srgb_encode(color.g).clamp(0.0, 1.0),
+            srgb_encode(color.b).clamp(0.0, 1.0),
+        ]);
+        self.hue = hue;
+        self.saturation = saturation;
+        self.value = value;
+        self.alpha = f64::from(color.a);
+    }
+
+    fn switch_mode(&mut self, mode: u32) {
+        if self.mode == mode {
+            return;
+        }
+        self.commit_current_color();
+        self.mode = mode.min(2);
+        let active = if self.mode == 0 {
+            self.solid_color.clone()
+        } else {
+            self.stops[self.selected_stop.min(self.stops.len() - 1)]
+                .color
+                .clone()
+        };
+        let color = active.color();
+        self.active_color = active;
+        self.load_picker_color(color);
+    }
+
+    fn select_stop(&mut self, selected: usize) {
+        if self.mode == 0 || self.stops.is_empty() {
+            return;
+        }
+        self.commit_current_color();
+        self.selected_stop = selected.min(self.stops.len() - 1);
+        let active = self.stops[self.selected_stop].color.clone();
+        let color = active.color();
+        self.active_color = active;
+        self.load_picker_color(color);
+    }
+
+    fn add_stop(&mut self) {
+        self.commit_current_color();
+        let position = if self.stops.len() < 2 {
+            0.5
+        } else {
+            let mut positions: Vec<f32> = self.stops.iter().map(|stop| stop.position).collect();
+            positions.sort_by(f32::total_cmp);
+            positions
+                .windows(2)
+                .max_by(|left, right| (left[1] - left[0]).total_cmp(&(right[1] - right[0])))
+                .map(|pair| (pair[0] + pair[1]) * 0.5)
+                .unwrap_or(0.5)
+        };
+        self.stops.push(ThemeEditorStop {
+            position,
+            color: self.active_color.clone(),
+        });
+        self.selected_stop = self.stops.len() - 1;
+    }
+
+    fn duplicate_stop(&mut self) {
+        self.commit_current_color();
+        let selected = self.selected_stop.min(self.stops.len() - 1);
+        let mut duplicate = self.stops[selected].clone();
+        duplicate.position = (duplicate.position + 0.05).min(1.0);
+        self.stops.push(duplicate);
+        self.selected_stop = self.stops.len() - 1;
+    }
+
+    fn remove_stop(&mut self) {
+        if self.stops.len() <= 2 {
+            return;
+        }
+        self.stops
+            .remove(self.selected_stop.min(self.stops.len() - 1));
+        self.selected_stop = self.selected_stop.min(self.stops.len() - 1);
+        let active = self.stops[self.selected_stop].color.clone();
+        let color = active.color();
+        self.active_color = active;
+        self.load_picker_color(color);
+    }
+
+    fn set_selected_stop_position(&mut self, position: f32) {
+        if let Some(stop) = self.stops.get_mut(self.selected_stop) {
+            stop.position = position.clamp(0.0, 1.0);
+        }
+    }
+
+    fn paint(&self) -> ThemePaint {
+        if self.mode == 0 {
+            return ThemePaint::solid(self.current_color());
+        }
+        let mut stops: Vec<GradientStop> = self
+            .stops
+            .iter()
+            .enumerate()
+            .map(|(index, stop)| GradientStop {
+                position: stop.position,
+                color: if index == self.selected_stop {
+                    self.current_color()
+                } else {
+                    stop.color.color()
+                },
+            })
+            .collect();
+        stops.sort_by(|left, right| left.position.total_cmp(&right.position));
+        let interpolation = GradientInterpolation {
+            space: self.interpolation_space,
+            premultiplied_alpha: true,
+        };
+        if self.mode == 1 {
+            ThemePaint::LinearGradient {
+                angle: self.linear_angle as f32,
+                interpolation,
+                stops,
+            }
+        } else {
+            ThemePaint::RadialGradient {
+                center: (self.radial_center.0 as f32, self.radial_center.1 as f32),
+                radius: self.radial_radius as f32,
+                interpolation,
+                stops,
+            }
+        }
+    }
+
+    fn paint_intent(&self) -> ThemePaintIntent {
+        ThemePaintIntent {
+            paint: self.paint(),
+            dynamic_range: self.dynamic_range,
+            hdr_luminance_nits: self.hdr_luminance_nits as f32,
+        }
+    }
+
+    fn document(&self) -> ThemeDocument {
+        let mut document = ThemeDocument::new(self.theme_name.clone(), self.paint_intent());
+        document.wallpaper = self.wallpaper.clone();
+        document.semantic = self.semantic.clone();
+        document
+    }
+
+    fn from_document(document: &ThemeDocument) -> Result<Self, String> {
+        let supported_color = |color: ThemeColor| {
+            if color.space == ThemeColorSpace::Rec2020 {
+                return Err("Rec.2020 themes are not editable in Phase 7".to_string());
+            }
+            if ![color.r, color.g, color.b]
+                .into_iter()
+                .all(|component| (0.0..=1.0).contains(&component))
+            {
+                return Err("theme color is outside the editable RGB cube".to_string());
+            }
+            Ok(ThemeEditorColor::new(color))
+        };
+
+        document.validate().map_err(|error| error.to_string())?;
+        let mut draft = Self::new(0.0, 0.0, 0.0, 1.0);
+        draft.theme_name = document.name.clone();
+        draft.wallpaper = document.wallpaper.clone();
+        draft.semantic = document.semantic.clone();
+        draft.dynamic_range = document.intent.dynamic_range;
+        draft.hdr_luminance_nits = f64::from(document.intent.hdr_luminance_nits);
+
+        match &document.intent.paint {
+            ThemePaint::Solid { color } => {
+                let color = supported_color(*color)?;
+                draft.mode = 0;
+                draft.active_color = color.clone();
+                draft.solid_color = color;
+            }
+            ThemePaint::LinearGradient {
+                angle,
+                interpolation,
+                stops,
+            } => {
+                if interpolation.space == ThemeColorSpace::Rec2020 {
+                    return Err("Rec.2020 interpolation is not editable in Phase 7".to_string());
+                }
+                if !interpolation.premultiplied_alpha {
+                    return Err(
+                        "straight-alpha gradient interpolation is not editable in Phase 7"
+                            .to_string(),
+                    );
+                }
+                if !(0.0..=360.0).contains(angle) {
+                    return Err("linear gradient angle must be between 0 and 360".to_string());
+                }
+                draft.mode = 1;
+                draft.linear_angle = f64::from(*angle);
+                draft.interpolation_space = interpolation.space;
+                draft.stops = stops
+                    .iter()
+                    .map(|stop| {
+                        Ok(ThemeEditorStop {
+                            position: stop.position,
+                            color: supported_color(stop.color)?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?;
+                draft.selected_stop = 0;
+                draft.active_color = draft.stops[0].color.clone();
+            }
+            ThemePaint::RadialGradient {
+                center,
+                radius,
+                interpolation,
+                stops,
+            } => {
+                if interpolation.space == ThemeColorSpace::Rec2020 {
+                    return Err("Rec.2020 interpolation is not editable in Phase 7".to_string());
+                }
+                if !interpolation.premultiplied_alpha {
+                    return Err(
+                        "straight-alpha gradient interpolation is not editable in Phase 7"
+                            .to_string(),
+                    );
+                }
+                if !(0.0..=1.0).contains(&center.0)
+                    || !(0.0..=1.0).contains(&center.1)
+                    || !(0.01..=2.0).contains(radius)
+                {
+                    return Err("radial gradient geometry is outside editor limits".to_string());
+                }
+                draft.mode = 2;
+                draft.radial_center = (f64::from(center.0), f64::from(center.1));
+                draft.radial_radius = f64::from(*radius);
+                draft.interpolation_space = interpolation.space;
+                draft.stops = stops
+                    .iter()
+                    .map(|stop| {
+                        Ok(ThemeEditorStop {
+                            position: stop.position,
+                            color: supported_color(stop.color)?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?;
+                draft.selected_stop = 0;
+                draft.active_color = draft.stops[0].color.clone();
+            }
+        }
+        let color = draft.active_color.color();
+        draft.load_picker_color(color);
+        Ok(draft)
+    }
+
+    fn preview_paint(&self) -> ThemePaint {
+        self.paint_intent().mapped_for_sdr_preview()
+    }
+
+    fn preview_color(&self, color: ThemeColor) -> ThemeColor {
+        let intent = ThemePaintIntent {
+            paint: ThemePaint::solid(color),
+            dynamic_range: self.dynamic_range,
+            hdr_luminance_nits: self.hdr_luminance_nits as f32,
+        };
+        let ThemePaint::Solid { color } = intent.mapped_for_sdr_preview() else {
+            unreachable!()
+        };
+        color
+    }
+
+    fn preview_current_color(&self) -> ThemeColor {
+        self.preview_color(self.current_color())
+    }
+}
+
+fn srgb_decode(component: f64) -> f64 {
+    if component <= 0.04045 {
+        component / 12.92
+    } else {
+        ((component + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_encode(component: f32) -> f64 {
+    let component = f64::from(component.max(0.0));
+    if component <= 0.003_130_8 {
+        component * 12.92
+    } else {
+        1.055 * component.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn hsv_to_rgb(hue: f64, saturation: f64, value: f64) -> [f64; 3] {
+    let chroma = value * saturation;
+    let sector = (hue.rem_euclid(360.0)) / 60.0;
+    let x = chroma * (1.0 - (sector.rem_euclid(2.0) - 1.0).abs());
+    let [r, g, b] = match sector as u32 {
+        0 => [chroma, x, 0.0],
+        1 => [x, chroma, 0.0],
+        2 => [0.0, chroma, x],
+        3 => [0.0, x, chroma],
+        4 => [x, 0.0, chroma],
+        _ => [chroma, 0.0, x],
+    };
+    let match_value = value - chroma;
+    [r + match_value, g + match_value, b + match_value]
+}
+
+fn rgb_to_hsv([r, g, b]: [f64; 3]) -> (f64, f64, f64) {
+    let maximum = r.max(g).max(b);
+    let minimum = r.min(g).min(b);
+    let delta = maximum - minimum;
+    let hue = if delta <= f64::EPSILON {
+        0.0
+    } else if maximum == r {
+        60.0 * ((g - b) / delta).rem_euclid(6.0)
+    } else if maximum == g {
+        60.0 * ((b - r) / delta + 2.0)
+    } else {
+        60.0 * ((r - g) / delta + 4.0)
+    };
+    let saturation = if maximum <= f64::EPSILON {
+        0.0
+    } else {
+        delta / maximum
+    };
+    (hue, saturation, maximum)
+}
+
+fn wrap_hue(hue: f64) -> f64 {
+    hue.rem_euclid(360.0)
+}
+
+fn hue_from_ring_point(width: f64, height: f64, x: f64, y: f64) -> f64 {
+    let center_x = width / 2.0;
+    let center_y = height / 2.0;
+    wrap_hue((y - center_y).atan2(x - center_x).to_degrees())
+}
+
+fn point_is_on_hue_ring(width: f64, height: f64, x: f64, y: f64) -> bool {
+    let center_x = width / 2.0;
+    let center_y = height / 2.0;
+    let ring_radius = width.min(height) / 2.0 - 18.0;
+    let distance = ((x - center_x).powi(2) + (y - center_y).powi(2)).sqrt();
+    (distance - ring_radius).abs() <= 16.0
+}
+
+fn saturation_value_from_point(width: f64, height: f64, x: f64, y: f64) -> (f64, f64) {
+    let square_size = (width.min(height) - 16.0).max(1.0);
+    let square_x = (width - square_size) / 2.0;
+    let square_y = (height - square_size) / 2.0;
+    (
+        ((x - square_x) / square_size).clamp(0.0, 1.0),
+        (1.0 - (y - square_y) / square_size).clamp(0.0, 1.0),
+    )
+}
+
+fn picker_color(space: ThemeColorSpace, hue: f64, saturation: f64, value: f64) -> ThemeColor {
+    let [r, g, b] = hsv_to_rgb(hue, saturation, value);
+    ThemeColor::new(
+        space,
+        srgb_decode(r) as f32,
+        srgb_decode(g) as f32,
+        srgb_decode(b) as f32,
+        1.0,
+    )
+}
+
+fn picker_point_is_in_srgb(space: ThemeColorSpace, hue: f64, saturation: f64, value: f64) -> bool {
+    picker_color(space, hue, saturation, value).is_in_srgb_gamut()
+}
+
+/// Normalized line segments tracing the sRGB edge within a Display P3
+/// saturation/value square. Coordinates are in the 0..=1 picker domain.
+fn srgb_gamut_boundary_segments(hue: f64, cells: u32) -> Vec<[f64; 4]> {
+    if cells < 2 {
+        return Vec::new();
+    }
+    let mut gamut = vec![false; (cells * cells) as usize];
+    for y in 0..cells {
+        for x in 0..cells {
+            let saturation = f64::from(x) / f64::from(cells - 1);
+            let value = 1.0 - f64::from(y) / f64::from(cells - 1);
+            gamut[(y * cells + x) as usize] =
+                picker_point_is_in_srgb(ThemeColorSpace::DisplayP3, hue, saturation, value);
+        }
+    }
+
+    let mut segments = Vec::new();
+    let cell = 1.0 / f64::from(cells);
+    for y in 0..cells - 1 {
+        for x in 0..cells - 1 {
+            let here = gamut[(y * cells + x) as usize];
+            if here != gamut[(y * cells + x + 1) as usize] {
+                let edge_x = f64::from(x + 1) * cell;
+                let edge_y = f64::from(y) * cell;
+                segments.push([edge_x, edge_y, edge_x, edge_y + cell]);
+            }
+            if here != gamut[((y + 1) * cells + x) as usize] {
+                let edge_x = f64::from(x) * cell;
+                let edge_y = f64::from(y + 1) * cell;
+                segments.push([edge_x, edge_y, edge_x + cell, edge_y]);
+            }
+        }
+    }
+    segments
+}
+
+fn set_cairo_theme_color(cr: &cairo::Context, color: ThemeColor, alpha_scale: f64) {
+    let color = color.mapped_for_srgb_preview();
+    cr.set_source_rgba(
+        srgb_encode(color.r).clamp(0.0, 1.0),
+        srgb_encode(color.g).clamp(0.0, 1.0),
+        srgb_encode(color.b).clamp(0.0, 1.0),
+        f64::from(color.a).clamp(0.0, 1.0) * alpha_scale,
+    );
+}
+
+fn draw_theme_picker(cr: &cairo::Context, width: i32, height: i32, draft: &ThemeEditorDraft) {
+    let square_size = f64::from(width.min(height)) - 16.0;
+    let center_x = f64::from(width) / 2.0;
+    let center_y = f64::from(height) / 2.0;
+    let square_x = center_x - square_size / 2.0;
+    let square_y = center_y - square_size / 2.0;
+    let cells: u32 = 36;
+    let cell = square_size / f64::from(cells);
+    for y in 0..cells {
+        for x in 0..cells {
+            let saturation = f64::from(x) / f64::from(cells - 1);
+            let value = 1.0 - f64::from(y) / f64::from(cells - 1);
+            let color = picker_color(draft.space(), draft.hue, saturation, value);
+            set_cairo_theme_color(cr, color, 1.0);
+            cr.rectangle(
+                square_x + f64::from(x) * cell,
+                square_y + f64::from(y) * cell,
+                cell + 0.6,
+                cell + 0.6,
+            );
+            let _ = cr.fill();
+        }
+    }
+
+    if draft.space() == ThemeColorSpace::DisplayP3 {
+        let segments = srgb_gamut_boundary_segments(draft.hue, cells);
+        let append_boundary = |cr: &cairo::Context| {
+            for [x1, y1, x2, y2] in &segments {
+                cr.move_to(square_x + x1 * square_size, square_y + y1 * square_size);
+                cr.line_to(square_x + x2 * square_size, square_y + y2 * square_size);
+            }
+        };
+        cr.set_dash(&[], 0.0);
+        cr.set_line_width(4.0);
+        cr.set_source_rgba(0.0, 0.0, 0.0, 0.72);
+        append_boundary(cr);
+        let _ = cr.stroke();
+        cr.set_dash(&[4.0, 3.0], 0.0);
+        cr.set_line_width(1.6);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.96);
+        append_boundary(cr);
+        let _ = cr.stroke();
+        cr.set_dash(&[], 0.0);
+    }
+
+    let marker_x = square_x + draft.saturation * square_size;
+    let marker_y = square_y + (1.0 - draft.value) * square_size;
+    cr.set_line_width(3.0);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.arc(marker_x, marker_y, 7.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke_preserve();
+    cr.set_line_width(1.5);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    let _ = cr.stroke();
+}
+
+fn draw_hue_ring(cr: &cairo::Context, width: i32, height: i32, hue: f64) {
+    let center_x = f64::from(width) / 2.0;
+    let center_y = f64::from(height) / 2.0;
+    let radius = f64::from(width.min(height)) / 2.0 - 18.0;
+    let segments = 180;
+    cr.set_line_width(24.0);
+    for segment in 0..segments {
+        let start = f64::from(segment) * std::f64::consts::TAU / f64::from(segments);
+        let end = f64::from(segment + 1) * std::f64::consts::TAU / f64::from(segments) + 0.002;
+        let segment_hue = f64::from(segment) * 360.0 / f64::from(segments);
+        let [r, g, b] = hsv_to_rgb(segment_hue, 1.0, 1.0);
+        cr.set_source_rgb(r, g, b);
+        cr.arc(center_x, center_y, radius, start, end);
+        let _ = cr.stroke();
+    }
+
+    let angle = wrap_hue(hue).to_radians();
+    let marker_x = center_x + radius * angle.cos();
+    let marker_y = center_y + radius * angle.sin();
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+    cr.set_line_width(5.0);
+    cr.arc(marker_x, marker_y, 8.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_line_width(2.0);
+    cr.arc(marker_x, marker_y, 8.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.stroke();
+}
+
+fn paint_stop_values(stop: &GradientStop) -> [f64; 5] {
+    let color = stop.color.mapped_for_srgb_preview();
+    [
+        f64::from(stop.position.clamp(0.0, 1.0)),
+        srgb_encode(color.r).clamp(0.0, 1.0),
+        srgb_encode(color.g).clamp(0.0, 1.0),
+        srgb_encode(color.b).clamp(0.0, 1.0),
+        f64::from(color.a).clamp(0.0, 1.0),
+    ]
+}
+
+fn set_cairo_paint(cr: &cairo::Context, paint: &ThemePaint, width: f64, height: f64) {
+    match paint {
+        ThemePaint::Solid { color } => set_cairo_theme_color(cr, *color, 1.0),
+        ThemePaint::LinearGradient { angle, stops, .. } => {
+            let angle = f64::from(*angle).to_radians();
+            let center = (width * 0.5, height * 0.5);
+            let extent = width.hypot(height) * 0.5;
+            let offset = (angle.cos() * extent, angle.sin() * extent);
+            let gradient = cairo::LinearGradient::new(
+                center.0 - offset.0,
+                center.1 - offset.1,
+                center.0 + offset.0,
+                center.1 + offset.1,
+            );
+            for stop in stops {
+                let [position, r, g, b, a] = paint_stop_values(stop);
+                gradient.add_color_stop_rgba(position, r, g, b, a);
+            }
+            let _ = cr.set_source(&gradient);
+        }
+        ThemePaint::RadialGradient {
+            center,
+            radius,
+            stops,
+            ..
+        } => {
+            let center = (f64::from(center.0) * width, f64::from(center.1) * height);
+            let gradient = cairo::RadialGradient::new(
+                center.0,
+                center.1,
+                0.0,
+                center.0,
+                center.1,
+                f64::from(*radius) * width.max(height),
+            );
+            for stop in stops {
+                let [position, r, g, b, a] = paint_stop_values(stop);
+                gradient.add_color_stop_rgba(position, r, g, b, a);
+            }
+            let _ = cr.set_source(&gradient);
+        }
+    }
+}
+
+fn draw_theme_preview(cr: &cairo::Context, width: i32, height: i32, draft: &ThemeEditorDraft) {
+    let width = f64::from(width);
+    let height = f64::from(height);
+    cr.set_source_rgb(0.035, 0.045, 0.065);
+    let _ = cr.paint();
+
+    let paint = draft.preview_paint();
+    set_cairo_paint(cr, &paint, width, height);
+    cr.rectangle(0.0, 0.0, width, 42.0);
+    let _ = cr.fill();
+    cr.rectangle(0.0, 42.0, 72.0, height - 42.0);
+    let _ = cr.fill();
+
+    cr.set_source_rgba(0.08, 0.10, 0.15, 0.94);
+    cr.rectangle(98.0, 70.0, width - 126.0, height - 104.0);
+    let _ = cr.fill();
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.14);
+    cr.rectangle(98.0, 70.0, width - 126.0, 1.0);
+    let _ = cr.fill();
+
+    set_cairo_paint(cr, &paint, width - 150.0, 36.0);
+    cr.rectangle(114.0, 88.0, width - 158.0, 36.0);
+    let _ = cr.fill();
+
+    cr.set_source_rgba(0.96, 0.98, 1.0, 0.96);
+    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Bold);
+    cr.set_font_size(14.0);
+    cr.move_to(126.0, 111.0);
+    let _ = cr.show_text("FocalDesk Window");
+    cr.set_font_size(12.0);
+    cr.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
+    cr.move_to(122.0, 154.0);
+    let _ = cr.show_text("Panel, window, menu, accent and text");
+
+    cr.set_source_rgba(0.12, 0.15, 0.21, 0.94);
+    cr.rectangle(120.0, 172.0, width * 0.42, 94.0);
+    let _ = cr.fill();
+    for row in 0..3 {
+        if row == 1 {
+            set_cairo_paint(cr, &paint, width * 0.38, 22.0);
+            cr.rectangle(126.0, 179.0 + row as f64 * 26.0, width * 0.38, 22.0);
+            let _ = cr.fill();
+        }
+        cr.set_source_rgba(0.92, 0.95, 1.0, 0.9);
+        cr.move_to(136.0, 195.0 + row as f64 * 26.0);
+        let _ = cr.show_text(["New window", "Selected item", "Preferences"][row]);
+    }
+
+    set_cairo_theme_color(cr, draft.preview_current_color(), 0.32);
+    cr.rectangle(width - 176.0, 166.0, 122.0, 108.0);
+    let _ = cr.fill();
+    set_cairo_theme_color(cr, draft.preview_current_color(), 1.0);
+    cr.arc(width - 115.0, 220.0, 23.0, 0.0, std::f64::consts::TAU);
+    let _ = cr.fill();
+}
+
+fn semantic_surface(theme: &SemanticTheme, index: u32) -> &SurfaceStyle {
+    match index {
+        1 => &theme.surfaces.dock,
+        2 => &theme.surfaces.button,
+        3 => &theme.surfaces.active_button,
+        4 => &theme.surfaces.popup,
+        5 => &theme.surfaces.window_frame,
+        _ => &theme.surfaces.bar,
+    }
+}
+
+fn semantic_surface_mut(theme: &mut SemanticTheme, index: u32) -> &mut SurfaceStyle {
+    match index {
+        1 => &mut theme.surfaces.dock,
+        2 => &mut theme.surfaces.button,
+        3 => &mut theme.surfaces.active_button,
+        4 => &mut theme.surfaces.popup,
+        5 => &mut theme.surfaces.window_frame,
+        _ => &mut theme.surfaces.bar,
+    }
+}
+
+fn interaction_state_from_index(index: u32) -> InteractionState {
+    match index {
+        1 => InteractionState::Hover,
+        2 => InteractionState::Pressed,
+        3 => InteractionState::Selected,
+        4 => InteractionState::Focused,
+        5 => InteractionState::Urgent,
+        6 => InteractionState::Disabled,
+        _ => InteractionState::Normal,
+    }
+}
+
+fn draw_semantic_state_preview(
+    cr: &cairo::Context,
+    width: i32,
+    height: i32,
+    draft: &ThemeEditorDraft,
+    surface_index: u32,
+) {
+    cr.set_source_rgb(0.035, 0.045, 0.065);
+    let _ = cr.paint();
+    let style = semantic_surface(&draft.semantic, surface_index);
+    let states = [
+        ("Normal", InteractionState::Normal),
+        ("Hover", InteractionState::Hover),
+        ("Focused", InteractionState::Focused),
+        ("Urgent", InteractionState::Urgent),
+        ("Disabled", InteractionState::Disabled),
+    ];
+    let gap = 8.0;
+    let card_width = (f64::from(width) - gap * 6.0) / 5.0;
+    let text = draft.semantic.typography.primary.mapped_for_srgb_preview();
+    for (index, (label, state)) in states.into_iter().enumerate() {
+        let x = gap + index as f64 * (card_width + gap);
+        let color = style.resolve(state).mapped_for_srgb_preview();
+        set_cairo_theme_color(cr, color, 1.0);
+        cr.rectangle(x, 12.0, card_width, f64::from(height) - 24.0);
+        let _ = cr.fill();
+        set_cairo_theme_color(cr, text, 1.0);
+        cr.set_font_size(12.0);
+        cr.move_to(x + 10.0, 38.0);
+        let _ = cr.show_text(label);
+        let contrast = semantic_contrast_ratio(color, text);
+        cr.set_font_size(10.0);
+        cr.move_to(x + 10.0, 58.0);
+        let _ = cr.show_text(&format!(
+            "{contrast:.1}:1{}",
+            if contrast < 4.5 { " !" } else { "" }
+        ));
+    }
+}
+
+fn semantic_contrast_ratio(left: ThemeColor, right: ThemeColor) -> f32 {
+    let luminance = |color: ThemeColor| {
+        let color = color.converted_to(ThemeColorSpace::Srgb);
+        0.2126 * color.r.max(0.0) + 0.7152 * color.g.max(0.0) + 0.0722 * color.b.max(0.0)
+    };
+    let (left, right) = (luminance(left), luminance(right));
+    (left.max(right) + 0.05) / (left.min(right) + 0.05)
+}
+
+fn nearest_gradient_stop(stops: &[ThemeEditorStop], position: f32) -> Option<usize> {
+    stops
+        .iter()
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            (left.position - position)
+                .abs()
+                .total_cmp(&(right.position - position).abs())
+        })
+        .map(|(index, _)| index)
+}
+
+fn draw_gradient_stop_rail(cr: &cairo::Context, width: i32, height: i32, draft: &ThemeEditorDraft) {
+    let width = f64::from(width);
+    let height = f64::from(height);
+    cr.set_source_rgb(0.08, 0.09, 0.12);
+    let _ = cr.paint();
+    let paint = draft.preview_paint();
+    let stops = match &paint {
+        ThemePaint::LinearGradient { stops, .. } | ThemePaint::RadialGradient { stops, .. } => {
+            stops.clone()
+        }
+        ThemePaint::Solid { color } => vec![
+            GradientStop {
+                position: 0.0,
+                color: *color,
+            },
+            GradientStop {
+                position: 1.0,
+                color: *color,
+            },
+        ],
+    };
+    let rail_paint = ThemePaint::LinearGradient {
+        angle: 0.0,
+        interpolation: GradientInterpolation {
+            space: draft.interpolation_space,
+            premultiplied_alpha: true,
+        },
+        stops,
+    };
+    set_cairo_paint(cr, &rail_paint, width, height);
+    cr.rectangle(8.0, 8.0, width - 16.0, height - 26.0);
+    let _ = cr.fill();
+
+    for (index, stop) in draft.stops.iter().enumerate() {
+        let x = 8.0 + f64::from(stop.position.clamp(0.0, 1.0)) * (width - 16.0);
+        let y = height - 10.0;
+        let source_color = if index == draft.selected_stop {
+            draft.current_color()
+        } else {
+            stop.color.color()
+        };
+        set_cairo_theme_color(cr, draft.preview_color(source_color), 1.0);
+        cr.arc(x, y, 7.0, 0.0, std::f64::consts::TAU);
+        let _ = cr.fill_preserve();
+        cr.set_source_rgb(
+            if index == draft.selected_stop {
+                1.0
+            } else {
+                0.2
+            },
+            if index == draft.selected_stop {
+                1.0
+            } else {
+                0.2
+            },
+            if index == draft.selected_stop {
+                1.0
+            } else {
+                0.2
+            },
+        );
+        cr.set_line_width(if index == draft.selected_stop {
+            3.0
+        } else {
+            1.5
+        });
+        let _ = cr.stroke();
+    }
+}
+
+fn update_gradient_stop_accessibility(rail: &gtk::DrawingArea, draft: &ThemeEditorDraft) {
+    if draft.mode == 0 || draft.stops.is_empty() {
+        return;
+    }
+    let position = f64::from(draft.stops[draft.selected_stop].position) * 100.0;
+    let value = format!(
+        "Stop {} of {}, position {:.0} percent",
+        draft.selected_stop + 1,
+        draft.stops.len(),
+        position
+    );
+    rail.update_property(&[
+        gtk::accessible::Property::ValueNow(position),
+        gtk::accessible::Property::ValueText(&value),
+    ]);
+}
+
+fn update_theme_editor_status(label: &gtk::Label, draft: &ThemeEditorDraft) {
+    let space = match draft.space() {
+        ThemeColorSpace::Srgb => "sRGB",
+        ThemeColorSpace::DisplayP3 => "Display P3",
+        ThemeColorSpace::Rec2020 => "Rec.2020",
+    };
+    let gamut = if draft.space() == ThemeColorSpace::DisplayP3 {
+        if draft.current_color().is_in_srgb_gamut() {
+            "  ·  Inside sRGB gamut"
+        } else {
+            "  ●  Outside sRGB gamut"
+        }
+    } else {
+        ""
+    };
+    let paint = match draft.mode {
+        1 => format!(
+            "Linear · Stop {}/{}  ·  ",
+            draft.selected_stop + 1,
+            draft.stops.len()
+        ),
+        2 => format!(
+            "Radial · Stop {}/{}  ·  ",
+            draft.selected_stop + 1,
+            draft.stops.len()
+        ),
+        _ => "Solid  ·  ".to_string(),
+    };
+    let dynamic_range = match draft.dynamic_range {
+        ThemeDynamicRange::Sdr => "SDR".to_string(),
+        ThemeDynamicRange::Hdr => format!("HDR  ·  {:.0} nits", draft.hdr_luminance_nits),
+    };
+    label.set_text(&format!(
+        "{paint}{space}  ·  {dynamic_range}  ·  H {:.0}°  S {:.0}%  V {:.0}%{gamut}",
+        draft.hue,
+        draft.saturation * 100.0,
+        draft.value * 100.0
+    ));
+    label.remove_css_class("warning");
+    if draft.space() == ThemeColorSpace::DisplayP3 && !draft.current_color().is_in_srgb_gamut() {
+        label.add_css_class("warning");
+    }
+}
+
+fn update_theme_editor_accessibility(
+    picker: &gtk::DrawingArea,
+    hue_slider: &gtk::DrawingArea,
+    draft: &ThemeEditorDraft,
+) {
+    let outside =
+        draft.space() == ThemeColorSpace::DisplayP3 && !draft.current_color().is_in_srgb_gamut();
+    let picker_value = format!(
+        "{} saturation {:.0} percent, value {:.0} percent{}",
+        match draft.space() {
+            ThemeColorSpace::Srgb => "sRGB",
+            ThemeColorSpace::DisplayP3 => "Display P3",
+            ThemeColorSpace::Rec2020 => "Rec.2020",
+        },
+        draft.saturation * 100.0,
+        draft.value * 100.0,
+        if outside { ", outside sRGB gamut" } else { "" }
+    );
+    picker.update_property(&[
+        gtk::accessible::Property::ValueNow(draft.value * 100.0),
+        gtk::accessible::Property::ValueText(&picker_value),
+    ]);
+    let hue_value = format!("{:.0} degrees", draft.hue);
+    hue_slider.update_property(&[
+        gtk::accessible::Property::ValueNow(draft.hue),
+        gtk::accessible::Property::ValueText(&hue_value),
+    ]);
+}
+
+fn theme_editor_path_label(path: Option<&std::path::Path>, dirty: bool) -> String {
+    let location = path
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "Not saved yet".to_string());
+    if dirty {
+        format!("{location} · Unsaved changes")
+    } else {
+        location
+    }
+}
+
+fn theme_editor_toml_path(mut path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("toml");
+    }
+    path
+}
+
+fn theme_package_path(mut path: PathBuf) -> PathBuf {
+    if path.extension().is_none() {
+        path.set_extension("fdtheme");
+    }
+    path
+}
+
+fn installed_themes_root() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
+        .join("themes")
+}
+
+fn extract_wallpaper_accent(path: &std::path::Path) -> Result<ThemeColor, String> {
+    use image::GenericImageView;
+    let image = image::open(path)
+        .map_err(|error| error.to_string())?
+        .thumbnail(96, 96);
+    let mut sum = [0.0f64; 3];
+    let mut weight = 0.0;
+    for (_, _, pixel) in image.pixels() {
+        let rgb = [
+            f64::from(pixel[0]) / 255.0,
+            f64::from(pixel[1]) / 255.0,
+            f64::from(pixel[2]) / 255.0,
+        ];
+        let maximum = rgb.into_iter().fold(0.0f64, f64::max);
+        let minimum = rgb.into_iter().fold(1.0f64, f64::min);
+        let saturation = maximum - minimum;
+        let luminance = rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
+        let pixel_weight = saturation * (1.0 - (luminance - 0.55).abs()).max(0.1);
+        if pixel_weight > 0.02 {
+            for index in 0..3 {
+                sum[index] += rgb[index] * pixel_weight;
+            }
+            weight += pixel_weight;
+        }
+    }
+    if weight <= f64::EPSILON {
+        return Err("wallpaper has no extractable chromatic accent".to_string());
+    }
+    Ok(ThemeColor::srgb(
+        srgb_decode(sum[0] / weight) as f32,
+        srgb_decode(sum[1] / weight) as f32,
+        srgb_decode(sum[2] / weight) as f32,
+        1.0,
+    ))
+}
+
+fn persist_theme_editor_document(
+    draft: &Rc<RefCell<ThemeEditorDraft>>,
+    saved_document: &Rc<RefCell<ThemeDocument>>,
+    current_path: &Rc<RefCell<Option<PathBuf>>>,
+    path: PathBuf,
+) -> Result<(), String> {
+    let path = theme_editor_toml_path(path);
+    let document = draft.borrow().document();
+    document.save(&path).map_err(|error| error.to_string())?;
+    *saved_document.borrow_mut() = document;
+    *current_path.borrow_mut() = Some(path);
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ThemeEditorRuntimeStatus {
+    preview_active: bool,
+    applied_revision: u64,
+    gradient_rendering: bool,
+    semantic_rendering: bool,
+    wallpaper_processing: bool,
+    layout_metrics: bool,
+    typography_metrics: bool,
+    contrast_issue_count: usize,
+}
+
+#[derive(Debug)]
+enum ThemeEditorIpcJob {
+    Probe,
+    Preview(ThemeDocument),
+    Apply(ThemeDocument),
+    Revert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeEditorIpcAction {
+    Probe,
+    Preview,
+    Apply,
+    Revert,
+}
+
+#[derive(Debug)]
+struct ThemeEditorIpcResult {
+    action: ThemeEditorIpcAction,
+    gradient: bool,
+    result: Result<ThemeEditorRuntimeStatus, String>,
+}
+
+fn spawn_theme_editor_ipc_worker() -> (
+    mpsc::Sender<ThemeEditorIpcJob>,
+    mpsc::Receiver<ThemeEditorIpcResult>,
+) {
+    let (job_tx, job_rx) = mpsc::channel();
+    let (result_tx, result_rx) = mpsc::channel();
+    thread::spawn(move || {
+        while let Ok(job) = job_rx.recv() {
+            let (action, gradient, command) = match job {
+                ThemeEditorIpcJob::Probe => (ThemeEditorIpcAction::Probe, false, None),
+                ThemeEditorIpcJob::Preview(document) => {
+                    let gradient = !matches!(document.intent.paint, ThemePaint::Solid { .. });
+                    (
+                        ThemeEditorIpcAction::Preview,
+                        gradient,
+                        Some(ThemeEditorCommand::Preview { document }),
+                    )
+                }
+                ThemeEditorIpcJob::Apply(document) => {
+                    let gradient = !matches!(document.intent.paint, ThemePaint::Solid { .. });
+                    (
+                        ThemeEditorIpcAction::Apply,
+                        gradient,
+                        Some(ThemeEditorCommand::Apply { document }),
+                    )
+                }
+                ThemeEditorIpcJob::Revert => (
+                    ThemeEditorIpcAction::Revert,
+                    false,
+                    Some(ThemeEditorCommand::Revert),
+                ),
+            };
+            let result = send_theme_editor_command(command);
+            if result_tx
+                .send(ThemeEditorIpcResult {
+                    action,
+                    gradient,
+                    result,
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (job_tx, result_rx)
+}
+
+fn send_theme_editor_command(
+    command: Option<ThemeEditorCommand>,
+) -> Result<ThemeEditorRuntimeStatus, String> {
+    let request = match command {
+        Some(command) => IpcRequest::ThemeEditor {
+            protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
+            command,
+        },
+        None => IpcRequest::GetThemeEditorStatus {
+            protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
+        },
+    };
+    match send_desktop_request(&request)? {
+        IpcResponse::ThemeEditorStatus {
+            protocol_version,
+            preview_active,
+            applied_revision,
+            gradient_rendering,
+            semantic_rendering,
+            wallpaper_processing,
+            layout_metrics,
+            typography_metrics,
+            contrast_issue_count,
+        } if protocol_version == THEME_EDITOR_PROTOCOL_VERSION => Ok(ThemeEditorRuntimeStatus {
+            preview_active,
+            applied_revision,
+            gradient_rendering,
+            semantic_rendering,
+            wallpaper_processing,
+            layout_metrics,
+            typography_metrics,
+            contrast_issue_count,
+        }),
+        IpcResponse::ThemeEditorStatus {
+            protocol_version, ..
+        } => Err(format!(
+            "unsupported compositor theme protocol {protocol_version}; editor requires {THEME_EDITOR_PROTOCOL_VERSION}"
+        )),
+        IpcResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected compositor response: {other:?}")),
+    }
+}
+
+fn theme_editor_runtime_label(status: ThemeEditorRuntimeStatus, gradient: bool) -> String {
+    if !status.semantic_rendering {
+        "Connected · compositor lacks semantic theme rendering".to_string()
+    } else if !status.wallpaper_processing || !status.layout_metrics || !status.typography_metrics {
+        "Connected · compositor has partial semantic renderer support".to_string()
+    } else if gradient && !status.gradient_rendering {
+        "Connected · gradients preview at their midpoint".to_string()
+    } else if status.preview_active {
+        format!(
+            "Connected · preview active · {} contrast issue{}",
+            status.contrast_issue_count,
+            if status.contrast_issue_count == 1 {
+                ""
+            } else {
+                "s"
+            }
+        )
+    } else {
+        format!("Connected · applied revision {}", status.applied_revision)
+    }
+}
+
+fn theme_editor_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Theme Editor");
+    page.set_description(
+        "Phase 10: author semantic surfaces, interaction states, edges, typography, layout, and color behavior.",
+    );
+    let surfaces_page = adw::PreferencesPage::new();
+    surfaces_page.set_title("Surfaces");
+    surfaces_page
+        .set_description("Tune surface colors, interaction states, edges, and typography.");
+    let layout_page = adw::PreferencesPage::new();
+    layout_page.set_title("Layout & Color");
+    layout_page.set_description("Adjust shell geometry and output color behavior.");
+    let wallpaper_page = adw::PreferencesPage::new();
+    wallpaper_page.set_title("Wallpaper");
+    wallpaper_page.set_description("Choose an image and control its relationship to the theme.");
+    let paint_page = adw::PreferencesPage::new();
+    paint_page.set_title("Paint");
+    paint_page
+        .set_description("Author solid colors and gradients with the live picker and preview.");
+
+    let editor_root = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    let section_stack = gtk::Stack::new();
+    section_stack.set_hexpand(true);
+    section_stack.set_vexpand(true);
+    section_stack.set_transition_type(gtk::StackTransitionType::Crossfade);
+    section_stack.add_titled(&page, Some("general"), "General");
+    section_stack.add_titled(&surfaces_page, Some("surfaces"), "Surfaces");
+    section_stack.add_titled(&layout_page, Some("layout"), "Layout & Color");
+    section_stack.add_titled(&wallpaper_page, Some("wallpaper"), "Wallpaper");
+    section_stack.add_titled(&paint_page, Some("paint"), "Paint");
+
+    let section_switcher = gtk::StackSwitcher::new();
+    section_switcher.set_stack(Some(&section_stack));
+    section_switcher.set_halign(gtk::Align::Center);
+    section_switcher.set_margin_top(8);
+    section_switcher.set_margin_bottom(8);
+    section_switcher.set_margin_start(12);
+    section_switcher.set_margin_end(12);
+    section_switcher.add_css_class("linked");
+    editor_root.append(&section_switcher);
+    editor_root.append(&section_stack);
+
+    let draft = Rc::new(RefCell::new(ThemeEditorDraft::new(205.0, 0.88, 1.0, 1.0)));
+    let saved_document = Rc::new(RefCell::new(draft.borrow().document()));
+    let current_path = Rc::new(RefCell::new(None::<PathBuf>));
+    let installed_slug = Rc::new(RefCell::new(None::<String>));
+    let last_preview_document = Rc::new(RefCell::new(None::<ThemeDocument>));
+    let compositor_connected = Rc::new(Cell::new(false));
+    let editor_page_active = Rc::new(Cell::new(false));
+    let preview_in_flight = Rc::new(Cell::new(false));
+    let (theme_ipc_tx, theme_ipc_rx) = spawn_theme_editor_ipc_worker();
+    let theme_ipc_rx = Rc::new(RefCell::new(theme_ipc_rx));
+
+    let document_group = adw::PreferencesGroup::new();
+    document_group.set_title("Theme File");
+    let name_row = adw::ActionRow::new();
+    name_row.set_title("Name");
+    let theme_name = gtk::Entry::new();
+    theme_name.set_text(&draft.borrow().theme_name);
+    theme_name.set_width_chars(28);
+    name_row.add_suffix(&theme_name);
+    document_group.add(&name_row);
+
+    let file_row = adw::ActionRow::new();
+    file_row.set_title("TOML document");
+    file_row.set_subtitle("Not saved yet");
+    let file_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let open_theme = gtk::Button::with_label("Open…");
+    let save_theme = gtk::Button::with_label("Save");
+    save_theme.set_sensitive(false);
+    let save_theme_as = gtk::Button::with_label("Save As…");
+    let revert_theme = gtk::Button::with_label("Revert");
+    revert_theme.set_sensitive(false);
+    file_actions.append(&open_theme);
+    file_actions.append(&save_theme);
+    file_actions.append(&save_theme_as);
+    file_actions.append(&revert_theme);
+    file_row.add_suffix(&file_actions);
+    document_group.add(&file_row);
+
+    let file_message = gtk::Label::new(Some("Ready"));
+    file_message.set_xalign(0.0);
+    file_message.set_wrap(true);
+    file_message.add_css_class("dim-label");
+    document_group.add(&file_message);
+    page.add(&document_group);
+
+    let compositor_group = adw::PreferencesGroup::new();
+    compositor_group.set_title("Live Compositor");
+    compositor_group.set_description(Some(
+        "Preview is temporary. Apply keeps the runtime theme; leaving the editor restores the last applied theme.",
+    ));
+    let live_preview_row = adw::ActionRow::new();
+    live_preview_row.set_title("Live preview");
+    live_preview_row.set_subtitle("Debounced to avoid flooding compositor IPC");
+    let live_preview = gtk::Switch::new();
+    live_preview.set_active(true);
+    live_preview_row.add_suffix(&live_preview);
+    live_preview_row.set_activatable_widget(Some(&live_preview));
+    compositor_group.add(&live_preview_row);
+
+    let runtime_row = adw::ActionRow::new();
+    runtime_row.set_title("Runtime theme");
+    runtime_row.set_subtitle("Checking compositor…");
+    let runtime_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let apply_runtime = gtk::Button::with_label("Apply");
+    let revert_runtime = gtk::Button::with_label("Revert Preview");
+    apply_runtime.set_sensitive(false);
+    revert_runtime.set_sensitive(false);
+    runtime_actions.append(&apply_runtime);
+    runtime_actions.append(&revert_runtime);
+    runtime_row.add_suffix(&runtime_actions);
+    compositor_group.add(&runtime_row);
+    page.add(&compositor_group);
+
+    let wallpaper_group = adw::PreferencesGroup::new();
+    wallpaper_group.set_title("Wallpaper");
+    let wallpaper_picture = gtk::Picture::new();
+    wallpaper_picture.set_content_fit(gtk::ContentFit::Cover);
+    wallpaper_picture.set_size_request(-1, 180);
+    wallpaper_picture.add_css_class("card");
+    wallpaper_group.add(&wallpaper_picture);
+    let wallpaper_row = adw::ActionRow::new();
+    wallpaper_row.set_title("Image asset");
+    wallpaper_row.set_subtitle("No wallpaper selected");
+    let wallpaper_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let choose_wallpaper = gtk::Button::with_label("Choose…");
+    let clear_wallpaper = gtk::Button::with_label("Clear");
+    clear_wallpaper.set_sensitive(false);
+    wallpaper_actions.append(&choose_wallpaper);
+    wallpaper_actions.append(&clear_wallpaper);
+    wallpaper_row.add_suffix(&wallpaper_actions);
+    wallpaper_group.add(&wallpaper_row);
+    let wallpaper_fit_row = adw::ActionRow::new();
+    wallpaper_fit_row.set_title("Fit mode");
+    let wallpaper_fit = dropdown_from_strings(&["Fill", "Fit", "Stretch", "Center", "Tile"], 0);
+    wallpaper_fit_row.add_suffix(&wallpaper_fit);
+    wallpaper_group.add(&wallpaper_fit_row);
+    let wallpaper_dim_row = adw::ActionRow::new();
+    wallpaper_dim_row.set_title("Dimming");
+    let wallpaper_dim = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    wallpaper_dim.set_value(0.0);
+    wallpaper_dim.set_digits(2);
+    wallpaper_dim.set_draw_value(true);
+    wallpaper_dim.set_size_request(280, -1);
+    wallpaper_dim_row.add_suffix(&wallpaper_dim);
+    wallpaper_group.add(&wallpaper_dim_row);
+    let wallpaper_tint_row = adw::ActionRow::new();
+    wallpaper_tint_row.set_title("Tint");
+    let wallpaper_tint = gtk::Switch::new();
+    wallpaper_tint_row.add_suffix(&wallpaper_tint);
+    wallpaper_tint_row.set_activatable_widget(Some(&wallpaper_tint));
+    wallpaper_group.add(&wallpaper_tint_row);
+    let tint_values = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    tint_values.set_sensitive(false);
+    let mut wallpaper_tint_spins = Vec::new();
+    for (name, value) in [("R", 0.1), ("G", 0.2), ("B", 0.4), ("A", 0.3)] {
+        tint_values.append(&gtk::Label::new(Some(name)));
+        let spin = gtk::SpinButton::with_range(0.0, 1.0, 0.01);
+        spin.set_digits(2);
+        spin.set_value(value);
+        tint_values.append(&spin);
+        wallpaper_tint_spins.push(spin);
+    }
+    wallpaper_group.add(&tint_values);
+    wallpaper_page.add(&wallpaper_group);
+
+    let package_group = adw::PreferencesGroup::new();
+    package_group.set_title("Theme Package");
+    package_group.set_description(Some(
+        "Portable .fdtheme packages embed the validated TOML document and wallpaper asset.",
+    ));
+    let package_row = adw::ActionRow::new();
+    package_row.set_title("Installable package");
+    package_row.set_subtitle("Not installed");
+    let package_actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let export_package = gtk::Button::with_label("Export…");
+    let import_package = gtk::Button::with_label("Import…");
+    let uninstall_package = gtk::Button::with_label("Uninstall");
+    uninstall_package.set_sensitive(false);
+    package_actions.append(&export_package);
+    package_actions.append(&import_package);
+    package_actions.append(&uninstall_package);
+    package_row.add_suffix(&package_actions);
+    package_group.add(&package_row);
+    page.add(&package_group);
+
+    let semantic_group = adw::PreferencesGroup::new();
+    semantic_group.set_title("Surfaces and Interaction");
+    let semantic_surface_row = adw::ActionRow::new();
+    semantic_surface_row.set_title("Surface");
+    let semantic_surface_select = dropdown_from_strings(
+        &[
+            "Bar",
+            "Dock",
+            "Button",
+            "Active Button",
+            "Popup",
+            "Window Frame",
+        ],
+        0,
+    );
+    semantic_surface_row.add_suffix(&semantic_surface_select);
+    semantic_group.add(&semantic_surface_row);
+    let semantic_state_row = adw::ActionRow::new();
+    semantic_state_row.set_title("Interaction state");
+    let semantic_state_select = dropdown_from_strings(
+        &[
+            "Normal", "Hover", "Pressed", "Selected", "Focused", "Urgent", "Disabled",
+        ],
+        0,
+    );
+    semantic_state_row.add_suffix(&semantic_state_select);
+    semantic_group.add(&semantic_state_row);
+    let semantic_override_row = adw::ActionRow::new();
+    semantic_override_row.set_title("Override inherited color");
+    let semantic_override = gtk::Switch::new();
+    semantic_override.set_sensitive(false);
+    semantic_override_row.add_suffix(&semantic_override);
+    semantic_group.add(&semantic_override_row);
+    let semantic_color_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let mut semantic_color_spins = Vec::new();
+    for name in ["R", "G", "B", "A"] {
+        semantic_color_box.append(&gtk::Label::new(Some(name)));
+        let spin = gtk::SpinButton::with_range(0.0, 1.0, 0.01);
+        spin.set_digits(2);
+        semantic_color_box.append(&spin);
+        semantic_color_spins.push(spin);
+    }
+    semantic_group.add(&semantic_color_box);
+    let semantic_preview = gtk::DrawingArea::new();
+    semantic_preview.set_content_height(105);
+    semantic_preview.set_hexpand(true);
+    {
+        let draft = draft.clone();
+        let semantic_surface_select = semantic_surface_select.clone();
+        semantic_preview.set_draw_func(move |_, cr, width, height| {
+            draw_semantic_state_preview(
+                cr,
+                width,
+                height,
+                &draft.borrow(),
+                semantic_surface_select.selected(),
+            );
+        });
+    }
+    semantic_group.add(&semantic_preview);
+    surfaces_page.add(&semantic_group);
+
+    let edges_group = adw::PreferencesGroup::new();
+    edges_group.set_title("Edges");
+    let border_color_row = adw::ActionRow::new();
+    border_color_row.set_title("Border color");
+    let semantic_border_color = gtk::ColorDialogButton::new(None::<gtk::ColorDialog>);
+    border_color_row.add_suffix(&semantic_border_color);
+    edges_group.add(&border_color_row);
+    let highlight_color_row = adw::ActionRow::new();
+    highlight_color_row.set_title("Inner highlight");
+    let semantic_inner_highlight = gtk::ColorDialogButton::new(None::<gtk::ColorDialog>);
+    highlight_color_row.add_suffix(&semantic_inner_highlight);
+    edges_group.add(&highlight_color_row);
+    let semantic_border_width = add_scale_row(&edges_group, "Border width", 0.0, 16.0, 0.5, 1.0);
+    let semantic_radius = add_scale_row(&edges_group, "Radius", 0.0, 64.0, 1.0, 10.0);
+    let semantic_shadow = add_scale_row(&edges_group, "Shadow", 0.0, 1.0, 0.01, 0.4);
+    let semantic_glow = add_scale_row(&edges_group, "Glow", 0.0, 1.0, 0.01, 0.15);
+    surfaces_page.add(&edges_group);
+
+    let typography_group = adw::PreferencesGroup::new();
+    typography_group.set_title("Typography");
+    let primary_text_row = adw::ActionRow::new();
+    primary_text_row.set_title("Primary text");
+    let semantic_primary_text = gtk::ColorDialogButton::new(None::<gtk::ColorDialog>);
+    semantic_primary_text.set_rgba(&gtk::gdk::RGBA::new(0.96, 0.98, 1.0, 1.0));
+    primary_text_row.add_suffix(&semantic_primary_text);
+    typography_group.add(&primary_text_row);
+    let secondary_text_row = adw::ActionRow::new();
+    secondary_text_row.set_title("Secondary text");
+    let semantic_secondary_text = gtk::ColorDialogButton::new(None::<gtk::ColorDialog>);
+    semantic_secondary_text.set_rgba(&gtk::gdk::RGBA::new(0.72, 0.78, 0.86, 1.0));
+    secondary_text_row.add_suffix(&semantic_secondary_text);
+    typography_group.add(&secondary_text_row);
+    let semantic_font_weight =
+        add_scale_row(&typography_group, "Font weight", 100.0, 900.0, 100.0, 500.0);
+    let semantic_font_size = add_scale_row(&typography_group, "Font size", 8.0, 72.0, 1.0, 14.0);
+    let semantic_letter_spacing =
+        add_scale_row(&typography_group, "Letter spacing", -2.0, 8.0, 0.1, 0.0);
+    surfaces_page.add(&typography_group);
+
+    let layout_group = adw::PreferencesGroup::new();
+    layout_group.set_title("Layout");
+    let semantic_bar_height = add_scale_row(&layout_group, "Bar height", 24.0, 96.0, 1.0, 36.0);
+    let semantic_dock_width = add_scale_row(&layout_group, "Dock width", 40.0, 160.0, 1.0, 64.0);
+    let semantic_padding = add_scale_row(&layout_group, "Padding", 0.0, 48.0, 1.0, 12.0);
+    let semantic_gap = add_scale_row(&layout_group, "Gaps", 0.0, 48.0, 1.0, 8.0);
+    let semantic_icon_size = add_scale_row(&layout_group, "Icon size", 12.0, 96.0, 1.0, 24.0);
+    layout_page.add(&layout_group);
+
+    let color_behavior_group = adw::PreferencesGroup::new();
+    color_behavior_group.set_title("Color Behavior");
+    let semantic_sdr_white =
+        add_scale_row(&color_behavior_group, "SDR white", 80.0, 400.0, 1.0, 203.0);
+    let semantic_luminance_cap = add_scale_row(
+        &color_behavior_group,
+        "Luminance cap",
+        203.0,
+        10_000.0,
+        10.0,
+        1_000.0,
+    );
+    let gamut_mapping_row = adw::ActionRow::new();
+    gamut_mapping_row.set_title("Gamut mapping");
+    let semantic_gamut_mapping = dropdown_from_strings(&["Clip", "Perceptual", "Preserve Hue"], 1);
+    gamut_mapping_row.add_suffix(&semantic_gamut_mapping);
+    color_behavior_group.add(&gamut_mapping_row);
+    layout_page.add(&color_behavior_group);
+
+    let wallpaper_processing_group = adw::PreferencesGroup::new();
+    wallpaper_processing_group.set_title("Wallpaper Integration");
+    let semantic_wallpaper_blur =
+        add_scale_row(&wallpaper_processing_group, "Blur", 0.0, 64.0, 1.0, 0.0);
+    let semantic_wallpaper_saturation = add_scale_row(
+        &wallpaper_processing_group,
+        "Saturation",
+        0.0,
+        2.0,
+        0.01,
+        1.0,
+    );
+    let auto_accent_row = adw::ActionRow::new();
+    auto_accent_row.set_title("Automatic accent extraction");
+    let semantic_auto_accent = gtk::Switch::new();
+    auto_accent_row.add_suffix(&semantic_auto_accent);
+    wallpaper_processing_group.add(&auto_accent_row);
+    wallpaper_page.add(&wallpaper_processing_group);
+
+    let phase = adw::PreferencesGroup::new();
+    phase.set_title("Paint");
+    let mode_row = adw::ActionRow::new();
+    mode_row.set_title("Color mode");
+    let mode = dropdown_from_strings(&["Solid", "Linear Gradient", "Radial Gradient"], 0);
+    mode_row.add_suffix(&mode);
+    phase.add(&mode_row);
+    let phase_row = adw::ActionRow::new();
+    phase_row.set_title("Gamut");
+    phase_row.set_subtitle("The picker geometry stays the same in either gamut");
+    let gamut = dropdown_from_strings(&["sRGB", "Display P3"], 0);
+    phase_row.add_suffix(&gamut);
+    phase.add(&phase_row);
+
+    let dynamic_range_row = adw::ActionRow::new();
+    dynamic_range_row.set_title("Dynamic range");
+    dynamic_range_row.set_subtitle("HDR changes luminance intent, not picker geometry");
+    let dynamic_range = dropdown_from_strings(&["SDR", "HDR"], 0);
+    dynamic_range_row.add_suffix(&dynamic_range);
+    phase.add(&dynamic_range_row);
+
+    let hdr_luminance_row = adw::ActionRow::new();
+    hdr_luminance_row.set_title("HDR luminance");
+    hdr_luminance_row.set_subtitle("SDR-mapped locally; source intent remains HDR");
+    let hdr_luminance = gtk::Scale::with_range(gtk::Orientation::Horizontal, 203.0, 1_000.0, 1.0);
+    hdr_luminance.set_value(1_000.0);
+    hdr_luminance.set_digits(0);
+    hdr_luminance.set_draw_value(true);
+    hdr_luminance.set_size_request(320, -1);
+    hdr_luminance.set_sensitive(false);
+    hdr_luminance_row.add_suffix(&hdr_luminance);
+    phase.add(&hdr_luminance_row);
+    paint_page.add(&phase);
+
+    let gradient_group = adw::PreferencesGroup::new();
+    gradient_group.set_title("Gradient");
+    gradient_group.set_visible(false);
+    let stop_rail = gtk::DrawingArea::new();
+    stop_rail.set_content_height(72);
+    stop_rail.set_hexpand(true);
+    stop_rail.set_focusable(true);
+    stop_rail.set_accessible_role(gtk::AccessibleRole::Slider);
+    stop_rail.update_property(&[
+        gtk::accessible::Property::Label("Gradient stops"),
+        gtk::accessible::Property::Description(
+            "Select or drag a stop. Left and Right move the selected stop; hold Shift for larger steps.",
+        ),
+        gtk::accessible::Property::ValueMin(0.0),
+        gtk::accessible::Property::ValueMax(100.0),
+    ]);
+    {
+        let draft = draft.clone();
+        stop_rail.set_draw_func(move |_, cr, width, height| {
+            draw_gradient_stop_rail(cr, width, height, &draft.borrow());
+        });
+    }
+    gradient_group.add(&stop_rail);
+
+    let stop_actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let add_stop = gtk::Button::with_label("Add Stop");
+    let duplicate_stop = gtk::Button::with_label("Duplicate");
+    let remove_stop = gtk::Button::with_label("Remove");
+    stop_actions.append(&add_stop);
+    stop_actions.append(&duplicate_stop);
+    stop_actions.append(&remove_stop);
+    gradient_group.add(&stop_actions);
+
+    let position_row = adw::ActionRow::new();
+    position_row.set_title("Selected stop position");
+    let stop_position = gtk::SpinButton::with_range(0.0, 1.0, 0.01);
+    stop_position.set_digits(2);
+    stop_position.set_value(0.0);
+    position_row.add_suffix(&stop_position);
+    gradient_group.add(&position_row);
+
+    let interpolation_row = adw::ActionRow::new();
+    interpolation_row.set_title("Interpolation gamut");
+    let interpolation = dropdown_from_strings(&["Linear sRGB", "Linear Display P3"], 0);
+    interpolation_row.add_suffix(&interpolation);
+    gradient_group.add(&interpolation_row);
+
+    let angle_row = adw::ActionRow::new();
+    angle_row.set_title("Linear angle");
+    let linear_angle = gtk::SpinButton::with_range(0.0, 360.0, 1.0);
+    linear_angle.set_digits(0);
+    linear_angle.set_value(135.0);
+    angle_row.add_suffix(&linear_angle);
+    gradient_group.add(&angle_row);
+
+    let radial_center_x_row = adw::ActionRow::new();
+    radial_center_x_row.set_title("Radial center X");
+    let radial_center_x = gtk::SpinButton::with_range(0.0, 1.0, 0.01);
+    radial_center_x.set_digits(2);
+    radial_center_x.set_value(0.5);
+    radial_center_x_row.add_suffix(&radial_center_x);
+    radial_center_x_row.set_visible(false);
+    gradient_group.add(&radial_center_x_row);
+
+    let radial_center_y_row = adw::ActionRow::new();
+    radial_center_y_row.set_title("Radial center Y");
+    let radial_center_y = gtk::SpinButton::with_range(0.0, 1.0, 0.01);
+    radial_center_y.set_digits(2);
+    radial_center_y.set_value(0.5);
+    radial_center_y_row.add_suffix(&radial_center_y);
+    radial_center_y_row.set_visible(false);
+    gradient_group.add(&radial_center_y_row);
+
+    let radial_radius_row = adw::ActionRow::new();
+    radial_radius_row.set_title("Radial radius");
+    let radial_radius = gtk::SpinButton::with_range(0.01, 2.0, 0.01);
+    radial_radius.set_digits(2);
+    radial_radius.set_value(0.75);
+    radial_radius_row.add_suffix(&radial_radius);
+    radial_radius_row.set_visible(false);
+    gradient_group.add(&radial_radius_row);
+    paint_page.add(&gradient_group);
+
+    let editor_group = adw::PreferencesGroup::new();
+    editor_group.set_title("Picker and Preview");
+    let columns = gtk::Box::new(gtk::Orientation::Horizontal, 24);
+    columns.set_homogeneous(true);
+
+    let picker_column = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let picker = gtk::DrawingArea::new();
+    picker.set_content_width(238);
+    picker.set_content_height(238);
+    picker.set_halign(gtk::Align::Center);
+    picker.set_valign(gtk::Align::Center);
+    picker.set_focusable(true);
+    picker.set_accessible_role(gtk::AccessibleRole::Slider);
+    picker.update_property(&[
+        gtk::accessible::Property::Label("Saturation and value"),
+        gtk::accessible::Property::Description(
+            "Drag to choose saturation and value. Arrow keys adjust the selection; hold Shift for larger steps.",
+        ),
+        gtk::accessible::Property::ValueMin(0.0),
+        gtk::accessible::Property::ValueMax(100.0),
+    ]);
+    picker.set_tooltip_text(Some(
+        "Saturation/value — drag, or use arrow keys (Shift for larger steps)",
+    ));
+    {
+        let draft = draft.clone();
+        picker.set_draw_func(move |_, cr, width, height| {
+            draw_theme_picker(cr, width, height, &draft.borrow());
+        });
+    }
+    let hue_slider = gtk::DrawingArea::new();
+    hue_slider.set_content_width(340);
+    hue_slider.set_content_height(340);
+    hue_slider.set_halign(gtk::Align::Center);
+    hue_slider.set_focusable(true);
+    hue_slider.set_accessible_role(gtk::AccessibleRole::Slider);
+    hue_slider.update_property(&[
+        gtk::accessible::Property::Label("Hue"),
+        gtk::accessible::Property::Description(
+            "Drag around the ring to choose hue. Arrow keys adjust one degree; hold Shift for ten degrees.",
+        ),
+        gtk::accessible::Property::ValueMin(0.0),
+        gtk::accessible::Property::ValueMax(360.0),
+        gtk::accessible::Property::ValueNow(205.0),
+    ]);
+    hue_slider.set_tooltip_text(Some(
+        "Hue ring — drag, or use arrow keys (Shift for 10° steps)",
+    ));
+    {
+        let draft = draft.clone();
+        hue_slider.set_draw_func(move |_, cr, width, height| {
+            draw_hue_ring(cr, width, height, draft.borrow().hue);
+        });
+    }
+    let picker_overlay = gtk::Overlay::new();
+    picker_overlay.set_child(Some(&hue_slider));
+    picker_overlay.add_overlay(&picker);
+    picker_column.append(&picker_overlay);
+
+    let gamut_status = gtk::Label::new(None);
+    gamut_status.set_xalign(0.5);
+    update_theme_editor_status(&gamut_status, &draft.borrow());
+    update_theme_editor_accessibility(&picker, &hue_slider, &draft.borrow());
+    picker_column.append(&gamut_status);
+
+    let values = gtk::Grid::new();
+    values.set_column_spacing(8);
+    values.set_row_spacing(8);
+    let encoded = hsv_to_rgb(205.0, 0.88, 1.0);
+    let mut spins = Vec::new();
+    for (column, (name, initial)) in [
+        ("R", encoded[0]),
+        ("G", encoded[1]),
+        ("B", encoded[2]),
+        ("A", 1.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let label = gtk::Label::new(Some(name));
+        let spin = gtk::SpinButton::with_range(0.0, 1.0, 0.001);
+        spin.set_digits(3);
+        spin.set_value(initial);
+        values.attach(&label, column as i32, 0, 1, 1);
+        values.attach(&spin, column as i32, 1, 1, 1);
+        spins.push(spin);
+    }
+    picker_column.append(&values);
+    columns.append(&picker_column);
+
+    let preview_column = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    let preview_title = gtk::Label::new(Some("Live FocalDesk surfaces"));
+    preview_title.set_xalign(0.0);
+    preview_title.add_css_class("heading");
+    preview_column.append(&preview_title);
+    let preview = gtk::DrawingArea::new();
+    preview.set_content_width(440);
+    preview.set_content_height(340);
+    preview.set_hexpand(true);
+    preview.set_vexpand(true);
+    {
+        let draft = draft.clone();
+        preview.set_draw_func(move |_, cr, width, height| {
+            draw_theme_preview(cr, width, height, &draft.borrow());
+        });
+    }
+    preview_column.append(&preview);
+    let preview_range_status = gtk::Label::new(Some("SDR preview"));
+    preview_range_status.set_xalign(0.0);
+    preview_range_status.add_css_class("dim-label");
+    preview_column.append(&preview_range_status);
+
+    columns.append(&preview_column);
+    editor_group.add(&columns);
+    paint_page.add(&editor_group);
+
+    let syncing = Rc::new(Cell::new(false));
+    let sync_numeric = {
+        let spins = spins.clone();
+        let gamut = gamut.clone();
+        let stop_position = stop_position.clone();
+        let syncing = syncing.clone();
+        Rc::new(move |draft: &ThemeEditorDraft| {
+            syncing.set(true);
+            let rgb = hsv_to_rgb(draft.hue, draft.saturation, draft.value);
+            for (spin, value) in spins[..3].iter().zip(rgb) {
+                spin.set_value(value);
+            }
+            spins[3].set_value(draft.alpha);
+            gamut.set_selected(if draft.space() == ThemeColorSpace::Srgb {
+                0
+            } else {
+                1
+            });
+            if draft.mode != 0 {
+                stop_position.set_value(f64::from(draft.stops[draft.selected_stop].position));
+            }
+            syncing.set(false);
+        })
+    };
+
+    let sync_document_ui = {
+        let theme_name = theme_name.clone();
+        let mode = mode.clone();
+        let gamut = gamut.clone();
+        let dynamic_range = dynamic_range.clone();
+        let hdr_luminance = hdr_luminance.clone();
+        let interpolation = interpolation.clone();
+        let stop_position = stop_position.clone();
+        let linear_angle = linear_angle.clone();
+        let radial_center_x = radial_center_x.clone();
+        let radial_center_y = radial_center_y.clone();
+        let radial_radius = radial_radius.clone();
+        let gradient_group = gradient_group.clone();
+        let angle_row = angle_row.clone();
+        let radial_center_x_row = radial_center_x_row.clone();
+        let radial_center_y_row = radial_center_y_row.clone();
+        let radial_radius_row = radial_radius_row.clone();
+        let remove_stop = remove_stop.clone();
+        let preview_range_status = preview_range_status.clone();
+        let wallpaper_picture = wallpaper_picture.clone();
+        let wallpaper_row = wallpaper_row.clone();
+        let clear_wallpaper = clear_wallpaper.clone();
+        let semantic_preview = semantic_preview.clone();
+        let wallpaper_fit = wallpaper_fit.clone();
+        let wallpaper_dim = wallpaper_dim.clone();
+        let wallpaper_tint = wallpaper_tint.clone();
+        let tint_values = tint_values.clone();
+        let wallpaper_tint_spins = wallpaper_tint_spins.clone();
+        let semantic_color_spins = semantic_color_spins.clone();
+        let semantic_surface_select = semantic_surface_select.clone();
+        let semantic_state_select = semantic_state_select.clone();
+        let semantic_override = semantic_override.clone();
+        let semantic_border_width = semantic_border_width.clone();
+        let semantic_border_color = semantic_border_color.clone();
+        let semantic_inner_highlight = semantic_inner_highlight.clone();
+        let semantic_radius = semantic_radius.clone();
+        let semantic_shadow = semantic_shadow.clone();
+        let semantic_glow = semantic_glow.clone();
+        let semantic_font_weight = semantic_font_weight.clone();
+        let semantic_primary_text = semantic_primary_text.clone();
+        let semantic_secondary_text = semantic_secondary_text.clone();
+        let semantic_font_size = semantic_font_size.clone();
+        let semantic_letter_spacing = semantic_letter_spacing.clone();
+        let semantic_bar_height = semantic_bar_height.clone();
+        let semantic_dock_width = semantic_dock_width.clone();
+        let semantic_padding = semantic_padding.clone();
+        let semantic_gap = semantic_gap.clone();
+        let semantic_icon_size = semantic_icon_size.clone();
+        let semantic_sdr_white = semantic_sdr_white.clone();
+        let semantic_luminance_cap = semantic_luminance_cap.clone();
+        let semantic_gamut_mapping = semantic_gamut_mapping.clone();
+        let semantic_wallpaper_blur = semantic_wallpaper_blur.clone();
+        let semantic_wallpaper_saturation = semantic_wallpaper_saturation.clone();
+        let semantic_auto_accent = semantic_auto_accent.clone();
+        let picker = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let syncing = syncing.clone();
+        let sync_numeric = sync_numeric.clone();
+        Rc::new(move |draft: &ThemeEditorDraft| {
+            syncing.set(true);
+            theme_name.set_text(&draft.theme_name);
+            mode.set_selected(draft.mode);
+            gamut.set_selected(if draft.space() == ThemeColorSpace::Srgb {
+                0
+            } else {
+                1
+            });
+            let is_hdr = draft.dynamic_range == ThemeDynamicRange::Hdr;
+            dynamic_range.set_selected(u32::from(is_hdr));
+            hdr_luminance.set_value(draft.hdr_luminance_nits);
+            hdr_luminance.set_sensitive(is_hdr);
+            interpolation.set_selected(if draft.interpolation_space == ThemeColorSpace::Srgb {
+                0
+            } else {
+                1
+            });
+            if draft.mode != 0 {
+                stop_position.set_value(f64::from(draft.stops[draft.selected_stop].position));
+            }
+            linear_angle.set_value(draft.linear_angle);
+            radial_center_x.set_value(draft.radial_center.0);
+            radial_center_y.set_value(draft.radial_center.1);
+            radial_radius.set_value(draft.radial_radius);
+            gradient_group.set_visible(draft.mode != 0);
+            angle_row.set_visible(draft.mode == 1);
+            radial_center_x_row.set_visible(draft.mode == 2);
+            radial_center_y_row.set_visible(draft.mode == 2);
+            radial_radius_row.set_visible(draft.mode == 2);
+            remove_stop.set_sensitive(draft.stops.len() > 2);
+            let preview_status = if is_hdr {
+                format!(
+                    "HDR · {:.0} nits · SDR-mapped preview",
+                    draft.hdr_luminance_nits
+                )
+            } else {
+                "SDR preview".to_string()
+            };
+            preview_range_status.set_text(&preview_status);
+            if let Some(path) = draft.wallpaper.path.as_deref() {
+                wallpaper_picture.set_filename(Some(path));
+                wallpaper_row.set_subtitle(path);
+                clear_wallpaper.set_sensitive(true);
+            } else {
+                wallpaper_picture.set_filename(None::<&std::path::Path>);
+                wallpaper_row.set_subtitle("No wallpaper selected");
+                clear_wallpaper.set_sensitive(false);
+            }
+            wallpaper_fit.set_selected(match draft.wallpaper.fit {
+                ThemeWallpaperFit::Fill => 0,
+                ThemeWallpaperFit::Fit => 1,
+                ThemeWallpaperFit::Stretch => 2,
+                ThemeWallpaperFit::Center => 3,
+                ThemeWallpaperFit::Tile => 4,
+            });
+            wallpaper_dim.set_value(f64::from(draft.wallpaper.dim));
+            let tint_enabled = draft.wallpaper.tint.is_some();
+            wallpaper_tint.set_active(tint_enabled);
+            tint_values.set_sensitive(tint_enabled);
+            if let Some(tint) = draft.wallpaper.tint {
+                for (spin, value) in wallpaper_tint_spins.iter().zip(tint.components()) {
+                    spin.set_value(f64::from(value));
+                }
+            }
+            for (spin, value) in semantic_color_spins
+                .iter()
+                .zip(draft.semantic.surfaces.bar.normal.components())
+            {
+                spin.set_value(f64::from(value));
+                spin.set_sensitive(true);
+            }
+            semantic_surface_select.set_selected(0);
+            semantic_state_select.set_selected(0);
+            semantic_override.set_active(true);
+            semantic_override.set_sensitive(false);
+            semantic_border_width.set_value(f64::from(draft.semantic.edges.border_width));
+            for (button, color) in [
+                (&semantic_border_color, draft.semantic.edges.border_color),
+                (
+                    &semantic_inner_highlight,
+                    draft.semantic.edges.inner_highlight,
+                ),
+            ] {
+                button.set_rgba(&gtk::gdk::RGBA::new(
+                    srgb_encode(color.r) as f32,
+                    srgb_encode(color.g) as f32,
+                    srgb_encode(color.b) as f32,
+                    color.a,
+                ));
+            }
+            semantic_radius.set_value(f64::from(draft.semantic.edges.radius));
+            semantic_shadow.set_value(f64::from(draft.semantic.edges.shadow));
+            semantic_glow.set_value(f64::from(draft.semantic.edges.glow));
+            semantic_font_weight.set_value(f64::from(draft.semantic.typography.font_weight));
+            for (button, color) in [
+                (&semantic_primary_text, draft.semantic.typography.primary),
+                (
+                    &semantic_secondary_text,
+                    draft.semantic.typography.secondary,
+                ),
+            ] {
+                button.set_rgba(&gtk::gdk::RGBA::new(
+                    srgb_encode(color.r) as f32,
+                    srgb_encode(color.g) as f32,
+                    srgb_encode(color.b) as f32,
+                    color.a,
+                ));
+            }
+            semantic_font_size.set_value(f64::from(draft.semantic.typography.size));
+            semantic_letter_spacing.set_value(f64::from(draft.semantic.typography.letter_spacing));
+            semantic_bar_height.set_value(f64::from(draft.semantic.layout.bar_height));
+            semantic_dock_width.set_value(f64::from(draft.semantic.layout.dock_width));
+            semantic_padding.set_value(f64::from(draft.semantic.layout.padding));
+            semantic_gap.set_value(f64::from(draft.semantic.layout.gap));
+            semantic_icon_size.set_value(f64::from(draft.semantic.layout.icon_size));
+            semantic_sdr_white.set_value(f64::from(draft.semantic.color_behavior.sdr_white_nits));
+            semantic_luminance_cap
+                .set_value(f64::from(draft.semantic.color_behavior.luminance_cap_nits));
+            semantic_gamut_mapping.set_selected(
+                match draft.semantic.color_behavior.gamut_mapping {
+                    focaldesk_themes::GamutMapping::Clip => 0,
+                    focaldesk_themes::GamutMapping::Perceptual => 1,
+                    focaldesk_themes::GamutMapping::PreserveHue => 2,
+                },
+            );
+            semantic_wallpaper_blur.set_value(f64::from(draft.semantic.wallpaper.blur));
+            semantic_wallpaper_saturation.set_value(f64::from(draft.semantic.wallpaper.saturation));
+            semantic_auto_accent.set_active(draft.semantic.wallpaper.automatic_accent);
+            sync_numeric(draft);
+            syncing.set(false);
+            picker.queue_draw();
+            hue_slider.queue_draw();
+            preview.queue_draw();
+            semantic_preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, draft);
+            update_theme_editor_accessibility(&picker, &hue_slider, draft);
+            update_gradient_stop_accessibility(&stop_rail, draft);
+        })
+    };
+
+    {
+        let draft = draft.clone();
+        let syncing = syncing.clone();
+        theme_name.connect_changed(move |entry| {
+            if !syncing.get() {
+                draft.borrow_mut().theme_name = entry.text().to_string();
+            }
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let wallpaper_picture = wallpaper_picture.clone();
+        let wallpaper_row = wallpaper_row.clone();
+        let clear_wallpaper = clear_wallpaper.clone();
+        let semantic_preview = semantic_preview.clone();
+        choose_wallpaper.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Choose Theme Wallpaper");
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Wallpaper images"));
+            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp"] {
+                filter.add_pattern(pattern);
+            }
+            dialog.set_default_filter(Some(&filter));
+            dialog.open(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let draft = draft.clone();
+                let wallpaper_picture = wallpaper_picture.clone();
+                let wallpaper_row = wallpaper_row.clone();
+                let clear_wallpaper = clear_wallpaper.clone();
+                let semantic_preview = semantic_preview.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        wallpaper_row.set_subtitle("Wallpaper must be a local image");
+                        return;
+                    };
+                    draft.borrow_mut().wallpaper.path = Some(path.to_string_lossy().into_owned());
+                    if draft.borrow().semantic.wallpaper.automatic_accent {
+                        if let Ok(accent) = extract_wallpaper_accent(&path) {
+                            draft.borrow_mut().semantic.surfaces.active_button.normal = accent;
+                            semantic_preview.queue_draw();
+                        }
+                    }
+                    wallpaper_picture.set_filename(Some(&path));
+                    wallpaper_row.set_subtitle(&path.display().to_string());
+                    clear_wallpaper.set_sensitive(true);
+                }
+            });
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let wallpaper_picture = wallpaper_picture.clone();
+        let wallpaper_row = wallpaper_row.clone();
+        let clear_wallpaper = clear_wallpaper.clone();
+        clear_wallpaper.clone().connect_clicked(move |_| {
+            draft.borrow_mut().wallpaper.path = None;
+            wallpaper_picture.set_filename(None::<&std::path::Path>);
+            wallpaper_row.set_subtitle("No wallpaper selected");
+            clear_wallpaper.set_sensitive(false);
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let syncing = syncing.clone();
+        wallpaper_fit.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            draft.borrow_mut().wallpaper.fit = match dropdown.selected() {
+                1 => ThemeWallpaperFit::Fit,
+                2 => ThemeWallpaperFit::Stretch,
+                3 => ThemeWallpaperFit::Center,
+                4 => ThemeWallpaperFit::Tile,
+                _ => ThemeWallpaperFit::Fill,
+            };
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let syncing = syncing.clone();
+        wallpaper_dim.connect_value_changed(move |scale| {
+            if !syncing.get() {
+                draft.borrow_mut().wallpaper.dim = scale.value() as f32;
+            }
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let tint_values = tint_values.clone();
+        let wallpaper_tint_spins = wallpaper_tint_spins.clone();
+        let syncing = syncing.clone();
+        wallpaper_tint.connect_active_notify(move |toggle| {
+            if syncing.get() {
+                return;
+            }
+            tint_values.set_sensitive(toggle.is_active());
+            draft.borrow_mut().wallpaper.tint = toggle.is_active().then(|| {
+                ThemeColor::srgb(
+                    wallpaper_tint_spins[0].value() as f32,
+                    wallpaper_tint_spins[1].value() as f32,
+                    wallpaper_tint_spins[2].value() as f32,
+                    wallpaper_tint_spins[3].value() as f32,
+                )
+            });
+        });
+    }
+
+    for spin in &wallpaper_tint_spins {
+        let draft = draft.clone();
+        let wallpaper_tint_spins = wallpaper_tint_spins.clone();
+        let syncing = syncing.clone();
+        spin.connect_value_changed(move |_| {
+            if syncing.get() || draft.borrow().wallpaper.tint.is_none() {
+                return;
+            }
+            draft.borrow_mut().wallpaper.tint = Some(ThemeColor::srgb(
+                wallpaper_tint_spins[0].value() as f32,
+                wallpaper_tint_spins[1].value() as f32,
+                wallpaper_tint_spins[2].value() as f32,
+                wallpaper_tint_spins[3].value() as f32,
+            ));
+        });
+    }
+
+    let sync_semantic_color_controls = {
+        let draft = draft.clone();
+        let semantic_surface_select = semantic_surface_select.clone();
+        let semantic_state_select = semantic_state_select.clone();
+        let semantic_override = semantic_override.clone();
+        let semantic_color_spins = semantic_color_spins.clone();
+        let syncing = syncing.clone();
+        Rc::new(move || {
+            let draft = draft.borrow();
+            let style = semantic_surface(&draft.semantic, semantic_surface_select.selected());
+            let state = interaction_state_from_index(semantic_state_select.selected());
+            let explicit = match state {
+                InteractionState::Normal => true,
+                InteractionState::Hover => style.hover.is_some(),
+                InteractionState::Pressed => style.pressed.is_some(),
+                InteractionState::Selected => style.selected.is_some(),
+                InteractionState::Focused => style.focused.is_some(),
+                InteractionState::Urgent => style.urgent.is_some(),
+                InteractionState::Disabled => style.disabled.is_some(),
+            };
+            syncing.set(true);
+            semantic_override.set_sensitive(state != InteractionState::Normal);
+            semantic_override.set_active(explicit);
+            for (spin, value) in semantic_color_spins
+                .iter()
+                .zip(style.resolve(state).components())
+            {
+                spin.set_value(f64::from(value));
+                spin.set_sensitive(explicit);
+            }
+            syncing.set(false);
+        })
+    };
+
+    for dropdown in [&semantic_surface_select, &semantic_state_select] {
+        let sync = sync_semantic_color_controls.clone();
+        let semantic_preview = semantic_preview.clone();
+        dropdown.connect_selected_notify(move |_| {
+            sync();
+            semantic_preview.queue_draw();
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let semantic_surface_select = semantic_surface_select.clone();
+        let semantic_state_select = semantic_state_select.clone();
+        let semantic_color_spins = semantic_color_spins.clone();
+        let semantic_preview = semantic_preview.clone();
+        let syncing = syncing.clone();
+        semantic_override.connect_active_notify(move |toggle| {
+            if syncing.get() {
+                return;
+            }
+            let state = interaction_state_from_index(semantic_state_select.selected());
+            let mut draft = draft.borrow_mut();
+            let style =
+                semantic_surface_mut(&mut draft.semantic, semantic_surface_select.selected());
+            if let Some(slot) = style.override_for_mut(state) {
+                *slot = toggle.is_active().then(|| {
+                    ThemeColor::srgb(
+                        semantic_color_spins[0].value() as f32,
+                        semantic_color_spins[1].value() as f32,
+                        semantic_color_spins[2].value() as f32,
+                        semantic_color_spins[3].value() as f32,
+                    )
+                });
+            }
+            for spin in &semantic_color_spins {
+                spin.set_sensitive(toggle.is_active());
+            }
+            semantic_preview.queue_draw();
+        });
+    }
+
+    for spin in &semantic_color_spins {
+        let draft = draft.clone();
+        let semantic_surface_select = semantic_surface_select.clone();
+        let semantic_state_select = semantic_state_select.clone();
+        let semantic_color_spins = semantic_color_spins.clone();
+        let semantic_preview = semantic_preview.clone();
+        let syncing = syncing.clone();
+        spin.connect_value_changed(move |_| {
+            if syncing.get() {
+                return;
+            }
+            let color = ThemeColor::srgb(
+                semantic_color_spins[0].value() as f32,
+                semantic_color_spins[1].value() as f32,
+                semantic_color_spins[2].value() as f32,
+                semantic_color_spins[3].value() as f32,
+            );
+            let state = interaction_state_from_index(semantic_state_select.selected());
+            let mut draft = draft.borrow_mut();
+            let style =
+                semantic_surface_mut(&mut draft.semantic, semantic_surface_select.selected());
+            if state == InteractionState::Normal {
+                style.normal = color;
+            } else if let Some(slot) = style.override_for_mut(state) {
+                *slot = Some(color);
+            }
+            semantic_preview.queue_draw();
+        });
+    }
+
+    for (scale, field) in [
+        (&semantic_border_width, 0u8),
+        (&semantic_radius, 1),
+        (&semantic_shadow, 2),
+        (&semantic_glow, 3),
+        (&semantic_font_weight, 4),
+        (&semantic_font_size, 5),
+        (&semantic_letter_spacing, 6),
+        (&semantic_bar_height, 7),
+        (&semantic_dock_width, 8),
+        (&semantic_padding, 9),
+        (&semantic_gap, 10),
+        (&semantic_icon_size, 11),
+        (&semantic_sdr_white, 12),
+        (&semantic_luminance_cap, 13),
+        (&semantic_wallpaper_blur, 14),
+        (&semantic_wallpaper_saturation, 15),
+    ] {
+        let draft = draft.clone();
+        let semantic_preview = semantic_preview.clone();
+        let syncing = syncing.clone();
+        scale.connect_value_changed(move |scale| {
+            if syncing.get() {
+                return;
+            }
+            let value = scale.value() as f32;
+            let mut draft = draft.borrow_mut();
+            match field {
+                0 => draft.semantic.edges.border_width = value,
+                1 => draft.semantic.edges.radius = value,
+                2 => draft.semantic.edges.shadow = value,
+                3 => draft.semantic.edges.glow = value,
+                4 => draft.semantic.typography.font_weight = value as u16,
+                5 => draft.semantic.typography.size = value,
+                6 => draft.semantic.typography.letter_spacing = value,
+                7 => draft.semantic.layout.bar_height = value,
+                8 => draft.semantic.layout.dock_width = value,
+                9 => draft.semantic.layout.padding = value,
+                10 => draft.semantic.layout.gap = value,
+                11 => draft.semantic.layout.icon_size = value,
+                12 => {
+                    draft.semantic.color_behavior.sdr_white_nits = value;
+                    draft.semantic.color_behavior.luminance_cap_nits =
+                        draft.semantic.color_behavior.luminance_cap_nits.max(value);
+                }
+                13 => {
+                    draft.semantic.color_behavior.luminance_cap_nits =
+                        value.max(draft.semantic.color_behavior.sdr_white_nits);
+                }
+                14 => draft.semantic.wallpaper.blur = value,
+                _ => draft.semantic.wallpaper.saturation = value,
+            }
+            semantic_preview.queue_draw();
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let syncing = syncing.clone();
+        semantic_gamut_mapping.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            draft.borrow_mut().semantic.color_behavior.gamut_mapping = match dropdown.selected() {
+                0 => focaldesk_themes::GamutMapping::Clip,
+                2 => focaldesk_themes::GamutMapping::PreserveHue,
+                _ => focaldesk_themes::GamutMapping::Perceptual,
+            };
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let syncing = syncing.clone();
+        let semantic_preview = semantic_preview.clone();
+        semantic_auto_accent.connect_active_notify(move |toggle| {
+            if !syncing.get() {
+                draft.borrow_mut().semantic.wallpaper.automatic_accent = toggle.is_active();
+                if toggle.is_active() {
+                    let path = draft.borrow().wallpaper.path.clone();
+                    if let Some(accent) = path
+                        .and_then(|path| extract_wallpaper_accent(std::path::Path::new(&path)).ok())
+                    {
+                        draft.borrow_mut().semantic.surfaces.active_button.normal = accent;
+                        semantic_preview.queue_draw();
+                    }
+                }
+            }
+        });
+    }
+    for (button, target) in [
+        (&semantic_primary_text, 0u8),
+        (&semantic_secondary_text, 1),
+        (&semantic_border_color, 2),
+        (&semantic_inner_highlight, 3),
+    ] {
+        let draft = draft.clone();
+        let semantic_preview = semantic_preview.clone();
+        let syncing = syncing.clone();
+        button.connect_rgba_notify(move |button| {
+            if syncing.get() {
+                return;
+            }
+            let rgba = button.rgba();
+            let color = ThemeColor::srgb(
+                srgb_decode(f64::from(rgba.red())) as f32,
+                srgb_decode(f64::from(rgba.green())) as f32,
+                srgb_decode(f64::from(rgba.blue())) as f32,
+                rgba.alpha(),
+            );
+            match target {
+                0 => draft.borrow_mut().semantic.typography.primary = color,
+                1 => draft.borrow_mut().semantic.typography.secondary = color,
+                2 => draft.borrow_mut().semantic.edges.border_color = color,
+                _ => draft.borrow_mut().semantic.edges.inner_highlight = color,
+            }
+            semantic_preview.queue_draw();
+        });
+    }
+    sync_semantic_color_controls();
+
+    let save_as_action: Rc<dyn Fn()> = {
+        let draft = draft.clone();
+        let saved_document = saved_document.clone();
+        let current_path = current_path.clone();
+        let file_message = file_message.clone();
+        Rc::new(move || {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Save FocalDesk Theme");
+            dialog.set_initial_name(Some("focaldesk-theme.toml"));
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("FocalDesk themes (*.toml)"));
+            filter.add_pattern("*.toml");
+            dialog.set_default_filter(Some(&filter));
+            dialog.save(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let draft = draft.clone();
+                let saved_document = saved_document.clone();
+                let current_path = current_path.clone();
+                let file_message = file_message.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        file_message.set_text("That destination is not a local file");
+                        return;
+                    };
+                    match persist_theme_editor_document(
+                        &draft,
+                        &saved_document,
+                        &current_path,
+                        path,
+                    ) {
+                        Ok(()) => file_message.set_text("Theme saved"),
+                        Err(error) => file_message.set_text(&format!("Save failed: {error}")),
+                    }
+                }
+            });
+        })
+    };
+
+    {
+        let draft = draft.clone();
+        let package_row = package_row.clone();
+        export_package.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Export FocalDesk Theme Package");
+            dialog.set_initial_name(Some("focaldesk-theme.fdtheme"));
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("FocalDesk theme packages (*.fdtheme)"));
+            filter.add_pattern("*.fdtheme");
+            dialog.set_default_filter(Some(&filter));
+            dialog.save(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let draft = draft.clone();
+                let package_row = package_row.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        package_row.set_subtitle("Export destination must be local");
+                        return;
+                    };
+                    let result = ThemePackage::from_document(&draft.borrow().document())
+                        .and_then(|package| package.save(&theme_package_path(path)));
+                    match result {
+                        Ok(()) => package_row.set_subtitle("Package exported"),
+                        Err(error) => package_row.set_subtitle(&format!("Export failed: {error}")),
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let saved_document = saved_document.clone();
+        let current_path = current_path.clone();
+        let installed_slug = installed_slug.clone();
+        let sync_document_ui = sync_document_ui.clone();
+        let package_row = package_row.clone();
+        let uninstall_package = uninstall_package.clone();
+        import_package.connect_clicked(move |_| {
+            if draft.borrow().document() != *saved_document.borrow() {
+                package_row.set_subtitle("Save or revert unsaved changes before importing");
+                return;
+            }
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Import FocalDesk Theme Package");
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("FocalDesk theme packages (*.fdtheme)"));
+            filter.add_pattern("*.fdtheme");
+            dialog.set_default_filter(Some(&filter));
+            dialog.open(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let draft = draft.clone();
+                let saved_document = saved_document.clone();
+                let current_path = current_path.clone();
+                let installed_slug = installed_slug.clone();
+                let sync_document_ui = sync_document_ui.clone();
+                let package_row = package_row.clone();
+                let uninstall_package = uninstall_package.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        package_row.set_subtitle("Package source must be local");
+                        return;
+                    };
+                    let imported = ThemePackage::load(&path)
+                        .and_then(|package| {
+                            let installed = package.install(&installed_themes_root())?;
+                            let document = ThemeDocument::load(&installed.document_path)?;
+                            Ok((installed, document))
+                        })
+                        .and_then(|(installed, document)| {
+                            ThemeEditorDraft::from_document(&document)
+                                .map(|loaded| (installed, document, loaded))
+                                .map_err(anyhow::Error::msg)
+                        });
+                    match imported {
+                        Ok((installed, document, loaded)) => {
+                            *draft.borrow_mut() = loaded;
+                            *saved_document.borrow_mut() = document;
+                            *current_path.borrow_mut() = Some(installed.document_path);
+                            *installed_slug.borrow_mut() = Some(installed.slug.clone());
+                            let snapshot = draft.borrow().clone();
+                            sync_document_ui(&snapshot);
+                            uninstall_package.set_sensitive(true);
+                            package_row.set_subtitle(&format!("Installed: {}", installed.slug));
+                        }
+                        Err(error) => {
+                            package_row.set_subtitle(&format!("Import failed: {error}"));
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let current_path = current_path.clone();
+        let installed_slug = installed_slug.clone();
+        let package_row = package_row.clone();
+        let uninstall_package = uninstall_package.clone();
+        uninstall_package.clone().connect_clicked(move |_| {
+            let Some(slug) = installed_slug.borrow().clone() else {
+                return;
+            };
+            match ThemePackage::uninstall(&installed_themes_root(), &slug) {
+                Ok(()) => {
+                    *installed_slug.borrow_mut() = None;
+                    *current_path.borrow_mut() = None;
+                    draft.borrow_mut().wallpaper.path = None;
+                    uninstall_package.set_sensitive(false);
+                    package_row.set_subtitle("Theme uninstalled; editor draft retained");
+                }
+                Err(error) => package_row.set_subtitle(&format!("Uninstall failed: {error}")),
+            }
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let saved_document = saved_document.clone();
+        let current_path = current_path.clone();
+        let file_message = file_message.clone();
+        let save_as_action = save_as_action.clone();
+        save_theme.connect_clicked(move |_| {
+            let Some(path) = current_path.borrow().clone() else {
+                save_as_action();
+                return;
+            };
+            match persist_theme_editor_document(&draft, &saved_document, &current_path, path) {
+                Ok(()) => file_message.set_text("Theme saved"),
+                Err(error) => file_message.set_text(&format!("Save failed: {error}")),
+            }
+        });
+    }
+
+    {
+        let save_as_action = save_as_action.clone();
+        save_theme_as.connect_clicked(move |_| save_as_action());
+    }
+
+    {
+        let draft = draft.clone();
+        let saved_document = saved_document.clone();
+        let sync_document_ui = sync_document_ui.clone();
+        let file_message = file_message.clone();
+        revert_theme.connect_clicked(move |_| {
+            match ThemeEditorDraft::from_document(&saved_document.borrow()) {
+                Ok(restored) => {
+                    *draft.borrow_mut() = restored;
+                    let snapshot = draft.borrow().clone();
+                    sync_document_ui(&snapshot);
+                    file_message.set_text("Unsaved changes reverted");
+                }
+                Err(error) => file_message.set_text(&format!("Revert failed: {error}")),
+            }
+        });
+    }
+
+    let _ = theme_ipc_tx.send(ThemeEditorIpcJob::Probe);
+
+    {
+        let draft = draft.clone();
+        let last_preview_document = last_preview_document.clone();
+        let theme_ipc_tx = theme_ipc_tx.clone();
+        let runtime_row = runtime_row.clone();
+        apply_runtime.clone().connect_clicked(move |_| {
+            let document = draft.borrow().document();
+            *last_preview_document.borrow_mut() = Some(document.clone());
+            runtime_row.set_subtitle("Applying runtime theme…");
+            let _ = theme_ipc_tx.send(ThemeEditorIpcJob::Apply(document));
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let last_preview_document = last_preview_document.clone();
+        let theme_ipc_tx = theme_ipc_tx.clone();
+        let runtime_row = runtime_row.clone();
+        revert_runtime.clone().connect_clicked(move |_| {
+            *last_preview_document.borrow_mut() = Some(draft.borrow().document());
+            runtime_row.set_subtitle("Reverting preview…");
+            let _ = theme_ipc_tx.send(ThemeEditorIpcJob::Revert);
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let last_preview_document = last_preview_document.clone();
+        let theme_ipc_tx = theme_ipc_tx.clone();
+        let runtime_row = runtime_row.clone();
+        live_preview.connect_active_notify(move |toggle| {
+            *last_preview_document.borrow_mut() = None;
+            if toggle.is_active() {
+                runtime_row.set_subtitle("Live preview enabled · waiting for changes");
+                return;
+            }
+            *last_preview_document.borrow_mut() = Some(draft.borrow().document());
+            runtime_row.set_subtitle("Disabling preview…");
+            let _ = theme_ipc_tx.send(ThemeEditorIpcJob::Revert);
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let last_preview_document = last_preview_document.clone();
+        let preview_in_flight = preview_in_flight.clone();
+        let editor_page_active = editor_page_active.clone();
+        let live_preview = live_preview.clone();
+        let theme_ipc_tx = theme_ipc_tx.clone();
+        glib::timeout_add_local(Duration::from_millis(225), move || {
+            if !editor_page_active.get() || !live_preview.is_active() || preview_in_flight.get() {
+                return glib::ControlFlow::Continue;
+            }
+            let document = draft.borrow().document();
+            if last_preview_document.borrow().as_ref() == Some(&document) {
+                return glib::ControlFlow::Continue;
+            }
+            *last_preview_document.borrow_mut() = Some(document.clone());
+            preview_in_flight.set(true);
+            if theme_ipc_tx
+                .send(ThemeEditorIpcJob::Preview(document))
+                .is_err()
+            {
+                preview_in_flight.set(false);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    {
+        let theme_ipc_rx = theme_ipc_rx.clone();
+        let preview_in_flight = preview_in_flight.clone();
+        let compositor_connected = compositor_connected.clone();
+        let runtime_row = runtime_row.clone();
+        let apply_runtime = apply_runtime.clone();
+        let revert_runtime = revert_runtime.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || {
+            while let Ok(message) = theme_ipc_rx.borrow().try_recv() {
+                if message.action == ThemeEditorIpcAction::Preview {
+                    preview_in_flight.set(false);
+                }
+                match message.result {
+                    Ok(status) => {
+                        compositor_connected.set(true);
+                        runtime_row
+                            .set_subtitle(&theme_editor_runtime_label(status, message.gradient));
+                        apply_runtime.set_sensitive(true);
+                        revert_runtime.set_sensitive(status.preview_active);
+                    }
+                    Err(error) => {
+                        compositor_connected.set(false);
+                        let action = match message.action {
+                            ThemeEditorIpcAction::Apply => "Apply failed",
+                            ThemeEditorIpcAction::Revert => "Revert failed",
+                            ThemeEditorIpcAction::Probe | ThemeEditorIpcAction::Preview => {
+                                "Disconnected"
+                            }
+                        };
+                        runtime_row.set_subtitle(&format!("{action} · {error}"));
+                        apply_runtime.set_sensitive(false);
+                        revert_runtime.set_sensitive(false);
+                    }
+                }
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    {
+        let editor_page_active = editor_page_active.clone();
+        let last_preview_document = last_preview_document.clone();
+        let theme_ipc_tx = theme_ipc_tx.clone();
+        editor_root.connect_map(move |_| {
+            editor_page_active.set(true);
+            *last_preview_document.borrow_mut() = None;
+            let _ = theme_ipc_tx.send(ThemeEditorIpcJob::Probe);
+        });
+    }
+
+    {
+        let editor_page_active = editor_page_active.clone();
+        let theme_ipc_tx = theme_ipc_tx.clone();
+        editor_root.connect_unmap(move |_| {
+            editor_page_active.set(false);
+            let _ = theme_ipc_tx.send(ThemeEditorIpcJob::Revert);
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let saved_document = saved_document.clone();
+        let current_path = current_path.clone();
+        let installed_slug = installed_slug.clone();
+        let sync_document_ui = sync_document_ui.clone();
+        let file_message = file_message.clone();
+        let uninstall_package = uninstall_package.clone();
+        open_theme.connect_clicked(move |_| {
+            if draft.borrow().document() != *saved_document.borrow() {
+                file_message.set_text("Save or revert unsaved changes before opening a theme");
+                return;
+            }
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title("Open FocalDesk Theme");
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("FocalDesk themes (*.toml)"));
+            filter.add_pattern("*.toml");
+            dialog.set_default_filter(Some(&filter));
+            dialog.open(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let draft = draft.clone();
+                let saved_document = saved_document.clone();
+                let current_path = current_path.clone();
+                let installed_slug = installed_slug.clone();
+                let sync_document_ui = sync_document_ui.clone();
+                let file_message = file_message.clone();
+                let uninstall_package = uninstall_package.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        file_message.set_text("That source is not a local file");
+                        return;
+                    };
+                    let loaded = ThemeDocument::load(&path)
+                        .map_err(|error| error.to_string())
+                        .and_then(|document| {
+                            ThemeEditorDraft::from_document(&document)
+                                .map(|draft| (document, draft))
+                        });
+                    match loaded {
+                        Ok((document, loaded_draft)) => {
+                            *draft.borrow_mut() = loaded_draft;
+                            *saved_document.borrow_mut() = document;
+                            *current_path.borrow_mut() = Some(path);
+                            *installed_slug.borrow_mut() = None;
+                            uninstall_package.set_sensitive(false);
+                            let snapshot = draft.borrow().clone();
+                            sync_document_ui(&snapshot);
+                            file_message.set_text("Theme loaded");
+                        }
+                        Err(error) => file_message.set_text(&format!("Open failed: {error}")),
+                    }
+                }
+            });
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let saved_document = saved_document.clone();
+        let current_path = current_path.clone();
+        let file_row = file_row.clone();
+        let save_theme = save_theme.clone();
+        let revert_theme = revert_theme.clone();
+        glib::timeout_add_local(Duration::from_millis(200), move || {
+            let dirty = draft.borrow().document() != *saved_document.borrow();
+            save_theme.set_sensitive(dirty);
+            revert_theme.set_sensitive(dirty);
+            file_row.set_subtitle(&theme_editor_path_label(
+                current_path.borrow().as_deref(),
+                dirty,
+            ));
+            glib::ControlFlow::Continue
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let gradient_group = gradient_group.clone();
+        let angle_row = angle_row.clone();
+        let radial_center_x_row = radial_center_x_row.clone();
+        let radial_center_y_row = radial_center_y_row.clone();
+        let radial_radius_row = radial_radius_row.clone();
+        let remove_stop = remove_stop.clone();
+        let sync_numeric = sync_numeric.clone();
+        mode.connect_selected_notify(move |dropdown| {
+            let selected = dropdown.selected();
+            {
+                let mut draft = draft.borrow_mut();
+                draft.switch_mode(selected);
+                sync_numeric(&draft);
+            }
+            gradient_group.set_visible(selected != 0);
+            angle_row.set_visible(selected == 1);
+            radial_center_x_row.set_visible(selected == 2);
+            radial_center_y_row.set_visible(selected == 2);
+            radial_radius_row.set_visible(selected == 2);
+            remove_stop.set_sensitive(draft.borrow().stops.len() > 2);
+            picker.queue_draw();
+            hue_slider.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider, &draft.borrow());
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let hdr_luminance = hdr_luminance.clone();
+        let preview_range_status = preview_range_status.clone();
+        dynamic_range.connect_selected_notify(move |dropdown| {
+            let is_hdr = dropdown.selected() == 1;
+            draft.borrow_mut().dynamic_range = if is_hdr {
+                ThemeDynamicRange::Hdr
+            } else {
+                ThemeDynamicRange::Sdr
+            };
+            draft.borrow_mut().semantic.color_behavior.dynamic_range = if is_hdr {
+                ThemeDynamicRange::Hdr
+            } else {
+                ThemeDynamicRange::Sdr
+            };
+            hdr_luminance.set_sensitive(is_hdr);
+            if is_hdr {
+                preview_range_status.set_text(&format!(
+                    "HDR · {:.0} nits · SDR-mapped preview",
+                    draft.borrow().hdr_luminance_nits
+                ));
+            } else {
+                preview_range_status.set_text("SDR preview");
+            }
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let preview_range_status = preview_range_status.clone();
+        hdr_luminance.connect_value_changed(move |scale| {
+            draft.borrow_mut().hdr_luminance_nits = scale.value();
+            draft
+                .borrow_mut()
+                .semantic
+                .color_behavior
+                .luminance_cap_nits = scale.value() as f32;
+            preview_range_status.set_text(&format!(
+                "HDR · {:.0} nits · SDR-mapped preview",
+                scale.value()
+            ));
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        let syncing = syncing.clone();
+        gamut.connect_selected_notify(move |dropdown| {
+            if syncing.get() {
+                return;
+            }
+            let target = if dropdown.selected() == 0 {
+                ThemeColorSpace::Srgb
+            } else {
+                ThemeColorSpace::DisplayP3
+            };
+            {
+                let mut draft = draft.borrow_mut();
+                draft.switch_space(target);
+                draft.semantic.color_behavior.gamut = target;
+                sync_numeric(&draft);
+            }
+            picker.queue_draw();
+            hue_slider.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider, &draft.borrow());
+        });
+    }
+
+    {
+        let gesture = gtk::GestureClick::new();
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail_clone = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        gesture.connect_pressed(move |gesture, _, x, _| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let position =
+                ((x - 8.0) / (f64::from(widget.width()) - 16.0).max(1.0)).clamp(0.0, 1.0) as f32;
+            let selected = nearest_gradient_stop(&draft.borrow().stops, position);
+            let Some(selected) = selected else {
+                return;
+            };
+            {
+                let mut draft = draft.borrow_mut();
+                draft.select_stop(selected);
+                sync_numeric(&draft);
+            }
+            picker.queue_draw();
+            hue_slider.queue_draw();
+            preview.queue_draw();
+            stop_rail_clone.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider, &draft.borrow());
+            update_gradient_stop_accessibility(&stop_rail_clone, &draft.borrow());
+            stop_rail_clone.grab_focus();
+        });
+        stop_rail.add_controller(gesture);
+    }
+
+    {
+        let drag = gtk::GestureDrag::new();
+        let origin_x = Rc::new(Cell::new(0.0));
+        {
+            let origin_x = origin_x.clone();
+            drag.connect_drag_begin(move |_, x, _| origin_x.set(x));
+        }
+        let draft = draft.clone();
+        let preview = preview.clone();
+        let stop_rail_clone = stop_rail.clone();
+        let stop_position = stop_position.clone();
+        let syncing = syncing.clone();
+        drag.connect_drag_update(move |gesture, offset_x, _| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let position = ((origin_x.get() + offset_x - 8.0)
+                / (f64::from(widget.width()) - 16.0).max(1.0))
+            .clamp(0.0, 1.0) as f32;
+            draft.borrow_mut().set_selected_stop_position(position);
+            syncing.set(true);
+            stop_position.set_value(f64::from(position));
+            syncing.set(false);
+            preview.queue_draw();
+            stop_rail_clone.queue_draw();
+            update_gradient_stop_accessibility(&stop_rail_clone, &draft.borrow());
+        });
+        stop_rail.add_controller(drag);
+    }
+
+    {
+        let keys = gtk::EventControllerKey::new();
+        let draft = draft.clone();
+        let preview = preview.clone();
+        let stop_rail_clone = stop_rail.clone();
+        let stop_position = stop_position.clone();
+        let syncing = syncing.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                0.10
+            } else {
+                0.01
+            };
+            let current = draft.borrow().stops[draft.borrow().selected_stop].position;
+            let position = match key {
+                gtk::gdk::Key::Left | gtk::gdk::Key::Down => (current - step).max(0.0),
+                gtk::gdk::Key::Right | gtk::gdk::Key::Up => (current + step).min(1.0),
+                gtk::gdk::Key::Home => 0.0,
+                gtk::gdk::Key::End => 1.0,
+                _ => return glib::Propagation::Proceed,
+            };
+            draft.borrow_mut().set_selected_stop_position(position);
+            syncing.set(true);
+            stop_position.set_value(f64::from(position));
+            syncing.set(false);
+            preview.queue_draw();
+            stop_rail_clone.queue_draw();
+            update_gradient_stop_accessibility(&stop_rail_clone, &draft.borrow());
+            glib::Propagation::Stop
+        });
+        stop_rail.add_controller(keys);
+    }
+
+    for (button, action) in [
+        (&add_stop, 0u8),
+        (&duplicate_stop, 1u8),
+        (&remove_stop, 2u8),
+    ] {
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let remove_stop = remove_stop.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        button.connect_clicked(move |_| {
+            {
+                let mut draft = draft.borrow_mut();
+                match action {
+                    0 => draft.add_stop(),
+                    1 => draft.duplicate_stop(),
+                    _ => draft.remove_stop(),
+                }
+                sync_numeric(&draft);
+                remove_stop.set_sensitive(draft.stops.len() > 2);
+            }
+            picker.queue_draw();
+            hue_slider.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider, &draft.borrow());
+            update_gradient_stop_accessibility(&stop_rail, &draft.borrow());
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let syncing = syncing.clone();
+        stop_position.connect_value_changed(move |spin| {
+            if syncing.get() {
+                return;
+            }
+            draft
+                .borrow_mut()
+                .set_selected_stop_position(spin.value() as f32);
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_gradient_stop_accessibility(&stop_rail, &draft.borrow());
+        });
+    }
+
+    {
+        let draft = draft.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        interpolation.connect_selected_notify(move |dropdown| {
+            draft.borrow_mut().interpolation_space = if dropdown.selected() == 0 {
+                ThemeColorSpace::Srgb
+            } else {
+                ThemeColorSpace::DisplayP3
+            };
+            preview.queue_draw();
+            stop_rail.queue_draw();
+        });
+    }
+
+    for (spin, field) in [
+        (&linear_angle, 0u8),
+        (&radial_center_x, 1u8),
+        (&radial_center_y, 2u8),
+        (&radial_radius, 3u8),
+    ] {
+        let draft = draft.clone();
+        let preview = preview.clone();
+        spin.connect_value_changed(move |spin| {
+            let mut draft = draft.borrow_mut();
+            match field {
+                0 => draft.linear_angle = spin.value(),
+                1 => draft.radial_center.0 = spin.value(),
+                2 => draft.radial_center.1 = spin.value(),
+                _ => draft.radial_radius = spin.value(),
+            }
+            preview.queue_draw();
+        });
+    }
+
+    {
+        let gesture = gtk::GestureClick::new();
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider_clone = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let width = f64::from(widget.width());
+            let height = f64::from(widget.height());
+            if !point_is_on_hue_ring(width, height, x, y) {
+                return;
+            }
+            {
+                let mut draft = draft.borrow_mut();
+                draft.hue = hue_from_ring_point(width, height, x, y);
+                sync_numeric(&draft);
+            }
+            picker.queue_draw();
+            hue_slider_clone.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider_clone, &draft.borrow());
+            hue_slider_clone.grab_focus();
+        });
+        hue_slider.add_controller(gesture);
+    }
+
+    {
+        let drag = gtk::GestureDrag::new();
+        let origin = Rc::new(Cell::new((0.0, 0.0)));
+        let active = Rc::new(Cell::new(false));
+        {
+            let origin = origin.clone();
+            let active = active.clone();
+            drag.connect_drag_begin(move |gesture, x, y| {
+                let Some(widget) = gesture.widget() else {
+                    return;
+                };
+                origin.set((x, y));
+                active.set(point_is_on_hue_ring(
+                    f64::from(widget.width()),
+                    f64::from(widget.height()),
+                    x,
+                    y,
+                ));
+            });
+        }
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider_clone = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+            if !active.get() {
+                return;
+            }
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let (origin_x, origin_y) = origin.get();
+            {
+                let mut draft = draft.borrow_mut();
+                draft.hue = hue_from_ring_point(
+                    f64::from(widget.width()),
+                    f64::from(widget.height()),
+                    origin_x + offset_x,
+                    origin_y + offset_y,
+                );
+                sync_numeric(&draft);
+            }
+            picker.queue_draw();
+            hue_slider_clone.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider_clone, &draft.borrow());
+        });
+        hue_slider.add_controller(drag);
+    }
+
+    {
+        let gesture = gtk::GestureClick::new();
+        let draft = draft.clone();
+        let picker_clone = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        gesture.connect_pressed(move |gesture, _, x, y| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let width = f64::from(widget.width());
+            let height = f64::from(widget.height());
+            let (saturation, value) = saturation_value_from_point(width, height, x, y);
+            {
+                let mut draft = draft.borrow_mut();
+                draft.saturation = saturation;
+                draft.value = value;
+                sync_numeric(&draft);
+            }
+            picker_clone.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker_clone, &hue_slider, &draft.borrow());
+            picker_clone.grab_focus();
+        });
+        picker.add_controller(gesture);
+    }
+
+    {
+        let drag = gtk::GestureDrag::new();
+        let origin = Rc::new(Cell::new((0.0, 0.0)));
+        {
+            let origin = origin.clone();
+            drag.connect_drag_begin(move |_, x, y| origin.set((x, y)));
+        }
+        let draft = draft.clone();
+        let picker_clone = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        drag.connect_drag_update(move |gesture, offset_x, offset_y| {
+            let Some(widget) = gesture.widget() else {
+                return;
+            };
+            let (origin_x, origin_y) = origin.get();
+            let (saturation, value) = saturation_value_from_point(
+                f64::from(widget.width()),
+                f64::from(widget.height()),
+                origin_x + offset_x,
+                origin_y + offset_y,
+            );
+            {
+                let mut draft = draft.borrow_mut();
+                draft.saturation = saturation;
+                draft.value = value;
+                sync_numeric(&draft);
+            }
+            picker_clone.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker_clone, &hue_slider, &draft.borrow());
+        });
+        picker.add_controller(drag);
+    }
+
+    {
+        let keys = gtk::EventControllerKey::new();
+        let draft = draft.clone();
+        let picker_clone = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                0.10
+            } else {
+                0.01
+            };
+            let changed = {
+                let mut draft = draft.borrow_mut();
+                match key {
+                    gtk::gdk::Key::Left => draft.saturation = (draft.saturation - step).max(0.0),
+                    gtk::gdk::Key::Right => draft.saturation = (draft.saturation + step).min(1.0),
+                    gtk::gdk::Key::Up => draft.value = (draft.value + step).min(1.0),
+                    gtk::gdk::Key::Down => draft.value = (draft.value - step).max(0.0),
+                    gtk::gdk::Key::Home => {
+                        draft.saturation = 0.0;
+                        draft.value = 1.0;
+                    }
+                    gtk::gdk::Key::End => {
+                        draft.saturation = 1.0;
+                        draft.value = 0.0;
+                    }
+                    _ => return glib::Propagation::Proceed,
+                }
+                sync_numeric(&draft);
+                true
+            };
+            if changed {
+                picker_clone.queue_draw();
+                preview.queue_draw();
+                stop_rail.queue_draw();
+                update_theme_editor_status(&gamut_status, &draft.borrow());
+                update_theme_editor_accessibility(&picker_clone, &hue_slider, &draft.borrow());
+            }
+            glib::Propagation::Stop
+        });
+        picker.add_controller(keys);
+    }
+
+    {
+        let keys = gtk::EventControllerKey::new();
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider_clone = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let sync_numeric = sync_numeric.clone();
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            let step = if modifiers.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+                10.0
+            } else {
+                1.0
+            };
+            {
+                let mut draft = draft.borrow_mut();
+                match key {
+                    gtk::gdk::Key::Left | gtk::gdk::Key::Down => {
+                        draft.hue = wrap_hue(draft.hue - step)
+                    }
+                    gtk::gdk::Key::Right | gtk::gdk::Key::Up => {
+                        draft.hue = wrap_hue(draft.hue + step)
+                    }
+                    gtk::gdk::Key::Home => draft.hue = 0.0,
+                    gtk::gdk::Key::End => draft.hue = 359.999,
+                    _ => return glib::Propagation::Proceed,
+                }
+                sync_numeric(&draft);
+            }
+            picker.queue_draw();
+            hue_slider_clone.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider_clone, &draft.borrow());
+            glib::Propagation::Stop
+        });
+        hue_slider.add_controller(keys);
+    }
+
+    for spin in &spins {
+        let draft = draft.clone();
+        let picker = picker.clone();
+        let hue_slider = hue_slider.clone();
+        let preview = preview.clone();
+        let stop_rail = stop_rail.clone();
+        let gamut_status = gamut_status.clone();
+        let spins = spins.clone();
+        let syncing = syncing.clone();
+        spin.connect_value_changed(move |_| {
+            if syncing.get() {
+                return;
+            }
+            let (hue, saturation, value) =
+                rgb_to_hsv([spins[0].value(), spins[1].value(), spins[2].value()]);
+            {
+                let mut draft = draft.borrow_mut();
+                draft.hue = hue;
+                draft.saturation = saturation;
+                draft.value = value;
+                draft.alpha = spins[3].value();
+            }
+            picker.queue_draw();
+            hue_slider.queue_draw();
+            preview.queue_draw();
+            stop_rail.queue_draw();
+            update_theme_editor_status(&gamut_status, &draft.borrow());
+            update_theme_editor_accessibility(&picker, &hue_slider, &draft.borrow());
+        });
+    }
+
+    adw::NavigationPage::new(&editor_root, "Theme Editor")
+}
+
 fn appearance_page(
     config: Rc<RefCell<FocalDeskConfig>>,
     settings: Rc<RefCell<Settings>>,
@@ -2513,6 +6318,30 @@ fn appearance_page(
     }
 
     visual_group.add(&shader_row);
+
+    let glass_row = adw::ActionRow::new();
+    glass_row.set_title("Work-area glass");
+    glass_row.set_subtitle("Add a subtle glass tint and edge highlight behind windows");
+
+    let glass_switch = gtk::Switch::new();
+    glass_switch.set_active(config.borrow().appearance.work_area_glass);
+    glass_row.add_suffix(&glass_switch);
+    glass_row.set_activatable_widget(Some(&glass_switch));
+
+    {
+        let config = config.clone();
+        glass_switch.connect_active_notify(move |s| {
+            let active = s.is_active();
+            config.borrow_mut().appearance.work_area_glass = active;
+            persist_config_key(
+                &config.borrow(),
+                "appearance.work_area_glass",
+                json!(active),
+            );
+        });
+    }
+
+    visual_group.add(&glass_row);
 
     // Output focus glow
     let focus_row = adw::ActionRow::new();
@@ -2670,6 +6499,7 @@ fn appearance_page(
     {
         let rx = start_config_watch(&[
             "appearance.shader_chrome",
+            "appearance.work_area_glass",
             "appearance.output_focus_glow",
             "appearance.theme",
             "appearance.glow_strength",
@@ -2677,6 +6507,7 @@ fn appearance_page(
         ]);
         let config = config.clone();
         let shader_switch = shader_switch.clone();
+        let glass_switch = glass_switch.clone();
         let focus_switch = focus_switch.clone();
         let theme_dropdown = theme_dropdown.clone();
         let glow_scale = glow_scale.clone();
@@ -2689,6 +6520,12 @@ fn appearance_page(
                         if let Some(active) = event.value.as_bool() {
                             config.borrow_mut().appearance.shader_chrome = active;
                             set_switch_if_changed(&shader_switch, active);
+                        }
+                    }
+                    "appearance.work_area_glass" => {
+                        if let Some(active) = event.value.as_bool() {
+                            config.borrow_mut().appearance.work_area_glass = active;
+                            set_switch_if_changed(&glass_switch, active);
                         }
                     }
                     "appearance.output_focus_glow" => {
@@ -5371,6 +9208,8 @@ fn displays_page(
     page.set_title("Displays");
 
     let detected_displays = Rc::new(RefCell::new(load_displays()));
+    let runtime_statuses = load_display_runtime_statuses();
+    apply_runtime_statuses(&detected_displays, &runtime_statuses, false);
     let row_registry: Rc<RefCell<HashMap<String, adw::ExpanderRow>>> =
         Rc::new(RefCell::new(HashMap::new()));
     let hdr_switch_registry: Rc<RefCell<HashMap<String, gtk::Switch>>> =
@@ -5604,8 +9443,6 @@ fn displays_page(
     }
 
     {
-        let runtime_statuses = load_display_runtime_statuses();
-        apply_runtime_statuses(&detected_displays, &runtime_statuses, false);
         for display in detected_displays.borrow().iter() {
             if let Some(row) = row_registry.borrow().get(&display.name) {
                 row.set_subtitle(&display_summary(display));
@@ -5655,6 +9492,369 @@ fn displays_page(
 mod tests {
     use super::*;
 
+    fn assert_rgb_close(left: [f64; 3], right: [f64; 3]) {
+        for (left, right) in left.into_iter().zip(right) {
+            assert!((left - right).abs() < 1.0e-9, "{left} != {right}");
+        }
+    }
+
+    #[test]
+    fn theme_editor_rgb_and_hsv_controls_round_trip() {
+        for rgb in [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.15, 0.63, 0.92],
+            [0.42, 0.42, 0.42],
+        ] {
+            let (hue, saturation, value) = rgb_to_hsv(rgb);
+            assert_rgb_close(hsv_to_rgb(hue, saturation, value), rgb);
+        }
+    }
+
+    #[test]
+    fn theme_editor_hue_ring_maps_cardinal_points_and_wraps() {
+        assert_eq!(hue_from_ring_point(200.0, 200.0, 182.0, 100.0), 0.0);
+        assert_eq!(hue_from_ring_point(200.0, 200.0, 100.0, 182.0), 90.0);
+        assert_eq!(hue_from_ring_point(200.0, 200.0, 18.0, 100.0), 180.0);
+        assert_eq!(hue_from_ring_point(200.0, 200.0, 100.0, 18.0), 270.0);
+        assert_eq!(wrap_hue(-1.0), 359.0);
+        assert_eq!(wrap_hue(360.0), 0.0);
+        assert_eq!(wrap_hue(361.0), 1.0);
+    }
+
+    #[test]
+    fn theme_editor_hue_ring_hit_testing_and_drag_coordinates() {
+        assert!(point_is_on_hue_ring(200.0, 200.0, 182.0, 100.0));
+        assert!(!point_is_on_hue_ring(200.0, 200.0, 100.0, 100.0));
+        // A drag beginning at the right edge and moving to the bottom is 90°.
+        let origin = (182.0, 100.0);
+        let offset = (-82.0, 82.0);
+        assert_eq!(
+            hue_from_ring_point(200.0, 200.0, origin.0 + offset.0, origin.1 + offset.1),
+            90.0
+        );
+    }
+
+    #[test]
+    fn theme_editor_square_maps_and_clamps_pointer_coordinates() {
+        // A 300x200 widget contains a centered 184x184 picker square.
+        let (saturation, value) = saturation_value_from_point(300.0, 200.0, 58.0, 8.0);
+        assert_eq!((saturation, value), (0.0, 1.0));
+        let (saturation, value) = saturation_value_from_point(300.0, 200.0, 242.0, 192.0);
+        assert_eq!((saturation, value), (1.0, 0.0));
+        let (saturation, value) = saturation_value_from_point(300.0, 200.0, 150.0, 100.0);
+        assert!((saturation - 0.5).abs() < f64::EPSILON);
+        assert!((value - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn theme_editor_first_p3_switch_preserves_color_appearance() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.88, 0.74, 0.8);
+        let original = draft.current_color();
+        draft.switch_space(ThemeColorSpace::DisplayP3);
+        let round_trip = draft.current_color().converted_to(ThemeColorSpace::Srgb);
+        for (left, right) in original
+            .components()
+            .into_iter()
+            .zip(round_trip.components())
+        {
+            assert!((left - right).abs() < 0.000_1, "{left} != {right}");
+        }
+    }
+
+    #[test]
+    fn theme_editor_preserves_out_of_srgb_p3_draft_across_switches() {
+        let mut draft = ThemeEditorDraft::new(0.0, 1.0, 1.0, 1.0);
+        draft.switch_space(ThemeColorSpace::DisplayP3);
+        draft.hue = 0.0;
+        draft.saturation = 1.0;
+        draft.value = 1.0;
+        let p3_red = draft.current_color();
+        assert!(!p3_red.is_in_srgb_gamut());
+
+        draft.switch_space(ThemeColorSpace::Srgb);
+        assert_eq!(draft.space(), ThemeColorSpace::Srgb);
+        draft.switch_space(ThemeColorSpace::DisplayP3);
+        assert_eq!(draft.space(), ThemeColorSpace::DisplayP3);
+        assert_eq!(draft.current_color(), p3_red);
+    }
+
+    #[test]
+    fn theme_editor_classifies_p3_picker_points_against_srgb() {
+        assert!(!picker_point_is_in_srgb(
+            ThemeColorSpace::DisplayP3,
+            0.0,
+            1.0,
+            1.0
+        ));
+        assert!(picker_point_is_in_srgb(
+            ThemeColorSpace::DisplayP3,
+            0.0,
+            0.0,
+            0.5
+        ));
+        assert!(picker_point_is_in_srgb(
+            ThemeColorSpace::Srgb,
+            120.0,
+            1.0,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn theme_editor_p3_boundary_tracks_hue_and_stays_normalized() {
+        let red_boundary = srgb_gamut_boundary_segments(0.0, 32);
+        let green_boundary = srgb_gamut_boundary_segments(120.0, 32);
+        assert!(!red_boundary.is_empty());
+        assert!(!green_boundary.is_empty());
+        assert_ne!(red_boundary, green_boundary);
+        assert!(red_boundary
+            .iter()
+            .flatten()
+            .all(|coordinate| (0.0..=1.0).contains(coordinate)));
+        assert!(srgb_gamut_boundary_segments(0.0, 1).is_empty());
+    }
+
+    #[test]
+    fn theme_editor_gradient_stop_lifecycle_keeps_two_minimum() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.9, 1.0);
+        draft.switch_mode(1);
+        draft.add_stop();
+        assert_eq!(draft.stops.len(), 3);
+        assert_eq!(draft.stops[draft.selected_stop].position, 0.5);
+        draft.duplicate_stop();
+        assert_eq!(draft.stops.len(), 4);
+        assert_eq!(draft.stops[draft.selected_stop].position, 0.55);
+        draft.remove_stop();
+        draft.remove_stop();
+        draft.remove_stop();
+        assert_eq!(draft.stops.len(), 2);
+    }
+
+    #[test]
+    fn theme_editor_gradient_paint_sorts_stops_and_keeps_geometry() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.9, 1.0);
+        draft.switch_mode(1);
+        draft.stops[0].position = 0.9;
+        draft.stops[1].position = 0.1;
+        draft.linear_angle = 42.0;
+        let ThemePaint::LinearGradient { angle, stops, .. } = draft.paint() else {
+            panic!("expected linear gradient");
+        };
+        assert_eq!(angle, 42.0);
+        assert_eq!(stops[0].position, 0.1);
+        assert_eq!(stops[1].position, 0.9);
+
+        draft.switch_mode(2);
+        draft.radial_center = (0.25, 0.75);
+        draft.radial_radius = 1.2;
+        let ThemePaint::RadialGradient { center, radius, .. } = draft.paint() else {
+            panic!("expected radial gradient");
+        };
+        assert_eq!(center, (0.25, 0.75));
+        assert_eq!(radius, 1.2);
+    }
+
+    #[test]
+    fn theme_editor_gradient_stop_owns_color_gamut_and_alpha() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.9, 1.0);
+        draft.switch_mode(1);
+        draft.switch_space(ThemeColorSpace::DisplayP3);
+        draft.hue = 0.0;
+        draft.saturation = 1.0;
+        draft.value = 1.0;
+        draft.alpha = 0.4;
+        draft.select_stop(1);
+
+        let first = draft.stops[0].color.color();
+        assert_eq!(first.space, ThemeColorSpace::DisplayP3);
+        assert!((first.a - 0.4).abs() < f32::EPSILON);
+        assert!(!first.is_in_srgb_gamut());
+        assert_eq!(draft.stops[1].color.color().space, ThemeColorSpace::Srgb);
+    }
+
+    #[test]
+    fn theme_editor_gradient_stop_hit_testing_selects_nearest() {
+        let color = ThemeEditorColor::new(ThemeColor::srgb(0.0, 0.0, 0.0, 1.0));
+        let stops = vec![
+            ThemeEditorStop {
+                position: 0.1,
+                color: color.clone(),
+            },
+            ThemeEditorStop {
+                position: 0.8,
+                color,
+            },
+        ];
+        assert_eq!(nearest_gradient_stop(&stops, 0.2), Some(0));
+        assert_eq!(nearest_gradient_stop(&stops, 0.7), Some(1));
+        assert_eq!(nearest_gradient_stop(&[], 0.5), None);
+    }
+
+    #[test]
+    fn theme_editor_gradient_has_toml_serialization_shape() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.9, 1.0);
+        draft.switch_mode(1);
+        let encoded = toml::to_string(&draft.paint()).unwrap();
+        assert!(encoded.contains("mode = \"linear_gradient\""));
+        assert_eq!(encoded.matches("position =").count(), 2);
+        assert!(encoded.contains("space = \"srgb\""));
+    }
+
+    #[test]
+    fn theme_editor_dynamic_range_does_not_change_paint_or_luminance_setting() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.9, 1.0);
+        draft.hdr_luminance_nits = 650.0;
+        let source = draft.paint();
+
+        draft.dynamic_range = ThemeDynamicRange::Hdr;
+        assert_eq!(draft.paint(), source);
+        assert_eq!(draft.hdr_luminance_nits, 650.0);
+        draft.dynamic_range = ThemeDynamicRange::Sdr;
+        assert_eq!(draft.paint(), source);
+        assert_eq!(draft.hdr_luminance_nits, 650.0);
+    }
+
+    #[test]
+    fn theme_editor_paint_intent_wraps_solid_and_gradient_paints() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.9, 1.0);
+        draft.dynamic_range = ThemeDynamicRange::Hdr;
+        draft.hdr_luminance_nits = 800.0;
+        let solid = draft.paint_intent();
+        assert_eq!(solid.dynamic_range, ThemeDynamicRange::Hdr);
+        assert_eq!(solid.hdr_luminance_nits, 800.0);
+        assert!(matches!(solid.paint, ThemePaint::Solid { .. }));
+
+        draft.switch_mode(1);
+        let gradient = draft.paint_intent();
+        assert_eq!(gradient.dynamic_range, ThemeDynamicRange::Hdr);
+        assert_eq!(gradient.hdr_luminance_nits, 800.0);
+        assert!(matches!(gradient.paint, ThemePaint::LinearGradient { .. }));
+    }
+
+    #[test]
+    fn theme_editor_hdr_preview_does_not_mutate_source_paint() {
+        let mut draft = ThemeEditorDraft::new(205.0, 0.8, 0.5, 1.0);
+        draft.dynamic_range = ThemeDynamicRange::Hdr;
+        draft.hdr_luminance_nits = 1_000.0;
+        let source = draft.paint();
+        let preview = draft.preview_paint();
+
+        assert_ne!(preview, source);
+        assert_eq!(draft.paint(), source);
+    }
+
+    #[test]
+    fn theme_editor_document_restores_gradient_hdr_and_gamut_metadata() {
+        let mut document = ThemeDocument::new(
+            "Polar Light",
+            ThemePaintIntent {
+                paint: ThemePaint::LinearGradient {
+                    angle: 73.0,
+                    interpolation: GradientInterpolation {
+                        space: ThemeColorSpace::DisplayP3,
+                        premultiplied_alpha: true,
+                    },
+                    stops: vec![
+                        GradientStop {
+                            position: 0.0,
+                            color: ThemeColor::display_p3(1.0, 0.2, 0.1, 0.7),
+                        },
+                        GradientStop {
+                            position: 1.0,
+                            color: ThemeColor::srgb(0.1, 0.3, 0.8, 1.0),
+                        },
+                    ],
+                },
+                dynamic_range: ThemeDynamicRange::Hdr,
+                hdr_luminance_nits: 750.0,
+            },
+        );
+        document.wallpaper = ThemeWallpaper {
+            path: Some("/tmp/polar-light.png".to_string()),
+            fit: ThemeWallpaperFit::Tile,
+            tint: Some(ThemeColor::srgb(0.1, 0.2, 0.3, 0.4)),
+            dim: 0.25,
+        };
+        let draft = ThemeEditorDraft::from_document(&document).unwrap();
+        assert_eq!(draft.theme_name, "Polar Light");
+        assert_eq!(draft.mode, 1);
+        assert_eq!(draft.linear_angle, 73.0);
+        assert_eq!(draft.interpolation_space, ThemeColorSpace::DisplayP3);
+        assert_eq!(draft.dynamic_range, ThemeDynamicRange::Hdr);
+        assert_eq!(draft.hdr_luminance_nits, 750.0);
+        assert_eq!(
+            draft.stops[0].color.color().space,
+            ThemeColorSpace::DisplayP3
+        );
+        assert_eq!(draft.stops[1].color.color().space, ThemeColorSpace::Srgb);
+        assert_eq!(draft.wallpaper, document.wallpaper);
+    }
+
+    #[test]
+    fn theme_editor_rejects_documents_it_cannot_edit_losslessly() {
+        let document = ThemeDocument::new(
+            "Future gamut",
+            ThemePaintIntent::new(ThemePaint::solid(ThemeColor::rec2020(0.5, 0.5, 0.5, 1.0))),
+        );
+        assert!(ThemeEditorDraft::from_document(&document)
+            .unwrap_err()
+            .contains("Rec.2020"));
+    }
+
+    #[test]
+    fn theme_editor_save_path_adds_toml_extension_only_when_missing() {
+        assert_eq!(
+            theme_editor_toml_path(PathBuf::from("aurora")),
+            PathBuf::from("aurora.toml")
+        );
+        assert_eq!(
+            theme_editor_toml_path(PathBuf::from("aurora.theme")),
+            PathBuf::from("aurora.theme")
+        );
+        assert_eq!(
+            theme_package_path(PathBuf::from("aurora")),
+            PathBuf::from("aurora.fdtheme")
+        );
+    }
+
+    #[test]
+    fn theme_editor_runtime_status_reports_preview_and_gradient_capability() {
+        let status = ThemeEditorRuntimeStatus {
+            preview_active: true,
+            applied_revision: 4,
+            gradient_rendering: true,
+            semantic_rendering: true,
+            wallpaper_processing: true,
+            layout_metrics: true,
+            typography_metrics: true,
+            contrast_issue_count: 0,
+        };
+        assert_eq!(
+            theme_editor_runtime_label(status, false),
+            "Connected · preview active · 0 contrast issues"
+        );
+        assert_eq!(
+            theme_editor_runtime_label(
+                ThemeEditorRuntimeStatus {
+                    gradient_rendering: false,
+                    ..status
+                },
+                true
+            ),
+            "Connected · gradients preview at their midpoint"
+        );
+    }
+
+    #[test]
+    fn semantic_preview_contrast_flags_legibility_difference() {
+        let black = ThemeColor::srgb(0.0, 0.0, 0.0, 1.0);
+        let white = ThemeColor::srgb(1.0, 1.0, 1.0, 1.0);
+        assert!(semantic_contrast_ratio(black, white) > 20.0);
+        assert!(semantic_contrast_ratio(white, white) < 1.1);
+    }
+
     #[test]
     fn hdr_status_distinguishes_request_from_active_output() {
         assert_eq!(hdr_status_subtitle(true, true), "Active now");
@@ -5692,6 +9892,7 @@ mod tests {
             hdr_supported: true,
             hdr_requested: true,
             hdr_enabled: false,
+            hdr_appearance: HdrAppearance::default(),
             icc_lut_fallback_active: false,
             wide_gamut_active: false,
             exclusive_hdr_phase: ExclusiveHdrPhase::Off,
@@ -5702,6 +9903,7 @@ mod tests {
 
         assert!(output.hdr_requested);
         assert!(!output.hdr_enabled);
+        assert_eq!(output.hdr_appearance, HdrAppearance::default());
     }
 
     fn test_display(name: &str, hdr_requested: bool) -> DisplayConfig {
@@ -5723,6 +9925,7 @@ mod tests {
             hdr_supported: true,
             hdr_requested,
             hdr_enabled: false,
+            hdr_appearance: HdrAppearance::default(),
             icc_lut_fallback_active: false,
             wide_gamut_active: false,
             exclusive_hdr_phase: ExclusiveHdrPhase::Off,
@@ -5746,5 +9949,32 @@ mod tests {
             &mut none_requested
         ));
         assert!(none_requested.iter().all(|display| !display.hdr_requested));
+    }
+
+    #[test]
+    fn existing_display_files_receive_neutral_hdr_appearance_defaults() {
+        let mut value = serde_json::to_value(test_display("DP-3", true)).unwrap();
+        value.as_object_mut().unwrap().remove("hdr_appearance");
+        let restored: DisplayConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.hdr_appearance, HdrAppearance::default());
+    }
+
+    #[test]
+    fn hdr_appearance_presets_are_valid_and_custom_values_are_detected() {
+        for selected in 0..HDR_APPEARANCE_CUSTOM_PRESET {
+            let appearance = hdr_appearance_preset(selected).unwrap();
+            assert_eq!(appearance.validate(), Ok(appearance));
+            assert_eq!(hdr_appearance_preset_index(appearance), selected);
+        }
+
+        let custom = HdrAppearance {
+            reference_white_nits: 225.0,
+            ..HdrAppearance::default()
+        };
+        assert_eq!(
+            hdr_appearance_preset_index(custom),
+            HDR_APPEARANCE_CUSTOM_PRESET
+        );
+        assert!(hdr_appearance_preset(HDR_APPEARANCE_CUSTOM_PRESET).is_none());
     }
 }

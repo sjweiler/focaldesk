@@ -9,7 +9,8 @@ pub mod updates;
 
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
-use focaldesk_settings_core::{ExclusiveHdrPhase, OutputConfig, Settings};
+use focaldesk_settings_core::{ExclusiveHdrPhase, HdrAppearance, OutputConfig, Settings};
+use focaldesk_themes::ThemeDocument;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -19,6 +20,7 @@ pub const DESKTOP_SOCKET_NAME: &str = "desktop.sock";
 pub const SETTINGS_SOCKET_NAME: &str = "settings.sock";
 pub const DESKTOP_SOCKET_ENV: &str = "FOCALDESK_DESKTOP_SOCKET_PATH";
 pub const SETTINGS_SOCKET_ENV: &str = "FOCALDESK_SETTINGS_SOCKET_PATH";
+pub const THEME_EDITOR_PROTOCOL_VERSION: u16 = 1;
 
 pub fn desktop_socket_path() -> Result<std::path::PathBuf, String> {
     transport::socket_path(DESKTOP_SOCKET_ENV, DESKTOP_SOCKET_NAME)
@@ -53,9 +55,22 @@ pub enum IpcRequest {
     SetDisplays {
         outputs: Vec<OutputConfig>,
     },
+    /// Update only the final HDR shader parameters for one connector. This
+    /// request deliberately cannot change modes, topology, or KMS HDR state.
+    SetHdrAppearance {
+        connector: String,
+        appearance: HdrAppearance,
+    },
     GetDisplayRuntimeStatus,
     /// Returns a bounded, secret-free snapshot of compositor-owned desktop state.
     GetDesktopSnapshot,
+    GetThemeEditorStatus {
+        protocol_version: u16,
+    },
+    ThemeEditor {
+        protocol_version: u16,
+        command: ThemeEditorCommand,
+    },
     GetPowerSnapshot,
     IdentifyDisplays,
     Reload,
@@ -74,6 +89,14 @@ pub enum IpcRequest {
         namespace: String,
         output_count: usize,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "command", rename_all = "snake_case")]
+pub enum ThemeEditorCommand {
+    Preview { document: ThemeDocument },
+    Apply { document: ThemeDocument },
+    Revert,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -133,6 +156,22 @@ pub enum IpcResponse {
     },
     DesktopSnapshot {
         snapshot: DesktopSnapshot,
+    },
+    ThemeEditorStatus {
+        protocol_version: u16,
+        preview_active: bool,
+        applied_revision: u64,
+        gradient_rendering: bool,
+        #[serde(default)]
+        semantic_rendering: bool,
+        #[serde(default)]
+        wallpaper_processing: bool,
+        #[serde(default)]
+        layout_metrics: bool,
+        #[serde(default)]
+        typography_metrics: bool,
+        #[serde(default)]
+        contrast_issue_count: usize,
     },
     PowerSnapshot {
         snapshot: PowerSnapshot,
@@ -370,3 +409,76 @@ pub use updates::{
     UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME, UpdateIpcRequest, UpdateIpcResponse,
     send_update_request, serve_update_ipc, updates_socket_path,
 };
+
+#[cfg(test)]
+mod theme_editor_tests {
+    use super::*;
+    use focaldesk_themes::{ThemeColor, ThemePaint, ThemePaintIntent};
+
+    #[test]
+    fn theme_editor_preview_round_trips_through_versioned_transport() {
+        let request = IpcRequest::ThemeEditor {
+            protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
+            command: ThemeEditorCommand::Preview {
+                document: ThemeDocument::new(
+                    "IPC preview",
+                    ThemePaintIntent::new(ThemePaint::solid(ThemeColor::srgb(0.1, 0.2, 0.3, 1.0))),
+                ),
+            },
+        };
+        let encoded = transport::encode_message(&request).unwrap();
+        let decoded: IpcRequest = transport::decode_message(&encoded).unwrap();
+        let IpcRequest::ThemeEditor {
+            protocol_version,
+            command: ThemeEditorCommand::Preview { document },
+        } = decoded
+        else {
+            panic!("expected theme editor preview");
+        };
+        assert_eq!(protocol_version, THEME_EDITOR_PROTOCOL_VERSION);
+        assert_eq!(document.name, "IPC preview");
+    }
+
+    #[test]
+    fn legacy_theme_status_defaults_new_capabilities_to_unsupported() {
+        let response = IpcResponse::ThemeEditorStatus {
+            protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
+            preview_active: false,
+            applied_revision: 2,
+            gradient_rendering: false,
+            semantic_rendering: true,
+            wallpaper_processing: true,
+            layout_metrics: true,
+            typography_metrics: true,
+            contrast_issue_count: 3,
+        };
+        let mut value = serde_json::to_value(response).unwrap();
+        let object = value.as_object_mut().unwrap();
+        for key in [
+            "semantic_rendering",
+            "wallpaper_processing",
+            "layout_metrics",
+            "typography_metrics",
+            "contrast_issue_count",
+        ] {
+            object.remove(key);
+        }
+        let decoded: IpcResponse = serde_json::from_value(value).unwrap();
+        let IpcResponse::ThemeEditorStatus {
+            semantic_rendering,
+            wallpaper_processing,
+            layout_metrics,
+            typography_metrics,
+            contrast_issue_count,
+            ..
+        } = decoded
+        else {
+            panic!("expected theme editor status");
+        };
+        assert!(!semantic_rendering);
+        assert!(!wallpaper_processing);
+        assert!(!layout_metrics);
+        assert!(!typography_metrics);
+        assert_eq!(contrast_issue_count, 0);
+    }
+}

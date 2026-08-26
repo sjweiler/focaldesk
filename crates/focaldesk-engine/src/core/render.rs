@@ -192,6 +192,7 @@ pub struct RenderState {
     pub last_frame: Option<Instant>,
     // wallpaper texture, damage tracking, etc
     pub wallpaper_texture: Option<GlesTexture>,
+    pub wallpaper_path: Option<String>,
     /// Software cursor: GPU texture + layout (physical pixels), when not on the DRM cursor plane.
     pub sw_cursor_texture: Option<GlesTexture>,
     pub sw_cursor_surface: Option<WlSurface>,
@@ -277,6 +278,17 @@ fn linearize_rgba(c: [f32; 4]) -> [f32; 4] {
     ]
 }
 
+pub(crate) fn work_area_glass_style(theme: &FlowTheme) -> GlassStyle {
+    chrome_theme_from_flow_theme(theme).glass
+}
+
+pub(crate) fn linear_work_area_glass_style(theme: &FlowTheme) -> GlassStyle {
+    let mut style = work_area_glass_style(theme);
+    style.tint = linearize_rgba(style.tint);
+    style.edge_color = linearize_rgba(style.edge_color);
+    style
+}
+
 /// Linear Rec.709/sRGB scene color to linear Display P3 shader-authoring
 /// coordinates. The wide shader epilogue applies the inverse transform before
 /// blending into the FP16 scene, so existing theme colors retain their look.
@@ -299,6 +311,7 @@ fn bevel_style_to_display_p3(mut style: BevelStyle) -> BevelStyle {
 
 fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
     let mut t = theme.clone();
+    t.semantic_colors_linear = true;
     t.background.color = linearize_rgba(t.background.color);
     t.wallpaper.tint_color = linearize_rgba(t.wallpaper.tint_color);
     t.chrome.bg_color = linearize_rgba(t.chrome.bg_color);
@@ -323,6 +336,28 @@ fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
     t.icons.active = linearize_rgba(t.icons.active);
     t.icons.disabled = linearize_rgba(t.icons.disabled);
     t.icons.glow = linearize_rgba(t.icons.glow);
+    if let Some(semantic) = &t.semantic {
+        if semantic.color_behavior.dynamic_range == focaldesk_themes::ThemeDynamicRange::Hdr {
+            let scale = (semantic.color_behavior.luminance_cap_nits
+                / semantic.color_behavior.sdr_white_nits)
+                .max(1.0);
+            for color in [
+                &mut t.dialog.title_color,
+                &mut t.dialog.text_color,
+                &mut t.text.title,
+                &mut t.text.normal,
+                &mut t.text.dim,
+                &mut t.text.accent,
+                &mut t.text.meta_label,
+                &mut t.text.meta_value,
+                &mut t.text.clock,
+            ] {
+                color[0] *= scale;
+                color[1] *= scale;
+                color[2] *= scale;
+            }
+        }
+    }
     t
 }
 
@@ -358,7 +393,11 @@ fn contiguous_runs_by_key<'a, T, K: PartialEq>(
 
 #[cfg(test)]
 mod color_run_tests {
-    use super::{clipped_dest_local_damage, contiguous_runs_by_key};
+    use super::{
+        clipped_dest_local_damage, contiguous_runs_by_key, semantic_color, themed_icon_style,
+        UiVisualState,
+    };
+    use focaldesk_themes::{theme_by_name, SemanticTheme, ThemeColor};
     use smithay::utils::{Physical, Rectangle};
 
     #[test]
@@ -403,9 +442,126 @@ mod color_run_tests {
             ]
         );
     }
+
+    #[test]
+    fn semantic_selected_icon_uses_foreground_instead_of_button_fill() {
+        let mut theme = theme_by_name("Classic");
+        let mut semantic = SemanticTheme::default();
+        let selected_fill = ThemeColor::srgb(0.0, 0.35, 0.85, 1.0);
+        let foreground = ThemeColor::srgb(0.95, 0.98, 1.0, 1.0);
+        semantic.surfaces.active_button.selected = Some(selected_fill);
+        semantic.typography.primary = foreground;
+        theme.semantic = Some(semantic);
+
+        let style = themed_icon_style(&theme, UiVisualState::Selected);
+
+        assert_eq!(style.tint, semantic_color(&theme, foreground));
+        assert_ne!(style.tint, semantic_color(&theme, selected_fill));
+    }
 }
 
-fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> ChromeTheme {
+fn semantic_color(theme: &FlowTheme, color: focaldesk_themes::ThemeColor) -> [f32; 4] {
+    let mut value = color
+        .converted_to(focaldesk_themes::ThemeColorSpace::Srgb)
+        .components();
+    if theme.semantic_colors_linear {
+        if let Some(semantic) = &theme.semantic {
+            if semantic.color_behavior.dynamic_range == focaldesk_themes::ThemeDynamicRange::Hdr {
+                let scale = (semantic.color_behavior.luminance_cap_nits
+                    / semantic.color_behavior.sdr_white_nits)
+                    .max(1.0);
+                value[0] *= scale;
+                value[1] *= scale;
+                value[2] *= scale;
+            }
+        }
+    } else {
+        if let Some(semantic) = &theme.semantic {
+            match semantic.color_behavior.gamut_mapping {
+                focaldesk_themes::GamutMapping::Clip => {
+                    for channel in &mut value[..3] {
+                        *channel = channel.clamp(0.0, 1.0);
+                    }
+                }
+                focaldesk_themes::GamutMapping::Perceptual
+                | focaldesk_themes::GamutMapping::PreserveHue => {
+                    let minimum = value[..3].iter().copied().fold(f32::INFINITY, f32::min);
+                    if minimum < 0.0 {
+                        for channel in &mut value[..3] {
+                            *channel -= minimum;
+                        }
+                    }
+                    let maximum = value[..3].iter().copied().fold(0.0_f32, f32::max);
+                    if maximum > 1.0 {
+                        for channel in &mut value[..3] {
+                            *channel /= maximum;
+                        }
+                    }
+                }
+            }
+        }
+        for channel in &mut value[..3] {
+            *channel = if *channel <= 0.003_130_8 {
+                12.92 * *channel
+            } else {
+                1.055 * channel.powf(1.0 / 2.4) - 0.055
+            };
+        }
+    }
+    value
+}
+
+fn themed_text_style(theme: &FlowTheme, role: FontRole, fallback_size: u32) -> TextStyle {
+    let mut style = style_for(
+        role,
+        fallback_size,
+        theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle),
+    );
+    let Some(semantic) = &theme.semantic else {
+        return style;
+    };
+    style.size_px =
+        ((fallback_size as f32 * semantic.typography.size / 14.0).round() as u32).clamp(8, 72);
+    style.letter_spacing_64 = (semantic.typography.letter_spacing * 64.0)
+        .round()
+        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16;
+    let heavy = semantic.typography.font_weight >= 600;
+    let medium = semantic.typography.font_weight >= 450;
+    style.font = match style.font {
+        FontId::IbmPlexSansRegular | FontId::IbmPlexSansMedium | FontId::IbmPlexSansSemiBold => {
+            if heavy {
+                FontId::IbmPlexSansSemiBold
+            } else if medium {
+                FontId::IbmPlexSansMedium
+            } else {
+                FontId::IbmPlexSansRegular
+            }
+        }
+        FontId::RajdhaniRegular | FontId::RajdhaniMedium | FontId::RajdhaniSemiBold => {
+            if heavy {
+                FontId::RajdhaniSemiBold
+            } else if medium {
+                FontId::RajdhaniMedium
+            } else {
+                FontId::RajdhaniRegular
+            }
+        }
+        FontId::OrbitronRegular | FontId::OrbitronMedium | FontId::OrbitronSemiBold => {
+            if heavy {
+                FontId::OrbitronSemiBold
+            } else if medium {
+                FontId::OrbitronMedium
+            } else {
+                FontId::OrbitronRegular
+            }
+        }
+        other => other,
+    };
+    style
+}
+
+fn chrome_theme_from_flow_theme(theme: &FlowTheme) -> ChromeTheme {
+    let chrome = &theme.chrome;
     let mut legacy = default_chrome_theme();
     legacy.frame_outer.face_color = chrome.bg_color;
     legacy.panel_inner.face_color = chrome.panel_color;
@@ -416,6 +572,31 @@ fn chrome_theme_from_flow_theme(chrome: &focaldesk_themes::ChromeTheme) -> Chrom
     legacy.glass.tint = chrome.glass_tint;
     legacy.top_bar.radius = chrome.corner_radius;
     legacy.top_bar.trim_color = chrome.trim_color;
+
+    if let Some(semantic) = &theme.semantic {
+        let edges = &semantic.edges;
+        legacy.frame_outer.face_color =
+            semantic_color(theme, semantic.surfaces.window_frame.normal);
+        legacy.frame_inner.face_color =
+            semantic_color(theme, semantic.surfaces.window_frame.normal);
+        legacy.sidebar.face_color = semantic_color(theme, semantic.surfaces.dock.normal);
+        legacy.panel_base.face_color = semantic_color(theme, semantic.surfaces.popup.normal);
+        legacy.panel_inner.face_color = semantic_color(theme, semantic.surfaces.popup.normal);
+        legacy.button.face_color = semantic_color(theme, semantic.surfaces.button.normal);
+        legacy.button.glow_color = semantic_color(theme, semantic.surfaces.active_button.normal);
+        legacy.button.glow_strength = edges.glow;
+        legacy.frame_outer.light_color = semantic_color(theme, edges.inner_highlight);
+        legacy.frame_outer.shadow_color = [0.0, 0.0, 0.0, edges.shadow];
+        legacy.frame_outer.bevel = edges.border_width.max(0.1);
+        legacy.top_bar.face_color = semantic_color(theme, semantic.surfaces.bar.normal);
+        legacy.top_bar.edge_color = semantic_color(theme, edges.border_color);
+        legacy.top_bar.radius = edges.radius;
+        legacy.top_bar.highlight_strength = edges.inner_highlight.a;
+        legacy.top_bar.shadow_strength = edges.shadow;
+        legacy.trim.face_color = semantic_color(theme, edges.border_color);
+        legacy.trim.bevel = edges.border_width.max(0.1);
+        legacy.glass.edge_color = semantic_color(theme, edges.inner_highlight);
+    }
 
     legacy
 }
@@ -463,6 +644,42 @@ fn ellipsize_for_width(text: &str, max_width: i32, size_px: u32) -> String {
 }
 
 fn themed_icon_style(theme: &FlowTheme, state: UiVisualState) -> UiVisualStyle {
+    if let Some(semantic) = &theme.semantic {
+        // Icons are foreground content. Using a button surface state as their
+        // tint makes selected indicators disappear when the selected surface
+        // and glyph resolve to the same color (most visibly the Wi-Fi icon).
+        let mut tint = semantic_color(
+            theme,
+            if matches!(state, UiVisualState::Disabled) {
+                semantic.typography.secondary
+            } else {
+                semantic.typography.primary
+            },
+        );
+        if matches!(state, UiVisualState::Disabled) {
+            tint[3] *= 0.55;
+        } else if matches!(state, UiVisualState::Inactive) {
+            tint[3] *= 0.82;
+        }
+        return UiVisualStyle {
+            tint,
+            glow: if matches!(
+                state,
+                UiVisualState::Hover | UiVisualState::Active | UiVisualState::Selected
+            ) {
+                semantic.edges.glow
+            } else {
+                0.0
+            },
+            alpha: tint[3],
+            scale: match state {
+                UiVisualState::Hover => theme.hover_scale,
+                UiVisualState::Active => theme.press_scale,
+                UiVisualState::Selected => 1.02,
+                _ => 1.0,
+            },
+        };
+    }
     let (tint, glow, alpha, scale) = match state {
         UiVisualState::Inactive => (theme.icons.inactive, 0.0, theme.icons.inactive[3], 1.0),
         UiVisualState::Hover => (
@@ -490,6 +707,30 @@ fn themed_icon_style(theme: &FlowTheme, state: UiVisualState) -> UiVisualStyle {
 }
 
 fn selected_sidebar_style(theme: &FlowTheme, hovered: bool) -> BevelStyle {
+    if let Some(semantic) = &theme.semantic {
+        let state = if hovered {
+            focaldesk_themes::InteractionState::Hover
+        } else {
+            focaldesk_themes::InteractionState::Selected
+        };
+        return BevelStyle {
+            bevel: semantic.edges.border_width.max(0.1),
+            softness: 1.25,
+            glow_width: 5.0,
+            glow_alpha: semantic.edges.glow,
+            inner_shadow: semantic.edges.shadow,
+            face_color: semantic_color(theme, semantic.surfaces.active_button.resolve(state)),
+            light_color: semantic_color(theme, semantic.edges.inner_highlight),
+            shadow_color: [0.0, 0.0, 0.0, semantic.edges.shadow],
+            glow_color: semantic_color(
+                theme,
+                semantic
+                    .surfaces
+                    .active_button
+                    .resolve(focaldesk_themes::InteractionState::Focused),
+            ),
+        };
+    }
     let mut face_color = theme.chrome.panel_color;
     face_color[3] = 0.34;
 
@@ -708,6 +949,7 @@ impl RenderState {
             scratch_damage: [zero; 8],
             scratch_damage_len: 0,
             wallpaper_texture: None,
+            wallpaper_path: None,
             sw_cursor_texture: None,
             sw_cursor_surface: None,
             sw_cursor_surface_elements: Vec::new(),
@@ -778,9 +1020,8 @@ impl RenderState {
         theme: &focaldesk_themes::FlowTheme,
         scale: Scale<f64>,
     ) -> Result<(), GlesError> {
-        let builtin_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
-        let title_style = style_for(FontRole::Title, 24, builtin_id);
-        let style = style_for(FontRole::Meta, 18, builtin_id);
+        let title_style = themed_text_style(theme, FontRole::Title, 24);
+        let style = themed_text_style(theme, FontRole::Meta, 18);
         let gap = theme.spacing.max(4);
 
         let output_s = output_number.to_string();
@@ -945,7 +1186,7 @@ impl RenderState {
             }
 
             // ✅ MUST be inside loop
-            cursor_x += glyph.advance.round() as i32;
+            cursor_x += (glyph.advance + f32::from(style.letter_spacing_64) / 64.0).round() as i32;
         }
 
         Ok(())
@@ -982,11 +1223,7 @@ impl RenderState {
             return Ok(());
         };
 
-        let style = style_for(
-            FontRole::Label,
-            14,
-            theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle),
-        );
+        let style = themed_text_style(theme, FontRole::Label, 14);
         let text_w = fonts.advance_width(text, style);
         let rect = tooltip_rect_for_element(el.bounds, el.kind, text_w, output_size);
 
@@ -1700,20 +1937,22 @@ impl RenderState {
         Ok(())
     }
 
-    pub fn ensure_wallpaper_loaded(&mut self, renderer: &mut GlesRenderer) {
-        if self.wallpaper_texture.is_some() {
+    pub fn ensure_wallpaper_loaded(&mut self, renderer: &mut GlesRenderer, path: Option<&str>) {
+        if self.wallpaper_path.as_deref() == path {
             return;
         }
+        self.wallpaper_texture = None;
+        self.wallpaper_path = path.map(str::to_string);
+        let Some(path) = path else {
+            return;
+        };
         info!(
             target: "focaldesk",
             session_id = session_id(),
             "ensure_wallpaper_loaded: attempting load"
         );
 
-        let tex = Self::load_wallpaper(
-            renderer,
-            "/home/steve/focaldesk/assets/wallpaper/focaldesk_wallpaper.png",
-        );
+        let tex = Self::load_wallpaper(renderer, path);
         info!(
             target: "focaldesk",
             session_id = session_id(),
@@ -2052,7 +2291,7 @@ impl RenderState {
                         inputs.sidebar_pulse,
                         inputs.topbar_pulse,
                         inputs.clock_pulse,
-                        theme.chrome,
+                        theme,
                     );
                 }
 
@@ -2899,7 +3138,7 @@ impl RenderState {
         let Some(glass) = glass else {
             return Ok(());
         };
-        let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
+        let legacy_theme = chrome_theme_from_flow_theme(theme);
         let mut style = legacy_theme.glass;
         if wide_gamut {
             style.tint = scene_linear_to_display_p3(style.tint);
@@ -3207,7 +3446,7 @@ impl RenderState {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
 
-        use crate::core::wallpaper::{compute_wallpaper_blit, RectI, SizeI, WallpaperMode};
+        use crate::core::wallpaper::{compute_wallpaper_blits, RectI, SizeI, WallpaperMode};
 
         let Some(tex) = self.wallpaper_texture.as_ref() else {
             return;
@@ -3224,44 +3463,36 @@ impl RenderState {
         let sz = tex.size();
         let src = SizeI { w: sz.w, h: sz.h };
 
-        let mode = WallpaperMode::Fill;
-
-        let Some(blit) = compute_wallpaper_blit(src, out, mode) else {
-            return;
+        let mode = match theme.fit {
+            focaldesk_themes::ThemeWallpaperFit::Fill => WallpaperMode::Fill,
+            focaldesk_themes::ThemeWallpaperFit::Fit => WallpaperMode::Fit,
+            focaldesk_themes::ThemeWallpaperFit::Stretch => WallpaperMode::Stretch,
+            focaldesk_themes::ThemeWallpaperFit::Center => WallpaperMode::Center,
+            focaldesk_themes::ThemeWallpaperFit::Tile => WallpaperMode::Tile,
         };
-
-        let dst_world: Rectangle<i32, Physical> = Rectangle::new(
-            (blit.dst.x, blit.dst.y).into(),
-            (blit.dst.w, blit.dst.h).into(),
-        );
-
-        //let dst =
-        //    RenderState::rect_apply_flipped180(dst_world, (ctx.output_size.0, ctx.output_size.1));
-        let dst = dst_world;
-
-        let damage_local = clipped_dest_local_damage(dst, &ctx.damage);
-        if damage_local.is_empty() {
+        let blits = compute_wallpaper_blits(src, out, mode);
+        if blits.is_empty() {
             return;
         }
 
-        let tw = src.w as f64;
-        let th = src.h as f64;
-
-        let src_rect: Rectangle<f64, Buffer> = Rectangle::new(
-            (blit.uv.u0 as f64 * tw, blit.uv.v0 as f64 * th).into(),
-            (
-                (blit.uv.u1 as f64 - blit.uv.u0 as f64) * tw,
-                (blit.uv.v1 as f64 - blit.uv.v0 as f64) * th,
-            )
-                .into(),
-        );
-
         let wide_gamut =
             client_compositing.ui_textures_linear() && self.chrome_shaders.wide_gamut_ready();
-        let tint = if wide_gamut {
-            scene_linear_to_display_p3(theme.tint_color)
+        let tint_alpha = 1.0 - (1.0 - theme.tint_color[3]) * (1.0 - theme.dim);
+        let tint_weight = if tint_alpha > f32::EPSILON {
+            theme.tint_color[3] / tint_alpha
         } else {
-            theme.tint_color
+            0.0
+        };
+        let effective_tint = [
+            theme.tint_color[0] * tint_weight,
+            theme.tint_color[1] * tint_weight,
+            theme.tint_color[2] * tint_weight,
+            tint_alpha,
+        ];
+        let tint = if wide_gamut {
+            scene_linear_to_display_p3(effective_tint)
+        } else {
+            effective_tint
         };
         let uniforms = [
             Uniform::new("u_tint", tint),
@@ -3273,6 +3504,12 @@ impl RenderState {
                     0.0f32
                 },
             ),
+            Uniform::new(
+                "u_texel_size",
+                [1.0 / src.w.max(1) as f32, 1.0 / src.h.max(1) as f32],
+            ),
+            Uniform::new("u_blur_radius", theme.blur),
+            Uniform::new("u_saturation", theme.saturation),
         ];
 
         let wallpaper_program = if wide_gamut {
@@ -3281,19 +3518,39 @@ impl RenderState {
             self.chrome_shaders.wallpaper_tint.as_ref()
         };
 
-        frame
-            .render_texture_from_to(
-                tex,
-                src_rect,
-                dst,
-                &damage_local,
-                &[],
-                Transform::Normal,
-                1.0,
-                wallpaper_program,
-                &uniforms,
-            )
-            .unwrap();
+        let tw = src.w as f64;
+        let th = src.h as f64;
+        for blit in blits {
+            let dst: Rectangle<i32, Physical> = Rectangle::new(
+                (blit.dst.x, blit.dst.y).into(),
+                (blit.dst.w, blit.dst.h).into(),
+            );
+            let damage_local = clipped_dest_local_damage(dst, &ctx.damage);
+            if damage_local.is_empty() {
+                continue;
+            }
+            let src_rect: Rectangle<f64, Buffer> = Rectangle::new(
+                (blit.uv.u0 as f64 * tw, blit.uv.v0 as f64 * th).into(),
+                (
+                    (blit.uv.u1 as f64 - blit.uv.u0 as f64) * tw,
+                    (blit.uv.v1 as f64 - blit.uv.v0 as f64) * th,
+                )
+                    .into(),
+            );
+            frame
+                .render_texture_from_to(
+                    tex,
+                    src_rect,
+                    dst,
+                    &damage_local,
+                    &[],
+                    Transform::Normal,
+                    1.0,
+                    wallpaper_program,
+                    &uniforms,
+                )
+                .unwrap();
+        }
     }
 
     /// Overlay the bundled wallpaper's wide-gamut accents and conservative
@@ -3311,6 +3568,9 @@ impl RenderState {
         reference_white_nits: f32,
         peak_nits: f32,
     ) {
+        if theme.fit != focaldesk_themes::ThemeWallpaperFit::Fill {
+            return;
+        }
         use crate::core::wallpaper::{compute_wallpaper_blit, RectI, SizeI, WallpaperMode};
         use smithay::backend::renderer::gles::Uniform;
 
@@ -3774,9 +4034,9 @@ impl RenderState {
         sidebar_pulse: Option<SidebarPulseFrame>,
         topbar_pulse: Option<TopbarPulseFrame>,
         clock_pulse: Option<ClockPulseFrame>,
-        theme: focaldesk_themes::ChromeTheme,
+        theme: &FlowTheme,
     ) {
-        let legacy_theme = chrome_theme_from_flow_theme(&theme);
+        let legacy_theme = chrome_theme_from_flow_theme(theme);
 
         let beveled = self
             .chrome_shaders
@@ -4153,7 +4413,7 @@ impl RenderState {
         linear_target: bool,
     ) {
         let wide_gamut = linear_target && self.chrome_shaders.wide_gamut_ready();
-        let legacy_theme = chrome_theme_from_flow_theme(&theme.chrome);
+        let legacy_theme = chrome_theme_from_flow_theme(theme);
 
         let beveled = if wide_gamut {
             self.chrome_shaders
@@ -4286,6 +4546,31 @@ impl RenderState {
 
                 let state = el.visual_state();
                 let mut style = themed_icon_style(active_theme, state);
+                if let Some(semantic) = &active_theme.semantic {
+                    let urgent = (el.id == focaldesk_ui::ui_builder::TOPBAR_NOTIFICATIONS_ID
+                        && notification_unread_count > 0)
+                        || (el.id == focaldesk_ui::ui_builder::TOPBAR_UPDATES_ID
+                            && update_available_count > 0);
+                    if urgent {
+                        style.tint = semantic_color(
+                            active_theme,
+                            semantic
+                                .surfaces
+                                .active_button
+                                .resolve(focaldesk_themes::InteractionState::Urgent),
+                        );
+                        style.glow = semantic.edges.glow.max(0.2);
+                    } else if ui_focus == Some(el.id) {
+                        style.tint = semantic_color(
+                            active_theme,
+                            semantic
+                                .surfaces
+                                .active_button
+                                .resolve(focaldesk_themes::InteractionState::Focused),
+                        );
+                        style.glow = semantic.edges.glow.max(0.15);
+                    }
+                }
                 if wide_gamut {
                     style.tint = scene_linear_to_display_p3(style.tint);
                 }
@@ -4370,14 +4655,8 @@ impl RenderState {
                                     6.0,
                                     active_theme.chrome.accent_color,
                                 );
-                                let badge_style = style_for(
-                                    FontRole::Meta,
-                                    11,
-                                    active_theme
-                                        .id
-                                        .builtin_id()
-                                        .unwrap_or(BuiltInThemeId::Eagle),
-                                );
+                                let badge_style =
+                                    themed_text_style(active_theme, FontRole::Meta, 11);
                                 let _ = self.draw_text_cached(
                                     frame,
                                     fonts,
@@ -4429,14 +4708,8 @@ impl RenderState {
                                     6.0,
                                     active_theme.chrome.accent_color,
                                 );
-                                let badge_style = style_for(
-                                    FontRole::Meta,
-                                    11,
-                                    active_theme
-                                        .id
-                                        .builtin_id()
-                                        .unwrap_or(BuiltInThemeId::Eagle),
-                                );
+                                let badge_style =
+                                    themed_text_style(active_theme, FontRole::Meta, 11);
                                 let _ = self.draw_text_cached(
                                     frame,
                                     fonts,
@@ -4519,14 +4792,7 @@ impl RenderState {
                         let clock_rect_logical = inset_rect(base_rect_logical, 4);
                         //self.draw_clock_text(frame, atlas, &time_str, clock_rect,tinted_icon);
 
-                        let clock_style = style_for(
-                            FontRole::Clock,
-                            24,
-                            active_theme
-                                .id
-                                .builtin_id()
-                                .unwrap_or(BuiltInThemeId::Eagle),
-                        );
+                        let clock_style = themed_text_style(active_theme, FontRole::Clock, 24);
 
                         let _ = self.draw_clock_font_text(
                             frame,
@@ -4722,7 +4988,7 @@ pub struct LightChannelStyle {
     pub core_color: [f32; 4],
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GlassStyle {
     pub opacity: f32,
     pub edge_width: f32,

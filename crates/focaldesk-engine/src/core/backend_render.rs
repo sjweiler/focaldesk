@@ -21,6 +21,7 @@ use focaldesk_logging::FLogLevel;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowTheme;
 use focaldesk_types::OutputId;
+use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 
 pub struct PreparedOutput {
@@ -293,8 +294,10 @@ pub fn prepare_output(
         );
         crate::core::wayland::color_management_protocol::notify_preferred_color_changed(state);
     }
-    // need to pass state.theme.wallpaper into this function so theme wallpaper can be loaded
-    state.render.ensure_wallpaper_loaded(renderer);
+    let wallpaper_path = state.theme.active_theme().wallpaper.path.clone();
+    state
+        .render
+        .ensure_wallpaper_loaded(renderer, wallpaper_path.as_deref());
 
     if !state.render.fonts_prewarm_done {
         prewarm_font_glyphs(state)?;
@@ -389,9 +392,21 @@ fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::erro
         ],
     };
 
+    let mut sizes = vec![10, 12, 14, 16, 18, 20, 24];
+    if let Some(semantic) = &state.theme.active_theme().semantic {
+        for fallback in [11.0_f32, 14.0, 15.0, 16.0, 18.0, 22.0, 24.0] {
+            sizes.push(((fallback * semantic.typography.size / 14.0).round() as u32).clamp(8, 72));
+        }
+        sizes.sort_unstable();
+        sizes.dedup();
+    }
     for &font in preload_fonts {
-        for size_px in [10, 12, 14, 16, 18, 20, 24] {
-            let style = TextStyle { font, size_px };
+        for &size_px in &sizes {
+            let style = TextStyle {
+                font,
+                size_px,
+                letter_spacing_64: 0,
+            };
 
             state.fonts.prepare_text("FocalDesk", style)?;
             state.fonts.prepare_text("FocalDesk Debug", style)?;
@@ -617,6 +632,11 @@ pub fn draw_output_stage(
     chrome_glass_pass: ChromeGlassPass,
     defer_egui_to_sdr: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let chrome_glass_pass = if state.work_area_glass_enabled() {
+        chrome_glass_pass
+    } else {
+        ChromeGlassPass::Skip
+    };
     let egui_frame_ctx = DesktopFrameCtx {
         output_size: prepared.frame_ctx.output_size,
         output_scale: prepared.frame_ctx.output_scale,
@@ -668,12 +688,27 @@ pub fn draw_output_stage(
         })
         .unwrap_or(true);
 
+    let semantic_metrics = state
+        .theme
+        .active_theme()
+        .semantic
+        .as_ref()
+        .map(|semantic| {
+            let layout = &semantic.layout;
+            ChromeMetrics {
+                sidebar_w: layout.dock_width.round() as i32,
+                topbar_h: layout.bar_height.round() as i32,
+                icon_base_px: layout.icon_size.round().max(1.0) as u32,
+                icon_padding: layout.padding.round() as i32,
+                slot_spacing: layout.gap.round() as i32,
+            }
+        });
     let inputs = RenderInputs {
         ctx: &prepared.frame_ctx,
         layout: &prepared.layout,
         scene,
         output: output_state,
-        metrics: &state.chrome.metrics,
+        metrics: semantic_metrics.as_ref().unwrap_or(&state.chrome.metrics),
         elements,
         popup_elements,
         sidebar_hover_slot: state

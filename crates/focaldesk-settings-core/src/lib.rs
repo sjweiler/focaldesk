@@ -86,6 +86,67 @@ pub struct OutputConfig {
     pub hdr_requested: bool,
     #[serde(default)]
     pub hdr_enabled: bool,
+    #[serde(default)]
+    pub hdr_appearance: HdrAppearance,
+}
+
+/// Per-output creative controls for the final HDR10 encode pass.
+///
+/// These values never enable HDR or change KMS connector state. They are only
+/// consumed after the compositor has independently selected a guarded HDR10
+/// output path.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HdrAppearance {
+    pub reference_white_nits: f32,
+    pub peak_nits: f32,
+    pub saturation: f32,
+    pub midtone_gamma: f32,
+}
+
+impl Default for HdrAppearance {
+    fn default() -> Self {
+        Self {
+            reference_white_nits: 203.0,
+            peak_nits: 450.0,
+            saturation: 1.0,
+            midtone_gamma: 1.0,
+        }
+    }
+}
+
+impl HdrAppearance {
+    // The current HDR10 metadata contract advertises a 450-nit mastering
+    // ceiling. Shader tuning must not create pixels above that promise.
+    pub const REFERENCE_WHITE_RANGE: std::ops::RangeInclusive<f32> = 80.0..=450.0;
+    pub const PEAK_RANGE: std::ops::RangeInclusive<f32> = 203.0..=450.0;
+    pub const SATURATION_RANGE: std::ops::RangeInclusive<f32> = 0.75..=1.25;
+    pub const MIDTONE_GAMMA_RANGE: std::ops::RangeInclusive<f32> = 0.70..=1.50;
+
+    pub fn validate(self) -> Result<Self, &'static str> {
+        if !self.reference_white_nits.is_finite()
+            || !self.peak_nits.is_finite()
+            || !self.saturation.is_finite()
+            || !self.midtone_gamma.is_finite()
+        {
+            return Err("HDR appearance values must be finite");
+        }
+        if !Self::REFERENCE_WHITE_RANGE.contains(&self.reference_white_nits) {
+            return Err("HDR reference white is outside the supported range");
+        }
+        if !Self::PEAK_RANGE.contains(&self.peak_nits) {
+            return Err("HDR peak luminance is outside the supported range");
+        }
+        if self.reference_white_nits > self.peak_nits {
+            return Err("HDR reference white cannot exceed peak luminance");
+        }
+        if !Self::SATURATION_RANGE.contains(&self.saturation) {
+            return Err("HDR saturation is outside the supported range");
+        }
+        if !Self::MIDTONE_GAMMA_RANGE.contains(&self.midtone_gamma) {
+            return Err("HDR midtone gamma is outside the supported range");
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -588,5 +649,44 @@ mod tests {
         let restored: ExclusiveHdrState =
             serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
         assert_eq!(restored, state);
+    }
+
+    #[test]
+    fn hdr_appearance_defaults_are_neutral_and_valid() {
+        let appearance = HdrAppearance::default();
+        assert_eq!(appearance.reference_white_nits, 203.0);
+        assert_eq!(appearance.peak_nits, 450.0);
+        assert_eq!(appearance.saturation, 1.0);
+        assert_eq!(appearance.midtone_gamma, 1.0);
+        assert_eq!(appearance.validate(), Ok(appearance));
+    }
+
+    #[test]
+    fn hdr_appearance_rejects_unsafe_or_non_finite_values() {
+        assert!(
+            HdrAppearance {
+                reference_white_nits: 451.0,
+                ..HdrAppearance::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HdrAppearance {
+                reference_white_nits: 300.0,
+                peak_nits: 250.0,
+                ..HdrAppearance::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HdrAppearance {
+                saturation: f32::NAN,
+                ..HdrAppearance::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

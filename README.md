@@ -27,6 +27,9 @@ and [roadmap](ROADMAP.md) for the intended direction.
 - OpenGL ES rendering with shell effects, damage tracking, and experimental HDR
   and color-management paths.
 - First-party launcher, Settings, file manager, login greeter, and AI Console.
+- Versioned theme editor with semantic surface tokens, wide-gamut/HDR paint
+  intent, live compositor preview, wallpaper processing, and portable theme
+  packages ([details](docs/theme-editor.md)).
 - PipeWire and portal integration for experimental screen capture.
 - Separate user services for launching, settings, notifications, power,
   dialogs, controls, speech, voice input, and permissioned automation.
@@ -54,7 +57,7 @@ release.
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
 | HDR and color management | Experimental and hardware-dependent; HDR10 verified on Fedora 44 with NVIDIA 595, including Google Chrome ([details](docs/hdr.md#known-working-configuration)) |
-| Settings, file manager, launcher, and AI console | Usable prototypes |
+| Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradient rendering is not yet compositor-native |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |
 

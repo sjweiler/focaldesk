@@ -14,6 +14,7 @@ working configuration before testing a new revision.
 | `$XDG_CONFIG_HOME/focaldesk/settings.json` | Main desktop, application, input, workspace, privacy, power, debug, and chrome settings | Prefer the Settings application |
 | `$XDG_CONFIG_HOME/focaldesk/config.toml` | Compact compositor appearance and display configuration used by the typed config API | Developer-facing; may be consolidated with `settings.json` later |
 | `$XDG_CONFIG_HOME/focaldesk/displays.json` | Detected output topology and runtime display choices | Generated; do not edit while FocalDesk is running |
+| `$XDG_DATA_HOME/focaldesk/themes/` | Theme packages installed by the Theme Editor | Manage through Theme Editor import and uninstall actions |
 | `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions; stored mode `0600` | Manage through the permission UI when possible |
 | `$XDG_CONFIG_HOME/focaldesk/automation/automations.toml` | Scheduled automation definitions | Experimental; service is opt-in |
 | `$XDG_CONFIG_HOME/focaldesk/automation/scripts/` | Lua automation scripts referenced by `automations.toml` | Experimental and security-sensitive |
@@ -52,7 +53,7 @@ The main settings model currently includes:
 
 - Appearance: theme, accent, shell sizing, icons, and animations.
 - Displays: connector, mode, position, scale, primary output, color profile,
-  ICC profile, and requested HDR state.
+  ICC profile, requested HDR state, and per-output HDR appearance values.
 - Input: pointer speed, natural scrolling, XKB layout options, and validated
   compositor shortcut overrides.
 - Applications: preferred terminal, browser, browser backend, and file manager.
@@ -62,6 +63,11 @@ The main settings model currently includes:
 Use the Settings application for ordinary changes. If you edit JSON or TOML by
 hand, stop the component that owns the file first and validate the syntax before
 restarting it.
+
+The `Default` appearance theme loads the installed
+`/usr/share/focaldesk/default.toml` document. Theme Editor source documents and
+portable packages have different save/apply semantics; see
+[Theme Editor](theme-editor.md) before moving or hand-editing them.
 
 Common shortcuts are editable on the Keyboard page. Advanced overrides use the
 `input.keybindings` object in `settings.json`; see
@@ -87,6 +93,7 @@ not listed here should be treated as internal and may change without notice.
 | `FOCALDESK_OLLAMA_MODEL` | Select the default Ollama model |
 | `FOCALDESK_AI_SOCKET` | Override the AI service Unix-socket path for development |
 | `FOCALDESK_SCREENCAST_OUTPUT` | Select the capture output when no portal chooser input is available |
+| `FOCALDESK_HDR_CALIBRATION_PATTERN` | Set to `1` to replace active HDR output content with the session-only calibration pattern |
 | `FOCALDESK_VOSK_MODEL_DIR` | Point voice recognition at a Vosk model directory |
 | `FOCALD_SPEECH_BACKEND` | Select `espeak-ng` or `piper` for speech synthesis |
 
@@ -97,9 +104,10 @@ paths must live in a real directory owned by the current user; FocalDesk refuses
 shared, symlinked, or foreign-owned socket directories. Normal services use
 private sockets below `$XDG_RUNTIME_DIR/focaldesk`.
 
-HDR and color-management overrides are intentionally omitted here. They bypass
-hardware safeguards and should only be used while investigating the relevant
-code and logs.
+Other HDR and color-management overrides are intentionally omitted here. They
+bypass hardware safeguards and should only be used while investigating the
+relevant code and logs. See [HDR and color management](hdr.md) for the guarded
+Settings controls and calibration-pattern behavior.
 
 ## Secrets
 

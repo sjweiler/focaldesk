@@ -1,0 +1,210 @@
+format_version = 1
+name = "Default"
+dynamic_range = "sdr"
+hdr_luminance_nits = 1000.0
+
+[paint]
+mode = "solid"
+
+[paint.color]
+space = "srgb"
+r = 0.03583464398980141
+g = 0.20386143028736115
+b = 0.7295855283737183
+a = 1.0
+
+[wallpaper]
+path = "/usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png"
+fit = "fill"
+dim = 0.0
+
+[semantic.surfaces.bar.normal]
+space = "srgb"
+r = 0.10000000149011612
+g = 0.11999999731779099
+b = 0.1599999964237213
+a = 1.0
+
+[semantic.surfaces.bar.urgent]
+space = "srgb"
+r = 0.8500000238418579
+g = 0.07999999821186066
+b = 0.03999999910593033
+a = 1.0
+
+[semantic.surfaces.bar.disabled]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.09000000357627869
+b = 0.10999999940395355
+a = 0.550000011920929
+
+[semantic.surfaces.dock.normal]
+space = "srgb"
+r = 0.10000000149011612
+g = 0.11999999731779099
+b = 0.1599999964237213
+a = 1.0
+
+[semantic.surfaces.dock.urgent]
+space = "srgb"
+r = 0.8500000238418579
+g = 0.07999999821186066
+b = 0.03999999910593033
+a = 1.0
+
+[semantic.surfaces.dock.disabled]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.09000000357627869
+b = 0.10999999940395355
+a = 0.550000011920929
+
+[semantic.surfaces.button.normal]
+space = "srgb"
+r = 0.10000000149011612
+g = 0.11999999731779099
+b = 0.1599999964237213
+a = 1.0
+
+[semantic.surfaces.button.urgent]
+space = "srgb"
+r = 0.8500000238418579
+g = 0.07999999821186066
+b = 0.03999999910593033
+a = 1.0
+
+[semantic.surfaces.button.disabled]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.09000000357627869
+b = 0.10999999940395355
+a = 0.550000011920929
+
+[semantic.surfaces.active_button.normal]
+space = "srgb"
+r = 0.05000000074505806
+g = 0.41999998688697815
+b = 0.9300000071525574
+a = 1.0
+
+[semantic.surfaces.active_button.hover]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.550000011920929
+b = 1.0
+a = 1.0
+
+[semantic.surfaces.active_button.urgent]
+space = "srgb"
+r = 0.8500000238418579
+g = 0.07999999821186066
+b = 0.03999999910593033
+a = 1.0
+
+[semantic.surfaces.active_button.disabled]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.09000000357627869
+b = 0.10999999940395355
+a = 0.550000011920929
+
+[semantic.surfaces.popup.normal]
+space = "srgb"
+r = 0.10000000149011612
+g = 0.11999999731779099
+b = 0.1599999964237213
+a = 1.0
+
+[semantic.surfaces.popup.urgent]
+space = "srgb"
+r = 0.8500000238418579
+g = 0.07999999821186066
+b = 0.03999999910593033
+a = 1.0
+
+[semantic.surfaces.popup.disabled]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.09000000357627869
+b = 0.10999999940395355
+a = 0.550000011920929
+
+[semantic.surfaces.window_frame.normal]
+space = "srgb"
+r = 0.10000000149011612
+g = 0.11999999731779099
+b = 0.1599999964237213
+a = 1.0
+
+[semantic.surfaces.window_frame.urgent]
+space = "srgb"
+r = 0.8500000238418579
+g = 0.07999999821186066
+b = 0.03999999910593033
+a = 1.0
+
+[semantic.surfaces.window_frame.disabled]
+space = "srgb"
+r = 0.07999999821186066
+g = 0.09000000357627869
+b = 0.10999999940395355
+a = 0.550000011920929
+
+[semantic.edges]
+border_width = 1.0
+shadow = 0.4000000059604645
+glow = 0.15000000596046448
+radius = 10.0
+
+[semantic.edges.border_color]
+space = "srgb"
+r = 0.3499999940395355
+g = 0.44999998807907104
+b = 0.6000000238418579
+a = 0.800000011920929
+
+[semantic.edges.inner_highlight]
+space = "srgb"
+r = 1.0
+g = 1.0
+b = 1.0
+a = 0.11999999731779099
+
+[semantic.typography]
+font_weight = 500
+size = 14.0
+letter_spacing = 0.0
+
+[semantic.typography.primary]
+space = "srgb"
+r = 0.9200000166893005
+g = 0.949999988079071
+b = 1.0
+a = 1.0
+
+[semantic.typography.secondary]
+space = "srgb"
+r = 0.550000011920929
+g = 0.6200000047683716
+b = 0.7200000286102295
+a = 1.0
+
+[semantic.layout]
+bar_height = 70.0
+dock_width = 64.0
+padding = 12.0
+gap = 8.0
+icon_size = 48.0
+
+[semantic.color_behavior]
+gamut = "srgb"
+dynamic_range = "sdr"
+sdr_white_nits = 203.0
+luminance_cap_nits = 1000.0
+gamut_mapping = "perceptual"
+
+[semantic.wallpaper]
+blur = 0.0
+saturation = 1.0
+automatic_accent = false

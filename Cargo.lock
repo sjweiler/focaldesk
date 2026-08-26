@@ -2138,6 +2138,7 @@ dependencies = [
  "focaldesk-notifications",
  "focaldesk-power",
  "focaldesk-settings-core",
+ "focaldesk-themes",
  "focaldesk-updates",
  "libc",
  "nix 0.27.1",
@@ -2374,6 +2375,7 @@ dependencies = [
  "focaldesk-sounds",
  "focaldesk-themes",
  "gtk4",
+ "image",
  "libadwaita",
  "serde",
  "serde_json",
@@ -2436,7 +2438,11 @@ name = "focaldesk-themes"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
+ "image",
  "serde",
+ "sha2",
+ "tempfile",
  "toml 0.8.23",
 ]
 

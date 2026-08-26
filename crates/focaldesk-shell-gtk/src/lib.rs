@@ -877,6 +877,7 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
         ("fd_shell_text_dim", theme.text.dim),
         ("fd_shell_clock", theme.text.clock),
         ("fd_shell_icon", theme.icons.inactive),
+        ("fd_shell_dock_icon", with_alpha(theme.icons.inactive, 1.0)),
         ("fd_shell_icon_hover", theme.icons.hover),
         ("fd_shell_icon_active", theme.icons.active),
         (
@@ -981,6 +982,8 @@ mod tests {
         assert!(eagle.contains("rgba(51, 153, 255"));
         assert!(moonbase.contains("rgba(107, 173, 219"));
         assert!(classic.contains("rgba(255, 128, 0"));
+        assert!(eagle.contains("@define-color fd_shell_dock_icon rgba(178, 191, 209, 1.000);"));
+        assert!(eagle.contains("color: @fd_shell_dock_icon;"));
         assert!(eagle.contains(".focal-dock { border-radius:"));
         assert_ne!(eagle, moonbase);
         assert_ne!(moonbase, classic);

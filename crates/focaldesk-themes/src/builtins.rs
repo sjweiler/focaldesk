@@ -1,4 +1,5 @@
 use crate::theme::*;
+use crate::ThemeWallpaperFit;
 
 pub fn builtin_theme(id: BuiltInThemeId) -> FlowTheme {
     match id {
@@ -18,9 +19,12 @@ pub fn eagle_theme() -> FlowTheme {
         },
 
         wallpaper: WallpaperTheme {
-            path: Some("assets/wallpaper/focaldesk_wallpaper.png".to_string()),
+            path: Some("/usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png".to_string()),
+            fit: ThemeWallpaperFit::Fill,
             tint_color: [0.05, 0.15, 0.30, 0.25],
             dim: 0.35,
+            blur: 0.0,
+            saturation: 1.0,
         },
 
         chrome: ChromeTheme {
@@ -61,6 +65,9 @@ pub fn eagle_theme() -> FlowTheme {
             glow: [0.2, 0.6, 1.0, 0.45],
         },
 
+        semantic: None,
+        semantic_colors_linear: false,
+
         spacing: 6,
         density: UiDensity::Compact,
         animation_speed: 1.5,
@@ -80,9 +87,12 @@ pub fn moonbase_theme() -> FlowTheme {
         },
 
         wallpaper: WallpaperTheme {
-            path: Some("assets/wallpaper/focaldesk_wallpaper.png".to_string()),
+            path: Some("/usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png".to_string()),
+            fit: ThemeWallpaperFit::Fill,
             tint_color: [0.85, 0.90, 1.00, 0.15],
             dim: 0.20,
+            blur: 0.0,
+            saturation: 1.0,
         },
 
         chrome: ChromeTheme {
@@ -123,6 +133,9 @@ pub fn moonbase_theme() -> FlowTheme {
             glow: [0.70, 0.88, 1.00, 0.42],
         },
 
+        semantic: None,
+        semantic_colors_linear: false,
+
         spacing: 10,
         density: UiDensity::Normal,
         animation_speed: 1.0,
@@ -142,9 +155,12 @@ pub fn classic_theme() -> FlowTheme {
         },
 
         wallpaper: WallpaperTheme {
-            path: Some("assets/wallpaper/focaldesk_wallpaper.png".to_string()),
+            path: Some("/usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png".to_string()),
+            fit: ThemeWallpaperFit::Fill,
             tint_color: [1.0, 0.5, 0.1, 0.25],
             dim: 0.45,
+            blur: 0.0,
+            saturation: 1.0,
         },
 
         chrome: ChromeTheme {
@@ -184,6 +200,9 @@ pub fn classic_theme() -> FlowTheme {
             disabled: [0.55, 0.36, 0.20, 0.7],
             glow: [1.0, 0.5, 0.0, 0.55],
         },
+
+        semantic: None,
+        semantic_colors_linear: false,
 
         spacing: 12,
         density: UiDensity::Spacious,

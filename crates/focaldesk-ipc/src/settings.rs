@@ -86,8 +86,11 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             | IpcRequest::Watch { .. }
             | IpcRequest::GetConfig
             | IpcRequest::SetConfig { .. }
+            | IpcRequest::SetHdrAppearance { .. }
             | IpcRequest::GetDisplayRuntimeStatus
             | IpcRequest::GetDesktopSnapshot
+            | IpcRequest::GetThemeEditorStatus { .. }
+            | IpcRequest::ThemeEditor { .. }
             | IpcRequest::Notify { .. }
             | IpcRequest::ExecuteDesktopAction { .. }
             | IpcRequest::ShellReady { .. },

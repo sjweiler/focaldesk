@@ -10,6 +10,21 @@ version numbers where practical.
 
 ### Added
 
+- Added a versioned Theme Editor with sRGB and Display P3 paint authoring,
+  solid and gradient sources, SDR/HDR intent, semantic interaction states,
+  layout and typography controls, wallpaper processing, contrast audits,
+  debounced compositor preview/apply/revert IPC, TOML save/load, and validated
+  portable `.fdtheme` packages.
+- Added an installable system-default theme and wallpaper, used when no
+  explicit built-in theme is selected, with a safe Eagle fallback.
+- Added per-display HDR appearance tuning in Display Settings with bounded
+  reference-white, highlight, saturation, and midtone controls, live
+  shader-only preview, conservative presets, automatic 15-second rollback, and
+  neutral reset values.
+- Added a session-only absolute-nits HDR output calibration pattern for checking
+  neutral levels, equal-luminance BT.2020 primaries, peak output, and banding.
+- Decode BT.1886-tagged client surfaces with a distinct 2.4-power transfer
+  instead of treating them as piecewise sRGB.
 - Added bounded transient AI-provider retries and in-memory provider health
   telemetry for latency, outcomes, cancellations, traffic, and reported token
   usage, surfaced in the AI Console Providers page.
