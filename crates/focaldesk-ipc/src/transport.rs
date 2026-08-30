@@ -35,8 +35,10 @@ pub struct PeerPolicy<'a> {
 pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "desktop",
     allowed_executables: &[
-        "focal-dock",
-        "focal-panel",
+        "focaldesk-dock",
+        "focaldesk-panel",
+        "focaldesk-system-rail",
+        "focaldesk-task-shelf",
         "focaldesk-settings",
         "focaldesk-portal",
         "focaldesk-cli",
@@ -47,6 +49,8 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
     allowed_units: &[
         "focaldesk-dock.service",
         "focaldesk-panel.service",
+        "focaldesk-system-rail.service",
+        "focaldesk-task-shelf.service",
         "focald-voice.service",
     ],
 };
@@ -408,17 +412,25 @@ mod tests {
 
     #[test]
     fn desktop_policy_allows_trusted_shell_clients() {
-        assert!(DESKTOP_POLICY.allowed_executables.contains(&"focal-dock"));
-        assert!(DESKTOP_POLICY.allowed_executables.contains(&"focal-panel"));
         assert!(
             DESKTOP_POLICY
-                .allowed_units
-                .contains(&"focaldesk-dock.service")
+                .allowed_executables
+                .contains(&"focaldesk-task-shelf")
+        );
+        assert!(
+            DESKTOP_POLICY
+                .allowed_executables
+                .contains(&"focaldesk-system-rail")
         );
         assert!(
             DESKTOP_POLICY
                 .allowed_units
-                .contains(&"focaldesk-panel.service")
+                .contains(&"focaldesk-task-shelf.service")
+        );
+        assert!(
+            DESKTOP_POLICY
+                .allowed_units
+                .contains(&"focaldesk-system-rail.service")
         );
     }
 

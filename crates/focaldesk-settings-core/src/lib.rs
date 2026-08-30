@@ -277,6 +277,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub browser_launch_backend: BrowserLaunchBackend,
     pub file_manager: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default = "default_true")]
+    pub pin_email_to_shelf: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -456,6 +460,8 @@ pub fn default_settings() -> Settings {
             browser: "google-chrome".into(),
             browser_launch_backend: BrowserLaunchBackend::Auto,
             file_manager: "focaldesk-files".into(),
+            email: String::new(),
+            pin_email_to_shelf: true,
         },
         workspaces: WorkspaceSettings::default(),
         privacy: PrivacySettings::default(),
@@ -583,6 +589,18 @@ mod tests {
 
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert!(!settings.appearance.high_contrast);
+    }
+
+    #[test]
+    fn email_shelf_settings_are_backward_compatible() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        let apps = value["apps"].as_object_mut().unwrap();
+        apps.remove("email");
+        apps.remove("pin_email_to_shelf");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.apps.email.is_empty());
+        assert!(settings.apps.pin_email_to_shelf);
     }
 
     #[test]

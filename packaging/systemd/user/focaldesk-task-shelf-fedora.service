@@ -1,12 +1,15 @@
 [Unit]
-Description=FocalDesk experimental external top panel
+Description=FocalDesk GTK task shelf
 PartOf=focaldesk-session.target
 After=focaldesk-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/focal-panel
+ExecStart=/usr/bin/focaldesk-task-shelf
 Restart=on-failure
 RestartSec=2
 KillSignal=SIGINT
 TimeoutStopSec=10
+
+[Install]
+WantedBy=focaldesk-session.target

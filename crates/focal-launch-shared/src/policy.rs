@@ -67,12 +67,11 @@ pub fn chrome_command_args(
         "--new-window".into(),
     ];
 
-    // SDR: force Display P3 so Blink's `color-gamut: p3` matches and wide-gamut
-    // CSS (Chrome NTP shortcut circles) draws. HDR: do not force scrgb-linear.
-    // That profile uses BT.709 primaries, so `color-gamut: p3` fails even though
-    // the output is BT.2020/PQ. Chrome still tags HDR buffers with
-    // `create_windows_scrgb` (80-nit unit white, extended linear) when the
-    // compositor advertises that feature.
+    // In HDR, let Chrome follow the compositor's wp_color preferred
+    // Display-P3/extended-sRGB description. Forcing HDR10 here can make an
+    // 8-bit AB24 raster buffer carry pixels encoded for a different transfer
+    // function, visibly corrupting wide-gamut images. SDR keeps the explicit
+    // P3 target used for wide-gamut CSS and images.
     if !hdr_output_active {
         args.insert(2, "--force-color-profile=display-p3-d65".into());
     }
@@ -99,14 +98,18 @@ mod tests {
     }
 
     #[test]
-    fn chrome_hdr_launch_follows_wp_color_preferred_gamut() {
+    fn chrome_hdr_launch_follows_wayland_preferred_color() {
         let args = chrome_command_args(false, "/tmp/focaldesk-chrome-test", true);
         assert!(
             !args
                 .iter()
                 .any(|arg| arg.starts_with("--force-color-profile="))
         );
-        assert!(!args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--force-raster-color-profile="))
+        );
         assert!(
             args.iter()
                 .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1")

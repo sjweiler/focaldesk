@@ -645,32 +645,54 @@ pub fn gamut_matrix_linear_rgb(
     multiply_3x3(inv_dst, m_src)
 }
 
-/// Destination primaries for HDR10 gamut mapping.
+/// Destination primaries for an HDR10 scanout.
 ///
-/// P3-class panels (named P3 or a factory ICC) map into Display P3 D65 so the
-/// wide-gamut W stays in-gamut and HDR white stays D65. Swapping only the ICC
-/// white without adapting the RGB xy distorts that volume and turns the W
-/// orange and HDR clouds magenta. A missing ICC does not crush P3 into sRGB.
-/// A named BT.2020 panel is a no-op.
-pub fn hdr10_encode_panel_primaries(panel: ColorPrimaries) -> ColorPrimaries {
-    match panel {
-        ColorPrimaries::Srgb | ColorPrimaries::Bt2020 => ColorPrimaries::Bt2020,
-        ColorPrimaries::DisplayP3 | ColorPrimaries::Custom(_) => ColorPrimaries::DisplayP3,
-    }
+/// The connector is explicitly signaled as BT.2020/PQ, so the pixels must be
+/// encoded in BT.2020 regardless of the monitor's SDR ICC profile. That ICC
+/// describes the panel in its SDR operating mode; using its native gamut as
+/// an intermediate HDR space applies an unmeasured calibration before the
+/// display performs its own HDR10-to-panel mapping.
+pub fn hdr10_encode_panel_primaries(_panel: ColorPrimaries) -> ColorPrimaries {
+    ColorPrimaries::Bt2020
 }
 
-/// Scene Rec.709 → panel RGB, panel RGB → BT.2020, and panel luminance coeffs.
+/// Scene Rec.709 → HDR10 BT.2020, identity wire transform, and BT.2020 luma.
+///
+/// The two-matrix shape is retained for the shader interface. With BT.2020 as
+/// `dest`, the second transform is identity and gamut compression only affects
+/// values genuinely outside the HDR10 container.
 pub fn hdr10_pq_encode_transforms(
     panel: ColorPrimaries,
 ) -> ([[f32; 3]; 3], [[f32; 3]; 3], [f32; 3]) {
     let dest = hdr10_encode_panel_primaries(panel);
-    let scene_to_panel =
-        gamut_matrix_linear_rgb(scene_working_primaries(), dest, RenderingIntent::Relative);
-    let panel_to_bt2020 =
-        gamut_matrix_linear_rgb(dest, ColorPrimaries::Bt2020, RenderingIntent::Relative);
+    // All HDR10 working spaces here use D65. Normalize each row so [v, v, v]
+    // remains exactly neutral through both transforms instead of letting f32
+    // inversion error become a one-code pink/cyan split after PQ quantization.
+    let scene_to_panel = normalize_neutral_axis(gamut_matrix_linear_rgb(
+        scene_working_primaries(),
+        dest,
+        RenderingIntent::Relative,
+    ));
+    let panel_to_bt2020 = normalize_neutral_axis(gamut_matrix_linear_rgb(
+        dest,
+        ColorPrimaries::Bt2020,
+        RenderingIntent::Relative,
+    ));
     let xyz = primaries_to_rgb_to_xyz(dest.chromaticity());
     let luma = [xyz[1][0], xyz[1][1], xyz[1][2]];
     (scene_to_panel, panel_to_bt2020, luma)
+}
+
+fn normalize_neutral_axis(mut matrix: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    for row in &mut matrix {
+        let sum = row[0] + row[1] + row[2];
+        if sum.is_finite() && sum.abs() > f32::EPSILON {
+            row[0] /= sum;
+            row[1] /= sum;
+            row[2] /= sum;
+        }
+    }
+    matrix
 }
 
 /// Row-major 3×3: scene-linear Rec.709 → linear output primaries.
@@ -1352,7 +1374,7 @@ mod tests {
         );
         assert_eq!(
             hdr10_encode_panel_primaries(panel.primaries),
-            ColorPrimaries::DisplayP3
+            ColorPrimaries::Bt2020
         );
         assert_eq!(
             hdr10_encode_panel_primaries(ColorPrimaries::Srgb),
@@ -1365,7 +1387,7 @@ mod tests {
     }
 
     #[test]
-    fn hdr10_gamut_map_keeps_p3_red_and_pulls_rec2020_green_into_panel() {
+    fn hdr10_gamut_map_preserves_p3_and_rec2020_inside_wire_container() {
         fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
             [
                 matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
@@ -1395,7 +1417,8 @@ mod tests {
             ]
         }
 
-        let (scene_to_p3, _, p3_luma) = hdr10_pq_encode_transforms(ColorPrimaries::DisplayP3);
+        let (scene_to_bt2020, _, bt2020_luma) =
+            hdr10_pq_encode_transforms(ColorPrimaries::DisplayP3);
 
         let p3_red_scene = transform(
             gamut_matrix_linear_rgb(
@@ -1405,8 +1428,9 @@ mod tests {
             ),
             [1.0, 0.0, 0.0],
         );
-        let p3_red_panel = transform(scene_to_p3, p3_red_scene);
-        assert!(p3_red_panel.iter().all(|c| *c >= -1e-4));
+        let p3_red_wire = transform(scene_to_bt2020, p3_red_scene);
+        let p3_red_mapped = compress(p3_red_wire, bt2020_luma);
+        assert!(p3_red_mapped.iter().all(|c| *c >= -1e-4));
 
         let rec2020_green_scene = transform(
             gamut_matrix_linear_rgb(
@@ -1416,9 +1440,9 @@ mod tests {
             ),
             [0.0, 1.0, 0.0],
         );
-        let rec2020_green_panel = transform(scene_to_p3, rec2020_green_scene);
-        assert!(rec2020_green_panel.iter().any(|c| *c < 0.0));
-        let mapped = compress(rec2020_green_panel, p3_luma);
+        let rec2020_green_wire = transform(scene_to_bt2020, rec2020_green_scene);
+        assert!(rec2020_green_wire.iter().all(|c| *c >= -1e-4));
+        let mapped = compress(rec2020_green_wire, bt2020_luma);
         assert!(mapped.iter().all(|c| *c >= -1e-4));
     }
 
@@ -1492,11 +1516,8 @@ mod tests {
             b: [0.14802192, 0.067950554],
             w: [0.34569982, 0.35850027],
         });
-        assert_eq!(
-            hdr10_encode_panel_primaries(warm),
-            ColorPrimaries::DisplayP3
-        );
-        let (scene_to_panel, panel_to_bt2020, _) = hdr10_pq_encode_transforms(warm);
+        assert_eq!(hdr10_encode_panel_primaries(warm), ColorPrimaries::Bt2020);
+        let (scene_to_panel, panel_to_bt2020, luma) = hdr10_pq_encode_transforms(warm);
         let bt2020 = transform(panel_to_bt2020, transform(scene_to_panel, [1.0, 1.0, 1.0]));
         close(bt2020[0], 1.0, 0.02);
         close(bt2020[1], 1.0, 0.02);
@@ -1511,6 +1532,20 @@ mod tests {
             [1.0, 0.0, 0.0],
         );
         let p3_red_panel = transform(scene_to_panel, p3_red_scene);
+        let y = luma[0] * p3_red_panel[0] + luma[1] * p3_red_panel[1] + luma[2] * p3_red_panel[2];
+        let gray = [y; 3];
+        let t = p3_red_panel
+            .iter()
+            .zip(gray)
+            .filter(|(channel, _)| **channel < 0.0)
+            .map(|(channel, neutral)| *channel / (*channel - neutral))
+            .fold(0.0f32, f32::max)
+            .clamp(0.0, 1.0);
+        let p3_red_panel = [
+            p3_red_panel[0] + t * (gray[0] - p3_red_panel[0]),
+            p3_red_panel[1] + t * (gray[1] - p3_red_panel[1]),
+            p3_red_panel[2] + t * (gray[2] - p3_red_panel[2]),
+        ];
         assert!(
             p3_red_panel.iter().all(|c| *c >= -1e-4),
             "P3 red must stay in-gamut for the W test, got {p3_red_panel:?}"
@@ -1655,6 +1690,28 @@ mod tests {
             for j in 0..3 {
                 let expected = if i == j { 1.0 } else { 0.0 };
                 close(m[i][j], expected, 1e-4);
+            }
+        }
+    }
+
+    #[test]
+    fn hdr10_transforms_preserve_the_neutral_axis() {
+        fn transform(matrix: [[f32; 3]; 3], value: [f32; 3]) -> [f32; 3] {
+            [
+                matrix[0][0] * value[0] + matrix[0][1] * value[1] + matrix[0][2] * value[2],
+                matrix[1][0] * value[0] + matrix[1][1] * value[1] + matrix[1][2] * value[2],
+                matrix[2][0] * value[0] + matrix[2][1] * value[1] + matrix[2][2] * value[2],
+            ]
+        }
+
+        for panel in [ColorPrimaries::DisplayP3, ColorPrimaries::Bt2020] {
+            let (scene_to_panel, panel_to_bt2020, _) = hdr10_pq_encode_transforms(panel);
+            for level in [0.01, 0.18, 0.5, 1.0, 4.0] {
+                let panel_rgb = transform(scene_to_panel, [level; 3]);
+                let bt2020 = transform(panel_to_bt2020, panel_rgb);
+                close(bt2020[0], level, 2e-6);
+                close(bt2020[1], level, 2e-6);
+                close(bt2020[2], level, 2e-6);
             }
         }
     }

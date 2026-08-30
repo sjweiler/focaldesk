@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
 use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
-use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
     send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
@@ -59,6 +59,7 @@ const SCALE_OPTIONS: &[(&str, f64)] = &[
 ];
 
 const THEME_OPTIONS: &[&str] = &["Default", "Eagle", "Moonbase", "Classic"];
+const TASK_SHELF_VISIBILITY_OPTIONS: &[&str] = &["Intelligent dodge", "Always visible", "Autohide"];
 const ORIENTATION_OPTIONS: &[&str] = &[
     "Landscape",
     "Portrait Right",
@@ -157,6 +158,13 @@ struct ConfigEvent {
 type DynamicRows = Rc<RefCell<Vec<gtk::Widget>>>;
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct DisplayModeConfig {
+    width: i32,
+    height: i32,
+    refresh_mhz: i32,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayConfig {
     name: String,
     enabled: bool,
@@ -164,6 +172,8 @@ struct DisplayConfig {
     mode_width: i32,
     mode_height: i32,
     refresh_mhz: i32,
+    #[serde(default)]
+    available_modes: Vec<DisplayModeConfig>,
 
     scale: f64,
 
@@ -643,21 +653,35 @@ fn selected_display_color_profile(index: u32) -> DisplayColorProfile {
     }
 }
 
-fn resolution_options(current_width: i32, current_height: i32) -> Vec<(i32, i32)> {
-    let mut options = vec![
-        (1280, 720),
-        (1366, 768),
-        (1600, 900),
-        (1920, 1080),
-        (2560, 1440),
-        (3440, 1440),
-        (3840, 2160),
-    ];
+fn resolution_options(display: &DisplayConfig) -> Vec<(i32, i32)> {
+    let mut options = display
+        .available_modes
+        .iter()
+        .map(|mode| (mode.width, mode.height))
+        .collect::<Vec<_>>();
 
-    if !options.contains(&(current_width, current_height)) {
-        options.push((current_width, current_height));
+    if !options.contains(&(display.mode_width, display.mode_height)) {
+        options.push((display.mode_width, display.mode_height));
     }
 
+    options.sort_unstable();
+    options.dedup();
+    options
+}
+
+fn refresh_options(display: &DisplayConfig, width: i32, height: i32) -> Vec<i32> {
+    let mut options = display
+        .available_modes
+        .iter()
+        .filter(|mode| mode.width == width && mode.height == height)
+        .map(|mode| mode.refresh_mhz)
+        .collect::<Vec<_>>();
+    if width == display.mode_width
+        && height == display.mode_height
+        && !options.contains(&display.refresh_mhz)
+    {
+        options.push(display.refresh_mhz);
+    }
     options.sort_unstable();
     options.dedup();
     options
@@ -1986,7 +2010,7 @@ fn connected_display_row(
 
     let resolution_row = adw::ActionRow::new();
     resolution_row.set_title("Resolution");
-    let resolutions = resolution_options(display.mode_width, display.mode_height);
+    let resolutions = resolution_options(&display);
     let resolution_labels = resolutions
         .iter()
         .map(|(width, height)| format!("{width} x {height}"))
@@ -2009,6 +2033,7 @@ fn connected_display_row(
         let displays = displays.clone();
         let area = area.clone();
         let row = row.clone();
+        let available_modes = display.available_modes.clone();
         resolution_dropdown.connect_selected_notify(move |dropdown| {
             let Some((width, height)) = resolutions.get(dropdown.selected() as usize).copied()
             else {
@@ -2018,6 +2043,57 @@ fn connected_display_row(
             if let Some(display) = displays.borrow_mut().get_mut(index) {
                 display.mode_width = width;
                 display.mode_height = height;
+                if !available_modes.iter().any(|mode| {
+                    mode.width == width
+                        && mode.height == height
+                        && mode.refresh_mhz == display.refresh_mhz
+                }) {
+                    if let Some(refresh_mhz) = available_modes
+                        .iter()
+                        .filter(|mode| mode.width == width && mode.height == height)
+                        .map(|mode| mode.refresh_mhz)
+                        .max()
+                    {
+                        display.refresh_mhz = refresh_mhz;
+                    }
+                }
+            }
+            save_display_change(&displays, &area, &row, index);
+        });
+    }
+
+    let refresh_row = adw::ActionRow::new();
+    refresh_row.set_title("Refresh rate");
+    refresh_row.set_subtitle("Takes effect after signing out and back in");
+    let refresh_rates = refresh_options(&display, display.mode_width, display.mode_height);
+    let refresh_labels = refresh_rates
+        .iter()
+        .map(|refresh_mhz| format!("{} Hz", refresh_mhz / 1000))
+        .collect::<Vec<_>>();
+    let refresh_label_refs = refresh_labels
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let refresh_dropdown = dropdown_from_strings(
+        &refresh_label_refs,
+        refresh_rates
+            .iter()
+            .position(|refresh_mhz| *refresh_mhz == display.refresh_mhz)
+            .unwrap_or(0) as u32,
+    );
+    refresh_row.add_suffix(&refresh_dropdown);
+    row.add_row(&refresh_row);
+
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        refresh_dropdown.connect_selected_notify(move |dropdown| {
+            let Some(refresh_mhz) = refresh_rates.get(dropdown.selected() as usize).copied() else {
+                return;
+            };
+            if let Some(display) = displays.borrow_mut().get_mut(index) {
+                display.refresh_mhz = refresh_mhz;
             }
             save_display_change(&displays, &area, &row, index);
         });
@@ -2675,6 +2751,22 @@ fn set_switch_if_changed(switch: &gtk::Switch, active: bool) {
 fn set_scale_if_changed(scale: &gtk::Scale, value: f64) {
     if (scale.value() - value).abs() > f64::EPSILON {
         scale.set_value(value);
+    }
+}
+
+fn dock_visibility_index(visibility: DockVisibility) -> u32 {
+    match visibility {
+        DockVisibility::IntelligentDodge => 0,
+        DockVisibility::AlwaysVisible => 1,
+        DockVisibility::Autohide => 2,
+    }
+}
+
+fn dock_visibility_from_index(index: u32) -> DockVisibility {
+    match index {
+        1 => DockVisibility::AlwaysVisible,
+        2 => DockVisibility::Autohide,
+        _ => DockVisibility::IntelligentDodge,
     }
 }
 
@@ -6368,6 +6460,27 @@ fn appearance_page(
     }
 
     visual_group.add(&focus_row);
+
+    let shelf_visibility = add_dropdown_row(
+        &visual_group,
+        "Task shelf visibility",
+        Some("Choose when the bottom application shelf moves out of the way"),
+        TASK_SHELF_VISIBILITY_OPTIONS,
+        dock_visibility_index(config.borrow().dock.visibility),
+    );
+    {
+        let config = config.clone();
+        shelf_visibility.connect_selected_notify(move |dropdown| {
+            let visibility = dock_visibility_from_index(dropdown.selected());
+            if config.borrow().dock.visibility == visibility {
+                return;
+            }
+            config.borrow_mut().dock.visibility = visibility;
+            let value =
+                serde_json::to_value(visibility).unwrap_or_else(|_| json!("intelligent-dodge"));
+            persist_config_key(&config.borrow(), "dock.visibility", value);
+        });
+    }
     page.add(&visual_group);
 
     let tuning_group = adw::PreferencesGroup::new();
@@ -6504,6 +6617,7 @@ fn appearance_page(
             "appearance.theme",
             "appearance.glow_strength",
             "appearance.font_scale",
+            "dock.visibility",
         ]);
         let config = config.clone();
         let shader_switch = shader_switch.clone();
@@ -6512,6 +6626,7 @@ fn appearance_page(
         let theme_dropdown = theme_dropdown.clone();
         let glow_scale = glow_scale.clone();
         let font_scale = font_scale.clone();
+        let shelf_visibility = shelf_visibility.clone();
 
         glib::timeout_add_local(Duration::from_millis(100), move || {
             while let Ok(event) = rx.try_recv() {
@@ -6554,6 +6669,17 @@ fn appearance_page(
                         if let Some(value) = event.value.as_f64() {
                             config.borrow_mut().appearance.font_scale = value;
                             set_scale_if_changed(&font_scale, value);
+                        }
+                    }
+                    "dock.visibility" => {
+                        if let Ok(visibility) =
+                            serde_json::from_value::<DockVisibility>(event.value.clone())
+                        {
+                            config.borrow_mut().dock.visibility = visibility;
+                            let selected = dock_visibility_index(visibility);
+                            if shelf_visibility.selected() != selected {
+                                shelf_visibility.set_selected(selected);
+                            }
                         }
                     }
                     _ => {}
@@ -7972,6 +8098,34 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         let settings = settings.clone();
         file_manager.connect_changed(move |entry| {
             settings.borrow_mut().apps.file_manager = entry.text().to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let email = add_entry_row(
+        &defaults_group,
+        "Email",
+        "Leave blank to discover Evolution, Thunderbird, or Geary",
+    );
+    email.set_text(&settings.borrow().apps.email);
+    {
+        let settings = settings.clone();
+        email.connect_changed(move |entry| {
+            settings.borrow_mut().apps.email = entry.text().to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
+
+    let pin_email = add_switch_row(
+        &defaults_group,
+        "Pin email to task shelf",
+        Some("Show Email with the other pinned applications when a mail client is available"),
+        settings.borrow().apps.pin_email_to_shelf,
+    );
+    {
+        let settings = settings.clone();
+        pin_email.connect_active_notify(move |switch| {
+            settings.borrow_mut().apps.pin_email_to_shelf = switch.is_active();
             persist_settings(&settings.borrow());
         });
     }
@@ -9880,6 +10034,7 @@ mod tests {
             mode_width: 3840,
             mode_height: 2160,
             refresh_mhz: 60_000,
+            available_modes: Vec::new(),
             scale: 1.0,
             logical_x: 0,
             logical_y: 0,
@@ -9913,6 +10068,7 @@ mod tests {
             mode_width: 2560,
             mode_height: 1440,
             refresh_mhz: 120_000,
+            available_modes: Vec::new(),
             scale: 1.0,
             logical_x: 0,
             logical_y: 0,
@@ -9931,6 +10087,29 @@ mod tests {
             exclusive_hdr_phase: ExclusiveHdrPhase::Off,
             exclusive_hdr_reason: None,
         }
+    }
+
+    #[test]
+    fn refresh_selector_uses_modes_for_current_resolution() {
+        let mut display = test_display("DP-4", true);
+        display.available_modes = vec![
+            DisplayModeConfig {
+                width: 2560,
+                height: 1440,
+                refresh_mhz: 120_000,
+            },
+            DisplayModeConfig {
+                width: 1920,
+                height: 1080,
+                refresh_mhz: 60_000,
+            },
+            DisplayModeConfig {
+                width: 2560,
+                height: 1440,
+                refresh_mhz: 60_000,
+            },
+        ];
+        assert_eq!(refresh_options(&display, 2560, 1440), vec![60_000, 120_000]);
     }
 
     #[test]

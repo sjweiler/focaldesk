@@ -1,12 +1,12 @@
 [package]
-name = "focal-panel"
+name = "focaldesk-system-rail"
 version = "0.1.0"
 edition = "2021"
-description = "FocalDesk trusted top panel layer-shell client"
+description = "FocalDesk GTK system rail layer-shell client"
 license = "MIT"
 
 [[bin]]
-name = "focal-panel"
+name = "focaldesk-system-rail"
 path = "src/main.rs"
 
 [dependencies]

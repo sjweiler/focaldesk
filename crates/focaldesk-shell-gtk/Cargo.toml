@@ -10,7 +10,9 @@ anyhow.workspace = true
 focaldesk-ipc = { path = "../focaldesk-ipc" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-config = { path = "../focaldesk-config" }
+focaldesk-settings-core = { path = "../focaldesk-settings-core" }
 focaldesk-themes = { path = "../focaldesk-themes" }
 chrono.workspace = true
 gtk = { package = "gtk4", version = "0.9", features = ["v4_12"] }
 gtk4-layer-shell = "0.4"
+resvg.workspace = true

@@ -391,14 +391,66 @@ fn contiguous_runs_by_key<'a, T, K: PartialEq>(
     runs
 }
 
+fn preferred_output_index(
+    window_geometry: Rectangle<i32, Logical>,
+    output_geometries: &[Rectangle<i32, Logical>],
+) -> Option<usize> {
+    output_geometries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, output_geometry)| {
+            window_geometry
+                .intersection(*output_geometry)
+                .map(|overlap| {
+                    let area = i64::from(overlap.size.w) * i64::from(overlap.size.h);
+                    (index, area)
+                })
+        })
+        .max_by_key(|(_, area)| *area)
+        .map(|(index, _)| index)
+}
+
+/// Select exactly one output for a client window, even while its geometry crosses an output
+/// boundary. This prevents retained client content from being submitted to two scanout targets.
+fn window_prefers_output(space: &Space<Window>, window: &Window, output: &Output) -> bool {
+    let outputs = space.outputs_for_element(window);
+    let Some(window_geometry) = space.element_geometry(window) else {
+        return false;
+    };
+    outputs
+        .iter()
+        .filter_map(|candidate| {
+            let geometry = space.output_geometry(candidate)?;
+            let overlap = window_geometry.intersection(geometry)?;
+            let area = i64::from(overlap.size.w) * i64::from(overlap.size.h);
+            Some((candidate, area))
+        })
+        .max_by_key(|(_, area)| *area)
+        .is_some_and(|(preferred, _)| preferred == output)
+}
+
 #[cfg(test)]
 mod color_run_tests {
     use super::{
-        clipped_dest_local_damage, contiguous_runs_by_key, semantic_color, themed_icon_style,
-        UiVisualState,
+        clipped_dest_local_damage, contiguous_runs_by_key, preferred_output_index, semantic_color,
+        themed_icon_style, UiVisualState,
     };
     use focaldesk_themes::{theme_by_name, SemanticTheme, ThemeColor};
-    use smithay::utils::{Physical, Rectangle};
+    use smithay::utils::{Logical, Physical, Rectangle};
+
+    #[test]
+    fn crossing_window_has_one_preferred_output() {
+        let outputs = [
+            Rectangle::<i32, Logical>::from_loc_and_size((0, 0), (100, 100)),
+            Rectangle::<i32, Logical>::from_loc_and_size((100, 0), (100, 100)),
+        ];
+
+        let mostly_left = Rectangle::from_loc_and_size((60, 10), (60, 60));
+        let mostly_right = Rectangle::from_loc_and_size((80, 10), (60, 60));
+
+        assert_eq!(preferred_output_index(mostly_left, &outputs), Some(0));
+        assert_eq!(preferred_output_index(mostly_right, &outputs), Some(1));
+    }
 
     #[test]
     fn alternating_color_runs_preserve_back_to_front_draw_order() {
@@ -3677,7 +3729,11 @@ impl RenderState {
 
         let on_workspace: std::collections::HashSet<_> = windows
             .iter()
-            .filter(|mw| mw.mapped && mw.workspace == active_workspace)
+            .filter(|mw| {
+                mw.mapped
+                    && mw.workspace == active_workspace
+                    && window_prefers_output(space, &mw.window, output)
+            })
             .map(|mw| &mw.window)
             .collect();
 
@@ -3790,7 +3846,11 @@ impl RenderState {
 
         let on_workspace: std::collections::HashSet<_> = windows
             .iter()
-            .filter(|mw| mw.mapped && mw.workspace == active_workspace)
+            .filter(|mw| {
+                mw.mapped
+                    && mw.workspace == active_workspace
+                    && window_prefers_output(space, &mw.window, output)
+            })
             .map(|mw| &mw.window)
             .collect();
 

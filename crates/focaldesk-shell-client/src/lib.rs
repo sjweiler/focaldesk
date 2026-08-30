@@ -1,10 +1,10 @@
 #![allow(dead_code, deprecated)]
 
-//! Standalone GLES shell renderer for `focal-panel` and `focal-dock`.
+//! Runtime adapter for `focaldesk-system-rail` and `focaldesk-task-shelf`.
 //!
-//! Everything under this crate is client-owned: Wayland/EGL setup, render
-//! loop, shader sources, icon atlas, IBM Plex font atlas, and shell layout.
-//! There is intentionally no dependency on `focaldesk-ui` or the compositor.
+//! GTK is the supported shell personality. The older client-owned Wayland/EGL
+//! renderer remains here as an opt-in diagnostic fallback and intentionally
+//! has no dependency on `focaldesk-ui` or the compositor.
 
 mod atlas;
 mod chrome;
@@ -116,21 +116,15 @@ struct ClickPulse {
     started: Instant,
 }
 
-/// Prefer the independent GLES client and enter GTK only after a GLES failure.
+/// Run the panel and dock as GTK4 layer-shell clients.
+///
+/// The independent GLES renderer remains available as an explicit diagnostic
+/// path while GTK is the session-supported presentation.
 pub fn run(role: ShellRole) -> Result<()> {
-    if std::env::var_os("FOCALDESK_SHELL_FORCE_GTK").is_some() {
-        return run_gtk(role);
+    if std::env::var_os("FOCALDESK_SHELL_FORCE_GLES").is_some() {
+        return run_gles(role);
     }
-    match run_gles(role) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            eprintln!(
-                "{}: independent GLES renderer failed ({error:#}); starting GTK fallback",
-                role.namespace()
-            );
-            run_gtk(role).with_context(|| format!("GTK fallback after GLES failure: {error:#}"))
-        }
-    }
+    run_gtk(role)
 }
 
 fn run_gtk(role: ShellRole) -> Result<()> {
@@ -558,7 +552,10 @@ impl ShellClient {
             started: Instant::now(),
         });
         let fallback = match &action {
-            DesktopAction::CreateWorkspace | DesktopAction::DeleteWorkspace => {
+            DesktopAction::CreateWorkspace
+            | DesktopAction::DeleteWorkspace
+            | DesktopAction::CreateWorkspaceOnOutput { .. }
+            | DesktopAction::DeleteWorkspaceOnOutput { .. } => {
                 Some(DesktopAction::OpenSettingsPanel {
                     panel: "workspaces".into(),
                 })

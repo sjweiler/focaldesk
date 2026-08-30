@@ -7,17 +7,25 @@
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
-    time::Duration,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
 use focaldesk_config::{
-    load_config, DockPosition, DockSize, FocalDeskConfig, PanelPosition, ShellStyle,
+    load_config, ClockFormat, DockPosition, DockSize, DockVisibility, FocalDeskConfig,
+    PanelPosition, ShellStyle,
 };
 use focaldesk_ipc::{
-    send_desktop_request, DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse,
+    send_desktop_request, DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, OutputSnapshot,
+    ShellPanel, WindowSnapshot,
 };
 use focaldesk_logging::{flog, init_default_logging, startup_banner};
+use focaldesk_settings_core::load_settings;
 use focaldesk_themes::{theme_by_name, FlowTheme};
 use gtk::{gdk, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
@@ -34,12 +42,19 @@ pub struct ShellMetrics {
 pub const DEFAULT_METRICS: ShellMetrics = ShellMetrics {
     panel_height: 64,
     dock_width: 76,
-    control_size: 44,
+    // CSS content-box size; the 1px border on each side produces the
+    // compositor's canonical 48px outer dock module.
+    control_size: 46,
     control_gap: 8,
 };
 
-const PANEL_HEIGHT: i32 = DEFAULT_METRICS.panel_height;
-const DOCK_WIDTH: i32 = DEFAULT_METRICS.dock_width;
+const SYSTEM_RAIL_WIDTH: i32 = 64;
+const SYSTEM_RAIL_RESERVATION: i32 = 80;
+const TASK_SHELF_WIDTH: i32 = 560;
+const TASK_SHELF_HEIGHT: i32 = 64;
+const TASK_SHELF_VISIBLE_MARGIN: i32 = 22;
+const TASK_SHELF_REVEAL_STRIP: i32 = 4;
+const TASK_SHELF_HIDE_DELAY: Duration = Duration::from_millis(300);
 const SHELL_CSS_BASE: &str = include_str!("shell.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,15 +66,22 @@ pub enum ShellRole {
 impl ShellRole {
     pub const fn namespace(self) -> &'static str {
         match self {
-            Self::Panel => "focal-panel",
-            Self::Dock => "focal-dock",
+            Self::Panel => "focaldesk-system-rail",
+            Self::Dock => "focaldesk-task-shelf",
         }
     }
 
     const fn application_id(self) -> &'static str {
         match self {
-            Self::Panel => "dev.focaldesk.Panel",
-            Self::Dock => "dev.focaldesk.Dock",
+            Self::Panel => "dev.focaldesk.SystemRail",
+            Self::Dock => "dev.focaldesk.TaskShelf",
+        }
+    }
+
+    const fn layer_default_size(self) -> (i32, i32) {
+        match self {
+            Self::Panel => (SYSTEM_RAIL_WIDTH, 0),
+            Self::Dock => (TASK_SHELF_WIDTH, TASK_SHELF_HEIGHT),
         }
     }
 }
@@ -115,9 +137,13 @@ fn rebuild_shell_windows(
         let Some(monitor) = monitors.item(index).and_downcast::<gdk::Monitor>() else {
             continue;
         };
+        let connector = monitor
+            .connector()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| format!("output-{}", index + 1));
         let window = match role {
-            ShellRole::Dock => build_dock(app, config),
-            ShellRole::Panel => build_panel(app, index + 1, config),
+            ShellRole::Dock => build_dock(app, config, connector),
+            ShellRole::Panel => build_panel(app, index + 1, config, connector),
         };
         configure_layer_window(&window, role, &monitor, config);
         window.present();
@@ -126,8 +152,8 @@ fn rebuild_shell_windows(
 
     if output_count == 0 {
         let window = match role {
-            ShellRole::Dock => build_dock(app, config),
-            ShellRole::Panel => build_panel(app, 1, config),
+            ShellRole::Dock => build_dock(app, config, "output-1".into()),
+            ShellRole::Panel => build_panel(app, 1, config, "output-1".into()),
         };
         configure_layer_window_without_monitor(&window, role, config);
         window.present();
@@ -157,237 +183,510 @@ fn configure_layer_window(
 fn configure_layer_window_without_monitor(
     window: &gtk::ApplicationWindow,
     role: ShellRole,
-    config: &FocalDeskConfig,
+    _config: &FocalDeskConfig,
 ) {
     window.init_layer_shell();
     window.set_namespace(role.namespace());
     window.set_layer(Layer::Top);
-    window.set_keyboard_mode(KeyboardMode::None);
-    window.add_css_class(match config.shell.style {
-        ShellStyle::Floating => "floating",
-        ShellStyle::Attached => "attached",
-    });
+    window.set_keyboard_mode(KeyboardMode::OnDemand);
+    window.add_css_class("floating");
     match role {
         ShellRole::Panel => {
-            let edge = match config.panel.position {
-                PanelPosition::Top => Edge::Top,
-                PanelPosition::Bottom => Edge::Bottom,
-            };
-            window.add_css_class(match config.panel.position {
-                PanelPosition::Top => "edge-top",
-                PanelPosition::Bottom => "edge-bottom",
-            });
-            window.set_anchor(edge, true);
-            window.set_anchor(Edge::Left, true);
-            window.set_anchor(Edge::Right, true);
-            window.set_default_size(1, PANEL_HEIGHT);
-            if config.shell.style == ShellStyle::Floating {
-                window.set_margin(edge, 10);
-                window.set_margin(Edge::Left, 12);
-                window.set_margin(Edge::Right, 12);
-                window.set_exclusive_zone(PANEL_HEIGHT + 10);
-            } else {
-                window.set_exclusive_zone(PANEL_HEIGHT);
-            }
-        }
-        ShellRole::Dock => {
-            let edge = match config.dock.position {
-                DockPosition::Left => Edge::Left,
-                DockPosition::Right => Edge::Right,
-            };
-            window.add_css_class(match config.dock.position {
-                DockPosition::Left => "edge-left",
-                DockPosition::Right => "edge-right",
-            });
-            window.set_anchor(edge, true);
+            window.add_css_class("edge-right");
             window.set_anchor(Edge::Top, true);
             window.set_anchor(Edge::Bottom, true);
-            window.set_default_size(DOCK_WIDTH, 1);
-            if config.shell.style == ShellStyle::Floating {
-                window.set_margin(edge, 12);
-                window.set_margin(Edge::Top, 10);
-                window.set_margin(Edge::Bottom, 10);
-                window.set_exclusive_zone(0);
-            } else {
-                window.set_exclusive_zone(DOCK_WIDTH);
-            }
+            window.set_anchor(Edge::Right, true);
+            let (width, height) = role.layer_default_size();
+            window.set_default_size(width, height);
+            window.set_margin(Edge::Top, 12);
+            window.set_margin(Edge::Right, 12);
+            window.set_margin(Edge::Bottom, 12);
+            window.set_exclusive_zone(SYSTEM_RAIL_RESERVATION);
+        }
+        ShellRole::Dock => {
+            window.add_css_class("edge-bottom");
+            window.set_anchor(Edge::Bottom, true);
+            let (width, height) = role.layer_default_size();
+            window.set_default_size(width, height);
+            window.set_margin(Edge::Bottom, TASK_SHELF_VISIBLE_MARGIN);
+            window.set_exclusive_zone(0);
         }
     }
 }
 
 #[derive(Default)]
-struct DockWidgets {
-    workspace_count: usize,
-    workspace_buttons: Vec<gtk::Button>,
+struct ShelfWidgets {
+    running_signature: Vec<(u32, String, String, bool)>,
+    obscured: bool,
+    pointer_inside: bool,
+    hidden: bool,
+    hide_after: Option<Instant>,
 }
 
-fn build_dock(app: &gtk::Application, config: &FocalDeskConfig) -> gtk::ApplicationWindow {
+fn build_dock(
+    app: &gtk::Application,
+    config: &FocalDeskConfig,
+    connector: String,
+) -> gtk::ApplicationWindow {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .decorated(false)
         .resizable(false)
         .build();
     window.add_css_class("focal-shell-window");
-    window.add_css_class("focal-dock-window");
+    window.add_css_class("task-shelf-window");
 
-    let gap = match config.dock.size {
-        DockSize::Compact => 5,
-        DockSize::Normal => 8,
-        DockSize::Expanded => 10,
-    };
-    let padding = match config.dock.size {
-        DockSize::Compact => 6,
-        DockSize::Normal => 8,
-        DockSize::Expanded => 10,
-    };
-    let rail = gtk::Box::new(gtk::Orientation::Vertical, gap);
-    rail.add_css_class("focal-dock");
-    rail.set_margin_top(padding);
-    rail.set_margin_bottom(padding);
-    rail.set_margin_start(padding);
-    rail.set_margin_end(padding);
-    window.set_child(Some(&rail));
+    let shelf = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    shelf.add_css_class("task-shelf");
+    shelf.set_halign(gtk::Align::Center);
+    shelf.set_valign(gtk::Align::Center);
+    window.set_child(Some(&shelf));
 
-    rail.append(&dock_button(
-        "preferences-system-symbolic",
-        "Settings",
-        || {
-            send_action(DesktopAction::OpenSettingsPanel {
-                panel: "appearance".into(),
-            })
-        },
+    let pinned = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    pinned.add_css_class("shelf-group");
+    pinned.append(&shelf_launch_button(
+        "web-browser-symbolic",
+        "Browser",
+        "@browser",
     ));
-    rail.append(&dock_button("view-app-grid-symbolic", "Launcher", || {
-        send_action(DesktopAction::LaunchApp {
-            app: "@launcher".into(),
-        });
-    }));
-
-    let workspace_box = gtk::Box::new(gtk::Orientation::Vertical, gap);
-    workspace_box.add_css_class("dock-workspaces");
-    rail.append(&workspace_box);
-
-    let separator = gtk::Separator::new(gtk::Orientation::Horizontal);
-    separator.add_css_class("dock-separator");
-    rail.append(&separator);
-
-    rail.append(&dock_button(
-        "list-add-symbolic",
-        "Add new workspace",
-        || send_action(DesktopAction::CreateWorkspace),
-    ));
-    rail.append(&dock_button(
-        "list-remove-symbolic",
-        "Delete workspace",
-        || send_action(DesktopAction::DeleteWorkspace),
-    ));
-    rail.append(&dock_button("web-browser-symbolic", "Browser", || {
-        send_action(DesktopAction::LaunchApp {
-            app: "@browser".into(),
-        });
-    }));
-    rail.append(&dock_button(
+    pinned.append(&shelf_launch_button(
         "utilities-terminal-symbolic",
         "Terminal",
-        || {
-            send_action(DesktopAction::LaunchApp {
-                app: "@terminal".into(),
-            });
-        },
+        "@terminal",
     ));
-    rail.append(&dock_button(
+    pinned.append(&shelf_launch_button(
         "system-file-manager-symbolic",
         "Files",
-        || {
-            send_action(DesktopAction::LaunchApp {
-                app: "@files".into(),
-            });
-        },
+        "@files",
     ));
-    rail.append(&dock_button("mail-unread-symbolic", "Email", || {
-        send_action(DesktopAction::LaunchApp {
-            app: "evolution".into(),
-        });
-    }));
 
-    let widgets = Rc::new(RefCell::new(DockWidgets::default()));
-    rebuild_workspace_buttons(&workspace_box, &widgets, 1);
+    let email_command = Rc::new(RefCell::new(preferred_email_command()));
+    let email_target = Rc::new(Cell::new(None::<u32>));
+    let click_email_command = email_command.clone();
+    let click_email_target = email_target.clone();
+    let (email_button, _) =
+        glass_icon_button("mail-unread-symbolic", "Email", "shelf-button", move || {
+            if let Some(window_id) = click_email_target.get() {
+                send_action(DesktopAction::FocusWindow { window_id });
+            } else if let Some(app) = click_email_command.borrow().clone() {
+                send_action(DesktopAction::LaunchApp { app });
+            }
+        });
+    email_button.set_visible(email_command.borrow().is_some());
+    pinned.append(&email_button);
+    shelf.append(&pinned);
+
+    let running = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    running.add_css_class("shelf-group");
+    running.add_css_class("running-group");
+    shelf.append(&running);
+    shelf.append(&shelf_separator());
+
+    let utilities = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    utilities.add_css_class("shelf-group");
+    utilities.append(&shelf_launch_button(
+        "view-app-grid-symbolic",
+        "Application launcher",
+        "@launcher",
+    ));
+    utilities.append(&shelf_launch_button(
+        "preferences-system-symbolic",
+        "Settings",
+        "@settings",
+    ));
+    shelf.append(&utilities);
+
+    let widgets = Rc::new(RefCell::new(ShelfWidgets::default()));
+    let visibility = Rc::new(Cell::new(config.dock.visibility));
+    let visibility_reload = visibility.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        visibility_reload.set(load_config().dock.visibility);
+        glib::ControlFlow::Continue
+    });
+    let email_reload_command = email_command.clone();
+    let email_reload_button = email_button.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        let command = preferred_email_command();
+        email_reload_button.set_visible(command.is_some());
+        *email_reload_command.borrow_mut() = command;
+        glib::ControlFlow::Continue
+    });
+
+    let pointer = gtk::EventControllerMotion::new();
+    let enter_widgets = widgets.clone();
+    let enter_window = window.downgrade();
+    pointer.connect_enter(move |_, _, _| {
+        let Some(window) = enter_window.upgrade() else {
+            return;
+        };
+        let mut state = enter_widgets.borrow_mut();
+        state.pointer_inside = true;
+        state.hide_after = None;
+        set_shelf_hidden(&window, &mut state, false);
+    });
+    let leave_widgets = widgets.clone();
+    pointer.connect_leave(move |_| {
+        let mut state = leave_widgets.borrow_mut();
+        state.pointer_inside = false;
+        state.hide_after = Some(Instant::now() + TASK_SHELF_HIDE_DELAY);
+    });
+    window.add_controller(pointer);
+
+    let snapshots = start_snapshot_poll(&window);
     let weak_window = window.downgrade();
-    glib::timeout_add_local(Duration::from_millis(500), move || {
+    glib::timeout_add_local(Duration::from_millis(100), move || {
         let Some(_window) = weak_window.upgrade() else {
             return glib::ControlFlow::Break;
         };
-        if let Some(snapshot) = desktop_snapshot() {
-            let count = snapshot.shell.workspace_count.max(1);
-            if widgets.borrow().workspace_count != count {
-                rebuild_workspace_buttons(&workspace_box, &widgets, count);
-            }
-            for (index, button) in widgets.borrow().workspace_buttons.iter().enumerate() {
-                if snapshot.session.active_workspace_id == index as u32 + 1 {
-                    button.add_css_class("active");
-                } else {
-                    button.remove_css_class("active");
-                }
+        if let Some(snapshot) = snapshots
+            .try_lock()
+            .ok()
+            .and_then(|mut snapshot| snapshot.take())
+        {
+            let output = output_for_connector(&snapshot, &connector);
+            let workspace = output
+                .map(|output| output.active_workspace_id)
+                .unwrap_or(snapshot.session.active_workspace_id);
+            email_target.set(
+                email_command
+                    .borrow()
+                    .as_deref()
+                    .and_then(|command| existing_email_window(&snapshot, command)),
+            );
+            widgets.borrow_mut().obscured =
+                output.is_some_and(|output| shelf_is_obscured(&snapshot, output, workspace));
+            let signature = snapshot
+                .windows
+                .iter()
+                .filter(|item| {
+                    window_belongs_to_output(item, output, snapshot.outputs.len())
+                        && item.workspace_id == workspace
+                        && item.mapped
+                        && !item.minimized
+                })
+                .map(|item| {
+                    (
+                        item.id,
+                        item.app_id
+                            .clone()
+                            .or_else(|| item.class.clone())
+                            .unwrap_or_default(),
+                        item.title.clone(),
+                        item.focused,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if widgets.borrow().running_signature != signature {
+                rebuild_running_apps(&running, &snapshot, output, workspace);
+                widgets.borrow_mut().running_signature = signature;
             }
         }
+        update_shelf_visibility(&_window, &widgets, visibility.get(), Instant::now());
         glib::ControlFlow::Continue
     });
 
     window
 }
 
-fn rebuild_workspace_buttons(
-    workspace_box: &gtk::Box,
-    widgets: &Rc<RefCell<DockWidgets>>,
-    workspace_count: usize,
+fn update_shelf_visibility(
+    window: &gtk::ApplicationWindow,
+    widgets: &Rc<RefCell<ShelfWidgets>>,
+    visibility: DockVisibility,
+    now: Instant,
 ) {
-    while let Some(child) = workspace_box.first_child() {
-        workspace_box.remove(&child);
+    let mut state = widgets.borrow_mut();
+    let should_hide = match visibility {
+        DockVisibility::AlwaysVisible => false,
+        DockVisibility::IntelligentDodge => state.obscured,
+        DockVisibility::Autohide => true,
+    } && !state.pointer_inside
+        && !window.is_active();
+
+    if !should_hide {
+        state.hide_after = None;
+        set_shelf_hidden(window, &mut state, false);
+        return;
     }
-    let mut buttons = Vec::new();
-    for workspace in 1..=workspace_count.min(9) {
-        let button = gtk::Button::with_label(&workspace.to_string());
-        button.add_css_class("dock-button");
-        button.add_css_class("workspace-button");
-        button.set_halign(gtk::Align::Center);
-        button.set_tooltip_text(Some(&format!("Workspace {workspace}")));
-        button.connect_clicked(move |_| {
-            send_action(DesktopAction::FocusWorkspace {
-                workspace: workspace as u32,
-            });
-        });
-        workspace_box.append(&button);
-        buttons.push(button);
+
+    let deadline = *state.hide_after.get_or_insert(now + TASK_SHELF_HIDE_DELAY);
+    if now >= deadline {
+        set_shelf_hidden(window, &mut state, true);
     }
-    *widgets.borrow_mut() = DockWidgets {
-        workspace_count,
-        workspace_buttons: buttons,
-    };
 }
 
+fn set_shelf_hidden(window: &gtk::ApplicationWindow, state: &mut ShelfWidgets, hidden: bool) {
+    if state.hidden == hidden {
+        return;
+    }
+    let bottom_margin = if hidden {
+        -(TASK_SHELF_HEIGHT - TASK_SHELF_REVEAL_STRIP)
+    } else {
+        TASK_SHELF_VISIBLE_MARGIN
+    };
+    window.set_margin(Edge::Bottom, bottom_margin);
+    if hidden {
+        window.add_css_class("shelf-hidden");
+    } else {
+        window.remove_css_class("shelf-hidden");
+    }
+    state.hidden = hidden;
+}
+
+fn shelf_is_obscured(snapshot: &DesktopSnapshot, output: &OutputSnapshot, workspace: u32) -> bool {
+    snapshot.windows.iter().any(|window| {
+        if !window.mapped
+            || window.minimized
+            || window.workspace_id != workspace
+            || !window_belongs_to_output(window, Some(output), snapshot.outputs.len())
+        {
+            return false;
+        }
+        if window.fullscreen || window.maximized {
+            return true;
+        }
+        window_overlaps_shelf(window, output)
+    })
+}
+
+fn window_overlaps_shelf(window: &WindowSnapshot, output: &OutputSnapshot) -> bool {
+    let shelf_width = TASK_SHELF_WIDTH.min(output.width.max(1));
+    let shelf_left = output.x + (output.width - shelf_width) / 2;
+    let shelf_top = output.y + output.height - TASK_SHELF_VISIBLE_MARGIN - TASK_SHELF_HEIGHT;
+    let shelf_right = shelf_left + shelf_width;
+    let shelf_bottom = shelf_top + TASK_SHELF_HEIGHT;
+    let (Some(x), Some(y), Some(width), Some(height)) =
+        (window.x, window.y, window.width, window.height)
+    else {
+        return false;
+    };
+    x < shelf_right
+        && x.saturating_add(width) > shelf_left
+        && y < shelf_bottom
+        && y.saturating_add(height) > shelf_top
+}
+
+fn shelf_launch_button(icon: &str, tooltip: &str, app: &'static str) -> gtk::Button {
+    glass_icon_button(icon, tooltip, "shelf-button", move || {
+        send_action(DesktopAction::LaunchApp { app: app.into() });
+    })
+    .0
+}
+
+fn preferred_email_command() -> Option<String> {
+    let settings = load_settings();
+    if !settings.apps.pin_email_to_shelf {
+        return None;
+    }
+    let configured = settings.apps.email.trim();
+    if !configured.is_empty() {
+        return Some(configured.to_string());
+    }
+    ["evolution", "thunderbird", "geary"]
+        .into_iter()
+        .find(|candidate| command_available(candidate))
+        .map(str::to_string)
+}
+
+fn command_available(command: &str) -> bool {
+    let Some(executable) = command.split_whitespace().next() else {
+        return false;
+    };
+    if executable.contains('/') {
+        return std::path::Path::new(executable).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|directory| directory.join(executable).is_file())
+    })
+}
+
+fn existing_email_window(snapshot: &DesktopSnapshot, command: &str) -> Option<u32> {
+    snapshot
+        .windows
+        .iter()
+        .filter(|window| window.mapped && !window.minimized)
+        .find(|window| {
+            let identity = window
+                .app_id
+                .as_deref()
+                .or(window.class.as_deref())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            email_identity_matches(command, &identity)
+        })
+        .map(|window| window.id)
+}
+
+fn email_identity_matches(command: &str, identity: &str) -> bool {
+    let command = command.to_ascii_lowercase();
+    let identity = identity.to_ascii_lowercase();
+    let executable = command
+        .split_whitespace()
+        .next()
+        .and_then(|part| std::path::Path::new(part).file_name())
+        .and_then(|part| part.to_str())
+        .unwrap_or_default();
+    (!executable.is_empty() && identity.contains(executable))
+        || ["evolution", "thunderbird", "geary", "mailspring"]
+            .iter()
+            .any(|token| command.contains(token) && identity.contains(token))
+}
+
+fn shelf_separator() -> gtk::Separator {
+    let separator = gtk::Separator::new(gtk::Orientation::Vertical);
+    separator.add_css_class("shelf-separator");
+    separator
+}
+
+fn rebuild_running_apps(
+    container: &gtk::Box,
+    snapshot: &DesktopSnapshot,
+    output: Option<&OutputSnapshot>,
+    workspace: u32,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+    let windows = snapshot
+        .windows
+        .iter()
+        .filter(|item| {
+            window_belongs_to_output(item, output, snapshot.outputs.len())
+                && item.workspace_id == workspace
+                && item.mapped
+                && !item.minimized
+        })
+        .collect::<Vec<_>>();
+    if windows.is_empty() {
+        container.set_visible(false);
+        return;
+    }
+    container.set_visible(true);
+    let mut groups: Vec<(String, Vec<&focaldesk_ipc::WindowSnapshot>)> = Vec::new();
+    for item in windows {
+        let identity = item
+            .app_id
+            .as_deref()
+            .or(item.class.as_deref())
+            .unwrap_or(&item.title)
+            .to_ascii_lowercase();
+        if let Some((_, windows)) = groups.iter_mut().find(|(key, _)| *key == identity) {
+            windows.push(item);
+        } else {
+            groups.push((identity, vec![item]));
+        }
+    }
+    let overflow = groups.len().saturating_sub(5);
+    for (identity, windows) in groups.into_iter().take(5) {
+        let icon = app_icon_name(Some(&identity));
+        let target = windows
+            .iter()
+            .find(|window| window.focused)
+            .copied()
+            .unwrap_or(windows[0]);
+        let id = target.id;
+        let tooltip = if windows.len() == 1 {
+            target.title.clone()
+        } else {
+            format!("{} — {} windows", target.title, windows.len())
+        };
+        let (button, _) = glass_icon_button(icon, &tooltip, "shelf-button", move || {
+            send_action(DesktopAction::FocusWindow { window_id: id });
+        });
+        button.add_css_class("running-app");
+        set_button_active(&button, windows.iter().any(|window| window.focused));
+        if windows.len() > 1 {
+            let overlay = gtk::Overlay::new();
+            overlay.set_child(Some(&button));
+            let marks = gtk::Label::new(Some("≡"));
+            marks.add_css_class("window-stack-marks");
+            marks.set_halign(gtk::Align::End);
+            marks.set_valign(gtk::Align::Start);
+            overlay.add_overlay(&marks);
+            container.append(&overlay);
+        } else {
+            container.append(&button);
+        }
+    }
+    if overflow > 0 {
+        let more = gtk::Label::new(Some(&format!("+{overflow}")));
+        more.add_css_class("shelf-overflow");
+        more.set_tooltip_text(Some(&format!("{overflow} more running applications")));
+        container.append(&more);
+    }
+}
+
+fn window_belongs_to_output(
+    window: &WindowSnapshot,
+    output: Option<&OutputSnapshot>,
+    output_count: usize,
+) -> bool {
+    let Some(output) = output else {
+        return output_count == 1 || window.output_id.is_none();
+    };
+    if let Some(output_id) = window.output_id {
+        return output_id == output.id;
+    }
+
+    // XWayland and newly mapped windows can briefly lack an explicit output.
+    // Geometry is the strongest fallback; focus keeps geometry-less windows on
+    // exactly one shelf instead of duplicating them across every monitor.
+    if let (Some(x), Some(y), Some(width), Some(height)) =
+        (window.x, window.y, window.width, window.height)
+    {
+        let center_x = x.saturating_add(width / 2);
+        let center_y = y.saturating_add(height / 2);
+        return center_x >= output.x
+            && center_x < output.x.saturating_add(output.width)
+            && center_y >= output.y
+            && center_y < output.y.saturating_add(output.height);
+    }
+
+    output_count == 1 || (window.focused && output.focused)
+}
+
+fn app_icon_name(identity: Option<&str>) -> &'static str {
+    let identity = identity.unwrap_or_default().to_ascii_lowercase();
+    if identity.contains("terminal") || identity.contains("foot") {
+        "utilities-terminal-symbolic"
+    } else if identity.contains("file") || identity.contains("nautilus") {
+        "system-file-manager-symbolic"
+    } else if identity.contains("mail") || identity.contains("evolution") {
+        "mail-unread-symbolic"
+    } else if identity.contains("browser")
+        || identity.contains("chrome")
+        || identity.contains("firefox")
+    {
+        "web-browser-symbolic"
+    } else {
+        "application-x-executable-symbolic"
+    }
+}
+
+#[cfg(any())]
 struct PanelWidgets {
-    workspace: gtk::Label,
-    workspace_menu: gtk::Box,
-    workspace_popover: gtk::Popover,
-    workspace_count: Cell<usize>,
-    active_workspace: Cell<u32>,
     title: gtk::Label,
     network_button: gtk::Button,
     network_image: gtk::Image,
+    microphone_button: gtk::Button,
+    microphone_image: gtk::Image,
     notifications_button: gtk::Button,
     notifications_image: gtk::Image,
     updates_button: gtk::Button,
     updates_image: gtk::Image,
     dnd_button: gtk::Button,
     dnd_image: gtk::Image,
-    battery: gtk::Label,
+    camera_button: gtk::Button,
+    camera_image: gtk::Image,
+    display_button: gtk::Button,
     clock: gtk::Label,
 }
 
+#[cfg(any())]
 fn build_panel(
     app: &gtk::Application,
     output_number: u32,
-    _config: &FocalDeskConfig,
+    config: &FocalDeskConfig,
+    connector: String,
 ) -> gtk::ApplicationWindow {
     let window = gtk::ApplicationWindow::builder()
         .application(app)
@@ -397,15 +696,24 @@ fn build_panel(
     window.add_css_class("focal-shell-window");
     window.add_css_class("focal-panel-window");
 
-    let panel = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    let panel = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     panel.add_css_class("focal-panel");
     panel.set_height_request(PANEL_HEIGHT);
     window.set_child(Some(&panel));
 
     let corner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     corner.add_css_class("panel-corner");
-    corner.set_width_request(DOCK_WIDTH);
+    // The compositor's top-bar inner frame begins four pixels after the dock.
+    corner.set_width_request(DOCK_WIDTH + 4);
     panel.append(&corner);
+
+    let panel_inner = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    panel_inner.add_css_class("panel-inner");
+    panel_inner.set_hexpand(true);
+    panel_inner.set_margin_top(3);
+    panel_inner.set_margin_bottom(3);
+    panel_inner.set_margin_end(4);
+    panel.append(&panel_inner);
 
     let (launcher, _) = glass_icon_button(
         "focaldesk-ai-console",
@@ -418,95 +726,89 @@ fn build_panel(
         },
     );
     launcher.add_css_class("panel-well");
-    panel.append(&launcher);
+    launcher.set_margin_start(6);
+    launcher.set_margin_end(12);
+    panel_inner.append(&launcher);
 
-    let identity = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-    identity.add_css_class("panel-identity");
-    let brand = gtk::Label::new(Some("FOCALDESK"));
-    brand.add_css_class("panel-brand");
-    identity.append(&brand);
-    let output_label = gtk::Label::new(Some(&format!("OUT {output_number}")));
-    output_label.add_css_class("panel-meta");
-    identity.append(&output_label);
-    let workspace = gtk::Label::new(Some("Workspace 1"));
-    workspace.add_css_class("panel-meta");
-    let workspace_button = gtk::MenuButton::new();
-    workspace_button.add_css_class("panel-workspace-button");
-    workspace_button.set_tooltip_text(Some("Choose workspace"));
-    workspace_button.set_child(Some(&workspace));
-    let workspace_popover = gtk::Popover::new();
-    workspace_popover.add_css_class("workspace-popover");
-    let workspace_menu = gtk::Box::new(gtk::Orientation::Vertical, 4);
-    workspace_menu.set_margin_top(8);
-    workspace_menu.set_margin_bottom(8);
-    workspace_menu.set_margin_start(8);
-    workspace_menu.set_margin_end(8);
-    workspace_popover.set_child(Some(&workspace_menu));
-    workspace_button.set_popover(Some(&workspace_popover));
-    identity.append(&workspace_button);
-    panel.append(&identity);
-
-    let title = gtk::Label::new(None);
+    let title = gtk::Label::new(Some(&format!("FOCALDESK · OUT {output_number} · WS 1")));
     title.add_css_class("panel-title");
-    title.add_css_class("panel-well");
     title.set_hexpand(true);
-    title.set_halign(gtk::Align::Start);
+    title.set_halign(gtk::Align::Fill);
     title.set_valign(gtk::Align::Center);
+    title.set_xalign(0.0);
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    panel.append(&title);
+    let title_region = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    title_region.add_css_class("panel-well");
+    title_region.add_css_class("panel-title-region");
+    title_region.set_hexpand(true);
+    title_region.set_halign(gtk::Align::Fill);
+    title_region.set_valign(gtk::Align::Center);
+    title_region.set_margin_end(10);
+    title_region.append(&title);
+    panel_inner.append(&title_region);
 
-    let status_cluster = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    let status_cluster = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     status_cluster.add_css_class("panel-status-cluster");
+    status_cluster.set_valign(gtk::Align::Center);
 
+    let network_connector = connector.clone();
     let (network_button, network_image) = glass_icon_button(
         "network-wireless-offline-symbolic",
         "Network",
         "panel-status-button",
-        || {
-            send_action(DesktopAction::OpenSettingsPanel {
-                panel: "network".into(),
-            });
+        move || {
+            open_shell_panel(&network_connector, ShellPanel::Network);
         },
     );
     status_cluster.append(&network_button);
+    let bluetooth_connector = connector.clone();
     status_cluster.append(
         &glass_icon_button(
             "bluetooth-active-symbolic",
             "Bluetooth",
             "panel-status-button",
-            || {
-                send_action(DesktopAction::OpenSettingsPanel {
-                    panel: "bluetooth".into(),
-                });
+            move || {
+                open_shell_panel(&bluetooth_connector, ShellPanel::Bluetooth);
             },
         )
         .0,
     );
+    let audio_connector = connector.clone();
     status_cluster.append(
         &glass_icon_button(
             "audio-volume-high-symbolic",
-            "Sound",
+            "Output volume",
             "panel-status-button",
-            || {
-                send_action(DesktopAction::OpenSettingsPanel {
-                    panel: "sound".into(),
-                });
+            move || {
+                open_shell_panel(&audio_connector, ShellPanel::Audio);
             },
         )
         .0,
     );
+    let microphone_connector = connector.clone();
+    let (microphone_button, microphone_image) = glass_icon_button(
+        "microphone-sensitivity-muted-symbolic",
+        "Voice input",
+        "panel-status-button",
+        move || {
+            open_shell_panel(&microphone_connector, ShellPanel::Audio);
+        },
+    );
+    status_cluster.append(&microphone_button);
+    let notifications_connector = connector.clone();
     let (notifications_button, notifications_image) = glass_icon_button(
         "notification-symbolic",
         "Notifications",
         "panel-status-button",
-        || send_action(DesktopAction::OpenNotificationsPanel),
+        move || open_shell_panel(&notifications_connector, ShellPanel::NotificationHistory),
     );
     status_cluster.append(&notifications_button);
+    let updates_connector = connector.clone();
     let (updates_button, updates_image) = glass_icon_button(
         "software-update-available-symbolic",
         "System updates",
         "panel-status-button",
-        || send_action(DesktopAction::OpenUpdatesPanel),
+        move || open_shell_panel(&updates_connector, ShellPanel::Updates),
     );
     status_cluster.append(&updates_button);
     let (dnd_button, dnd_image) = glass_icon_button(
@@ -516,79 +818,90 @@ fn build_panel(
         || send_action(DesktopAction::ToggleDoNotDisturb),
     );
     status_cluster.append(&dnd_button);
-    status_cluster.append(
-        &glass_icon_button(
-            "video-display-symbolic",
-            "Displays",
-            "panel-status-button",
-            || {
-                send_action(DesktopAction::OpenSettingsPanel {
-                    panel: "displays".into(),
-                });
-            },
-        )
-        .0,
+    let camera_connector = connector.clone();
+    let (camera_button, camera_image) = glass_icon_button(
+        "camera-disabled-symbolic",
+        "Camera",
+        "panel-status-button",
+        move || {
+            open_shell_panel(&camera_connector, ShellPanel::Settings);
+        },
     );
-    let battery = gtk::Label::new(None);
-    battery.add_css_class("panel-battery");
-    battery.add_css_class("panel-well");
-    status_cluster.append(&battery);
+    status_cluster.append(&camera_button);
+    let display_connector = connector.clone();
+    let (display_button, _) = glass_icon_button(
+        "video-display-symbolic",
+        "Displays",
+        "panel-status-button",
+        move || {
+            open_shell_panel(&display_connector, ShellPanel::Display);
+        },
+    );
+    status_cluster.append(&display_button);
+    let power_connector = connector.clone();
     status_cluster.append(
         &glass_icon_button(
             "system-shutdown-symbolic",
             "Power",
             "panel-status-button",
-            || {
-                send_action(DesktopAction::OpenSettingsPanel {
-                    panel: "power".into(),
-                });
+            move || {
+                open_shell_panel(&power_connector, ShellPanel::Power);
             },
         )
         .0,
     );
-    panel.append(&status_cluster);
+    panel_inner.append(&status_cluster);
 
     let clock = gtk::Label::new(None);
     clock.add_css_class("panel-clock");
     let clock_button = gtk::Button::new();
     clock_button.add_css_class("panel-well");
+    clock_button.add_css_class("panel-clock-button");
+    clock_button.set_valign(gtk::Align::Center);
+    clock_button.set_margin_start(8);
+    clock_button.set_margin_end(10);
     clock_button.set_tooltip_text(Some("Calendar and clock"));
     clock_button.set_child(Some(&clock));
-    clock_button.connect_clicked(|_| send_action(DesktopAction::OpenCalendarPanel));
-    panel.append(&clock_button);
+    let clock_connector = connector.clone();
+    clock_button.connect_clicked(move |_| open_shell_panel(&clock_connector, ShellPanel::Calendar));
+    panel_inner.append(&clock_button);
 
     let widgets = PanelWidgets {
-        workspace,
-        workspace_menu,
-        workspace_popover,
-        workspace_count: Cell::new(0),
-        active_workspace: Cell::new(0),
         title,
         network_button,
         network_image,
+        microphone_button,
+        microphone_image,
         notifications_button,
         notifications_image,
         updates_button,
         updates_image,
         dnd_button,
         dnd_image,
-        battery,
+        camera_button,
+        camera_image,
+        display_button,
         clock,
     };
-    rebuild_panel_workspace_menu(&widgets.workspace_menu, &widgets.workspace_popover, 1, 1);
-    widgets.workspace_count.set(1);
-    widgets.active_workspace.set(1);
+    let clock_format = config.panel.clock_format;
+    update_clock(&widgets.clock, clock_format);
+    let clock = widgets.clock.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        update_clock(&clock, clock_format);
+        glib::ControlFlow::Continue
+    });
+    let snapshots = start_snapshot_poll(&window);
     let weak_window = window.downgrade();
-    glib::timeout_add_local(Duration::from_millis(500), move || {
+    glib::timeout_add_local(Duration::from_millis(100), move || {
         let Some(_window) = weak_window.upgrade() else {
             return glib::ControlFlow::Break;
         };
-        if let Some(snapshot) = desktop_snapshot() {
-            update_panel(&widgets, &snapshot);
-        } else {
-            widgets
-                .clock
-                .set_text(&chrono::Local::now().format("%-I:%M %p").to_string());
+        let snapshot = snapshots
+            .try_lock()
+            .ok()
+            .and_then(|mut snapshot| snapshot.take());
+        if let Some(snapshot) = snapshot {
+            update_panel(&widgets, &snapshot, &connector, output_number);
         }
         glib::ControlFlow::Continue
     });
@@ -596,56 +909,72 @@ fn build_panel(
     window
 }
 
-fn update_panel(widgets: &PanelWidgets, snapshot: &DesktopSnapshot) {
-    widgets.workspace.set_text(&format!(
-        "Workspace {}",
-        snapshot.session.active_workspace_id
+#[cfg(any())]
+fn update_panel(
+    widgets: &PanelWidgets,
+    snapshot: &DesktopSnapshot,
+    connector: &str,
+    output_number: u32,
+) {
+    let output = output_for_connector(snapshot, connector);
+    let active_workspace = output
+        .map(|output| output.active_workspace_id)
+        .unwrap_or(snapshot.session.active_workspace_id)
+        .max(1);
+    // Match the compositor-owned identity exactly. The connector still selects
+    // this output's state; the visible identity uses the stable shell numbering.
+    widgets.title.set_text(&format!(
+        "FOCALDESK · OUT {output_number} · WS {active_workspace}"
     ));
-    let workspace_count = snapshot.shell.workspace_count.max(1);
-    let active_workspace = snapshot.session.active_workspace_id.max(1);
-    if widgets.workspace_count.get() != workspace_count
-        || widgets.active_workspace.get() != active_workspace
-    {
-        rebuild_panel_workspace_menu(
-            &widgets.workspace_menu,
-            &widgets.workspace_popover,
-            workspace_count,
-            active_workspace,
-        );
-        widgets.workspace_count.set(workspace_count);
-        widgets.active_workspace.set(active_workspace);
-    }
-    widgets
-        .title
-        .set_text(snapshot.shell.focused_window_title.as_deref().unwrap_or(""));
-    widgets
-        .network_image
-        .set_icon_name(Some(if snapshot.shell.network_carrier {
+    set_shell_icon(
+        &widgets.network_image,
+        if snapshot.shell.network_carrier {
             "network-wireless-signal-excellent-symbolic"
         } else {
             "network-wireless-offline-symbolic"
-        }));
+        },
+    );
     set_button_active(&widgets.network_button, snapshot.shell.network_carrier);
-    widgets.notifications_image.set_icon_name(Some(
+    set_shell_icon(
+        &widgets.microphone_image,
+        if snapshot.shell.microphone_active {
+            "audio-input-microphone-symbolic"
+        } else {
+            "microphone-sensitivity-muted-symbolic"
+        },
+    );
+    set_button_active(&widgets.microphone_button, snapshot.shell.microphone_active);
+    widgets
+        .microphone_button
+        .set_tooltip_text(Some(if snapshot.shell.microphone_active {
+            "Voice input: listening"
+        } else if snapshot.shell.microphone_detected {
+            "Voice input: not listening"
+        } else {
+            "No microphone detected"
+        }));
+    set_shell_icon(
+        &widgets.notifications_image,
         if snapshot.shell.notification_unread_count > 0 {
             "notification-new-symbolic"
         } else {
             "notification-symbolic"
         },
-    ));
+    );
     set_button_active(
         &widgets.notifications_button,
         snapshot.shell.notification_unread_count > 0,
     );
-    widgets
-        .updates_image
-        .set_icon_name(Some(if snapshot.shell.update_busy {
+    set_shell_icon(
+        &widgets.updates_image,
+        if snapshot.shell.update_busy {
             "emblem-synchronizing-symbolic"
         } else if snapshot.shell.update_available_count > 0 {
             "software-update-available-symbolic"
         } else {
             "software-update-available-symbolic"
-        }));
+        },
+    );
     set_button_active(
         &widgets.updates_button,
         snapshot.shell.update_available_count > 0 || snapshot.shell.update_busy,
@@ -665,62 +994,396 @@ fn update_panel(widgets: &PanelWidgets, snapshot: &DesktopSnapshot) {
     widgets
         .updates_button
         .set_tooltip_text(Some(&updates_tooltip));
-    widgets
-        .dnd_image
-        .set_icon_name(Some(if snapshot.shell.do_not_disturb {
-            "notifications-disabled-symbolic"
-        } else {
-            "notifications-symbolic"
-        }));
+    set_shell_icon(&widgets.dnd_image, "notifications-disabled-symbolic");
     set_button_active(&widgets.dnd_button, snapshot.shell.do_not_disturb);
+    set_shell_icon(
+        &widgets.camera_image,
+        if snapshot.shell.camera_active {
+            "camera-web-symbolic"
+        } else {
+            "camera-disabled-symbolic"
+        },
+    );
+    set_button_active(&widgets.camera_button, snapshot.shell.camera_active);
+    widgets
+        .camera_button
+        .set_tooltip_text(Some(if snapshot.shell.camera_active {
+            "Camera in use"
+        } else if snapshot.shell.camera_detected {
+            "Camera detected — not in use"
+        } else {
+            "No camera detected"
+        }));
+    if let Some(output) = output {
+        set_button_active(&widgets.display_button, output.hdr_active);
+        widgets
+            .display_button
+            .set_tooltip_text(Some(if output.hdr_active {
+                "Displays: HDR active"
+            } else if output.hdr_supported {
+                "Displays: HDR available"
+            } else {
+                "Displays"
+            }));
+    }
+}
+
+#[derive(Default)]
+struct RailWorkspaceWidgets {
+    workspace_count: usize,
+    buttons: Vec<gtk::Button>,
+}
+
+struct SystemRailWidgets {
+    network_button: gtk::Button,
+    network_image: gtk::Image,
+    display_button: gtk::Button,
+    display_badge: gtk::Label,
+    battery: gtk::Label,
+    notifications_button: gtk::Button,
+    clock: gtk::Label,
+    workspaces: Rc<RefCell<RailWorkspaceWidgets>>,
+    workspace_box: gtk::Box,
+    add_workspace_button: gtk::Button,
+    remove_workspace_button: gtk::Button,
+}
+
+fn build_panel(
+    app: &gtk::Application,
+    _output_number: u32,
+    config: &FocalDeskConfig,
+    connector: String,
+) -> gtk::ApplicationWindow {
+    let window = gtk::ApplicationWindow::builder()
+        .application(app)
+        .decorated(false)
+        .resizable(false)
+        .build();
+    window.add_css_class("focal-shell-window");
+    window.add_css_class("system-rail-window");
+
+    let rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    rail.add_css_class("system-rail");
+    window.set_child(Some(&rail));
+
+    let top = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    top.add_css_class("rail-group");
+    let network_connector = connector.clone();
+    let (network_button, network_image) = glass_icon_button(
+        "network-wireless-offline-symbolic",
+        "Network",
+        "rail-button",
+        move || open_shell_panel(&network_connector, ShellPanel::Network),
+    );
+    top.append(&network_button);
+    let audio_connector = connector.clone();
+    top.append(
+        &glass_icon_button(
+            "audio-volume-high-symbolic",
+            "Audio",
+            "rail-button",
+            move || open_shell_panel(&audio_connector, ShellPanel::Audio),
+        )
+        .0,
+    );
+    let bluetooth_connector = connector.clone();
+    top.append(
+        &glass_icon_button(
+            "bluetooth-active-symbolic",
+            "Bluetooth",
+            "rail-button",
+            move || open_shell_panel(&bluetooth_connector, ShellPanel::Bluetooth),
+        )
+        .0,
+    );
+    let display_button = gtk::Button::new();
+    display_button.add_css_class("rail-button");
+    display_button.set_tooltip_text(Some("Display settings"));
+    let display_overlay = gtk::Overlay::new();
+    let display_image = shell_icon_image("video-display-symbolic");
+    display_image.set_pixel_size(26);
+    display_overlay.set_child(Some(&display_image));
+    let display_badge = gtk::Label::new(None);
+    display_badge.add_css_class("rail-display-badge");
+    display_badge.set_halign(gtk::Align::End);
+    display_badge.set_valign(gtk::Align::Start);
+    display_badge.set_visible(false);
+    display_overlay.add_overlay(&display_badge);
+    display_button.set_child(Some(&display_overlay));
+    let display_connector = connector.clone();
+    display_button
+        .connect_clicked(move |_| open_shell_panel(&display_connector, ShellPanel::Display));
+    top.append(&display_button);
+    let battery = gtk::Label::new(None);
+    battery.add_css_class("rail-battery-label");
+    let battery_button = gtk::Button::new();
+    battery_button.add_css_class("rail-button");
+    battery_button.set_tooltip_text(Some("Battery and power"));
+    battery_button.set_child(Some(&battery));
+    let battery_connector = connector.clone();
+    battery_button
+        .connect_clicked(move |_| open_shell_panel(&battery_connector, ShellPanel::Power));
+    top.append(&battery_button);
+    rail.append(&top);
+
+    let workspace_cluster = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    workspace_cluster.add_css_class("rail-workspace-cluster");
+    workspace_cluster.set_vexpand(true);
+    workspace_cluster.set_valign(gtk::Align::Center);
+    let workspace_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    workspace_box.add_css_class("rail-workspaces");
+    workspace_cluster.append(&workspace_box);
+    let workspaces = Rc::new(RefCell::new(RailWorkspaceWidgets::default()));
+    rebuild_rail_workspaces(&workspace_box, &workspaces, 1, &connector);
+
+    let add_workspace_button = gtk::Button::with_label("+");
+    add_workspace_button.add_css_class("rail-button");
+    add_workspace_button.add_css_class("rail-workspace-control");
+    add_workspace_button.set_tooltip_text(Some("Add workspace"));
+    let add_connector = connector.clone();
+    add_workspace_button.connect_clicked(move |_| {
+        send_action(DesktopAction::CreateWorkspaceOnOutput {
+            connector: add_connector.clone(),
+        });
+    });
+    workspace_cluster.append(&add_workspace_button);
+
+    let remove_workspace_button = gtk::Button::with_label("−");
+    remove_workspace_button.add_css_class("rail-button");
+    remove_workspace_button.add_css_class("rail-workspace-control");
+    remove_workspace_button.set_tooltip_text(Some("Delete current workspace"));
+    remove_workspace_button.set_visible(false);
+    let remove_connector = connector.clone();
+    remove_workspace_button.connect_clicked(move |_| {
+        send_action(DesktopAction::DeleteWorkspaceOnOutput {
+            connector: remove_connector.clone(),
+        });
+    });
+    workspace_cluster.append(&remove_workspace_button);
+    rail.append(&workspace_cluster);
+
+    let bottom = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    bottom.add_css_class("rail-group");
+    let clock = gtk::Label::new(None);
+    clock.add_css_class("rail-clock");
+    let clock_button = gtk::Button::new();
+    clock_button.add_css_class("rail-button");
+    clock_button.set_tooltip_text(Some("Calendar and clock"));
+    clock_button.set_child(Some(&clock));
+    let clock_connector = connector.clone();
+    clock_button.connect_clicked(move |_| open_shell_panel(&clock_connector, ShellPanel::Calendar));
+    bottom.append(&clock_button);
+    let notifications_connector = connector.clone();
+    let (notifications_button, _) = glass_icon_button(
+        "notification-symbolic",
+        "Notification center",
+        "rail-button",
+        move || open_shell_panel(&notifications_connector, ShellPanel::NotificationHistory),
+    );
+    bottom.append(&notifications_button);
+    let power_connector = connector.clone();
+    bottom.append(
+        &glass_icon_button(
+            "system-shutdown-symbolic",
+            "Power menu",
+            "rail-button",
+            move || open_shell_panel(&power_connector, ShellPanel::Power),
+        )
+        .0,
+    );
+    rail.append(&bottom);
+
+    let widgets = SystemRailWidgets {
+        network_button,
+        network_image,
+        display_button,
+        display_badge,
+        battery,
+        notifications_button,
+        clock,
+        workspaces,
+        workspace_box,
+        add_workspace_button,
+        remove_workspace_button,
+    };
+    let clock_format = config.panel.clock_format;
+    update_clock(&widgets.clock, clock_format);
+    let clock = widgets.clock.clone();
+    glib::timeout_add_seconds_local(1, move || {
+        update_clock(&clock, clock_format);
+        glib::ControlFlow::Continue
+    });
+
+    let snapshots = start_snapshot_poll(&window);
+    let weak_window = window.downgrade();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let Some(_window) = weak_window.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if let Some(snapshot) = snapshots
+            .try_lock()
+            .ok()
+            .and_then(|mut snapshot| snapshot.take())
+        {
+            update_system_rail(&widgets, &snapshot, &connector);
+        }
+        glib::ControlFlow::Continue
+    });
+    window
+}
+
+fn rebuild_rail_workspaces(
+    container: &gtk::Box,
+    widgets: &Rc<RefCell<RailWorkspaceWidgets>>,
+    count: usize,
+    connector: &str,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
+    }
+    let mut buttons = Vec::new();
+    for workspace in 1..=count.min(9) {
+        let button = gtk::Button::with_label(&workspace.to_string());
+        button.add_css_class("rail-button");
+        button.add_css_class("rail-workspace-button");
+        button.set_tooltip_text(Some(&format!("Workspace {workspace}")));
+        let connector = connector.to_string();
+        button.connect_clicked(move |_| {
+            send_action(DesktopAction::FocusWorkspaceOnOutput {
+                connector: connector.clone(),
+                workspace: workspace as u32,
+            });
+        });
+        container.append(&button);
+        buttons.push(button);
+    }
+    *widgets.borrow_mut() = RailWorkspaceWidgets {
+        workspace_count: count,
+        buttons,
+    };
+}
+
+fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, connector: &str) {
+    let output = output_for_connector(snapshot, connector);
+    let active_workspace = output
+        .map(|output| output.active_workspace_id)
+        .unwrap_or(snapshot.session.active_workspace_id)
+        .max(1);
+    let count = snapshot.shell.workspace_count.max(1);
+    let maximum = snapshot.shell.max_workspace_slots.max(1);
+    if widgets.workspaces.borrow().workspace_count != count {
+        rebuild_rail_workspaces(
+            &widgets.workspace_box,
+            &widgets.workspaces,
+            count,
+            connector,
+        );
+    }
+    for (index, button) in widgets.workspaces.borrow().buttons.iter().enumerate() {
+        set_button_active(button, active_workspace == index as u32 + 1);
+    }
+    widgets.add_workspace_button.set_sensitive(count < maximum);
+    widgets.remove_workspace_button.set_visible(count > 1);
+    if let Some(output) = output {
+        let status = rail_display_status(output);
+        widgets
+            .display_button
+            .set_tooltip_text(Some(&status.tooltip));
+        widgets.display_badge.set_label(status.badge.unwrap_or(""));
+        widgets.display_badge.set_visible(status.badge.is_some());
+        if status.warning {
+            widgets.display_badge.add_css_class("warning");
+        } else {
+            widgets.display_badge.remove_css_class("warning");
+        }
+    } else {
+        widgets
+            .display_button
+            .set_tooltip_text(Some("Display settings"));
+        widgets.display_badge.set_visible(false);
+        widgets.display_badge.remove_css_class("warning");
+    }
+    set_shell_icon(
+        &widgets.network_image,
+        if snapshot.shell.network_carrier {
+            "network-wireless-signal-excellent-symbolic"
+        } else {
+            "network-wireless-offline-symbolic"
+        },
+    );
+    set_button_active(&widgets.network_button, snapshot.shell.network_carrier);
     widgets.battery.set_text(
         &snapshot
             .shell
             .battery_percent
             .map(|percent| format!("{percent}%"))
-            .unwrap_or_default(),
+            .unwrap_or_else(|| "AC".into()),
     );
+    set_button_active(
+        &widgets.notifications_button,
+        snapshot.shell.notification_unread_count > 0,
+    );
+    let notification_tooltip = match snapshot.shell.notification_unread_count {
+        0 => "Notification center".into(),
+        count => format!("Notification center: {count} unread"),
+    };
     widgets
-        .clock
-        .set_text(&chrono::Local::now().format("%-I:%M %p").to_string());
+        .notifications_button
+        .set_tooltip_text(Some(&notification_tooltip));
 }
 
-fn rebuild_panel_workspace_menu(
-    menu: &gtk::Box,
-    popover: &gtk::Popover,
-    workspace_count: usize,
-    active_workspace: u32,
-) {
-    while let Some(child) = menu.first_child() {
-        menu.remove(&child);
+#[derive(Debug, PartialEq, Eq)]
+struct RailDisplayStatus {
+    badge: Option<&'static str>,
+    warning: bool,
+    tooltip: String,
+}
+
+fn rail_display_status(output: &OutputSnapshot) -> RailDisplayStatus {
+    let mode = if output.hdr_active {
+        "HDR active"
+    } else if output.hdr_requested {
+        "HDR requested but not active"
+    } else {
+        "SDR"
+    };
+    let gamut = if output.wide_gamut_active {
+        "wide gamut"
+    } else {
+        "sRGB gamut"
+    };
+    let warning = (output.hdr_requested && !output.hdr_active) || output.icc_lut_fallback_active;
+    let badge = if warning {
+        Some("!")
+    } else if output.hdr_active {
+        Some("HDR")
+    } else {
+        None
+    };
+    let fallback = if output.icc_lut_fallback_active {
+        " · ICC fallback active"
+    } else {
+        ""
+    };
+    RailDisplayStatus {
+        badge,
+        warning,
+        tooltip: format!("{} · {mode} · {gamut}{fallback}", output.connector),
     }
+}
 
-    let heading = gtk::Label::new(Some(&format!("Current: Workspace {active_workspace}")));
-    heading.add_css_class("workspace-menu-heading");
-    heading.set_halign(gtk::Align::Start);
-    menu.append(&heading);
-    menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+fn update_clock(clock: &gtk::Label, format: ClockFormat) {
+    clock.set_text(
+        &chrono::Local::now()
+            .format(rail_clock_pattern(format))
+            .to_string(),
+    );
+}
 
-    for workspace in 1..=workspace_count.min(9) {
-        let prefix = if workspace as u32 == active_workspace {
-            "✓"
-        } else {
-            " "
-        };
-        let label = gtk::Label::new(Some(&format!("{prefix}  Workspace {workspace}")));
-        label.set_xalign(0.0);
-        let button = gtk::Button::new();
-        button.set_child(Some(&label));
-        button.add_css_class("workspace-menu-item");
-        button.set_halign(gtk::Align::Fill);
-        let popover = popover.clone();
-        button.connect_clicked(move |_| {
-            send_action(DesktopAction::FocusWorkspace {
-                workspace: workspace as u32,
-            });
-            popover.popdown();
-        });
-        menu.append(&button);
+fn rail_clock_pattern(format: ClockFormat) -> &'static str {
+    match format {
+        ClockFormat::TwelveHour => "%-I:%M\n%p",
+        ClockFormat::TwentyFourHour => "%H:%M",
     }
 }
 
@@ -733,11 +1396,28 @@ pub fn set_button_active(widget: &gtk::Button, active: bool) {
     }
 }
 
-/// Build a canonical dock button with a symbolic GTK icon.
-pub fn dock_button(icon_name: &str, tooltip: &str, action: impl Fn() + 'static) -> gtk::Button {
+/// Build a canonical three-layer dock module with a symbolic GTK button.
+pub fn dock_button(icon_name: &str, tooltip: &str, action: impl Fn() + 'static) -> gtk::Box {
     let (button, _) = glass_icon_button(icon_name, tooltip, "dock-button", action);
+    dock_module(&button)
+}
+
+fn dock_module(button: &gtk::Button) -> gtk::Box {
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    outer.add_css_class("dock-module");
+    outer.set_halign(gtk::Align::Center);
+    outer.set_valign(gtk::Align::Center);
+
+    let inner = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    inner.add_css_class("dock-module-inner");
+    inner.set_halign(gtk::Align::Center);
+    inner.set_valign(gtk::Align::Center);
+
     button.set_halign(gtk::Align::Center);
-    button
+    button.set_valign(gtk::Align::Center);
+    inner.append(button);
+    outer.append(&inner);
+    outer
 }
 
 /// Build a reusable glass-styled icon button and return its image for live
@@ -748,14 +1428,114 @@ pub fn glass_icon_button(
     css_class: &str,
     action: impl Fn() + 'static,
 ) -> (gtk::Button, gtk::Image) {
-    let image = gtk::Image::from_icon_name(icon_name);
-    image.set_pixel_size(24);
+    let image = shell_icon_image(icon_name);
+    if css_class == "rail-button" {
+        image.set_pixel_size(26);
+        set_shell_icon_at_size(&image, icon_name, 26);
+    } else if css_class == "shelf-button" {
+        image.set_pixel_size(28);
+        set_shell_icon_at_size(&image, icon_name, 28);
+    }
     let button = gtk::Button::new();
     button.add_css_class(css_class);
+    button.set_valign(gtk::Align::Center);
     button.set_child(Some(&image));
     button.set_tooltip_text(Some(tooltip));
     button.connect_clicked(move |_| action());
     (button, image)
+}
+
+fn shell_icon_image(icon_name: &str) -> gtk::Image {
+    let image = gtk::Image::new();
+    image.set_pixel_size(24);
+    set_shell_icon(&image, icon_name);
+    image
+}
+
+fn set_shell_icon(image: &gtk::Image, icon_name: &str) {
+    set_shell_icon_at_size(image, icon_name, image.pixel_size().max(1) as u32);
+}
+
+fn set_shell_icon_at_size(image: &gtk::Image, icon_name: &str, icon_size: u32) {
+    let Some(svg) = focaldesk_icon_svg(icon_name) else {
+        image.set_icon_name(Some(icon_name));
+        return;
+    };
+    let Ok(svg) = std::str::from_utf8(svg) else {
+        return;
+    };
+    let styled = svg.replace("currentColor", "#8CA4C4");
+    let mut fontdb = resvg::usvg::fontdb::Database::new();
+    fontdb.load_system_fonts();
+    let Ok(tree) =
+        resvg::usvg::Tree::from_data(styled.as_bytes(), &resvg::usvg::Options::default(), &fontdb)
+    else {
+        return;
+    };
+    let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(icon_size, icon_size) else {
+        return;
+    };
+    let size = tree.size();
+    let icon_size_f32 = icon_size as f32;
+    let transform = resvg::tiny_skia::Transform::from_scale(
+        icon_size_f32 / size.width(),
+        icon_size_f32 / size.height(),
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
+    let bytes = glib::Bytes::from_owned(pixmap.data().to_vec());
+    let texture = gdk::MemoryTexture::new(
+        icon_size as i32,
+        icon_size as i32,
+        gdk::MemoryFormat::R8g8b8a8Premultiplied,
+        &bytes,
+        (icon_size * 4) as usize,
+    );
+    image.set_paintable(Some(&texture));
+}
+
+fn focaldesk_icon_svg(icon_name: &str) -> Option<&'static [u8]> {
+    Some(match icon_name {
+        "focaldesk-ai-console" => include_bytes!("../../../assets/icons/focal-ai-console.svg"),
+        "preferences-system-symbolic" => include_bytes!("../../../assets/svg/settings.svg"),
+        "view-app-grid-symbolic" => include_bytes!("../../../assets/svg/launcher.svg"),
+        "list-add-symbolic" => include_bytes!("../../../assets/svg/plus.svg"),
+        "list-remove-symbolic" => include_bytes!("../../../assets/svg/minus.svg"),
+        "web-browser-symbolic" => include_bytes!("../../../assets/svg/browser.svg"),
+        "utilities-terminal-symbolic" => include_bytes!("../../../assets/svg/terminal.svg"),
+        "system-file-manager-symbolic" => include_bytes!("../../../assets/svg/files.svg"),
+        "mail-unread-symbolic" => include_bytes!("../../../assets/svg/email.svg"),
+        "network-wireless-signal-excellent-symbolic" => {
+            include_bytes!("../../../assets/svg/wifi.svg")
+        }
+        "network-wireless-offline-symbolic" => include_bytes!("../../../assets/svg/wifi-off.svg"),
+        "bluetooth-active-symbolic" => include_bytes!("../../../assets/svg/bluetooth.svg"),
+        "audio-volume-high-symbolic" => include_bytes!("../../../assets/svg/volume.svg"),
+        "audio-input-microphone-symbolic" => include_bytes!("../../../assets/svg/microphone.svg"),
+        "microphone-sensitivity-muted-symbolic" => {
+            include_bytes!("../../../assets/svg/microphone-off.svg")
+        }
+        "notification-symbolic" | "notification-new-symbolic" => {
+            include_bytes!("../../../assets/svg/notifications.svg")
+        }
+        "software-update-available-symbolic" | "emblem-synchronizing-symbolic" => {
+            include_bytes!("../../../assets/svg/updates.svg")
+        }
+        "notifications-disabled-symbolic" => include_bytes!("../../../assets/svg/volume-off.svg"),
+        "camera-web-symbolic" => include_bytes!("../../../assets/svg/video.svg"),
+        "camera-disabled-symbolic" => include_bytes!("../../../assets/svg/video-off.svg"),
+        "video-display-symbolic" => include_bytes!("../../../assets/svg/hdr-enabled.svg"),
+        "system-shutdown-symbolic" => include_bytes!("../../../assets/svg/power-menu.svg"),
+        "focal-workspace-1" => include_bytes!("../../../assets/svg/slot-1.svg"),
+        "focal-workspace-2" => include_bytes!("../../../assets/svg/slot-2.svg"),
+        "focal-workspace-3" => include_bytes!("../../../assets/svg/slot-3.svg"),
+        "focal-workspace-4" => include_bytes!("../../../assets/svg/slot-4.svg"),
+        "focal-workspace-5" => include_bytes!("../../../assets/svg/slot-5.svg"),
+        "focal-workspace-6" => include_bytes!("../../../assets/svg/slot-6.svg"),
+        "focal-workspace-7" => include_bytes!("../../../assets/svg/slot-7.svg"),
+        "focal-workspace-8" => include_bytes!("../../../assets/svg/slot-8.svg"),
+        "focal-workspace-9" => include_bytes!("../../../assets/svg/slot-9.svg"),
+        _ => return None,
+    })
 }
 
 fn desktop_snapshot() -> Option<DesktopSnapshot> {
@@ -769,10 +1549,52 @@ fn desktop_snapshot() -> Option<DesktopSnapshot> {
     }
 }
 
+fn start_snapshot_poll(window: &gtk::ApplicationWindow) -> Arc<Mutex<Option<DesktopSnapshot>>> {
+    let latest = Arc::new(Mutex::new(None));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let stopped_on_close = stopped.clone();
+    window.connect_close_request(move |_| {
+        stopped_on_close.store(true, Ordering::Release);
+        glib::Propagation::Proceed
+    });
+
+    let latest_for_thread = latest.clone();
+    thread::spawn(move || {
+        while !stopped.load(Ordering::Acquire) {
+            if let Some(snapshot) = desktop_snapshot() {
+                if let Ok(mut slot) = latest_for_thread.lock() {
+                    *slot = Some(snapshot);
+                }
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+    });
+    latest
+}
+
+fn output_for_connector<'a>(
+    snapshot: &'a DesktopSnapshot,
+    connector: &str,
+) -> Option<&'a focaldesk_ipc::OutputSnapshot> {
+    snapshot
+        .outputs
+        .iter()
+        .find(|output| output.connector == connector)
+}
+
 fn send_action(action: DesktopAction) {
-    if let Err(error) = send_desktop_request(&IpcRequest::ExecuteDesktopAction { action }) {
-        flog(format!("shell action failed: {error}"));
-    }
+    thread::spawn(move || {
+        if let Err(error) = send_desktop_request(&IpcRequest::ExecuteDesktopAction { action }) {
+            flog(format!("shell action failed: {error}"));
+        }
+    });
+}
+
+fn open_shell_panel(connector: &str, panel: ShellPanel) {
+    send_action(DesktopAction::OpenShellPanel {
+        connector: connector.to_string(),
+        panel,
+    });
 }
 
 fn install_theme() {
@@ -903,9 +1725,9 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
     let panel_radius = snapshot.panel_corner_radius.clamp(0.0, 48.0);
     let dock_radius = snapshot.dock_corner_radius.clamp(0.0, 48.0);
     let dock_control_size = match snapshot.dock_size {
-        DockSize::Compact => 38,
+        DockSize::Compact => 36,
         DockSize::Normal => DEFAULT_METRICS.control_size,
-        DockSize::Expanded => 52,
+        DockSize::Expanded => 50,
     };
     let panel_corners = match (snapshot.shell_style, snapshot.panel_position) {
         (ShellStyle::Floating, _) => format!("{panel_radius:.1}px"),
@@ -935,9 +1757,8 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
          window.focal-shell-window {{ font-size: {font_scale:.3}em; }}\n\
          window.focal-panel-window > .focal-panel {{ border-radius: {panel_corners}; {panel_edge} }}\n\
          .focal-dock {{ border-radius: {dock_corners}; border-width: {border_width:.1}px; }}\n\
-         .dock-button {{ min-width: {dock_control_size}px; min-height: {dock_control_size}px; border-radius: {radius:.1}px; border-width: {border_width:.1}px; }}\n\
-         .panel-launcher, .panel-identity, .panel-well, .panel-status-button, .panel-workspace-button {{ border-radius: {radius:.1}px; border-width: {border_width:.1}px; }}\n\
-         popover.workspace-popover > contents {{ border-radius: {radius:.1}px; }}\n\
+         .dock-module {{ min-height: {dock_control_size}px; border-radius: {radius:.1}px; border-width: {border_width:.1}px; }}\n\
+         .panel-launcher, .panel-well, .panel-status-button {{ border-radius: {radius:.1}px; border-width: {border_width:.1}px; }}\n\
          window.focal-shell-window * {{ transition-duration: {transition_ms}ms; }}\n"
     )
 }
@@ -969,8 +1790,13 @@ fn rgba(color: [f32; 4]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{shell_css, shell_css_configured, ThemeSnapshot};
-    use focaldesk_config::{DockPosition, DockSize, PanelPosition, ShellStyle};
+    use super::{
+        email_identity_matches, rail_clock_pattern, rail_display_status, shell_css,
+        shell_css_configured, window_belongs_to_output, window_overlaps_shelf, ShellRole,
+        ThemeSnapshot,
+    };
+    use focaldesk_config::{ClockFormat, DockPosition, DockSize, PanelPosition, ShellStyle};
+    use focaldesk_ipc::{OutputSnapshot, WindowSnapshot};
     use focaldesk_themes::theme_by_name;
 
     #[test]
@@ -1007,6 +1833,138 @@ mod tests {
 
         assert!(css.contains("border-radius: 0 0 16.0px 16.0px"));
         assert!(css.contains("border-radius: 0 24.0px 24.0px 0"));
-        assert!(css.contains("min-width: 38px; min-height: 38px"));
+        assert!(css.contains("min-height: 36px"));
+    }
+
+    #[test]
+    fn clock_format_selects_twelve_or_twenty_four_hour_time() {
+        assert_eq!(rail_clock_pattern(ClockFormat::TwelveHour), "%-I:%M\n%p");
+        assert_eq!(rail_clock_pattern(ClockFormat::TwentyFourHour), "%H:%M");
+    }
+
+    #[test]
+    fn layer_shell_uses_zero_for_each_compositor_sized_axis() {
+        assert_eq!(ShellRole::Panel.layer_default_size(), (64, 0));
+        assert_eq!(ShellRole::Dock.layer_default_size(), (560, 64));
+    }
+
+    #[test]
+    fn shelf_assigns_unassociated_windows_by_geometry_then_focus() {
+        let left = output_snapshot(1, 0, true);
+        let right = output_snapshot(2, 1920, false);
+        let mut window = window_snapshot();
+        window.x = Some(2200);
+        window.y = Some(100);
+        window.width = Some(800);
+        window.height = Some(600);
+
+        assert!(!window_belongs_to_output(&window, Some(&left), 2));
+        assert!(window_belongs_to_output(&window, Some(&right), 2));
+
+        window.x = None;
+        window.y = None;
+        window.width = None;
+        window.height = None;
+        window.focused = true;
+        assert!(window_belongs_to_output(&window, Some(&left), 2));
+        assert!(!window_belongs_to_output(&window, Some(&right), 2));
+    }
+
+    #[test]
+    fn display_badge_only_calls_attention_to_hdr_or_fallback() {
+        let mut output = output_snapshot(1, 0, true);
+        let sdr = rail_display_status(&output);
+        assert_eq!(sdr.badge, None);
+        assert!(sdr.tooltip.contains("SDR"));
+
+        output.hdr_requested = true;
+        output.hdr_active = true;
+        output.wide_gamut_active = true;
+        let hdr = rail_display_status(&output);
+        assert_eq!(hdr.badge, Some("HDR"));
+        assert!(!hdr.warning);
+        assert!(hdr.tooltip.contains("HDR active · wide gamut"));
+
+        output.hdr_active = false;
+        output.icc_lut_fallback_active = true;
+        let fallback = rail_display_status(&output);
+        assert_eq!(fallback.badge, Some("!"));
+        assert!(fallback.warning);
+        assert!(fallback.tooltip.contains("ICC fallback active"));
+    }
+
+    #[test]
+    fn intelligent_dodge_only_triggers_for_shelf_overlap() {
+        let output = output_snapshot(1, 0, true);
+        let mut window = window_snapshot();
+        window.x = Some(800);
+        window.y = Some(950);
+        window.width = Some(320);
+        window.height = Some(120);
+        assert!(window_overlaps_shelf(&window, &output));
+
+        window.x = Some(20);
+        window.y = Some(20);
+        window.width = Some(400);
+        window.height = Some(300);
+        assert!(!window_overlaps_shelf(&window, &output));
+    }
+
+    #[test]
+    fn configured_mail_client_matches_its_existing_window() {
+        assert!(email_identity_matches(
+            "thunderbird",
+            "org.mozilla.Thunderbird"
+        ));
+        assert!(email_identity_matches(
+            "flatpak run org.gnome.Evolution",
+            "org.gnome.Evolution"
+        ));
+        assert!(!email_identity_matches(
+            "thunderbird",
+            "org.mozilla.firefox"
+        ));
+    }
+
+    fn output_snapshot(id: u64, x: i32, focused: bool) -> OutputSnapshot {
+        OutputSnapshot {
+            id,
+            connector: format!("output-{id}"),
+            make: String::new(),
+            model: String::new(),
+            serial: String::new(),
+            width: 1920,
+            height: 1080,
+            x,
+            y: 0,
+            scale: 1.0,
+            active_workspace_id: 1,
+            focused,
+            hdr_supported: false,
+            hdr_requested: false,
+            hdr_active: false,
+            wide_gamut_active: false,
+            icc_lut_fallback_active: false,
+        }
+    }
+
+    fn window_snapshot() -> WindowSnapshot {
+        WindowSnapshot {
+            id: 1,
+            title: "Terminal".into(),
+            app_id: Some("terminal".into()),
+            class: None,
+            workspace_id: 1,
+            output_id: None,
+            mapped: true,
+            minimized: false,
+            maximized: false,
+            fullscreen: false,
+            focused: false,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+        }
     }
 }

@@ -1,12 +1,12 @@
 [package]
-name = "focal-dock"
+name = "focaldesk-task-shelf"
 version = "0.1.0"
 edition = "2021"
-description = "FocalDesk trusted sidebar layer-shell client"
+description = "FocalDesk GTK task shelf layer-shell client"
 license = "MIT"
 
 [[bin]]
-name = "focal-dock"
+name = "focaldesk-task-shelf"
 path = "src/main.rs"
 
 [dependencies]

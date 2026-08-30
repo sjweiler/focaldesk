@@ -76,11 +76,21 @@ pub enum PanelPosition {
     Bottom,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum ClockFormat {
+    #[default]
+    #[serde(rename = "12-hour")]
+    TwelveHour,
+    #[serde(rename = "24-hour")]
+    TwentyFourHour,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PanelConfig {
     pub position: PanelPosition,
     pub corner_radius: f64,
+    pub clock_format: ClockFormat,
 }
 
 impl Default for PanelConfig {
@@ -88,6 +98,7 @@ impl Default for PanelConfig {
         Self {
             position: PanelPosition::Top,
             corner_radius: 16.0,
+            clock_format: ClockFormat::TwelveHour,
         }
     }
 }
@@ -109,12 +120,22 @@ pub enum DockSize {
     Expanded,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DockVisibility {
+    AlwaysVisible,
+    #[default]
+    IntelligentDodge,
+    Autohide,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DockConfig {
     pub position: DockPosition,
     pub corner_radius: f64,
     pub size: DockSize,
+    pub visibility: DockVisibility,
 }
 
 impl Default for DockConfig {
@@ -123,6 +144,7 @@ impl Default for DockConfig {
             position: DockPosition::Left,
             corner_radius: 24.0,
             size: DockSize::Normal,
+            visibility: DockVisibility::IntelligentDodge,
         }
     }
 }
@@ -230,6 +252,7 @@ mod tests {
         assert_eq!(config.shell.style, ShellStyle::Attached);
         assert!(config.appearance.work_area_glass);
         assert_eq!(config.panel.position, PanelPosition::Top);
+        assert_eq!(config.panel.clock_format, ClockFormat::TwelveHour);
         assert_eq!(config.dock.position, DockPosition::Left);
         assert_eq!(config.dock.size, DockSize::Normal);
     }
@@ -244,6 +267,7 @@ mod tests {
             [panel]
             position = "bottom"
             corner_radius = 18
+            clock_format = "24-hour"
 
             [dock]
             position = "right"
@@ -255,6 +279,7 @@ mod tests {
 
         assert_eq!(config.shell.style, ShellStyle::Attached);
         assert_eq!(config.panel.position, PanelPosition::Bottom);
+        assert_eq!(config.panel.clock_format, ClockFormat::TwentyFourHour);
         assert_eq!(config.dock.position, DockPosition::Right);
         assert_eq!(config.dock.size, DockSize::Expanded);
     }

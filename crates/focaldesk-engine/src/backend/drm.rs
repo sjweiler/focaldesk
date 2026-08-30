@@ -125,6 +125,13 @@ use crate::backend::common::{finish_xwayland_startup, start_xwayland};
 use drm::control::Mode;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DisplayModeConfig {
+    pub width: i32,
+    pub height: i32,
+    pub refresh_mhz: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DisplayConfig {
     pub name: String,
     pub enabled: bool,
@@ -132,6 +139,8 @@ pub struct DisplayConfig {
     pub mode_width: i32,
     pub mode_height: i32,
     pub refresh_mhz: i32,
+    #[serde(default)]
+    pub available_modes: Vec<DisplayModeConfig>,
 
     pub scale: f64,
 
@@ -297,6 +306,7 @@ pub struct DrmSurfaceState {
     pub connector: connector::Handle,
     pub output: Output,
     pub mode: WlMode,
+    pub available_modes: Vec<DisplayModeConfig>,
     pub size: Size<i32, Physical>,
     pub output_id: OutputId,
     pub origin: Point<i32, Logical>,
@@ -397,6 +407,24 @@ fn hdr_commit_stalled(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
 
+fn output_render_is_idle(
+    redraw_all: bool,
+    screenshot_all: bool,
+    portal_needs_composite: bool,
+    portal_output_pending: bool,
+    pending_damage: bool,
+    wants_screenshot: bool,
+    cursor_update_pending: bool,
+) -> bool {
+    !redraw_all
+        && !screenshot_all
+        && !portal_needs_composite
+        && !portal_output_pending
+        && !pending_damage
+        && !wants_screenshot
+        && !cursor_update_pending
+}
+
 fn hdr_active_status_verified(
     render_active: bool,
     exclusive_output: bool,
@@ -466,7 +494,19 @@ fn select_drm_mode_index(candidates: &[DrmModeCandidate]) -> Option<usize> {
         .or(Some(default_index))
 }
 
-fn select_connector_mode(modes: &[Mode]) -> Option<Mode> {
+fn select_requested_drm_mode_index(
+    candidates: &[DrmModeCandidate],
+    requested: (i32, i32, i32),
+) -> Option<usize> {
+    let (width, height, refresh_mhz) = requested;
+    candidates.iter().position(|candidate| {
+        i32::from(candidate.width) == width
+            && i32::from(candidate.height) == height
+            && (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs() <= 1000
+    })
+}
+
+fn select_connector_mode(modes: &[Mode], requested: Option<(i32, i32, i32)>) -> Option<Mode> {
     let candidates: Vec<_> = modes
         .iter()
         .map(|mode| {
@@ -481,6 +521,11 @@ fn select_connector_mode(modes: &[Mode]) -> Option<Mode> {
             }
         })
         .collect();
+    if let Some(index) =
+        requested.and_then(|requested| select_requested_drm_mode_index(&candidates, requested))
+    {
+        return Some(modes[index]);
+    }
     select_drm_mode_index(&candidates).map(|index| modes[index])
 }
 
@@ -1238,7 +1283,14 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
             return Ok(true);
         };
 
-        let selected_mode = select_connector_mode(info.modes());
+        let selected_mode = select_connector_mode(
+            info.modes(),
+            Some((
+                surface.mode.size.w,
+                surface.mode.size.h,
+                surface.mode.refresh,
+            )),
+        );
         if selected_mode.as_ref().is_none_or(|mode| {
             let (width, height) = mode.size();
             surface.mode.size != Size::from((i32::from(width), i32::from(height)))
@@ -1493,6 +1545,32 @@ mod screenshot_tests {
 }
 
 #[cfg(test)]
+mod output_render_scheduling_tests {
+    use super::output_render_is_idle;
+
+    #[test]
+    fn idle_cursor_owner_does_not_render_for_another_outputs_damage() {
+        assert!(output_render_is_idle(
+            false, false, false, false, false, false, false,
+        ));
+    }
+
+    #[test]
+    fn dirty_hardware_cursor_schedules_its_output() {
+        assert!(!output_render_is_idle(
+            false, false, false, false, false, false, true,
+        ));
+    }
+
+    #[test]
+    fn local_scene_damage_still_schedules_the_output() {
+        assert!(!output_render_is_idle(
+            false, false, false, false, true, false, false,
+        ));
+    }
+}
+
+#[cfg(test)]
 mod hdr_tests {
     use super::{
         configured_display_hdr_requested, exclusive_hdr_prepare_decision,
@@ -1501,10 +1579,10 @@ mod hdr_tests {
         hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
-        DisplayConfig, DisplayTransform, DrmModeCandidate, EdidHdrMetadata,
-        ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT,
-        DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
-        HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
+        select_requested_drm_mode_index, DisplayConfig, DisplayTransform, DrmModeCandidate,
+        EdidHdrMetadata, ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport,
+        DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS,
+        HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance};
     use std::time::{Duration, Instant};
@@ -1516,6 +1594,7 @@ mod hdr_tests {
             mode_width: 2560,
             mode_height: 1440,
             refresh_mhz: 165_000,
+            available_modes: Vec::new(),
             scale: 1.0,
             logical_x: 0,
             logical_y: 0,
@@ -1694,6 +1773,28 @@ mod hdr_tests {
         ];
 
         assert_eq!(select_drm_mode_index(&candidates), Some(1));
+    }
+
+    #[test]
+    fn configured_refresh_selects_exact_advertised_mode() {
+        let candidates = [
+            DrmModeCandidate {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 120,
+                preferred: true,
+            },
+            DrmModeCandidate {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 60,
+                preferred: false,
+            },
+        ];
+        assert_eq!(
+            select_requested_drm_mode_index(&candidates, (2560, 1440, 60_000)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2020,6 +2121,7 @@ pub(crate) fn collect_display_configs(
             mode_width: w,
             mode_height: h,
             refresh_mhz: surface.mode.refresh,
+            available_modes: surface.available_modes.clone(),
 
             scale,
 
@@ -3384,6 +3486,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         } else {
             data.core.last_now = now;
+            // A global repaint flag cannot be cleared safely after rendering only the CRTCs that
+            // are currently available. Expand it into per-output damage first so an output still
+            // awaiting vblank retains its cleanup work for the next loop iteration.
+            data.core.state.materialize_full_redraw_damage();
 
             for (_node, device) in data.backend.devices.iter_mut() {
                 let gpu_vendor_id = device.gpu_vendor_id;
@@ -3400,6 +3506,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     }
 
                     let owns_cursor = data.core.state.output_owns_cursor(surface.output_id);
+                    let surface_cursor = data.core.state.render.sw_cursor_surface.is_some();
+                    let cursor_update_pending = owns_cursor
+                        && data.core.state.drm_submit_hw_cursor
+                        && data.core.state.cursor_manager.visible()
+                        && !surface_cursor;
                     let pending_damage =
                         data.core.state.output_has_pending_damage(surface.output_id);
                     let wants_screenshot = screenshot_output == Some(surface.output_id);
@@ -3409,27 +3520,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         .pending_portal_captures
                         .iter()
                         .any(|cap| cap.output_id == surface.output_id);
-                    let should_skip = !data.core.state.render.redraw_all
-                        && !data.core.state.screenshot_all_requested
-                        && !portal_needs_composite
-                        && !portal_output_pending
-                        && !pending_damage
-                        && !wants_screenshot
-                        && !owns_cursor;
+                    let should_skip = output_render_is_idle(
+                        data.core.state.render.redraw_all,
+                        data.core.state.screenshot_all_requested,
+                        portal_needs_composite,
+                        portal_output_pending,
+                        pending_damage,
+                        wants_screenshot,
+                        cursor_update_pending,
+                    );
 
                     if should_skip {
                         continue;
                     }
 
-                    let surface_cursor = data.core.state.render.sw_cursor_surface.is_some();
-                    if owns_cursor && !surface_cursor {
-                        // Retry KMS cursor each frame; SW overlay covers Skipped uploads.
-                        data.core.state.drm_submit_hw_cursor = true;
-                    }
-                    data.core.state.drm_try_pass_cursor_this_frame = owns_cursor
-                        && data.core.state.drm_submit_hw_cursor
-                        && data.core.state.cursor_manager.visible()
-                        && !surface_cursor;
+                    // Include the cursor whenever its output really renders so an atomic primary
+                    // plane update retains the cursor plane. Cursor ownership alone no longer
+                    // pulls this output into frames triggered solely by another monitor.
+                    data.core.state.drm_try_pass_cursor_this_frame =
+                        owns_cursor && data.core.state.cursor_manager.visible() && !surface_cursor;
 
                     let buffer_size = Size::from((surface.size.w, surface.size.h));
 
@@ -3893,6 +4002,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         surface.frame_queued_at = Some(now);
                         data.core.state.compositor_ready = true;
                     }
+                    data.core
+                        .state
+                        .clear_output_repaint_request(surface.output_id);
                 }
 
                 // screen capture all outputs
@@ -3931,7 +4043,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
         data.core.state.screenshot_all_requested = false;
 
-        data.core.state.clear_repaint_request();
+        // Never clear another CRTC's damage here: it may have been skipped while waiting for its
+        // previous page flip. Only successfully rendered outputs consumed their queues above.
+        data.core.state.finish_output_repaint_cycle();
         data.core.state.render.frame_no += 1;
 
         let frame_time_ms = data.core.start.elapsed().as_millis() as u32;
@@ -4457,7 +4571,11 @@ fn device_added(
         let hdr_safe_mode_requested = hdr_requested_config
             && hdr_support.can_signal_hdr10()
             && hdr_support.bpc_control_allows_ten_bit();
-        let mode = select_connector_mode(info.modes());
+        let requested_mode = configured_displays
+            .iter()
+            .find(|display| display.name == output_name)
+            .map(|display| (display.mode_width, display.mode_height, display.refresh_mhz));
+        let mode = select_connector_mode(info.modes(), requested_mode);
 
         if let Some(mode) = mode {
             let (w, h) = mode.size();
@@ -4529,6 +4647,24 @@ fn device_added(
             );
 
             let refresh_mhz = ((mode.vrefresh() as i32).max(60)) * 1000;
+            let mut available_modes = info
+                .modes()
+                .iter()
+                .map(|candidate| {
+                    let (width, height) = candidate.size();
+                    DisplayModeConfig {
+                        width: i32::from(width),
+                        height: i32::from(height),
+                        refresh_mhz: (candidate.vrefresh() as i32).max(1) * 1000,
+                    }
+                })
+                .collect::<Vec<_>>();
+            available_modes.sort_by_key(|candidate| {
+                (candidate.width, candidate.height, candidate.refresh_mhz)
+            });
+            available_modes.dedup_by_key(|candidate| {
+                (candidate.width, candidate.height, candidate.refresh_mhz)
+            });
             let wl_mode = WlMode {
                 size: (w as i32, h as i32).into(),
                 refresh: refresh_mhz,
@@ -4724,6 +4860,7 @@ fn device_added(
                 connector: *conn,
                 output,
                 mode: wl_mode,
+                available_modes,
                 size: Size::<i32, Physical>::from((w as i32, h as i32)),
                 output_id,
                 origin,

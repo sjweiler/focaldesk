@@ -13,13 +13,17 @@ use smithay::{
     wayland::shell::wlr_layer::{Anchor, ExclusiveZone},
 };
 
-pub const PANEL_NAMESPACE: &str = "focal-panel";
-pub const DOCK_NAMESPACE: &str = "focal-dock";
-pub const PANEL_INPUT_HEIGHT: i32 = 64;
-pub const DOCK_INPUT_WIDTH: i32 = 76;
+pub const PANEL_NAMESPACE: &str = "focaldesk-system-rail";
+pub const DOCK_NAMESPACE: &str = "focaldesk-task-shelf";
+pub const LEGACY_PANEL_NAMESPACE: &str = "focal-panel";
+pub const LEGACY_DOCK_NAMESPACE: &str = "focal-dock";
+pub const SYSTEM_RAIL_INPUT_WIDTH: i32 = 64;
 
 pub fn is_trusted_namespace(namespace: &str) -> bool {
-    matches!(namespace, PANEL_NAMESPACE | DOCK_NAMESPACE)
+    matches!(
+        namespace,
+        PANEL_NAMESPACE | DOCK_NAMESPACE | LEGACY_PANEL_NAMESPACE | LEGACY_DOCK_NAMESPACE
+    )
 }
 
 /// The interactive part of each trusted shell surface. The clients allocate a
@@ -29,8 +33,12 @@ pub fn is_trusted_namespace(namespace: &str) -> bool {
 /// surface view (notably after a viewport/fractional-scale transition).
 pub fn input_region_contains(namespace: &str, point: Point<f64, Logical>) -> bool {
     match namespace {
-        PANEL_NAMESPACE => point.x >= 0.0 && point.y >= 0.0 && point.y < PANEL_INPUT_HEIGHT as f64,
-        DOCK_NAMESPACE => point.x >= 0.0 && point.x < DOCK_INPUT_WIDTH as f64 && point.y >= 0.0,
+        PANEL_NAMESPACE => {
+            point.x >= 0.0 && point.x < SYSTEM_RAIL_INPUT_WIDTH as f64 && point.y >= 0.0
+        }
+        DOCK_NAMESPACE => point.x >= 0.0 && point.y >= 0.0,
+        LEGACY_PANEL_NAMESPACE => point.x >= 0.0 && point.y >= 0.0 && point.y < 64.0,
+        LEGACY_DOCK_NAMESPACE => point.x >= 0.0 && point.x < 76.0 && point.y >= 0.0,
         _ => false,
     }
 }
@@ -39,11 +47,13 @@ pub fn input_region_contains(namespace: &str, point: Point<f64, Logical>) -> boo
 pub struct TrustedShellReservation {
     pub top: i32,
     pub left: i32,
+    pub right: i32,
+    pub bottom: i32,
 }
 
 impl TrustedShellReservation {
     pub fn is_active(self) -> bool {
-        self.top > 0 || self.left > 0
+        self.top > 0 || self.left > 0 || self.right > 0 || self.bottom > 0
     }
 }
 
@@ -77,10 +87,16 @@ pub fn reservation_for_output(output: &Output) -> TrustedShellReservation {
         };
         let zone = zone.min(i32::MAX as u32) as i32;
         match layer.namespace() {
-            PANEL_NAMESPACE if layer.cached_state().anchor.contains(Anchor::TOP) => {
+            PANEL_NAMESPACE if layer.cached_state().anchor.contains(Anchor::RIGHT) => {
+                reservation.right = reservation.right.max(zone);
+            }
+            DOCK_NAMESPACE if layer.cached_state().anchor.contains(Anchor::BOTTOM) => {
+                reservation.bottom = reservation.bottom.max(zone);
+            }
+            LEGACY_PANEL_NAMESPACE if layer.cached_state().anchor.contains(Anchor::TOP) => {
                 reservation.top = reservation.top.max(zone);
             }
-            DOCK_NAMESPACE if layer.cached_state().anchor.contains(Anchor::LEFT) => {
+            LEGACY_DOCK_NAMESPACE if layer.cached_state().anchor.contains(Anchor::LEFT) => {
                 reservation.left = reservation.left.max(zone);
             }
             _ => {}
@@ -96,9 +112,18 @@ pub fn work_area_for_output(
 ) -> Rectangle<i32, Logical> {
     let left = reservation.left.clamp(0, output.size.w.saturating_sub(1));
     let top = reservation.top.clamp(0, output.size.h.saturating_sub(1));
+    let right = reservation
+        .right
+        .clamp(0, output.size.w.saturating_sub(left + 1));
+    let bottom = reservation
+        .bottom
+        .clamp(0, output.size.h.saturating_sub(top + 1));
     Rectangle::from_loc_and_size(
         (output.loc.x + left, output.loc.y + top),
-        ((output.size.w - left).max(1), (output.size.h - top).max(1)),
+        (
+            (output.size.w - left - right).max(1),
+            (output.size.h - top - bottom).max(1),
+        ),
     )
 }
 
@@ -110,15 +135,25 @@ mod tests {
     fn work_area_applies_trusted_edges_without_underflow() {
         let output = Rectangle::from_loc_and_size((0, 0), (100, 80));
         assert_eq!(
-            work_area_for_output(output, TrustedShellReservation { top: 20, left: 30 }),
-            Rectangle::from_loc_and_size((30, 20), (70, 60))
+            work_area_for_output(
+                output,
+                TrustedShellReservation {
+                    top: 20,
+                    left: 30,
+                    right: 10,
+                    bottom: 5,
+                }
+            ),
+            Rectangle::from_loc_and_size((30, 20), (60, 55))
         );
         assert_eq!(
             work_area_for_output(
                 output,
                 TrustedShellReservation {
                     top: 500,
-                    left: 500
+                    left: 500,
+                    right: 500,
+                    bottom: 500,
                 }
             )
             .size,
@@ -128,13 +163,12 @@ mod tests {
 
     #[test]
     fn trusted_input_regions_exclude_tooltip_extensions() {
-        assert!(input_region_contains(PANEL_NAMESPACE, (500.0, 32.0).into()));
+        assert!(input_region_contains(PANEL_NAMESPACE, (32.0, 500.0).into()));
         assert!(!input_region_contains(
             PANEL_NAMESPACE,
-            (500.0, 70.0).into()
+            (70.0, 500.0).into()
         ));
-        assert!(input_region_contains(DOCK_NAMESPACE, (38.0, 500.0).into()));
-        assert!(!input_region_contains(DOCK_NAMESPACE, (84.0, 500.0).into()));
+        assert!(input_region_contains(DOCK_NAMESPACE, (38.0, 40.0).into()));
         assert!(!input_region_contains("untrusted", (1.0, 1.0).into()));
     }
 }

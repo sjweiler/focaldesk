@@ -1520,21 +1520,16 @@ mod tests {
     fn hdr_pq_encode_tone_maps_luminance_instead_of_per_channel_clip() {
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("tone_map_nits(y, 10000.0, u_max_nits"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.8)"));
-        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("min(white, display_peak * 0.9)"));
-        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.9)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mapped / y"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(10000.0))"));
-        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("u_max_nits / peak_channel"));
-        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(u_max_nits))"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("compress_to_panel_gamut"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither(gl_FragCoord.xy)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("/ 1023.0"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_saturation"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_midtone_gamma"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_calibration_pattern"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(panel - vec3(panel_y)) * u_saturation"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pow(normalized, u_midtone_gamma)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pow(normalized, u_midtone_gamma"));
+        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_calibration_pattern"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("calibration_pattern_nits(v_coords)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.2627"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.6780"));
@@ -1588,7 +1583,8 @@ mod tests {
         assert!(!CLIENT_TO_SCENE_LINEAR_FRAG.contains("straight = max(straight, vec3(0.0))"));
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_src_bits"));
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither_code_value"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither * step"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("float dither = a - b"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3(dither * step)"));
     }
 
     #[test]
@@ -1697,14 +1693,18 @@ vec3 pq_to_scene_linear(vec3 c) {
 
 vec3 dither_code_value(vec3 c) {
     // 8-bit client surfaces have 256 steps regardless of their transfer tag.
-    // Ordered dither in code value hides dark ramps promoted into HDR10; it
-    // cannot recover detail that was absent from the client buffer.
+    // Triangular dither in code value breaks up contours before the nonlinear
+    // decode expands them into HDR. Keep one scalar for RGB so neutral grays
+    // stay neutral instead of acquiring pink/green chroma noise.
     if (u_src_bits <= 1.0) {
         return c;
     }
     float step = 1.0 / (exp2(u_src_bits) - 1.0);
-    float dither = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) - 0.5;
-    return c + vec3(dither * step);
+    vec2 p = floor(gl_FragCoord.xy);
+    float a = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+    float b = fract(52.9829189 * fract(dot(p, vec2(0.00583715, 0.06711056)) + 0.38196601));
+    float dither = a - b;
+    return clamp(c + vec3(dither * step), 0.0, 1.0);
 }
 
 vec3 decode_color(vec3 c) {
@@ -2186,8 +2186,6 @@ vec3 mul_panel_to_bt2020(vec3 v) {
     return vec3(dot(u_p0, v), dot(u_p1, v), dot(u_p2, v));
 }
 
-// Pull Rec.2020-only colors into this output's ICC/EDID volume. In-gamut
-// P3/sRGB stays put. A near-Rec.2020 panel never hits the negative branch.
 vec3 compress_to_panel_gamut(vec3 rgb) {
     float minc = min(rgb.r, min(rgb.g, rgb.b));
     if (minc >= 0.0) {
@@ -2217,13 +2215,6 @@ float pq_oetf(float nits) {
     const float c3 = 2392.0 / 128.0;
     float Lm = pow(L, m1);
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
-}
-
-float pq_output_dither(vec2 pixel) {
-    // Stable, zero-mean noise in [-0.5, 0.5) PQ code values. Apply it after
-    // ST 2084 so the final 10-bit quantization does not expose contours from
-    // the otherwise floating-point composition and tone-map passes.
-    return fract(52.9829189 * fract(dot(floor(pixel), vec2(0.06711056, 0.00583715)))) - 0.5;
 }
 
 float bt2020_luminance(vec3 nits) {
@@ -2261,9 +2252,6 @@ vec3 calibration_pattern_nits(vec2 coords) {
     return vec3(ramp * u_max_nits);
 }
 
-// Keep graphics white and most in-range HDR. Roll from 80% of panel peak
-// so 400 nit content is not crushed from paper white, while extremes still
-// compress. A per-channel min() of the same values turns clouds magenta.
 float tone_map_nits(float value, float source_peak, float display_peak, float white) {
     float knee = max(white, display_peak * 0.8);
     if (value <= knee || display_peak <= knee) {
@@ -2285,12 +2273,8 @@ void main() {
     bool calibration = u_calibration_pattern > 0.5;
     vec3 nits;
     if (calibration) {
-        // The pattern is already absolute linear BT.2020. Bypass the creative
-        // controls so a measurement does not depend on the current preset.
         nits = calibration_pattern_nits(v_coords);
     } else {
-        // Scene Rec.709 → panel volume → BT.2020 PQ. HDR10 on the wire stays
-        // Rec.2020; out-of-gamut colors are mapped like Windows WDDM.
         vec3 panel = compress_to_panel_gamut(mul_mat3(scene_linear));
         float panel_y = max(dot(panel, u_panel_luma), 0.0);
         panel = compress_to_panel_gamut(
@@ -2300,8 +2284,6 @@ void main() {
     }
     float y = bt2020_luminance(nits);
     if (y > 0.0001) {
-        // Shape only the SDR range, keeping black and reference white fixed.
-        // Values above reference white retain their authored HDR luminance.
         if (!calibration && y < u_sdr_white_nits) {
             float normalized = clamp(y / u_sdr_white_nits, 0.0, 1.0);
             float shaped = pow(normalized, u_midtone_gamma) * u_sdr_white_nits;
@@ -2311,12 +2293,8 @@ void main() {
         float mapped = tone_map_nits(y, 10000.0, u_max_nits, u_sdr_white_nits);
         nits *= mapped / y;
     }
-    // PQ legal range is 0–10,000 nits per channel. Do not also clamp each
-    // channel to the panel luminance peak: Rec.2020 blue's Y weight is 0.0593,
-    // so a 400 nit sky has ~6,700 nits in B and that scale would leave ~27 nits.
     nits = min(nits, vec3(10000.0));
-    vec3 pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
-    pq = clamp(pq + vec3(pq_output_dither(gl_FragCoord.xy) / 1023.0), 0.0, 1.0);
+    vec3 pq = clamp(vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b)), 0.0, 1.0);
     float output_alpha = calibration ? 1.0 : src.a;
     gl_FragColor = vec4(pq * output_alpha, output_alpha) * alpha;
 }

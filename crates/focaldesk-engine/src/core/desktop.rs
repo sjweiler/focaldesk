@@ -106,7 +106,9 @@ use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmit
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::utils::Serial;
 use smithay::utils::SERIAL_COUNTER;
-use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
+use smithay::utils::{
+    Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
+};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{
@@ -2028,7 +2030,7 @@ impl DesktopState {
                 namespace,
                 output_count,
             } => {
-                if matches!(namespace.as_str(), "focal-panel" | "focal-dock") {
+                if crate::core::wayland::trusted_shell::is_trusted_namespace(&namespace) {
                     flog_info!(
                         "trusted shell ready namespace={} outputs={output_count}",
                         namespace
@@ -2171,6 +2173,7 @@ impl DesktopState {
         let windows = self
             .windows
             .iter()
+            .filter(|window| window.alive())
             .take(256)
             .map(|window| {
                 let geometry = self.global_window_bbox(&window.window);
@@ -2229,6 +2232,7 @@ impl DesktopState {
             },
             shell: focaldesk_ipc::ShellSnapshot {
                 workspace_count: self.workspace_names.len(),
+                max_workspace_slots: self.workspaces.max_workspace_slots as usize,
                 do_not_disturb: self.do_not_disturb,
                 notification_unread_count: self.notification_unread_count,
                 update_available_count: self.update_state.available_count(),
@@ -2239,6 +2243,13 @@ impl DesktopState {
                     .wifi
                     .as_ref()
                     .and_then(|wifi| wifi.signal_percent),
+                microphone_detected: self.microphone_detected,
+                microphone_active: matches!(
+                    self.voice_capture_status,
+                    VoiceCaptureStatus::Starting | VoiceCaptureStatus::Listening
+                ),
+                camera_detected: self.camera_status.detected,
+                camera_active: self.camera_status.active,
                 battery_percent: self
                     .last_power_snapshot
                     .as_ref()
@@ -2270,6 +2281,21 @@ impl DesktopState {
                 if workspace == 0 || workspace as usize > self.workspace_names.len() {
                     return Err(format!("workspace {workspace} does not exist"));
                 }
+                self.set_focused_workspace(WorkspaceId(workspace));
+            }
+            DesktopAction::FocusWorkspaceOnOutput {
+                connector,
+                workspace,
+            } => {
+                if workspace == 0 || workspace as usize > self.workspace_names.len() {
+                    return Err(format!("workspace {workspace} does not exist"));
+                }
+                let output = self
+                    .outputs
+                    .iter()
+                    .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
+                    .ok_or_else(|| format!("output {connector} does not exist"))?;
+                self.set_focused_output(output);
                 self.set_focused_workspace(WorkspaceId(workspace));
             }
             DesktopAction::MoveFocusedToOutput { output } => {
@@ -2381,6 +2407,30 @@ impl DesktopState {
                     vec!["--panel".to_string(), panel],
                 );
             }
+            DesktopAction::OpenShellPanel { connector, panel } => {
+                let output = self
+                    .outputs
+                    .iter()
+                    .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
+                    .ok_or_else(|| format!("output {connector} does not exist"))?;
+                let panel = match panel {
+                    focaldesk_ipc::ShellPanel::Network => focaldesk_ui::types::PanelKind::Network,
+                    focaldesk_ipc::ShellPanel::Bluetooth => {
+                        focaldesk_ui::types::PanelKind::Bluetooth
+                    }
+                    focaldesk_ipc::ShellPanel::Audio => focaldesk_ui::types::PanelKind::Audio,
+                    focaldesk_ipc::ShellPanel::Display => focaldesk_ui::types::PanelKind::Display,
+                    focaldesk_ipc::ShellPanel::Settings => focaldesk_ui::types::PanelKind::Settings,
+                    focaldesk_ipc::ShellPanel::Power => focaldesk_ui::types::PanelKind::Power,
+                    focaldesk_ipc::ShellPanel::Calendar => focaldesk_ui::types::PanelKind::Calendar,
+                    focaldesk_ipc::ShellPanel::NotificationHistory => {
+                        focaldesk_ui::types::PanelKind::NotificationHistory
+                    }
+                    focaldesk_ipc::ShellPanel::Updates => focaldesk_ui::types::PanelKind::Updates,
+                };
+                self.pending_egui_ops
+                    .push(PendingEguiOp::OpenPanel(panel, output));
+            }
             DesktopAction::OpenNotificationsPanel => {
                 self.pending_egui_ops.push(PendingEguiOp::OpenPanel(
                     focaldesk_ui::types::PanelKind::NotificationHistory,
@@ -2400,11 +2450,38 @@ impl DesktopState {
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
             }
             DesktopAction::CreateWorkspace => {
+                if self.workspace_names.len() >= self.workspaces.max_workspace_slots as usize {
+                    return Err("maximum workspace count reached".into());
+                }
                 let name = format!("Workspace {}", self.workspace_names.len() + 1);
                 self.create_workspace_from_dialog(name);
             }
             DesktopAction::DeleteWorkspace => {
                 if self.workspace_names.len() > 1 {
+                    self.open_delete_workspace_dialog();
+                }
+            }
+            DesktopAction::CreateWorkspaceOnOutput { connector } => {
+                if self.workspace_names.len() >= self.workspaces.max_workspace_slots as usize {
+                    return Err("maximum workspace count reached".into());
+                }
+                let output = self
+                    .outputs
+                    .iter()
+                    .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
+                    .ok_or_else(|| format!("output {connector} does not exist"))?;
+                self.set_focused_output(output);
+                let name = format!("Workspace {}", self.workspace_names.len() + 1);
+                self.create_workspace_from_dialog(name);
+            }
+            DesktopAction::DeleteWorkspaceOnOutput { connector } => {
+                if self.workspace_names.len() > 1 {
+                    let output = self
+                        .outputs
+                        .iter()
+                        .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
+                        .ok_or_else(|| format!("output {connector} does not exist"))?;
+                    self.set_focused_output(output);
                     self.open_delete_workspace_dialog();
                 }
             }
@@ -2752,20 +2829,25 @@ impl DesktopState {
             .map(|(id, _)| *id)
     }
     pub fn update_ui_hover_for_output(&mut self, output_id: OutputId) -> bool {
-        self.update_ui_hover_for_output_inner(output_id, true)
+        self.update_ui_hover_for_output_inner(output_id, true, true)
     }
 
     pub fn refresh_ui_hover_for_output(&mut self, output_id: OutputId) -> bool {
-        self.update_ui_hover_for_output_inner(output_id, false)
+        // Frame preparation has just rebuilt this output's UI tree. Reusing it here avoids a
+        // second options/layout/tree build for every rendered frame.
+        self.update_ui_hover_for_output_inner(output_id, false, false)
     }
 
     fn update_ui_hover_for_output_inner(
         &mut self,
         output_id: OutputId,
         play_hover_sound: bool,
+        rebuild_ui: bool,
     ) -> bool {
         let old_hovered = self.ui.hovered;
-        self.rebuild_ui_tree_for_output(output_id);
+        if rebuild_ui {
+            self.rebuild_ui_tree_for_output(output_id);
+        }
         if !self.output_contains_pointer(output_id) {
             self.ui.hovered = None;
 
@@ -2892,6 +2974,17 @@ impl DesktopState {
         reservation: crate::core::wayland::trusted_shell::TrustedShellReservation,
         kind: UiElementKind,
     ) -> bool {
+        if reservation.right > 0 {
+            return matches!(
+                kind,
+                UiElementKind::SidebarButton
+                    | UiElementKind::WorkspaceSlot
+                    | UiElementKind::TopbarIndicator
+                    | UiElementKind::TopbarButton
+                    | UiElementKind::TopbarFlowField
+                    | UiElementKind::Clock
+            );
+        }
         (reservation.left > 0
             && matches!(
                 kind,
@@ -2992,9 +3085,12 @@ impl DesktopState {
         Some(options)
     }
 
-    pub(crate) fn chrome_layout_for_output(&self, output_id: OutputId) -> Option<ChromeLayout> {
+    fn chrome_layout_for_output_with_options(
+        &self,
+        output_id: OutputId,
+        options: &UiBuildOptions,
+    ) -> Option<ChromeLayout> {
         let output = self.outputs.get(&output_id)?;
-        let options = self.ui_build_options_for_output(output_id)?;
         let trusted_shell =
             crate::core::wayland::trusted_shell::reservation_for_output(&output.handle);
         let semantic_layout = self
@@ -3017,20 +3113,54 @@ impl DesktopState {
                 layout.dock_width.round() as i32
             })
         };
-        Some(build_chrome_layout_with_config(
+        let mut layout = build_chrome_layout_with_config(
             output.logical_size,
             topbar_h,
             sidebar_w,
             options.layout_config(),
-        ))
+        );
+
+        // The alternative GTK shell does not use the compositor's etched top/left
+        // frame.  Its rail reserves the right edge directly, so make the desktop
+        // recess describe that real layer-shell work area instead of retaining the
+        // built-in chrome's default topbar/sidebar offsets.  The legacy external
+        // panel/dock keep their framed layout through the top/left path above.
+        if trusted_shell.right > 0 || trusted_shell.bottom > 0 {
+            let work = crate::core::wayland::trusted_shell::work_area_for_output(
+                Rectangle::from_size(output.logical_size),
+                trusted_shell,
+            );
+            layout.work_area.outer = work;
+            layout.work_area.inner_frame = work;
+            layout.work_area.recess = work;
+            layout.work_area.glass = work;
+            layout.work_area.trim = None;
+        }
+
+        Some(layout)
     }
 
-    fn rebuild_ui_tree_for_output(&mut self, output_id: OutputId) {
+    pub(crate) fn chrome_layout_for_output(&self, output_id: OutputId) -> Option<ChromeLayout> {
+        let options = self.ui_build_options_for_output(output_id)?;
+        self.chrome_layout_for_output_with_options(output_id, &options)
+    }
+
+    pub(crate) fn rebuild_ui_tree_for_output(
+        &mut self,
+        output_id: OutputId,
+    ) -> Option<ChromeLayout> {
         let Some(options) = self.ui_build_options_for_output(output_id) else {
-            return;
+            return None;
         };
-        let Some(layout) = self.chrome_layout_for_output(output_id) else {
-            return;
+        let Some(layout) = self.chrome_layout_for_output_with_options(output_id, &options) else {
+            return None;
+        };
+        // ChromeLayout's Smithay coordinate marker is not Clone. Derive the owned copy needed by
+        // DesktopOutput from the already-built options; this is allocation-free and still avoids
+        // rebuilding UiBuildOptions or the UI tree.
+        let Some(desktop_layout) = self.chrome_layout_for_output_with_options(output_id, &options)
+        else {
+            return None;
         };
         build_ui_for_output_with_options(&mut self.ui, &layout, options);
         if let Some(output) = self.outputs.get(&output_id) {
@@ -3047,13 +3177,14 @@ impl DesktopState {
                 Rectangle::from_loc_and_size((0, 0), output.logical_size),
                 output.scale_factor,
                 self.chrome.metrics.clone(),
-                layout,
+                desktop_layout,
                 &self.ui,
             );
         }
         if output_id == self.focused_output {
             self.publish_accessibility_tree();
         }
+        Some(layout)
     }
 
     pub(crate) fn publish_accessibility_tree(&mut self) {
@@ -3853,15 +3984,36 @@ impl DesktopState {
     }
 
     pub(crate) fn handle_surface_destroyed(&mut self, id: &Id) {
-        let Some(old) = self.surface_damage.remove(id) else {
-            return;
-        };
+        if let Some(old) = self.surface_damage.remove(id) {
+            remove_surface_root_membership(&mut self.surface_damage_roots, &old.root, id);
 
-        remove_surface_root_membership(&mut self.surface_damage_roots, &old.root, id);
+            self.surface_damage_metrics.destroyed_surfaces += 1;
+            self.surface_damage_metrics.rectangles_queued += 1;
+            self.mark_global_logical_damage_with_margin(old.geometry, 1, DamageSource::CommitBbox);
+        }
 
-        self.surface_damage_metrics.destroyed_surfaces += 1;
-        self.surface_damage_metrics.rectangles_queued += 1;
-        self.mark_global_logical_damage_with_margin(old.geometry, 1, DamageSource::CommitBbox);
+        // XDG shell has no separate toplevel-destroy callback in this handler path.
+        // Remove a native managed window when its root wl_surface dies; otherwise it
+        // remains mapped in desktop snapshots and shell clients can mistake the dead
+        // fullscreen window for a live obstruction indefinitely.
+        let destroyed_window = self.windows.iter().position(|managed| {
+            matches!(
+                managed.kind,
+                crate::core::shell::managed_window::ManagedWindowKind::Wayland(_)
+            ) && managed
+                .wl_surface()
+                .is_some_and(|surface| Id::from_wayland_resource(&*surface) == *id)
+        });
+        if let Some(index) = destroyed_window {
+            let managed = self.windows.remove(index);
+            self.space.unmap_elem(&managed.window);
+            if self.focused_window == Some(managed.id) {
+                self.focused_window = None;
+            }
+            self.workspace_focus
+                .retain(|_, window_id| *window_id != managed.id);
+            self.mark_all_outputs_full_damage(DamageSource::CommitBbox);
+        }
     }
 
     fn window_surface_tree_target(
@@ -4143,6 +4295,7 @@ impl DesktopState {
 
         let old_owner = self.cursor_owner_output;
         self.cursor_owner_output = owner;
+        self.drm_submit_hw_cursor = true;
 
         if let Some(output_id) = old_owner {
             self.mark_output_full_damage(output_id, DamageSource::Cursor);
@@ -5945,6 +6098,36 @@ impl DesktopState {
         best
     }
 
+    /// Update `wp_color` feedback as soon as compositor-driven movement changes the output that
+    /// owns a window. Waiting for the next client commit is too late: a static Chrome frame can
+    /// cross from SDR to HDR without committing another buffer, leaving both the client's
+    /// preferred description and the retained output pixels on the old monitor's color path.
+    fn refresh_window_preferred_color_output(&mut self, window: &Window) -> bool {
+        let Some(toplevel) = window.wl_surface() else {
+            return false;
+        };
+        let output_id = self.preferred_output_id_for_window(window);
+        let previous = self
+            .wp_color_surface_outputs
+            .insert(toplevel.id(), output_id);
+        if previous == Some(output_id) {
+            return false;
+        }
+
+        crate::core::wayland::color_management_protocol::notify_surface_feedback_preferred(
+            self, &toplevel,
+        );
+
+        // A color-domain handoff invalidates retained pixels even when the client buffer itself
+        // did not change. Repaint both scanout targets completely so no SDR-encoded tiles survive
+        // on HDR (or vice versa).
+        if let Some(previous) = previous {
+            self.mark_output_full_damage(previous, DamageSource::Unknown);
+        }
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
     /// Geometry for a newly launched window when "maximize on launch" is disabled: centered in
     /// the work recess, sized generously but without filling the screen.
     pub(crate) fn default_unmaximized_toplevel_geometry(
@@ -7265,18 +7448,7 @@ impl DesktopState {
         }
 
         if let Some(window) = committed_window {
-            if let Some(toplevel) = window.wl_surface() {
-                let output_id = self.preferred_output_id_for_window(&window);
-                let prev = self
-                    .wp_color_surface_outputs
-                    .insert(toplevel.id(), output_id);
-                if prev != Some(output_id) {
-                    crate::core::wayland::color_management_protocol::notify_surface_feedback_preferred(
-                        self,
-                        &toplevel,
-                    );
-                }
-            }
+            self.refresh_window_preferred_color_output(&window);
         }
 
         flog_info!(
@@ -7877,10 +8049,10 @@ impl DesktopState {
                 if let Some(w) = self.window(window_id) {
                     let window = w.window.clone();
                     let old_bbox = self.global_window_bbox(&window);
-                    let new_loc =
-                        self.clamp_window_location_to_work_recess(&w.window, new_loc, pos);
-                    self.map_window_bbox_location(window, new_loc, false);
+                    let new_loc = self.clamp_window_location_to_work_recess(&window, new_loc, pos);
+                    self.map_window_bbox_location(window.clone(), new_loc, false);
                     self.space.refresh();
+                    self.refresh_window_preferred_color_output(&window);
                     let new_bbox = self
                         .window(window_id)
                         .and_then(|w| self.global_window_bbox(&w.window));
@@ -8168,6 +8340,7 @@ impl DesktopState {
                     return;
                 }
                 self.cursor_manager.move_to(position.x, position.y);
+                self.drm_submit_hw_cursor = true;
                 const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
                 if self.input.pointer_left_down {
                     if let Some((id, start)) = self.pending_xdg_move {
@@ -8662,6 +8835,36 @@ impl DesktopState {
             output.pending_damage.clear();
         }
         self.damage_source_counts = DamageSourceCounts::default();
+    }
+
+    /// Convert a global redraw request into output-owned damage so a backend can consume each
+    /// output independently. This matters for DRM, where one CRTC may still be waiting for its
+    /// previous vblank while another is ready to render.
+    pub fn materialize_full_redraw_damage(&mut self) {
+        if !self.render.redraw_all {
+            return;
+        }
+
+        self.render.redraw_all = false;
+        self.mark_all_outputs_full_damage(DamageSource::FullRedrawFallback);
+    }
+
+    /// Consume damage only for an output that actually completed its render/present path.
+    pub fn clear_output_repaint_request(&mut self, output_id: OutputId) {
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            output.pending_damage.clear();
+        }
+    }
+
+    pub fn finish_output_repaint_cycle(&mut self) {
+        if !self.render.redraw_all
+            && self
+                .outputs
+                .values()
+                .all(|output| output.pending_damage.is_empty())
+        {
+            self.damage_source_counts = DamageSourceCounts::default();
+        }
     }
 
     pub fn mark_redraw(&mut self) {
@@ -9290,6 +9493,17 @@ impl DesktopState {
                 window.send_frame(&output, time, None, |_, _| Some(output.clone()));
             }
         }
+
+        // Layer-shell clients such as the GTK panel and dock use frame
+        // callbacks to pace buffer updates just like ordinary toplevels. If
+        // these callbacks are omitted, GTK presents its initial buffer and
+        // then waits forever, leaving clocks and status controls frozen at
+        // their launch state.
+        for output in self.space.outputs() {
+            for layer in smithay::desktop::layer_map_for_output(output).layers() {
+                layer.send_frame(output, time, None, |_, _| Some(output.clone()));
+            }
+        }
     }
 
     pub fn window_mut(&mut self, id: WindowId) -> Option<&mut ManagedWindow> {
@@ -9706,6 +9920,7 @@ impl DesktopState {
     ) {
         if cursor_on_hw_plane {
             self.cursor_manager.set_hardware_cursor_ready(true);
+            self.drm_submit_hw_cursor = false;
             return;
         }
 
@@ -9726,6 +9941,7 @@ impl DesktopState {
                 ) && s.visible_area > 0
                 {
                     self.cursor_manager.set_hardware_cursor_ready(true);
+                    self.drm_submit_hw_cursor = false;
                 }
             }
         }
@@ -9996,10 +10212,9 @@ fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
         "--no-default-browser-check".to_string(),
         "--new-window".to_string(),
     ];
-    // HDR Chromium must follow wp_color preferred BT.2020/PQ so
-    // `color-gamut: p3` stays true (NTP shortcut circles). Forcing
-    // scrgb-linear advertises BT.709 primaries and drops that CSS.
-    // Chrome still tags HDR buffers with create_windows_scrgb.
+    // Match focal-launchd's policy: HDR follows wp_color's preferred
+    // Display-P3/extended-sRGB description. Forcing HDR10 can mismatch the
+    // encoding of Chrome's commonly submitted 8-bit AB24 raster buffer.
     if !hdr_output_active {
         args.insert(2, "--force-color-profile=display-p3-d65".to_string());
     }
@@ -10483,12 +10698,14 @@ mod tests {
     }
 
     #[test]
-    fn chromium_hdr_follows_wp_color_preferred_gamut() {
+    fn chromium_hdr_follows_wayland_preferred_color() {
         let args = chrome_command_args(false, true);
         assert!(!args
             .iter()
             .any(|arg| arg.starts_with("--force-color-profile=")));
-        assert!(!args.iter().any(|arg| arg == "--force-color-profile=hdr10"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("--force-raster-color-profile=")));
     }
 
     #[test]
@@ -10496,7 +10713,12 @@ mod tests {
         use crate::core::wayland::trusted_shell::TrustedShellReservation;
         use focaldesk_ui::types::UiElementKind;
 
-        let panel = TrustedShellReservation { top: 64, left: 0 };
+        let panel = TrustedShellReservation {
+            top: 64,
+            left: 0,
+            right: 0,
+            bottom: 0,
+        };
         assert!(super::DesktopState::external_shell_owns_element(
             panel,
             UiElementKind::TopbarIndicator
@@ -10506,13 +10728,33 @@ mod tests {
             UiElementKind::SidebarButton
         ));
 
-        let dock = TrustedShellReservation { top: 0, left: 76 };
+        let dock = TrustedShellReservation {
+            top: 0,
+            left: 76,
+            right: 0,
+            bottom: 0,
+        };
         assert!(super::DesktopState::external_shell_owns_element(
             dock,
             UiElementKind::SidebarButton
         ));
         assert!(!super::DesktopState::external_shell_owns_element(
             dock,
+            UiElementKind::Clock
+        ));
+
+        let rail = TrustedShellReservation {
+            top: 0,
+            left: 0,
+            right: 72,
+            bottom: 0,
+        };
+        assert!(super::DesktopState::external_shell_owns_element(
+            rail,
+            UiElementKind::SidebarButton
+        ));
+        assert!(super::DesktopState::external_shell_owns_element(
+            rail,
             UiElementKind::Clock
         ));
     }

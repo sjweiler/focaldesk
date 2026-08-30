@@ -94,6 +94,9 @@ release-focaldmd:
 release-focald-secrets:
     cargo build --release -p focald-secrets -p pam-focald-secrets
 
+release-shell:
+    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf
+
 install-server-service:
     cargo build --release -p focaldesk-server
     install -Dm755 target/release/focaldesk-server "$HOME/.local/bin/focaldesk-server"
@@ -109,11 +112,19 @@ install-session-target:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/"focaldesk-*.service
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
-    # The native compositor chrome is primary; keep external shell clients opt-in.
-    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-panel.service"
-    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-dock.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
 
-install-services: install-session-target install-server-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
+install-shell-services: install-session-target
+    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf
+    install -Dm755 target/release/focaldesk-system-rail "$HOME/.local/bin/focaldesk-system-rail"
+    install -Dm755 target/release/focaldesk-task-shelf "$HOME/.local/bin/focaldesk-task-shelf"
+    install -Dm644 packaging/systemd/user/focaldesk-system-rail.service "$HOME/.config/systemd/user/focaldesk-system-rail.service"
+    install -Dm644 packaging/systemd/user/focaldesk-task-shelf.service "$HOME/.config/systemd/user/focaldesk-task-shelf.service"
+    systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service || true
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
+
+install-services: install-session-target install-shell-services install-server-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -343,7 +354,7 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
 
 # Both the system credential socket and user-session IPC use this directory.
 # Prepare it before starting user services so a directory created by PID 1
@@ -412,9 +423,17 @@ install-session-target-fedora:
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/"focaldesk-*.service
     rm -f "$HOME/.config/systemd/user/graphical-session.target.wants/focal-launchd.service"
     rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-polkitd.service"
-    # The native compositor chrome is primary; keep external shell clients opt-in.
-    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-panel.service"
-    rm -f "$HOME/.config/systemd/user/focaldesk-session.target.wants/focaldesk-dock.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+
+install-shell-services-fedora: install-session-target-fedora
+    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf
+    sudo install -Dm755 target/release/focaldesk-system-rail /usr/bin/focaldesk-system-rail
+    sudo install -Dm755 target/release/focaldesk-task-shelf /usr/bin/focaldesk-task-shelf
+    sudo install -Dm644 packaging/systemd/user/focaldesk-system-rail-fedora.service /usr/lib/systemd/user/focaldesk-system-rail.service
+    sudo install -Dm644 packaging/systemd/user/focaldesk-task-shelf-fedora.service /usr/lib/systemd/user/focaldesk-task-shelf.service
+    systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service || true
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
 
 install-power-service-fedora:
     cargo build --release -p focaldesk-powerd

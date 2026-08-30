@@ -13,7 +13,7 @@ use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
     RenderInputsMut,
 };
-use crate::core::ui_builder::{build_ui_for_output_with_options, AiFlowMode, UiBuildOptions};
+use crate::core::ui_builder::{AiFlowMode, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_flow::keybinds::BackendKind;
@@ -206,18 +206,13 @@ pub fn prepare_output(
     let draw_software_cursor =
         pointer_on_this_output && state.cursor_manager.software_cursor_needed();
 
+    // Rebuild the shared compositor UI exactly once for this output. The rebuild also syncs the
+    // per-output chrome and publishes the focused accessibility tree, and returns the same layout
+    // used for both operations so frame preparation does not derive it again.
     let layout = state
-        .chrome_layout_for_output(output_id)
-        .expect("active output layout missing");
-    let ui_options = state
-        .ui_build_options_for_output(output_id)
-        .expect("active output UI options missing");
-
-    build_ui_for_output_with_options(&mut state.ui, &layout, ui_options);
+        .rebuild_ui_tree_for_output(output_id)
+        .expect("active output UI layout missing");
     state.refresh_ui_hover_for_output(output_id);
-    if output_id == state.focused_output {
-        state.publish_accessibility_tree();
-    }
 
     if let Some(rect) = state.active_sidebar_pulse_damage_rect(output_id, now) {
         state.mark_output_logical_damage(

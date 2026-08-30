@@ -171,6 +171,22 @@ impl WlrLayerShellHandler for DesktopState {
         // using that committed state and sends the initial configure there.
     }
 
+    fn new_popup(
+        &mut self,
+        _parent: WlrLayerSurface,
+        popup: smithay::wayland::shell::xdg::PopupSurface,
+    ) {
+        use smithay::desktop::{PopupKind, PopupManager};
+
+        // xdg-shell announces the popup before wlr-layer-shell assigns its
+        // layer parent, so the first tracking attempt cannot find a root.
+        // Register it now that get_popup has established that relationship.
+        self.unconstrain_popup(&popup);
+        if let Err(error) = self.popups.track_popup(PopupKind::from(popup)) {
+            focaldesk_logging::flog(format!("failed to track layer-shell popup: {error}"));
+        }
+    }
+
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         use smithay::desktop::layer_map_for_output;
 

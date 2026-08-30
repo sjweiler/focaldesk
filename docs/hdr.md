@@ -171,21 +171,34 @@ PQ. Tagged sRGB and Display P3 surfaces are decoded into the scene-linear FP16
 working buffer, converted from scene Rec.709 primaries to BT.2020, and only then
 PQ encoded.
 
-Chromium's HDR10 path copies the compositor preferred description onto the
-window. HDR Chrome sessions must not use `--force-color-profile=scrgb-linear`:
-that profile's BT.709 primaries make Blink report `color-gamut: srgb`, so
-wide-gamut CSS such as the new-tab shortcut circles disappears. SDR and
-linear-SDR sessions keep `--force-color-profile=display-p3-d65`. HDR10 scanout
-stays BT.2020/PQ. The preferred description for P3-class panels is Display P3
-with extended sRGB (Chrome's HDR raster: 1.0 is paper white). Advertising PQ
-on 8-bit windows made the W-test reds clip together and broke still shading.
+The HDR encode does not apply the monitor's SDR ICC tone curves. It preserves
+wide-gamut client values in FP16, maps the scene into BT.2020, applies the
+configured graphics-white and highlight appearance, then encodes ST.2084.
+HDR10 scanout is BT.2020/PQ, and the display performs the final mapping from
+that signaled wire space to its HDR panel mode.
+A separately measured HDR calibration can be added before PQ encoding; an SDR
+ICC profile is not substituted for one.
+
+In HDR, compositor-launched Chromium is not given a forced color or raster
+profile. It follows the compositor's preferred Display P3 with extended-sRGB
+description. Forcing HDR10 while Chromium still submits an 8-bit `AB24` raster
+buffer creates an encoding mismatch and corrupts ordinary P3 images. SDR and
+linear-SDR use `--force-color-profile=display-p3-d65`.
+Desktop Linux/Ozone can still submit an 8-bit `AB24` window despite advertised
+`RGBA_1010102`/`AB30` DMA-BUF formats. FocalDesk detects and dithers that source
+before conversion. The final PQ target is kept stable and quantized directly
+to 10 bits; monitors with an 8-bit+FRC panel perform their own temporal
+dithering from those 10-bit input codes. HDR10 scanout stays BT.2020/PQ.
+Advertising PQ on 8-bit windows made the W-test reds clip together and broke
+still shading.
 Named BT.2020 panels still prefer BT.2020+PQ. Blink reports `color-gamut: p3`
-for HDR, not `rec2020`. PQ encode maps the scene into Display P3 D65 then
-BT.2020. `ext_srgb` is still advertised so clients that actually use extended
+for HDR, not `rec2020`. PQ encode maps the scene directly into BT.2020.
+`ext_srgb` is still advertised so clients that actually use extended
 sRGB can tag it directly. 8-bit `AB24` is decoded as Display P3 sRGB-HDR, not
-ST.2084; 10-bit packed RGB can keep PQ. Decode dithers those 8-bit
-sRGB-HDR samples so video skies do not stair-step into purple and blue
-slabs; it cannot invent the missing codes. FP16 surfaces tagged PQ decode as
+ST.2084; 10-bit packed RGB can keep PQ. Decode applies hue-preserving
+triangular dither to those 8-bit sRGB-HDR samples before linearization so skies
+do not stair-step into purple and blue slabs; it cannot invent the missing
+codes. FP16 surfaces tagged PQ decode as
 Rec.709 linear HDR. linux-dmabuf feedback prefers FP16 and 10-bit RGB so
 Chrome can upgrade off 8-bit. The factory ICC white is often warm and is not
 used for HDR. PQ scanout tone-maps highlight luminance into about 450 nits of

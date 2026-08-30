@@ -24,9 +24,7 @@ FocalDesk falls back to built-in defaults when a settings file does not exist.
 An invalid file may also cause the affected component to use defaults, so check
 the logs after hand-editing configuration.
 
-The GTK fallback shell can read alternate geometry and presentation from
-`config.toml`. The primary GLES shell deliberately follows the compositor's
-canonical top-bar and left-sidebar layout:
+The GTK shell clients read geometry and presentation from `config.toml`:
 
 ```toml
 [shell]
@@ -35,14 +33,16 @@ style = "attached" # attached | floating
 [panel]
 position = "top" # top | bottom
 corner_radius = 16
+clock_format = "12-hour" # 12-hour | 24-hour
 
 [dock]
 position = "left" # left | right
 corner_radius = 24
 size = "normal" # compact | normal | expanded
+visibility = "intelligent-dodge" # always-visible | intelligent-dodge | autohide
 ```
 
-These options configure the standalone GTK shell clients. Floating GTK docks do
+These options configure the panel and dock shell clients. Floating GTK docks do
 not reserve a full work-area strip. Attached GTK panels and docks claim an
 exclusive zone matching their configured edge and size. Restart the shell
 clients after changing geometry.

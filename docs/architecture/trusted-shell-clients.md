@@ -1,38 +1,37 @@
-# Experimental external shell clients
+# Replaceable GTK shell clients
 
-FocalDesk's panel and dock are rendered by the compositor. Two independent
-Wayland layer-shell clients remain available as an experimental alternative,
-but they are not enabled or launched by the default session:
+FocalDesk's alternative shell is formed by independent GTK4 Wayland
+layer-shell clients launched by the normal desktop session:
 
-- `focal-panel` (`focal-panel` namespace) can own the top bar and its exclusive
-  top-edge zone.
-- `focal-dock` (`focal-dock` namespace) can own the vertical sidebar and its
-  exclusive left-edge zone.
+- `focaldesk-system-rail` (`focaldesk-system-rail` namespace) is a narrow,
+  floating right-edge control rail. It owns system state, workspaces, clock,
+  notifications, and power, and reserves 80 logical pixels at the right edge.
+- `focaldesk-task-shelf` (`focaldesk-task-shelf` namespace) is a grouped,
+  bottom-centered application shelf. It shows pinned, running, and utility
+  groups and intentionally claims no exclusive zone.
 
 The applications are separate processes from the compositor. Their primary
-runtime is `focaldesk-shell-client`, which creates a layer surface per output
-and owns its Wayland connection, EGL display, GLES context, render loop, and
-GPU resources. The shell crate owns copies of the top-bar/sidebar layout,
-shader sources, SVG icon-atlas builder, theme translation, and IBM Plex font
-atlas. It has no dependency on `focaldesk-ui` or `focaldesk-engine`, does not
-borrow compositor renderer objects, and does not share their GPU lifetime.
+runtime is `focaldesk-shell-gtk`, which creates a GTK4 layer surface per output.
+It consumes renderer-neutral theme tokens and has no dependency on
+`focaldesk-ui`, `focaldesk-engine`, compositor renderer objects, shaders, or the
+compositor's GPU lifetime.
 
-`focaldesk-shell-gtk` is the reliability fallback. If EGL/GLES initialization,
-resource compilation, or frame presentation fails, the client tears down the
-GLES runtime and starts the corresponding GTK4 layer-shell UI. Set
-`FOCALDESK_SHELL_FORCE_GTK=1` to select that fallback explicitly for diagnosis
-or for systems without a working GLES Wayland path.
+The former independent GLES renderer remains available for legacy diagnostics
+by setting `FOCALDESK_SHELL_FORCE_GLES=1`; it retains the old `focal-panel` and
+`focal-dock` namespaces. The compositor retains its native chrome as a startup
+fallback and stops drawing it once a renderable trusted shell surface claims
+the work area.
 
 Only the trusted panel and dock namespaces contribute to FocalDesk's internal
 work-area calculation. Other layer-shell clients continue to render through
 the normal Smithay layer map but cannot move normal-window placement.
 Namespace filtering is a protocol boundary, not a cryptographic identity
-mechanism. Experimental deployments should launch these clients from trusted
-user services and additionally validate the connecting UID and executable or
-a launch token before relying on the namespace as identity.
+mechanism. The session launches these clients from trusted user services and
+the IPC transport validates the connecting UID and executable. Namespace
+filtering is used for layout ownership, not as IPC authentication.
 
-Both renderers consume the existing desktop snapshot IPC for workspace and
-shell state and send interactions through typed desktop-action IPC. The
-compositor remains the authority for workspaces, window state, notifications,
-and settings; neither the GLES nor GTK shell renderer contains compositor
-state.
+Both clients consume the existing desktop snapshot IPC for per-output window,
+workspace, and shell state and send interactions through typed desktop-action
+IPC. The compositor remains the authoritative shell service for window state,
+workspaces, notifications, settings, secure prompts, and the lock screen;
+neither GTK process reaches into Smithay internals.

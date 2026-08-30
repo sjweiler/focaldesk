@@ -1745,14 +1745,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "98de4bbd547a563b716d8dfa9aad1cb19bfab00f4fa09a6a4ed21dbcf44ce9c4"
 
 [[package]]
-name = "focal-dock"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "focaldesk-shell-client",
-]
-
-[[package]]
 name = "focal-launch-shared"
 version = "0.1.0"
 dependencies = [
@@ -1773,14 +1765,6 @@ dependencies = [
  "focaldesk-settings-core",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "focal-panel"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "focaldesk-shell-client",
 ]
 
 [[package]]
@@ -2424,14 +2408,32 @@ dependencies = [
  "focaldesk-config",
  "focaldesk-ipc",
  "focaldesk-logging",
+ "focaldesk-settings-core",
  "focaldesk-themes",
  "gtk4",
  "gtk4-layer-shell",
+ "resvg 0.41.0",
 ]
 
 [[package]]
 name = "focaldesk-sounds"
 version = "0.1.0"
+
+[[package]]
+name = "focaldesk-system-rail"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-shell-client",
+]
+
+[[package]]
+name = "focaldesk-task-shelf"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-shell-client",
+]
 
 [[package]]
 name = "focaldesk-themes"

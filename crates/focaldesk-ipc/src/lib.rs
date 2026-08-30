@@ -108,24 +108,70 @@ pub enum DesktopDirection {
     Down,
 }
 
+/// Compositor-owned shell panels that trusted clients may open on an output.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellPanel {
+    Network,
+    Bluetooth,
+    Audio,
+    Display,
+    Settings,
+    Power,
+    Calendar,
+    NotificationHistory,
+    Updates,
+}
+
 /// Actions that trusted desktop helpers may ask the compositor to perform.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum DesktopAction {
-    LaunchApp { app: String },
-    FocusWorkspace { workspace: u32 },
-    MoveFocusedToOutput { output: u32 },
-    MoveFocused { direction: DesktopDirection },
+    LaunchApp {
+        app: String,
+    },
+    FocusWorkspace {
+        workspace: u32,
+    },
+    FocusWorkspaceOnOutput {
+        connector: String,
+        workspace: u32,
+    },
+    MoveFocusedToOutput {
+        output: u32,
+    },
+    MoveFocused {
+        direction: DesktopDirection,
+    },
     CloseFocused,
-    SetVolume { percent: u8 },
-    FocusWindow { window_id: u32 },
-    MoveWindowToWorkspace { window_id: u32, workspace: u32 },
-    OpenSettingsPanel { panel: String },
+    SetVolume {
+        percent: u8,
+    },
+    FocusWindow {
+        window_id: u32,
+    },
+    MoveWindowToWorkspace {
+        window_id: u32,
+        workspace: u32,
+    },
+    OpenSettingsPanel {
+        panel: String,
+    },
+    OpenShellPanel {
+        connector: String,
+        panel: ShellPanel,
+    },
     OpenNotificationsPanel,
     OpenUpdatesPanel,
     ToggleDoNotDisturb,
     CreateWorkspace,
     DeleteWorkspace,
+    CreateWorkspaceOnOutput {
+        connector: String,
+    },
+    DeleteWorkspaceOnOutput {
+        connector: String,
+    },
     OpenCalendarPanel,
     Logout,
 }
@@ -218,6 +264,8 @@ pub struct DesktopSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ShellSnapshot {
     pub workspace_count: usize,
+    #[serde(default)]
+    pub max_workspace_slots: usize,
     pub do_not_disturb: bool,
     pub notification_unread_count: usize,
     #[serde(default)]
@@ -226,6 +274,14 @@ pub struct ShellSnapshot {
     pub update_busy: bool,
     pub network_carrier: bool,
     pub wifi_signal_percent: Option<u8>,
+    #[serde(default)]
+    pub microphone_detected: bool,
+    #[serde(default)]
+    pub microphone_active: bool,
+    #[serde(default)]
+    pub camera_detected: bool,
+    #[serde(default)]
+    pub camera_active: bool,
     pub battery_percent: Option<u8>,
     pub focused_window_title: Option<String>,
 }
