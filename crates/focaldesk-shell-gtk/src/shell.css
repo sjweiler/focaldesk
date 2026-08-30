@@ -215,6 +215,15 @@ window.task-shelf-window {
   border-color: alpha(@fd_shell_rim, 0.76);
 }
 
+.rail-output-focus-notch {
+  min-width: 24px;
+  min-height: 3px;
+  margin-top: 2px;
+  border-radius: 0 0 3px 3px;
+  background: alpha(@fd_shell_accent, 0.92);
+  box-shadow: 0 0 7px alpha(@fd_shell_glow, 0.52);
+}
+
 .task-shelf {
   background-color: alpha(@fd_shell_bg, 0.86);
   background-image: linear-gradient(155deg, alpha(@fd_shell_highlight, 0.18), alpha(@fd_shell_surface_raised, 0.66) 22%, alpha(@fd_shell_bg, 0.82) 62%, alpha(@fd_shell_glass_bottom, 0.90));
@@ -260,6 +269,13 @@ window.task-shelf-window {
   background: alpha(@fd_shell_accent, 0.16);
   border-color: alpha(@fd_shell_accent, 0.38);
   color: @fd_shell_icon_active;
+}
+
+.rail-privacy-indicator.active {
+  background: alpha(@fd_shell_accent, 0.24);
+  border-color: rgba(244, 176, 76, 0.88);
+  color: @fd_shell_icon_active;
+  box-shadow: inset 0 1px alpha(@fd_shell_highlight, 0.28), 0 0 9px rgba(244, 176, 76, 0.26);
 }
 
 .rail-workspace-button {

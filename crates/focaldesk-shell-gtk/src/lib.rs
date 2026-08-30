@@ -1306,8 +1306,11 @@ struct RailWorkspaceWidgets {
 }
 
 struct SystemRailWidgets {
+    focus_notch: gtk::Box,
     network_button: gtk::Button,
     network_image: gtk::Image,
+    microphone_button: gtk::Button,
+    camera_button: gtk::Button,
     display_button: gtk::Button,
     display_badge: gtk::Label,
     battery_button: gtk::Button,
@@ -1337,7 +1340,18 @@ fn build_panel(
 
     let rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
     rail.add_css_class("system-rail");
-    window.set_child(Some(&rail));
+    let rail_overlay = gtk::Overlay::new();
+    rail_overlay.set_child(Some(&rail));
+    let focus_notch = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    focus_notch.add_css_class("rail-output-focus-notch");
+    focus_notch.set_width_request(24);
+    focus_notch.set_height_request(3);
+    focus_notch.set_halign(gtk::Align::Center);
+    focus_notch.set_valign(gtk::Align::Start);
+    focus_notch.set_can_target(false);
+    focus_notch.set_visible(false);
+    rail_overlay.add_overlay(&focus_notch);
+    window.set_child(Some(&rail_overlay));
 
     let top = gtk::Box::new(gtk::Orientation::Vertical, 4);
     top.add_css_class("rail-group");
@@ -1369,6 +1383,26 @@ fn build_panel(
         )
         .0,
     );
+    let microphone_connector = connector.clone();
+    let (microphone_button, _) = glass_icon_button(
+        "audio-input-microphone-symbolic",
+        "Microphone in use",
+        "rail-button",
+        move || open_shell_panel(&microphone_connector, ShellPanel::Audio),
+    );
+    microphone_button.add_css_class("rail-privacy-indicator");
+    microphone_button.set_visible(false);
+    top.append(&microphone_button);
+    let camera_connector = connector.clone();
+    let (camera_button, _) = glass_icon_button(
+        "camera-web-symbolic",
+        "Camera in use",
+        "rail-button",
+        move || open_shell_panel(&camera_connector, ShellPanel::Settings),
+    );
+    camera_button.add_css_class("rail-privacy-indicator");
+    camera_button.set_visible(false);
+    top.append(&camera_button);
     let display_button = gtk::Button::new();
     display_button.add_css_class("rail-button");
     display_button.set_tooltip_text(Some("Display settings"));
@@ -1477,8 +1511,11 @@ fn build_panel(
     rail.append(&bottom);
 
     let widgets = SystemRailWidgets {
+        focus_notch,
         network_button,
         network_image,
+        microphone_button,
+        camera_button,
         display_button,
         display_badge,
         battery_button,
@@ -1550,6 +1587,9 @@ fn rebuild_rail_workspaces(
 
 fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, connector: &str) {
     let output = output_for_connector(snapshot, connector);
+    widgets
+        .focus_notch
+        .set_visible(output.is_some_and(|output| output.focused));
     let active_workspace = output
         .map(|output| output.active_workspace_id)
         .unwrap_or(snapshot.session.active_workspace_id)
@@ -1597,6 +1637,14 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
         },
     );
     set_button_active(&widgets.network_button, snapshot.shell.network_carrier);
+    widgets
+        .microphone_button
+        .set_visible(snapshot.shell.microphone_active);
+    set_button_active(&widgets.microphone_button, snapshot.shell.microphone_active);
+    widgets
+        .camera_button
+        .set_visible(snapshot.shell.camera_active);
+    set_button_active(&widgets.camera_button, snapshot.shell.camera_active);
     let externally_powered =
         snapshot.shell.line_power_online == Some(true) || snapshot.shell.battery_percent.is_none();
     set_shell_icon(

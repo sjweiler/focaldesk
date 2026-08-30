@@ -1365,7 +1365,11 @@ fn pause_drm_session(data: &mut DrmLoopData, reason: &str) {
     }
 }
 
-fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
+fn resume_drm_session(
+    data: &mut DrmLoopData,
+    loop_handle: &LoopHandle<'_, DrmLoopData>,
+    reason: &str,
+) {
     // PrepareForSleep(false) is delivered on a separate D-Bus connection and
     // can win the race with libseat's ActivateSession. Defer until libseat has
     // restored ownership; activating a paused DRM manager before that point
@@ -1399,8 +1403,27 @@ fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
     // DrmOutputManager::activate().
     let mut all_devices_ready = true;
     if data.backend.devices.is_empty() {
-        flog_warn!("No DRM devices are available after resume; scheduling retry");
-        all_devices_ready = false;
+        let node = data.backend.primary_gpu;
+        match node.dev_path() {
+            Some(path) => {
+                flog_warn!(
+                    "No retained DRM device after resume; reopening primary node {}",
+                    path.display()
+                );
+                if let Err(err) = device_added(data, loop_handle, node, &path) {
+                    flog_warn!(
+                        "Failed to reopen primary DRM device after resume: {err}; scheduling retry"
+                    );
+                    all_devices_ready = false;
+                }
+            }
+            None => {
+                flog_warn!(
+                    "No retained DRM device after resume and primary node path is unavailable; scheduling retry"
+                );
+                all_devices_ready = false;
+            }
+        }
     }
     for (node, device) in &mut data.backend.devices {
         if let Err(err) = device.drm_output_manager.lock().activate(false) {
@@ -1413,7 +1436,7 @@ fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
     }
 
     if !all_devices_ready {
-        data.resume_retry_at = Some(Instant::now() + Duration::from_millis(250));
+        data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
         return;
     }
 
@@ -1439,6 +1462,10 @@ fn resume_drm_session(data: &mut DrmLoopData, reason: &str) {
     data.core.last_now = Instant::now();
     data.core.state.mark_redraw();
     data.session_active = true;
+}
+
+fn defer_primary_drm_removal(session_active: bool, resume_pending: bool) -> bool {
+    !session_active || resume_pending
 }
 
 /// Live KMS HDR application is compiled in but remains runtime opt-in. NVIDIA also
@@ -1705,6 +1732,14 @@ mod hdr_tests {
 
         reset_surface_timing_after_resume(&mut queued_at, &mut hdr_deadline, false, resumed_at);
         assert_eq!(hdr_deadline, None);
+    }
+
+    #[test]
+    fn suspend_time_primary_drm_removal_is_deferred_until_resume() {
+        assert!(defer_primary_drm_removal(false, true));
+        assert!(defer_primary_drm_removal(false, false));
+        assert!(defer_primary_drm_removal(true, true));
+        assert!(!defer_primary_drm_removal(true, false));
     }
 
     #[test]
@@ -3097,13 +3132,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         })?;
     }
 
+    let session_loop_handle = loop_handle.clone();
     let _session_token =
         loop_handle.insert_source(notifier, move |event, _, data| match event {
             SessionEvent::PauseSession => {
                 pause_drm_session(data, "libseat PauseSession");
             }
             SessionEvent::ActivateSession => {
-                resume_drm_session(data, "libseat ActivateSession");
+                resume_drm_session(data, &session_loop_handle, "libseat ActivateSession");
             }
         })?;
     let sleep_notifications = spawn_session_sleep_watch().ok();
@@ -3170,6 +3206,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let Ok(node) = DrmNode::from_dev_id(device_id) else {
                 return;
             };
+            if node == data.backend.primary_gpu
+                && defer_primary_drm_removal(data.session_active, data.resume_pending)
+            {
+                flog_warn!(
+                    "Deferring removal of primary DRM device {node:?} while session is suspended"
+                );
+                return;
+            }
             remove_drm_device(data, &udev_handle, node);
         }
     })?;
@@ -3214,7 +3258,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         pause_drm_session(&mut data, "login1 PrepareForSleep(true)");
                     }
                     SessionSleepEvent::WokeUp => {
-                        resume_drm_session(&mut data, "login1 PrepareForSleep(false)");
+                        resume_drm_session(
+                            &mut data,
+                            &loop_handle,
+                            "login1 PrepareForSleep(false)",
+                        );
                     }
                 }
             }
@@ -3225,7 +3273,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 .resume_retry_at
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            resume_drm_session(&mut data, "deferred resume retry");
+            resume_drm_session(&mut data, &loop_handle, "deferred resume retry");
         }
 
         #[cfg(feature = "xwayland")]
