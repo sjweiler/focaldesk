@@ -203,35 +203,44 @@ window.task-shelf-window {
 
 .system-rail,
 .task-shelf {
-  border: 1px solid alpha(@fd_shell_border, 0.78);
+  border: 1px solid alpha(@fd_shell_rim, 0.82);
   border-radius: 18px;
-  box-shadow: 0 12px 36px alpha(@fd_shell_shadow, 0.72), inset 0 1px alpha(@fd_shell_highlight, 0.55);
+  box-shadow: 0 12px 36px alpha(@fd_shell_shadow, 0.72), inset 0 1px alpha(@fd_shell_highlight, 0.72), inset 1px 0 alpha(@fd_shell_highlight, 0.24);
 }
 
 .system-rail {
   padding: 9px 7px;
   background-color: alpha(@fd_shell_bg, 0.78);
-  background-image: linear-gradient(to bottom, alpha(@fd_shell_surface_raised, 0.82), alpha(@fd_shell_bg, 0.72));
-  border-color: alpha(@fd_shell_border, 0.62);
+  background-image: linear-gradient(145deg, alpha(@fd_shell_highlight, 0.20), alpha(@fd_shell_surface_raised, 0.74) 18%, alpha(@fd_shell_bg, 0.72) 58%, alpha(@fd_shell_glass_bottom, 0.86));
+  border-color: alpha(@fd_shell_rim, 0.76);
 }
 
 .task-shelf {
   background-color: alpha(@fd_shell_bg, 0.86);
+  background-image: linear-gradient(155deg, alpha(@fd_shell_highlight, 0.18), alpha(@fd_shell_surface_raised, 0.66) 22%, alpha(@fd_shell_bg, 0.82) 62%, alpha(@fd_shell_glass_bottom, 0.90));
+}
+
+.rail-workspaces {
+  background: transparent;
 }
 
 .rail-group,
-.rail-workspace-cluster,
-.rail-workspaces {
-  background: transparent;
+.rail-workspace-cluster {
+  padding: 2px 0;
+  border: 1px solid alpha(@fd_shell_border, 0.20);
+  border-radius: 15px;
+  background-color: alpha(@fd_shell_surface, 0.13);
+  background-image: linear-gradient(to bottom right, alpha(@fd_shell_highlight, 0.08), alpha(@fd_shell_bg, 0.06));
+  box-shadow: inset 0 1px alpha(@fd_shell_highlight, 0.12);
 }
 
 .rail-button,
 .shelf-button {
   padding: 0;
-  border: 1px solid transparent;
-  background: transparent;
+  border: 1px solid alpha(@fd_shell_border, 0.14);
+  background: alpha(@fd_shell_surface, 0.10);
   color: @fd_shell_icon;
-  box-shadow: none;
+  box-shadow: inset 0 1px alpha(@fd_shell_highlight, 0.08);
 }
 
 .rail-button {
@@ -263,12 +272,14 @@ window.task-shelf-window {
 }
 
 .rail-workspace-control {
-  min-width: 40px;
-  min-height: 34px;
-  margin: 1px 4px;
+  min-width: 42px;
+  min-height: 40px;
+  margin: 2px 3px;
   font-size: 18px;
-  font-weight: 500;
-  color: @fd_shell_text_dim;
+  font-weight: 650;
+  color: @fd_shell_icon;
+  background: alpha(@fd_shell_surface_raised, 0.22);
+  border-color: alpha(@fd_shell_border, 0.24);
 }
 
 .rail-workspace-control:hover {
@@ -293,14 +304,27 @@ window.task-shelf-window {
 }
 
 .rail-battery-label {
-  font-size: 10px;
-  font-weight: 700;
+  min-width: 22px;
+  min-height: 11px;
+  margin: 0 0 1px 0;
+  padding: 0 2px;
+  border-radius: 6px;
+  background: alpha(@fd_shell_bg, 0.88);
+  color: @fd_shell_text;
+  font-size: 7px;
+  font-weight: 800;
 }
 
 .rail-clock {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 700;
   line-height: 1.10;
+}
+
+.rail-battery-control,
+.rail-clock-control {
+  background: alpha(@fd_shell_surface_raised, 0.22);
+  border-color: alpha(@fd_shell_border, 0.24);
 }
 
 .task-shelf {
@@ -337,10 +361,71 @@ window.task-shelf-window {
 }
 
 .shelf-overflow {
-  min-width: 24px;
+  min-width: 48px;
+  min-height: 48px;
+  padding: 0;
   color: @fd_shell_text_dim;
   font-size: 10px;
   font-weight: 700;
+}
+
+window.task-shelf-overflow-window {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+}
+
+.shelf-overflow-surface {
+  padding: 10px;
+  border: 1px solid alpha(@fd_shell_border, 0.78);
+  border-radius: 18px;
+  background: alpha(@fd_shell_bg, 0.96);
+  box-shadow: 0 12px 32px alpha(@fd_shell_shadow, 0.76);
+}
+
+.shelf-overflow-header {
+  min-height: 32px;
+  color: @fd_shell_text;
+  font-weight: 700;
+}
+
+.shelf-overflow-close {
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: @fd_shell_icon;
+}
+
+.shelf-overflow-close:hover {
+  background: alpha(@fd_shell_text, 0.10);
+}
+
+.shelf-overflow-list {
+  padding: 4px;
+  background: transparent;
+}
+
+.shelf-overflow-row {
+  min-width: 144px;
+  min-height: 124px;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 14px;
+  background: alpha(@fd_shell_surface_raised, 0.36);
+  color: @fd_shell_text;
+}
+
+.shelf-overflow-row:hover {
+  border-color: alpha(@fd_shell_border, 0.55);
+  background: alpha(@fd_shell_text, 0.10);
+}
+
+.shelf-overflow-row.active {
+  border-color: alpha(@fd_shell_accent, 0.55);
+  background: alpha(@fd_shell_accent, 0.16);
+  box-shadow: inset 0 -3px alpha(@fd_shell_accent, 0.78);
 }
 
 .window-stack-marks {

@@ -79,6 +79,8 @@ pub struct LinearOffscreenTargets {
     /// CPU-generated premultiplied RGBA8 work-area glass, sampled only through
     /// Smithay's stock texture program on drivers that reject the procedural quad.
     pub(crate) glass_texture: Option<GlesTexture>,
+    /// Full-resolution destination size used as the texture cache key. The
+    /// uploaded texture itself is deliberately smaller and filtered when drawn.
     pub(crate) glass_texture_size: Option<Size<i32, Physical>>,
     pub(crate) glass_texture_style: Option<GlassStyle>,
     /// Ping-pong target for full-frame output encode (C1b/C2c SDR).
@@ -1170,43 +1172,107 @@ fn smoothstep(edge0: f32, edge1: f32, value: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+const WORK_AREA_GLASS_DOWNSAMPLE: i32 = 2;
+const GLASS_LOOKUP_SAMPLES: usize = 4096;
+
+#[derive(Clone, Copy)]
+struct GlassAxisSample {
+    uv: f32,
+    edge_mask: f32,
+    edge_distance: f32,
+}
+
+fn work_area_glass_texture_size(size: Size<i32, Physical>) -> Size<i32, Physical> {
+    Size::from((
+        (size.w.max(1) + WORK_AREA_GLASS_DOWNSAMPLE - 1) / WORK_AREA_GLASS_DOWNSAMPLE,
+        (size.h.max(1) + WORK_AREA_GLASS_DOWNSAMPLE - 1) / WORK_AREA_GLASS_DOWNSAMPLE,
+    ))
+}
+
+fn glass_axis_samples(
+    sample_count: i32,
+    output_extent: i32,
+    edge_width: f32,
+) -> Vec<GlassAxisSample> {
+    let sample_count = sample_count.max(1);
+    let output_extent = output_extent.max(1) as f32;
+    (0..sample_count)
+        .map(|sample| {
+            let uv = (sample as f32 + 0.5) / sample_count as f32;
+            let position = uv * output_extent;
+            GlassAxisSample {
+                uv,
+                edge_mask: smoothstep(0.0, edge_width, position).min(smoothstep(
+                    0.0,
+                    edge_width,
+                    output_extent - position,
+                )),
+                edge_distance: position.min(output_extent - position),
+            }
+        })
+        .collect()
+}
+
+fn glass_noise(x: u32, y: u32) -> f32 {
+    let mut value = x.wrapping_mul(0x1f12_3bb5) ^ y.wrapping_mul(0x5f35_6495);
+    value ^= value >> 16;
+    value = value.wrapping_mul(0x7feb_352d);
+    value ^= value >> 15;
+    value = value.wrapping_mul(0x846c_a68b);
+    value ^= value >> 16;
+    value as f32 / u32::MAX as f32
+}
+
 /// Generate the cosmetic glass once on the CPU. The resulting premultiplied
 /// RGBA8 texture is drawn with Smithay's proven stock texture program; no
 /// procedural shader or custom full-screen quad reaches the NVIDIA path.
 fn work_area_glass_pixels(size: Size<i32, Physical>, style: GlassStyle, time: f32) -> Vec<u8> {
-    let width = size.w.max(1);
-    let height = size.h.max(1);
-    let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+    work_area_glass_pixels_for_output(size, size, style, time)
+}
 
-    for y in 0..height {
-        let uv_y = (y as f32 + 0.5) / height as f32;
-        for x in 0..width {
-            let uv_x = (x as f32 + 0.5) / width as f32;
-            let p_x = uv_x * width as f32;
-            let p_y = uv_y * height as f32;
-            let left = smoothstep(0.0, style.edge_width, p_x);
-            let right = smoothstep(0.0, style.edge_width, width as f32 - p_x);
-            let top = smoothstep(0.0, style.edge_width, p_y);
-            let bottom = smoothstep(0.0, style.edge_width, height as f32 - p_y);
-            let e = left.min(right).min(top).min(bottom);
+fn work_area_glass_pixels_for_output(
+    texture_size: Size<i32, Physical>,
+    output_size: Size<i32, Physical>,
+    style: GlassStyle,
+    time: f32,
+) -> Vec<u8> {
+    let width = texture_size.w.max(1);
+    let height = texture_size.h.max(1);
+    let x_samples = glass_axis_samples(width, output_size.w, style.edge_width);
+    let y_samples = glass_axis_samples(height, output_size.h, style.edge_width);
+    let tone_lookup: Vec<f32> = (0..=GLASS_LOOKUP_SAMPLES)
+        .map(|sample| (sample as f32 / GLASS_LOOKUP_SAMPLES as f32).powf(0.97))
+        .collect();
+    let shimmer_lookup: Vec<f32> = (0..=GLASS_LOOKUP_SAMPLES)
+        .map(|sample| {
+            let phase = sample as f32 / GLASS_LOOKUP_SAMPLES as f32 * 12.0 - time * 0.10;
+            0.5 + 0.5 * phase.sin()
+        })
+        .collect();
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+
+    for (y, y_sample) in y_samples.iter().enumerate() {
+        let top_band =
+            smoothstep(0.0, 0.08, y_sample.uv) * (1.0 - smoothstep(0.08, 0.24, y_sample.uv)) * 0.05;
+        let body_gradient = 0.985 + (1.015 - 0.985) * (1.0 - y_sample.uv);
+        for (x, x_sample) in x_samples.iter().enumerate() {
+            let e = x_sample.edge_mask.min(y_sample.edge_mask);
             let edge = 1.0 - e;
 
-            let diag = uv_x * 0.75 + uv_y * 0.25;
+            let diag = x_sample.uv * 0.75 + y_sample.uv * 0.25;
             let highlight = (smoothstep(0.20, 0.52, diag) - smoothstep(0.52, 0.88, diag))
                 * style.highlight_strength
                 * 0.18;
-            let top_band =
-                smoothstep(0.0, 0.08, uv_y) * (1.0 - smoothstep(0.08, 0.24, uv_y)) * 0.05;
-            let shimmer_wave = 0.5 + 0.5 * ((uv_x * 0.85 + uv_y * 0.35) * 10.0 - time * 0.10).sin();
+            let shimmer_phase = (x_sample.uv * 0.85 + y_sample.uv * 0.35) * 10.0;
+            let shimmer_index = ((shimmer_phase / 12.0) * GLASS_LOOKUP_SAMPLES as f32)
+                .round()
+                .clamp(0.0, GLASS_LOOKUP_SAMPLES as f32) as usize;
+            let shimmer_wave = shimmer_lookup[shimmer_index];
             let shimmer = smoothstep(0.80, 0.98, shimmer_wave) * 0.007;
-            let body_gradient = 0.985 + (1.015 - 0.985) * (1.0 - uv_y);
             let inner_edge = 1.0 - smoothstep(0.03, 0.18, e);
-            let bezel_distance = p_x
-                .min(width as f32 - p_x)
-                .min(p_y.min(height as f32 - p_y));
+            let bezel_distance = x_sample.edge_distance.min(y_sample.edge_distance);
             let bezel = 1.0 - smoothstep(0.0, 2.5, bezel_distance);
-            let noise_seed = (x as f32 * 12.9898 + y as f32 * 78.233).sin() * 43758.547;
-            let noise = noise_seed - noise_seed.floor();
+            let noise = glass_noise(x as u32, y as u32);
 
             let mut color = [0.0f32; 3];
             for channel in 0..3 {
@@ -1218,7 +1284,9 @@ fn work_area_glass_pixels(size: Size<i32, Physical>, style: GlassStyle, time: f3
                     - inner_edge * 0.035
                     - bezel * 0.025
                     + (noise - 0.5) * 0.0025;
-                color[channel] = value.max(0.0).powf(0.97);
+                let tone_index =
+                    (value.clamp(0.0, 1.0) * GLASS_LOOKUP_SAMPLES as f32).round() as usize;
+                color[channel] = tone_lookup[tone_index];
             }
             let glass_alpha = (style.opacity
                 + edge * 0.025
@@ -1226,10 +1294,12 @@ fn work_area_glass_pixels(size: Size<i32, Physical>, style: GlassStyle, time: f3
                 + top_band * 0.12
                 + shimmer * 0.08)
                 .clamp(0.0, 0.10);
-            for channel in color {
-                pixels.push((channel * glass_alpha * 255.0).round().clamp(0.0, 255.0) as u8);
+            let offset = (y * width as usize + x) * 4;
+            for (channel, value) in color.into_iter().enumerate() {
+                pixels[offset + channel] =
+                    (value * glass_alpha * 255.0).round().clamp(0.0, 255.0) as u8;
             }
-            pixels.push((glass_alpha * 255.0).round() as u8);
+            pixels[offset + 3] = (glass_alpha * 255.0).round() as u8;
         }
     }
     pixels
@@ -1346,17 +1416,27 @@ pub fn run_linear_staged_pass(
                 != Some(work_area_glass_style(state.theme.active_theme())))
     {
         let style = work_area_glass_style(state.theme.active_theme());
-        let pixels = work_area_glass_pixels(glass_rect.size, style, 0.0);
+        let texture_size = work_area_glass_texture_size(glass_rect.size);
+        let generation_started = Instant::now();
+        let pixels = work_area_glass_pixels_for_output(texture_size, glass_rect.size, style, 0.0);
         targets.glass_texture = Some(
             renderer
                 .import_memory(
                     &pixels,
                     Fourcc::Abgr8888,
-                    Size::<i32, Buffer>::from((glass_rect.size.w, glass_rect.size.h)),
+                    Size::<i32, Buffer>::from((texture_size.w, texture_size.h)),
                     false,
                 )
                 .map_err(|err| anyhow!("upload work-area glass texture: {err}"))?,
         );
+        flog(format!(
+            "work-area glass generated {}x{} for {}x{} in {:.1} ms",
+            texture_size.w,
+            texture_size.h,
+            glass_rect.size.w,
+            glass_rect.size.h,
+            generation_started.elapsed().as_secs_f64() * 1_000.0
+        ));
         targets.glass_texture_size = Some(glass_rect.size);
         targets.glass_texture_style = Some(style);
     }
@@ -1860,7 +1940,7 @@ pub fn present_offscreen_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_hdr_encode_state, work_area_glass_pixels};
+    use super::{resolve_hdr_encode_state, work_area_glass_pixels, work_area_glass_texture_size};
     use crate::core::color::hdr_reference_white_nits;
     use crate::core::render::GlassStyle;
     use smithay::utils::{Physical, Size};
@@ -1883,6 +1963,22 @@ mod tests {
         assert!(pixels
             .chunks_exact(4)
             .all(|pixel| { pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3] }));
+    }
+
+    #[test]
+    fn cpu_glass_texture_uses_half_resolution_rounded_up() {
+        assert_eq!(
+            work_area_glass_texture_size(Size::<i32, Physical>::from((3840, 2160))),
+            Size::from((1920, 1080))
+        );
+        assert_eq!(
+            work_area_glass_texture_size(Size::<i32, Physical>::from((7, 5))),
+            Size::from((4, 3))
+        );
+        assert_eq!(
+            work_area_glass_texture_size(Size::<i32, Physical>::from((1, 1))),
+            Size::from((1, 1))
+        );
     }
 
     #[test]

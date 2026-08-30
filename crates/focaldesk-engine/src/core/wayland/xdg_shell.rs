@@ -7,9 +7,11 @@ use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::utils::Serial;
 use smithay::wayland::shell::xdg::{
     Configure, PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+    XdgToplevelSurfaceData,
 };
 use wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge;
 use wayland_server::protocol::{wl_output, wl_seat, wl_surface};
+use wayland_server::Resource;
 
 use crate::core::desktop::DesktopState;
 use crate::core::focus::KeyboardFocusTarget;
@@ -17,6 +19,52 @@ use focaldesk_logging::session_id;
 #[allow(unused_imports)]
 use focaldesk_types::WindowId;
 use tracing::{debug, info_span, trace};
+
+use crate::core::desktop::DamageSource;
+use crate::core::shell::managed_window::ManagedWindowKind;
+
+pub(crate) fn toplevel_metadata(surface: &ToplevelSurface) -> (Option<String>, Option<String>) {
+    smithay::wayland::compositor::with_states(surface.wl_surface(), |states| {
+        let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() else {
+            return (None, None);
+        };
+        let role = data.lock().unwrap();
+        (
+            non_empty_metadata(role.title.clone()),
+            non_empty_metadata(role.app_id.clone()),
+        )
+    })
+}
+
+fn non_empty_metadata(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+impl DesktopState {
+    fn sync_xdg_toplevel_metadata(&mut self, surface: &ToplevelSurface) {
+        let (title, app_id) = toplevel_metadata(surface);
+        let mut changed = false;
+        if let Some(window) = self
+            .windows
+            .iter_mut()
+            .find(|window| window.matches_toplevel(surface))
+        {
+            if let ManagedWindowKind::Wayland(meta) = &mut window.kind {
+                changed = meta.title != title || meta.app_id != app_id;
+                meta.title = title;
+                meta.app_id = app_id;
+            }
+        }
+        if changed {
+            trace!(
+                target: "focaldesk",
+                surface = ?surface.wl_surface().id(),
+                "xdg toplevel metadata updated"
+            );
+            self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        }
+    }
+}
 
 impl XdgShellHandler for DesktopState {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -50,6 +98,14 @@ impl XdgShellHandler for DesktopState {
             state.size = Some(size);
         });
         surface.send_configure();
+    }
+
+    fn title_changed(&mut self, surface: ToplevelSurface) {
+        self.sync_xdg_toplevel_metadata(&surface);
+    }
+
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        self.sync_xdg_toplevel_metadata(&surface);
     }
 
     fn parent_changed(&mut self, surface: ToplevelSurface) {

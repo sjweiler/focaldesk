@@ -55,6 +55,10 @@ const TASK_SHELF_HEIGHT: i32 = 64;
 const TASK_SHELF_VISIBLE_MARGIN: i32 = 22;
 const TASK_SHELF_REVEAL_STRIP: i32 = 4;
 const TASK_SHELF_HIDE_DELAY: Duration = Duration::from_millis(300);
+const TASK_SHELF_BUTTON_WIDTH: i32 = 48;
+const TASK_SHELF_GROUP_GAP: i32 = 4;
+// Outer padding/border and spacing, the separator, and the two utility buttons.
+const TASK_SHELF_FIXED_WIDTH: i32 = 151;
 const SHELL_CSS_BASE: &str = include_str!("shell.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -217,10 +221,69 @@ fn configure_layer_window_without_monitor(
 #[derive(Default)]
 struct ShelfWidgets {
     running_signature: Vec<(u32, String, String, bool)>,
+    pinned_count: usize,
     obscured: bool,
     pointer_inside: bool,
+    overflow_open: bool,
     hidden: bool,
     hide_after: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct ShelfOverflowUi {
+    surface: gtk::Box,
+    title: gtk::Label,
+    list: gtk::Box,
+    window: glib::WeakRef<gtk::ApplicationWindow>,
+}
+
+fn build_shelf_overflow_ui(
+    window: &gtk::ApplicationWindow,
+    shelf_state: &Rc<RefCell<ShelfWidgets>>,
+) -> ShelfOverflowUi {
+    let surface = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    surface.add_css_class("shelf-overflow-surface");
+    surface.set_visible(false);
+
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    header.add_css_class("shelf-overflow-header");
+    let title = gtk::Label::new(None);
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    header.append(&title);
+    let close = gtk::Button::from_icon_name("window-close-symbolic");
+    close.add_css_class("shelf-overflow-close");
+    close.set_tooltip_text(Some("Close window list"));
+    let close_surface = surface.clone();
+    let close_window = window.downgrade();
+    let close_state = shelf_state.clone();
+    close.connect_clicked(move |_| {
+        close_surface.set_visible(false);
+        if let Some(window) = close_window.upgrade() {
+            window.set_default_size(TASK_SHELF_WIDTH, TASK_SHELF_HEIGHT);
+        }
+        let mut state = close_state.borrow_mut();
+        state.overflow_open = false;
+        state.hide_after = Some(Instant::now() + TASK_SHELF_HIDE_DELAY);
+    });
+    header.append(&close);
+    surface.append(&header);
+
+    let list = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    list.add_css_class("shelf-overflow-list");
+    let scroller = gtk::ScrolledWindow::new();
+    scroller.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+    scroller.set_hexpand(true);
+    scroller.set_vexpand(true);
+    scroller.set_child(Some(&list));
+    surface.append(&scroller);
+
+    ShelfOverflowUi {
+        surface,
+        title,
+        list,
+        window: window.downgrade(),
+    }
 }
 
 fn build_dock(
@@ -236,11 +299,18 @@ fn build_dock(
     window.add_css_class("focal-shell-window");
     window.add_css_class("task-shelf-window");
 
+    let widgets = Rc::new(RefCell::new(ShelfWidgets::default()));
+    let overflow_ui = build_shelf_overflow_ui(&window, &widgets);
+
     let shelf = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     shelf.add_css_class("task-shelf");
     shelf.set_halign(gtk::Align::Center);
     shelf.set_valign(gtk::Align::Center);
-    window.set_child(Some(&shelf));
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    root.add_css_class("task-shelf-root");
+    root.append(&overflow_ui.surface);
+    root.append(&shelf);
+    window.set_child(Some(&root));
 
     let pinned = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     pinned.add_css_class("shelf-group");
@@ -296,7 +366,6 @@ fn build_dock(
     ));
     shelf.append(&utilities);
 
-    let widgets = Rc::new(RefCell::new(ShelfWidgets::default()));
     let visibility = Rc::new(Cell::new(config.dock.visibility));
     let visibility_reload = visibility.clone();
     glib::timeout_add_seconds_local(1, move || {
@@ -333,6 +402,7 @@ fn build_dock(
     window.add_controller(pointer);
 
     let snapshots = start_snapshot_poll(&window);
+    let capacity_email_button = email_button.clone();
     let weak_window = window.downgrade();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let Some(_window) = weak_window.upgrade() else {
@@ -376,9 +446,22 @@ fn build_dock(
                     )
                 })
                 .collect::<Vec<_>>();
-            if widgets.borrow().running_signature != signature {
-                rebuild_running_apps(&running, &snapshot, output, workspace);
-                widgets.borrow_mut().running_signature = signature;
+            let pinned_count = 3 + usize::from(capacity_email_button.is_visible());
+            if widgets.borrow().running_signature != signature
+                || widgets.borrow().pinned_count != pinned_count
+            {
+                rebuild_running_apps(
+                    &running,
+                    &snapshot,
+                    output,
+                    workspace,
+                    pinned_count,
+                    &widgets,
+                    &overflow_ui,
+                );
+                let mut state = widgets.borrow_mut();
+                state.running_signature = signature;
+                state.pinned_count = pinned_count;
             }
         }
         update_shelf_visibility(&_window, &widgets, visibility.get(), Instant::now());
@@ -400,6 +483,7 @@ fn update_shelf_visibility(
         DockVisibility::IntelligentDodge => state.obscured,
         DockVisibility::Autohide => true,
     } && !state.pointer_inside
+        && !state.overflow_open
         && !window.is_active();
 
     if !should_hide {
@@ -537,11 +621,31 @@ fn shelf_separator() -> gtk::Separator {
     separator
 }
 
+fn shelf_group_width(buttons: usize) -> i32 {
+    if buttons == 0 {
+        return 0;
+    }
+    buttons as i32 * TASK_SHELF_BUTTON_WIDTH
+        + buttons.saturating_sub(1) as i32 * TASK_SHELF_GROUP_GAP
+}
+
+fn running_app_capacity(pinned_count: usize, reserve_overflow_button: bool) -> usize {
+    let mut available = TASK_SHELF_WIDTH - TASK_SHELF_FIXED_WIDTH - shelf_group_width(pinned_count);
+    if reserve_overflow_button {
+        available -= TASK_SHELF_BUTTON_WIDTH + TASK_SHELF_GROUP_GAP;
+    }
+    ((available + TASK_SHELF_GROUP_GAP).max(0) / (TASK_SHELF_BUTTON_WIDTH + TASK_SHELF_GROUP_GAP))
+        as usize
+}
+
 fn rebuild_running_apps(
     container: &gtk::Box,
     snapshot: &DesktopSnapshot,
     output: Option<&OutputSnapshot>,
     workspace: u32,
+    pinned_count: usize,
+    shelf_state: &Rc<RefCell<ShelfWidgets>>,
+    overflow_ui: &ShelfOverflowUi,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -575,23 +679,66 @@ fn rebuild_running_apps(
             groups.push((identity, vec![item]));
         }
     }
-    let overflow = groups.len().saturating_sub(5);
-    for (identity, windows) in groups.into_iter().take(5) {
+
+    let total_windows = groups
+        .iter()
+        .map(|(_, windows)| windows.len())
+        .sum::<usize>();
+    let needs_overflow_button = groups.len() > running_app_capacity(pinned_count, false);
+    let visible_capacity = if needs_overflow_button {
+        running_app_capacity(pinned_count, true)
+    } else {
+        groups.len()
+    };
+    let mut visible_indices = (0..visible_capacity.min(groups.len())).collect::<Vec<_>>();
+    if let Some(focused_index) = groups
+        .iter()
+        .position(|(_, windows)| windows.iter().any(|window| window.focused))
+    {
+        if !visible_indices.contains(&focused_index) {
+            if let Some(last) = visible_indices.last_mut() {
+                *last = focused_index;
+            }
+        }
+    }
+    for index in visible_indices {
+        let (identity, windows) = &groups[index];
         let icon = app_icon_name(Some(&identity));
         let target = windows
             .iter()
             .find(|window| window.focused)
             .copied()
             .unwrap_or(windows[0]);
-        let id = target.id;
         let tooltip = if windows.len() == 1 {
             target.title.clone()
         } else {
-            format!("{} — {} windows", target.title, windows.len())
+            format!("{} windows — click to choose", windows.len())
         };
-        let (button, _) = glass_icon_button(icon, &tooltip, "shelf-button", move || {
-            send_action(DesktopAction::FocusWindow { window_id: id });
-        });
+        let (button, _) = if windows.len() > 1 {
+            let entries = windows
+                .iter()
+                .map(|window| ShelfOverflowEntry {
+                    id: window.id,
+                    identity: identity.clone(),
+                    title: window.title.clone(),
+                    focused: window.focused,
+                })
+                .collect::<Vec<_>>();
+            let group_ui = overflow_ui.clone();
+            let group_state = shelf_state.clone();
+            glass_icon_button(icon, &tooltip, "shelf-button", move || {
+                eprintln!(
+                    "focaldesk-task-shelf: opening chooser for one application / {} windows",
+                    entries.len()
+                );
+                present_shelf_overflow(&group_ui, 1, &entries, &group_state);
+            })
+        } else {
+            let id = target.id;
+            glass_icon_button(icon, &tooltip, "shelf-button", move || {
+                send_action(DesktopAction::FocusWindow { window_id: id });
+            })
+        };
         button.add_css_class("running-app");
         set_button_active(&button, windows.iter().any(|window| window.focused));
         if windows.len() > 1 {
@@ -599,6 +746,7 @@ fn rebuild_running_apps(
             overlay.set_child(Some(&button));
             let marks = gtk::Label::new(Some("≡"));
             marks.add_css_class("window-stack-marks");
+            marks.set_can_target(false);
             marks.set_halign(gtk::Align::End);
             marks.set_valign(gtk::Align::Start);
             overlay.add_overlay(&marks);
@@ -607,11 +755,134 @@ fn rebuild_running_apps(
             container.append(&button);
         }
     }
-    if overflow > 0 {
-        let more = gtk::Label::new(Some(&format!("+{overflow}")));
+
+    if needs_overflow_button {
+        let entries = groups
+            .iter()
+            .flat_map(|(identity, windows)| {
+                windows.iter().map(|window| ShelfOverflowEntry {
+                    id: window.id,
+                    identity: identity.clone(),
+                    title: window.title.clone(),
+                    focused: window.focused,
+                })
+            })
+            .collect::<Vec<_>>();
+        let app_count = groups.len();
+        let more = gtk::Button::with_label(&total_windows.to_string());
+        more.add_css_class("shelf-button");
         more.add_css_class("shelf-overflow");
-        more.set_tooltip_text(Some(&format!("{overflow} more running applications")));
+        more.set_tooltip_text(Some(&format!(
+            "Open all {total_windows} windows across {app_count} applications"
+        )));
+        let overflow_state = shelf_state.clone();
+        let overflow_ui = overflow_ui.clone();
+        more.connect_clicked(move |_| {
+            eprintln!(
+                "focaldesk-task-shelf: opening chooser for {} applications / {} windows",
+                app_count,
+                entries.len()
+            );
+            present_shelf_overflow(&overflow_ui, app_count, &entries, &overflow_state);
+        });
         container.append(&more);
+    }
+}
+
+#[derive(Clone)]
+struct ShelfOverflowEntry {
+    id: u32,
+    identity: String,
+    title: String,
+    focused: bool,
+}
+
+fn present_shelf_overflow(
+    ui: &ShelfOverflowUi,
+    app_count: usize,
+    entries: &[ShelfOverflowEntry],
+    shelf_state: &Rc<RefCell<ShelfWidgets>>,
+) {
+    ui.title.set_label(&format!(
+        "{app_count} applications · {} windows",
+        entries.len()
+    ));
+    while let Some(child) = ui.list.first_child() {
+        ui.list.remove(&child);
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let icon_name = app_icon_name(Some(&entry.identity));
+        let row = gtk::Button::new();
+        row.add_css_class("shelf-overflow-row");
+        if entry.focused {
+            row.add_css_class("active");
+        }
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        let image = shell_icon_image(icon_name);
+        image.set_pixel_size(48);
+        set_shell_icon_at_size(&image, icon_name, 48);
+        image.set_halign(gtk::Align::Center);
+        content.append(&image);
+        let title = shelf_window_label(entry, index);
+        let label = gtk::Label::new(Some(&title));
+        label.set_xalign(0.5);
+        label.set_justify(gtk::Justification::Center);
+        label.set_max_width_chars(18);
+        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        content.append(&label);
+        row.set_child(Some(&content));
+        row.set_tooltip_text(Some(&title));
+        let id = entry.id;
+        let row_ui = ui.clone();
+        let row_state = shelf_state.clone();
+        row.connect_clicked(move |_| {
+            send_action(DesktopAction::FocusWindow { window_id: id });
+            row_ui.surface.set_visible(false);
+            if let Some(window) = row_ui.window.upgrade() {
+                window.set_default_size(TASK_SHELF_WIDTH, TASK_SHELF_HEIGHT);
+            }
+            let mut state = row_state.borrow_mut();
+            state.overflow_open = false;
+            state.hide_after = Some(Instant::now() + TASK_SHELF_HIDE_DELAY);
+        });
+        ui.list.append(&row);
+    }
+    ui.surface.set_visible(true);
+    if let Some(window) = ui.window.upgrade() {
+        window.set_default_size(760, 300);
+        window.present();
+    }
+    let mut state = shelf_state.borrow_mut();
+    state.overflow_open = true;
+    state.hide_after = None;
+}
+
+fn shelf_window_label(entry: &ShelfOverflowEntry, index: usize) -> String {
+    let title = entry.title.trim();
+    if !title.is_empty()
+        && !title.eq_ignore_ascii_case("untitled")
+        && !title.eq_ignore_ascii_case("wayland app")
+    {
+        return title.to_string();
+    }
+
+    let identity = entry.identity.trim();
+    if !identity.is_empty()
+        && !identity.eq_ignore_ascii_case("untitled")
+        && !identity.eq_ignore_ascii_case("wayland app")
+    {
+        return format!("{} · Window {}", humanize_app_identity(identity), index + 1);
+    }
+    format!("Window {}", index + 1)
+}
+
+fn humanize_app_identity(identity: &str) -> String {
+    let leaf = identity.rsplit('.').next().unwrap_or(identity);
+    let words = leaf.replace(['-', '_'], " ");
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => "Application".into(),
     }
 }
 
@@ -1039,6 +1310,8 @@ struct SystemRailWidgets {
     network_image: gtk::Image,
     display_button: gtk::Button,
     display_badge: gtk::Label,
+    battery_button: gtk::Button,
+    battery_image: gtk::Image,
     battery: gtk::Label,
     notifications_button: gtk::Button,
     clock: gtk::Label,
@@ -1118,8 +1391,17 @@ fn build_panel(
     battery.add_css_class("rail-battery-label");
     let battery_button = gtk::Button::new();
     battery_button.add_css_class("rail-button");
+    battery_button.add_css_class("rail-battery-control");
     battery_button.set_tooltip_text(Some("Battery and power"));
-    battery_button.set_child(Some(&battery));
+    let battery_overlay = gtk::Overlay::new();
+    let battery_image = shell_icon_image("ac-adapter-symbolic");
+    battery_image.set_pixel_size(26);
+    set_shell_icon_at_size(&battery_image, "ac-adapter-symbolic", 26);
+    battery_overlay.set_child(Some(&battery_image));
+    battery.set_halign(gtk::Align::End);
+    battery.set_valign(gtk::Align::End);
+    battery_overlay.add_overlay(&battery);
+    battery_button.set_child(Some(&battery_overlay));
     let battery_connector = connector.clone();
     battery_button
         .connect_clicked(move |_| open_shell_panel(&battery_connector, ShellPanel::Power));
@@ -1168,6 +1450,7 @@ fn build_panel(
     clock.add_css_class("rail-clock");
     let clock_button = gtk::Button::new();
     clock_button.add_css_class("rail-button");
+    clock_button.add_css_class("rail-clock-control");
     clock_button.set_tooltip_text(Some("Calendar and clock"));
     clock_button.set_child(Some(&clock));
     let clock_connector = connector.clone();
@@ -1198,6 +1481,8 @@ fn build_panel(
         network_image,
         display_button,
         display_badge,
+        battery_button,
+        battery_image,
         battery,
         notifications_button,
         clock,
@@ -1312,13 +1597,36 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
         },
     );
     set_button_active(&widgets.network_button, snapshot.shell.network_carrier);
+    let externally_powered =
+        snapshot.shell.line_power_online == Some(true) || snapshot.shell.battery_percent.is_none();
+    set_shell_icon(
+        &widgets.battery_image,
+        if externally_powered {
+            "ac-adapter-symbolic"
+        } else {
+            "battery-symbolic"
+        },
+    );
     widgets.battery.set_text(
         &snapshot
             .shell
             .battery_percent
             .map(|percent| format!("{percent}%"))
-            .unwrap_or_else(|| "AC".into()),
+            .unwrap_or_default(),
     );
+    let power_tooltip = match (
+        snapshot.shell.battery_percent,
+        externally_powered,
+        snapshot.shell.battery_charging,
+    ) {
+        (Some(percent), _, true) => format!("Battery {percent}% · charging"),
+        (Some(percent), true, false) => format!("Battery {percent}% · plugged in"),
+        (Some(percent), false, false) => format!("Battery {percent}% · discharging"),
+        (None, _, _) => "External power".into(),
+    };
+    widgets
+        .battery_button
+        .set_tooltip_text(Some(&power_tooltip));
     set_button_active(
         &widgets.notifications_button,
         snapshot.shell.notification_unread_count > 0,
@@ -1433,8 +1741,8 @@ pub fn glass_icon_button(
         image.set_pixel_size(26);
         set_shell_icon_at_size(&image, icon_name, 26);
     } else if css_class == "shelf-button" {
-        image.set_pixel_size(28);
-        set_shell_icon_at_size(&image, icon_name, 28);
+        image.set_pixel_size(32);
+        set_shell_icon_at_size(&image, icon_name, 32);
     }
     let button = gtk::Button::new();
     button.add_css_class(css_class);
@@ -1524,6 +1832,8 @@ fn focaldesk_icon_svg(icon_name: &str) -> Option<&'static [u8]> {
         "camera-web-symbolic" => include_bytes!("../../../assets/svg/video.svg"),
         "camera-disabled-symbolic" => include_bytes!("../../../assets/svg/video-off.svg"),
         "video-display-symbolic" => include_bytes!("../../../assets/svg/hdr-enabled.svg"),
+        "ac-adapter-symbolic" => include_bytes!("../../../assets/svg/plug.svg"),
+        "battery-symbolic" => include_bytes!("../../../assets/svg/battery.svg"),
         "system-shutdown-symbolic" => include_bytes!("../../../assets/svg/power-menu.svg"),
         "focal-workspace-1" => include_bytes!("../../../assets/svg/slot-1.svg"),
         "focal-workspace-2" => include_bytes!("../../../assets/svg/slot-2.svg"),
@@ -1791,9 +2101,9 @@ fn rgba(color: [f32; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        email_identity_matches, rail_clock_pattern, rail_display_status, shell_css,
-        shell_css_configured, window_belongs_to_output, window_overlaps_shelf, ShellRole,
-        ThemeSnapshot,
+        email_identity_matches, rail_clock_pattern, rail_display_status, running_app_capacity,
+        shelf_window_label, shell_css, shell_css_configured, window_belongs_to_output,
+        window_overlaps_shelf, ShelfOverflowEntry, ShellRole, ThemeSnapshot,
     };
     use focaldesk_config::{ClockFormat, DockPosition, DockSize, PanelPosition, ShellStyle};
     use focaldesk_ipc::{OutputSnapshot, WindowSnapshot};
@@ -1911,6 +2221,14 @@ mod tests {
     }
 
     #[test]
+    fn shelf_keeps_pinned_apps_and_reserves_a_real_overflow_button() {
+        assert_eq!(running_app_capacity(4, false), 4);
+        assert_eq!(running_app_capacity(4, true), 3);
+        assert_eq!(running_app_capacity(3, false), 5);
+        assert_eq!(running_app_capacity(3, true), 4);
+    }
+
+    #[test]
     fn configured_mail_client_matches_its_existing_window() {
         assert!(email_identity_matches(
             "thunderbird",
@@ -1924,6 +2242,24 @@ mod tests {
             "thunderbird",
             "org.mozilla.firefox"
         ));
+    }
+
+    #[test]
+    fn chooser_never_repeats_an_unhelpful_untitled_label() {
+        let entry = ShelfOverflowEntry {
+            id: 7,
+            identity: "untitled".into(),
+            title: "Untitled".into(),
+            focused: false,
+        };
+        assert_eq!(shelf_window_label(&entry, 0), "Window 1");
+        assert_eq!(shelf_window_label(&entry, 18), "Window 19");
+
+        let identified = ShelfOverflowEntry {
+            identity: "org.gnome.TextEditor".into(),
+            ..entry
+        };
+        assert_eq!(shelf_window_label(&identified, 1), "TextEditor · Window 2");
     }
 
     fn output_snapshot(id: u64, x: i32, focused: bool) -> OutputSnapshot {

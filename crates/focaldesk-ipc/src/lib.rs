@@ -283,6 +283,10 @@ pub struct ShellSnapshot {
     #[serde(default)]
     pub camera_active: bool,
     pub battery_percent: Option<u8>,
+    #[serde(default)]
+    pub line_power_online: Option<bool>,
+    #[serde(default)]
+    pub battery_charging: bool,
     pub focused_window_title: Option<String>,
 }
 

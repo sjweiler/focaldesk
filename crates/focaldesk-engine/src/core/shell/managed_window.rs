@@ -231,9 +231,11 @@ impl ManagedWindow {
 
     pub fn title(&self) -> String {
         match &self.kind {
-            ManagedWindowKind::Wayland(meta) => {
-                meta.title.clone().unwrap_or_else(|| "Untitled".into())
-            }
+            ManagedWindowKind::Wayland(meta) => meta
+                .title
+                .clone()
+                .or_else(|| meta.app_id.clone())
+                .unwrap_or_else(|| "Wayland App".into()),
             ManagedWindowKind::Xwayland(meta) => meta
                 .title
                 .clone()

@@ -2254,6 +2254,14 @@ impl DesktopState {
                     .last_power_snapshot
                     .as_ref()
                     .and_then(PowerSnapshot::lowest_battery_percentage),
+                line_power_online: self
+                    .last_power_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.line_power_online),
+                battery_charging: self
+                    .last_power_snapshot
+                    .as_ref()
+                    .is_some_and(PowerSnapshot::is_charging),
                 focused_window_title: self.focused_window.and_then(|id| {
                     self.window(id)
                         .map(|window| bounded_metadata(&window.title()))
@@ -6952,7 +6960,8 @@ impl DesktopState {
 
         let window = Window::new_wayland_window(surface.clone());
         let workspace = self.focused_workspace();
-        let meta = WaylandWindowMeta::new(None, None);
+        let (title, app_id) = crate::core::wayland::xdg_shell::toplevel_metadata(&surface);
+        let meta = WaylandWindowMeta::new(title, app_id);
 
         //self.space.map_element(window.clone(), (100, 100), false);
         //dbg_flush(&format!("after map space={}", self.space.elements().count()));
