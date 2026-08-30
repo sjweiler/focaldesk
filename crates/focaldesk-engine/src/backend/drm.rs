@@ -1600,10 +1600,10 @@ mod output_render_scheduling_tests {
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, exclusive_hdr_prepare_decision,
-        hdr_active_status_verified, hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
-        hdr_driver_allows_output_with_override, hdr_failure_persist_action,
-        hdr_verification_complete, merge_disconnected_display_configs,
+        configured_display_hdr_requested, defer_primary_drm_removal,
+        exclusive_hdr_prepare_decision, hdr_active_status_verified, hdr_commit_stalled,
+        hdr_detection::parse_edid_hdr_support, hdr_driver_allows_output_with_override,
+        hdr_failure_persist_action, hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
         select_requested_drm_mode_index, DisplayConfig, DisplayTransform, DrmModeCandidate,
