@@ -163,6 +163,7 @@ mod tests {
         assert!(css.contains("padding: 11px"));
         assert!(css.contains("transition-duration: 0ms"));
         assert!(css.contains("border-width: 2.0px"));
+        assert!(css.contains(".shell-surface"));
         assert!(gtk_app_prefers_dark(&classic));
     }
 }

@@ -187,7 +187,10 @@ These recipes install:
 
 On NVIDIA systems that support `s2idle`, `install-desktop` also installs the
 FocalDesk sleep configuration selecting it. This avoids known S3/deep-resume
-failures that leave the NVIDIA GPU context or KMS scanout unusable.
+failures that leave the NVIDIA GPU context or KMS scanout unusable. It remains
+a supplemental platform workaround: the DRM backend independently reconstructs
+scanout state after session activation and forces a complete post-resume
+modeset.
 
 Log out, select **FocalDesk** in the display manager, and sign in. Keep a known
 working session installed so you can recover from compositor or driver failures.

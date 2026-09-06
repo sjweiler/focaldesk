@@ -67,14 +67,14 @@ pub fn chrome_command_args(
         "--new-window".into(),
     ];
 
-    // In HDR, let Chrome follow the compositor's wp_color preferred
-    // Display-P3/extended-sRGB description. Forcing HDR10 here can make an
-    // 8-bit AB24 raster buffer carry pixels encoded for a different transfer
-    // function, visibly corrupting wide-gamut images. SDR keeps the explicit
-    // P3 target used for wide-gamut CSS and images.
-    if !hdr_output_active {
-        args.insert(2, "--force-color-profile=display-p3-d65".into());
-    }
+    // Current desktop Chromium can select a PQ surface while continuing to
+    // allocate an 8-bit AB24 Wayland buffer, visibly quantizing gradients.
+    // Keep browser composition in Display-P3/sRGB on both SDR and HDR outputs;
+    // FocalDesk promotes that scene in FP16 before its final BT.2020/PQ encode.
+    // Keep this input in the policy API so native browser HDR can be restored
+    // once Chromium reliably selects AB30 or FP16.
+    let _ = hdr_output_active;
+    args.insert(2, "--force-color-profile=display-p3-d65".into());
 
     args
 }
@@ -98,12 +98,11 @@ mod tests {
     }
 
     #[test]
-    fn chrome_hdr_launch_follows_wayland_preferred_color() {
+    fn chrome_hdr_launch_avoids_eight_bit_pq_surfaces() {
         let args = chrome_command_args(false, "/tmp/focaldesk-chrome-test", true);
         assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("--force-color-profile="))
+            args.iter()
+                .any(|arg| arg == "--force-color-profile=display-p3-d65")
         );
         assert!(
             !args

@@ -31,19 +31,22 @@ authored ceiling is about 450 nits on DisplayHDR 400-class VA panels: they
 cannot reproduce 800–1000 nit spectacle, and inventing it only clips or trips
 the monitor's global tone map. The dark space background stays at its original
 black floor. The final output stage still owns BT.2020 conversion and ST 2084
-encoding. KMS HDR static metadata signals 203-nit BT.2408 SDR/graphics white
-as MaxFALL and 450 nits as MaxCLL / mastering peak, rather than the Type-1
-EDID values (often 409 / ~300) that make these ASUS panels over-compress.
+encoding. KMS HDR static metadata describes the encoded data as BT.2020/D65
+with a 450-nit MaxCLL/mastering ceiling. MaxFALL remains zero (unknown) until
+the compositor performs frame-average analysis; the 203-nit BT.2408
+SDR/graphics-white anchor is represented in the PQ pixels rather than placed
+in the unrelated MaxFALL field.
 
 ## HDR appearance tuning
 
 Each HDR-capable connector has an **HDR appearance tuning** section in Display
 Settings. Its controls affect only the final FP16 scene-to-BT.2020/PQ shader;
 they do not enable HDR, change a display mode, or submit KMS connector
-properties. Reference white and highlight roll-off remain bounded by the
-current 203/450-nit HDR10 metadata contract. Saturation is applied in the
-resolved panel gamut while preserving luminance, and midtone gamma shapes only
-the SDR range while keeping black and reference white fixed.
+properties. The profile stores measured black level, SDR reference white, 10%
+peak, and sustained full-frame peak separately. The final two values become
+MaxCLL/mastering peak and MaxFALL in the live KMS metadata. Saturation is
+applied in the resolved panel gamut while preserving luminance, and midtone
+gamma shapes only the SDR range while keeping black and reference white fixed.
 
 Moving a control or selecting the **Neutral (BT.2408)**, **Bright room**, or
 **Punchy OLED** preset starts a live 15-second preview. Choose **Keep** to save
@@ -52,13 +55,14 @@ profile, or choose **Reset** to preview the neutral 203-nit white, 450-nit peak,
 1.00 saturation, and 1.00 midtone gamma. Invalid, non-finite, or out-of-range
 values are rejected by both IPC and the compositor before render state changes.
 
-For output-path measurements, start a session with
-`FOCALDESK_HDR_CALIBRATION_PATTERN=1`. An active HDR output is replaced with
-100-, 203-, and 300-nit neutral patches, a configured-peak patch, equal-200-nit
-BT.2020 red/green/blue patches, and a zero-to-peak neutral ramp. The diagnostic
-pattern bypasses appearance saturation and midtone shaping but still uses the
-normal highlight roll-off, ST 2084 encode, and 10-bit output dither. It is an
-environment-only diagnostic and is never persisted in display settings.
+Use **Calibration pattern** in Display Settings for output-path measurements.
+Available session-only targets include absolute near-black steps, configured
+reference-white and full-frame fields, a centered 10%-area peak window, and an
+overview containing neutral, BT.2020 primary, and ramp patches. The targets
+bypass appearance saturation and midtone shaping but still use the normal ST
+2084 encode and 10-bit output path. Select **Off** when finished. The legacy
+`FOCALDESK_HDR_CALIBRATION_PATTERN=1` overview remains available for startup
+diagnostics; neither mechanism is persisted as a display setting.
 
 ## SDR wide gamut and 10-bit output
 
@@ -179,26 +183,58 @@ that signaled wire space to its HDR panel mode.
 A separately measured HDR calibration can be added before PQ encoding; an SDR
 ICC profile is not substituted for one.
 
-In HDR, compositor-launched Chromium is not given a forced color or raster
-profile. It follows the compositor's preferred Display P3 with extended-sRGB
-description. Forcing HDR10 while Chromium still submits an 8-bit `AB24` raster
-buffer creates an encoding mismatch and corrupts ordinary P3 images. SDR and
-linear-SDR use `--force-color-profile=display-p3-d65`.
-Desktop Linux/Ozone can still submit an 8-bit `AB24` window despite advertised
-`RGBA_1010102`/`AB30` DMA-BUF formats. FocalDesk detects and dithers that source
-before conversion. The final PQ target is kept stable and quantized directly
-to 10 bits; monitors with an 8-bit+FRC panel perform their own temporal
-dithering from those 10-bit input codes. HDR10 scanout stays BT.2020/PQ.
-Advertising PQ on 8-bit windows made the W-test reds clip together and broke
-still shading.
+### Chromium HDR color-management validation
+
+Chromium must start after the compositor so it can bind FocalDesk's
+`wp_color_manager_v1` global. To record the negotiation, start the FocalDesk
+session with:
+
+```toml
+[session_environment]
+FOCALDESK_WP_COLOR_TRACE = "1"
+```
+
+Then fully exit Chrome, launch it again as a native Wayland client, and inspect
+`/tmp/focaldesk-wp-color.trace`. A negotiated path records the Chrome client
+binding the manager, requesting the output image description, and applying a
+surface description. Image-description information includes the advertised
+primaries, transfer function, primary and target luminance, MaxCLL, and
+MaxFALL. The trace contains process credentials and protocol object IDs but no
+page contents.
+
+The compositor advertises only full-range identity RGB through
+`wp_color_representation_v1`. It deliberately does not advertise YCbCr matrix,
+limited-range, chroma-location, straight-alpha, or optical-premultiplication
+support until those conversions exist in the GLES import path. Chrome can
+therefore fall back to compositing video into its color-managed RGB surface
+instead of receiving a falsely advertised direct YUV path.
+
+Final HDR tone-map metadata is selected from the client and popup render
+elements belonging to the output being encoded. HDR content on another output
+or an inactive workspace does not change this output's roll-off.
+
+Compositor-launched Chromium uses `--force-color-profile=display-p3-d65` for
+both SDR and HDR outputs. Current desktop Chromium can otherwise choose a PQ
+surface while continuing to allocate an 8-bit `AB24` Wayland buffer, producing
+severe visible quantization. Keeping browser composition in Display P3 with an
+sRGB transfer preserves smooth wide-gamut SDR; FocalDesk converts that FP16
+scene to BT.2020/PQ at final scanout. Native browser HDR is intentionally
+deferred until Chromium reliably supplies AB30 or FP16 buffers.
+Desktop Linux/Ozone can still retag that same 8-bit `AB24` window as
+Display-P3/PQ when it enters an HDR output despite the forced profile. FocalDesk
+does not advertise PQ or HLG as supported client transfers to Chromium, keeping
+its window raster in Display-P3/extended-sRGB before quantization. Other clients
+retain PQ and HLG support. As a defensive fallback, FocalDesk also normalizes the
+contradictory Display-P3/PQ/AB24 combination back to Display-P3/sRGB at import.
+True 10-bit PQ buffers keep their PQ description, and final HDR10 scanout stays
+BT.2020/PQ.
 Named BT.2020 panels still prefer BT.2020+PQ. Blink reports `color-gamut: p3`
 for HDR, not `rec2020`. PQ encode maps the scene directly into BT.2020.
-`ext_srgb` is still advertised so clients that actually use extended
-sRGB can tag it directly. 8-bit `AB24` is decoded as Display P3 sRGB-HDR, not
-ST.2084; 10-bit packed RGB can keep PQ. Decode applies hue-preserving
-triangular dither to those 8-bit sRGB-HDR samples before linearization so skies
-do not stair-step into purple and blue slabs; it cannot invent the missing
-codes. FP16 surfaces tagged PQ decode as
+`ext_srgb` is still advertised so clients that actually use extended sRGB can
+tag it directly. A Display-P3/PQ `AB24` surface is treated as Display-P3/sRGB;
+other PQ surfaces retain ST.2084. Decode applies hue-preserving triangular
+dither to 8-bit code values before linearization.
+FP16 surfaces tagged PQ decode as
 Rec.709 linear HDR. linux-dmabuf feedback prefers FP16 and 10-bit RGB so
 Chrome can upgrade off 8-bit. The factory ICC white is often warm and is not
 used for HDR. PQ scanout tone-maps highlight luminance into about 450 nits of

@@ -568,7 +568,10 @@ impl ChromeShaders {
                 LINEAR_SCRGB_TO_PQ_FRAG,
                 &[
                     UniformName::new("u_max_nits", UniformType::_1f),
+                    UniformName::new("u_full_frame_nits", UniformType::_1f),
+                    UniformName::new("u_black_level_nits", UniformType::_1f),
                     UniformName::new("u_sdr_white_nits", UniformType::_1f),
+                    UniformName::new("u_source_peak_nits", UniformType::_1f),
                     UniformName::new("u_saturation", UniformType::_1f),
                     UniformName::new("u_midtone_gamma", UniformType::_1f),
                     UniformName::new("u_calibration_pattern", UniformType::_1f),
@@ -1518,7 +1521,7 @@ mod tests {
 
     #[test]
     fn hdr_pq_encode_tone_maps_luminance_instead_of_per_channel_clip() {
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("tone_map_nits(y, 10000.0, u_max_nits"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(u_source_peak_nits, u_max_nits)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.8)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mapped / y"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(10000.0))"));
@@ -1528,9 +1531,18 @@ mod tests {
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_midtone_gamma"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(panel - vec3(panel_y)) * u_saturation"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pow(normalized, u_midtone_gamma"));
-        assert!(!LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("float pq_output_dither()"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(a - b) / 1023.0"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq + vec3(pq_output_dither())"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_calibration_pattern"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("calibration_pattern_nits(v_coords)"));
+        assert!(
+            LINEAR_SCRGB_TO_PQ_FRAG
+                .contains("calibration_pattern_nits(v_coords, u_calibration_pattern)")
+        );
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(black * 4.0)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(u_sdr_white_nits)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("inside ? vec3(u_max_nits)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(u_full_frame_nits)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.2627"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.6780"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.0593"));
@@ -1592,6 +1604,13 @@ mod tests {
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 bt1886_to_linear(vec3 c)"));
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return bt1886_to_linear(c);"));
         assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_decode_tf >= 3.5 && u_decode_tf < 4.5"));
+    }
+
+    #[test]
+    fn client_decode_supports_hlg_with_reference_white_headroom() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 hlg_to_scene_linear(vec3 c)"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return hlg_to_scene_linear(c);"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("pow(reference, 1.2)"));
     }
 
     #[test]
@@ -1691,6 +1710,22 @@ vec3 pq_to_scene_linear(vec3 c) {
     return nits / max(u_reference_white_nits, 1.0);
 }
 
+vec3 hlg_to_scene_linear(vec3 c) {
+    // BT.2100 HLG inverse OETF followed by the nominal 1000-nit display OOTF.
+    // Normalize signal level 0.75 to scene reference white, retaining the
+    // highlight headroom above diffuse white.
+    const float a = 0.17883277;
+    const float b = 0.28466892;
+    const float c0 = 0.55991073;
+    vec3 low = c * c / 3.0;
+    vec3 high = (exp((c - c0) / a) + b) / 12.0;
+    // Both branches meet at 0.5, so step keeps this valid in the shared
+    // GLSL ES 1.00/3.00 subset without converting a boolean vector to floats.
+    vec3 scene = mix(low, high, step(vec3(0.5), c));
+    float reference = (exp((0.75 - c0) / a) + b) / 12.0;
+    return pow(max(scene, vec3(0.0)), vec3(1.2)) / pow(reference, 1.2);
+}
+
 vec3 dither_code_value(vec3 c) {
     // 8-bit client surfaces have 256 steps regardless of their transfer tag.
     // Triangular dither in code value breaks up contours before the nonlinear
@@ -1724,7 +1759,10 @@ vec3 decode_color(vec3 c) {
     if (u_decode_tf < 4.5) {
         return srgb_to_linear(c);
     }
-    return bt1886_to_linear(c);
+    if (u_decode_tf < 5.5) {
+        return bt1886_to_linear(c);
+    }
+    return hlg_to_scene_linear(c);
 }
 
 vec3 mul_mat3(vec3 v) {
@@ -2166,7 +2204,10 @@ precision mediump float;
 varying vec2 v_coords;
 uniform float alpha;
 uniform float u_max_nits;
+uniform float u_full_frame_nits;
+uniform float u_black_level_nits;
 uniform float u_sdr_white_nits;
+uniform float u_source_peak_nits;
 uniform float u_saturation;
 uniform float u_midtone_gamma;
 uniform float u_calibration_pattern;
@@ -2217,11 +2258,21 @@ float pq_oetf(float nits) {
     return pow((c1 + c2 * Lm) / (1.0 + c3 * Lm), m2);
 }
 
+float pq_output_dither() {
+    // The HDR target is RGB10. Decorrelate its quantization error with a
+    // stable triangular dither in electrical PQ code space. Use one value for
+    // all channels so neutral browser grays cannot acquire colored speckle.
+    vec2 p = floor(gl_FragCoord.xy);
+    float a = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+    float b = fract(52.9829189 * fract(dot(p, vec2(0.00583715, 0.06711056)) + 0.38196601));
+    return (a - b) / 1023.0;
+}
+
 float bt2020_luminance(vec3 nits) {
     return dot(nits, vec3(0.2627, 0.6780, 0.0593));
 }
 
-vec3 calibration_pattern_nits(vec2 coords) {
+vec3 calibration_overview_nits(vec2 coords) {
     // Upper half: fixed 100/203/300-nit neutrals and the configured peak.
     // Lower half: equal-200-nit BT.2020 primaries plus a 0-to-peak ramp.
     // Primary channel values exceed their luminance by the reciprocal luma
@@ -2252,16 +2303,46 @@ vec3 calibration_pattern_nits(vec2 coords) {
     return vec3(ramp * u_max_nits);
 }
 
+vec3 calibration_pattern_nits(vec2 coords, float pattern) {
+    if (pattern < 1.5) {
+        return calibration_overview_nits(coords);
+    }
+    if (pattern < 2.5) {
+        // Signal black followed by the selected mastering minimum and two
+        // multiples. Adjust until the second column is barely distinguishable.
+        float black = max(u_black_level_nits, 0.001);
+        if (coords.x < 0.25) return vec3(0.0);
+        if (coords.x < 0.50) return vec3(black);
+        if (coords.x < 0.75) return vec3(black * 2.0);
+        return vec3(black * 4.0);
+    }
+    if (pattern < 3.5) {
+        return vec3(u_sdr_white_nits);
+    }
+    if (pattern < 4.5) {
+        // A centered 10%-area peak window on signal black, matching common
+        // HDR calibration measurements without triggering full-field ABL.
+        vec2 distance_from_center = abs(coords - vec2(0.5));
+        bool inside = distance_from_center.x < 0.158114
+            && distance_from_center.y < 0.158114;
+        return inside ? vec3(u_max_nits) : vec3(0.0);
+    }
+    return vec3(u_full_frame_nits);
+}
+
 float tone_map_nits(float value, float source_peak, float display_peak, float white) {
     float knee = max(white, display_peak * 0.8);
-    if (value <= knee || display_peak <= knee) {
+    if (value <= knee || display_peak <= knee || source_peak <= display_peak) {
         return min(value, display_peak);
     }
     float peak = max(source_peak, knee + 0.0001);
     float range = max(display_peak - knee, 0.0001);
     float denominator = 1.0 - exp(-(peak - knee) / range);
     float numerator = 1.0 - exp(-(value - knee) / range);
-    return knee + range * numerator / max(denominator, 0.0001);
+    return min(
+        knee + range * numerator / max(denominator, 0.0001),
+        display_peak
+    );
 }
 
 void main() {
@@ -2273,7 +2354,7 @@ void main() {
     bool calibration = u_calibration_pattern > 0.5;
     vec3 nits;
     if (calibration) {
-        nits = calibration_pattern_nits(v_coords);
+        nits = calibration_pattern_nits(v_coords, u_calibration_pattern);
     } else {
         vec3 panel = compress_to_panel_gamut(mul_mat3(scene_linear));
         float panel_y = max(dot(panel, u_panel_luma), 0.0);
@@ -2290,11 +2371,19 @@ void main() {
             nits *= shaped / y;
             y = shaped;
         }
-        float mapped = tone_map_nits(y, 10000.0, u_max_nits, u_sdr_white_nits);
+        float mapped = tone_map_nits(
+            y,
+            max(u_source_peak_nits, u_max_nits),
+            u_max_nits,
+            u_sdr_white_nits
+        );
         nits *= mapped / y;
     }
     nits = min(nits, vec3(10000.0));
     vec3 pq = clamp(vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b)), 0.0, 1.0);
+    if (!calibration) {
+        pq = clamp(pq + vec3(pq_output_dither()), 0.0, 1.0);
+    }
     float output_alpha = calibration ? 1.0 : src.a;
     gl_FragColor = vec4(pq * output_alpha, output_alpha) * alpha;
 }

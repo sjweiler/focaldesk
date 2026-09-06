@@ -59,6 +59,10 @@ const TASK_SHELF_BUTTON_WIDTH: i32 = 48;
 const TASK_SHELF_GROUP_GAP: i32 = 4;
 // Outer padding/border and spacing, the separator, and the two utility buttons.
 const TASK_SHELF_FIXED_WIDTH: i32 = 151;
+// Focus follows the pointer across outputs, so the rail's active-output accent
+// must not wait on the slower background-status refresh cadence.
+const RAIL_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const BACKGROUND_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SHELL_CSS_BASE: &str = include_str!("shell.css");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -231,7 +235,7 @@ struct ShelfWidgets {
 
 #[derive(Clone)]
 struct ShelfOverflowUi {
-    surface: gtk::Box,
+    revealer: gtk::Revealer,
     title: gtk::Label,
     list: gtk::Box,
     window: glib::WeakRef<gtk::ApplicationWindow>,
@@ -241,9 +245,14 @@ fn build_shelf_overflow_ui(
     window: &gtk::ApplicationWindow,
     shelf_state: &Rc<RefCell<ShelfWidgets>>,
 ) -> ShelfOverflowUi {
+    let revealer = gtk::Revealer::new();
+    revealer.set_transition_type(gtk::RevealerTransitionType::SlideUp);
+    revealer.set_transition_duration(180);
+
     let surface = gtk::Box::new(gtk::Orientation::Vertical, 8);
     surface.add_css_class("shelf-overflow-surface");
-    surface.set_visible(false);
+    surface.add_css_class("shell-surface");
+    revealer.set_child(Some(&surface));
 
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     header.add_css_class("shelf-overflow-header");
@@ -254,16 +263,12 @@ fn build_shelf_overflow_ui(
     let close = gtk::Button::from_icon_name("window-close-symbolic");
     close.add_css_class("shelf-overflow-close");
     close.set_tooltip_text(Some("Close window list"));
-    let close_surface = surface.clone();
+    let close_revealer = revealer.clone();
     let close_window = window.downgrade();
     let close_state = shelf_state.clone();
     close.connect_clicked(move |_| {
-        close_surface.set_visible(false);
-        if let Some(window) = close_window.upgrade() {
-            window.set_default_size(TASK_SHELF_WIDTH, TASK_SHELF_HEIGHT);
-        }
+        dismiss_shelf_overflow(&close_revealer, &close_window, &close_state);
         let mut state = close_state.borrow_mut();
-        state.overflow_open = false;
         state.hide_after = Some(Instant::now() + TASK_SHELF_HIDE_DELAY);
     });
     header.append(&close);
@@ -279,7 +284,7 @@ fn build_shelf_overflow_ui(
     surface.append(&scroller);
 
     ShelfOverflowUi {
-        surface,
+        revealer,
         title,
         list,
         window: window.downgrade(),
@@ -304,11 +309,12 @@ fn build_dock(
 
     let shelf = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     shelf.add_css_class("task-shelf");
+    shelf.add_css_class("shell-surface");
     shelf.set_halign(gtk::Align::Center);
     shelf.set_valign(gtk::Align::Center);
     let root = gtk::Box::new(gtk::Orientation::Vertical, 10);
     root.add_css_class("task-shelf-root");
-    root.append(&overflow_ui.surface);
+    root.append(&overflow_ui.revealer);
     root.append(&shelf);
     window.set_child(Some(&root));
 
@@ -401,7 +407,7 @@ fn build_dock(
     });
     window.add_controller(pointer);
 
-    let snapshots = start_snapshot_poll(&window);
+    let snapshots = start_snapshot_poll(&window, BACKGROUND_SNAPSHOT_POLL_INTERVAL);
     let capacity_email_button = email_button.clone();
     let weak_window = window.downgrade();
     glib::timeout_add_local(Duration::from_millis(100), move || {
@@ -837,24 +843,47 @@ fn present_shelf_overflow(
         let row_state = shelf_state.clone();
         row.connect_clicked(move |_| {
             send_action(DesktopAction::FocusWindow { window_id: id });
-            row_ui.surface.set_visible(false);
-            if let Some(window) = row_ui.window.upgrade() {
-                window.set_default_size(TASK_SHELF_WIDTH, TASK_SHELF_HEIGHT);
-            }
+            dismiss_shelf_overflow(&row_ui.revealer, &row_ui.window, &row_state);
             let mut state = row_state.borrow_mut();
-            state.overflow_open = false;
             state.hide_after = Some(Instant::now() + TASK_SHELF_HIDE_DELAY);
         });
         ui.list.append(&row);
     }
-    ui.surface.set_visible(true);
     if let Some(window) = ui.window.upgrade() {
         window.set_default_size(760, 300);
         window.present();
     }
+    ui.revealer.set_reveal_child(true);
     let mut state = shelf_state.borrow_mut();
     state.overflow_open = true;
     state.hide_after = None;
+}
+
+fn dismiss_shelf_overflow(
+    revealer: &gtk::Revealer,
+    window: &glib::WeakRef<gtk::ApplicationWindow>,
+    shelf_state: &Rc<RefCell<ShelfWidgets>>,
+) {
+    revealer.set_reveal_child(false);
+    shelf_state.borrow_mut().overflow_open = false;
+
+    let revealer = revealer.downgrade();
+    let window = window.clone();
+    let shelf_state = shelf_state.clone();
+    glib::timeout_add_local_once(Duration::from_millis(190), move || {
+        if shelf_state.borrow().overflow_open {
+            return;
+        }
+        if revealer
+            .upgrade()
+            .is_some_and(|revealer| revealer.reveals_child())
+        {
+            return;
+        }
+        if let Some(window) = window.upgrade() {
+            window.set_default_size(TASK_SHELF_WIDTH, TASK_SHELF_HEIGHT);
+        }
+    });
 }
 
 fn shelf_window_label(entry: &ShelfOverflowEntry, index: usize) -> String {
@@ -1161,7 +1190,7 @@ fn build_panel(
         update_clock(&clock, clock_format);
         glib::ControlFlow::Continue
     });
-    let snapshots = start_snapshot_poll(&window);
+    let snapshots = start_snapshot_poll(&window, BACKGROUND_SNAPSHOT_POLL_INTERVAL);
     let weak_window = window.downgrade();
     glib::timeout_add_local(Duration::from_millis(100), move || {
         let Some(_window) = weak_window.upgrade() else {
@@ -1340,6 +1369,7 @@ fn build_panel(
 
     let rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
     rail.add_css_class("system-rail");
+    rail.add_css_class("shell-surface");
     let rail_overlay = gtk::Overlay::new();
     rail_overlay.set_child(Some(&rail));
     let focus_notch = gtk::Box::new(gtk::Orientation::Horizontal, 0);
@@ -1536,9 +1566,9 @@ fn build_panel(
         glib::ControlFlow::Continue
     });
 
-    let snapshots = start_snapshot_poll(&window);
+    let snapshots = start_snapshot_poll(&window, RAIL_SNAPSHOT_POLL_INTERVAL);
     let weak_window = window.downgrade();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
+    glib::timeout_add_local(RAIL_SNAPSHOT_POLL_INTERVAL, move || {
         let Some(_window) = weak_window.upgrade() else {
             return glib::ControlFlow::Break;
         };
@@ -1907,7 +1937,10 @@ fn desktop_snapshot() -> Option<DesktopSnapshot> {
     }
 }
 
-fn start_snapshot_poll(window: &gtk::ApplicationWindow) -> Arc<Mutex<Option<DesktopSnapshot>>> {
+fn start_snapshot_poll(
+    window: &gtk::ApplicationWindow,
+    interval: Duration,
+) -> Arc<Mutex<Option<DesktopSnapshot>>> {
     let latest = Arc::new(Mutex::new(None));
     let stopped = Arc::new(AtomicBool::new(false));
     let stopped_on_close = stopped.clone();
@@ -1924,7 +1957,7 @@ fn start_snapshot_poll(window: &gtk::ApplicationWindow) -> Arc<Mutex<Option<Desk
                     *slot = Some(snapshot);
                 }
             }
-            thread::sleep(Duration::from_millis(500));
+            thread::sleep(interval);
         }
     });
     latest
@@ -1983,6 +2016,7 @@ fn install_theme() {
 struct ThemeSnapshot {
     name: String,
     font_scale: f64,
+    animations: bool,
     shell_style: ShellStyle,
     panel_position: PanelPosition,
     panel_corner_radius: f64,
@@ -1993,9 +2027,11 @@ struct ThemeSnapshot {
 
 fn active_theme_snapshot() -> ThemeSnapshot {
     let config = load_config();
+    let settings = load_settings();
     ThemeSnapshot {
         name: config.appearance.theme,
         font_scale: config.appearance.font_scale,
+        animations: settings.appearance.animations,
         shell_style: config.shell.style,
         panel_position: config.panel.position,
         panel_corner_radius: config.panel.corner_radius,
@@ -2008,6 +2044,9 @@ fn active_theme_snapshot() -> ThemeSnapshot {
 fn apply_theme_snapshot(provider: &gtk::CssProvider, snapshot: &ThemeSnapshot) {
     let theme = theme_by_name(&snapshot.name);
     provider.load_from_string(&shell_css_configured(&theme, snapshot));
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_enable_animations(snapshot.animations);
+    }
 }
 
 /// Generate the GTK shell stylesheet from shared FocalDesk theme tokens.
@@ -2018,6 +2057,7 @@ pub fn shell_css(theme: &FlowTheme, font_scale: f64) -> String {
         &ThemeSnapshot {
             name: defaults.appearance.theme,
             font_scale,
+            animations: true,
             shell_style: defaults.shell.style,
             panel_position: defaults.panel.position,
             panel_corner_radius: defaults.panel.corner_radius,
@@ -2078,7 +2118,11 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
     .join("\n");
     let radius = theme.chrome.corner_radius.max(3.0);
     let border_width = theme.chrome.border_width.max(1.0);
-    let transition_ms = (150.0 / theme.animation_speed.max(0.1)).round() as u32;
+    let transition_ms = if snapshot.animations {
+        (150.0 / theme.animation_speed.max(0.1)).round() as u32
+    } else {
+        0
+    };
     let font_scale = snapshot.font_scale.clamp(0.75, 1.5);
     let panel_radius = snapshot.panel_corner_radius.clamp(0.0, 48.0);
     let dock_radius = snapshot.dock_corner_radius.clamp(0.0, 48.0);
@@ -2153,7 +2197,9 @@ mod tests {
         shelf_window_label, shell_css, shell_css_configured, window_belongs_to_output,
         window_overlaps_shelf, ShelfOverflowEntry, ShellRole, ThemeSnapshot,
     };
-    use focaldesk_config::{ClockFormat, DockPosition, DockSize, PanelPosition, ShellStyle};
+    use focaldesk_config::{
+        ClockFormat, DockPosition, DockSize, FocalDeskConfig, PanelPosition, ShellStyle,
+    };
     use focaldesk_ipc::{OutputSnapshot, WindowSnapshot};
     use focaldesk_themes::theme_by_name;
 
@@ -2180,6 +2226,7 @@ mod tests {
             &ThemeSnapshot {
                 name: "Eagle".into(),
                 font_scale: 1.0,
+                animations: true,
                 shell_style: ShellStyle::Attached,
                 panel_position: PanelPosition::Top,
                 panel_corner_radius: 16.0,
@@ -2192,6 +2239,28 @@ mod tests {
         assert!(css.contains("border-radius: 0 0 16.0px 16.0px"));
         assert!(css.contains("border-radius: 0 24.0px 24.0px 0"));
         assert!(css.contains("min-height: 36px"));
+        assert!(css.contains(".shell-surface"));
+    }
+
+    #[test]
+    fn shell_css_disables_transitions_when_motion_is_reduced() {
+        let defaults = FocalDeskConfig::default();
+        let css = shell_css_configured(
+            &theme_by_name("Eagle"),
+            &ThemeSnapshot {
+                name: "Eagle".into(),
+                font_scale: 1.0,
+                animations: false,
+                shell_style: defaults.shell.style,
+                panel_position: defaults.panel.position,
+                panel_corner_radius: defaults.panel.corner_radius,
+                dock_position: defaults.dock.position,
+                dock_corner_radius: defaults.dock.corner_radius,
+                dock_size: defaults.dock.size,
+            },
+        );
+
+        assert!(css.contains("transition-duration: 0ms"));
     }
 
     #[test]

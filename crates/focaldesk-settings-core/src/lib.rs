@@ -96,18 +96,57 @@ pub struct OutputConfig {
 /// consumed after the compositor has independently selected a guarded HDR10
 /// output path.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct HdrAppearance {
+    pub black_level_nits: f32,
     pub reference_white_nits: f32,
     pub peak_nits: f32,
+    #[serde(default = "legacy_hdr_full_frame_peak_nits")]
+    pub full_frame_peak_nits: f32,
     pub saturation: f32,
     pub midtone_gamma: f32,
+}
+
+fn legacy_hdr_full_frame_peak_nits() -> f32 {
+    // Valid for every legacy peak setting; users can then measure upward.
+    203.0
+}
+
+/// Session-only absolute-luminance stimulus shown by the final HDR10 encoder.
+/// This is intentionally not part of `DisplayConfig`, so calibration cannot
+/// accidentally replace the desktop after a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HdrCalibrationPattern {
+    #[default]
+    Off,
+    Overview,
+    NearBlack,
+    ReferenceWhite,
+    PeakWindow,
+    PeakFullFrame,
+}
+
+impl HdrCalibrationPattern {
+    pub const fn shader_value(self) -> f32 {
+        match self {
+            Self::Off => 0.0,
+            Self::Overview => 1.0,
+            Self::NearBlack => 2.0,
+            Self::ReferenceWhite => 3.0,
+            Self::PeakWindow => 4.0,
+            Self::PeakFullFrame => 5.0,
+        }
+    }
 }
 
 impl Default for HdrAppearance {
     fn default() -> Self {
         Self {
+            black_level_nits: 0.05,
             reference_white_nits: 203.0,
             peak_nits: 450.0,
+            full_frame_peak_nits: 300.0,
             saturation: 1.0,
             midtone_gamma: 1.0,
         }
@@ -115,20 +154,27 @@ impl Default for HdrAppearance {
 }
 
 impl HdrAppearance {
-    // The current HDR10 metadata contract advertises a 450-nit mastering
-    // ceiling. Shader tuning must not create pixels above that promise.
+    // The current HDR10 path supports a conservative 450-nit mastering
+    // ceiling. KMS metadata follows the selected per-output peak.
     pub const REFERENCE_WHITE_RANGE: std::ops::RangeInclusive<f32> = 80.0..=450.0;
     pub const PEAK_RANGE: std::ops::RangeInclusive<f32> = 203.0..=450.0;
+    pub const BLACK_LEVEL_RANGE: std::ops::RangeInclusive<f32> = 0.0..=0.25;
+    pub const FULL_FRAME_PEAK_RANGE: std::ops::RangeInclusive<f32> = 80.0..=450.0;
     pub const SATURATION_RANGE: std::ops::RangeInclusive<f32> = 0.75..=1.25;
     pub const MIDTONE_GAMMA_RANGE: std::ops::RangeInclusive<f32> = 0.70..=1.50;
 
     pub fn validate(self) -> Result<Self, &'static str> {
-        if !self.reference_white_nits.is_finite()
+        if !self.black_level_nits.is_finite()
+            || !self.reference_white_nits.is_finite()
             || !self.peak_nits.is_finite()
+            || !self.full_frame_peak_nits.is_finite()
             || !self.saturation.is_finite()
             || !self.midtone_gamma.is_finite()
         {
             return Err("HDR appearance values must be finite");
+        }
+        if !Self::BLACK_LEVEL_RANGE.contains(&self.black_level_nits) {
+            return Err("HDR black level is outside the supported range");
         }
         if !Self::REFERENCE_WHITE_RANGE.contains(&self.reference_white_nits) {
             return Err("HDR reference white is outside the supported range");
@@ -138,6 +184,12 @@ impl HdrAppearance {
         }
         if self.reference_white_nits > self.peak_nits {
             return Err("HDR reference white cannot exceed peak luminance");
+        }
+        if !Self::FULL_FRAME_PEAK_RANGE.contains(&self.full_frame_peak_nits) {
+            return Err("HDR full-frame peak is outside the supported range");
+        }
+        if self.full_frame_peak_nits > self.peak_nits {
+            return Err("HDR full-frame peak cannot exceed peak luminance");
         }
         if !Self::SATURATION_RANGE.contains(&self.saturation) {
             return Err("HDR saturation is outside the supported range");
@@ -672,11 +724,28 @@ mod tests {
     #[test]
     fn hdr_appearance_defaults_are_neutral_and_valid() {
         let appearance = HdrAppearance::default();
+        assert_eq!(appearance.black_level_nits, 0.05);
         assert_eq!(appearance.reference_white_nits, 203.0);
         assert_eq!(appearance.peak_nits, 450.0);
+        assert_eq!(appearance.full_frame_peak_nits, 300.0);
         assert_eq!(appearance.saturation, 1.0);
         assert_eq!(appearance.midtone_gamma, 1.0);
         assert_eq!(appearance.validate(), Ok(appearance));
+    }
+
+    #[test]
+    fn hdr_appearance_old_json_receives_calibration_defaults() {
+        let appearance: HdrAppearance = serde_json::from_value(serde_json::json!({
+            "reference_white_nits": 203.0,
+            "peak_nits": 400.0,
+            "saturation": 1.0,
+            "midtone_gamma": 1.0
+        }))
+        .unwrap();
+        assert_eq!(appearance.black_level_nits, 0.05);
+        assert_eq!(appearance.full_frame_peak_nits, 203.0);
+        assert_eq!(appearance.peak_nits, 400.0);
+        assert!(appearance.validate().is_ok());
     }
 
     #[test]

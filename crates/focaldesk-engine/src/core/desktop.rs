@@ -89,8 +89,8 @@ use focaldesk_power::{
 use focaldesk_settings_core::{
     load_settings, rearm_exclusive_hdr_for_next_session, AppSettings, BrowserLaunchBackend,
     ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings, DisplayColorProfile,
-    HdrAppearance, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
-    PowerButtonAction, PowerSettings, PrivacySettings, WorkspaceSettings,
+    HdrAppearance, HdrCalibrationPattern, LidCloseAction, LowBatteryAction, OutputConfig,
+    PerformanceMode, PowerButtonAction, PowerSettings, PrivacySettings, WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::atlas::IconId;
@@ -622,6 +622,8 @@ pub struct OutputState {
     /// Creative parameters for the final PQ shader only. This never controls
     /// whether KMS HDR is requested or active.
     pub hdr_appearance: HdrAppearance,
+    /// Transient compositor-generated stimulus used while calibrating HDR.
+    pub hdr_calibration_pattern: HdrCalibrationPattern,
     /// EDID Type-1 HDR static metadata (nits), when detected.
     pub edid_hdr_max_luminance_nits: Option<f32>,
     pub edid_hdr_max_fall_nits: Option<f32>,
@@ -838,6 +840,8 @@ pub struct DesktopInit {
     pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub color_management_state:
         crate::core::wayland::color_management_protocol::ColorManagementState,
+    pub color_representation_state:
+        crate::core::wayland::color_representation_protocol::ColorRepresentationState,
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     pub backend_kind: BackendKind,
     pub cursor_manager: CursorManager,
@@ -928,6 +932,8 @@ pub struct DesktopState {
     pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub color_management_state:
         crate::core::wayland::color_management_protocol::ColorManagementState,
+    pub color_representation_state:
+        crate::core::wayland::color_representation_protocol::ColorRepresentationState,
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
@@ -1790,17 +1796,27 @@ impl DesktopState {
         self.last_power_snapshot = None;
         // Force a fresh battery/AC snapshot on the next timer pass after wake.
         self.last_power_poll_at = Instant::now() - focaldesk_power::command_timeout();
-        self.render.invalidate_gpu_state();
+        self.invalidate_gpu_state();
         for output_id in self.hdr_outputs_to_restore_after_resume.drain(..) {
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.hdr_requested = output.hdr_supported;
             }
         }
         for output in self.desktop_outputs.values_mut() {
-            output.egui.invalidate_gpu_state();
             output.egui.refresh_power_status_now();
         }
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    /// Drop compositor-owned resources tied to the current EGL context.
+    ///
+    /// This is also used by the DRM recovery path before it replaces a
+    /// renderer, not only by ordinary suspend/resume.
+    pub(crate) fn invalidate_gpu_state(&mut self) {
+        self.render.invalidate_gpu_state();
+        for output in self.desktop_outputs.values_mut() {
+            output.egui.invalidate_gpu_state();
+        }
     }
 
     pub(crate) fn handle_session_suspend(&mut self) {
@@ -2053,6 +2069,12 @@ impl DesktopState {
                 Ok(()) => Some(IpcResponse::Ok),
                 Err(message) => Some(IpcResponse::Error { message }),
             },
+            IpcRequest::SetHdrCalibrationPattern { connector, pattern } => {
+                match self.set_hdr_calibration_pattern(&connector, pattern) {
+                    Ok(()) => Some(IpcResponse::Ok),
+                    Err(message) => Some(IpcResponse::Error { message }),
+                }
+            }
             IpcRequest::GetDisplayRuntimeStatus => Some(IpcResponse::DisplayRuntimeStatus {
                 outputs: self.runtime_display_statuses(),
             }),
@@ -2632,6 +2654,27 @@ impl DesktopState {
             return Err(format!("unknown display connector: {connector}"));
         };
         output.hdr_appearance = appearance;
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        self.mark_redraw();
+        Ok(())
+    }
+
+    fn set_hdr_calibration_pattern(
+        &mut self,
+        connector: &str,
+        pattern: HdrCalibrationPattern,
+    ) -> Result<(), String> {
+        let Some(output) = self
+            .outputs
+            .values_mut()
+            .find(|output| output.handle.name() == connector)
+        else {
+            return Err(format!("unknown display connector: {connector}"));
+        };
+        if pattern != HdrCalibrationPattern::Off && !output.hdr_enabled {
+            return Err(format!("HDR is not active on {connector}"));
+        }
+        output.hdr_calibration_pattern = pattern;
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
         self.mark_redraw();
         Ok(())
@@ -5097,6 +5140,12 @@ impl DesktopState {
         interaction: PowerActionInteraction,
     ) {
         if matches!(action, PowerIpcRequest::Suspend) {
+            // Every suspend entry point (power menu, idle timer, lid, low
+            // battery, and power button) must leave the same locked state
+            // behind. PrepareForSleep can arrive too late to render before the
+            // machine sleeps, but this in-memory state survives and is the
+            // first frame shown after resume.
+            self.lock_session();
             self.unattended_suspend_state = if interaction == PowerActionInteraction::NonInteractive
             {
                 Some(UnattendedSuspendState::Requested { at: Instant::now() })
@@ -5617,6 +5666,7 @@ impl DesktopState {
                 hdr_verification_pending: false,
                 hdr_enabled: false,
                 hdr_appearance: HdrAppearance::default(),
+                hdr_calibration_pattern: HdrCalibrationPattern::Off,
                 edid_hdr_max_luminance_nits: None,
                 edid_hdr_max_fall_nits: None,
                 active_workspace: WorkspaceId(1),
@@ -6807,6 +6857,7 @@ impl DesktopState {
             image_copy_capture_sessions: Vec::new(),
             color_tag_state: init.color_tag_state,
             color_management_state: init.color_management_state,
+            color_representation_state: init.color_representation_state,
             cursor_shape_state: init.cursor_shape_state,
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
@@ -9109,6 +9160,7 @@ impl DesktopState {
                     hdr_verification_pending: false,
                     hdr_enabled: false,
                     hdr_appearance: HdrAppearance::default(),
+                    hdr_calibration_pattern: HdrCalibrationPattern::Off,
                     edid_hdr_max_luminance_nits: None,
                     edid_hdr_max_fall_nits: None,
                     active_workspace: WorkspaceId(1),
@@ -10221,12 +10273,10 @@ fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
         "--no-default-browser-check".to_string(),
         "--new-window".to_string(),
     ];
-    // Match focal-launchd's policy: HDR follows wp_color's preferred
-    // Display-P3/extended-sRGB description. Forcing HDR10 can mismatch the
-    // encoding of Chrome's commonly submitted 8-bit AB24 raster buffer.
-    if !hdr_output_active {
-        args.insert(2, "--force-color-profile=display-p3-d65".to_string());
-    }
+    // Match focal-launchd's policy: avoid PQ in Chrome's commonly submitted
+    // 8-bit AB24 buffer. FocalDesk promotes the P3/sRGB scene to HDR in FP16.
+    let _ = hdr_output_active;
+    args.insert(2, "--force-color-profile=display-p3-d65".to_string());
     args
 }
 
@@ -10707,11 +10757,11 @@ mod tests {
     }
 
     #[test]
-    fn chromium_hdr_follows_wayland_preferred_color() {
+    fn chromium_hdr_avoids_eight_bit_pq_surfaces() {
         let args = chrome_command_args(false, true);
-        assert!(!args
+        assert!(args
             .iter()
-            .any(|arg| arg.starts_with("--force-color-profile=")));
+            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
         assert!(!args
             .iter()
             .any(|arg| arg.starts_with("--force-raster-color-profile=")));

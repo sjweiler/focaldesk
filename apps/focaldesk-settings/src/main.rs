@@ -17,8 +17,8 @@ use focaldesk_permissions::{
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
     BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, ExclusiveHdrPhase, ExclusiveHdrState,
-    HdrAppearance, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
-    PowerButtonAction, Settings,
+    HdrAppearance, HdrCalibrationPattern, LidCloseAction, LowBatteryAction, OutputConfig,
+    PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 use focaldesk_themes::{
@@ -85,6 +85,14 @@ const DISPLAY_COLOR_PROFILE_OPTIONS: &[&str] = &["Auto", "sRGB", "Display P3"];
 const HDR_APPEARANCE_PRESET_OPTIONS: &[&str] =
     &["Neutral (BT.2408)", "Bright room", "Punchy OLED", "Custom"];
 const HDR_APPEARANCE_CUSTOM_PRESET: u32 = 3;
+const HDR_CALIBRATION_PATTERN_OPTIONS: &[&str] = &[
+    "Off",
+    "Overview",
+    "Near-black steps",
+    "Reference-white field",
+    "10% peak window",
+    "Full-field peak",
+];
 const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("launch_terminal", "Open terminal", "Super+Enter"),
     ("launch_browser", "Open browser", "Super+B"),
@@ -307,6 +315,21 @@ fn set_live_hdr_appearance(connector: &str, appearance: HdrAppearance) -> Result
         Ok(IpcResponse::Ok) => Ok(()),
         Ok(IpcResponse::Error { message }) => Err(message),
         Ok(other) => Err(format!("unexpected HDR appearance response: {other:?}")),
+        Err(err) => Err(err),
+    }
+}
+
+fn set_live_hdr_calibration_pattern(
+    connector: &str,
+    pattern: HdrCalibrationPattern,
+) -> Result<(), String> {
+    match send_desktop_request(&IpcRequest::SetHdrCalibrationPattern {
+        connector: connector.to_string(),
+        pattern,
+    }) {
+        Ok(IpcResponse::Ok) => Ok(()),
+        Ok(IpcResponse::Error { message }) => Err(message),
+        Ok(other) => Err(format!("unexpected HDR calibration response: {other:?}")),
         Err(err) => Err(err),
     }
 }
@@ -1624,8 +1647,10 @@ fn save_display_change(
 
 #[derive(Clone, Copy)]
 enum HdrAppearanceField {
+    BlackLevel,
     ReferenceWhite,
     Peak,
+    FullFramePeak,
     Saturation,
     MidtoneGamma,
 }
@@ -1634,14 +1659,18 @@ fn hdr_appearance_preset(selected: u32) -> Option<HdrAppearance> {
     match selected {
         0 => Some(HdrAppearance::default()),
         1 => Some(HdrAppearance {
+            black_level_nits: 0.05,
             reference_white_nits: 250.0,
             peak_nits: 450.0,
+            full_frame_peak_nits: 300.0,
             saturation: 1.0,
             midtone_gamma: 0.90,
         }),
         2 => Some(HdrAppearance {
+            black_level_nits: 0.05,
             reference_white_nits: 203.0,
             peak_nits: 450.0,
+            full_frame_peak_nits: 300.0,
             saturation: 1.10,
             midtone_gamma: 1.10,
         }),
@@ -1653,6 +1682,17 @@ fn hdr_appearance_preset_index(appearance: HdrAppearance) -> u32 {
     (0..HDR_APPEARANCE_CUSTOM_PRESET)
         .find(|selected| hdr_appearance_preset(*selected) == Some(appearance))
         .unwrap_or(HDR_APPEARANCE_CUSTOM_PRESET)
+}
+
+fn hdr_calibration_pattern(selected: u32) -> HdrCalibrationPattern {
+    match selected {
+        1 => HdrCalibrationPattern::Overview,
+        2 => HdrCalibrationPattern::NearBlack,
+        3 => HdrCalibrationPattern::ReferenceWhite,
+        4 => HdrCalibrationPattern::PeakWindow,
+        5 => HdrCalibrationPattern::PeakFullFrame,
+        _ => HdrCalibrationPattern::Off,
+    }
 }
 
 fn hdr_tuning_scale(min: f64, max: f64, step: f64, value: f32, digits: i32) -> gtk::Scale {
@@ -1674,8 +1714,10 @@ fn start_hdr_appearance_preview(
     generation: Rc<Cell<u64>>,
     suppress: Rc<Cell<bool>>,
     status: adw::ActionRow,
+    black_level: gtk::Scale,
     reference_white: gtk::Scale,
     peak: gtk::Scale,
+    full_frame_peak: gtk::Scale,
     saturation: gtk::Scale,
     midtone_gamma: gtk::Scale,
     preset: gtk::DropDown,
@@ -1708,8 +1750,10 @@ fn start_hdr_appearance_preview(
         suppress.set(true);
         *draft.borrow_mut() = rollback;
         preset.set_selected(hdr_appearance_preset_index(rollback));
+        black_level.set_value(f64::from(rollback.black_level_nits));
         reference_white.set_value(f64::from(rollback.reference_white_nits));
         peak.set_value(f64::from(rollback.peak_nits));
+        full_frame_peak.set_value(f64::from(rollback.full_frame_peak_nits));
         saturation.set_value(f64::from(rollback.saturation));
         midtone_gamma.set_value(f64::from(rollback.midtone_gamma));
         suppress.set(false);
@@ -1728,8 +1772,10 @@ fn connect_hdr_appearance_scale(
     generation: Rc<Cell<u64>>,
     suppress: Rc<Cell<bool>>,
     status: adw::ActionRow,
+    black_level: gtk::Scale,
     reference_white: gtk::Scale,
     peak: gtk::Scale,
+    full_frame_peak: gtk::Scale,
     saturation: gtk::Scale,
     midtone_gamma: gtk::Scale,
     preset: gtk::DropDown,
@@ -1741,6 +1787,7 @@ fn connect_hdr_appearance_scale(
         let mut appearance = *draft.borrow();
         let value = scale.value() as f32;
         match field {
+            HdrAppearanceField::BlackLevel => appearance.black_level_nits = value,
             HdrAppearanceField::ReferenceWhite => {
                 appearance.reference_white_nits = value;
                 if appearance.peak_nits < value {
@@ -1756,6 +1803,21 @@ fn connect_hdr_appearance_scale(
                     appearance.reference_white_nits = value;
                     suppress.set(true);
                     reference_white.set_value(f64::from(value));
+                    suppress.set(false);
+                }
+                if appearance.full_frame_peak_nits > value {
+                    appearance.full_frame_peak_nits = value;
+                    suppress.set(true);
+                    full_frame_peak.set_value(f64::from(value));
+                    suppress.set(false);
+                }
+            }
+            HdrAppearanceField::FullFramePeak => {
+                appearance.full_frame_peak_nits = value;
+                if appearance.peak_nits < value {
+                    appearance.peak_nits = value;
+                    suppress.set(true);
+                    peak.set_value(f64::from(value));
                     suppress.set(false);
                 }
             }
@@ -1774,8 +1836,10 @@ fn connect_hdr_appearance_scale(
             generation.clone(),
             suppress.clone(),
             status.clone(),
+            black_level.clone(),
             reference_white.clone(),
             peak.clone(),
+            full_frame_peak.clone(),
             saturation.clone(),
             midtone_gamma.clone(),
             preset.clone(),
@@ -1796,8 +1860,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
     section.set_title("HDR appearance tuning");
     section.set_subtitle("Final PQ shader only; does not change HDR signaling or display modes");
 
+    let black_level = hdr_tuning_scale(0.0, 0.25, 0.005, initial.black_level_nits, 3);
     let reference_white = hdr_tuning_scale(80.0, 450.0, 1.0, initial.reference_white_nits, 0);
     let peak = hdr_tuning_scale(203.0, 450.0, 1.0, initial.peak_nits, 0);
+    let full_frame_peak = hdr_tuning_scale(80.0, 450.0, 1.0, initial.full_frame_peak_nits, 0);
     let saturation = hdr_tuning_scale(0.75, 1.25, 0.01, initial.saturation, 2);
     let midtone_gamma = hdr_tuning_scale(0.70, 1.50, 0.01, initial.midtone_gamma, 2);
     let preset = gtk::DropDown::from_strings(HDR_APPEARANCE_PRESET_OPTIONS);
@@ -1809,7 +1875,22 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
     preset_row.add_suffix(&preset);
     section.add_row(&preset_row);
 
+    let calibration_pattern = gtk::DropDown::from_strings(HDR_CALIBRATION_PATTERN_OPTIONS);
+    calibration_pattern.set_selected(0);
+    let calibration_row = adw::ActionRow::new();
+    calibration_row.set_title("Calibration pattern");
+    calibration_row.set_subtitle(
+        "Session only; move Settings to another display before selecting a full-screen target",
+    );
+    calibration_row.add_suffix(&calibration_pattern);
+    section.add_row(&calibration_row);
+
     for (title, subtitle, control) in [
+        (
+            "Black level",
+            "Set until the second near-black band is barely distinguishable from signal black",
+            &black_level,
+        ),
         (
             "Reference white",
             "Diffuse desktop white in nits; neutral default is 203",
@@ -1817,8 +1898,13 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
         ),
         (
             "Peak luminance",
-            "Highlight roll-off target in nits; bounded by current HDR10 metadata",
+            "10% highlight target in nits; use the centered peak window",
             &peak,
+        ),
+        (
+            "Full-frame peak",
+            "Sustained full-screen white in nits; exported as MaxFALL",
+            &full_frame_peak,
         ),
         (
             "Saturation",
@@ -1850,9 +1936,30 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
     status.add_suffix(&buttons);
     section.add_row(&status);
 
+    {
+        let connector = connector.clone();
+        let status = status.clone();
+        calibration_pattern.connect_selected_notify(move |selector| {
+            let pattern = hdr_calibration_pattern(selector.selected());
+            match set_live_hdr_calibration_pattern(&connector, pattern) {
+                Ok(()) if pattern == HdrCalibrationPattern::Off => {
+                    status.set_subtitle("Calibration pattern disabled");
+                }
+                Ok(()) => {
+                    status.set_subtitle(
+                        "Calibration target active on the HDR display; select Off when finished",
+                    );
+                }
+                Err(message) => status.set_subtitle(&format!("Calibration unavailable: {message}")),
+            }
+        });
+    }
+
     for (scale, field) in [
+        (&black_level, HdrAppearanceField::BlackLevel),
         (&reference_white, HdrAppearanceField::ReferenceWhite),
         (&peak, HdrAppearanceField::Peak),
+        (&full_frame_peak, HdrAppearanceField::FullFramePeak),
         (&saturation, HdrAppearanceField::Saturation),
         (&midtone_gamma, HdrAppearanceField::MidtoneGamma),
     ] {
@@ -1865,8 +1972,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
             generation.clone(),
             suppress.clone(),
             status.clone(),
+            black_level.clone(),
             reference_white.clone(),
             peak.clone(),
+            full_frame_peak.clone(),
             saturation.clone(),
             midtone_gamma.clone(),
             preset.clone(),
@@ -1880,8 +1989,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
         let generation = generation.clone();
         let suppress = suppress.clone();
         let status = status.clone();
+        let black_level = black_level.clone();
         let reference_white = reference_white.clone();
         let peak = peak.clone();
+        let full_frame_peak = full_frame_peak.clone();
         let saturation = saturation.clone();
         let midtone_gamma = midtone_gamma.clone();
         preset.connect_selected_notify(move |preset| {
@@ -1893,8 +2004,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
             };
             suppress.set(true);
             *draft.borrow_mut() = appearance;
+            black_level.set_value(f64::from(appearance.black_level_nits));
             reference_white.set_value(f64::from(appearance.reference_white_nits));
             peak.set_value(f64::from(appearance.peak_nits));
+            full_frame_peak.set_value(f64::from(appearance.full_frame_peak_nits));
             saturation.set_value(f64::from(appearance.saturation));
             midtone_gamma.set_value(f64::from(appearance.midtone_gamma));
             suppress.set(false);
@@ -1906,8 +2019,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
                 generation.clone(),
                 suppress.clone(),
                 status.clone(),
+                black_level.clone(),
                 reference_white.clone(),
                 peak.clone(),
+                full_frame_peak.clone(),
                 saturation.clone(),
                 midtone_gamma.clone(),
                 preset.clone(),
@@ -1922,8 +2037,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
         let generation = generation.clone();
         let suppress = suppress.clone();
         let status = status.clone();
+        let black_level = black_level.clone();
         let reference_white = reference_white.clone();
         let peak = peak.clone();
+        let full_frame_peak = full_frame_peak.clone();
         let saturation = saturation.clone();
         let midtone_gamma = midtone_gamma.clone();
         let preset = preset.clone();
@@ -1932,8 +2049,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
             suppress.set(true);
             *draft.borrow_mut() = defaults;
             preset.set_selected(0);
+            black_level.set_value(f64::from(defaults.black_level_nits));
             reference_white.set_value(f64::from(defaults.reference_white_nits));
             peak.set_value(f64::from(defaults.peak_nits));
+            full_frame_peak.set_value(f64::from(defaults.full_frame_peak_nits));
             saturation.set_value(f64::from(defaults.saturation));
             midtone_gamma.set_value(f64::from(defaults.midtone_gamma));
             suppress.set(false);
@@ -1945,8 +2064,10 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
                 generation.clone(),
                 suppress.clone(),
                 status.clone(),
+                black_level.clone(),
                 reference_white.clone(),
                 peak.clone(),
+                full_frame_peak.clone(),
                 saturation.clone(),
                 midtone_gamma.clone(),
                 preset.clone(),

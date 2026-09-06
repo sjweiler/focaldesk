@@ -329,7 +329,7 @@ install-desktop: install-polkit
     @echo "Installed to {{desktop_bin}}:"
     @md5sum "{{desktop_bin}}"
     @bash -c 'b=$(md5sum target/release/focaldesk-desktop | cut -d" " -f1); i=$(md5sum "{{desktop_bin}}" | cut -d" " -f1); test "$b" = "$i" && echo "md5 OK: $i" || { echo "md5 MISMATCH: build=$b installed=$i" >&2; exit 1; }'
-    @if test -e /proc/driver/nvidia/version && rg -q 's2idle' /sys/power/mem_sleep; then sudo install -Dm644 packaging/systemd/sleep.conf.d/90-focaldesk-nvidia.conf /etc/systemd/sleep.conf.d/90-focaldesk-nvidia.conf; systemd-analyze cat-config systemd/sleep.conf | rg 'MemorySleepMode=s2idle'; echo "NVIDIA detected: installed the s2idle suspend workaround."; fi
+    @if test -e /proc/driver/nvidia/version && rg -q 's2idle' /sys/power/mem_sleep; then sudo install -Dm644 packaging/systemd/sleep.conf.d/90-focaldesk-nvidia.conf /etc/systemd/sleep.conf.d/90-focaldesk-nvidia.conf && printf '%s\n' s2idle | sudo tee /sys/power/mem_sleep >/dev/null && systemd-analyze cat-config systemd/sleep.conf | rg 'MemorySleepMode=s2idle' && rg -q '\[s2idle\]' /sys/power/mem_sleep && echo "NVIDIA detected: installed and activated the s2idle suspend workaround."; fi
 
 # Install or verify the workaround independently when troubleshooting NVIDIA
 # resume. install-desktop applies the same guarded configuration automatically;
@@ -338,8 +338,10 @@ install-nvidia-suspend-workaround:
     test -e /proc/driver/nvidia/version
     rg -q 's2idle' /sys/power/mem_sleep
     sudo install -Dm644 packaging/systemd/sleep.conf.d/90-focaldesk-nvidia.conf /etc/systemd/sleep.conf.d/90-focaldesk-nvidia.conf
+    printf '%s\n' s2idle | sudo tee /sys/power/mem_sleep >/dev/null
     systemd-analyze cat-config systemd/sleep.conf | rg 'MemorySleepMode=s2idle'
-    @echo "NVIDIA suspend workaround installed; the next suspend will use s2idle."
+    rg -q '\[s2idle\]' /sys/power/mem_sleep
+    @echo "NVIDIA suspend workaround installed and active; suspend will use s2idle."
 
 install-desktop-session:
     sudo install -Dm644 packaging/wayland-sessions/focaldesk.desktop /usr/share/wayland-sessions/focaldesk.desktop

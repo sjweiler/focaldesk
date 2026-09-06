@@ -22,6 +22,7 @@ use anyhow::{anyhow, Context, Result};
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::gles::{
     ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
@@ -368,6 +369,7 @@ pub fn apply_output_encode(
     targets: &mut LinearOffscreenTargets,
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
+    visible_source_peak_nits: Option<f32>,
 ) -> Result<Option<SyncPoint>> {
     targets.encoded_hdr = false;
     let output_state = state.outputs.get(&output_id);
@@ -400,19 +402,36 @@ pub fn apply_output_encode(
                 let appearance = output_state
                     .map(|output| output.hdr_appearance.validate().unwrap_or_default())
                     .unwrap_or_default();
+                let calibration_pattern = if crate::core::color::hdr_calibration_pattern_enabled() {
+                    1.0
+                } else {
+                    output_state
+                        .map(|output| output.hdr_calibration_pattern.shader_value())
+                        .unwrap_or(0.0)
+                };
                 match apply_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
                     appearance.peak_nits,
+                    appearance.full_frame_peak_nits,
+                    appearance.black_level_nits,
                     appearance.reference_white_nits,
+                    visible_source_peak_nits.unwrap_or(appearance.peak_nits),
                     output_hdr_panel_primaries(state, output_id),
                     appearance.saturation,
                     appearance.midtone_gamma,
+                    calibration_pattern,
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
+                        if hdr_kms_target {
+                            return Err(anyhow!(
+                                "HDR PQ encode failed for {:?} while KMS HDR is active: {err}",
+                                output_id
+                            ));
+                        }
                         flog_warn!(
                             "HDR PQ encode failed for {:?}: {err}; falling back to SDR encode",
                             output_id
@@ -420,12 +439,24 @@ pub fn apply_output_encode(
                     }
                 }
             } else {
+                if hdr_kms_target {
+                    return Err(anyhow!(
+                        "HDR render requested for {:?} while KMS HDR is active, but 10-bit offscreen is unavailable",
+                        output_id
+                    ));
+                }
                 flog_warn!(
                     "HDR render requested for {:?} but 10-bit offscreen is unavailable; using SDR encode",
                     output_id
                 );
             }
         } else {
+            if hdr_kms_target {
+                return Err(anyhow!(
+                    "HDR render requested for {:?} while KMS HDR is active, but EDID max luminance is missing",
+                    output_id
+                ));
+            }
             flog_warn!(
                 "HDR render requested for {:?} but EDID max luminance is missing; using SDR encode",
                 output_id
@@ -553,20 +584,24 @@ fn blit_with_shader(
 fn hdr_pq_shader_uniforms(
     panel: ColorPrimaries,
     max_nits: f32,
+    full_frame_nits: f32,
+    black_level_nits: f32,
     sdr_white_nits: f32,
+    source_peak_nits: f32,
     saturation: f32,
     midtone_gamma: f32,
+    calibration_pattern: f32,
 ) -> Vec<Uniform<'static>> {
     let (scene_to_panel, panel_to_bt2020, luma) = hdr10_pq_encode_transforms(panel);
     vec![
         Uniform::new("u_max_nits", max_nits),
+        Uniform::new("u_full_frame_nits", full_frame_nits),
+        Uniform::new("u_black_level_nits", black_level_nits),
         Uniform::new("u_sdr_white_nits", sdr_white_nits),
+        Uniform::new("u_source_peak_nits", source_peak_nits),
         Uniform::new("u_saturation", saturation),
         Uniform::new("u_midtone_gamma", midtone_gamma),
-        Uniform::new(
-            "u_calibration_pattern",
-            crate::core::color::hdr_calibration_pattern_enabled() as u8 as f32,
-        ),
+        Uniform::new("u_calibration_pattern", calibration_pattern),
         Uniform::new("u_m0", scene_to_panel[0]),
         Uniform::new("u_m1", scene_to_panel[1]),
         Uniform::new("u_m2", scene_to_panel[2]),
@@ -585,16 +620,41 @@ fn output_hdr_panel_primaries(state: &DesktopState, output_id: OutputId) -> Colo
         .unwrap_or(ColorPrimaries::Bt2020)
 }
 
+fn visible_hdr_source_peak_nits(
+    state: &DesktopState,
+    client_elements: &[FlowRenderElement],
+    popup_elements: &[FlowRenderElement],
+) -> Option<f32> {
+    maximum_valid_hdr_peak(
+        client_elements
+            .iter()
+            .chain(popup_elements)
+            .filter_map(|element| state.surface_colors.get(element.id()))
+            .map(|color| color.source_peak_nits),
+    )
+}
+
+fn maximum_valid_hdr_peak(peaks: impl IntoIterator<Item = f32>) -> Option<f32> {
+    peaks
+        .into_iter()
+        .filter(|peak| peak.is_finite() && *peak > 0.0)
+        .reduce(f32::max)
+}
+
 fn apply_hdr_pq_encode(
     state: &DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
     buffer_size: Size<i32, Physical>,
     max_nits: f32,
+    full_frame_nits: f32,
+    black_level_nits: f32,
     sdr_white_nits: f32,
+    source_peak_nits: f32,
     panel: ColorPrimaries,
     saturation: f32,
     midtone_gamma: f32,
+    calibration_pattern: f32,
 ) -> Result<Option<SyncPoint>> {
     let damage = full_damage(buffer_size);
     let sdr_to_scrgb = state
@@ -655,7 +715,17 @@ fn apply_hdr_pq_encode(
             .texture,
         buffer_size,
         scrgb_to_pq,
-        &hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits, saturation, midtone_gamma),
+        &hdr_pq_shader_uniforms(
+            panel,
+            max_nits,
+            full_frame_nits,
+            black_level_nits,
+            sdr_white_nits,
+            source_peak_nits,
+            saturation,
+            midtone_gamma,
+            calibration_pattern,
+        ),
         "linear-scRGB-to-PQ",
         &damage,
     )?;
@@ -960,12 +1030,16 @@ fn apply_linear_hdr_pq_encode(
     targets: &mut LinearOffscreenTargets,
     buffer_size: Size<i32, Physical>,
     max_nits: f32,
+    full_frame_nits: f32,
+    black_level_nits: f32,
     sdr_white_nits: f32,
+    source_peak_nits: f32,
     requested_damage: &[Rectangle<i32, Physical>],
     destination_current: bool,
     panel: ColorPrimaries,
     saturation: f32,
     midtone_gamma: f32,
+    calibration_pattern: f32,
 ) -> Result<SyncPoint> {
     let shader = state
         .render
@@ -984,8 +1058,17 @@ fn apply_linear_hdr_pq_encode(
             offscreen_texture_is_valid(targets.hdr_offscreen.as_ref(), buffer_size, format)
         });
     targets.ensure_hdr_offscreen(renderer, buffer_size)?;
-    let uniforms =
-        hdr_pq_shader_uniforms(panel, max_nits, sdr_white_nits, saturation, midtone_gamma);
+    let uniforms = hdr_pq_shader_uniforms(
+        panel,
+        max_nits,
+        full_frame_nits,
+        black_level_nits,
+        sdr_white_nits,
+        source_peak_nits,
+        saturation,
+        midtone_gamma,
+        calibration_pattern,
+    );
     let destination = &mut targets
         .hdr_offscreen
         .as_mut()
@@ -1019,6 +1102,7 @@ fn apply_linear_output_encode(
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     damage: &[Rectangle<i32, Physical>],
+    visible_source_peak_nits: Option<f32>,
 ) -> Result<SyncPoint> {
     let previous_encoded_scanout = targets.encoded_scanout;
     let previous_encoded_hdr = targets.encoded_hdr;
@@ -1052,26 +1136,55 @@ fn apply_linear_output_encode(
                 let appearance = output_state
                     .map(|output| output.hdr_appearance.validate().unwrap_or_default())
                     .unwrap_or_default();
+                let calibration_pattern = if crate::core::color::hdr_calibration_pattern_enabled() {
+                    1.0
+                } else {
+                    output_state
+                        .map(|output| output.hdr_calibration_pattern.shader_value())
+                        .unwrap_or(0.0)
+                };
                 match apply_linear_hdr_pq_encode(
                     state,
                     renderer,
                     targets,
                     buffer_size,
                     appearance.peak_nits,
+                    appearance.full_frame_peak_nits,
+                    appearance.black_level_nits,
                     appearance.reference_white_nits,
+                    visible_source_peak_nits.unwrap_or(appearance.peak_nits),
                     damage,
                     previous_encoded_hdr,
                     output_hdr_panel_primaries(state, output_id),
                     appearance.saturation,
                     appearance.midtone_gamma,
+                    calibration_pattern,
                 ) {
                     Ok(sync) => return Ok(sync),
-                    Err(err) => flog_warn!(
-                        "linear HDR PQ encode failed for {:?}: {err}; falling back to SDR",
-                        output_id
-                    ),
+                    Err(err) => {
+                        if hdr_kms_target {
+                            return Err(anyhow!(
+                                "linear HDR PQ encode failed for {:?} while KMS HDR is active: {err}",
+                                output_id
+                            ));
+                        }
+                        flog_warn!(
+                            "linear HDR PQ encode failed for {:?}: {err}; falling back to SDR",
+                            output_id
+                        );
+                    }
                 }
+            } else if hdr_kms_target {
+                return Err(anyhow!(
+                    "linear HDR render requested for {:?} while KMS HDR is active, but 10-bit offscreen is unavailable",
+                    output_id
+                ));
             }
+        } else if hdr_kms_target {
+            return Err(anyhow!(
+                "linear HDR render requested for {:?} while KMS HDR is active, but EDID max luminance is missing",
+                output_id
+            ));
         }
     }
 
@@ -1145,8 +1258,16 @@ fn finish_with_output_encode(
     output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     sync: SyncPoint,
+    visible_source_peak_nits: Option<f32>,
 ) -> Result<SyncPoint> {
-    match apply_output_encode(state, renderer, targets, output_id, buffer_size) {
+    match apply_output_encode(
+        state,
+        renderer,
+        targets,
+        output_id,
+        buffer_size,
+        visible_source_peak_nits,
+    ) {
         Ok(Some(encode_sync)) => Ok(encode_sync),
         Ok(None) => Ok(sync),
         Err(err) => {
@@ -1584,6 +1705,8 @@ pub fn run_linear_staged_pass(
 
     let client_elements = build_output_client_elements(state, renderer, output_id);
     let popup_elements = build_output_popup_elements(state, renderer, output_id);
+    let visible_source_peak_nits =
+        visible_hdr_source_peak_nits(state, &client_elements, &popup_elements);
     {
         let pass_started = Instant::now();
         let linear = targets
@@ -1768,6 +1891,7 @@ pub fn run_linear_staged_pass(
         output_id,
         buffer_size,
         &prepared.frame_ctx.damage,
+        visible_source_peak_nits,
     )?;
     if profile_timings {
         record_gpu_completion(
@@ -1882,7 +2006,7 @@ pub fn run_sdr_pass(
     targets.scene_linear = false;
     targets.ensure_offscreen(renderer, buffer_size)?;
 
-    let sync = {
+    let (sync, visible_source_peak_nits) = {
         let sdr = targets
             .offscreen
             .as_mut()
@@ -1892,6 +2016,8 @@ pub fn run_sdr_pass(
             .map_err(|e| anyhow!("bind offscreen for draw: {e}"))?;
         let client_elements = build_output_client_elements(state, renderer, output_id);
         let popup_elements = build_output_popup_elements(state, renderer, output_id);
+        let visible_source_peak_nits =
+            visible_hdr_source_peak_nits(state, &client_elements, &popup_elements);
         let mut frame = renderer
             .render(&mut target, buffer_size, Transform::Normal)
             .map_err(|e| anyhow!("begin offscreen frame: {e}"))?;
@@ -1906,11 +2032,20 @@ pub fn run_sdr_pass(
             output_state,
         )
         .map_err(|err| anyhow!("{err}"))?;
-        frame
+        let sync = frame
             .finish()
-            .map_err(|e| anyhow!("finish offscreen frame: {e}"))?
+            .map_err(|e| anyhow!("finish offscreen frame: {e}"))?;
+        (sync, visible_source_peak_nits)
     };
-    finish_with_output_encode(state, renderer, targets, output_id, buffer_size, sync)
+    finish_with_output_encode(
+        state,
+        renderer,
+        targets,
+        output_id,
+        buffer_size,
+        sync,
+        visible_source_peak_nits,
+    )
 }
 
 pub fn present_offscreen_texture(
@@ -1940,7 +2075,10 @@ pub fn present_offscreen_texture(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_hdr_encode_state, work_area_glass_pixels, work_area_glass_texture_size};
+    use super::{
+        maximum_valid_hdr_peak, resolve_hdr_encode_state, work_area_glass_pixels,
+        work_area_glass_texture_size,
+    };
     use crate::core::color::hdr_reference_white_nits;
     use crate::core::render::GlassStyle;
     use smithay::utils::{Physical, Size};
@@ -1963,6 +2101,15 @@ mod tests {
         assert!(pixels
             .chunks_exact(4)
             .all(|pixel| { pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3] }));
+    }
+
+    #[test]
+    fn visible_hdr_peak_ignores_sdr_and_invalid_metadata() {
+        assert_eq!(
+            maximum_valid_hdr_peak([0.0, f32::NAN, -1.0, 600.0, 1_000.0]),
+            Some(1_000.0)
+        );
+        assert_eq!(maximum_valid_hdr_peak([0.0, f32::NAN]), None);
     }
 
     #[test]

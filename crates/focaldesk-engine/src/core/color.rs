@@ -124,6 +124,8 @@ pub enum TransferFunction {
     Linear,
     /// SMPTE ST 2084 perceptual quantizer (HDR PQ scanout).
     St2084Pq,
+    /// ARIB STD-B67 / BT.2100 hybrid log-gamma.
+    Hlg,
     /// Piecewise sRGB extended above 1.0 (Wayland `ext_srgb`, Chromium `SRGB_HDR`).
     SrgbHdr,
 }
@@ -138,6 +140,7 @@ pub enum TransferDecodeMode {
     St2084Pq = 3,
     SrgbHdrExtended = 4,
     Bt1886 = 5,
+    Hlg = 6,
 }
 
 impl TransferFunction {
@@ -149,6 +152,7 @@ impl TransferFunction {
             Self::Linear => TransferDecodeMode::LinearPassThrough,
             Self::St2084Pq => TransferDecodeMode::St2084Pq,
             Self::SrgbHdr => TransferDecodeMode::SrgbHdrExtended,
+            Self::Hlg => TransferDecodeMode::Hlg,
         }
     }
 
@@ -159,6 +163,7 @@ impl TransferFunction {
             Self::Gamma22 => TransferDecodeMode::Gamma22,
             Self::Linear => TransferDecodeMode::SrgbPiecewise,
             Self::St2084Pq => TransferDecodeMode::St2084Pq,
+            Self::Hlg => TransferDecodeMode::Hlg,
         }
     }
 }
@@ -208,9 +213,14 @@ pub fn hdr_conservative_peak_nits(max_luminance_nits: f32) -> f32 {
     HDR_CONSERVATIVE_PEAK_NITS
 }
 
-/// CTA-861 Type-1 has no SDR-white field. MaxFALL carries BT.2408 graphics
-/// white so the monitor's global tone map treats desktop average as paper
-/// white instead of a full-frame 450-nit peak.
+/// CTA-861 Type-1 chromaticities for the BT.2020/D65 data sent to KMS.
+///
+/// These describe the encoded signal, not the receiving panel. DRM uses
+/// 0.00002 units, hence the 50,000 multiplier.
+pub const HDR10_BT2020_PRIMARIES: [(u16, u16); 3] =
+    [(35_400, 14_600), (8_500, 39_850), (6_550, 2_300)];
+pub const HDR10_D65_WHITE_POINT: (u16, u16) = (15_635, 16_450);
+
 pub fn hdr10_kms_max_luminance_nits() -> u16 {
     HDR_CONSERVATIVE_PEAK_NITS.round() as u16
 }
@@ -219,8 +229,12 @@ pub fn hdr10_kms_max_cll_nits() -> u16 {
     hdr10_kms_max_luminance_nits()
 }
 
+/// MaxFALL is a property of the pixels in a complete frame, not the HDR
+/// reference-white level. The compositor does not analyze every composed
+/// frame yet, so advertise it as unknown rather than putting 203-nit graphics
+/// white in a field with different semantics.
 pub fn hdr10_kms_max_fall_nits() -> u16 {
-    HDR_REFERENCE_WHITE_NITS.round() as u16
+    0
 }
 
 /// PQ-encode luminance map: keep graphics white and most in-range HDR.
@@ -232,14 +246,14 @@ pub fn tone_map_hdr_nits(value: f32, source_peak: f32, display_peak: f32, white:
     let display_peak = display_peak.max(1.0);
     let white = white.max(1.0).min(display_peak);
     let knee = white.max(display_peak * 0.8);
-    if value <= knee || display_peak <= knee {
+    if value <= knee || display_peak <= knee || source_peak <= display_peak {
         return value.min(display_peak);
     }
     let peak = source_peak.max(knee + 0.0001);
     let range = (display_peak - knee).max(0.0001);
     let denominator = 1.0 - (-(peak - knee) / range).exp();
     let numerator = 1.0 - (-(value - knee) / range).exp();
-    knee + range * numerator / denominator.max(0.0001)
+    (knee + range * numerator / denominator.max(0.0001)).min(display_peak)
 }
 
 impl ColorDescription {
@@ -446,25 +460,33 @@ pub enum ClientBufferEncoding {
     Float16,
 }
 
-/// Chrome's 8-bit HDR window is Display P3 with an sRGB-style transfer, even
-/// when it copies a PQ tag. PQ-decoding those samples clips both W-test reds
-/// to the same peak and wrecks still shading. 10-bit packed RGB can be real
-/// HDR10. FP16 tagged PQ is linear Rec.709, not ST.2084.
+/// Normalize client descriptions only when the buffer representation is known
+/// to contradict the tag.
+///
+/// Chromium currently retags its Display-P3 window as PQ or extended sRGB when
+/// it enters an HDR output while continuing to submit the same 8-bit AB24
+/// raster. Treating that raster as HDR changes its content-peak semantics and,
+/// for PQ, its luminance. Reinterpret both 8-bit P3 combinations as the same
+/// Display-P3/sRGB raster seen on an SDR output. An 8-bit UNORM buffer cannot
+/// represent extended-sRGB values outside 0..1 anyway. Genuine 10-bit PQ and
+/// FP16 extended-sRGB remain HDR. FP16 Chromium surfaces are the other
+/// exceptional case observed to contain linear scRGB-shaped samples while
+/// carrying a copied PQ tag.
 pub fn sanitize_tagged_client_description(
     description: ColorDescription,
     buffer: ClientBufferEncoding,
 ) -> ColorDescription {
     match buffer {
-        ClientBufferEncoding::Float16 if description.transfer == TransferFunction::St2084Pq => {
-            ColorDescription::SCRGB_LINEAR_HDR
-        }
-        ClientBufferEncoding::Unorm8 | ClientBufferEncoding::Unknown
+        ClientBufferEncoding::Unorm8
             if matches!(
                 description.transfer,
                 TransferFunction::St2084Pq | TransferFunction::SrgbHdr
-            ) =>
+            ) && description.primaries == ColorPrimaries::DisplayP3 =>
         {
-            ColorDescription::DISPLAY_P3_SRGB_HDR
+            ColorDescription::DISPLAY_P3_SRGB
+        }
+        ClientBufferEncoding::Float16 if description.transfer == TransferFunction::St2084Pq => {
+            ColorDescription::SCRGB_LINEAR_HDR
         }
         _ => description,
     }
@@ -474,7 +496,7 @@ pub fn sanitize_tagged_client_description(
 pub fn is_hdr_client_preferred_transfer(transfer: TransferFunction) -> bool {
     matches!(
         transfer,
-        TransferFunction::St2084Pq | TransferFunction::SrgbHdr
+        TransferFunction::St2084Pq | TransferFunction::SrgbHdr | TransferFunction::Hlg
     )
 }
 
@@ -502,6 +524,9 @@ pub struct SurfaceColorRenderState {
     /// Encoded-source bit depth for decode dither. GTK and Chrome commonly
     /// submit `AB24`; 10-bit/FP16 sources leave this at 0.
     pub src_bits: f32,
+    /// Content peak used by the final HDR tone mapper. Zero denotes SDR or
+    /// unknown metadata rather than inventing HDR headroom for every surface.
+    pub source_peak_nits: f32,
 }
 
 impl SurfaceColorRenderState {
@@ -513,6 +538,14 @@ impl SurfaceColorRenderState {
             intent,
             client_to_scene,
             src_bits: 0.0,
+            source_peak_nits: if is_hdr_client_preferred_transfer(description.transfer) {
+                description
+                    .max_cll_nits
+                    .unwrap_or(description.max_luminance_nits)
+                    .max(description.reference_white_nits)
+            } else {
+                0.0
+            },
         }
     }
 
@@ -1141,7 +1174,7 @@ mod tests {
     }
 
     #[test]
-    fn pq_tagged_chrome_buffers_decode_as_scrgb_linear_hdr() {
+    fn pq_tagged_chrome_buffers_match_their_actual_encoding() {
         let claimed = ColorDescription::bt2020_pq_hdr(409.0, 400.0);
         let fp16 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Float16);
         assert!(!fp16.is_windows_scrgb());
@@ -1155,14 +1188,32 @@ mod tests {
         assert_eq!(pq10.primaries, ColorPrimaries::Bt2020);
 
         let unorm8 = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unorm8);
-        assert_eq!(unorm8.transfer, TransferFunction::SrgbHdr);
-        assert_eq!(unorm8.primaries, ColorPrimaries::DisplayP3);
+        assert_eq!(unorm8.transfer, TransferFunction::St2084Pq);
+        assert_eq!(unorm8.primaries, ColorPrimaries::Bt2020);
         assert!(!unorm8.is_windows_scrgb());
+
+        let p3_pq = ColorDescription::display_p3_pq_hdr(450.0, 203.0);
+        let chrome = sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm8);
+        assert_eq!(chrome, ColorDescription::DISPLAY_P3_SRGB);
+
+        let p3_pq10 = sanitize_tagged_client_description(p3_pq, ClientBufferEncoding::Unorm10);
+        assert_eq!(p3_pq10, p3_pq);
+
+        let p3_extended = ColorDescription::DISPLAY_P3_SRGB_HDR;
+        let chrome_extended =
+            sanitize_tagged_client_description(p3_extended, ClientBufferEncoding::Unorm8);
+        assert_eq!(chrome_extended, ColorDescription::DISPLAY_P3_SRGB);
+        let p3_extended_fp16 =
+            sanitize_tagged_client_description(p3_extended, ClientBufferEncoding::Float16);
+        assert_eq!(p3_extended_fp16, p3_extended);
+
+        let unknown = sanitize_tagged_client_description(claimed, ClientBufferEncoding::Unknown);
+        assert_eq!(unknown, claimed);
     }
 
     #[test]
     fn eight_bit_clients_enable_decode_dither() {
-        let pq = ColorDescription::bt2020_pq_hdr(450.0, 400.0);
+        let pq = ColorDescription::display_p3_pq_hdr(450.0, 203.0);
         let eight = SurfaceColorRenderState::for_description(pq, RenderingIntent::Relative)
             .with_buffer_encoding(ClientBufferEncoding::Unorm8);
         assert_eq!(eight.src_bits, 8.0);
@@ -1181,7 +1232,8 @@ mod tests {
         let chrome_eight =
             SurfaceColorRenderState::for_description(chrome, RenderingIntent::Relative)
                 .with_buffer_encoding(ClientBufferEncoding::Unorm8);
-        assert_eq!(chrome.transfer, TransferFunction::SrgbHdr);
+        assert_eq!(chrome.transfer, TransferFunction::Srgb);
+        assert_eq!(chrome.primaries, ColorPrimaries::DisplayP3);
         assert_eq!(chrome_eight.src_bits, 8.0);
 
         let tagged = SurfaceColorRenderState::for_description(
@@ -1190,6 +1242,19 @@ mod tests {
         )
         .with_buffer_encoding(ClientBufferEncoding::Unorm8);
         assert_eq!(tagged.src_bits, 8.0);
+    }
+
+    #[test]
+    fn hdr_render_state_carries_content_peak_metadata() {
+        let description = ColorDescription::bt2020_pq_hdr(1_000.0, 400.0);
+        let render =
+            SurfaceColorRenderState::for_description(description, RenderingIntent::Relative);
+        assert_eq!(render.source_peak_nits, 1_000.0);
+        assert_eq!(
+            SurfaceColorRenderState::srgb_default().source_peak_nits,
+            0.0
+        );
+        assert_eq!(TransferFunction::Hlg.decode_mode(), TransferDecodeMode::Hlg);
     }
 
     #[test]
@@ -1467,7 +1532,18 @@ mod tests {
         assert_eq!(hdr_reference_white_nits(409.0), HDR_REFERENCE_WHITE_NITS);
         assert_eq!(hdr10_kms_max_luminance_nits(), 450);
         assert_eq!(hdr10_kms_max_cll_nits(), 450);
-        assert_eq!(hdr10_kms_max_fall_nits(), 203);
+        assert_eq!(hdr10_kms_max_fall_nits(), 0);
+        assert_eq!(HDR10_BT2020_PRIMARIES[0], (35_400, 14_600));
+        assert_eq!(HDR10_BT2020_PRIMARIES[1], (8_500, 39_850));
+        assert_eq!(HDR10_BT2020_PRIMARIES[2], (6_550, 2_300));
+        assert_eq!(HDR10_D65_WHITE_POINT, (15_635, 16_450));
+    }
+
+    #[test]
+    fn tone_map_uses_content_peak_and_never_exceeds_the_display() {
+        assert_eq!(tone_map_hdr_nits(400.0, 400.0, 450.0, 203.0), 400.0);
+        assert_eq!(tone_map_hdr_nits(1_000.0, 400.0, 450.0, 203.0), 450.0);
+        assert!(tone_map_hdr_nits(1_000.0, 1_000.0, 450.0, 203.0) <= 450.0);
     }
 
     #[test]

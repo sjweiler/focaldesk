@@ -433,7 +433,7 @@ fn window_prefers_output(space: &Space<Window>, window: &Window, output: &Output
 mod color_run_tests {
     use super::{
         clipped_dest_local_damage, contiguous_runs_by_key, preferred_output_index, semantic_color,
-        themed_icon_style, UiVisualState,
+        themed_icon_style, RenderState, UiVisualState,
     };
     use focaldesk_themes::{theme_by_name, SemanticTheme, ThemeColor};
     use smithay::utils::{Logical, Physical, Rectangle};
@@ -450,6 +450,17 @@ mod color_run_tests {
 
         assert_eq!(preferred_output_index(mostly_left, &outputs), Some(0));
         assert_eq!(preferred_output_index(mostly_right, &outputs), Some(1));
+    }
+
+    #[test]
+    fn gpu_invalidation_forces_wallpaper_reload() {
+        let mut render = RenderState::new();
+        render.wallpaper_path = Some("/tmp/focaldesk-wallpaper.png".to_string());
+
+        render.invalidate_gpu_state();
+
+        assert!(render.wallpaper_texture.is_none());
+        assert!(render.wallpaper_path.is_none());
     }
 
     #[test]
@@ -1879,6 +1890,10 @@ impl RenderState {
         self.glass_control_background_linear = false;
         self.glass_control_background_disabled = false;
         self.wallpaper_texture = None;
+        // ensure_wallpaper_loaded uses the cached path as its load-generation
+        // key.  Clearing only the texture makes it incorrectly treat the dead
+        // post-resume GPU cache as current and skip re-uploading the wallpaper.
+        self.wallpaper_path = None;
         self.sw_cursor_texture = None;
         self.sw_cursor_cache_key = None;
         self.font_atlas_texture = None;

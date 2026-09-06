@@ -168,6 +168,38 @@ Switch to another virtual terminal using the distribution's normal
 
 Do not enable undocumented HDR or atomic-commit overrides as a general fix.
 
+### Blank display after suspend
+
+First compare FocalDesk with another Wayland compositor on the same installed
+kernel, GPU driver, firmware, and display topology. If the other compositor
+resumes correctly, investigate FocalDesk's display-pipeline reconstruction
+before changing the kernel sleep mode.
+
+The DRM backend records monotonic `t_ms` values while moving through:
+
+```text
+Running -> Suspending -> SessionInactive -> Resuming -> Reprobing -> Modesetting -> Running
+```
+
+The journal should contain `prepare-for-sleep(true)`, rendering stopped and the
+number of abandoned flips, `prepare-for-sleep(false)`, DRM device activation,
+connector reprobe, the first post-resume atomic modeset being queued, and its
+page-flip completion. `render_frame` and `queue_frame` failures include their
+full debug error chain so a DRM errno is retained when the backend exposes one.
+
+After activation, FocalDesk resets connector and plane state through the
+existing libseat-owned DRM file descriptor. It then invalidates compositor GPU
+caches, requests full output damage, and uses the next frame as a complete
+modeset rather than reusing the pre-suspend page-flip state. Connector changes
+received while the session is inactive are deferred until ownership returns.
+
+For isolation, begin with one display at 60 Hz using SDR and 8-bit scanout, with
+the hardware cursor disabled. Re-enable native resolution, the hardware cursor,
+a second display, high refresh, 10-bit scanout, and HDR in that order. If minimal
+SDR resumes but HDR does not, capture the first post-resume commit failure and
+the connector HDR-property readback. If minimal SDR also fails, focus on the
+libseat activation, connector reprobe, and first modeset events.
+
 ## Build failures after an update
 
 Use the committed lockfile first:

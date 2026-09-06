@@ -845,6 +845,9 @@ pub(crate) fn bootstrap_compositor_core(
         crate::core::wayland::color_management_protocol::ColorManagementState::bind_global::<
             DesktopState,
         >(&dh);
+        crate::core::wayland::color_representation_protocol::ColorRepresentationState::bind_global::<
+            DesktopState,
+        >(&dh);
     }
     #[cfg(feature = "xwayland")]
     let xwayland_shell_state = XWaylandShellState::new::<DesktopState>(&dh);
@@ -958,6 +961,7 @@ pub(crate) fn bootstrap_compositor_core(
         image_copy_capture_state,
         color_tag_state: Default::default(),
         color_management_state: Default::default(),
+        color_representation_state: Default::default(),
         cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<
             DesktopState,
         >(&dh),

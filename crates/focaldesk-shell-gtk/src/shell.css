@@ -201,8 +201,8 @@ window.task-shelf-window {
   box-shadow: none;
 }
 
-.system-rail,
-.task-shelf {
+.shell-surface {
+  background-clip: padding-box;
   border: 1px solid alpha(@fd_shell_rim, 0.82);
   border-radius: 18px;
   box-shadow: 0 12px 36px alpha(@fd_shell_shadow, 0.72), inset 0 1px alpha(@fd_shell_highlight, 0.72), inset 1px 0 alpha(@fd_shell_highlight, 0.24);

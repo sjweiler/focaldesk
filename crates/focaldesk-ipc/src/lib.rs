@@ -9,7 +9,9 @@ pub mod updates;
 
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
-use focaldesk_settings_core::{ExclusiveHdrPhase, HdrAppearance, OutputConfig, Settings};
+use focaldesk_settings_core::{
+    ExclusiveHdrPhase, HdrAppearance, HdrCalibrationPattern, OutputConfig, Settings,
+};
 use focaldesk_themes::ThemeDocument;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -60,6 +62,11 @@ pub enum IpcRequest {
     SetHdrAppearance {
         connector: String,
         appearance: HdrAppearance,
+    },
+    /// Display a transient, compositor-generated HDR calibration stimulus.
+    SetHdrCalibrationPattern {
+        connector: String,
+        pattern: HdrCalibrationPattern,
     },
     GetDisplayRuntimeStatus,
     /// Returns a bounded, secret-free snapshot of compositor-owned desktop state.

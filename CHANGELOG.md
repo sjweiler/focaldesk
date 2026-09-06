@@ -62,6 +62,13 @@ version numbers where practical.
 
 ### Changed
 
+- DRM suspend/resume now uses explicit lifecycle states, abandons stale flip
+  bookkeeping, waits for libseat activation, resets connectors and planes,
+  reprobes resources, invalidates GPU caches, and forces a complete modeset with
+  timestamped recovery diagnostics.
+- Extended Wayland color-management negotiation and HDR calibration controls,
+  including RGB color-representation advertising, per-output client metadata,
+  live KMS metadata refresh, and session-only calibration patterns.
 - NVIDIA multi-output HDR permission now preserves each monitor's independent
   HDR/SDR request instead of promoting every capable sibling to HDR10.
 - Documented a successful Fedora 44 and NVIDIA 595-series HDR10 configuration,

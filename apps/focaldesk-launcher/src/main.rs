@@ -9,7 +9,7 @@ use focaldesk_logging::init_default_logging;
 use focaldesk_settings_core::load_settings;
 use focaldesk_themes::{gtk_app_css, gtk_app_prefers_dark, theme_by_name, GtkAppThemeOptions};
 use gtk::{gdk, gio, glib};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::process::Command;
 use std::rc::Rc;
 use std::time::Duration;
@@ -42,6 +42,8 @@ struct LauncherView {
     window: adw::ApplicationWindow,
     state: Rc<RefCell<LauncherState>>,
     toasts: ToastOverlay,
+    animations: Rc<RefCell<Vec<adw::TimedAnimation>>>,
+    render_generation: Rc<Cell<u64>>,
 }
 
 type QuickLaunchEntry = (&'static str, &'static str, Box<dyn Fn() -> String>);
@@ -472,6 +474,9 @@ fn app_search_score(name: &str, query: &str) -> Option<u8> {
 
 impl LauncherView {
     fn render(&self, category: &str, query: &str) {
+        self.animations.borrow_mut().clear();
+        let generation = self.render_generation.get().wrapping_add(1);
+        self.render_generation.set(generation);
         while let Some(child) = self.flow.first_child() {
             self.flow.remove(&child);
         }
@@ -527,6 +532,7 @@ impl LauncherView {
                 .cmp(score_b)
                 .then_with(|| file_a.name.to_lowercase().cmp(&file_b.name.to_lowercase()))
         });
+        let animate_results = load_settings().appearance.animations;
 
         for (index, (_, app)) in matches.iter().enumerate() {
             let button = app_button(app, &self.window, &self.state, &self.toasts);
@@ -534,6 +540,7 @@ impl LauncherView {
                 button.add_css_class("launcher-best-match");
             }
             self.flow.insert(&button, -1);
+            self.animate_result(&button, index, generation, animate_results);
         }
 
         let app_match_count = matches.len();
@@ -543,6 +550,12 @@ impl LauncherView {
                 button.add_css_class("launcher-best-match");
             }
             self.flow.insert(&button, -1);
+            self.animate_result(
+                &button,
+                app_match_count + index,
+                generation,
+                animate_results,
+            );
         }
 
         if matches.is_empty() && file_matches.is_empty() {
@@ -570,6 +583,33 @@ impl LauncherView {
             self.results.set_visible_child_name("apps");
         }
     }
+
+    fn animate_result(&self, button: &gtk::Button, index: usize, generation: u64, enabled: bool) {
+        if !enabled {
+            return;
+        }
+
+        button.set_opacity(0.0);
+        let weak_button = button.downgrade();
+        let target = adw::CallbackAnimationTarget::new(move |value| {
+            if let Some(button) = weak_button.upgrade() {
+                button.set_opacity(value);
+            }
+        });
+        let animation = adw::TimedAnimation::new(button, 0.0, 1.0, 180, target);
+        animation.set_easing(adw::Easing::EaseOutCubic);
+        self.animations.borrow_mut().push(animation.clone());
+
+        let render_generation = self.render_generation.clone();
+        glib::timeout_add_local_once(
+            Duration::from_millis((index.min(8) as u64) * 24),
+            move || {
+                if render_generation.get() == generation {
+                    animation.play();
+                }
+            },
+        );
+    }
 }
 
 fn build_ui(app: &adw::Application) {
@@ -581,10 +621,11 @@ fn build_ui(app: &adw::Application) {
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 12);
     root.add_css_class("launcher-root");
-    root.set_margin_top(16);
-    root.set_margin_bottom(16);
-    root.set_margin_start(16);
-    root.set_margin_end(16);
+    root.add_css_class("shell-surface");
+    root.set_margin_top(10);
+    root.set_margin_bottom(14);
+    root.set_margin_start(14);
+    root.set_margin_end(14);
 
     let header = adw::HeaderBar::new();
     let toolbar_view = adw::ToolbarView::new();
@@ -672,6 +713,7 @@ fn build_ui(app: &adw::Application) {
     let results = gtk::Stack::new();
     results.set_vexpand(true);
     results.set_transition_type(gtk::StackTransitionType::Crossfade);
+    results.set_transition_duration(180);
     results.add_named(&scroll, Some("apps"));
     results.add_named(&empty_state.widget(), Some("empty"));
     root.append(&results);
@@ -686,6 +728,8 @@ fn build_ui(app: &adw::Application) {
         window: window.clone(),
         state: launcher_state.clone(),
         toasts,
+        animations: Rc::new(RefCell::new(Vec::new())),
+        render_generation: Rc::new(Cell::new(0)),
     };
     for category in CATEGORIES {
         let button = gtk::ToggleButton::with_label(category);

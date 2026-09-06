@@ -69,6 +69,19 @@ fn is_cursor_executable_name(exe_name: &str) -> bool {
     matches!(exe_name, "cursor" | "cursor-bin")
 }
 
+fn is_chromium_executable_name(exe_name: &str) -> bool {
+    matches!(
+        exe_name,
+        "chrome"
+            | "google-chrome"
+            | "google-chrome-stable"
+            | "google-chrome-beta"
+            | "google-chrome-unstable"
+            | "chromium"
+            | "chromium-browser"
+    )
+}
+
 fn client_exe_basename(
     credentials: &crate::core::wayland::client::ClientCredentials,
 ) -> Option<String> {
@@ -95,6 +108,20 @@ fn client_is_cursor(client: &Client) -> bool {
     };
 
     is_cursor_executable_name(exe_name.as_ref())
+}
+
+fn client_is_chromium(client: &Client) -> bool {
+    let Some(client_state) = client.get_data::<ClientState>() else {
+        return false;
+    };
+    let Some(credentials) = client_state.credentials else {
+        return false;
+    };
+    let Some(exe_name) = client_exe_basename(&credentials) else {
+        return false;
+    };
+
+    is_chromium_executable_name(exe_name.as_ref())
 }
 
 fn send_image_description_ready(
@@ -459,7 +486,10 @@ fn windows_scrgb_supported() -> bool {
     crate::core::color::linear_sdr_runtime_enabled()
 }
 
-fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
+fn send_manager_advertisement(
+    manager: &wp_color_manager_v1::WpColorManagerV1,
+    advertise_hdr_transfers: bool,
+) {
     use wp_color_manager_v1::{Feature, Primaries, RenderIntent, TransferFunction};
 
     manager.supported_intent(RenderIntent::Perceptual);
@@ -468,7 +498,6 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_feature(Feature::IccV2V4);
     manager.supported_feature(Feature::Parametric);
     manager.supported_feature(Feature::SetPrimaries);
-    manager.supported_feature(Feature::SetTfPower);
     manager.supported_feature(Feature::SetLuminances);
     manager.supported_feature(Feature::SetMasteringDisplayPrimaries);
     manager.supported_feature(Feature::ExtendedTargetVolume);
@@ -479,7 +508,10 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_tf_named(TransferFunction::Bt1886);
     manager.supported_tf_named(TransferFunction::Gamma22);
     manager.supported_tf_named(TransferFunction::ExtLinear);
-    manager.supported_tf_named(TransferFunction::St2084Pq);
+    if advertise_hdr_transfers {
+        manager.supported_tf_named(TransferFunction::St2084Pq);
+        manager.supported_tf_named(TransferFunction::Hlg);
+    }
     // Chromium maps gfx::ColorSpace::SRGB → WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB
     // and SRGB_HDR → EXT_SRGB. Without ExtSrgb it copies the preferred PQ
     // description onto linear/sRGB-HDR window buffers.
@@ -491,7 +523,7 @@ fn send_manager_advertisement(manager: &wp_color_manager_v1::WpColorManagerV1) {
     manager.supported_primaries_named(Primaries::DisplayP3);
     manager.supported_primaries_named(Primaries::Bt2020);
     manager.done();
-    wp_color_trace!("manager advertisement sent");
+    wp_color_trace!("manager advertisement sent advertise_hdr_transfers={advertise_hdr_transfers}");
 }
 
 fn fail_image_description(
@@ -674,8 +706,10 @@ fn init_inert_image_description_info<D>(
 fn primary_luminance_wire_values(description: &ColorDescription) -> (u32, u32, u32) {
     // Minimum is wire ×10000; maximum/reference are unscaled cd/m².
     let pq = description.transfer == CoreTransferFunction::St2084Pq;
-    let hdr_volume = crate::core::color::is_hdr_client_preferred_transfer(description.transfer)
-        || description.is_windows_scrgb();
+    let absolute_hdr_signal = matches!(
+        description.transfer,
+        CoreTransferFunction::St2084Pq | CoreTransferFunction::SrgbHdr
+    ) || description.is_windows_scrgb();
     let min_nits: f32 = if pq { 0.005 } else { 0.2 };
     let min_lum = (min_nits * 10_000.0).round() as u32;
     // ST 2084 and extended sRGB advertise a 10,000-nit signal volume. The
@@ -683,7 +717,7 @@ fn primary_luminance_wire_values(description: &ColorDescription) -> (u32, u32, u
     // separately below. Advertising the panel peak here causes clients such
     // as Chromium to construct a malformed HDR output color space when mapping
     // SDR video into the HDR surface.
-    let max_lum = if hdr_volume {
+    let max_lum = if absolute_hdr_signal {
         10_000
     } else {
         description.max_luminance_nits.round().max(1.0) as u32
@@ -741,7 +775,7 @@ fn sanitize_client_color_description(
 ) -> ColorDescription {
     if description.transfer == CoreTransferFunction::St2084Pq {
         flog_warn!(
-            "wp color: surface={:?} tagged PQ; 8-bit decodes as P3 sRGB-HDR, 10-bit keeps PQ, FP16 decodes as Rec.709 linear HDR",
+            "wp color: surface={:?} tagged PQ; Display-P3 AB24 is normalized to its sRGB raster, 10-bit keeps PQ, FP16 decodes as Rec.709 linear HDR",
             surface.id()
         );
     }
@@ -772,9 +806,7 @@ fn send_canonical_sdr_image_description_info(
     info.tf_named(TransferFunction::CompoundPower24);
     let (min_lum, max_lum, reference_lum) = primary_luminance_wire_values(&ColorDescription::SRGB);
     info.luminances(min_lum, max_lum, reference_lum);
-    if info.version() >= 2 {
-        info.target_luminance(min_lum, max_lum);
-    }
+    info.target_luminance(min_lum, max_lum);
     queue_image_description_info_done(info, state);
 }
 
@@ -821,15 +853,14 @@ fn emit_image_description_info_events(
         }
         CoreTransferFunction::Linear => TransferFunction::ExtLinear,
         CoreTransferFunction::St2084Pq => TransferFunction::St2084Pq,
+        CoreTransferFunction::Hlg => TransferFunction::Hlg,
     };
     info.tf_named(tf_named);
 
     let (primary_min_lum, primary_max_lum, reference_lum) =
         primary_luminance_wire_values(description);
     info.luminances(primary_min_lum, primary_max_lum, reference_lum);
-    if info.version() >= 2
-        && crate::core::color::is_hdr_client_preferred_transfer(description.transfer)
-    {
+    if crate::core::color::is_hdr_client_preferred_transfer(description.transfer) {
         // Chromium uses target primaries to construct the HDR display
         // color volume. Omitting this event leaves its HDR target
         // metadata incomplete, which can collapse P3 content and produce
@@ -850,16 +881,26 @@ fn emit_image_description_info_events(
     // display target volume. PQ's primary volume remains the fixed
     // 10,000-nit ST 2084 signal swing, while target_luminance carries the
     // real panel/content peak.
-    if info.version() >= 2 {
-        let (target_min_lum, target_max_lum) = target_luminance_wire_values(description);
-        info.target_luminance(target_min_lum, target_max_lum);
-        if let Some(max_cll) = description.max_cll_nits {
-            info.target_max_cll(max_cll.round().max(1.0) as u32);
-        }
-        if let Some(max_fall) = description.max_fall_nits {
-            info.target_max_fall(max_fall.round().max(1.0) as u32);
-        }
+    let (target_min_lum, target_max_lum) = target_luminance_wire_values(description);
+    info.target_luminance(target_min_lum, target_max_lum);
+    if let Some(max_cll) = description.max_cll_nits {
+        info.target_max_cll(max_cll.round().max(1.0) as u32);
     }
+    if let Some(max_fall) = description.max_fall_nits {
+        info.target_max_fall(max_fall.round().max(1.0) as u32);
+    }
+    wp_color_trace!(
+        "image description information: primaries={:?} transfer={:?} primary_luminance=({}, {}, {}) target_luminance=({}, {}) max_cll={:?} max_fall={:?}",
+        description.primaries,
+        description.transfer,
+        primary_min_lum,
+        primary_max_lum,
+        reference_lum,
+        target_min_lum,
+        target_max_lum,
+        description.max_cll_nits,
+        description.max_fall_nits,
+    );
 }
 
 fn send_image_description_info(
@@ -891,6 +932,7 @@ fn build_description_from_params(
             wp_color_manager_v1::TransferFunction::ExtSrgb => CoreTransferFunction::SrgbHdr,
             wp_color_manager_v1::TransferFunction::ExtLinear => CoreTransferFunction::Linear,
             wp_color_manager_v1::TransferFunction::St2084Pq => CoreTransferFunction::St2084Pq,
+            wp_color_manager_v1::TransferFunction::Hlg => CoreTransferFunction::Hlg,
             _ => return Err("unsupported named transfer function".into()),
         },
         ParametricTransfer::Power(exp) if (exp - 2.4).abs() <= 0.0001 => CoreTransferFunction::Srgb,
@@ -900,9 +942,10 @@ fn build_description_from_params(
         ParametricTransfer::Power(_) => return Err("unsupported power transfer function".into()),
     };
 
-    let default_ref_nits = if mapped_tf == CoreTransferFunction::St2084Pq
-        || mapped_tf == CoreTransferFunction::SrgbHdr
-    {
+    let default_ref_nits = if matches!(
+        mapped_tf,
+        CoreTransferFunction::St2084Pq | CoreTransferFunction::SrgbHdr | CoreTransferFunction::Hlg
+    ) {
         203.0
     } else {
         80.0
@@ -1026,7 +1069,11 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for DesktopState 
             "wp_color_manager_v1 bound {}",
             client_trace_prefix(client, _handle)
         );
-        send_manager_advertisement(&manager);
+        // Chromium currently allocates AB24 when it selects PQ or HLG. Do not
+        // offer nonlinear HDR transfers to Chromium until it can submit AB30
+        // or FP16; Display-P3/ext-sRGB remains wide-gamut and is promoted into
+        // FocalDesk's FP16 HDR scene before final PQ scanout.
+        send_manager_advertisement(&manager, !client_is_chromium(client));
     }
 }
 
@@ -1870,7 +1917,9 @@ impl
 
 #[cfg(test)]
 mod tests {
-    use super::{is_cursor_executable_name, primary_luminance_wire_values};
+    use super::{
+        is_chromium_executable_name, is_cursor_executable_name, primary_luminance_wire_values,
+    };
     use crate::core::color::ColorDescription;
     use wayland_protocols::wp::color_management::v1::server::wp_color_manager_v1::TransferFunction as WpTransferFunction;
 
@@ -1881,6 +1930,21 @@ mod tests {
         assert!(!is_cursor_executable_name("Cursor"));
         assert!(!is_cursor_executable_name("cursor.exe"));
         assert!(!is_cursor_executable_name("code"));
+    }
+
+    #[test]
+    fn chromium_executable_name_filter_covers_native_wayland_clients() {
+        for name in [
+            "chrome",
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ] {
+            assert!(is_chromium_executable_name(name), "{name}");
+        }
+        assert!(!is_chromium_executable_name("cursor"));
+        assert!(!is_chromium_executable_name("firefox"));
     }
 
     #[test]
@@ -1900,6 +1964,20 @@ mod tests {
         assert_eq!(max_lum, 10_000);
         assert_eq!(reference_lum, 203);
         assert_eq!(super::target_luminance_wire_values(&description), (50, 600));
+    }
+
+    #[test]
+    fn hlg_luminance_uses_its_declared_signal_peak() {
+        let description = ColorDescription {
+            primaries: crate::core::color::ColorPrimaries::Bt2020,
+            transfer: crate::core::color::TransferFunction::Hlg,
+            max_luminance_nits: 1_000.0,
+            reference_white_nits: 203.0,
+            ..ColorDescription::SRGB
+        };
+        let (_, max_lum, reference_lum) = primary_luminance_wire_values(&description);
+        assert_eq!(max_lum, 1_000);
+        assert_eq!(reference_lum, 203);
     }
 
     #[test]
@@ -2103,5 +2181,22 @@ mod tests {
         assert_eq!(description.max_luminance_nits, 1_000.0);
         assert_eq!(description.max_cll_nits, Some(1_000.0));
         assert_eq!(description.max_fall_nits, Some(400.0));
+    }
+
+    #[test]
+    fn parametric_hlg_is_preserved_for_chromium_surfaces() {
+        let creator = super::ParametricCreatorInner {
+            primaries: Some(crate::core::color::ColorPrimaries::Bt2020),
+            tf: Some(super::ParametricTransfer::Named(WpTransferFunction::Hlg)),
+            reference_luminance_nits: Some(203),
+            max_luminance_nits: Some(1_000),
+            ..Default::default()
+        };
+        let description = super::build_description_from_params(&creator).expect("valid HLG params");
+        assert_eq!(
+            description.transfer,
+            crate::core::color::TransferFunction::Hlg
+        );
+        assert_eq!(description.max_luminance_nits, 1_000.0);
     }
 }

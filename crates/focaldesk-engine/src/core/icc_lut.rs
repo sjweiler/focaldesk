@@ -89,7 +89,9 @@ pub(crate) fn source_profile(description: ColorDescription) -> Result<Profile, I
         }
         TransferFunction::Gamma22 => ToneCurve::new(2.2),
         TransferFunction::Linear => ToneCurve::new(1.0),
-        TransferFunction::St2084Pq => return Err(IccError::Invalid("PQ ICC LUT source")),
+        TransferFunction::St2084Pq | TransferFunction::Hlg => {
+            return Err(IccError::Invalid("HDR ICC LUT source"));
+        }
     };
     Profile::new_rgb(&white, &primaries, &[&curve, &curve, &curve]).map_err(Into::into)
 }

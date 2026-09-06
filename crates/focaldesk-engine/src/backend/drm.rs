@@ -192,6 +192,13 @@ pub struct EdidHdrMetadata {
     pub max_fall: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HdrMetadataConfig {
+    peak_nits: u16,
+    min_luminance: u16,
+    max_fall: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct HdrBpcRange {
     pub min: u64,
@@ -315,6 +322,9 @@ pub struct DrmSurfaceState {
     pub render_targets: LinearOffscreenTargets,
     pub hdr_support: HdrSupport,
     pub hdr_metadata_blob: Option<u64>,
+    /// Values encoded into `hdr_metadata_blob`, retained so calibration
+    /// changes can trigger an atomic metadata refresh.
+    hdr_metadata_config: Option<HdrMetadataConfig>,
     pub hdr_enabled_applied: bool,
     pub hdr_transition_target: Option<bool>,
     /// The pending HDR state was attached before this output's first commit,
@@ -673,16 +683,44 @@ pub(crate) struct DrmLoopData {
     pub backend: DrmBackend,
     pub libinput: Libinput,
     pub session_active: bool,
+    /// Tracks the libinput half of the session independently from KMS. A DRM
+    /// activation retry must not repeatedly resume an already-active input
+    /// context, and rendering must not resume unless input did too.
+    pub libinput_active: bool,
+    lifecycle: DrmLifecycle,
     /// A resume can be announced by login1 before libseat has returned DRM
     /// ownership. Keep the session paused until the existing DRM output
     /// managers can be activated again.
     pub resume_pending: bool,
     pub resume_retry_at: Option<Instant>,
+    /// Connector events can arrive while libseat has revoked the DRM fd. Do
+    /// not inspect or rebuild the device until ownership has been restored.
+    pub drm_topology_refresh_pending: bool,
     /// Device rebuilds requested from inside a DRM event callback after an
     /// exclusive HDR validation failure. Rebuilding with failed persistent
     /// state restores the ordinary all-output SDR topology.
     pub exclusive_hdr_recovery_nodes: Vec<DrmNode>,
     pub should_stop: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DrmLifecycle {
+    Running,
+    Suspending,
+    SessionInactive,
+    Resuming,
+    Reprobing,
+    Modesetting,
+}
+
+fn set_drm_lifecycle(data: &mut DrmLoopData, next: DrmLifecycle, event: &str) {
+    let previous = std::mem::replace(&mut data.lifecycle, next);
+    flog_warn!(
+        "DRM lifecycle t_ms={} {:?}->{:?} event={event}",
+        data.core.start.elapsed().as_millis(),
+        previous,
+        next,
+    );
 }
 
 fn display_config_path() -> PathBuf {
@@ -1333,6 +1371,11 @@ fn reinitialize_drm_device(
     ));
 
     let topology = data.core.state.snapshot_output_topology();
+    // Destroy painter resources while the old EGL context is still alive, and
+    // make every other compositor cache rebuild against the replacement
+    // renderer created by device_added().
+    data.core.state.invalidate_gpu_state();
+    data.core.ui_state.chrome.invalidate_gpu_state();
     remove_drm_device(data, loop_handle, node);
     device_added(data, loop_handle, node, &path)?;
     data.core.state.restore_output_topology(topology);
@@ -1353,16 +1396,30 @@ fn pause_drm_session(data: &mut DrmLoopData, reason: &str) {
         return;
     }
 
+    set_drm_lifecycle(data, DrmLifecycle::Suspending, reason);
     // Keep this at warning level so production journals retain the exact
     // suspend/resume ordering.  Resume failures are impossible to diagnose if
     // the last visible compositor event predates PrepareForSleep(true).
     flog_warn!("Pausing DRM session ({reason})");
     data.core.state.handle_session_suspend();
     data.session_active = false;
-    data.libinput.suspend();
+    if data.libinput_active {
+        data.libinput.suspend();
+        data.libinput_active = false;
+    }
+    let mut abandoned_flips = 0usize;
     for device in data.backend.devices.values_mut() {
+        for surface in device.surfaces.values_mut() {
+            abandoned_flips += usize::from(surface.frame_queued_at.take().is_some());
+            surface.hdr_commit_deadline = None;
+        }
         device.drm_output_manager.pause();
     }
+    set_drm_lifecycle(
+        data,
+        DrmLifecycle::SessionInactive,
+        &format!("rendering stopped; pending flips abandoned={abandoned_flips}"),
+    );
 }
 
 fn resume_drm_session(
@@ -1390,9 +1447,7 @@ fn resume_drm_session(
 
     flog_warn!("Resuming DRM session ({reason})");
     data.session_active = false;
-    if let Err(err) = data.libinput.resume() {
-        flog(&format!("Failed to resume libinput: {err:?}"));
-    }
+    set_drm_lifecycle(data, DrmLifecycle::Resuming, reason);
 
     // libseat keeps ownership of every device opened through the session and
     // restores those file descriptors before ActivateSession is emitted. Do
@@ -1400,7 +1455,11 @@ fn resume_drm_session(
     // a second time fails with EINVAL on seatd/libseat, and removing the old
     // device first also destroys the only output state that can be resumed.
     // Smithay's intended suspend/resume pair is DrmOutputManager::pause() and
-    // DrmOutputManager::activate().
+    // DrmOutputManager::activate(). Request a connector/plane reset here. The
+    // optimistic `false` path assumes the pre-suspend KMS state survived,
+    // which is specifically unsafe on NVIDIA after system sleep. `true`
+    // disables the old connector/plane state and makes the next frame a full
+    // modeset while retaining the libseat-owned fd.
     let mut all_devices_ready = true;
     if data.backend.devices.is_empty() {
         let node = data.backend.primary_gpu;
@@ -1426,18 +1485,48 @@ fn resume_drm_session(
         }
     }
     for (node, device) in &mut data.backend.devices {
-        if let Err(err) = device.drm_output_manager.lock().activate(false) {
+        if let Err(err) = device.drm_output_manager.lock().activate(true) {
             flog_warn!(
                 "Failed to reactivate DRM device {:?} after resume: {err}; scheduling retry",
                 node
             );
             all_devices_ready = false;
+        } else {
+            flog_warn!(
+                "DRM lifecycle t_ms={} event=DRM device resumed node={node:?} connectors_and_planes_reset=true",
+                data.core.start.elapsed().as_millis(),
+            );
         }
     }
 
     if !all_devices_ready {
         data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
         return;
+    }
+
+    if !data.libinput_active {
+        if let Err(err) = data.libinput.resume() {
+            flog_warn!("Failed to resume libinput: {err:?}; scheduling retry");
+            data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
+            return;
+        }
+        data.libinput_active = true;
+    }
+
+    set_drm_lifecycle(data, DrmLifecycle::Reprobing, "enumerating DRM connectors");
+    for (node, device) in &data.backend.devices {
+        match device.drm_output_manager.device().resource_handles() {
+            Ok(resources) => flog_warn!(
+                "DRM lifecycle t_ms={} event=connectors reprobed node={node:?} count={}",
+                data.core.start.elapsed().as_millis(),
+                resources.connectors().len(),
+            ),
+            Err(err) => {
+                flog_warn!("DRM connector reprobe failed on {node:?}: {err}; scheduling retry");
+                data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                return;
+            }
+        }
     }
 
     let resumed_at = Instant::now();
@@ -1462,9 +1551,55 @@ fn resume_drm_session(
     data.core.last_now = Instant::now();
     data.core.state.mark_redraw();
     data.session_active = true;
+    set_drm_lifecycle(
+        data,
+        DrmLifecycle::Modesetting,
+        "full repaint requested; awaiting first post-resume modeset",
+    );
+
+    if std::mem::take(&mut data.drm_topology_refresh_pending) {
+        let mut changed_nodes = Vec::new();
+        let mut topology_inspection_failed = false;
+        for (node, device) in &data.backend.devices {
+            match drm_connector_topology_changed(device, &data.core.state) {
+                Ok(true) => changed_nodes.push(*node),
+                Ok(false) => {}
+                Err(err) => {
+                    flog_warn!("Failed to inspect deferred DRM topology on {node:?}: {err}");
+                    topology_inspection_failed = true;
+                }
+            }
+        }
+        if topology_inspection_failed {
+            data.drm_topology_refresh_pending = true;
+            data.resume_pending = true;
+            data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
+        }
+        for node in changed_nodes {
+            flog_warn!("Applying deferred DRM connector topology change on {node:?}");
+            if let Err(err) = reinitialize_drm_device(data, loop_handle, node) {
+                flog_warn!("Failed to rebuild deferred DRM topology on {node:?}: {err}");
+                data.session_active = false;
+                data.resume_pending = true;
+                data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
+                return;
+            }
+        }
+    }
 }
 
-fn defer_primary_drm_removal(session_active: bool, resume_pending: bool) -> bool {
+fn should_remove_drm_device(is_primary: bool) -> bool {
+    // NVIDIA can emit the primary card's udev Removed event before login1's
+    // PrepareForSleep(true) reaches the compositor.  Removing the device here
+    // drops the only DRM output manager that libseat can reactivate; trying to
+    // open the same path after wake is then rejected by libseat with EINVAL.
+    // Keep the primary device for the lifetime of the compositor.  Connector
+    // hotplug is handled independently, and a compositor cannot usefully keep
+    // running after a genuinely permanent loss of its primary GPU anyway.
+    !is_primary
+}
+
+fn should_defer_drm_topology_change(session_active: bool, resume_pending: bool) -> bool {
     !session_active || resume_pending
 }
 
@@ -1600,13 +1735,14 @@ mod output_render_scheduling_tests {
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, defer_primary_drm_removal,
-        exclusive_hdr_prepare_decision, hdr_active_status_verified, hdr_commit_stalled,
-        hdr_detection::parse_edid_hdr_support, hdr_driver_allows_output_with_override,
-        hdr_failure_persist_action, hdr_verification_complete, merge_disconnected_display_configs,
+        configured_display_hdr_requested, exclusive_hdr_prepare_decision,
+        hdr_active_status_verified, hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
+        hdr_driver_allows_output_with_override, hdr_failure_persist_action,
+        hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
-        select_requested_drm_mode_index, DisplayConfig, DisplayTransform, DrmModeCandidate,
+        select_requested_drm_mode_index, should_defer_drm_topology_change,
+        should_remove_drm_device, DisplayConfig, DisplayTransform, DrmModeCandidate,
         EdidHdrMetadata, ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport,
         DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS,
         HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
@@ -1735,11 +1871,17 @@ mod hdr_tests {
     }
 
     #[test]
-    fn suspend_time_primary_drm_removal_is_deferred_until_resume() {
-        assert!(defer_primary_drm_removal(false, true));
-        assert!(defer_primary_drm_removal(false, false));
-        assert!(defer_primary_drm_removal(true, true));
-        assert!(!defer_primary_drm_removal(true, false));
+    fn primary_drm_device_is_retained_across_udev_remove() {
+        assert!(!should_remove_drm_device(true));
+        assert!(should_remove_drm_device(false));
+    }
+
+    #[test]
+    fn drm_topology_work_waits_for_a_fully_resumed_session() {
+        assert!(should_defer_drm_topology_change(false, false));
+        assert!(should_defer_drm_topology_change(false, true));
+        assert!(should_defer_drm_topology_change(true, true));
+        assert!(!should_defer_drm_topology_change(true, false));
     }
 
     #[test]
@@ -2028,8 +2170,12 @@ mod hdr_output {
         surface: &mut DrmSurfaceState,
         device: &impl drm::control::Device,
         hdr_target: bool,
+        hdr_appearance: HdrAppearance,
     ) -> bool {
-        if hdr_target == surface.hdr_enabled_applied {
+        let metadata_changed = hdr_target
+            && surface.hdr_metadata_config
+                != Some(hdr_detection::hdr_kms::hdr_metadata_config(hdr_appearance));
+        if hdr_target == surface.hdr_enabled_applied && !metadata_changed {
             return true;
         }
 
@@ -2066,6 +2212,8 @@ mod hdr_output {
             device,
             &surface.hdr_support,
             &mut surface.hdr_metadata_blob,
+            &mut surface.hdr_metadata_config,
+            hdr_appearance,
         ) {
             Ok(blob) => Some(blob),
             Err(err) => {
@@ -2599,28 +2747,44 @@ mod hdr_detection {
             drm_ffi::hdr_metadata_infoframe__bindgen_ty_2 { x, y }
         }
 
-        fn build_hdr_output_metadata(support: &HdrSupport) -> drm_ffi::hdr_output_metadata {
+        pub(crate) fn hdr_metadata_config(appearance: HdrAppearance) -> HdrMetadataConfig {
+            let appearance = appearance.validate().unwrap_or_default();
+            HdrMetadataConfig {
+                peak_nits: appearance.peak_nits.round().clamp(1.0, 10_000.0) as u16,
+                min_luminance: (appearance.black_level_nits * 10_000.0)
+                    .round()
+                    .clamp(0.0, f32::from(u16::MAX)) as u16,
+                max_fall: appearance.full_frame_peak_nits.round().clamp(1.0, 10_000.0) as u16,
+            }
+        }
+
+        fn build_hdr_output_metadata(
+            support: &HdrSupport,
+            config: HdrMetadataConfig,
+        ) -> drm_ffi::hdr_output_metadata {
             const DRM_MODE_HDR_METADATA_TYPE1: u32 = 0;
             const HDMI_EOTF_SMPTE_ST2084: u8 = 2;
             // HDMI Static Metadata Descriptor Type 1 is encoded as descriptor ID zero.
             const HDMI_STATIC_METADATA_TYPE1: u8 = 0;
 
-            let metadata = support
+            let _metadata = support
                 .edid_hdr_metadata
                 .expect("HDR metadata blob requires parsed EDID Type 1 metadata");
-            let max_luminance = crate::core::color::hdr10_kms_max_luminance_nits();
-            let max_cll = crate::core::color::hdr10_kms_max_cll_nits();
-            let max_fall = crate::core::color::hdr10_kms_max_fall_nits();
+            let data_primaries = crate::core::color::HDR10_BT2020_PRIMARIES;
+            let data_white_point = crate::core::color::HDR10_D65_WHITE_POINT;
 
             let infoframe = drm_ffi::hdr_metadata_infoframe {
                 eotf: HDMI_EOTF_SMPTE_ST2084,
                 metadata_type: HDMI_STATIC_METADATA_TYPE1,
-                display_primaries: metadata.display_primaries.map(|(x, y)| hdr_point(x, y)),
-                white_point: hdr_white_point(metadata.white_point.0, metadata.white_point.1),
-                max_display_mastering_luminance: max_luminance,
-                min_display_mastering_luminance: metadata.min_luminance,
-                max_cll,
-                max_fall,
+                // HDR_OUTPUT_METADATA describes the BT.2020/D65 PQ data in
+                // the framebuffer. EDID chromaticities describe the sink and
+                // must not be copied back as mastering/data primaries.
+                display_primaries: data_primaries.map(|(x, y)| hdr_point(x, y)),
+                white_point: hdr_white_point(data_white_point.0, data_white_point.1),
+                max_display_mastering_luminance: config.peak_nits,
+                min_display_mastering_luminance: config.min_luminance,
+                max_cll: config.peak_nits,
+                max_fall: config.max_fall,
             };
 
             drm_ffi::hdr_output_metadata {
@@ -2634,6 +2798,7 @@ mod hdr_detection {
         pub(crate) fn create_hdr_metadata_blob(
             device: &impl drm::control::Device,
             support: &HdrSupport,
+            config: HdrMetadataConfig,
         ) -> Result<u64, anyhow::Error> {
             if !support.can_signal_hdr10() {
                 return Err(anyhow!(
@@ -2642,7 +2807,7 @@ mod hdr_detection {
             }
 
             match device
-                .create_property_blob(&build_hdr_output_metadata(support))
+                .create_property_blob(&build_hdr_output_metadata(support, config))
                 .map_err(|err| anyhow!("failed to create HDR metadata blob: {err}"))?
             {
                 property::Value::Blob(blob) => Ok(blob),
@@ -2669,22 +2834,29 @@ mod hdr_detection {
             device: &impl drm::control::Device,
             support: &HdrSupport,
             blob: &mut Option<u64>,
+            blob_config: &mut Option<HdrMetadataConfig>,
+            appearance: HdrAppearance,
         ) -> Result<u64, anyhow::Error> {
-            if let Some(blob) = *blob {
-                return Ok(blob);
+            let config = hdr_metadata_config(appearance);
+            if let (Some(blob), Some(existing_config)) = (*blob, *blob_config) {
+                if existing_config == config {
+                    return Ok(blob);
+                }
             }
 
-            let created = create_hdr_metadata_blob(device, support)?;
-            *blob = Some(created);
-            flog(&format!(
-                "HDR10 KMS metadata blob={created} max_luminance={} max_cll={} max_fall={} (SDR white) min_mastering={:?}",
-                crate::core::color::hdr10_kms_max_luminance_nits(),
-                crate::core::color::hdr10_kms_max_cll_nits(),
-                crate::core::color::hdr10_kms_max_fall_nits(),
-                support
-                    .edid_hdr_metadata
-                    .map(|metadata| metadata.min_luminance)
-            ));
+            // Create the replacement first. If allocation fails, retain the
+            // current blob and the metadata that may still be active in KMS.
+            let created = create_hdr_metadata_blob(device, support, config)?;
+            let replaced = blob.replace(created);
+            *blob_config = Some(config);
+            destroy_hdr_metadata_blob(device, replaced);
+            flog_warn!(
+                "HDR10 KMS metadata blob={created} primaries=BT.2020 white=D65 max_luminance={} max_cll={} max_fall={} min_mastering={}",
+                config.peak_nits,
+                config.peak_nits,
+                config.max_fall,
+                config.min_luminance,
+            );
             Ok(created)
         }
 
@@ -2830,7 +3002,43 @@ mod hdr_detection {
 
         #[cfg(test)]
         mod tests {
-            use super::ConnectorHdrSnapshot;
+            use super::{build_hdr_output_metadata, hdr_metadata_config, ConnectorHdrSnapshot};
+            use crate::backend::drm::{EdidHdrMetadata, HdrSupport};
+            use focaldesk_settings_core::HdrAppearance;
+
+            #[test]
+            fn hdr_metadata_describes_bt2020_data_not_sink_primaries() {
+                let support = HdrSupport {
+                    edid_hdr_metadata: Some(EdidHdrMetadata {
+                        display_primaries: [(1, 2), (3, 4), (5, 6)],
+                        white_point: (7, 8),
+                        max_luminance: 409,
+                        min_luminance: 50,
+                        max_fall: 300,
+                    }),
+                    ..HdrSupport::default()
+                };
+                let config = hdr_metadata_config(HdrAppearance {
+                    black_level_nits: 0.02,
+                    peak_nits: 400.0,
+                    full_frame_peak_nits: 300.0,
+                    ..HdrAppearance::default()
+                });
+                let metadata = build_hdr_output_metadata(&support, config);
+                // bindgen represents the metadata payload as a C union.
+                let info = unsafe { metadata.__bindgen_anon_1.hdmi_metadata_type1 };
+                let primaries = info.display_primaries.map(|point| (point.x, point.y));
+
+                assert_eq!(primaries, crate::core::color::HDR10_BT2020_PRIMARIES);
+                assert_eq!(
+                    (info.white_point.x, info.white_point.y),
+                    crate::core::color::HDR10_D65_WHITE_POINT
+                );
+                assert_eq!(info.max_display_mastering_luminance, 400);
+                assert_eq!(info.min_display_mastering_luminance, 200);
+                assert_eq!(info.max_cll, 400);
+                assert_eq!(info.max_fall, 300);
+            }
 
             #[test]
             fn validates_complete_hdr_property_readback() {
@@ -3078,8 +3286,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         },
         libinput,
         session_active: session.is_active(),
+        libinput_active: session.is_active(),
+        lifecycle: if session.is_active() {
+            DrmLifecycle::Running
+        } else {
+            DrmLifecycle::SessionInactive
+        },
         resume_pending: false,
         resume_retry_at: None,
+        drm_topology_refresh_pending: false,
         exclusive_hdr_recovery_nodes: Vec::new(),
         should_stop: false,
     };
@@ -3162,6 +3377,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let Ok(node) = DrmNode::from_dev_id(device_id) else {
                 return;
             };
+            if should_defer_drm_topology_change(data.session_active, data.resume_pending) {
+                if node == data.backend.primary_gpu {
+                    data.drm_topology_refresh_pending = true;
+                    flog_warn!("Deferring DRM add for {node:?} until session resume");
+                }
+                return;
+            }
             if node == data.backend.primary_gpu && !data.backend.devices.contains_key(&node) {
                 if let Err(err) = device_added(data, &udev_handle, node, &path) {
                     flog(&format!(
@@ -3175,6 +3397,13 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let Ok(node) = DrmNode::from_dev_id(device_id) else {
                 return;
             };
+            if should_defer_drm_topology_change(data.session_active, data.resume_pending) {
+                if node == data.backend.primary_gpu {
+                    data.drm_topology_refresh_pending = true;
+                    flog_warn!("Deferring DRM topology change on {node:?} until session resume");
+                }
+                return;
+            }
             let topology_changed = data
                 .backend
                 .devices
@@ -3206,12 +3435,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let Ok(node) = DrmNode::from_dev_id(device_id) else {
                 return;
             };
-            if node == data.backend.primary_gpu
-                && defer_primary_drm_removal(data.session_active, data.resume_pending)
-            {
-                flog_warn!(
-                    "Deferring removal of primary DRM device {node:?} while session is suspended"
-                );
+            let is_primary = node == data.backend.primary_gpu;
+            if !should_remove_drm_device(is_primary) {
+                flog_warn!("Retaining primary DRM device {node:?} across udev removal");
                 return;
             }
             remove_drm_device(data, &udev_handle, node);
@@ -3255,9 +3481,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             while let Ok(event) = rx.try_recv() {
                 match event {
                     SessionSleepEvent::GoingToSleep => {
+                        flog_warn!(
+                            "DRM lifecycle t_ms={} event=prepare-for-sleep(true)",
+                            data.core.start.elapsed().as_millis(),
+                        );
                         pause_drm_session(&mut data, "login1 PrepareForSleep(true)");
                     }
                     SessionSleepEvent::WokeUp => {
+                        flog_warn!(
+                            "DRM lifecycle t_ms={} event=prepare-for-sleep(false)",
+                            data.core.start.elapsed().as_millis(),
+                        );
                         resume_drm_session(
                             &mut data,
                             &loop_handle,
@@ -3609,8 +3843,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                     )
                             })
                             .unwrap_or(false);
+                    let hdr_appearance = data
+                        .core
+                        .state
+                        .outputs
+                        .get(&surface.output_id)
+                        .map(|output| output.hdr_appearance.validate().unwrap_or_default())
+                        .unwrap_or_default();
+                    let hdr_metadata_changed = hdr_target
+                        && surface.hdr_metadata_config
+                            != Some(hdr_detection::hdr_kms::hdr_metadata_config(hdr_appearance));
                     if surface.hdr_transition_target.is_none()
-                        && hdr_target != surface.hdr_enabled_applied
+                        && (hdr_target != surface.hdr_enabled_applied || hdr_metadata_changed)
                     {
                         if hdr_target && !all_outputs_stable {
                             // Keep producing baseline SDR frames until this
@@ -3638,6 +3882,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             surface,
                             device.drm_output_manager.device(),
                             hdr_target,
+                            hdr_appearance,
                         ) {
                             surface.hdr_transition_target = Some(hdr_target);
                             surface.hdr_initial_modeset_pending = false;
@@ -4024,10 +4269,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     ) {
                         Ok(frame_result) => frame_result,
                         Err(err) => {
-                            flog(&format!(
-                                "DRM render_frame failed for output {:?}: {err}",
-                                surface.output_id
-                            ));
+                            flog_warn!(
+                                "DRM render_frame failed for output {:?} lifecycle={:?}: {err:?}",
+                                surface.output_id,
+                                data.lifecycle,
+                            );
                             data.core.state.mark_redraw();
                             continue;
                         }
@@ -4040,12 +4286,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
                     if !frame_result.is_empty {
                         if let Err(err) = surface.drm_output.queue_frame(None) {
-                            flog(&format!(
-                                "DRM queue_frame failed for output {:?}: {err}",
-                                surface.output_id
-                            ));
+                            flog_warn!(
+                                "DRM queue_frame failed for output {:?} lifecycle={:?}: {err:?}",
+                                surface.output_id,
+                                data.lifecycle,
+                            );
                             data.core.state.mark_redraw();
                             continue;
+                        }
+                        if data.lifecycle == DrmLifecycle::Modesetting {
+                            flog_warn!(
+                                "DRM lifecycle t_ms={} event=first post-resume atomic modeset queued output={:?}",
+                                data.core.start.elapsed().as_millis(),
+                                surface.output_id,
+                            );
                         }
                         surface.frame_queued_at = Some(now);
                         data.core.state.compositor_ready = true;
@@ -4411,7 +4665,10 @@ fn device_added(
             use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
             feedback_builder = feedback_builder.add_preference_tranche(
                 dmabuf_node.dev_id(),
-                Some(TrancheFlags::Scanout),
+                // These formats are preferred for compositor HDR precision;
+                // do not claim direct-scanout eligibility without checking
+                // the output plane's format/modifier set.
+                Some(TrancheFlags::empty()),
                 hdr_client_formats.iter().copied(),
             );
             flog(format!(
@@ -4922,6 +5179,7 @@ fn device_added(
                 },
                 hdr_support,
                 hdr_metadata_blob: None,
+                hdr_metadata_config: None,
                 hdr_enabled_applied: false,
                 hdr_transition_target: None,
                 hdr_initial_modeset_pending: false,
@@ -4949,6 +5207,13 @@ fn device_added(
                     drm_output_manager.device(),
                     &surface.hdr_support,
                     &mut surface.hdr_metadata_blob,
+                    &mut surface.hdr_metadata_config,
+                    data.core
+                        .state
+                        .outputs
+                        .get(&output_id)
+                        .map(|output| output.hdr_appearance.validate().unwrap_or_default())
+                        .unwrap_or_default(),
                 )
                 .and_then(|blob| {
                     hdr_detection::hdr_kms::configure_smithay_hdr_state(
@@ -5027,6 +5292,7 @@ fn device_added(
         loop_handle.insert_source(notifier, move |event, _, state| match event {
             DrmEvent::VBlank(crtc) => {
                 let mut recover_exclusive = false;
+                let mut first_resume_flip_completed = false;
                 if let Some(device) = state.backend.devices.get_mut(&node) {
                     let exclusive_hdr_output = device.exclusive_hdr_output.clone();
                     let DrmDeviceState {
@@ -5036,6 +5302,8 @@ fn device_added(
                     } = device;
                     if let Some(surface) = surfaces.get_mut(&crtc) {
                         let submitted = surface.drm_output.frame_submitted();
+                        first_resume_flip_completed =
+                            state.lifecycle == DrmLifecycle::Modesetting && submitted.is_ok();
                         if let Err(err) = &submitted {
                             surface.stable_vblank_count = 0;
                             flog(&format!(
@@ -5263,6 +5531,13 @@ fn device_added(
                             }
                         }
                     }
+                }
+                if first_resume_flip_completed {
+                    set_drm_lifecycle(
+                        state,
+                        DrmLifecycle::Running,
+                        "first post-resume page flip completed",
+                    );
                 }
                 if recover_exclusive
                     && !state.exclusive_hdr_recovery_nodes.contains(&node)
