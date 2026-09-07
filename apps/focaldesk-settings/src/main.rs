@@ -2637,6 +2637,14 @@ fn persist_settings(settings: &Settings) {
             "settings IPC reload unavailable after settings save"
         );
     }
+    if let Err(err) = send_desktop_request(&IpcRequest::Reload) {
+        info!(
+            target: "focaldesk",
+            session_id = session_id(),
+            error = %err,
+            "compositor settings reload unavailable after settings save"
+        );
+    }
 }
 
 fn focaldesk_config_dir() -> PathBuf {

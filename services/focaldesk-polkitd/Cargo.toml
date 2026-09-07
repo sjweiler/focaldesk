@@ -14,8 +14,8 @@ anyhow = "1"
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-zbus = "3"
-zbus_polkit = "3"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus_polkit = { version = "5.1", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 glib = "0.19"
 polkit = "0.19"

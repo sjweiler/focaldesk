@@ -10,6 +10,9 @@ version numbers where practical.
 
 ### Added
 
+- Added durable desktop-session restoration behind the existing Settings
+  switch, with atomic checkpoints, trusted desktop-entry relaunches, workspace
+  and output recovery, and Wayland/XWayland window-state placement.
 - Added a versioned Theme Editor with sRGB and Display P3 paint authoring,
   solid and gradient sources, SDR/HDR intent, semantic interaction states,
   layout and typography controls, wallpaper processing, contrast audits,
@@ -62,6 +65,8 @@ version numbers where practical.
 
 ### Changed
 
+- Upgraded the PolicyKit D-Bus binding to `zbus_polkit` 5.1.0, closing the
+  PID-reuse authorization bypass reported as RUSTSEC-2026-0278.
 - DRM suspend/resume now uses explicit lifecycle states, abandons stale flip
   bookkeeping, waits for libseat activation, resets connectors and planes,
   reprobes resources, invalidates GPU caches, and forces a complete modeset with

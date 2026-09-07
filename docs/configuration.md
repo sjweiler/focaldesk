@@ -19,6 +19,7 @@ working configuration before testing a new revision.
 | `$XDG_CONFIG_HOME/focaldesk/automation/automations.toml` | Scheduled automation definitions | Experimental; service is opt-in |
 | `$XDG_CONFIG_HOME/focaldesk/automation/scripts/` | Lua automation scripts referenced by `automations.toml` | Experimental and security-sensitive |
 | `$XDG_CONFIG_HOME/focaldesk/secrets-acl.toml` | Per-systemd-unit access to native credential-broker keys | Security-sensitive; default deny |
+| `$XDG_STATE_HOME/focaldesk/session.json` | Versioned desktop-session snapshot used when **Restore session** is enabled | Generated atomically; disabling Restore session removes it |
 
 FocalDesk falls back to built-in defaults when a settings file does not exist.
 An invalid file may also cause the affected component to use defaults, so check

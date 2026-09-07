@@ -2253,7 +2253,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "zbus 3.15.2",
+ "zbus 5.18.0",
  "zbus_polkit",
 ]
 
@@ -8722,16 +8722,15 @@ dependencies = [
 
 [[package]]
 name = "zbus_polkit"
-version = "3.0.1"
+version = "5.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07eb69d4b17d69f78632d4f9b03500f057e80764df8e17ed327f74ac67447813"
+checksum = "283d50dac36a7fee0d9c2e6b9c71253326c1f863a9d350342d338637aa3019ae"
 dependencies = [
  "enumflags2",
  "serde",
  "serde_repr",
  "static_assertions",
- "zbus 3.15.2",
- "zvariant 3.15.2",
+ "zbus 5.18.0",
 ]
 
 [[package]]

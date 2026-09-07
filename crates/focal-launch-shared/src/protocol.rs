@@ -28,6 +28,7 @@ pub enum LaunchSource {
     Keybind,
     Ai,
     Plugin,
+    SessionRestore,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

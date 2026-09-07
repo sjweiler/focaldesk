@@ -154,6 +154,9 @@ pub struct ManagedWindow {
     pub tile_rect: Option<Rectangle<i32, Logical>>,
     pub float_rect: Option<Rectangle<i32, Logical>>,
     pub restore_rect: Option<Rectangle<i32, Logical>>,
+    /// `Some` while a window is being recreated from the durable session.
+    /// The value records whether this was the previously focused window.
+    pub session_restore_focus: Option<bool>,
 }
 
 impl ManagedWindow {
@@ -188,6 +191,7 @@ impl ManagedWindow {
             tile_rect: None,
             float_rect: None,
             restore_rect: None,
+            session_restore_focus: None,
             pending_move: false,
             pending_resize: None,
         }
@@ -215,6 +219,7 @@ impl ManagedWindow {
             tile_rect: None,
             float_rect: None,
             restore_rect: None,
+            session_restore_focus: None,
             pending_move: false,
             pending_resize: None,
         }

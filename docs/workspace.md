@@ -94,6 +94,21 @@ Each workspace maintains independent focus history.
 
 Switching back to a workspace restores the previously focused window whenever possible.
 
+## Restoring a Login Session
+
+When **Settings → Workspaces → Restore session** is enabled, the compositor
+checkpoints workspace names and restorable top-level windows to
+`$XDG_STATE_HOME/focaldesk/session.json`. On the next login it launches matching
+installed desktop entries and restores their workspace, output, geometry,
+minimized state, maximized/fullscreen state, and focus. Geometry is stored
+relative to the output and clamped to the available work area if the display
+layout changed.
+
+Transient dialogs, menus, override-redirect X11 windows, and windows without a
+stable Wayland app ID or X11 class are not restored. Applications remain
+responsible for their internal state, such as open documents, browser tabs, and
+terminal processes. Disabling **Restore session** removes the saved snapshot.
+
 ## Multi-Monitor Behavior
 
 Each monitor can display a different workspace.

@@ -5,15 +5,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-use zbus::{Connection, DBusError, dbus_interface, dbus_proxy};
+use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str};
+use zbus::{Connection, DBusError, interface, proxy};
 use zbus_polkit::policykit1::{AuthorityProxy, Subject};
 
 const AGENT_OBJECT_PATH: &str = "/org/freedesktop/PolicyKit1/AuthenticationAgent";
 
 type LoginSessionEntry = (String, u32, String, String, OwnedObjectPath);
 
-#[dbus_proxy(
+#[proxy(
     interface = "org.freedesktop.login1.Manager",
     default_service = "org.freedesktop.login1",
     default_path = "/org/freedesktop/login1"
@@ -25,9 +25,9 @@ trait Login1Manager {
 /// Maps to `org.freedesktop.PolicyKit1.Error.*`; polkitd expects `Cancelled`
 /// specifically when the user dismisses/declines authentication.
 #[derive(Debug, DBusError)]
-#[dbus_error(prefix = "org.freedesktop.PolicyKit1.Error")]
+#[zbus(prefix = "org.freedesktop.PolicyKit1.Error")]
 enum AgentError {
-    #[dbus_error(zbus_error)]
+    #[zbus(error)]
     ZBus(zbus::Error),
     Cancelled(String),
     Failed(String),
@@ -42,7 +42,7 @@ enum AuthenticationOutcome {
     Failed(String),
 }
 
-#[dbus_interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
+#[interface(name = "org.freedesktop.PolicyKit1.AuthenticationAgent")]
 impl AuthenticationAgent {
     /// Per `org.freedesktop.PolicyKit1.AuthenticationAgent`: polkitd calls this and blocks until
     /// we return; on success we must have already called `AuthenticationAgentResponse2` on the
@@ -266,7 +266,7 @@ async fn session_subject(connection: &Connection) -> Result<Subject> {
         }
     };
     let mut subject_details = HashMap::new();
-    subject_details.insert("session-id".to_string(), Value::from(session_id).into());
+    subject_details.insert("session-id".to_string(), Str::from(session_id).into());
     Ok(Subject {
         subject_kind: "unix-session".to_string(),
         subject_details,

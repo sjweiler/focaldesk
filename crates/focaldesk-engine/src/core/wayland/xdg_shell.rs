@@ -21,6 +21,7 @@ use focaldesk_types::WindowId;
 use tracing::{debug, info_span, trace};
 
 use crate::core::desktop::DamageSource;
+use crate::core::session_restore::SavedProtocol;
 use crate::core::shell::managed_window::ManagedWindowKind;
 
 pub(crate) fn toplevel_metadata(surface: &ToplevelSurface) -> (Option<String>, Option<String>) {
@@ -52,7 +53,7 @@ impl DesktopState {
             if let ManagedWindowKind::Wayland(meta) = &mut window.kind {
                 changed = meta.title != title || meta.app_id != app_id;
                 meta.title = title;
-                meta.app_id = app_id;
+                meta.app_id = app_id.clone();
             }
         }
         if changed {
@@ -62,6 +63,68 @@ impl DesktopState {
                 "xdg toplevel metadata updated"
             );
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
+        }
+        if let (Some(window_id), Some(app_id)) =
+            (self.window_id_for_toplevel(surface), app_id.as_deref())
+        {
+            let restore_unresolved = self
+                .windows
+                .iter()
+                .find(|window| window.id == window_id)
+                .is_some_and(|window| window.session_restore_focus.is_none());
+            if restore_unresolved
+                && self.try_restore_window(window_id, SavedProtocol::Wayland, app_id)
+            {
+                self.configure_restored_xdg_toplevel(surface);
+            }
+        }
+    }
+
+    fn configure_restored_xdg_toplevel(&mut self, surface: &ToplevelSurface) {
+        let Some(window_id) = self.window_id_for_toplevel(surface) else {
+            return;
+        };
+        let Some(window) = self.windows.iter().find(|window| window.id == window_id) else {
+            return;
+        };
+        let output_id = window.output.unwrap_or(self.focused_output);
+        let maximized = window.maximized;
+        let fullscreen = window.fullscreen;
+        let minimized = window.minimized;
+        let rect = window.float_rect;
+        let mapped_window = window.mapped.then(|| window.window.clone());
+        let size = if fullscreen {
+            self.outputs
+                .get(&output_id)
+                .and_then(|output| self.space.output_geometry(&output.handle))
+                .map(|rect| rect.size)
+        } else if maximized {
+            self.work_recess_for_output(output_id).map(|rect| rect.size)
+        } else {
+            rect.map(|rect| rect.size)
+        };
+        surface.with_pending_state(|state| {
+            if maximized {
+                state
+                    .states
+                    .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            } else {
+                state
+                    .states
+                    .unset(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            }
+            if fullscreen {
+                state
+                    .states
+                    .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
+            }
+            state.size = size;
+        });
+        surface.send_pending_configure();
+        if !minimized {
+            if let (Some(window), Some(rect)) = (mapped_window, rect) {
+                self.map_window_bbox_location(window, rect.loc, false);
+            }
         }
     }
 }
@@ -73,27 +136,58 @@ impl XdgShellHandler for DesktopState {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window_id = self.add_xdg_toplevel(surface.clone());
-        let output_id = self.focused_output;
-        let maximize_on_launch = self.workspaces.maximize_on_launch;
-        let size = if maximize_on_launch {
+        let (_, app_id) = toplevel_metadata(&surface);
+        let restored = app_id.as_deref().is_some_and(|app_id| {
+            self.try_restore_window(window_id, SavedProtocol::Wayland, app_id)
+        });
+        let window = self.windows.iter().find(|window| window.id == window_id);
+        let output_id = window
+            .and_then(|window| window.output)
+            .unwrap_or(self.focused_output);
+        let maximize_on_launch = if restored {
+            window.is_some_and(|window| window.maximized)
+        } else {
+            self.workspaces.maximize_on_launch
+        };
+        let fullscreen_on_launch = restored && window.is_some_and(|window| window.fullscreen);
+        let minimized_on_launch = restored && window.is_some_and(|window| window.minimized);
+        let restored_size = window.and_then(|window| window.float_rect.map(|rect| rect.size));
+        let size = if fullscreen_on_launch {
+            self.outputs
+                .get(&output_id)
+                .and_then(|output| self.space.output_geometry(&output.handle))
+                .map(|rect| rect.size)
+                .unwrap_or_else(|| (1280, 720).into())
+        } else if maximize_on_launch {
             self.work_recess_for_output(output_id)
                 .map(|work| work.size)
                 .unwrap_or_else(|| (1280, 720).into())
         } else {
-            let geometry = self.default_unmaximized_toplevel_geometry(output_id);
+            let geometry = restored_size
+                .map(|size| smithay::utils::Rectangle::from_loc_and_size((0, 0), size))
+                .unwrap_or_else(|| self.default_unmaximized_toplevel_geometry(output_id));
             if let Some(window) = self.windows.iter_mut().find(|w| w.id == window_id) {
-                window.float_rect = Some(geometry);
+                if window.float_rect.is_none() {
+                    window.float_rect = Some(geometry);
+                }
             }
             geometry.size
         };
         surface.with_pending_state(|state| {
-            state
-                .states
-                .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
+            if !minimized_on_launch {
+                state
+                    .states
+                    .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Activated);
+            }
             if maximize_on_launch {
                 state
                     .states
                     .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized);
+            }
+            if fullscreen_on_launch {
+                state
+                    .states
+                    .set(wayland_protocols::xdg::shell::server::xdg_toplevel::State::Fullscreen);
             }
             state.size = Some(size);
         });

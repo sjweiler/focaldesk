@@ -16,6 +16,7 @@ pub mod output_store;
 pub mod render;
 pub mod scene;
 pub mod screenshot;
+pub mod session_restore;
 pub mod shell;
 pub mod ui;
 pub mod ui_state;

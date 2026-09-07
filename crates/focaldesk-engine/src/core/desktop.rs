@@ -39,6 +39,10 @@ use smithay::input::pointer::{
 };
 use smithay::reexports::wayland_server::Resource;
 
+use crate::core::session_restore::{
+    desktop_entry_for_identity, SavedOutput, SavedProtocol, SavedRect, SavedWindow,
+    SessionRestoreState, SessionSnapshot,
+};
 use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
@@ -1089,11 +1093,12 @@ pub struct DesktopState {
     pending_ui_actions: Vec<UiAction>,
     pending_egui_ops: Vec<PendingEguiOp>,
     pending_sidebar_dialogs: HashMap<DialogId, SidebarDialogKind>,
-    pending_app_launches: Vec<(u64, String, Vec<String>)>,
+    pending_app_launches: Vec<(u64, String, Vec<String>, LaunchSource)>,
     /// Map/focus deferred out of `handle_commit` so Wayland dispatch does not re-enter seat/xdg.
     pending_window_maps: Vec<(WindowId, Point<i32, Logical>)>,
     pending_focus_window: Option<WindowId>,
     next_launch_trace_id: u64,
+    session_restore: SessionRestoreState,
     //pub popups: Vec<PopupState>,
 }
 
@@ -1440,6 +1445,7 @@ impl DesktopState {
         self.process_pending_ui_actions();
         self.process_pending_app_launches();
         self.process_pending_egui_ops();
+        self.process_session_checkpoint();
     }
 
     /// Apply window map/focus queued during `handle_commit`.
@@ -1478,16 +1484,309 @@ impl DesktopState {
                 .values()
                 .any(|output| output.hdr_kms_applied || output.hdr_transition_target == Some(true)),
         };
-        let apps: Vec<(u64, String, Vec<String>)> = self.pending_app_launches.drain(..).collect();
-        for (launch_trace_id, app, args) in apps {
+        let apps: Vec<(u64, String, Vec<String>, LaunchSource)> =
+            self.pending_app_launches.drain(..).collect();
+        for (launch_trace_id, app, args, source) in apps {
             flog_info!(
                 "dequeuing app launch trace_id={} app={}",
                 launch_trace_id,
                 app
             );
             let ctx = ctx.clone();
-            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app, args));
+            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app, args, source));
         }
+    }
+
+    fn queue_session_restore_launches(&mut self, snapshot: &SessionSnapshot) {
+        let mut queued = 0usize;
+        for saved in snapshot.windows.iter().take(256) {
+            let Some((command, args)) = self.restore_launch_target(&saved.app_identity) else {
+                flog_warn!(
+                    "Session restore skipped app without installed desktop entry: {}",
+                    saved.app_identity
+                );
+                continue;
+            };
+            self.launch_app_with_source(command, args, LaunchSource::SessionRestore);
+            queued += 1;
+        }
+        if queued > 0 {
+            flog_info!("Session restore queued {queued} application launch(es)");
+        }
+    }
+
+    fn restore_launch_target(&self, identity: &str) -> Option<(String, Vec<String>)> {
+        let normalized = normalize_restore_identity(identity);
+        let internal = match normalized.as_str() {
+            "com.focaldesk.settings" => Some(focaldesk_settings_command()),
+            "com.focaldesk.files" => Some(focaldesk_files_command()),
+            "dev.focaldesk.aiconsole" => Some(focaldesk_ai_console_command()),
+            // The launcher is transient desktop chrome, not user session work.
+            "com.focaldesk.launcher" => return None,
+            _ => None,
+        };
+        if let Some(command) = internal {
+            return Some((command, Vec::new()));
+        }
+
+        for configured in [
+            &self.apps.terminal,
+            &self.apps.browser,
+            &self.apps.file_manager,
+            &self.apps.email,
+        ] {
+            let basename = Path::new(configured)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(configured);
+            if normalize_restore_identity(basename) == normalized {
+                return Some((configured.clone(), Vec::new()));
+            }
+        }
+
+        desktop_entry_for_identity(identity).map(|desktop_entry| {
+            (
+                "gio".to_string(),
+                vec![
+                    "launch".to_string(),
+                    desktop_entry.to_string_lossy().into_owned(),
+                ],
+            )
+        })
+    }
+
+    fn build_session_snapshot(&self) -> SessionSnapshot {
+        let mut instances: HashMap<(SavedProtocol, String), u32> = HashMap::new();
+        let outputs = self
+            .outputs
+            .iter()
+            .take(32)
+            .map(|(id, output)| SavedOutput {
+                connector: output.handle.name().to_string(),
+                active_workspace: self
+                    .workspace_names
+                    .get(output.active_workspace.0.saturating_sub(1) as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Workspace {}", output.active_workspace.0)),
+                focused: *id == self.focused_output,
+            })
+            .collect();
+        let windows = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.alive()
+                    && (window.mapped || window.minimized)
+                    && !window.is_dialog_like()
+                    && !window.is_override_redirect()
+                    && (window.app_id().is_some() || window.class().is_some())
+                    && !window
+                        .app_id()
+                        .is_some_and(session_restore_excluded_identity)
+            })
+            .take(256)
+            .filter_map(|window| {
+                let (protocol, identity) = match window.protocol() {
+                    crate::core::shell::managed_window::WindowProtocol::Wayland => (
+                        SavedProtocol::Wayland,
+                        window.app_id()?.chars().take(512).collect::<String>(),
+                    ),
+                    crate::core::shell::managed_window::WindowProtocol::Xwayland => (
+                        SavedProtocol::Xwayland,
+                        window.class()?.chars().take(512).collect::<String>(),
+                    ),
+                };
+                let key = (protocol, identity.to_ascii_lowercase());
+                let instance = instances.entry(key).or_default();
+                let saved_instance = *instance;
+                *instance = instance.saturating_add(1);
+
+                let geometry = self
+                    .global_window_bbox(&window.window)
+                    .unwrap_or_else(|| window.current_rect());
+                let output_id = window
+                    .output
+                    .unwrap_or_else(|| self.preferred_output_id_for_window(&window.window));
+                let output_connector = self
+                    .outputs
+                    .get(&output_id)
+                    .map(|output| output.handle.name().to_string());
+                let output_origin = self
+                    .outputs
+                    .get(&output_id)
+                    .map(|output| output.logical_origin)
+                    .unwrap_or_default();
+                let saved_rect = |rect: Rectangle<i32, Logical>| SavedRect {
+                    x: rect.loc.x - output_origin.x,
+                    y: rect.loc.y - output_origin.y,
+                    width: rect.size.w.max(1),
+                    height: rect.size.h.max(1),
+                };
+                let workspace = self
+                    .workspace_names
+                    .get(window.workspace.0.saturating_sub(1) as usize)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Workspace {}", window.workspace.0));
+
+                Some(SavedWindow {
+                    protocol,
+                    app_identity: identity,
+                    instance: saved_instance,
+                    workspace,
+                    output_connector,
+                    geometry: saved_rect(geometry),
+                    restore_geometry: window.restore_rect.map(saved_rect),
+                    floating: window.floating,
+                    maximized: window.maximized,
+                    fullscreen: window.fullscreen,
+                    minimized: window.minimized,
+                    focused: self.focused_window == Some(window.id),
+                })
+            })
+            .collect();
+        SessionSnapshot::new(
+            self.workspace_names
+                .iter()
+                .map(|name| name.chars().take(128).collect())
+                .collect(),
+            outputs,
+            windows,
+        )
+    }
+
+    fn process_session_checkpoint(&mut self) {
+        let enabled = self.workspaces.restore_session;
+        self.session_restore.set_enabled(enabled);
+        if !self.session_restore.due(Instant::now()) {
+            return;
+        }
+        self.checkpoint_session(false);
+    }
+
+    fn checkpoint_session(&mut self, force: bool) {
+        if !self.session_restore.enabled() {
+            return;
+        }
+        let snapshot = self.build_session_snapshot();
+        match self.session_restore.save(&snapshot, force) {
+            Ok(true) => flog_info!(
+                "Saved session snapshot with {} window(s)",
+                snapshot.windows.len()
+            ),
+            Ok(false) => {}
+            Err(err) => flog_warn!("Failed to save session snapshot: {err}"),
+        }
+    }
+
+    fn restored_output_id(&self, connector: Option<&str>) -> OutputId {
+        connector
+            .and_then(|connector| {
+                self.outputs.iter().find_map(|(id, output)| {
+                    (output.handle.name().as_str() == connector).then_some(*id)
+                })
+            })
+            .unwrap_or(self.primary_output)
+    }
+
+    fn restore_registered_output(&mut self, output_id: OutputId) {
+        let Some(connector) = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.handle.name().to_string())
+        else {
+            return;
+        };
+        let Some(saved) = self.session_restore.take_output(&connector) else {
+            return;
+        };
+        let workspace = self
+            .workspace_names
+            .iter()
+            .position(|name| name == &saved.active_workspace)
+            .map(|index| WorkspaceId(index as u32 + 1))
+            .unwrap_or(WorkspaceId(1));
+        if let Some(output) = self.outputs.get_mut(&output_id) {
+            output.active_workspace = workspace;
+        }
+        if saved.focused {
+            self.focused_output = output_id;
+            self.active_workspace = workspace;
+        }
+    }
+
+    fn clamp_restored_rect(
+        &self,
+        output_id: OutputId,
+        saved: SavedRect,
+    ) -> Rectangle<i32, Logical> {
+        let mut rect = Rectangle::from_loc_and_size(
+            self.outputs
+                .get(&output_id)
+                .map(|output| {
+                    (
+                        output.logical_origin.x + saved.x,
+                        output.logical_origin.y + saved.y,
+                    )
+                })
+                .unwrap_or((saved.x, saved.y)),
+            (saved.width.max(1), saved.height.max(1)),
+        );
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return rect;
+        };
+        rect.size.w = rect.size.w.min(work.size.w).max(1);
+        rect.size.h = rect.size.h.min(work.size.h).max(1);
+        rect.loc.x = rect
+            .loc
+            .x
+            .clamp(work.loc.x, work.loc.x + work.size.w - rect.size.w);
+        rect.loc.y = rect
+            .loc
+            .y
+            .clamp(work.loc.y, work.loc.y + work.size.h - rect.size.h);
+        rect
+    }
+
+    pub(crate) fn try_restore_window(
+        &mut self,
+        window_id: WindowId,
+        protocol: SavedProtocol,
+        identity: &str,
+    ) -> bool {
+        let Some(saved) = self.session_restore.take_match(protocol, identity) else {
+            return false;
+        };
+        let output_id = self.restored_output_id(saved.output_connector.as_deref());
+        let workspace = self
+            .workspace_names
+            .iter()
+            .position(|name| name == &saved.workspace)
+            .map(|index| WorkspaceId(index as u32 + 1))
+            .unwrap_or(WorkspaceId(1));
+        let rect = self.clamp_restored_rect(output_id, saved.geometry);
+        let restore_rect = saved
+            .restore_geometry
+            .map(|rect| self.clamp_restored_rect(output_id, rect))
+            .unwrap_or(rect);
+        let Some(window) = self.window_mut(window_id) else {
+            return false;
+        };
+        window.workspace = workspace;
+        window.output = Some(output_id);
+        window.float_rect = Some(rect);
+        window.restore_rect = Some(restore_rect);
+        window.floating = saved.floating;
+        window.maximized = saved.maximized;
+        window.fullscreen = saved.fullscreen;
+        window.minimized = saved.minimized;
+        window.session_restore_focus = Some(saved.focused);
+        flog_info!(
+            "Matched restored window {} to {} on workspace {}",
+            window_id.0,
+            identity,
+            workspace.0
+        );
+        true
     }
 
     pub fn process_chrome_timers(&mut self) {
@@ -1935,6 +2234,8 @@ impl DesktopState {
         self.keybinds = keybinds;
         self.apps = settings.apps;
         self.workspaces = settings.workspaces;
+        self.session_restore
+            .set_enabled(self.workspaces.restore_session);
         self.privacy = settings.privacy;
         self.power = settings.power;
         self.chrome_items = settings.chrome;
@@ -5216,6 +5517,7 @@ impl DesktopState {
     }
 
     fn request_hdr_safe_logout(&mut self) {
+        self.checkpoint_session(true);
         rearm_exclusive_hdr_for_next_session();
         if !self.hdr_rollback_needed() {
             self.running = false;
@@ -5232,6 +5534,9 @@ impl DesktopState {
         context: &'static str,
         interaction: PowerActionInteraction,
     ) {
+        if matches!(action, PowerIpcRequest::Reboot | PowerIpcRequest::PowerOff) {
+            self.checkpoint_session(true);
+        }
         if !matches!(
             action,
             PowerIpcRequest::Suspend | PowerIpcRequest::Hibernate
@@ -5701,6 +6006,7 @@ impl DesktopState {
         if self.outputs.len() == 1 {
             self.primary_output = output_id;
         }
+        self.restore_registered_output(output_id);
     }
 
     /// Preserve user-visible state while the DRM backend tears down and rebuilds its
@@ -6802,7 +7108,22 @@ impl DesktopState {
         let (network_state_tx, network_state_rx) = mpsc::channel();
         let (update_state_tx, update_state_rx) = mpsc::channel();
         let (lock_auth_tx, lock_auth_rx) = mpsc::channel();
-        let state = Self {
+        let (session_restore, restore_snapshot) =
+            SessionRestoreState::load_default(init.workspaces.restore_session);
+        let restored_workspace_names = restore_snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|name| !name.trim().is_empty())
+                    .take(32)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .filter(|names| !names.is_empty())
+            .unwrap_or_else(|| vec!["Workspace 1".to_string()]);
+        let mut state = Self {
             fonts: FontSystem::new(BuiltInThemeId::Classic).expect("REASON"),
             dialogs: Vec::new(),
             active_dialog: None,
@@ -6823,7 +7144,7 @@ impl DesktopState {
             desktop_outputs: IndexMap::new(),
             accessibility: crate::core::accessibility::AccessibilityBridge::new(),
             active_workspace: WorkspaceId(1),
-            workspace_names: vec!["Workspace 1".to_string()],
+            workspace_names: restored_workspace_names,
             next_window_id: WindowId(1),
             primary_output: init.primary_output,
             focused_output: init.primary_output,
@@ -6980,9 +7301,13 @@ impl DesktopState {
             pending_window_maps: Vec::new(),
             pending_focus_window: None,
             next_launch_trace_id: 1,
+            session_restore,
         };
 
         state.apply_power_settings();
+        if let Some(snapshot) = restore_snapshot {
+            state.queue_session_restore_launches(&snapshot);
+        }
         state
     }
 
@@ -7115,6 +7440,13 @@ impl DesktopState {
         .entered();
 
         self.sync_xwayland_window_meta(&surface);
+        let x11_class = surface.class();
+        let restore_unresolved = self
+            .window(id)
+            .is_some_and(|window| window.session_restore_focus.is_none());
+        let restored = restore_unresolved
+            && !x11_class.trim().is_empty()
+            && self.try_restore_window(id, SavedProtocol::Xwayland, &x11_class);
 
         if !surface.is_override_redirect() {
             let _ = surface.set_mapped(true);
@@ -7148,7 +7480,24 @@ impl DesktopState {
             });
 
         let should_float = self.windows[idx].floating;
-        let (bbox_location, configure_size, maximize_on_map) = if surface.is_override_redirect() {
+        let restored_maximized = restored && self.windows[idx].maximized;
+        let restored_fullscreen = restored && self.windows[idx].fullscreen;
+        let restored_rect = restored.then(|| self.windows[idx].float_rect).flatten();
+        let (bbox_location, configure_size, maximize_on_map) = if restored_fullscreen {
+            let geometry = self
+                .outputs
+                .get(&output_id)
+                .and_then(|output| self.space.output_geometry(&output.handle))
+                .unwrap_or(requested_geometry);
+            (geometry.loc, geometry.size, false)
+        } else if restored_maximized {
+            let geometry = self
+                .work_recess_for_output(output_id)
+                .unwrap_or(requested_geometry);
+            (geometry.loc, geometry.size, true)
+        } else if let Some(geometry) = restored_rect {
+            (geometry.loc, geometry.size, false)
+        } else if surface.is_override_redirect() {
             let geometry = Rectangle::from_loc_and_size(
                 self.xwayland_or_compositor_loc(&surface, requested_geometry.loc),
                 requested_geometry.size,
@@ -7203,7 +7552,12 @@ impl DesktopState {
             if maximize_on_map {
                 let _ = surface.set_maximized(true);
             }
-            self.focus_window_id(id);
+            if restored_fullscreen {
+                let _ = surface.set_fullscreen(true);
+            }
+            if self.windows[idx].session_restore_focus.unwrap_or(true) {
+                self.focus_window_id(id);
+            }
         }
 
         self.space.refresh();
@@ -7405,7 +7759,9 @@ impl DesktopState {
                 if in_space && !self.windows[idx].mapped && !self.windows[idx].minimized {
                     self.windows[idx].mapped = true;
                     let window_id = self.windows[idx].id;
-                    self.pending_focus_window = Some(window_id);
+                    if self.windows[idx].session_restore_focus.unwrap_or(true) {
+                        self.pending_focus_window = Some(window_id);
+                    }
                     tracing::trace!(
                         target: "focaldesk",
                         session_id = session_id(),
@@ -7447,7 +7803,7 @@ impl DesktopState {
         }
 
         let mut mapped_window = false;
-        if let Some(idx) = to_map {
+        if let Some(idx) = to_map.filter(|idx| !self.windows[*idx].minimized) {
             let output_id = self
                 .output_under_pointer(self.input.pointer_pos)
                 .unwrap_or(self.primary_output);
@@ -7459,7 +7815,9 @@ impl DesktopState {
 
             let window_id = self.windows[idx].id;
             self.pending_window_maps.push((window_id, map_loc));
-            self.pending_focus_window = Some(window_id);
+            if self.windows[idx].session_restore_focus.unwrap_or(true) {
+                self.pending_focus_window = Some(window_id);
+            }
             mapped_window = true;
             flog_info!("window map queued from commit window_id={}", window_id.0);
         }
@@ -7851,10 +8209,20 @@ impl DesktopState {
     }
 
     fn launch_app_with_args(&mut self, app: String, args: Vec<String>) -> u64 {
+        self.launch_app_with_source(app, args, LaunchSource::Ui)
+    }
+
+    fn launch_app_with_source(
+        &mut self,
+        app: String,
+        args: Vec<String>,
+        source: LaunchSource,
+    ) -> u64 {
         let launch_trace_id = self.next_launch_trace_id;
         self.next_launch_trace_id = self.next_launch_trace_id.saturating_add(1);
         flog_info!("queue launch trace_id={} app={}", launch_trace_id, app);
-        self.pending_app_launches.push((launch_trace_id, app, args));
+        self.pending_app_launches
+            .push((launch_trace_id, app, args, source));
         launch_trace_id
     }
 
@@ -9192,6 +9560,7 @@ impl DesktopState {
                 },
             )
         });
+        self.restore_registered_output(id);
 
         self.cursor_manager
             .set_base_size_and_scale(24, scale as f32);
@@ -10261,6 +10630,17 @@ fn focaldesk_ai_console_command() -> String {
         .unwrap_or_else(|| "focaldesk-ai-console".to_string())
 }
 
+fn normalize_restore_identity(identity: &str) -> String {
+    identity
+        .trim()
+        .trim_end_matches(".desktop")
+        .to_ascii_lowercase()
+}
+
+fn session_restore_excluded_identity(identity: &str) -> bool {
+    normalize_restore_identity(identity) == "com.focaldesk.launcher"
+}
+
 fn chrome_command_args(use_x11: bool, hdr_output_active: bool) -> Vec<String> {
     let profile = chrome_profile_dir();
     let ozone_platform = if use_x11 { "x11" } else { "wayland" };
@@ -10325,6 +10705,7 @@ fn spawn_app_detached(
     launch_trace_id: u64,
     app: String,
     extra_args: Vec<String>,
+    source: LaunchSource,
 ) {
     let app_name = app.clone();
     let chrome_like = is_chrome_like(&app_name);
@@ -10386,7 +10767,7 @@ fn spawn_app_detached(
             xwayland_display: xwayland_display.map(|display| display.to_string()),
             browser_backend: browser_backend_for_launch(browser_backend),
             hdr_output_active,
-            source: LaunchSource::Ui,
+            source,
         };
 
         chrome_launch_note(format!(
@@ -10394,7 +10775,27 @@ fn spawn_app_detached(
             browser_backend
         ));
 
-        match request_launch(&request) {
+        let mut attempts_left = if matches!(source, LaunchSource::SessionRestore) {
+            10
+        } else {
+            1
+        };
+        let launch_result = loop {
+            match request_launch(&request) {
+                Ok(response) => break Ok(response),
+                Err(err) => {
+                    attempts_left -= 1;
+                    if attempts_left == 0 {
+                        break Err(err);
+                    }
+                    // focaldesk-session.target is started asynchronously. A
+                    // restored app may reach this worker just before launchd's
+                    // socket appears, so retry only this startup-owned source.
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+            }
+        };
+        match launch_result {
             Ok(_) => {
                 if xwayland_display.is_none() && !(chrome_like || cursor_like) {
                     tracing::warn!(
