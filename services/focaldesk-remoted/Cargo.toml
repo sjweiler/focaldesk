@@ -1,0 +1,23 @@
+[package]
+name = "focaldesk-remoted"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+bytes = "1"
+focaldesk-remote-protocol = { path = "../../crates/focaldesk-remote-protocol" }
+ironrdp-server = { version = "=0.12.0", default-features = false, features = ["helper"] }
+libc = { workspace = true }
+rand = { workspace = true }
+rcgen = "0.14.10"
+serde = { workspace = true }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

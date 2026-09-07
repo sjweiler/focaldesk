@@ -14,6 +14,7 @@ anyhow = "1"
 dirs = "5"
 image.workspace = true
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
+focaldesk-launcher-state = { path = "../../crates/focaldesk-launcher-state" }
 focaldesk-gtk = { path = "../../crates/focaldesk-gtk" }
 focaldesk-config = { path = "../../crates/focaldesk-config" }
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }

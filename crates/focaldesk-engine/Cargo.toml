@@ -30,6 +30,7 @@ focaldesk-notifications = { path = "../focaldesk-notifications" }
 focaldesk-updates = { path = "../focaldesk-updates" }
 focaldesk-settings-core = { path = "../focaldesk-settings-core" }
 focaldesk-ipc = { path = "../focaldesk-ipc" }
+focaldesk-remote-protocol = { path = "../focaldesk-remote-protocol" }
 focaldesk-themes = { path = "../focaldesk-themes" }
 focaldesk-config = { path = "../focaldesk-config" }
 focaldesk-sounds = { path = "../focaldesk-sounds" }

@@ -2,7 +2,10 @@
 
 ## Status
 
-This document is an implementation roadmap, not a description of completed functionality. Items marked with checkboxes remain to be implemented unless noted otherwise. Decisions listed under **Open Decisions** must be resolved before their corresponding phase begins.
+This document tracks both completed and planned remote-desktop work. Checked
+items are implemented in the repository; unchecked items remain planned or need
+live validation. Decisions listed under **Open Decisions** must be resolved
+before their corresponding phase begins.
 
 ## Goal
 
@@ -157,41 +160,95 @@ All messages require explicit size limits. File descriptors and shared buffers m
 
 ### Phase 1: Shared output-capture broker
 
-- [ ] Add common capture frame, consumer, session, and error types.
-- [ ] Add an `OutputCaptureBroker` owned by the compositor state.
-- [ ] Register and remove capture consumers without leaking sessions or buffers.
-- [ ] Extract reusable output-export logic from portal capture.
-- [ ] Convert portal capture to use the shared broker.
-- [ ] Preserve current portal behavior and DMA-BUF constraints.
-- [ ] Associate each frame with an output, frame serial, timestamp, buffer, and damage list.
-- [ ] Force full damage for a new consumer and after size, scale, or transform changes.
-- [ ] Add bounded per-consumer queues and slow-consumer frame dropping.
-- [ ] Add unit tests for registration, removal, full-frame recovery, and queue limits.
+- [x] Add common capture frame, consumer, and session types.
+- [ ] Add a common capture error type before expanding the consumer APIs.
+- [x] Add an `OutputCaptureBroker` owned by the compositor state.
+- [x] Register and remove capture consumers without leaking sessions or buffers.
+- [x] Extract reusable output-export logic from portal capture.
+- [x] Convert portal capture to use the shared broker.
+- [x] Preserve current portal behavior and DMA-BUF constraints.
+- [x] Associate each frame with an output, frame serial, timestamp, buffer, and damage list.
+- [x] Force full damage for a new consumer and after size, scale, or transform changes.
+- [x] Add bounded per-consumer queues and slow-consumer frame dropping.
+- [x] Add unit tests for registration, removal, full-frame recovery, and queue limits.
 
 ### Phase 2: Local frame transport
 
-- [ ] Add `focaldesk-remote-protocol` with an explicit protocol version.
-- [ ] Add a compositor-owned Unix-domain socket endpoint.
-- [ ] Authenticate the service using peer credentials.
-- [ ] Implement `StartCapture` and `StopCapture` for one output.
-- [ ] Export frames through bounded shared-memory buffers.
-- [ ] Deliver full frames to a local diagnostic client.
-- [ ] Ensure the compositor never waits for the diagnostic client.
-- [ ] Clean up buffers and capture state after malformed messages or disconnects.
-- [ ] Add protocol round-trip, truncation, oversize-message, and disconnect tests.
+- [x] Add `focaldesk-remote-protocol` with an explicit protocol version.
+- [x] Add a compositor-owned Unix-domain socket endpoint.
+- [x] Authenticate the service using peer credentials.
+- [x] Implement `StartCapture` and `StopCapture` for one output.
+- [x] Export frames through bounded shared-memory buffers.
+- [x] Deliver full frames to a local diagnostic client.
+- [x] Ensure the compositor never waits for the diagnostic client.
+- [x] Clean up buffers and capture state after malformed messages or disconnects.
+- [x] Add protocol round-trip, truncation, oversize-message, and disconnect tests.
+
+#### Local transport diagnostic
+
+With the compositor running, request output 1 and save the first full RGBA frame:
+
+```bash
+cargo run -p focaldesk-remote-diagnostic -- 1 /tmp/focaldesk-frame.rgba
+```
+
+The client connects only to `$XDG_RUNTIME_DIR/focaldesk/remote-capture.sock` (or the
+explicit `FOCALDESK_REMOTE_SOCKET_PATH` development override). The compositor creates
+the socket with mode `0600`, verifies the connecting UID and executable identity using
+`SO_PEERCRED`, and sends pixels in sealed `memfd` buffers rather than embedding them in
+protocol messages.
 
 ### Phase 3: Remote service and view-only RDP
 
-- [ ] Add `services/focaldesk-remoted` to the Cargo workspace.
-- [ ] Add an initially disabled systemd user service.
-- [ ] Select and document the RDP server library.
-- [ ] Listen only on `127.0.0.1` by default.
-- [ ] Allow one client and reject or queue additional clients explicitly.
-- [ ] Use an expiring development token during this phase.
-- [ ] Negotiate the selected output's dimensions and pixel format.
-- [ ] Convert compositor frames to RDP bitmap updates.
-- [ ] Implement clean startup, disconnect, reconnect, and compositor-restart behavior.
+- [x] Add `services/focaldesk-remoted` to the Cargo workspace.
+- [x] Add an initially disabled systemd user service.
+- [x] Select and document the RDP server library.
+- [x] Listen only on `127.0.0.1` by default.
+- [x] Allow one client and reject or queue additional clients explicitly.
+- [x] Use an expiring development token during this phase.
+- [x] Negotiate the selected output's dimensions and pixel format.
+- [x] Convert compositor frames to RDP bitmap updates.
+- [x] Implement clean startup, disconnect, reconnect, and compositor-restart behavior.
 - [ ] Verify interoperability with at least two RDP clients where possible.
+
+#### RDP service implementation
+
+The focused [Remote Desktop guide](remote-desktop.md) documents installation,
+the Phase 3 security model, SSH tunneling, operation, and troubleshooting.
+
+Phase 3 uses `ironrdp-server` 0.12.0 for Enhanced RDP Security over TLS and
+compressed bitmap updates. Version 0.12.0 is pinned because the published 0.13.0
+dependency graph cannot currently be resolved consistently; revisit the pin after
+the upstream crates converge.
+
+IronRDP processes one accepted connection at a time. While that client is active,
+the TCP listener backlog queues later connections; they are not given concurrent
+access to the desktop.
+
+The service is intentionally not enabled at installation time. For a development
+session, install and start it explicitly, then read the short-lived credentials
+from the private runtime file:
+
+```bash
+just install-remoted-service
+systemctl --user start focaldesk-remoted.service
+cat "$XDG_RUNTIME_DIR/focaldesk/remoted-token.json"
+```
+
+Connect an RDP client to `127.0.0.1:3389` with the displayed `focaldesk` username
+and token. The development certificate is self-signed and recreated when the
+service starts; production certificate identity is tracked in Phase 7.
+
+For access from another machine, keep the daemon on loopback and forward the port
+through an authenticated SSH connection:
+
+```bash
+ssh -N -L 13389:127.0.0.1:3389 user@focaldesk-host
+```
+
+Then point the RDP client at `127.0.0.1:13389`. The daemon rejects non-loopback
+bind addresses, so Phase 3 cannot accidentally expose RDP directly to a LAN or the
+public internet.
 
 ### Phase 4: Efficient damage and encoding
 
@@ -418,11 +475,8 @@ The first supported release should not ship until:
 
 ## Open Decisions
 
-- Which Rust RDP server implementation satisfies the required server, graphics, clipboard, and multi-monitor capabilities?
 - Should production authentication use PAM, device pairing, or both?
 - Where should TLS keys and certificates be stored and rotated?
-- Which IPC serialization format provides safe bounded decoding and versioning?
-- Should the remote service be a user service, a system service, or split into both roles?
 - Should remote input reuse the active Smithay seat or create a dedicated virtual seat?
 - What precise content is visible while the local session is locked?
 - Which hardware encoders and GPU APIs are initially supported?
@@ -431,6 +485,17 @@ The first supported release should not ship until:
 - Which compositor surfaces, notifications, or protected content must never be captured?
 - What local confirmation policy applies to unattended access?
 
+## Resolved MVP Decisions
+
+- Use `ironrdp-server` for the RDP server and bitmap graphics path.
+- Run the network-facing component as an initially disabled systemd user service.
+- Use a versioned, length-prefixed JSON envelope over a private Unix socket, with
+  sealed shared-memory descriptors transferred using `SCM_RIGHTS`.
+- Keep Phase 3 view-only and loopback-only; use an authenticated SSH tunnel for
+  access from another machine.
+
 ## Immediate Next Step
 
-Implement Phase 1 without adding a network listener. Introduce a shared output-capture broker, convert the existing portal capture path to consume it, and verify that portal behavior remains unchanged. This establishes the central abstraction needed by remote desktop while keeping the first change local, testable, and security-neutral.
+Finish the remaining common capture types in Phase 1, exercise capture on both DRM
+and nested backends, and verify Phase 3 interoperability with at least two RDP clients.
+Then begin Phase 4 damage-only updates and bounded encoding metrics.

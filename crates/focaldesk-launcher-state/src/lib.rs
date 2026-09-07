@@ -31,12 +31,20 @@ fn remember_recent(state: &mut LauncherState, id: &str) {
     state.recents.truncate(MAX_RECENTS);
 }
 
+fn clear_recent(state: &mut LauncherState) {
+    state.recents.clear();
+}
+
 fn toggle_favorite(state: &mut LauncherState, id: &str) -> bool {
     toggle_entry(&mut state.favorites, id)
 }
 
 pub fn remember_recent_app(id: &str) -> io::Result<()> {
     mutate_launcher_state(&state_path(), |state| remember_recent(state, id))
+}
+
+pub fn clear_recent_apps() -> io::Result<()> {
+    mutate_launcher_state(&state_path(), clear_recent)
 }
 
 pub fn toggle_app_favorite(id: &str) -> io::Result<bool> {
@@ -217,8 +225,8 @@ fn append_entries(contents: &mut String, kind: &str, entries: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        load_launcher_state_from, mutate_launcher_state, remember_recent, save_launcher_state_to,
-        toggle_favorite, LauncherState,
+        clear_recent, load_launcher_state_from, mutate_launcher_state, remember_recent,
+        save_launcher_state_to, toggle_favorite, LauncherState,
     };
     use std::os::unix::fs::PermissionsExt;
 
@@ -292,6 +300,21 @@ mod tests {
         remember_recent(&mut state, "two.desktop");
         remember_recent(&mut state, "one.desktop");
         assert_eq!(state.recents, ["one.desktop", "two.desktop"]);
+    }
+
+    #[test]
+    fn clearing_recents_preserves_favorites() {
+        let mut state = LauncherState {
+            favorites: vec!["favorite.desktop".into()],
+            file_favorites: vec!["file:///tmp/note.txt".into()],
+            recents: vec!["recent.desktop".into()],
+        };
+
+        clear_recent(&mut state);
+
+        assert!(state.recents.is_empty());
+        assert_eq!(state.favorites, ["favorite.desktop"]);
+        assert_eq!(state.file_favorites, ["file:///tmp/note.txt"]);
     }
 
     #[test]

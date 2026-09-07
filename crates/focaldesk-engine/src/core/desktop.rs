@@ -33,7 +33,7 @@ use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonSta
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
-use smithay::input::keyboard::{keysyms, xkb};
+use smithay::input::keyboard::{keysyms, xkb, XkbConfig};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, MotionEvent, RelativeMotionEvent,
 };
@@ -932,7 +932,7 @@ pub struct DesktopState {
     pub output_capture_source_state:
         smithay::wayland::image_capture_source::OutputCaptureSourceState,
     pub image_copy_capture_state: smithay::wayland::image_copy_capture::ImageCopyCaptureState,
-    pub image_copy_capture_sessions: Vec<smithay::wayland::image_copy_capture::Session>,
+    pub image_copy_capture_sessions: Vec<crate::core::portal::PortalCaptureSession>,
     pub color_tag_state: crate::core::wayland::color_protocol::ColorTagState,
     pub color_management_state:
         crate::core::wayland::color_management_protocol::ColorManagementState,
@@ -942,8 +942,10 @@ pub struct DesktopState {
     pub portal_dispatch_ctx: Option<crate::core::portal::PortalDispatchCtx>,
     pub pending_portal_captures: Vec<crate::core::portal::PendingPortalCapture>,
     pub portal_frame_cache: HashMap<OutputId, crate::core::portal::PortalFrameCache>,
-    /// Latest DRM offscreen texture per output for portal/OBS capture.
-    pub portal_capture_source: HashMap<OutputId, crate::core::portal::PortalCaptureSource>,
+    /// Shared bounded frame fan-out for portal and future remote-desktop consumers.
+    pub output_capture_broker:
+        crate::core::capture::OutputCaptureBroker<crate::core::portal::PortalCaptureSource>,
+    pub local_remote_capture: Option<crate::core::remote::LocalRemoteCapture>,
     /// Offscreen targets for portal re-render fallback (matches linear/legacy scanout path).
     pub portal_offscreen_targets:
         HashMap<OutputId, crate::core::linear_compositing::LinearOffscreenTargets>,
@@ -1441,6 +1443,7 @@ impl DesktopState {
     /// Drain deferred sidebar/topbar clicks, app launches, and egui panel opens.
     /// Call from the backend main loop after input dispatch, before Wayland client dispatch.
     pub fn process_deferred_ui_and_launches(&mut self) {
+        crate::core::remote::process_commands(self);
         self.process_accessibility_actions();
         self.process_pending_ui_actions();
         self.process_pending_app_launches();
@@ -2230,6 +2233,26 @@ impl DesktopState {
                 .map(|(action, shortcut)| (action.as_str(), shortcut.as_str())),
         ) {
             flog_warn!("Ignored keybinding setting: {warning}");
+        }
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            let input = &settings.input;
+            if let Err(err) = keyboard.set_xkb_config(
+                self,
+                XkbConfig {
+                    layout: &input.keyboard_layout,
+                    variant: &input.keyboard_variant,
+                    model: &input.keyboard_model,
+                    options: (!input.keyboard_options.is_empty())
+                        .then(|| input.keyboard_options.clone()),
+                    ..Default::default()
+                },
+            ) {
+                flog_warn!("Ignored keyboard layout setting: {err}");
+            }
+            keyboard.change_repeat_info(
+                input.keyboard_repeat_rate.clamp(1, 100) as i32,
+                input.keyboard_repeat_delay_ms.clamp(100, 2_000) as i32,
+            );
         }
         self.keybinds = keybinds;
         self.apps = settings.apps;
@@ -7183,7 +7206,14 @@ impl DesktopState {
             portal_dispatch_ctx: None,
             pending_portal_captures: Vec::new(),
             portal_frame_cache: HashMap::new(),
-            portal_capture_source: HashMap::new(),
+            output_capture_broker: crate::core::capture::OutputCaptureBroker::default(),
+            local_remote_capture: crate::core::remote::LocalRemoteCapture::start()
+                .map_err(|error| {
+                    focaldesk_logging::flog(format!(
+                        "local remote capture transport unavailable: {error}"
+                    ));
+                })
+                .ok(),
             portal_offscreen_targets: HashMap::new(),
             compositor_ready: false,
             backend_kind: init.backend_kind,

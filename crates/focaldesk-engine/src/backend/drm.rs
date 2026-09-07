@@ -3605,10 +3605,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.tick_layout();
 
         let screenshot_output = data.core.state.screenshot_request();
-        data.core
-            .state
-            .image_copy_capture_sessions
-            .retain(|session| session.alive());
+        crate::core::portal::remove_dead_portal_sessions(&mut data.core.state);
         let portal_pending = crate::core::portal::portal_capture_pending(&data.core.state);
         let portal_needs_composite = crate::core::portal::portal_needs_composite(&data.core.state);
         // A DRM page-flip event is delivered only for a frame that we actually
@@ -4092,6 +4089,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     if let Some((texture, encoding)) = capture_source_texture(surface) {
                         crate::core::portal::publish_portal_capture_source(
                             &mut data.core.state,
+                            &mut device.renderer,
                             surface.output_id,
                             texture,
                             surface.size,

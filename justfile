@@ -55,6 +55,9 @@ release-desktop:
 release-server:
     cargo build --release -p focaldesk-server
 
+release-remoted:
+    cargo build --release -p focaldesk-remoted
+
 release-powerd:
     cargo build --release -p focaldesk-powerd
 
@@ -106,6 +109,13 @@ install-server-service:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
+install-remoted-service:
+    cargo build --release -p focaldesk-remoted
+    install -Dm755 target/release/focaldesk-remoted "$HOME/.local/bin/focaldesk-remoted"
+    install -Dm644 packaging/systemd/user/focaldesk-remoted.service "$HOME/.config/systemd/user/focaldesk-remoted.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    @echo "Installed focaldesk-remoted.service without enabling or starting it"
+
 install-session-target:
     install -Dm644 packaging/systemd/user/focaldesk-session.target "$HOME/.config/systemd/user/focaldesk-session.target"
     # Migrate services formerly enabled directly under the shared desktop target.
@@ -124,7 +134,7 @@ install-shell-services: install-session-target
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
 
-install-services: install-session-target install-shell-services install-server-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
+install-services: install-session-target install-shell-services install-server-service install-remoted-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -356,7 +366,14 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
-install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-server-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-remoted-service-fedora:
+    cargo build --release -p focaldesk-remoted
+    sudo install -Dm755 target/release/focaldesk-remoted /usr/bin/focaldesk-remoted
+    sudo install -Dm644 packaging/systemd/user/focaldesk-remoted-fedora.service /usr/lib/systemd/user/focaldesk-remoted.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    @echo "Installed focaldesk-remoted.service without enabling or starting it"
+
+install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-server-service-fedora install-remoted-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
 
 # Both the system credential socket and user-session IPC use this directory.
 # Prepare it before starting user services so a directory created by PID 1

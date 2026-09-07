@@ -1,6 +1,7 @@
 pub mod accessibility;
 pub mod app;
 pub mod camera;
+pub mod capture;
 pub mod color;
 pub mod colord;
 pub mod consts;
@@ -13,6 +14,7 @@ pub mod linear_compositing;
 pub mod lock;
 pub mod output;
 pub mod output_store;
+pub mod remote;
 pub mod render;
 pub mod scene;
 pub mod screenshot;

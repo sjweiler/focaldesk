@@ -89,12 +89,27 @@ impl ImageCopyCaptureHandler for DesktopState {
     }
 
     fn new_session(&mut self, session: Session) {
-        self.image_copy_capture_sessions.push(session);
+        let Some(output_id) = portal::output_id_for_session(self, &session) else {
+            focaldesk_logging::flog("portal capture session has no matching output");
+            return;
+        };
+        let consumer_id = self.output_capture_broker.register(output_id, 1);
+        self.image_copy_capture_sessions
+            .push(portal::PortalCaptureSession {
+                session,
+                consumer_id,
+            });
     }
 
     fn session_destroyed(&mut self, session: SessionRef) {
-        self.image_copy_capture_sessions
-            .retain(|stored| *stored != session);
+        if let Some(index) = self
+            .image_copy_capture_sessions
+            .iter()
+            .position(|stored| stored.session.eq(&session))
+        {
+            let stored = self.image_copy_capture_sessions.remove(index);
+            self.output_capture_broker.remove(stored.consumer_id);
+        }
         focaldesk_logging::flog("portal capture session destroyed");
     }
 
@@ -103,8 +118,17 @@ impl ImageCopyCaptureHandler for DesktopState {
             frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
             return;
         };
+        let Some(consumer_id) = self
+            .image_copy_capture_sessions
+            .iter()
+            .find(|stored| stored.session.eq(session))
+            .map(|stored| stored.consumer_id)
+        else {
+            frame.fail(smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown);
+            return;
+        };
 
-        portal::try_render_portal_frame(self, frame, output_id);
+        portal::try_render_portal_frame(self, frame, output_id, consumer_id);
     }
 }
 

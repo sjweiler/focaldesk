@@ -10,6 +10,7 @@ use focaldesk_ipc::{
     THEME_EDITOR_PROTOCOL_VERSION,
 };
 use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
+use focaldesk_launcher_state::clear_recent_apps;
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_permissions::{
     PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
@@ -66,10 +67,10 @@ const ORIENTATION_OPTIONS: &[&str] = &[
     "Landscape Flipped",
     "Portrait Left",
 ];
-const OUTPUT_CONFIGURATION_OPTIONS: &[&str] = &["HiFi 2.0 channels", "Stereo", "Mono"];
-const ALERT_SOUND_OPTIONS: &[&str] = &["Default", "Click", "Chime", "None"];
 const KEYBOARD_LAYOUT_OPTIONS: &[&str] = &["English (US)", "English (UK)", "German", "French"];
 const MODIFIER_BEHAVIOR_OPTIONS: &[&str] = &["Default", "Caps Lock as Ctrl", "Swap Ctrl and Alt"];
+const KEYBOARD_LAYOUT_VALUES: &[&str] = &["us", "gb", "de", "fr"];
+const MODIFIER_BEHAVIOR_VALUES: &[&str] = &["", "ctrl:nocaps", "ctrl:swap_lalt_lctl"];
 const LOG_LEVEL_OPTIONS: &[&str] = &["Error", "Warn", "Info", "Debug", "Trace"];
 const POWER_TIMEOUT_OPTIONS: &[&str] =
     &["Never", "1 minute", "5 minutes", "10 minutes", "30 minutes"];
@@ -1046,6 +1047,53 @@ fn set_default_audio_device(kind: AudioDeviceKind, selector: &str) -> Result<(),
     run_control_command("pactl", &[command, selector]).map(|_| ())
 }
 
+fn parse_wpctl_volume(output: &str) -> Option<f64> {
+    output
+        .split_whitespace()
+        .find_map(|part| part.parse::<f64>().ok())
+        .map(|volume| (volume * 100.0).clamp(0.0, 150.0))
+}
+
+fn parse_pactl_volume(output: &str) -> Option<f64> {
+    output.split_whitespace().find_map(|part| {
+        part.strip_suffix('%')
+            .and_then(|percent| percent.parse::<f64>().ok())
+    })
+}
+
+fn load_default_output_volume() -> Result<f64, String> {
+    match run_control_command("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]) {
+        Ok(output) => parse_wpctl_volume(&output)
+            .ok_or_else(|| "wpctl returned an unreadable volume".to_string()),
+        Err(wpctl_err) => {
+            let output = run_control_command("pactl", &["get-sink-volume", "@DEFAULT_SINK@"])
+                .map_err(|pactl_err| format!("{wpctl_err}; {pactl_err}"))?;
+            parse_pactl_volume(&output)
+                .ok_or_else(|| "pactl returned an unreadable volume".to_string())
+        }
+    }
+}
+
+fn set_default_output_volume(percent: f64) -> Result<(), String> {
+    let percent = percent.clamp(0.0, 150.0);
+    let wpctl_value = format!("{:.3}", percent / 100.0);
+    match run_control_command(
+        "wpctl",
+        &["set-volume", "@DEFAULT_AUDIO_SINK@", &wpctl_value],
+    ) {
+        Ok(_) => Ok(()),
+        Err(wpctl_err) => {
+            let pactl_value = format!("{percent:.0}%");
+            run_control_command(
+                "pactl",
+                &["set-sink-volume", "@DEFAULT_SINK@", &pactl_value],
+            )
+            .map(|_| ())
+            .map_err(|pactl_err| format!("{wpctl_err}; {pactl_err}"))
+        }
+    }
+}
+
 fn add_switch_row(
     group: &adw::PreferencesGroup,
     title: &str,
@@ -1149,10 +1197,6 @@ fn add_scale_row(
     group.add(&row);
 
     scale
-}
-
-fn suffix_chevron() -> gtk::Image {
-    gtk::Image::from_icon_name("go-next-symbolic")
 }
 
 fn run_control_command(program: &str, args: &[&str]) -> Result<String, String> {
@@ -6722,9 +6766,56 @@ fn appearance_page(
 
     {
         let config = config.clone();
+        let settings = settings.clone();
+        let shader_switch = shader_switch.clone();
+        let glass_switch = glass_switch.clone();
+        let focus_switch = focus_switch.clone();
+        let shelf_visibility = shelf_visibility.clone();
+        let theme_dropdown = theme_dropdown.clone();
+        let contrast_switch = contrast_switch.clone();
+        let motion_switch = motion_switch.clone();
+        let glow_scale = glow_scale.clone();
+        let font_scale = font_scale.clone();
         reset_button.connect_clicked(move |_| {
-            *config.borrow_mut() = FocalDeskConfig::default();
+            let default_config = FocalDeskConfig::default();
+            let default_settings = focaldesk_settings_core::default_settings();
+            config.borrow_mut().appearance = default_config.appearance;
+            config.borrow_mut().dock.visibility = default_config.dock.visibility;
+            settings.borrow_mut().appearance = default_settings.appearance;
             persist_config(&config.borrow());
+            persist_settings(&settings.borrow());
+
+            let (shader, glass, focus, visibility, theme, glow, font) = {
+                let config = config.borrow();
+                (
+                    config.appearance.shader_chrome,
+                    config.appearance.work_area_glass,
+                    config.appearance.output_focus_glow,
+                    config.dock.visibility,
+                    config.appearance.theme.clone(),
+                    config.appearance.glow_strength,
+                    config.appearance.font_scale,
+                )
+            };
+            set_switch_if_changed(&shader_switch, shader);
+            set_switch_if_changed(&glass_switch, glass);
+            set_switch_if_changed(&focus_switch, focus);
+            shelf_visibility.set_selected(dock_visibility_index(visibility));
+            if let Some(index) = THEME_OPTIONS.iter().position(|option| *option == theme) {
+                theme_dropdown.set_selected(index as u32);
+            }
+            set_scale_if_changed(&glow_scale, glow);
+            set_scale_if_changed(&font_scale, font);
+
+            let (high_contrast, animations) = {
+                let settings = settings.borrow();
+                (
+                    settings.appearance.high_contrast,
+                    settings.appearance.animations,
+                )
+            };
+            set_switch_if_changed(&contrast_switch, high_contrast);
+            set_switch_if_changed(&motion_switch, !animations);
             info!(
                 target: "focaldesk",
                 session_id = session_id(),
@@ -8080,33 +8171,34 @@ fn sound_page() -> adw::NavigationPage {
     }
     output_group.add(&output_device_row);
 
-    let output_config_row = adw::ActionRow::new();
-    output_config_row.set_title("Configuration");
-    output_config_row.add_suffix(&dropdown_from_strings(OUTPUT_CONFIGURATION_OPTIONS, 0));
-    output_group.add(&output_config_row);
-
     let output_volume_row = adw::ActionRow::new();
     output_volume_row.set_title("Output Volume");
     let output_volume_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
     output_volume_box.set_hexpand(true);
     let output_volume_icon = gtk::Image::from_icon_name("audio-volume-high-symbolic");
-    let output_volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+    let output_volume = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 150.0, 1.0);
     output_volume.set_hexpand(true);
     output_volume.set_draw_value(false);
-    output_volume.set_value(75.0);
+    match load_default_output_volume() {
+        Ok(volume) => {
+            output_volume.set_value(volume);
+            let row = output_volume_row.clone();
+            output_volume.connect_value_changed(move |scale| {
+                match set_default_output_volume(scale.value()) {
+                    Ok(()) => row.set_subtitle(&format!("{:.0}%", scale.value())),
+                    Err(err) => row.set_subtitle(&format!("Could not change volume: {err}")),
+                }
+            });
+        }
+        Err(err) => {
+            output_volume.set_sensitive(false);
+            output_volume_row.set_subtitle(&format!("Volume control unavailable: {err}"));
+        }
+    }
     output_volume_box.append(&output_volume_icon);
     output_volume_box.append(&output_volume);
     output_volume_row.add_suffix(&output_volume_box);
     output_group.add(&output_volume_row);
-
-    let balance_row = adw::ActionRow::new();
-    balance_row.set_title("Balance");
-    let balance = gtk::Scale::with_range(gtk::Orientation::Horizontal, -1.0, 1.0, 0.05);
-    balance.set_hexpand(true);
-    balance.set_draw_value(false);
-    balance.set_value(0.0);
-    balance_row.add_suffix(&balance);
-    output_group.add(&balance_row);
 
     let test_row = adw::ActionRow::new();
     test_row.set_title("Test Speakers");
@@ -8151,21 +8243,6 @@ fn sound_page() -> adw::NavigationPage {
     input_group.add(&input_device_row);
 
     page.add(&input_group);
-
-    let sounds_group = adw::PreferencesGroup::new();
-    sounds_group.set_title("Sounds");
-
-    let volume_levels_row = adw::ActionRow::new();
-    volume_levels_row.set_title("Volume Levels");
-    volume_levels_row.add_suffix(&suffix_chevron());
-    sounds_group.add(&volume_levels_row);
-
-    let alert_sound_row = adw::ActionRow::new();
-    alert_sound_row.set_title("Alert Sound");
-    alert_sound_row.add_suffix(&dropdown_from_strings(ALERT_SOUND_OPTIONS, 0));
-    sounds_group.add(&alert_sound_row);
-
-    page.add(&sounds_group);
 
     adw::NavigationPage::new(&page, "Sound")
 }
@@ -8275,6 +8352,8 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         let browser = browser.clone();
         let browser_backend = browser_backend.clone();
         let file_manager = file_manager.clone();
+        let email = email.clone();
+        let pin_email = pin_email.clone();
         move |_| {
             settings.borrow_mut().apps = focaldesk_settings_core::default_settings().apps;
             let apps = settings.borrow().apps.clone();
@@ -8282,6 +8361,8 @@ fn applications_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             browser.set_text(&apps.browser);
             browser_backend.set_selected(browser_launch_backend_index(apps.browser_launch_backend));
             file_manager.set_text(&apps.file_manager);
+            email.set_text(&apps.email);
+            set_switch_if_changed(&pin_email, apps.pin_email_to_shelf);
             persist_settings(&settings.borrow());
         }
     });
@@ -8463,18 +8544,6 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
 
-    add_switch_row(
-        &behavior_group,
-        "Show workspace indicator on top bar",
-        Some("Show the active workspace where it is always visible"),
-        true,
-    );
-    add_switch_row(
-        &behavior_group,
-        "Per-monitor workspaces",
-        Some("Keep each display on its own active workspace"),
-        false,
-    );
     let restore_session = add_switch_row(
         &behavior_group,
         "Restore session",
@@ -8503,12 +8572,6 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
-    add_switch_row(
-        &behavior_group,
-        "Wrap around when switching",
-        Some("Continue from the last workspace back to the first"),
-        true,
-    );
     page.add(&behavior_group);
 
     let keybind_group = adw::PreferencesGroup::new();
@@ -8532,22 +8595,79 @@ fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
 
     let input_group = adw::PreferencesGroup::new();
     input_group.set_title("Typing");
-    add_dropdown_row(
+    input_group.set_description(Some("Changes apply immediately to the current session"));
+    let layout = add_dropdown_row(
         &input_group,
         "Layout",
-        Some("Keyboard layout used for new sessions"),
+        Some("Keyboard layout used by FocalDesk and newly launched applications"),
         KEYBOARD_LAYOUT_OPTIONS,
-        0,
+        KEYBOARD_LAYOUT_VALUES
+            .iter()
+            .position(|layout| *layout == settings.borrow().input.keyboard_layout)
+            .unwrap_or(0) as u32,
     );
-    add_scale_row(&input_group, "Repeat delay", 150.0, 1000.0, 25.0, 350.0);
-    add_scale_row(&input_group, "Repeat speed", 10.0, 60.0, 1.0, 30.0);
-    add_dropdown_row(
+    {
+        let settings = settings.clone();
+        layout.connect_selected_notify(move |dropdown| {
+            let value = KEYBOARD_LAYOUT_VALUES
+                .get(dropdown.selected() as usize)
+                .copied()
+                .unwrap_or("us");
+            settings.borrow_mut().input.keyboard_layout = value.to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
+    let repeat_delay = add_scale_row(
+        &input_group,
+        "Repeat delay",
+        150.0,
+        1000.0,
+        25.0,
+        settings.borrow().input.keyboard_repeat_delay_ms as f64,
+    );
+    {
+        let settings = settings.clone();
+        repeat_delay.connect_value_changed(move |scale| {
+            settings.borrow_mut().input.keyboard_repeat_delay_ms = scale.value().round() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
+    let repeat_rate = add_scale_row(
+        &input_group,
+        "Repeat speed",
+        10.0,
+        60.0,
+        1.0,
+        settings.borrow().input.keyboard_repeat_rate as f64,
+    );
+    {
+        let settings = settings.clone();
+        repeat_rate.connect_value_changed(move |scale| {
+            settings.borrow_mut().input.keyboard_repeat_rate = scale.value().round() as u32;
+            persist_settings(&settings.borrow());
+        });
+    }
+    let modifier_behavior = add_dropdown_row(
         &input_group,
         "Modifier behavior",
         Some("Common modifier remaps"),
         MODIFIER_BEHAVIOR_OPTIONS,
-        0,
+        MODIFIER_BEHAVIOR_VALUES
+            .iter()
+            .position(|option| *option == settings.borrow().input.keyboard_options)
+            .unwrap_or(0) as u32,
     );
+    {
+        let settings = settings.clone();
+        modifier_behavior.connect_selected_notify(move |dropdown| {
+            let value = MODIFIER_BEHAVIOR_VALUES
+                .get(dropdown.selected() as usize)
+                .copied()
+                .unwrap_or_default();
+            settings.borrow_mut().input.keyboard_options = value.to_string();
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&input_group);
 
     let shortcuts_group = adw::PreferencesGroup::new();
@@ -8656,8 +8776,8 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     history_group.set_title("History");
     let recent_files = add_switch_row(
         &history_group,
-        "Recent files",
-        Some("Allow apps to show recently opened files"),
+        "Recent applications",
+        Some("Remember launched applications for the Launcher's Recent section"),
         settings.borrow().privacy.recent_files,
     );
     {
@@ -8713,13 +8833,24 @@ fn privacy_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     }
     let clear_history = add_button_row(
         &history_group,
-        "Clear recent history",
-        Some("Remove saved recent file entries"),
+        "Clear recent applications",
+        Some("Remove every application from the Launcher's Recent section"),
         "Clear",
     );
     clear_history.connect_clicked({
         let history_status = history_status.clone();
-        move |_| history_status.set_text("Recent history cleared")
+        move |_| match clear_recent_apps() {
+            Ok(()) => history_status.set_text("Recent applications cleared"),
+            Err(err) => {
+                warn!(
+                    target: "focaldesk",
+                    session_id = session_id(),
+                    error = %err,
+                    "failed to clear recent applications"
+                );
+                history_status.set_text("Could not clear recent applications")
+            }
+        }
     });
     history_group.add(&history_status);
     page.add(&history_group);
@@ -9774,6 +9905,18 @@ fn displays_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_volume_parsers_accept_wpctl_and_pactl_output() {
+        assert_eq!(parse_wpctl_volume("Volume: 0.73"), Some(73.0));
+        assert_eq!(parse_wpctl_volume("Volume: 1.25 [MUTED]"), Some(125.0));
+        assert_eq!(
+            parse_pactl_volume("front-left: 32768 / 50% / -18.06 dB"),
+            Some(50.0)
+        );
+        assert_eq!(parse_wpctl_volume("Volume: unavailable"), None);
+        assert_eq!(parse_pactl_volume("Volume: unavailable"), None);
+    }
 
     fn assert_rgb_close(left: [f64; 3], right: [f64; 3]) {
         for (left, right) in left.into_iter().zip(right) {

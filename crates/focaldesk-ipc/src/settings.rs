@@ -147,6 +147,34 @@ fn apply_setting_value(
             settings.input.natural_scroll = value.as_bool().ok_or("natural_scroll must be bool")?;
         }
 
+        "input.keyboard_layout" => {
+            settings.input.keyboard_layout = value
+                .as_str()
+                .ok_or("keyboard_layout must be string")?
+                .to_string();
+        }
+
+        "input.keyboard_options" => {
+            settings.input.keyboard_options = value
+                .as_str()
+                .ok_or("keyboard_options must be string")?
+                .to_string();
+        }
+
+        "input.keyboard_repeat_delay_ms" => {
+            settings.input.keyboard_repeat_delay_ms = value
+                .as_u64()
+                .ok_or("keyboard_repeat_delay_ms must be integer")?
+                .clamp(100, 2_000) as u32;
+        }
+
+        "input.keyboard_repeat_rate" => {
+            settings.input.keyboard_repeat_rate = value
+                .as_u64()
+                .ok_or("keyboard_repeat_rate must be integer")?
+                .clamp(1, 100) as u32;
+        }
+
         "apps.terminal" => {
             settings.apps.terminal = value.as_str().ok_or("terminal must be string")?.to_string();
         }

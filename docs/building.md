@@ -208,6 +208,8 @@ This installs binaries under `~/.local/bin`, user units under
 core service set. The command-executing automation service is deliberately not
 installed by this bundle; install it explicitly with
 `just install-automation-service` only after reviewing its scripts and unit.
+The experimental `focaldesk-remoted` binary and unit are installed but remain
+disabled and stopped. See [Remote Desktop](remote-desktop.md) before starting it.
 Fedora packagers can instead use:
 
 ```sh

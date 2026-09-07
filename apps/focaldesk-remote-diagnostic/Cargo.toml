@@ -1,0 +1,8 @@
+[package]
+name = "focaldesk-remote-diagnostic"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+focaldesk-remote-protocol = { path = "../../crates/focaldesk-remote-protocol" }

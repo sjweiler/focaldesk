@@ -249,8 +249,10 @@ fn app_button(
                 &format!("Could not launch {}: {err}", info.display_name()),
             );
         } else {
-            if let Err(err) = remember_recent_app(&app_id) {
-                warn!(%err, "focaldesk-launcher: failed to update recent applications");
+            if load_settings().privacy.recent_files {
+                if let Err(err) = remember_recent_app(&app_id) {
+                    warn!(%err, "focaldesk-launcher: failed to update recent applications");
+                }
             }
             window_for_launch.close();
         }

@@ -110,6 +110,12 @@ pub const AUTOMATION_POLICY: PeerPolicy<'static> = PeerPolicy {
     allowed_units: &[],
 };
 
+pub const REMOTE_CAPTURE_POLICY: PeerPolicy<'static> = PeerPolicy {
+    endpoint: "remote-capture",
+    allowed_executables: &["focaldesk-remote-diagnostic", "focaldesk-remoted"],
+    allowed_units: &["focaldesk-remoted.service"],
+};
+
 pub const LAUNCH_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "launch",
     allowed_executables: &["focaldesk-desktop"],

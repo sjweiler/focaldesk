@@ -866,8 +866,8 @@ pub(crate) fn bootstrap_compositor_core(
                 .then(|| settings.input.keyboard_options.clone()),
             ..Default::default()
         },
-        200,
-        25,
+        settings.input.keyboard_repeat_delay_ms.clamp(100, 2_000) as i32,
+        settings.input.keyboard_repeat_rate.clamp(1, 100) as i32,
     )?;
 
     let render = RenderState::new();

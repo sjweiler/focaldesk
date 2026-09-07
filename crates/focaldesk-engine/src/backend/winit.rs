@@ -257,10 +257,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
         nested.state.tick_layout();
 
-        nested
-            .state
-            .image_copy_capture_sessions
-            .retain(|session| session.alive());
+        crate::core::portal::remove_dead_portal_sessions(&mut nested.state);
         let portal_pending = crate::core::portal::portal_capture_pending(&nested.state);
         let portal_needs_composite = crate::core::portal::portal_needs_composite(&nested.state);
         let should_render = nested.state.needs_redraw() || portal_needs_composite;
@@ -313,6 +310,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 {
                     publish_portal_capture_source(
                         &mut nested.state,
+                        renderer,
                         OutputId(1),
                         capture_texture,
                         buffer_size_phys,

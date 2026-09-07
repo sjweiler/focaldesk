@@ -16,10 +16,11 @@ use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture
 use smithay::backend::renderer::{Bind, ExportMem, ImportMem, Offscreen, Renderer};
 use smithay::desktop::layer_map_for_output;
 use smithay::reexports::wayland_server::protocol::wl_shm;
-use smithay::utils::{Buffer, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Buffer, IsAlive, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
+use crate::core::capture::{CaptureConsumerId, CaptureGeometry};
 use crate::core::desktop::DesktopState;
 use crate::core::linear_compositing::{
     render_output_offscreen, select_hdr_offscreen_format, supports_linear_sdr,
@@ -161,12 +162,36 @@ fn tone_map_luminance(value: f32, source_peak: f32) -> f32 {
 /// Portal frame received during `dispatch_clients`; completed after the DRM offscreen draw.
 pub struct PendingPortalCapture {
     pub output_id: OutputId,
+    pub consumer_id: CaptureConsumerId,
     pub frame: Frame,
+}
+
+/// Associates a Smithay portal session with its broker consumer.
+pub struct PortalCaptureSession {
+    pub session: smithay::wayland::image_copy_capture::Session,
+    pub consumer_id: CaptureConsumerId,
+}
+
+/// Remove sessions whose Wayland resources disappeared and release their broker queues.
+pub fn remove_dead_portal_sessions(state: &mut DesktopState) {
+    let dead_consumers = state
+        .image_copy_capture_sessions
+        .iter()
+        .filter(|stored| !stored.session.alive())
+        .map(|stored| stored.consumer_id)
+        .collect::<Vec<_>>();
+    state
+        .image_copy_capture_sessions
+        .retain(|stored| stored.session.alive());
+    for consumer_id in dead_consumers {
+        state.output_capture_broker.remove(consumer_id);
+    }
 }
 
 /// Last composited frame per output before the monitor-specific color encode.
 /// Portal capture reuses it so OBS receives the same scene content (including
 /// sidebar/topbar chrome) under the portal color contract.
+#[derive(Clone)]
 pub struct PortalCaptureSource {
     pub texture: GlesTexture,
     pub size: Size<i32, Physical>,
@@ -202,13 +227,23 @@ impl DesktopState {
 /// Store the latest pre-output-transform texture for portal/OBS clients.
 pub fn publish_portal_capture_source(
     state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
     output_id: OutputId,
     texture: GlesTexture,
     size: Size<i32, Physical>,
     encoding: PortalCaptureEncoding,
     captured_at: Instant,
 ) {
-    state.portal_capture_source.insert(
+    let Some(output) = state.outputs.get(&output_id) else {
+        return;
+    };
+    let geometry = CaptureGeometry {
+        size,
+        scale: output.scale_factor,
+        transform: output.handle.current_transform(),
+    };
+    let damage = output.pending_damage.clone();
+    state.output_capture_broker.publish(
         output_id,
         PortalCaptureSource {
             texture,
@@ -216,8 +251,45 @@ pub fn publish_portal_capture_source(
             encoding,
             captured_at,
         },
+        geometry,
+        damage,
+        captured_at,
     );
     state.compositor_ready = true;
+    crate::core::remote::export_frames(state, renderer);
+}
+
+pub(crate) fn read_capture_source_rgba(
+    state: &mut DesktopState,
+    renderer: &mut GlesRenderer,
+    output_id: OutputId,
+    source: &PortalCaptureSource,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let output = state
+        .outputs
+        .get(&output_id)
+        .ok_or("capture output disappeared")?;
+    let capture_shader = state.render.chrome_shaders.portal_capture_sdr.clone();
+    let capture_transform = PortalCaptureTransform {
+        shader: capture_shader.as_ref(),
+        source_peak: portal_capture_source_peak(output),
+        color_mode: portal_capture_color_mode(),
+    };
+    let mut target = renderer.create_buffer(
+        Fourcc::Abgr8888,
+        Size::<i32, Buffer>::from((source.size.w, source.size.h)),
+    )?;
+    blit_capture_texture_to_texture(
+        renderer,
+        source.texture.clone(),
+        source.encoding,
+        source.size,
+        source.size,
+        Transform::Normal,
+        &mut target,
+        capture_transform,
+    )?;
+    read_bound_offscreen_rgba(renderer, &mut target, source.size)
 }
 
 fn portal_offscreen_targets_for_output(
@@ -303,15 +375,22 @@ pub fn output_id_for_session(state: &DesktopState, session: &SessionRef) -> Opti
 ///
 /// Frames are queued and completed after the offscreen draw so OBS receives the
 /// same composited scene as the monitor, converted to the portal color contract.
-pub fn try_render_portal_frame(state: &mut DesktopState, frame: Frame, output_id: OutputId) {
+pub fn try_render_portal_frame(
+    state: &mut DesktopState,
+    frame: Frame,
+    output_id: OutputId,
+    consumer_id: CaptureConsumerId,
+) {
     if state.portal_dispatch_ctx.is_none() {
         frame.fail(CaptureFailureReason::Unknown);
         return;
     }
 
-    state
-        .pending_portal_captures
-        .push(PendingPortalCapture { output_id, frame });
+    state.pending_portal_captures.push(PendingPortalCapture {
+        output_id,
+        consumer_id,
+        frame,
+    });
 }
 
 /// Fail in-flight frames and discard GPU resources indexed by the old OutputIds.
@@ -321,17 +400,19 @@ pub(crate) fn invalidate_portal_output_state(state: &mut DesktopState) {
         pending.frame.fail(CaptureFailureReason::Unknown);
     }
     state.portal_frame_cache.clear();
-    state.portal_capture_source.clear();
+    state.output_capture_broker.invalidate_all();
     state.portal_offscreen_targets.clear();
     state.compositor_ready = false;
 }
 
 /// True when every queued portal frame can be satisfied from the latest composited texture.
 pub fn pending_portal_outputs_have_capture_source(state: &DesktopState) -> bool {
-    state
-        .pending_portal_captures
-        .iter()
-        .all(|cap| state.portal_capture_source.contains_key(&cap.output_id))
+    state.pending_portal_captures.iter().all(|cap| {
+        state
+            .output_capture_broker
+            .latest_frame(cap.consumer_id)
+            .is_some_and(|frame| frame.output_id == cap.output_id)
+    })
 }
 
 /// Portal frames waiting to be completed after `dispatch_clients`.
@@ -368,6 +449,7 @@ pub fn complete_pending_portal_captures(
             scene,
             output_state,
             cap.output_id,
+            cap.consumer_id,
             cap.frame,
             now,
             dt,
@@ -404,6 +486,7 @@ pub fn complete_pending_portal_captures_for_output(
             scene,
             output_state,
             cap.output_id,
+            cap.consumer_id,
             cap.frame,
             now,
             dt,
@@ -500,10 +583,15 @@ fn complete_portal_frame(
     scene: &SceneState,
     output_state: &OutputState,
     output_id: OutputId,
+    consumer_id: CaptureConsumerId,
     frame: Frame,
     now: Instant,
     dt: Duration,
 ) {
+    let capture_source = state
+        .output_capture_broker
+        .latest_frame(consumer_id)
+        .map(|frame| frame.buffer.clone());
     let buffer = frame.buffer();
     let buffer_size = match capture_buffer_size(&buffer) {
         Some(size) => size,
@@ -571,7 +659,7 @@ fn complete_portal_frame(
             dmabuf.set_node(node);
         }
         let target_size = stream_size;
-        let render_res = if let Some(source) = state.portal_capture_source.get(&output_id) {
+        let render_res = if let Some(source) = capture_source.as_ref() {
             blit_offscreen_source_to_dmabuf_scaled(
                 renderer,
                 source.texture.clone(),
@@ -613,7 +701,7 @@ fn complete_portal_frame(
     }
 
     let render_size = Size::<i32, Physical>::from((buffer_size.w, buffer_size.h));
-    let rgba = if let Some(source) = state.portal_capture_source.get(&output_id) {
+    let rgba = if let Some(source) = capture_source.as_ref() {
         let mut capture_tex = match renderer.create_buffer(
             Fourcc::Abgr8888,
             Size::<i32, Buffer>::from((buffer_size.w, buffer_size.h)),

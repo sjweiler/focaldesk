@@ -1,0 +1,24 @@
+[Unit]
+Description=FocalDesk view-only remote desktop service
+Documentation=file:///usr/share/doc/focaldesk/remote-desktop-roadmap.md
+After=focaldesk-session.target
+PartOf=focaldesk-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focaldesk-remoted --enable --bind 127.0.0.1:3389 --output 1
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+UMask=0077
+LimitCORE=0
+
+# Intentionally no [Install] section: Phase 3 must be started explicitly.

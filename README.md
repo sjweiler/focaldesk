@@ -31,6 +31,8 @@ and [roadmap](ROADMAP.md) for the intended direction.
   intent, live compositor preview, wallpaper processing, and portable theme
   packages ([details](docs/theme-editor.md)).
 - PipeWire and portal integration for experimental screen capture.
+- Experimental, view-only RDP service with TLS, short-lived credentials, and a
+  loopback-only listener ([details](docs/remote-desktop.md)).
 - Separate user services for launching, settings, notifications, power,
   dialogs, controls, speech, voice input, and permissioned automation.
 - Encrypted credential broker with ACL-protected native IPC and Secret Service
@@ -56,6 +58,7 @@ release.
 | Workspaces and multi-monitor layout | Working, with ongoing edge-case work |
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
+| Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |
 | HDR and color management | Experimental and hardware-dependent; HDR10 verified on Fedora 44 with NVIDIA 595, including Google Chrome ([details](docs/hdr.md#known-working-configuration)) |
 | Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradient rendering is not yet compositor-native |
 | Local AI and automation services | Experimental and permission-gated |
@@ -181,7 +184,8 @@ diagrams, current boundaries, and implementation notes.
 - `apps/focaldesk-files`: file app prototype
 - `apps/focaldesk-settings`: settings app prototype
 - `apps/focaldesk-portal`: portal-related app code
-- `services/`: background daemons and IPC services
+- `services/focaldesk-remoted`: experimental view-only RDP service
+- `services/`: other background daemons and IPC services
 - `crates/`: shared FocalDesk libraries
 - `assets/`: bundled visual assets
 - `docs/`: design notes and architecture material
@@ -406,7 +410,7 @@ For a local build, install and enable the full service set with:
 just install-services
 ```
 
-That installs and enables:
+That installs and enables the core services:
 
 - `focaldesk-server`
 - `focal-launchd`
@@ -416,10 +420,14 @@ That installs and enables:
 - `focaldesk-dialogd`
 - `focaldesk-controlsd`
 - `focaldesk-settingsd`
-- `focaldesk-automation`
 - `focald-voice`
 - `focald-speech`
 - `focald-mic`
+
+It also installs `focaldesk-remoted` but leaves it disabled and stopped. Remote
+desktop must be started explicitly after reviewing the
+[security model and connection instructions](docs/remote-desktop.md).
+`focaldesk-automation` remains a separate opt-in installation.
 
 Each unit lives under `packaging/systemd/user/` and is copied to
 `~/.config/systemd/user/` for a local install.
@@ -476,7 +484,7 @@ HDR/color validation, and broader cursor, direct-scanout, and multi-GPU testing.
 
 Longer-term goals include maturing the first-party desktop experience, versioned
 IPC, narrower service privileges, better accessibility and recovery workflows,
-permissioned local automation, and optional remote-desktop support. These are
+permissioned local automation, and production-ready remote-desktop support. These are
 directions rather than release promises; see the complete [project
 roadmap](ROADMAP.md) for current priorities and release-readiness criteria.
 
@@ -496,6 +504,7 @@ should follow the private process in [SECURITY.md](SECURITY.md).
 - [Compatibility testing](docs/compatibility-testing.md)
 - [Configuration and environment](docs/configuration.md)
 - [Credential broker](docs/secrets.md)
+- [Remote desktop](docs/remote-desktop.md)
 - [Default keybindings](docs/keybindings.md)
 - [Troubleshooting and logs](docs/troubleshooting.md)
 - [Architecture](docs/architecture.md)

@@ -207,29 +207,20 @@ impl TabManager {
         self.window.add_action(&open_window);
 
         let empty_trash = gio::SimpleAction::new("empty-trash", None);
-        empty_trash.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "empty-trash",
-                "empty trash"
-            );
+        let this = self.clone();
+        empty_trash.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.show_empty_trash_confirmation());
         });
         self.window.add_action(&empty_trash);
 
         let properties =
             gio::SimpleAction::new("sidebar-properties", Some(&String::static_variant_type()));
-        properties.connect_activate(|_, parameter| {
+        let this = self.clone();
+        properties.connect_activate(move |_, parameter| {
             let Some(location) = sidebar_location_from_parameter(parameter) else {
                 return;
             };
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "sidebar-properties",
-                location = %location.display_text(),
-                "sidebar properties"
-            );
+            this.with_active_tab(|tab| tab.show_location_properties_dialog(&location));
         });
         self.window.add_action(&properties);
 
@@ -294,24 +285,16 @@ impl TabManager {
         self.window.add_action(&file_paste);
 
         let file_move_to = gio::SimpleAction::new("file-move-to", None);
-        file_move_to.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-move-to",
-                "move file item to"
-            );
+        let this = self.clone();
+        file_move_to.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.choose_destination_for_selected(ClipboardOp::Cut));
         });
         self.window.add_action(&file_move_to);
 
         let file_copy_to = gio::SimpleAction::new("file-copy-to", None);
-        file_copy_to.connect_activate(|_, _| {
-            info!(
-                target: "focaldesk",
-                session_id = session_id(),
-                action = "file-copy-to",
-                "copy file item to"
-            );
+        let this = self.clone();
+        file_copy_to.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.choose_destination_for_selected(ClipboardOp::Copy));
         });
         self.window.add_action(&file_copy_to);
 
@@ -1573,6 +1556,170 @@ impl FileManager {
         dialog.present();
     }
 
+    fn choose_destination_for_selected(&self, op: ClipboardOp) {
+        let items = self.selected_file_items();
+        if items.is_empty() {
+            let verb = if matches!(op, ClipboardOp::Copy) {
+                "copy"
+            } else {
+                "move"
+            };
+            self.set_status(&format!("Select one or more items to {verb}."));
+            return;
+        }
+
+        let files = items.into_iter().map(|item| item.file).collect::<Vec<_>>();
+        let (title, accept_label) = match op {
+            ClipboardOp::Copy => ("Choose Copy Destination", "Copy Here"),
+            ClipboardOp::Cut => ("Choose Move Destination", "Move Here"),
+        };
+        let initial_folder = match &*self.current_location.borrow() {
+            Location::Path(path) => gio::File::for_path(path),
+            Location::Trash | Location::Uri(_) | Location::Separator => {
+                gio::File::for_path(home_dir())
+            }
+        };
+        let dialog = gtk::FileDialog::builder()
+            .title(title)
+            .accept_label(accept_label)
+            .modal(true)
+            .initial_folder(&initial_folder)
+            .build();
+
+        let this = self.clone();
+        dialog.select_folder(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Ok(folder) => {
+                    let Some(target_dir) = folder.path() else {
+                        this.set_status("The selected destination is not a local folder.");
+                        return;
+                    };
+                    if !target_dir.is_dir() {
+                        this.set_status("The selected destination is not a folder.");
+                        return;
+                    }
+                    if matches!(op, ClipboardOp::Cut)
+                        && files.iter().all(|file| {
+                            file.path()
+                                .and_then(|path| path.parent().map(Path::to_path_buf))
+                                .is_some_and(|parent| parent == target_dir)
+                        })
+                    {
+                        this.set_status("The selected items are already in that folder.");
+                        return;
+                    }
+                    this.copy_or_move_files(files, op, &target_dir);
+                }
+                Err(err) => {
+                    if !err.matches(gio::IOErrorEnum::Cancelled) {
+                        this.set_status(&format!("Could not choose a destination: {err}"));
+                    }
+                }
+            },
+        );
+    }
+
+    fn show_empty_trash_confirmation(&self) {
+        let items = match read_location_items(&Location::Trash, true) {
+            Ok(items) => items,
+            Err(err) => {
+                self.set_status(&format!("Could not read Trash: {err}"));
+                return;
+            }
+        };
+        if items.is_empty() {
+            self.set_status("Trash is already empty.");
+            return;
+        }
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title("Empty Trash?")
+            .default_width(420)
+            .resizable(false)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let heading = gtk::Label::new(Some("Permanently delete everything in Trash?"));
+        heading.set_xalign(0.0);
+        heading.set_wrap(true);
+        heading.add_css_class("title-3");
+        let warning = gtk::Label::new(Some(&format!(
+            "This will permanently delete {} item{} and cannot be undone.",
+            items.len(),
+            plural(items.len())
+        )));
+        warning.set_xalign(0.0);
+        warning.set_wrap(true);
+        warning.add_css_class("dim-label");
+        let cancel = gtk::Button::with_label("Cancel");
+        let empty_button = gtk::Button::with_label("Empty Trash");
+        empty_button.add_css_class("destructive-action");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+        actions.append(&empty_button);
+        content.append(&heading);
+        content.append(&warning);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+
+        let dialog_for_cancel = dialog.clone();
+        cancel.connect_clicked(move |_| dialog_for_cancel.close());
+        let this = self.clone();
+        let dialog_for_empty = dialog.clone();
+        empty_button.connect_clicked(move |_| {
+            dialog_for_empty.close();
+            let files = items
+                .iter()
+                .map(|item| (item.name.clone(), item.file.clone()))
+                .collect::<Vec<_>>();
+            this.run_progress_job(
+                "Emptying Trash",
+                files.len(),
+                move |index| match files.get(index) {
+                    Some((name, file)) => file
+                        .delete(gio::Cancellable::NONE)
+                        .map_err(|err| format!("Could not permanently delete {name}: {err}")),
+                    None => Ok(()),
+                },
+                {
+                    let this = this.clone();
+                    move |outcome, completed, error| match outcome {
+                        FileJobOutcome::Finished => {
+                            if this.current_location.borrow().is_trash() {
+                                this.reload();
+                            }
+                            match (completed, error) {
+                                (0, Some(err)) => this.set_status(&err),
+                                (count, Some(err)) => this.set_status(&format!(
+                                    "Deleted {count} item{}; some items failed: {err}",
+                                    plural(count)
+                                )),
+                                (count, None) => this.set_status(&format!(
+                                    "Permanently deleted {count} item{}.",
+                                    plural(count)
+                                )),
+                            }
+                        }
+                        FileJobOutcome::Cancelled => this.set_status(&format!(
+                            "Cancelled after deleting {completed} item{}.",
+                            plural(completed)
+                        )),
+                    }
+                },
+            );
+        });
+        dialog.present();
+    }
+
     fn trash_selected(&self) {
         let selected = self.selected_file_items();
         if selected.is_empty() {
@@ -1692,7 +1839,7 @@ impl FileManager {
 
         if display.clipboard().is_local() {
             if let Some(clipboard) = self.file_clipboard.borrow().clone() {
-                self.copy_or_move_clipboard_files(clipboard.files, clipboard.op, &target_dir);
+                self.copy_or_move_files(clipboard.files, clipboard.op, &target_dir);
                 return;
             }
         } else {
@@ -1712,11 +1859,7 @@ impl FileManager {
                         .get::<gtk::gdk::FileList>()
                         .map_err(|_| glib::Error::new(gio::IOErrorEnum::InvalidData, "not files"))
                 }) {
-                    this.copy_or_move_clipboard_files(
-                        file_list.files(),
-                        ClipboardOp::Copy,
-                        &target_dir,
-                    );
+                    this.copy_or_move_files(file_list.files(), ClipboardOp::Copy, &target_dir);
                     return;
                 }
 
@@ -1736,11 +1879,9 @@ impl FileManager {
                     let this = this.clone();
                     read_transfer_text(stream, move |text| {
                         match file_clipboard_from_text(mime_type.as_str(), &text) {
-                            Some(clipboard) => this.copy_or_move_clipboard_files(
-                                clipboard.files,
-                                clipboard.op,
-                                &target_dir,
-                            ),
+                            Some(clipboard) => {
+                                this.copy_or_move_files(clipboard.files, clipboard.op, &target_dir)
+                            }
                             None => this.set_status("Clipboard does not contain files."),
                         }
                     });
@@ -1750,12 +1891,7 @@ impl FileManager {
         );
     }
 
-    fn copy_or_move_clipboard_files(
-        &self,
-        files: Vec<gio::File>,
-        op: ClipboardOp,
-        target_dir: &Path,
-    ) {
+    fn copy_or_move_files(&self, files: Vec<gio::File>, op: ClipboardOp, target_dir: &Path) {
         if files.is_empty() {
             self.set_status("Clipboard does not contain files.");
             return;
@@ -1769,6 +1905,10 @@ impl FileManager {
         let done_verb = match op {
             ClipboardOp::Copy => "Copied",
             ClipboardOp::Cut => "Moved",
+        };
+        let done_verb_lower = match op {
+            ClipboardOp::Copy => "copy",
+            ClipboardOp::Cut => "move",
         };
         self.run_progress_job(
             verb,
@@ -1794,17 +1934,14 @@ impl FileManager {
                         }
 
                         match (completed, error) {
-                            (0, Some(err)) => {
-                                this.set_status(&format!("Could not paste files: {err}"))
-                            }
+                            (0, Some(err)) => this
+                                .set_status(&format!("Could not {done_verb_lower} files: {err}")),
                             (count, Some(err)) => this.set_status(&format!(
                                 "{done_verb} {count} item{}; some items failed: {err}",
                                 plural(count)
                             )),
-                            (count, None) => this.set_status(&format!(
-                                "{done_verb} {count} pasted item{}.",
-                                plural(count)
-                            )),
+                            (count, None) => this
+                                .set_status(&format!("{done_verb} {count} item{}.", plural(count))),
                         }
                     }
                     FileJobOutcome::Cancelled => this.set_status(&format!(
@@ -2085,6 +2222,142 @@ impl FileManager {
 
         *self.sort_descending.borrow_mut() = descending;
         self.render_entries();
+    }
+
+    fn show_location_properties_dialog(&self, location: &Location) {
+        let (title, header_text, rows) = match location {
+            Location::Trash => {
+                let items = match read_location_items(location, true) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        self.set_status(&format!("Could not read Trash properties: {err}"));
+                        return;
+                    }
+                };
+                let total_size = items.iter().map(|item| item.size).sum::<u64>();
+                (
+                    "Trash Properties".to_string(),
+                    "Trash".to_string(),
+                    vec![
+                        ("Type", "Trash".to_string()),
+                        (
+                            "Contains",
+                            format!("{} item{}", items.len(), plural(items.len())),
+                        ),
+                        ("Size", format_size(total_size)),
+                        ("URI", "trash:///".to_string()),
+                    ],
+                )
+            }
+            Location::Path(path) => {
+                let file = gio::File::for_path(path);
+                let info = match file.query_info(
+                    "standard::display-name,standard::type,time::modified",
+                    gio::FileQueryInfoFlags::NONE,
+                    gio::Cancellable::NONE,
+                ) {
+                    Ok(info) => info,
+                    Err(err) => {
+                        self.set_status(&format!(
+                            "Could not read properties for {}: {err}",
+                            path.display()
+                        ));
+                        return;
+                    }
+                };
+                let items = match read_location_items(location, true) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        self.set_status(&format!(
+                            "Could not read properties for {}: {err}",
+                            path.display()
+                        ));
+                        return;
+                    }
+                };
+                let name = info.display_name().to_string();
+                let parent = path
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                (
+                    format!("{name} Properties"),
+                    name,
+                    vec![
+                        ("Type", "Folder".to_string()),
+                        ("Location", parent),
+                        (
+                            "Contains",
+                            format!("{} item{}", items.len(), plural(items.len())),
+                        ),
+                        ("Modified", modified_text(&info)),
+                        ("Path", path.to_string_lossy().into_owned()),
+                    ],
+                )
+            }
+            Location::Uri(uri) => {
+                let items = match read_location_items(location, true) {
+                    Ok(items) => items,
+                    Err(err) => {
+                        self.set_status(&format!("Could not read properties for {uri}: {err}"));
+                        return;
+                    }
+                };
+                (
+                    "Location Properties".to_string(),
+                    uri.clone(),
+                    vec![
+                        ("Type", "Remote Location".to_string()),
+                        (
+                            "Contains",
+                            format!("{} item{}", items.len(), plural(items.len())),
+                        ),
+                        ("URI", uri.clone()),
+                    ],
+                )
+            }
+            Location::Separator => return,
+        };
+
+        let dialog = gtk::Window::builder()
+            .transient_for(&self.window)
+            .modal(true)
+            .title(&title)
+            .default_width(460)
+            .resizable(false)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+
+        let header = gtk::Label::new(Some(&header_text));
+        header.set_xalign(0.0);
+        header.set_wrap(true);
+        header.add_css_class("title-3");
+        content.append(&header);
+
+        let grid = gtk::Grid::new();
+        grid.set_column_spacing(12);
+        grid.set_row_spacing(8);
+        let mut row = 0;
+        for (label, value) in rows {
+            add_property_row(&grid, &mut row, label, value);
+        }
+        content.append(&grid);
+
+        let close = gtk::Button::with_label("Close");
+        close.add_css_class("suggested-action");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&close);
+        content.append(&actions);
+        dialog.set_child(Some(&content));
+
+        let dialog_for_close = dialog.clone();
+        close.connect_clicked(move |_| dialog_for_close.close());
+        dialog.present();
     }
 
     fn show_properties_dialog(&self) {
@@ -3713,6 +3986,47 @@ mod tests {
         assert!(listing.lines().any(|line| line == "note.txt"));
         assert!(listing.lines().any(|line| line == "folder/nested.txt"));
 
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[test]
+    fn copies_selected_file_into_destination() {
+        let root = unique_test_dir("copy-to");
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        std::fs::create_dir_all(&source_dir).expect("create source folder");
+        std::fs::create_dir_all(&target_dir).expect("create target folder");
+        let source = source_dir.join("note.txt");
+        std::fs::write(&source, "copy me").expect("write source file");
+
+        copy_dropped_file(&gio::File::for_path(&source), &target_dir).expect("copy file");
+
+        assert_eq!(
+            std::fs::read_to_string(target_dir.join("note.txt")).expect("read copied file"),
+            "copy me"
+        );
+        assert!(source.exists());
+        std::fs::remove_dir_all(root).expect("remove test folder");
+    }
+
+    #[test]
+    fn moves_selected_folder_into_destination() {
+        let root = unique_test_dir("move-to");
+        let source_dir = root.join("source");
+        let target_dir = root.join("target");
+        let folder = source_dir.join("documents");
+        std::fs::create_dir_all(&folder).expect("create source folder");
+        std::fs::create_dir_all(&target_dir).expect("create target folder");
+        std::fs::write(folder.join("note.txt"), "move me").expect("write source file");
+
+        move_clipboard_file(&gio::File::for_path(&folder), &target_dir).expect("move folder");
+
+        assert!(!folder.exists());
+        assert_eq!(
+            std::fs::read_to_string(target_dir.join("documents/note.txt"))
+                .expect("read moved file"),
+            "move me"
+        );
         std::fs::remove_dir_all(root).expect("remove test folder");
     }
 }

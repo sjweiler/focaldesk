@@ -312,6 +312,12 @@ pub struct InputSettings {
     /// XKB options (e.g. "ctrl:nocaps"). Empty means none.
     #[serde(default)]
     pub keyboard_options: String,
+    /// Delay before a held key begins repeating, in milliseconds.
+    #[serde(default = "default_keyboard_repeat_delay_ms")]
+    pub keyboard_repeat_delay_ms: u32,
+    /// Number of repeated key events generated per second.
+    #[serde(default = "default_keyboard_repeat_rate")]
+    pub keyboard_repeat_rate: u32,
     /// Action name to shortcut overrides, for example
     /// `"launch_terminal": "Super+Enter"`.
     #[serde(default)]
@@ -320,6 +326,14 @@ pub struct InputSettings {
 
 fn default_keyboard_layout() -> String {
     "us".into()
+}
+
+fn default_keyboard_repeat_delay_ms() -> u32 {
+    200
+}
+
+fn default_keyboard_repeat_rate() -> u32 {
+    25
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -505,6 +519,8 @@ pub fn default_settings() -> Settings {
             keyboard_variant: String::new(),
             keyboard_model: String::new(),
             keyboard_options: String::new(),
+            keyboard_repeat_delay_ms: default_keyboard_repeat_delay_ms(),
+            keyboard_repeat_rate: default_keyboard_repeat_rate(),
             keybindings: BTreeMap::new(),
         },
         apps: AppSettings {
@@ -629,6 +645,25 @@ mod tests {
             restored.input.keybindings.get("launch_terminal"),
             Some(&"Ctrl+Alt+T".to_string())
         );
+    }
+
+    #[test]
+    fn keyboard_repeat_settings_are_backward_compatible_and_round_trip() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        let input = value["input"].as_object_mut().unwrap();
+        input.remove("keyboard_repeat_delay_ms");
+        input.remove("keyboard_repeat_rate");
+
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.input.keyboard_repeat_delay_ms, 200);
+        assert_eq!(settings.input.keyboard_repeat_rate, 25);
+
+        settings.input.keyboard_repeat_delay_ms = 450;
+        settings.input.keyboard_repeat_rate = 40;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(restored.input.keyboard_repeat_delay_ms, 450);
+        assert_eq!(restored.input.keyboard_repeat_rate, 40);
     }
 
     #[test]

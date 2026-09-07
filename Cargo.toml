@@ -4,6 +4,7 @@ members = [
     # library crates
     "crates/focaldesk-types",
     "crates/focaldesk-engine",
+    "crates/focaldesk-remote-protocol",
     "crates/focaldesk-flow",
     "crates/focaldesk-ai",
     "crates/focaldesk-memory",
@@ -32,9 +33,11 @@ members = [
     "apps/focaldesk-files",
     "apps/focaldesk-settings",
     "apps/focaldesk-launcher",
+    "apps/focaldesk-remote-diagnostic",
 
     # services
     "services/focaldesk-mcp",
+    "services/focaldesk-remoted",
     "services/focaldesk-server",
     "services/focaldesk-powerd",
     "services/focaldesk-notificationsd",
@@ -113,5 +116,5 @@ argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
 rand = "0.8"
-zeroize = { version = "1", features = ["derive"] }
+zeroize = { version = "1.8", features = ["derive"] }
 libc = "0.2"

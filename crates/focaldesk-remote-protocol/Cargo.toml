@@ -1,0 +1,10 @@
+[package]
+name = "focaldesk-remote-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libc = "0.2"
+nix = { version = "0.27", features = ["socket", "uio"] }
+serde = { workspace = true }
+serde_json = "1"
