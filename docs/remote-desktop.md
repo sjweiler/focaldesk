@@ -13,6 +13,12 @@ receives frames through a private Unix socket using versioned, size-bounded JSON
 messages and sealed `memfd` file descriptors. The compositor checks the peer UID
 and executable or systemd-unit identity before allowing capture.
 
+The IronRDP dependency graph also contains an RSA implementation for its
+Hybrid/CredSSP mode. FocalDesk does not enable that mode: it selects TLS security
+with a rustls acceptor and never performs private-key operations through the
+unused RSA dependency. This boundary is documented beside the temporary RustSec
+exception in CI and must be revisited when IronRDP makes CredSSP optional.
+
 Phase 3 adds these additional constraints:
 
 - The daemon does nothing unless started with `--enable`.

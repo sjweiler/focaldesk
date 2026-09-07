@@ -216,10 +216,15 @@ protocol messages.
 The focused [Remote Desktop guide](remote-desktop.md) documents installation,
 the Phase 3 security model, SSH tunneling, operation, and troubleshooting.
 
-Phase 3 uses `ironrdp-server` 0.12.0 for Enhanced RDP Security over TLS and
-compressed bitmap updates. Version 0.12.0 is pinned because the published 0.13.0
-dependency graph cannot currently be resolved consistently; revisit the pin after
-the upstream crates converge.
+Phase 3 uses `ironrdp-server` 0.13.0 for Enhanced RDP Security over TLS and
+compressed bitmap updates.
+
+IronRDP currently includes its Hybrid/CredSSP dependency stack even when a
+consumer selects TLS security. That unused stack pulls the RustCrypto `rsa`
+crate affected by RUSTSEC-2023-0071. FocalDesk calls `with_tls`, never
+`with_hybrid`, and does not perform RSA private-key operations through that
+dependency. CI carries a documented audit exception until IronRDP makes the
+CredSSP stack optional or RustCrypto publishes a patched release.
 
 IronRDP processes one accepted connection at a time. While that client is active,
 the TCP listener backlog queues later connections; they are not given concurrent

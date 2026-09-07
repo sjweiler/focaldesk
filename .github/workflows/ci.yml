@@ -127,9 +127,16 @@ jobs:
           # egui 0.31 pins AccessKit's AT-SPI stack to zbus-xml 4 / quick-xml
           # 0.30. The parser cannot be upgraded independently; keep these two
           # DoS advisories visible here until the egui/AccessKit upgrade lands.
+          # ironrdp-server 0.13 unconditionally includes its Hybrid/CredSSP
+          # stack, which currently pulls rsa despite this service selecting
+          # RdpServerSecurity::Tls via with_tls. FocalDesk never calls
+          # with_hybrid, so the RSA private-key operation described by the
+          # advisory is unreachable. RustSec lists no patched rsa release;
+          # remove this exception when IronRDP makes CredSSP optional.
           cargo audit --file Cargo.lock \
             --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2023-0071
           cargo audit --file crates/focald-secrets/fuzz/Cargo.lock
 
       - name: Markdown links
