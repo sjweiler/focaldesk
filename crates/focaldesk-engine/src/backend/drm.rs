@@ -76,7 +76,7 @@ use smithay::{
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
             element::solid::SolidColorRenderElement,
-            gles::{GlesRenderer, GlesTarget, GlesTexture},
+            gles::{Capability as GlesCapability, GlesRenderer, GlesTarget, GlesTexture},
             Color32F, ExportMem, ImportDma, ImportEgl,
         },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
@@ -88,9 +88,9 @@ use smithay::{
         calloop,
         gbm::Device as GbmDevice,
         input::Libinput,
-        wayland_server::{Client, Display, ListeningSocket},
+        wayland_server::{Client, Display, DisplayHandle, ListeningSocket},
     },
-    utils::{Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
+    utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform},
     wayland::dmabuf::DmabufFeedbackBuilder,
 };
 
@@ -1355,6 +1355,42 @@ fn drm_connector_topology_changed(device: &DrmDeviceState, state: &DesktopState)
     Ok(connected != active)
 }
 
+fn drm_connector_set_changed(device: &DrmDeviceState) -> Result<bool> {
+    let resources = device
+        .drm_output_manager
+        .device()
+        .resource_handles()
+        .context("failed to query DRM resources after resume")?;
+    let mut connected = std::collections::HashSet::new();
+
+    for connector in resources.connectors() {
+        let info = device
+            .drm_output_manager
+            .device()
+            .get_connector(*connector, false)
+            .context("failed to query DRM connector after resume")?;
+        if info.state() != drm::control::connector::State::Connected {
+            continue;
+        }
+        let output_name = connector_name(&info);
+        if device
+            .exclusive_hdr_output
+            .as_deref()
+            .is_some_and(|selected| selected != output_name)
+        {
+            continue;
+        }
+        connected.insert(*connector);
+    }
+
+    let active = device
+        .surfaces
+        .values()
+        .map(|surface| surface.connector)
+        .collect::<std::collections::HashSet<_>>();
+    Ok(connected != active)
+}
+
 fn reinitialize_drm_device(
     data: &mut DrmLoopData,
     loop_handle: &LoopHandle<'_, DrmLoopData>,
@@ -1504,6 +1540,24 @@ fn resume_drm_session(
         return;
     }
 
+    // A context that survives s2idle can be unusable after firmware-backed
+    // deep sleep. NVIDIA reports Xid 13 shader-header faults and rejects the
+    // resulting atomic input fences even though KMS activation succeeded.
+    // Drop compositor textures before replacing the context, while retaining
+    // the libseat-owned DRM/GBM device itself.
+    data.core.state.invalidate_gpu_state();
+    data.core.ui_state.chrome.invalidate_gpu_state();
+    let display_handle = data.core.display.handle();
+    for (node, device) in &mut data.backend.devices {
+        if let Err(err) = recreate_drm_renderer_after_resume(device, *node, &display_handle) {
+            flog_warn!(
+                "Failed to recreate DRM renderer after resume on {node:?}: {err}; scheduling retry"
+            );
+            data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
+            return;
+        }
+    }
+
     if !data.libinput_active {
         if let Err(err) = data.libinput.resume() {
             flog_warn!("Failed to resume libinput: {err:?}; scheduling retry");
@@ -1557,35 +1611,57 @@ fn resume_drm_session(
         "full repaint requested; awaiting first post-resume modeset",
     );
 
-    if std::mem::take(&mut data.drm_topology_refresh_pending) {
-        let mut changed_nodes = Vec::new();
-        let mut topology_inspection_failed = false;
-        for (node, device) in &data.backend.devices {
-            match drm_connector_topology_changed(device, &data.core.state) {
-                Ok(true) => changed_nodes.push(*node),
-                Ok(false) => {}
-                Err(err) => {
-                    flog_warn!("Failed to inspect deferred DRM topology on {node:?}: {err}");
-                    topology_inspection_failed = true;
-                }
-            }
-        }
-        if topology_inspection_failed {
-            data.drm_topology_refresh_pending = true;
-            data.resume_pending = true;
-            data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
-        }
-        for node in changed_nodes {
-            flog_warn!("Applying deferred DRM connector topology change on {node:?}");
-            if let Err(err) = reinitialize_drm_device(data, loop_handle, node) {
-                flog_warn!("Failed to rebuild deferred DRM topology on {node:?}: {err}");
-                data.session_active = false;
-                data.resume_pending = true;
-                data.resume_retry_at = Some(Instant::now() + Duration::from_secs(1));
-                return;
+    // Do not rebuild a retained primary device from inside libseat's
+    // ActivateSession callback. Closing and immediately reopening that device
+    // is rejected by libseat with EINVAL and leaves the compositor in an
+    // endless resume loop. Deferred udev notifications are processed only
+    // after the first successful post-resume page flip proves KMS is running.
+}
+
+fn process_deferred_drm_topology_change(
+    data: &mut DrmLoopData,
+    loop_handle: &LoopHandle<'_, DrmLoopData>,
+) {
+    if !deferred_topology_refresh_ready(
+        data.drm_topology_refresh_pending,
+        data.session_active,
+        data.resume_pending,
+        data.lifecycle,
+    ) {
+        return;
+    }
+
+    data.drm_topology_refresh_pending = false;
+    let mut changed_nodes = Vec::new();
+    for (node, device) in &data.backend.devices {
+        match drm_connector_set_changed(device) {
+            Ok(true) => changed_nodes.push(*node),
+            Ok(false) => flog_warn!(
+                "Ignoring transient deferred DRM change on {node:?}; connector set is unchanged"
+            ),
+            Err(err) => {
+                flog_warn!("Failed to inspect deferred DRM connectors on {node:?}: {err}");
+                data.drm_topology_refresh_pending = true;
             }
         }
     }
+
+    for node in changed_nodes {
+        flog_warn!("Applying deferred DRM connector-set change on {node:?}");
+        if let Err(err) = reinitialize_drm_device(data, loop_handle, node) {
+            flog_warn!("Failed to rebuild deferred DRM connector set on {node:?}: {err}");
+            data.drm_topology_refresh_pending = true;
+        }
+    }
+}
+
+fn deferred_topology_refresh_ready(
+    pending: bool,
+    session_active: bool,
+    resume_pending: bool,
+    lifecycle: DrmLifecycle,
+) -> bool {
+    pending && session_active && !resume_pending && lifecycle == DrmLifecycle::Running
 }
 
 fn should_remove_drm_device(is_primary: bool) -> bool {
@@ -1735,14 +1811,14 @@ mod output_render_scheduling_tests {
 #[cfg(test)]
 mod hdr_tests {
     use super::{
-        configured_display_hdr_requested, exclusive_hdr_prepare_decision,
-        hdr_active_status_verified, hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
-        hdr_driver_allows_output_with_override, hdr_failure_persist_action,
-        hdr_verification_complete, merge_disconnected_display_configs,
+        configured_display_hdr_requested, deferred_topology_refresh_ready,
+        exclusive_hdr_prepare_decision, hdr_active_status_verified, hdr_commit_stalled,
+        hdr_detection::parse_edid_hdr_support, hdr_driver_allows_output_with_override,
+        hdr_failure_persist_action, hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
         select_requested_drm_mode_index, should_defer_drm_topology_change,
-        should_remove_drm_device, DisplayConfig, DisplayTransform, DrmModeCandidate,
+        should_remove_drm_device, DisplayConfig, DisplayTransform, DrmLifecycle, DrmModeCandidate,
         EdidHdrMetadata, ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport,
         DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS,
         HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
@@ -1882,6 +1958,28 @@ mod hdr_tests {
         assert!(should_defer_drm_topology_change(false, true));
         assert!(should_defer_drm_topology_change(true, true));
         assert!(!should_defer_drm_topology_change(true, false));
+    }
+
+    #[test]
+    fn deferred_topology_rebuild_waits_for_first_resume_flip() {
+        assert!(!deferred_topology_refresh_ready(
+            true,
+            true,
+            false,
+            DrmLifecycle::Modesetting,
+        ));
+        assert!(deferred_topology_refresh_ready(
+            true,
+            true,
+            false,
+            DrmLifecycle::Running,
+        ));
+        assert!(!deferred_topology_refresh_ready(
+            true,
+            true,
+            true,
+            DrmLifecycle::Running,
+        ));
     }
 
     #[test]
@@ -3347,14 +3445,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         })?;
     }
 
-    let session_loop_handle = loop_handle.clone();
     let _session_token =
         loop_handle.insert_source(notifier, move |event, _, data| match event {
             SessionEvent::PauseSession => {
                 pause_drm_session(data, "libseat PauseSession");
             }
             SessionEvent::ActivateSession => {
-                resume_drm_session(data, &session_loop_handle, "libseat ActivateSession");
+                // Leave the libseat callback promptly and give driver resume
+                // services a short window to restore GPU state before EGL/KMS
+                // resources are recreated on the main loop.
+                data.resume_pending = true;
+                data.resume_retry_at = Some(Instant::now() + Duration::from_millis(250));
+                flog_warn!("libseat restored device ownership; scheduling settled DRM resume");
             }
         })?;
     let sleep_notifications = spawn_session_sleep_watch().ok();
@@ -3527,6 +3629,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.process_lock_timers();
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+        process_deferred_drm_topology_change(&mut data, &loop_handle);
         let exclusive_recovery_nodes = std::mem::take(&mut data.exclusive_hdr_recovery_nodes);
         for node in exclusive_recovery_nodes {
             flog_warn!(
@@ -4521,6 +4624,133 @@ pub fn make_drm_gpu(
     })
 }
 
+fn create_drm_renderer(
+    gbm: &GbmDevice<DrmDeviceFd>,
+    node: DrmNode,
+    disable_explicit_kms_fences: bool,
+) -> Result<(GlesRenderer, Option<DrmNode>)> {
+    let egl_display = unsafe { egl::EGLDisplay::new(gbm.clone()) }
+        .context("Failed to create EGLDisplay for DRM node")?;
+    let egl_device =
+        EGLDevice::device_for_display(&egl_display).context("Failed to query EGLDevice")?;
+
+    if egl_device.is_software() {
+        flog(
+            "EGL reports a software rasterizer (e.g. llvmpipe). Check drivers if you expected GPU acceleration.",
+        );
+    }
+
+    // Prefer the render node from the EGL driver so scan-out import matches
+    // where GL allocates.
+    let render_node = if egl_device.is_software() {
+        None
+    } else {
+        egl_device
+            .try_get_render_node()
+            .ok()
+            .flatten()
+            .or(Some(node))
+    };
+
+    // Prefer GLES 3 for core synchronization and framebuffer capabilities.
+    // Keep configless GLES 2 as a compatibility fallback.
+    let preferred_context = EGLContext::new_with_config_and_priority(
+        &egl_display,
+        GlAttributes {
+            version: (3, 0),
+            profile: None,
+            debug: cfg!(debug_assertions),
+            vsync: false,
+        },
+        PixelFormatRequirements::_8_bit(),
+        ContextPriority::High,
+    );
+
+    let create_renderer = |context: EGLContext| unsafe {
+        if disable_explicit_kms_fences {
+            let mut capabilities = GlesRenderer::supported_capabilities(&context)?;
+            capabilities.retain(|capability| *capability != GlesCapability::ExportFence);
+            GlesRenderer::with_capabilities(context, capabilities)
+        } else {
+            GlesRenderer::new(context)
+        }
+    };
+
+    let renderer = match preferred_context {
+        Ok(context) => match create_renderer(context) {
+            Ok(renderer) => {
+                flog("Created preferred OpenGL ES 3.0 context for DRM renderer");
+                renderer
+            }
+            Err(err) => {
+                flog(&format!(
+                    "OpenGL ES 3.0 DRM renderer initialization failed ({err:?}); falling back to OpenGL ES 2.0"
+                ));
+                let context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
+                    .context("Failed to create fallback OpenGL ES 2.0 context for DRM node")?;
+                create_renderer(context)
+                    .context("Failed to create fallback OpenGL ES 2.0 renderer for DRM node")?
+            }
+        },
+        Err(err) => {
+            flog(&format!(
+                "OpenGL ES 3.0 DRM context unavailable ({err:?}); falling back to OpenGL ES 2.0"
+            ));
+            let context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
+                .context("Failed to create fallback OpenGL ES 2.0 context for DRM node")?;
+            create_renderer(context)
+                .context("Failed to create fallback OpenGL ES 2.0 renderer for DRM node")?
+        }
+    };
+
+    if disable_explicit_kms_fences {
+        // NVIDIA 595's open kernel module can restore rendering after S3 while
+        // leaving its plane-fence semaphore path unusable.  Smithay otherwise
+        // exports every completed GLES frame as IN_FENCE_FD, and the driver's
+        // first post-resume atomic commit then fails with EAGAIN forever.  A
+        // renderer without ExportFence finishes GLES synchronously and gives
+        // Smithay a signaled, non-exportable SyncPoint, preserving atomic KMS
+        // while making the submission use implicit synchronization.
+        flog_warn!("Disabled explicit KMS input fences for the post-resume NVIDIA renderer");
+    }
+
+    Ok((renderer, render_node))
+}
+
+fn recreate_drm_renderer_after_resume(
+    device: &mut DrmDeviceState,
+    node: DrmNode,
+    display_handle: &DisplayHandle,
+) -> Result<()> {
+    let disable_explicit_kms_fences = device.gpu_vendor_id == Some(PCI_VENDOR_NVIDIA);
+    let (mut renderer, render_node) =
+        create_drm_renderer(&device.gbm, node, disable_explicit_kms_fences)?;
+    match renderer.bind_wl_display(display_handle) {
+        Ok(_) => flog("EGL Wayland display rebound after resume"),
+        Err(err) => flog(&format!(
+            "Failed to rebind EGL Wayland display after resume: {err:?}"
+        )),
+    }
+
+    for surface in device.surfaces.values_mut() {
+        let linear_supported = supports_linear_sdr(&mut renderer, surface.size);
+        let hdr_format = select_hdr_offscreen_format(&mut renderer, surface.size);
+        surface.render_targets = LinearOffscreenTargets {
+            linear_supported,
+            hdr_supported: hdr_format.is_some(),
+            hdr_format,
+            ..LinearOffscreenTargets::default()
+        };
+        surface.present_render_id = Id::new();
+        surface.present_damage = DamageBag::default();
+    }
+
+    device.render_node = render_node;
+    device.renderer = renderer;
+    flog_warn!("Recreated EGL/GL DRM renderer after system resume");
+    Ok(())
+}
+
 fn device_added(
     data: &mut DrmLoopData,
     loop_handle: &LoopHandle<'_, DrmLoopData>,
@@ -4567,70 +4797,7 @@ fn device_added(
         DrmDevice::new(fd.clone(), true).context("Failed to create DrmDevice for added node")?;
     let gbm = GbmDevice::new(fd.clone()).context("Failed to create GBM device for node")?;
 
-    let egl_display = unsafe { egl::EGLDisplay::new(gbm.clone()) }
-        .context("Failed to create EGLDisplay for DRM node")?;
-    let egl_device =
-        EGLDevice::device_for_display(&egl_display).context("Failed to query EGLDevice")?;
-
-    if egl_device.is_software() {
-        flog(
-            "EGL reports a software rasterizer (e.g. llvmpipe). Check drivers if you expected GPU acceleration.",
-        );
-    }
-
-    // Prefer the render node from the EGL driver so scan-out import matches where GL allocates.
-    let render_node_for_gpu = if egl_device.is_software() {
-        None
-    } else {
-        egl_device
-            .try_get_render_node()
-            .ok()
-            .flatten()
-            .or(Some(node))
-    };
-
-    // Prefer GLES 3 for core synchronization and framebuffer capabilities.  Keep
-    // the former configless GLES 2 context as a compatibility fallback: asking
-    // Smithay for an explicit GL version also requires selecting an EGLConfig,
-    // which some older or unusual DRM drivers may reject.
-    let preferred_context = EGLContext::new_with_config_and_priority(
-        &egl_display,
-        GlAttributes {
-            version: (3, 0),
-            profile: None,
-            debug: cfg!(debug_assertions),
-            vsync: false,
-        },
-        PixelFormatRequirements::_8_bit(),
-        ContextPriority::High,
-    );
-
-    let mut renderer = match preferred_context {
-        Ok(context) => match unsafe { GlesRenderer::new(context) } {
-            Ok(renderer) => {
-                flog("Created preferred OpenGL ES 3.0 context for DRM renderer");
-                renderer
-            }
-            Err(err) => {
-                flog(&format!(
-                    "OpenGL ES 3.0 DRM renderer initialization failed ({err:?}); falling back to OpenGL ES 2.0"
-                ));
-                let context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
-                    .context("Failed to create fallback OpenGL ES 2.0 context for DRM node")?;
-                unsafe { GlesRenderer::new(context) }
-                    .context("Failed to create fallback OpenGL ES 2.0 renderer for DRM node")?
-            }
-        },
-        Err(err) => {
-            flog(&format!(
-                "OpenGL ES 3.0 DRM context unavailable ({err:?}); falling back to OpenGL ES 2.0"
-            ));
-            let context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)
-                .context("Failed to create fallback OpenGL ES 2.0 context for DRM node")?;
-            unsafe { GlesRenderer::new(context) }
-                .context("Failed to create fallback OpenGL ES 2.0 renderer for DRM node")?
-        }
-    };
+    let (mut renderer, render_node_for_gpu) = create_drm_renderer(&gbm, node, false)?;
 
     match renderer.bind_wl_display(&data.core.display.handle()) {
         Ok(_) => flog("EGL Wayland display bound for DRM renderer"),

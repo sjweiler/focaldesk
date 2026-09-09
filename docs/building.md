@@ -185,12 +185,13 @@ These recipes install:
 - `/usr/share/wayland-sessions/focaldesk.desktop`
 - `/usr/lib/systemd/user/focaldesk-session.target`
 
-On NVIDIA systems that support `s2idle`, `install-desktop` also installs the
-FocalDesk sleep configuration selecting it. This avoids known S3/deep-resume
-failures that leave the NVIDIA GPU context or KMS scanout unusable. It remains
-a supplemental platform workaround: the DRM backend independently reconstructs
-scanout state after session activation and forces a complete post-resume
-modeset.
+FocalDesk leaves the platform sleep mode unchanged, including firmware-backed
+`deep` sleep. The DRM backend retains the libseat-owned DRM device across
+suspend, reconstructs scanout state after session activation, and forces a
+complete post-resume modeset. The post-resume NVIDIA renderer uses implicit KMS
+synchronization to avoid driver failures while attaching an explicit plane
+fence. `install-desktop` removes the legacy FocalDesk-owned NVIDIA `s2idle`
+override if an older installation left it behind.
 
 Log out, select **FocalDesk** in the display manager, and sign in. Keep a known
 working session installed so you can recover from compositor or driver failures.

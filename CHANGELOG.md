@@ -70,7 +70,13 @@ version numbers where practical.
 - DRM suspend/resume now uses explicit lifecycle states, abandons stale flip
   bookkeeping, waits for libseat activation, resets connectors and planes,
   reprobes resources, invalidates GPU caches, and forces a complete modeset with
-  timestamped recovery diagnostics.
+  timestamped recovery diagnostics. Deferred NVIDIA udev notifications no
+  longer destroy the retained DRM device during resume, and FocalDesk no longer
+  overrides the platform's firmware-backed deep-sleep policy with `s2idle`.
+  Firmware-backed resume also recreates the EGL/GL renderer instead of reusing
+  a context that NVIDIA may have invalidated while asleep. NVIDIA's recreated
+  renderer uses implicit KMS synchronization after resume, avoiding the driver
+  regression that rejects otherwise-valid `IN_FENCE_FD` plane fences.
 - Extended Wayland color-management negotiation and HDR calibration controls,
   including RGB color-representation advertising, per-output client metadata,
   live KMS metadata refresh, and session-only calibration patterns.

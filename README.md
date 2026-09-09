@@ -254,13 +254,14 @@ just install-desktop-session
 
 That recipe builds a release binary and installs it to
 `/usr/local/bin/focaldesk-desktop` (same path as the Wayland session `Exec=`).
-On NVIDIA systems that expose `s2idle`, it also selects that suspend mode to
-avoid stale GPU contexts and dead scanout after firmware S3/deep resume. The
-installer activates `s2idle` immediately and fails if the kernel does not
-confirm it as the selected mode. This is a platform workaround, not a substitute
-for compositor recovery: FocalDesk also pauses rendering and DRM commits,
-waits for libseat to restore device ownership, resets connector and plane state,
-reprobes DRM resources, invalidates GPU caches, and submits a fresh modeset.
+FocalDesk leaves the platform sleep mode unchanged, including firmware-backed
+`deep` sleep. It pauses rendering and DRM commits, waits for libseat to restore
+device ownership, resets connector and plane state, reprobes DRM resources,
+invalidates GPU caches, and submits a fresh modeset. After deep resume on
+NVIDIA, the recreated renderer uses implicit synchronization so a broken plane
+fence cannot prevent that modeset. The installer also removes the legacy
+FocalDesk-owned NVIDIA `s2idle` override if an older installation left it
+behind.
 Re-run `just install-desktop-session` after changing the session file.
 
 To build and install the file manager prototype:
