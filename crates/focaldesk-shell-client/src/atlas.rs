@@ -62,7 +62,7 @@ pub enum IconId {
     Updates,
     FocalDeskLabel,
     Power,
-    HDR,
+    Hdr,
     DiagonalResize,
     CrossHair,
     OppositeDiagonalResize,
@@ -163,7 +163,7 @@ impl IconId {
             "notifications" | "notification" => Self::Notifications,
             "updates" | "update" => Self::Updates,
             "power" => Self::Power,
-            "hdr" => Self::HDR,
+            "hdr" => Self::Hdr,
             "browser" => Self::Browser,
             "terminal" => Self::Terminal,
             "files" => Self::Files,
@@ -526,7 +526,7 @@ where
         ),
         //(IconId::FocalDeskLabel, include_bytes!("../../../assets/svg/focaldesk-logo.svg")),
         (
-            IconId::HDR,
+            IconId::Hdr,
             include_bytes!("../../../assets/svg/hdr-enabled.svg"),
         ),
         (

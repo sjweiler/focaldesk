@@ -129,7 +129,7 @@ pub fn panel_controls(shell: &ShellSnapshot) -> Vec<ShellControl> {
         )
         .enabled(false),
         ShellControl::new(
-            IconId::HDR,
+            IconId::Hdr,
             "HDR status unavailable",
             DesktopAction::OpenSettingsPanel {
                 panel: "displays".into(),
@@ -153,7 +153,7 @@ pub fn dock_controls(
 ) -> Vec<ShellControl> {
     let count = workspace_count.max(1);
     let fixed = 2 + 1 + usize::from(count > 1) + 4;
-    let workspace_capacity = capacity.saturating_sub(fixed).max(1).min(4);
+    let workspace_capacity = capacity.saturating_sub(fixed).clamp(1, 4);
     let overflow = count > workspace_capacity;
     let shown = count.min(if overflow {
         workspace_capacity.saturating_sub(1).max(1)

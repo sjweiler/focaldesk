@@ -16,8 +16,8 @@ use focaldesk_voice::{VoiceEvent, VoiceSession};
 use glib::ControlFlow;
 use gtk4::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box, Button, ComboBoxText, Entry, Label, Orientation, Paned,
-    Revealer, ScrolledWindow, Switch, TextBuffer, TextView,
+    Application, ApplicationWindow, Box, Button, DropDown, Entry, Label, Orientation, Paned,
+    Revealer, ScrolledWindow, StringList, Switch, TextBuffer, TextView,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -107,11 +107,53 @@ struct QuickPromptsPage {
 }
 
 #[derive(Clone)]
+struct ChoiceDropDown {
+    widget: DropDown,
+    ids: Rc<RefCell<Vec<String>>>,
+}
+
+impl ChoiceDropDown {
+    fn new() -> Self {
+        Self {
+            widget: DropDown::from_strings(&[]),
+            ids: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    fn replace(&self, choices: Vec<(String, String)>, selected_id: &str) {
+        let selected = choices
+            .iter()
+            .position(|(id, _)| id == selected_id)
+            .unwrap_or(0) as u32;
+        let labels = choices
+            .iter()
+            .map(|(_, label)| label.as_str())
+            .collect::<Vec<_>>();
+        self.widget.set_model(Some(&StringList::new(&labels)));
+        *self.ids.borrow_mut() = choices.into_iter().map(|(id, _)| id).collect();
+        self.widget.set_selected(selected);
+    }
+
+    fn selected_id(&self) -> Option<String> {
+        self.ids
+            .borrow()
+            .get(self.widget.selected() as usize)
+            .cloned()
+    }
+
+    fn connect_changed<F: Fn(&Self) + 'static>(&self, callback: F) {
+        let this = self.clone();
+        self.widget
+            .connect_selected_notify(move |_| callback(&this));
+    }
+}
+
+#[derive(Clone)]
 struct BackendBannerHandles {
     title_label: Label,
     subtitle_label: Label,
-    backend_combo: ComboBoxText,
-    model_combo: ComboBoxText,
+    backend_combo: ChoiceDropDown,
+    model_combo: ChoiceDropDown,
     provider_combo_syncing: Rc<RefCell<bool>>,
     model_combo_syncing: Rc<RefCell<bool>>,
 }
@@ -230,10 +272,10 @@ fn load_ai_runtime() -> AiConsoleRuntime {
 }
 
 fn normalize_state_with_runtime(state: &mut PersistedState, runtime: &AiConsoleRuntime) {
-    if state.app_state.active_provider.is_empty() {
-        if let Some(default_provider) = runtime.default_provider.as_ref() {
-            state.app_state.active_provider = default_provider.clone();
-        }
+    if state.app_state.active_provider.is_empty()
+        && let Some(default_provider) = runtime.default_provider.as_ref()
+    {
+        state.app_state.active_provider = default_provider.clone();
     }
 
     if !runtime.providers.is_empty()
@@ -924,9 +966,9 @@ fn render_conversation_panel(parent: &Box, conversation: &Conversation, heading:
     }
     for message in &conversation.messages {
         if message.starts_with("User:") {
-            add_message(parent, &message, "user-card");
+            add_message(parent, message, "user-card");
         } else {
-            add_message(parent, &message, "ai-card");
+            add_message(parent, message, "ai-card");
         }
     }
 }
@@ -973,11 +1015,11 @@ fn build_backend_banner(
     backend_label.set_xalign(0.0);
     backend_label.add_css_class("mode-control-label");
 
-    let backend_combo = ComboBoxText::new();
+    let backend_combo = ChoiceDropDown::new();
     let model_label = Label::new(Some("Model"));
     model_label.set_xalign(0.0);
     model_label.add_css_class("mode-control-label");
-    let model_combo = ComboBoxText::new();
+    let model_combo = ChoiceDropDown::new();
     populate_provider_combo(
         &backend_combo,
         &runtime.borrow().providers,
@@ -1003,9 +1045,9 @@ fn build_backend_banner(
 
     let backend_group = Box::new(Orientation::Vertical, 4);
     backend_group.append(&backend_label);
-    backend_group.append(&backend_combo);
+    backend_group.append(&backend_combo.widget);
     backend_group.append(&model_label);
-    backend_group.append(&model_combo);
+    backend_group.append(&model_combo.widget);
 
     controls.append(&backend_group);
     banner.append(&controls);
@@ -1035,10 +1077,10 @@ fn build_backend_banner(
         if *provider_combo_syncing_for_provider.borrow() {
             return;
         }
-        if let Some(selected) = combo.active_id() {
+        if let Some(selected) = combo.selected_id() {
             {
                 let mut state = state_clone.borrow_mut();
-                state.app_state.active_provider = selected.to_string();
+                state.app_state.active_provider = selected;
                 let runtime = runtime_clone.borrow();
                 sync_active_model_with_provider(&mut state, &runtime);
                 persist_state(&state);
@@ -1087,9 +1129,9 @@ fn build_backend_banner(
             if *model_combo_syncing.borrow() {
                 return;
             }
-            if let Some(selected) = combo.active_id() {
+            if let Some(selected) = combo.selected_id() {
                 let mut state = state_clone.borrow_mut();
-                state.app_state.active_model = selected.to_string();
+                state.app_state.active_model = selected;
                 persist_state(&state);
                 *provider_combo_syncing.borrow_mut() = true;
                 *model_combo_syncing.borrow_mut() = true;
@@ -1143,8 +1185,8 @@ fn build_backend_banner(
 fn refresh_backend_banner(
     title_label: &Label,
     subtitle_label: &Label,
-    backend_combo: &ComboBoxText,
-    model_combo: &ComboBoxText,
+    backend_combo: &ChoiceDropDown,
+    model_combo: &ChoiceDropDown,
     state: &PersistedState,
     runtime: &AiConsoleRuntime,
 ) {
@@ -1192,73 +1234,81 @@ fn refresh_backend_banner(
 }
 
 fn populate_provider_combo(
-    backend_combo: &ComboBoxText,
+    backend_combo: &ChoiceDropDown,
     providers: &[ProviderInfo],
     selected_provider: &str,
 ) {
-    backend_combo.remove_all();
     if providers.is_empty() {
-        backend_combo.append(Some("unavailable"), "No providers available");
-        backend_combo.set_active_id(Some("unavailable"));
+        backend_combo.replace(
+            vec![("unavailable".into(), "No providers available".into())],
+            "unavailable",
+        );
         return;
     }
 
-    for provider in providers {
-        backend_combo.append(Some(&provider.id), &provider_label(provider));
-    }
-
-    if providers
+    let selected = if providers
         .iter()
         .any(|provider| provider.id == selected_provider)
     {
-        backend_combo.set_active_id(Some(selected_provider));
+        selected_provider
     } else if let Some(default_provider) = providers.first() {
-        backend_combo.set_active_id(Some(&default_provider.id));
-    }
+        &default_provider.id
+    } else {
+        "unavailable"
+    };
+    backend_combo.replace(
+        providers
+            .iter()
+            .map(|provider| (provider.id.clone(), provider_label(provider)))
+            .collect(),
+        selected,
+    );
 }
 
 fn populate_model_combo(
-    model_combo: &ComboBoxText,
+    model_combo: &ChoiceDropDown,
     runtime: &AiConsoleRuntime,
     selected_provider: &str,
     selected_model: &str,
 ) {
-    model_combo.remove_all();
     let models = provider_models_for(runtime, selected_provider);
     if models.is_empty() {
-        model_combo.append(Some("unavailable"), "No models listed");
-        model_combo.set_active_id(Some("unavailable"));
+        model_combo.replace(
+            vec![("unavailable".into(), "No models listed".into())],
+            "unavailable",
+        );
         return;
     }
 
-    for model in models {
-        model_combo.append(Some(&model.id), &model_label(&model));
-    }
-
-    if !selected_model.is_empty() {
-        model_combo.set_active_id(Some(selected_model));
-        if model_combo.active_id().as_deref() == Some(selected_model) {
-            return;
-        }
-    }
-
-    if let Some(default_model) = runtime
-        .providers
-        .iter()
-        .find(|provider| provider.id == selected_provider)
-        .and_then(|provider| provider.default_model.clone())
-        .filter(|default_model| {
-            runtime
-                .provider_models
-                .get(selected_provider)
-                .map(|models| models.iter().any(|model| model.id == *default_model))
-                .unwrap_or(false)
-        })
-    {
-        model_combo.set_active_id(Some(&default_model));
-    } else if let Some(first_model) = provider_models_for(runtime, selected_provider).first() {
-        model_combo.set_active_id(Some(&first_model.id));
-    }
+    let selected =
+        if !selected_model.is_empty() && models.iter().any(|model| model.id == selected_model) {
+            selected_model.to_owned()
+        } else if let Some(default_model) = runtime
+            .providers
+            .iter()
+            .find(|provider| provider.id == selected_provider)
+            .and_then(|provider| provider.default_model.clone())
+            .filter(|default_model| {
+                runtime
+                    .provider_models
+                    .get(selected_provider)
+                    .map(|models| models.iter().any(|model| model.id == *default_model))
+                    .unwrap_or(false)
+            })
+        {
+            default_model
+        } else if let Some(first_model) = provider_models_for(runtime, selected_provider).first() {
+            first_model.id.clone()
+        } else {
+            "unavailable".into()
+        };
+    model_combo.replace(
+        models
+            .into_iter()
+            .map(|model| (model.id.clone(), model_label(&model)))
+            .collect(),
+        &selected,
+    );
 }
 
 fn refresh_composer_status_label(
@@ -3387,8 +3437,10 @@ mod tests {
 
     #[test]
     fn chat_request_uses_only_the_resolved_conversation() {
-        let mut app_state = AppState::default();
-        app_state.active_conversation = 0;
+        let app_state = AppState {
+            active_conversation: 0,
+            ..AppState::default()
+        };
         let store = PersistedState {
             conversations: vec![
                 conversation("Wrong thread", &["User: contaminated"]),

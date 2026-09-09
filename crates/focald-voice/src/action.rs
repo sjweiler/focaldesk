@@ -43,9 +43,7 @@ pub enum MapError {
 pub fn to_action(intent: VoiceIntent, state: &CompositorState) -> Result<DesktopAction, MapError> {
     match intent {
         VoiceIntent::OpenApp { app, output } => {
-            let exec = state
-                .resolve_app(&app)
-                .ok_or_else(|| MapError::UnknownApp(app))?;
+            let exec = state.resolve_app(&app).ok_or(MapError::UnknownApp(app))?;
             let output = match output {
                 Some(idx) => Some(state.valid_output(idx).ok_or(MapError::BadOutput(idx))?),
                 None => None,

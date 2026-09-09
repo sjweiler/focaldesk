@@ -97,7 +97,7 @@ impl Connection {
             .read_exact(&mut buf)
             .await
             .context("read frame body")?;
-        Ok(serde_json::from_slice(&buf).context("decode request")?)
+        serde_json::from_slice(&buf).context("decode request")
     }
 
     pub async fn send(&mut self, resp: &Response) -> anyhow::Result<()> {

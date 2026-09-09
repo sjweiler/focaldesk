@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
 
@@ -153,6 +153,13 @@ pub fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("focaldesk")
+        .join("settings.json")
+}
+
+fn legacy_config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("focaldesk")
         .join("config.toml")
 }
 
@@ -162,12 +169,17 @@ pub fn config_path() -> PathBuf {
 /// partial configuration returns `None` instead of the built-in configuration
 /// default, allowing the compositor to use its system-installed default theme.
 pub fn configured_theme() -> Option<String> {
-    let text = fs::read_to_string(config_path()).ok()?;
+    if let Ok(text) = fs::read_to_string(config_path()) {
+        if let Some(config) = config_from_settings_json(&text) {
+            return Some(config.appearance.theme);
+        }
+    }
+    let text = fs::read_to_string(legacy_config_path()).ok()?;
     configured_theme_from_toml(&text)
 }
 
 fn configured_theme_from_toml(text: &str) -> Option<String> {
-    let value: toml::Value = toml::from_str(&text).ok()?;
+    let value: toml::Value = toml::from_str(text).ok()?;
     value
         .get("appearance")?
         .get("theme")?
@@ -175,13 +187,22 @@ fn configured_theme_from_toml(text: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-pub fn load_config() -> FocalDeskConfig {
-    let path = config_path();
+fn config_from_settings_json(text: &str) -> Option<FocalDeskConfig> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    serde_json::from_value(value.get("desktop_config")?.clone()).ok()
+}
 
-    match fs::read_to_string(path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_default(),
-        Err(_) => FocalDeskConfig::default(),
+pub fn load_config() -> FocalDeskConfig {
+    if let Ok(text) = fs::read_to_string(config_path()) {
+        if let Some(config) = config_from_settings_json(&text) {
+            return config;
+        }
     }
+
+    fs::read_to_string(legacy_config_path())
+        .ok()
+        .and_then(|text| toml::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 pub fn save_config(config: &FocalDeskConfig) -> Result<()> {
@@ -191,8 +212,20 @@ pub fn save_config(config: &FocalDeskConfig) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let text = toml::to_string_pretty(config)?;
-    fs::write(path, text)?;
+    let mut root = match fs::read_to_string(&path) {
+        Ok(text) => {
+            let value: serde_json::Value = serde_json::from_str(&text)?;
+            let Some(root) = value.as_object().cloned() else {
+                bail!("{} must contain a JSON object", path.display());
+            };
+            root
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => return Err(error.into()),
+    };
+    root.insert("desktop_config".into(), serde_json::to_value(config)?);
+    let text = serde_json::to_string_pretty(&root)?;
+    fs::write(path, format!("{text}\n"))?;
 
     Ok(())
 }
@@ -233,6 +266,15 @@ mod tests {
             configured_theme_from_toml("[appearance]\ntheme = \"Classic\"\n"),
             Some("Classic".to_string())
         );
+    }
+
+    #[test]
+    fn canonical_settings_json_contains_typed_config() {
+        let config =
+            config_from_settings_json(r#"{"desktop_config":{"appearance":{"theme":"Classic"}}}"#)
+                .expect("parse canonical configuration");
+        assert_eq!(config.appearance.theme, "Classic");
+        assert_eq!(config.dock.visibility, DockVisibility::IntelligentDodge);
     }
 
     #[test]

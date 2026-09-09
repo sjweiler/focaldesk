@@ -6,6 +6,7 @@ pub mod color;
 pub mod colord;
 pub mod consts;
 pub mod desktop;
+mod desktop_services;
 pub mod icc;
 pub mod icc_lut;
 pub mod input;

@@ -54,6 +54,7 @@ release.
 | Area | Status |
 | --- | --- |
 | Wayland compositor and desktop shell | Working, alpha |
+| Wayland text input and input methods | text-input-v3 implemented; input-method-v2 restricted to configured IME executables |
 | DRM/KMS and nested winit backends | Working, alpha |
 | Workspaces and multi-monitor layout | Working, with ongoing edge-case work |
 | XWayland application support | Working, alpha |
@@ -479,10 +480,10 @@ NG.
 ## Roadmap
 
 Near-term work is focused on compositor stability, multi-monitor behavior,
-XWayland and portal hardening, configuration consolidation, auditable AI and
-automation permissions, repeatable alpha releases, and clearing the Clippy
-warning backlog. Rendering priorities include damage-path profiling, expanded
-HDR/color validation, and broader cursor, direct-scanout, and multi-GPU testing.
+XWayland and portal hardening, configuration migration, auditable AI and
+automation permissions, and repeatable alpha releases. Rendering priorities
+include damage-path profiling, expanded HDR/color validation, and broader
+cursor, direct-scanout, and multi-GPU testing.
 
 Longer-term goals include maturing the first-party desktop experience, versioned
 IPC, narrower service privileges, better accessibility and recovery workflows,

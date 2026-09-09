@@ -98,21 +98,20 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
             .filter(|arg| !(hdr_output_active && arg.starts_with("--force-color-profile="))),
     );
 
-    if chrome_like || browser_like {
-        if let Some(log_path) = launch_trace_path() {
-            if let Some(parent) = Path::new(&log_path).parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-            {
-                if let Ok(stderr_file) = file.try_clone() {
-                    cmd.stdout(std::process::Stdio::from(file));
-                    cmd.stderr(std::process::Stdio::from(stderr_file));
-                }
-            }
+    if (chrome_like || browser_like)
+        && let Some(log_path) = launch_trace_path()
+    {
+        if let Some(parent) = Path::new(&log_path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            && let Ok(stderr_file) = file.try_clone()
+        {
+            cmd.stdout(std::process::Stdio::from(file));
+            cmd.stderr(std::process::Stdio::from(stderr_file));
         }
     }
 

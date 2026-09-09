@@ -1396,7 +1396,7 @@ fn work_area_glass_pixels_for_output(
             let noise = glass_noise(x as u32, y as u32);
 
             let mut color = [0.0f32; 3];
-            for channel in 0..3 {
+            for (channel, output) in color.iter_mut().enumerate() {
                 let value = style.tint[channel] * 0.06 * body_gradient
                     + style.edge_color[channel] * edge * style.edge_brightness * 0.35
                     + highlight
@@ -1407,7 +1407,7 @@ fn work_area_glass_pixels_for_output(
                     + (noise - 0.5) * 0.0025;
                 let tone_index =
                     (value.clamp(0.0, 1.0) * GLASS_LOOKUP_SAMPLES as f32).round() as usize;
-                color[channel] = tone_lookup[tone_index];
+                *output = tone_lookup[tone_index];
             }
             let glass_alpha = (style.opacity
                 + edge * 0.025

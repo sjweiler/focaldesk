@@ -86,7 +86,7 @@ fn focaldesk_config_path() -> PathBuf {
         })
         .unwrap_or_else(|| PathBuf::from("."))
         .join("focaldesk")
-        .join("config.toml")
+        .join("settings.json")
 }
 
 fn focaldesk_log_candidates() -> Vec<PathBuf> {

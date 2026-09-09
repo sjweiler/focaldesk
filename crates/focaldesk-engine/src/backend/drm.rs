@@ -1262,7 +1262,7 @@ fn remove_drm_device(
     node: DrmNode,
 ) {
     if let Some(device) = data.backend.devices.remove(&node) {
-        let _ = loop_handle.remove(device.registration_token);
+        loop_handle.remove(device.registration_token);
 
         for surface in device.surfaces.into_values() {
             data.core.state.space.unmap_output(&surface.output);
@@ -2371,7 +2371,7 @@ pub(crate) fn collect_display_configs(
 ) -> Vec<DisplayConfig> {
     let mut displays = Vec::new();
 
-    for (_crtc, surface) in &device.surfaces {
+    for surface in device.surfaces.values() {
         let output_id = surface.output_id;
 
         let core_output = core.state.outputs.get(&output_id);
@@ -2473,7 +2473,7 @@ fn merge_disconnected_display_configs(
 /// Resolve which DRM node is primary for this seat (KMS node, matches udev
 /// `device_list` entries). This must not open the device: `device_added` opens
 /// it once through the active session.
-fn primary_drm_node<S: Session>(session: &S) -> Result<DrmNode>
+fn primary_drm_node<S>(session: &S) -> Result<DrmNode>
 where
     S: Session,
     S::Error: std::error::Error + Send + Sync + 'static,
@@ -2514,9 +2514,7 @@ mod hdr_detection {
         connector: connector::Handle,
         edid: Option<&[u8]>,
     ) -> HdrSupport {
-        let mut support = edid
-            .map(parse_edid_hdr_support)
-            .unwrap_or_else(HdrSupport::default);
+        let mut support = edid.map(parse_edid_hdr_support).unwrap_or_default();
 
         let Ok(props) = device.get_properties(connector) else {
             return support;
@@ -4624,7 +4622,7 @@ pub fn make_drm_gpu(
         allocator.clone(),
         framebuffer_exporter.clone(),
         Some(gbm.clone()),
-        color_formats.into_iter(),
+        color_formats,
         render_formats,
     );
 

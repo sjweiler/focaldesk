@@ -1029,99 +1029,6 @@ void main() {
 }
 "#;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn shader_sources() -> [&'static str; 26] {
-        [
-            BEVELED_PANEL_FRAG,
-            LIGHT_CHANNEL_FRAG,
-            CHAMFER_PANEL_FRAG,
-            CHAMFER_OLD__PANEL_FRAG,
-            BEVELED_PANEL_FRAG_V2,
-            WORKAREA_GLASS_FRAG,
-            RECESSED_BUTTON_FRAG,
-            TOP_BAR_FRAG,
-            TINTED_ICON_FRAG,
-            CLIENT_TO_SCENE_LINEAR_FRAG,
-            SRGB_TO_LINEAR_FRAG,
-            COMPOSITE_LINEAR_LAYER_FRAG,
-            OUTPUT_ENCODE_SDR_FRAG,
-            OUTPUT_ENCODE_LUT_FRAG,
-            SDR_TO_LINEAR_SCRGB_FRAG,
-            LINEAR_SCRGB_TO_PQ_FRAG,
-            LINEAR_TO_SRGB_FRAG,
-            AMBER_LIGHTBAR_FRAG,
-            FONT_TEXT_FRAG,
-            ROUNDED_RECT_FRAG,
-            WALLPAPER_TINT_FRAG,
-            PULSE_FRAG,
-            ACCENT_FRAG,
-            FLOW_FIELD_FRAG,
-            SCREENSAVER_FRAG,
-            GLASS_CONTROL_FRAG,
-        ]
-    }
-
-    #[test]
-    fn shaders_stay_in_the_shared_glsl_es_100_subset() {
-        for shader in shader_sources() {
-            assert!(!shader.contains("#version"));
-            assert!(!shader.contains("layout("));
-            assert!(!shader.contains("texture("));
-            assert!(!shader.contains("out vec4"));
-            assert!(shader.contains("varying vec2 v_coords;"));
-            assert!(shader.contains("gl_FragColor"));
-
-            if shader.contains("precision highp float;") {
-                assert!(shader.contains("GL_FRAGMENT_PRECISION_HIGH"));
-                assert!(shader.contains("precision mediump float;"));
-            }
-        }
-    }
-
-    #[test]
-    fn client_linear_decode_uses_hdr_dither_and_scene_scale_uniforms() {
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("uniform float u_src_bits;"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("decode_dither(gl_FragCoord.xy)"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("uniform float u_linear_to_scene_scale;"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG
-            .contains("decode_color(straight) * u_linear_to_scene_scale"));
-    }
-
-    #[test]
-    fn pq_output_dithers_to_ten_bit_code_values() {
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither(gl_FragCoord.xy)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("/ 1023.0"));
-    }
-
-    #[test]
-    fn pixel_shaders_use_smithays_vertex_varying() {
-        for shader in [RECESSED_BUTTON_FRAG, TOP_BAR_FRAG] {
-            assert!(shader.contains("varying vec2 v_coords;"));
-            assert!(!shader.contains("v_uv"));
-        }
-    }
-
-    #[test]
-    fn glass_control_uses_smithays_texture_shader_contract() {
-        assert!(GLASS_CONTROL_FRAG.contains("//_DEFINES"));
-        assert!(GLASS_CONTROL_FRAG.contains("varying vec2 v_coords;"));
-        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D tex;"));
-        assert!(GLASS_CONTROL_FRAG.contains("uniform float alpha;"));
-        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D u_background;"));
-        assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
-        assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
-    }
-
-    #[test]
-    fn tinted_icon_outputs_premultiplied_alpha() {
-        assert!(TINTED_ICON_FRAG.contains("uniform float alpha;"));
-        assert!(TINTED_ICON_FRAG.contains("vec4(u_tint.rgb * coverage, coverage)"));
-    }
-}
-
 const TINTED_ICON_FRAG: &str = r#"
 #ifdef GL_ES
 precision mediump float;
@@ -2289,3 +2196,96 @@ void main() {
     gl_FragColor = vec4(final_color * coverage, coverage);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shader_sources() -> [&'static str; 26] {
+        [
+            BEVELED_PANEL_FRAG,
+            LIGHT_CHANNEL_FRAG,
+            CHAMFER_PANEL_FRAG,
+            CHAMFER_OLD__PANEL_FRAG,
+            BEVELED_PANEL_FRAG_V2,
+            WORKAREA_GLASS_FRAG,
+            RECESSED_BUTTON_FRAG,
+            TOP_BAR_FRAG,
+            TINTED_ICON_FRAG,
+            CLIENT_TO_SCENE_LINEAR_FRAG,
+            SRGB_TO_LINEAR_FRAG,
+            COMPOSITE_LINEAR_LAYER_FRAG,
+            OUTPUT_ENCODE_SDR_FRAG,
+            OUTPUT_ENCODE_LUT_FRAG,
+            SDR_TO_LINEAR_SCRGB_FRAG,
+            LINEAR_SCRGB_TO_PQ_FRAG,
+            LINEAR_TO_SRGB_FRAG,
+            AMBER_LIGHTBAR_FRAG,
+            FONT_TEXT_FRAG,
+            ROUNDED_RECT_FRAG,
+            WALLPAPER_TINT_FRAG,
+            PULSE_FRAG,
+            ACCENT_FRAG,
+            FLOW_FIELD_FRAG,
+            SCREENSAVER_FRAG,
+            GLASS_CONTROL_FRAG,
+        ]
+    }
+
+    #[test]
+    fn shaders_stay_in_the_shared_glsl_es_100_subset() {
+        for shader in shader_sources() {
+            assert!(!shader.contains("#version"));
+            assert!(!shader.contains("layout("));
+            assert!(!shader.contains("texture("));
+            assert!(!shader.contains("out vec4"));
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(shader.contains("gl_FragColor"));
+
+            if shader.contains("precision highp float;") {
+                assert!(shader.contains("GL_FRAGMENT_PRECISION_HIGH"));
+                assert!(shader.contains("precision mediump float;"));
+            }
+        }
+    }
+
+    #[test]
+    fn client_linear_decode_uses_hdr_dither_and_scene_scale_uniforms() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("uniform float u_src_bits;"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("decode_dither(gl_FragCoord.xy)"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("uniform float u_linear_to_scene_scale;"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG
+            .contains("decode_color(straight) * u_linear_to_scene_scale"));
+    }
+
+    #[test]
+    fn pq_output_dithers_to_ten_bit_code_values() {
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq_output_dither(gl_FragCoord.xy)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("/ 1023.0"));
+    }
+
+    #[test]
+    fn pixel_shaders_use_smithays_vertex_varying() {
+        for shader in [RECESSED_BUTTON_FRAG, TOP_BAR_FRAG] {
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(!shader.contains("v_uv"));
+        }
+    }
+
+    #[test]
+    fn glass_control_uses_smithays_texture_shader_contract() {
+        assert!(GLASS_CONTROL_FRAG.contains("//_DEFINES"));
+        assert!(GLASS_CONTROL_FRAG.contains("varying vec2 v_coords;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D tex;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform float alpha;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D u_background;"));
+        assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
+        assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
+    }
+
+    #[test]
+    fn tinted_icon_outputs_premultiplied_alpha() {
+        assert!(TINTED_ICON_FRAG.contains("uniform float alpha;"));
+        assert!(TINTED_ICON_FRAG.contains("vec4(u_tint.rgb * coverage, coverage)"));
+    }
+}

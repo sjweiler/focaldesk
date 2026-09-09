@@ -47,8 +47,8 @@ pub fn sidebar_workspace_id(workspace_number: u32) -> u32 {
 /// Decodes a sidebar element id back into a 1-based workspace number, if it
 /// falls within the dynamic workspace id range.
 pub fn sidebar_workspace_number(id: u32) -> Option<u32> {
-    if id >= SIDEBAR_WORKSPACE_ID_BASE
-        && id < SIDEBAR_WORKSPACE_ID_BASE + SIDEBAR_WORKSPACE_ID_SLOTS
+    if (SIDEBAR_WORKSPACE_ID_BASE..SIDEBAR_WORKSPACE_ID_BASE + SIDEBAR_WORKSPACE_ID_SLOTS)
+        .contains(&id)
     {
         Some(id - SIDEBAR_WORKSPACE_ID_BASE + 1)
     } else {

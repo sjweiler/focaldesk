@@ -451,7 +451,7 @@ fn read_ai_stream_events(
             bail!("AI stream event exceeds {AI_MAX_RESPONSE_BYTES} bytes");
         }
         frame.pop();
-        let (response, mode) = decode_ai_response(&frame, Some(&request_id))?;
+        let (response, mode) = decode_ai_response(&frame, Some(request_id))?;
         if matches!(mode, AiWireMode::Legacy) {
             bail!("AI streaming requires daemon protocol version {AI_PROTOCOL_VERSION}");
         }

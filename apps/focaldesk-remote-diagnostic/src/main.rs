@@ -21,12 +21,12 @@ fn main() -> Result<()> {
         .parse::<u64>()
         .context("output id must be an integer")?;
     let destination = std::env::args().nth(2).map(PathBuf::from);
-    let mut stream = UnixStream::connect(socket_path()?).context("connect to compositor")?;
-    write_message(&mut stream, &Request::StartCapture { output_id })?;
+    let stream = UnixStream::connect(socket_path()?).context("connect to compositor")?;
+    write_message(&stream, &Request::StartCapture { output_id })?;
     let mut active_session = None;
 
     loop {
-        match read_message::<Event>(&mut stream)? {
+        match read_message::<Event>(&stream)? {
             Event::CaptureStarted {
                 session_id,
                 width,
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
                     File::create(path)?.write_all(&pixels)?;
                     println!("wrote frame {frame_serial} to {}", path.display());
                     if let Some(session_id) = active_session {
-                        write_message(&mut stream, &Request::StopCapture { session_id })?;
+                        write_message(&stream, &Request::StopCapture { session_id })?;
                     }
                     return Ok(());
                 }

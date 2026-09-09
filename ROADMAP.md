@@ -12,10 +12,11 @@ truth for what is usable today.
   and exercise multi-monitor hotplug, scale, transform, and mixed-refresh
   behavior on recorded hardware configurations.
 - Harden XWayland, portal capture, session startup, and user-service lifecycle.
-- Consolidate overlapping `settings.json` and `config.toml` configuration paths.
+- Continue migrating legacy `config.toml` users to the canonical `settings.json`
+  configuration path.
 - Keep AI and automation actions explicit, permission-gated, and auditable.
 - Establish repeatable alpha releases and installation verification.
-- Clear the existing Clippy warning backlog, then promote warnings to CI errors.
+- Keep the workspace warning-free under the CI-enforced `-D warnings` policy.
 
 ## Rendering and display work
 

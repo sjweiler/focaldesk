@@ -19,6 +19,12 @@ pub struct UpdateManager {
     jobs: std::sync::mpsc::Sender<Job>,
 }
 
+impl Default for UpdateManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl UpdateManager {
     pub fn new() -> Self {
         let backend = detect_backend();

@@ -1,6 +1,7 @@
 use std::os::unix::net::UnixStream;
 
 use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
+use smithay::reexports::wayland_server::Client;
 use smithay::wayland::compositor::CompositorClientState;
 use tracing::info_span;
 use wayland_server::backend::{ClientData, ClientId, DisconnectReason};
@@ -35,6 +36,24 @@ impl ClientState {
             credentials,
         }
     }
+}
+
+/// Resolve the executable name associated with a Wayland client.
+///
+/// This is only suitable for narrowing same-user protocol globals. The kernel
+/// credentials remain authoritative; process names alone are not an
+/// authentication boundary.
+pub(crate) fn client_executable_name(client: &Client) -> Option<String> {
+    let credentials = client.get_data::<ClientState>()?.credentials?;
+    if let Ok(exe_path) = std::fs::read_link(format!("/proc/{}/exe", credentials.pid)) {
+        if let Some(name) = exe_path.file_name() {
+            return Some(name.to_string_lossy().into_owned());
+        }
+    }
+
+    std::fs::read_to_string(format!("/proc/{}/comm", credentials.pid))
+        .ok()
+        .map(|name| name.trim().to_owned())
 }
 
 impl ClientData for ClientState {

@@ -105,7 +105,8 @@ pub fn draw_chrome_below_work_wallpaper(
         damage,
         &legacy_theme.panel_inner,
     );
-    for (well, style) in [(layout.topbar.ai_button, legacy_theme.button)] {
+    {
+        let (well, style) = (layout.topbar.ai_button, legacy_theme.button);
         let _ = draw_recessed_button(frame, button, well, frame_ctx.output_scale, damage, &style);
         let _ = draw_light_channel(
             frame,
@@ -302,7 +303,8 @@ pub fn draw_chrome_topbar_frame(
     ] {
         let _ = draw_beveled_panel(frame, beveled, rect, scale, damage, style);
     }
-    for (well, style) in [(layout.topbar.ai_button, legacy_theme.button)] {
+    {
+        let (well, style) = (layout.topbar.ai_button, legacy_theme.button);
         let _ = draw_recessed_button(frame, button, well, scale, damage, &style);
         let _ = draw_light_channel(
             frame,

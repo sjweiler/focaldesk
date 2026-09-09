@@ -95,6 +95,8 @@ jobs:
         run: cargo check --workspace
 
       - name: Clippy
+        env:
+          RUSTFLAGS: "-Dwarnings"
         run: cargo clippy --workspace --all-targets
 
       - name: Tests

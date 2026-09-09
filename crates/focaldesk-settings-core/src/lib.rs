@@ -3,7 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Settings {
+    /// Canonical storage for the typed shell/compositor configuration.
+    /// Kept as JSON here so `focaldesk-config` can own its versioned schema
+    /// without creating a crate dependency cycle.
+    pub desktop_config: serde_json::Value,
     pub appearance: AppearanceSettings,
     pub displays: DisplaySettings,
     pub input: InputSettings,
@@ -18,6 +23,12 @@ pub struct Settings {
     pub debug: DebugSettings,
     #[serde(default)]
     pub chrome: ChromeSettings,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        default_settings()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -502,6 +513,7 @@ pub enum PerformanceMode {
 
 pub fn default_settings() -> Settings {
     Settings {
+        desktop_config: serde_json::Value::Null,
         appearance: AppearanceSettings {
             theme: "space1999".into(),
             accent_color: [0.1, 0.7, 1.0, 1.0],
@@ -601,13 +613,53 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let json = serde_json::to_string_pretty(settings)?;
+    let existing = match fs::read_to_string(&path) {
+        Ok(json) => Some(json),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let json = merged_settings_json(settings, existing.as_deref())?;
     fs::write(path, json)
+}
+
+fn merged_settings_json(settings: &Settings, existing: Option<&str>) -> std::io::Result<String> {
+    let mut value = serde_json::to_value(settings).map_err(std::io::Error::other)?;
+    if let Some(existing) = existing {
+        let existing: serde_json::Value = serde_json::from_str(existing)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let existing = existing.as_object().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "settings.json must contain a JSON object",
+            )
+        })?;
+        if let Some(desktop_config) = existing.get("desktop_config") {
+            value
+                .as_object_mut()
+                .expect("serialized Settings is an object")
+                .insert("desktop_config".into(), desktop_config.clone());
+        }
+    }
+    let mut json = serde_json::to_string_pretty(&value).map_err(std::io::Error::other)?;
+    json.push('\n');
+    Ok(json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_save_merge_preserves_live_desktop_config() {
+        let settings = default_settings();
+        let json = merged_settings_json(
+            &settings,
+            Some(r#"{"desktop_config":{"dock":{"position":"right"}}}"#),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["desktop_config"]["dock"]["position"], "right");
+    }
 
     #[test]
     fn workspace_restore_setting_defaults_and_round_trips() {

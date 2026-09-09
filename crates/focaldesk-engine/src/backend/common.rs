@@ -861,6 +861,13 @@ pub(crate) fn bootstrap_compositor_core(
         );
     let layer_shell_state =
         smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<DesktopState>(&dh);
+    // Text-input is available to every client. Input-method is privileged and its
+    // global is only visible to explicitly recognized IME processes.
+    smithay::wayland::text_input::TextInputManagerState::new::<DesktopState>(&dh);
+    smithay::wayland::input_method::InputMethodManagerState::new::<DesktopState, _>(
+        &dh,
+        crate::core::wayland::input_method::input_method_client_allowed,
+    );
     let image_capture_source_state =
         smithay::wayland::image_capture_source::ImageCaptureSourceState::new();
     let output_capture_source_state =

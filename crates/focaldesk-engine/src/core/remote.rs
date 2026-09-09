@@ -249,15 +249,15 @@ fn accept_loop(listener: UnixListener, commands: mpsc::Sender<RemoteCommand>) {
     }
 }
 
-fn handle_client(mut stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
+fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let request = match focaldesk_remote_protocol::read_message::<Request>(&mut stream) {
+    let request = match focaldesk_remote_protocol::read_message::<Request>(&stream) {
         Ok(request) => request,
         Err(_) => return,
     };
     let Request::StartCapture { output_id } = request else {
         let _ = write_message(
-            &mut stream,
+            &stream,
             &Event::Error {
                 message: "first request must start capture".into(),
             },
@@ -278,21 +278,21 @@ fn handle_client(mut stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) 
         return;
     };
     let Event::CaptureStarted { session_id, .. } = first.event else {
-        let _ = write_message(&mut stream, &first.event);
+        let _ = write_message(&stream, &first.event);
         return;
     };
-    if write_message(&mut stream, &first.event).is_err() {
+    if write_message(&stream, &first.event).is_err() {
         let _ = commands.send(RemoteCommand::Disconnected { session_id });
         return;
     }
 
     let _ = stream.set_read_timeout(None);
-    if let Ok(mut reader) = stream.try_clone() {
+    if let Ok(reader) = stream.try_clone() {
         let reader_commands = commands.clone();
         let _ = thread::Builder::new()
             .name("focaldesk-remote-reader".into())
             .spawn(move || loop {
-                match focaldesk_remote_protocol::read_message::<Request>(&mut reader) {
+                match focaldesk_remote_protocol::read_message::<Request>(&reader) {
                     Ok(Request::StopCapture {
                         session_id: requested,
                     }) if requested == session_id => {
@@ -309,7 +309,7 @@ fn handle_client(mut stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) 
     }
 
     while let Ok(message) = incoming.recv() {
-        if write_message(&mut stream, &message.event).is_err() {
+        if write_message(&stream, &message.event).is_err() {
             break;
         }
         if let Some(fd) = message.fd {

@@ -420,15 +420,15 @@ impl AiPermissionPrompter {
 
 impl PermissionPrompter for AiPermissionPrompter {
     fn prompt(&mut self, request: &PermissionRequest) -> UserPromptResponse {
-        if matches!(self.mode, AiPermissionMode::Prompt) {
-            if let Some(response) = prompt_from_desktop_or_terminal(
+        if matches!(self.mode, AiPermissionMode::Prompt)
+            && let Some(response) = prompt_from_desktop_or_terminal(
                 request,
                 &self.prompt_title,
                 &self.prompt_message,
                 self.allow_persistent,
-            ) {
-                return response;
-            }
+            )
+        {
+            return response;
         }
 
         let decision = match self.mode {
@@ -684,7 +684,7 @@ impl AiPermissionGate {
 fn app_identity() -> AppIdentity {
     std::env::current_exe()
         .ok()
-        .and_then(|path| executable_name(path))
+        .and_then(executable_name)
         .map(AppIdentity::ExecutablePath)
         .unwrap_or(AppIdentity::Unknown)
 }

@@ -709,7 +709,7 @@ fn rebuild_running_apps(
     }
     for index in visible_indices {
         let (identity, windows) = &groups[index];
-        let icon = app_icon_name(Some(&identity));
+        let icon = app_icon_name(Some(identity));
         let target = windows
             .iter()
             .find(|window| window.focused)
@@ -2388,6 +2388,7 @@ mod tests {
             serial: String::new(),
             width: 1920,
             height: 1080,
+            refresh_mhz: 60_000,
             x,
             y: 0,
             scale: 1.0,

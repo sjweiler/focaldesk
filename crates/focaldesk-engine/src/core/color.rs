@@ -18,18 +18,13 @@ pub struct PrimariesChromaticity {
 }
 
 /// Pixel color primaries attached to a client surface or output.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub enum ColorPrimaries {
+    #[default]
     Srgb,
     DisplayP3,
     Bt2020,
     Custom(PrimariesChromaticity),
-}
-
-impl Default for ColorPrimaries {
-    fn default() -> Self {
-        Self::Srgb
-    }
 }
 
 impl ColorPrimaries {
@@ -1762,10 +1757,10 @@ mod tests {
             ColorPrimaries::Srgb,
             RenderingIntent::Relative,
         );
-        for i in 0..3 {
-            for j in 0..3 {
+        for (i, row) in m.iter().enumerate() {
+            for (j, actual) in row.iter().enumerate() {
                 let expected = if i == j { 1.0 } else { 0.0 };
-                close(m[i][j], expected, 1e-4);
+                close(*actual, expected, 1e-4);
             }
         }
     }

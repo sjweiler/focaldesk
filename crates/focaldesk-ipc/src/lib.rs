@@ -76,7 +76,7 @@ pub enum IpcRequest {
     },
     ThemeEditor {
         protocol_version: u16,
-        command: ThemeEditorCommand,
+        command: Box<ThemeEditorCommand>,
     },
     GetPowerSnapshot,
     IdentifyDisplays,
@@ -202,7 +202,7 @@ pub enum IpcResponse {
         config: FocalDeskConfig,
     },
     Settings {
-        settings: Settings,
+        settings: Box<Settings>,
     },
     DisplayRuntimeStatus {
         outputs: Vec<DisplayRuntimeOutputStatus>,
@@ -315,6 +315,8 @@ pub struct OutputSnapshot {
     pub serial: String,
     pub width: i32,
     pub height: i32,
+    #[serde(default)]
+    pub refresh_mhz: i32,
     pub x: i32,
     pub y: i32,
     pub scale: f64,
@@ -486,21 +488,24 @@ mod theme_editor_tests {
     fn theme_editor_preview_round_trips_through_versioned_transport() {
         let request = IpcRequest::ThemeEditor {
             protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
-            command: ThemeEditorCommand::Preview {
+            command: Box::new(ThemeEditorCommand::Preview {
                 document: ThemeDocument::new(
                     "IPC preview",
                     ThemePaintIntent::new(ThemePaint::solid(ThemeColor::srgb(0.1, 0.2, 0.3, 1.0))),
                 ),
-            },
+            }),
         };
         let encoded = transport::encode_message(&request).unwrap();
         let decoded: IpcRequest = transport::decode_message(&encoded).unwrap();
         let IpcRequest::ThemeEditor {
             protocol_version,
-            command: ThemeEditorCommand::Preview { document },
+            command,
         } = decoded
         else {
             panic!("expected theme editor preview");
+        };
+        let ThemeEditorCommand::Preview { document } = *command else {
+            panic!("expected theme editor preview command");
         };
         assert_eq!(protocol_version, THEME_EDITOR_PROTOCOL_VERSION);
         assert_eq!(document.name, "IPC preview");

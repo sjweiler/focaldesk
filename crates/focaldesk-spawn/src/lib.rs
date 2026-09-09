@@ -27,7 +27,11 @@ fn spawn_trace(msg: impl AsRef<str>) {
 }
 
 fn spawn_notice(msg: impl AsRef<str>) {
-    eprintln!("[focaldesk-spawn pid={}] {}", std::process::id(), msg.as_ref());
+    eprintln!(
+        "[focaldesk-spawn pid={}] {}",
+        std::process::id(),
+        msg.as_ref()
+    );
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -59,7 +63,10 @@ pub fn socket_path() -> PathBuf {
 }
 
 fn daemon_reachable() -> bool {
-    spawn_trace(format!("daemon_reachable? socket={}", socket_path().display()));
+    spawn_trace(format!(
+        "daemon_reachable? socket={}",
+        socket_path().display()
+    ));
     let Ok(mut stream) = UnixStream::connect(socket_path()) else {
         return false;
     };
@@ -174,7 +181,10 @@ fn run_daemon() -> std::io::Result<()> {
 }
 
 fn start_daemon_child() {
-    spawn_notice(format!("starting spawn daemon at {}", socket_path().display()));
+    spawn_notice(format!(
+        "starting spawn daemon at {}",
+        socket_path().display()
+    ));
     spawn_trace("starting daemon child");
     match unsafe { libc::fork() } {
         -1 => {}
@@ -244,8 +254,7 @@ pub fn request_spawn(msg: &SpawnMessage) -> std::io::Result<()> {
         )
     })?;
     if !reply.ok {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        return Err(std::io::Error::other(
             reply.error.unwrap_or_else(|| "spawn failed".to_string()),
         ));
     }

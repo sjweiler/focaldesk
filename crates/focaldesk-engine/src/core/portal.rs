@@ -921,10 +921,12 @@ fn render_portal_output_to_dmabuf(
     )
 }
 
+type PortalCaptureProgram<'a> = (Option<&'a GlesTexProgram>, Vec<Uniform<'static>>);
+
 fn portal_capture_program<'a>(
     encoding: PortalCaptureEncoding,
     capture_transform: PortalCaptureTransform<'a>,
-) -> Result<(Option<&'a GlesTexProgram>, Vec<Uniform<'static>>), Box<dyn std::error::Error>> {
+) -> Result<PortalCaptureProgram<'a>, Box<dyn std::error::Error>> {
     if encoding == PortalCaptureEncoding::TargetEncoded
         || (encoding == PortalCaptureEncoding::Srgb
             && capture_transform.color_mode == PortalCaptureColorMode::Srgb)

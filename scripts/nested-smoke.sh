@@ -196,6 +196,12 @@ if command -v wayland-info >/dev/null; then
             || fail "wl_compositor global was not advertised"
         grep -Eq 'interface: .xdg_wm_base.' "$ARTIFACTS/wayland-info.txt" \
             || fail "xdg_wm_base global was not advertised"
+        grep -Eq 'interface: .zwp_text_input_manager_v3.' "$ARTIFACTS/wayland-info.txt" \
+            || fail "text-input-v3 global was not advertised"
+        if grep -Eq 'interface: .zwp_input_method_manager_v2.' \
+            "$ARTIFACTS/wayland-info.txt"; then
+            fail "privileged input-method-v2 global was exposed to wayland-info"
+        fi
         pass "Wayland registry and round-trip"
     else
         fail "wayland-info could not complete against FocalDesk"

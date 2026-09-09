@@ -14,10 +14,17 @@ const MEMORY_SCHEMA_VERSION: u32 = 2;
 static EXTENSION_REGISTERED: std::sync::Once = std::sync::Once::new();
 
 fn register_sqlite_vec() {
+    type SqliteExtensionEntry = unsafe extern "C" fn(
+        *mut rusqlite::ffi::sqlite3,
+        *mut *mut std::ffi::c_char,
+        *const rusqlite::ffi::sqlite3_api_routines,
+    ) -> std::ffi::c_int;
     EXTENSION_REGISTERED.call_once(|| unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
+        sqlite3_auto_extension(Some(
+            std::mem::transmute::<*const (), SqliteExtensionEntry>(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            ),
+        ));
     });
 }
 

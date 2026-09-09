@@ -59,6 +59,18 @@ fn main() -> anyhow::Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+        "desktop-snapshot" => {
+            let response = send_desktop_request(&IpcRequest::GetDesktopSnapshot)
+                .map_err(anyhow::Error::msg)?;
+            match response {
+                IpcResponse::DesktopSnapshot { snapshot } => {
+                    println!("{}", serde_json::to_string_pretty(&snapshot)?);
+                    Ok(())
+                }
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         "diagnostics" => handle_diagnostics(args.collect()),
         "ai" => handle_ai(args.collect()),
         "help" | "--help" | "-h" => {
@@ -259,6 +271,7 @@ fn print_usage() {
     eprintln!("usage:");
     eprintln!("  focaldesk-cli notify <title> [body...] [--timeout-ms <ms>]");
     eprintln!("  focaldesk-cli identify-displays");
+    eprintln!("  focaldesk-cli desktop-snapshot");
     eprintln!("  focaldesk-cli diagnostics [--output <archive.tar.gz>] [--no-logs]");
     eprintln!("  focaldesk-cli ai providers");
     eprintln!("  focaldesk-cli ai chat [--stream] [--provider <id>] [--model <model>] <prompt...>");

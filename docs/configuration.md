@@ -11,8 +11,8 @@ working configuration before testing a new revision.
 
 | Path | Purpose | Editing guidance |
 | --- | --- | --- |
-| `$XDG_CONFIG_HOME/focaldesk/settings.json` | Main desktop, application, input, workspace, privacy, power, debug, and chrome settings | Prefer the Settings application |
-| `$XDG_CONFIG_HOME/focaldesk/config.toml` | Compact compositor appearance and display configuration used by the typed config API | Developer-facing; may be consolidated with `settings.json` later |
+| `$XDG_CONFIG_HOME/focaldesk/settings.json` | Canonical desktop, shell, application, input, workspace, privacy, power, debug, and chrome settings | Prefer the Settings application |
+| `$XDG_CONFIG_HOME/focaldesk/config.toml` | Legacy typed shell configuration | Read only as a migration fallback; new saves go to `settings.json` |
 | `$XDG_CONFIG_HOME/focaldesk/displays.json` | Detected output topology and runtime display choices | Generated; do not edit while FocalDesk is running |
 | `$XDG_DATA_HOME/focaldesk/themes/` | Theme packages installed by the Theme Editor | Manage through Theme Editor import and uninstall actions |
 | `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions; stored mode `0600` | Manage through the permission UI when possible |
@@ -25,22 +25,23 @@ FocalDesk falls back to built-in defaults when a settings file does not exist.
 An invalid file may also cause the affected component to use defaults, so check
 the logs after hand-editing configuration.
 
-The GTK shell clients read geometry and presentation from `config.toml`:
+The GTK shell clients read geometry and presentation from the `desktop_config`
+object in `settings.json`. Existing `config.toml` files remain readable until a
+setting is saved:
 
-```toml
-[shell]
-style = "attached" # attached | floating
-
-[panel]
-position = "top" # top | bottom
-corner_radius = 16
-clock_format = "12-hour" # 12-hour | 24-hour
-
-[dock]
-position = "left" # left | right
-corner_radius = 24
-size = "normal" # compact | normal | expanded
-visibility = "intelligent-dodge" # always-visible | intelligent-dodge | autohide
+```json
+{
+  "desktop_config": {
+    "shell": { "style": "attached" },
+    "panel": { "position": "top", "corner_radius": 16, "clock_format": "12-hour" },
+    "dock": {
+      "position": "left",
+      "corner_radius": 24,
+      "size": "normal",
+      "visibility": "intelligent-dodge"
+    }
+  }
+}
 ```
 
 These options configure the panel and dock shell clients. Floating GTK docks do
@@ -94,6 +95,7 @@ not listed here should be treated as internal and may change without notice.
 | `FOCALDESK_OLLAMA_MODEL` | Select the default Ollama model |
 | `FOCALDESK_AI_SOCKET` | Override the AI service Unix-socket path for development |
 | `FOCALDESK_SCREENCAST_OUTPUT` | Select the capture output when no portal chooser input is available |
+| `FOCALDESK_INPUT_METHOD_EXECUTABLES` | Colon-separated executable allowlist for privileged Wayland input-method clients; replaces the built-in fcitx5, IBus, and Maliit allowlist |
 | `FOCALDESK_HDR_CALIBRATION_PATTERN` | Set to `1` to replace active HDR output content with the session-only calibration pattern |
 | `FOCALDESK_VOSK_MODEL_DIR` | Point voice recognition at a Vosk model directory |
 | `FOCALD_SPEECH_BACKEND` | Select `espeak-ng` or `piper` for speech synthesis |

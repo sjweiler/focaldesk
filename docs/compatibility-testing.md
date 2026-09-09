@@ -18,7 +18,9 @@ The harness:
 1. Builds the winit compositor with XWayland support.
 2. Starts a private headless host when necessary.
 3. Waits for FocalDesk's client socket.
-4. Performs a Wayland registry round-trip and checks core globals.
+4. Performs a Wayland registry round-trip, checks core and text-input globals,
+   and verifies the privileged input-method global is hidden from ordinary
+   clients.
 5. Connects a native demo client when one is installed.
 6. Confirms the client exercises precise surface-tree damage and records the
    latest tree/rectangle/fallback counters.
@@ -60,6 +62,7 @@ remains open and the compositor remains healthy.
 | Panic/crash detection | Required | Long-running soak and recovery |
 | Window resize, maximize, and fullscreen | Client survival only | Visual and input verification |
 | Clipboard and primary selection | Unit coverage | Cross-toolkit interoperability |
+| text-input-v3 and input-method-v2 | Registry/policy coverage | fcitx5, IBus, and Maliit composition |
 | Fractional scaling and transforms | Unit/runtime coverage | Mixed-DPI visual verification |
 | Multiple outputs and hotplug | State/unit coverage | Physical connector testing |
 | HDR, ICC, direct scanout, and hardware cursor | Unit coverage | Supported GPU/display hardware |
@@ -82,3 +85,21 @@ For each direct-session run, record:
 
 Use the same record for successes and failures so the supported hardware matrix
 can be based on evidence rather than isolated bug reports.
+
+The guided hardware harness captures this record without changing display or
+power state itself. From a real DRM/KMS FocalDesk session, capture each stage:
+
+```sh
+cargo build --release -p focaldesk-cli
+scripts/drm-hardware-regression.sh capture baseline
+# Physically connect or disconnect an output.
+scripts/drm-hardware-regression.sh capture hotplug
+# Configure two outputs with different scale and refresh values.
+scripts/drm-hardware-regression.sh capture mixed-mode
+# Suspend and resume using the normal system UI.
+scripts/drm-hardware-regression.sh capture resumed
+scripts/drm-hardware-regression.sh verify
+```
+
+The final check requires observable hotplug change, multiple scale and refresh
+values, a ready compositor after resume, and journals without crash signatures.

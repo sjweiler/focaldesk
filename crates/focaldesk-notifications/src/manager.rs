@@ -222,6 +222,12 @@ impl NotificationManager {
     }
 }
 
+impl Default for NotificationManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,11 +282,5 @@ mod tests {
         manager.clear_history();
         assert!(manager.history_snapshots(Instant::now()).is_empty());
         assert!(!manager.has_visible(Instant::now()));
-    }
-}
-
-impl Default for NotificationManager {
-    fn default() -> Self {
-        Self::new()
     }
 }

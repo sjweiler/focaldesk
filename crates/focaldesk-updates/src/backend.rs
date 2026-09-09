@@ -79,7 +79,7 @@ fn list_packagekit(refresh_metadata: bool) -> Result<Vec<UpdatePackage>, String>
     if !packages.is_empty() {
         return Ok(packages);
     }
-    Ok(parse_pkcon_human(&stdout)?)
+    parse_pkcon_human(&stdout)
 }
 
 fn install_packagekit(ids: &[String]) -> Result<(), String> {

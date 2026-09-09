@@ -385,10 +385,10 @@ fn linearize_flow_theme(theme: &FlowTheme) -> FlowTheme {
 /// back-to-front.  Color-managed rendering needs a different texture program
 /// for some elements, so each run is submitted separately in reverse run order.
 /// Grouping non-adjacent elements with the same key would change stacking.
-fn contiguous_runs_by_key<'a, T, K: PartialEq>(
-    items: &'a [T],
+fn contiguous_runs_by_key<T, K: PartialEq>(
+    items: &[T],
     mut key_for: impl FnMut(&T) -> K,
-) -> Vec<(K, &'a [T])> {
+) -> Vec<(K, &[T])> {
     let Some(first) = items.first() else {
         return Vec::new();
     };

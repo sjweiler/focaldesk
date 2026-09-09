@@ -1,0 +1,3 @@
+# Rendering and GTK signal construction functions legitimately carry several
+# independent inputs. Above this threshold, require a context object.
+too-many-arguments-threshold = 12

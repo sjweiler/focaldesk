@@ -1425,205 +1425,6 @@ void main() {
 }
 "#;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn shader_sources() -> [&'static str; 27] {
-        [
-            BEVELED_PANEL_FRAG,
-            LIGHT_CHANNEL_FRAG,
-            CHAMFER_PANEL_FRAG,
-            CHAMFER_OLD__PANEL_FRAG,
-            BEVELED_PANEL_FRAG_V2,
-            WORKAREA_GLASS_FRAG,
-            RECESSED_BUTTON_FRAG,
-            TOP_BAR_FRAG,
-            TINTED_ICON_FRAG,
-            CLIENT_TO_SCENE_LINEAR_FRAG,
-            SRGB_TO_LINEAR_FRAG,
-            COMPOSITE_LINEAR_LAYER_FRAG,
-            PORTAL_CAPTURE_SDR_FRAG,
-            OUTPUT_ENCODE_SDR_FRAG,
-            OUTPUT_ENCODE_LUT_FRAG,
-            SDR_TO_LINEAR_SCRGB_FRAG,
-            LINEAR_SCRGB_TO_PQ_FRAG,
-            AMBER_LIGHTBAR_FRAG,
-            FONT_TEXT_FRAG,
-            ROUNDED_RECT_FRAG,
-            WALLPAPER_TINT_FRAG,
-            WALLPAPER_CREATIVE_GRADE_FRAG,
-            PULSE_FRAG,
-            ACCENT_FRAG,
-            FLOW_FIELD_FRAG,
-            SCREENSAVER_FRAG,
-            GLASS_CONTROL_FRAG,
-        ]
-    }
-
-    #[test]
-    fn shaders_stay_in_the_shared_glsl_es_100_subset() {
-        for shader in shader_sources() {
-            assert!(!shader.contains("#version"));
-            assert!(!shader.contains("layout("));
-            assert!(!shader.contains("texture("));
-            assert!(!shader.contains("out vec4"));
-            assert!(shader.contains("varying vec2 v_coords;"));
-            assert!(shader.contains("gl_FragColor"));
-
-            if shader.contains("precision highp float;") {
-                assert!(shader.contains("GL_FRAGMENT_PRECISION_HIGH"));
-                assert!(shader.contains("precision mediump float;"));
-            }
-        }
-    }
-
-    #[test]
-    fn pixel_shaders_use_smithays_vertex_varying() {
-        for shader in [RECESSED_BUTTON_FRAG, TOP_BAR_FRAG] {
-            assert!(shader.contains("varying vec2 v_coords;"));
-            assert!(!shader.contains("v_uv"));
-        }
-    }
-
-    #[test]
-    fn glass_control_uses_smithays_texture_shader_contract() {
-        assert!(GLASS_CONTROL_FRAG.contains("//_DEFINES"));
-        assert!(GLASS_CONTROL_FRAG.contains("varying vec2 v_coords;"));
-        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D tex;"));
-        assert!(GLASS_CONTROL_FRAG.contains("uniform float alpha;"));
-        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D u_background;"));
-        assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
-        assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
-    }
-
-    #[test]
-    fn tinted_icon_outputs_premultiplied_alpha() {
-        assert!(TINTED_ICON_FRAG.contains("uniform float alpha;"));
-        assert!(TINTED_ICON_FRAG.contains("vec4(u_tint.rgb * coverage, coverage)"));
-    }
-
-    #[test]
-    fn linear_output_encode_never_discards_scanout_pixels() {
-        assert!(!COMPOSITE_LINEAR_LAYER_FRAG.contains("discard;"));
-        assert!(COMPOSITE_LINEAR_LAYER_FRAG.contains("vec4(encoded, 1.0)"));
-    }
-
-    #[test]
-    fn portal_capture_tone_maps_luminance_before_gamut_compression() {
-        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("tone_map_luminance(luminance"));
-        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("mapped / luminance"));
-        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("compress_to_rec709(linear)"));
-        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_srgb"));
-        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_bt709"));
-        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("u_compress_gamut"));
-    }
-
-    #[test]
-    fn hdr_pq_encode_tone_maps_luminance_instead_of_per_channel_clip() {
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(u_source_peak_nits, u_max_nits)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.8)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mapped / y"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(10000.0))"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("compress_to_panel_gamut"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_saturation"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_midtone_gamma"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(panel - vec3(panel_y)) * u_saturation"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pow(normalized, u_midtone_gamma"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("float pq_output_dither()"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(a - b) / 1023.0"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq + vec3(pq_output_dither())"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_calibration_pattern"));
-        assert!(
-            LINEAR_SCRGB_TO_PQ_FRAG
-                .contains("calibration_pattern_nits(v_coords, u_calibration_pattern)")
-        );
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(black * 4.0)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(u_sdr_white_nits)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("inside ? vec3(u_max_nits)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(u_full_frame_nits)"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.2627"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.6780"));
-        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.0593"));
-    }
-
-    #[test]
-    fn wallpaper_grade_is_scene_linear_and_preserves_the_black_floor() {
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("graded - base"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("vec4((graded - base) * alpha, 0.0)"));
-        assert!(
-            WALLPAPER_CREATIVE_GRADE_FRAG
-                .contains("usable_peak = min(u_peak_nits, u_reference_white_nits * 2.0)")
-        );
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("target_level(u_reference_white_nits)"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("p3_luminance(p3)"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("0.228975, 0.691739, 0.079287"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight * 0.72"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("neutral_highlight = 1.0 - accent"));
-        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("neutral_highlight * isolated"));
-        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
-        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(80.0, 800.0"));
-        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("base + vec3"));
-    }
-
-    #[test]
-    fn wide_gamut_variants_are_separate_scene_linear_programs() {
-        let legacy = FLOW_FIELD_FRAG.to_owned();
-        let wide = wide_gamut_variant(FLOW_FIELD_FRAG, WideAlphaContract::Premultiplied);
-
-        assert_eq!(legacy, FLOW_FIELD_FRAG);
-        assert!(wide.contains("void fd_legacy_main()"));
-        assert!(wide.contains("vec4 fd_legacy_color;"));
-        assert!(wide.contains("vec4 fd_color = fd_legacy_color;"));
-        assert!(wide.contains("fd_display_p3_to_scene_linear"));
-        assert!(wide.contains("fd_scene * fd_color.a"));
-        assert!(!FLOW_FIELD_FRAG.contains("fd_display_p3_to_scene_linear"));
-    }
-
-    #[test]
-    fn wide_gamut_conversion_preserves_extended_scene_values() {
-        let wide = wide_gamut_variant(AMBER_LIGHTBAR_FRAG, WideAlphaContract::Straight);
-        assert!(wide.contains("1.224745 * p3.r - 0.224904 * p3.g"));
-        assert!(!wide.contains("clamp(fd_scene"));
-    }
-
-    #[test]
-    fn client_decode_preserves_scrgb_gamut_and_applies_white_scale() {
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return c * u_linear_to_scene_scale;"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("if (!extended_range)"));
-        assert!(!CLIENT_TO_SCENE_LINEAR_FRAG.contains("straight = max(straight, vec3(0.0))"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_src_bits"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither_code_value"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("float dither = a - b"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3(dither * step)"));
-    }
-
-    #[test]
-    fn client_decode_keeps_bt1886_distinct_from_piecewise_srgb() {
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 bt1886_to_linear(vec3 c)"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return bt1886_to_linear(c);"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_decode_tf >= 3.5 && u_decode_tf < 4.5"));
-    }
-
-    #[test]
-    fn client_decode_supports_hlg_with_reference_white_headroom() {
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 hlg_to_scene_linear(vec3 c)"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return hlg_to_scene_linear(c);"));
-        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("pow(reference, 1.2)"));
-    }
-
-    #[test]
-    fn sampled_scene_inputs_are_moved_into_p3_before_wide_effects() {
-        let wallpaper = wide_gamut_wallpaper_variant();
-        let glass = wide_gamut_glass_control_variant();
-        assert!(wallpaper.contains("vec3 scene = srgb_to_linear(src.rgb)"));
-        assert!(glass.contains("vec3 scene_background = texture2D"));
-        assert!(wallpaper.contains("0.822593 * scene.r"));
-        assert!(glass.contains("0.822593 * scene_background.r"));
-    }
-}
-
 const TINTED_ICON_FRAG: &str = r#"
 #ifdef GL_ES
 precision mediump float;
@@ -3238,3 +3039,202 @@ void main() {
     gl_FragColor = vec4(final_color * coverage, coverage);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shader_sources() -> [&'static str; 27] {
+        [
+            BEVELED_PANEL_FRAG,
+            LIGHT_CHANNEL_FRAG,
+            CHAMFER_PANEL_FRAG,
+            CHAMFER_OLD__PANEL_FRAG,
+            BEVELED_PANEL_FRAG_V2,
+            WORKAREA_GLASS_FRAG,
+            RECESSED_BUTTON_FRAG,
+            TOP_BAR_FRAG,
+            TINTED_ICON_FRAG,
+            CLIENT_TO_SCENE_LINEAR_FRAG,
+            SRGB_TO_LINEAR_FRAG,
+            COMPOSITE_LINEAR_LAYER_FRAG,
+            PORTAL_CAPTURE_SDR_FRAG,
+            OUTPUT_ENCODE_SDR_FRAG,
+            OUTPUT_ENCODE_LUT_FRAG,
+            SDR_TO_LINEAR_SCRGB_FRAG,
+            LINEAR_SCRGB_TO_PQ_FRAG,
+            AMBER_LIGHTBAR_FRAG,
+            FONT_TEXT_FRAG,
+            ROUNDED_RECT_FRAG,
+            WALLPAPER_TINT_FRAG,
+            WALLPAPER_CREATIVE_GRADE_FRAG,
+            PULSE_FRAG,
+            ACCENT_FRAG,
+            FLOW_FIELD_FRAG,
+            SCREENSAVER_FRAG,
+            GLASS_CONTROL_FRAG,
+        ]
+    }
+
+    #[test]
+    fn shaders_stay_in_the_shared_glsl_es_100_subset() {
+        for shader in shader_sources() {
+            assert!(!shader.contains("#version"));
+            assert!(!shader.contains("layout("));
+            assert!(!shader.contains("texture("));
+            assert!(!shader.contains("out vec4"));
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(shader.contains("gl_FragColor"));
+
+            if shader.contains("precision highp float;") {
+                assert!(shader.contains("GL_FRAGMENT_PRECISION_HIGH"));
+                assert!(shader.contains("precision mediump float;"));
+            }
+        }
+    }
+
+    #[test]
+    fn pixel_shaders_use_smithays_vertex_varying() {
+        for shader in [RECESSED_BUTTON_FRAG, TOP_BAR_FRAG] {
+            assert!(shader.contains("varying vec2 v_coords;"));
+            assert!(!shader.contains("v_uv"));
+        }
+    }
+
+    #[test]
+    fn glass_control_uses_smithays_texture_shader_contract() {
+        assert!(GLASS_CONTROL_FRAG.contains("//_DEFINES"));
+        assert!(GLASS_CONTROL_FRAG.contains("varying vec2 v_coords;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D tex;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform float alpha;"));
+        assert!(GLASS_CONTROL_FRAG.contains("uniform sampler2D u_background;"));
+        assert!(!GLASS_CONTROL_FRAG.contains("#version 300"));
+        assert!(!GLASS_CONTROL_FRAG.contains("v_uv"));
+    }
+
+    #[test]
+    fn tinted_icon_outputs_premultiplied_alpha() {
+        assert!(TINTED_ICON_FRAG.contains("uniform float alpha;"));
+        assert!(TINTED_ICON_FRAG.contains("vec4(u_tint.rgb * coverage, coverage)"));
+    }
+
+    #[test]
+    fn linear_output_encode_never_discards_scanout_pixels() {
+        assert!(!COMPOSITE_LINEAR_LAYER_FRAG.contains("discard;"));
+        assert!(COMPOSITE_LINEAR_LAYER_FRAG.contains("vec4(encoded, 1.0)"));
+    }
+
+    #[test]
+    fn portal_capture_tone_maps_luminance_before_gamut_compression() {
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("tone_map_luminance(luminance"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("mapped / luminance"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("compress_to_rec709(linear)"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_srgb"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("linear_to_bt709"));
+        assert!(PORTAL_CAPTURE_SDR_FRAG.contains("u_compress_gamut"));
+    }
+
+    #[test]
+    fn hdr_pq_encode_tone_maps_luminance_instead_of_per_channel_clip() {
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(u_source_peak_nits, u_max_nits)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.8)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mapped / y"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(10000.0))"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("compress_to_panel_gamut"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_saturation"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_midtone_gamma"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(panel - vec3(panel_y)) * u_saturation"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pow(normalized, u_midtone_gamma"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("float pq_output_dither()"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("(a - b) / 1023.0"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("pq + vec3(pq_output_dither())"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_calibration_pattern"));
+        assert!(
+            LINEAR_SCRGB_TO_PQ_FRAG
+                .contains("calibration_pattern_nits(v_coords, u_calibration_pattern)")
+        );
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(black * 4.0)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(u_sdr_white_nits)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("inside ? vec3(u_max_nits)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("return vec3(u_full_frame_nits)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.2627"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.6780"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("200.0 / 0.0593"));
+    }
+
+    #[test]
+    fn wallpaper_grade_is_scene_linear_and_preserves_the_black_floor() {
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("graded - base"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("vec4((graded - base) * alpha, 0.0)"));
+        assert!(
+            WALLPAPER_CREATIVE_GRADE_FRAG
+                .contains("usable_peak = min(u_peak_nits, u_reference_white_nits * 2.0)")
+        );
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("target_level(u_reference_white_nits)"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("p3_luminance(p3)"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("0.228975, 0.691739, 0.079287"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("cyan_highlight * 0.72"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("neutral_highlight = 1.0 - accent"));
+        assert!(WALLPAPER_CREATIVE_GRADE_FRAG.contains("neutral_highlight * isolated"));
+        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(600.0, 1000.0"));
+        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("mix(80.0, 800.0"));
+        assert!(!WALLPAPER_CREATIVE_GRADE_FRAG.contains("base + vec3"));
+    }
+
+    #[test]
+    fn wide_gamut_variants_are_separate_scene_linear_programs() {
+        let legacy = FLOW_FIELD_FRAG.to_owned();
+        let wide = wide_gamut_variant(FLOW_FIELD_FRAG, WideAlphaContract::Premultiplied);
+
+        assert_eq!(legacy, FLOW_FIELD_FRAG);
+        assert!(wide.contains("void fd_legacy_main()"));
+        assert!(wide.contains("vec4 fd_legacy_color;"));
+        assert!(wide.contains("vec4 fd_color = fd_legacy_color;"));
+        assert!(wide.contains("fd_display_p3_to_scene_linear"));
+        assert!(wide.contains("fd_scene * fd_color.a"));
+        assert!(!FLOW_FIELD_FRAG.contains("fd_display_p3_to_scene_linear"));
+    }
+
+    #[test]
+    fn wide_gamut_conversion_preserves_extended_scene_values() {
+        let wide = wide_gamut_variant(AMBER_LIGHTBAR_FRAG, WideAlphaContract::Straight);
+        assert!(wide.contains("1.224745 * p3.r - 0.224904 * p3.g"));
+        assert!(!wide.contains("clamp(fd_scene"));
+    }
+
+    #[test]
+    fn client_decode_preserves_scrgb_gamut_and_applies_white_scale() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return c * u_linear_to_scene_scale;"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("if (!extended_range)"));
+        assert!(!CLIENT_TO_SCENE_LINEAR_FRAG.contains("straight = max(straight, vec3(0.0))"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_src_bits"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("dither_code_value"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("float dither = a - b"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3(dither * step)"));
+    }
+
+    #[test]
+    fn client_decode_keeps_bt1886_distinct_from_piecewise_srgb() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 bt1886_to_linear(vec3 c)"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return bt1886_to_linear(c);"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("u_decode_tf >= 3.5 && u_decode_tf < 4.5"));
+    }
+
+    #[test]
+    fn client_decode_supports_hlg_with_reference_white_headroom() {
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("vec3 hlg_to_scene_linear(vec3 c)"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("return hlg_to_scene_linear(c);"));
+        assert!(CLIENT_TO_SCENE_LINEAR_FRAG.contains("pow(reference, 1.2)"));
+    }
+
+    #[test]
+    fn sampled_scene_inputs_are_moved_into_p3_before_wide_effects() {
+        let wallpaper = wide_gamut_wallpaper_variant();
+        let glass = wide_gamut_glass_control_variant();
+        assert!(wallpaper.contains("vec3 scene = srgb_to_linear(src.rgb)"));
+        assert!(glass.contains("vec3 scene_background = texture2D"));
+        assert!(wallpaper.contains("0.822593 * scene.r"));
+        assert!(glass.contains("0.822593 * scene_background.r"));
+    }
+}

@@ -35,7 +35,7 @@ pub enum ControlCenterRequest {
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind")]
 pub enum ControlCenterResponse {
-    Snapshot { snapshot: DashboardSnapshot },
+    Snapshot { snapshot: Box<DashboardSnapshot> },
     Error { message: String },
 }
 
@@ -285,15 +285,26 @@ async fn handle_connection(
     match request {
         ControlCenterRequest::GetSnapshot => {
             let snapshot = collect_snapshot(&ai_service, &collector).await;
-            write_response(&mut stream, &ControlCenterResponse::Snapshot { snapshot }).await?;
+            write_response(
+                &mut stream,
+                &ControlCenterResponse::Snapshot {
+                    snapshot: Box::new(snapshot),
+                },
+            )
+            .await?;
         }
         ControlCenterRequest::Subscribe { interval_ms } => {
             let interval_ms = clamp_interval(interval_ms);
             loop {
                 let snapshot = collect_snapshot(&ai_service, &collector).await;
-                if write_response(&mut stream, &ControlCenterResponse::Snapshot { snapshot })
-                    .await
-                    .is_err()
+                if write_response(
+                    &mut stream,
+                    &ControlCenterResponse::Snapshot {
+                        snapshot: Box::new(snapshot),
+                    },
+                )
+                .await
+                .is_err()
                 {
                     break;
                 }

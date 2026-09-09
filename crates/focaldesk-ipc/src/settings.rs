@@ -33,7 +33,9 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
     let response = match transport::decode_message::<IpcRequest>(&buf) {
         Ok(IpcRequest::GetAll) => {
             let settings = settings.lock().unwrap().clone();
-            IpcResponse::Settings { settings }
+            IpcResponse::Settings {
+                settings: Box::new(settings),
+            }
         }
 
         Ok(IpcRequest::GetPowerSnapshot) => IpcResponse::Error {

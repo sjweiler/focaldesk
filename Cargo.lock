@@ -2458,6 +2458,7 @@ dependencies = [
  "focaldesk-ai",
  "focaldesk-diagnostics",
  "focaldesk-ipc",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]
@@ -2482,6 +2483,7 @@ dependencies = [
  "dirs 5.0.1",
  "focaldesk-themes",
  "serde",
+ "serde_json",
  "toml 0.8.23",
 ]
 
@@ -2998,6 +3000,16 @@ dependencies = [
 [[package]]
 name = "focaldesk-sounds"
 version = "0.1.0"
+
+[[package]]
+name = "focaldesk-spawn"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "focaldesk-system-rail"
