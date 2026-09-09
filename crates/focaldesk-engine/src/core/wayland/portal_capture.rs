@@ -214,15 +214,28 @@ impl WlrLayerShellHandler for DesktopState {
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
         use smithay::desktop::layer_map_for_output;
 
-        if let Some((mut map, layer)) = self.space.outputs().find_map(|o| {
-            let map = layer_map_for_output(o);
+        let destroyed = self.space.outputs().find_map(|output| {
+            let map = layer_map_for_output(output);
             let layer = map
                 .layers()
-                .find(|l| l.layer_surface() == &surface)
+                .find(|layer| layer.layer_surface() == &surface)
                 .cloned();
-            layer.map(|l| (map, l))
-        }) {
+            layer.map(|layer| (output.clone(), layer))
+        });
+
+        if let Some((output, layer)) = destroyed {
+            let output_id = self.output_id_for_space_output(&output);
+            let mut map = layer_map_for_output(&output);
             map.unmap_layer(&layer);
+            map.arrange();
+            if let Some(output_id) = output_id {
+                // The removed trusted component may expose one compositor
+                // fallback and change the work recess in the same frame.
+                self.mark_output_full_damage(
+                    output_id,
+                    crate::core::desktop::DamageSource::CommitBbox,
+                );
+            }
         }
     }
 }

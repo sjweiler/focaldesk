@@ -19,6 +19,55 @@ pub const LEGACY_PANEL_NAMESPACE: &str = "focal-panel";
 pub const LEGACY_DOCK_NAMESPACE: &str = "focal-dock";
 pub const SYSTEM_RAIL_INPUT_WIDTH: i32 = 64;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TrustedShellPresence {
+    pub system_rail: bool,
+    pub task_shelf: bool,
+    pub legacy_panel: bool,
+    pub legacy_dock: bool,
+}
+
+impl TrustedShellPresence {
+    pub fn is_active(self) -> bool {
+        self.system_rail || self.task_shelf || self.legacy_panel || self.legacy_dock
+    }
+
+    pub fn internal_chrome(self) -> InternalChromeVisibility {
+        InternalChromeVisibility {
+            topbar: !self.system_rail && !self.legacy_panel,
+            sidebar_buttons: !self.task_shelf && !self.legacy_dock,
+            workspace_slots: !self.system_rail && !self.legacy_dock,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InternalChromeVisibility {
+    pub topbar: bool,
+    pub sidebar_buttons: bool,
+    pub workspace_slots: bool,
+}
+
+impl Default for InternalChromeVisibility {
+    fn default() -> Self {
+        Self {
+            topbar: true,
+            sidebar_buttons: true,
+            workspace_slots: true,
+        }
+    }
+}
+
+impl InternalChromeVisibility {
+    pub fn sidebar(self) -> bool {
+        self.sidebar_buttons || self.workspace_slots
+    }
+
+    pub fn any(self) -> bool {
+        self.topbar || self.sidebar()
+    }
+}
+
 pub fn is_trusted_namespace(namespace: &str) -> bool {
     matches!(
         namespace,
@@ -55,6 +104,40 @@ impl TrustedShellReservation {
     pub fn is_active(self) -> bool {
         self.top > 0 || self.left > 0 || self.right > 0 || self.bottom > 0
     }
+}
+
+/// Discover trusted shell components that have imported a real client buffer.
+///
+/// Presence is deliberately independent of exclusive-zone geometry: the task
+/// shelf is an overlay and claims a zero-sized exclusive zone, but it still
+/// owns the compositor's application-dock presentation while it is renderable.
+pub fn presence_for_output(output: &Output) -> TrustedShellPresence {
+    let map = layer_map_for_output(output);
+    let mut presence = TrustedShellPresence::default();
+
+    for layer in map.layers() {
+        let has_renderable_buffer = with_states(layer.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<RendererSurfaceStateUserData>()
+                .and_then(|state| state.lock().ok())
+                .and_then(|state| state.view())
+                .is_some()
+        });
+        if !has_renderable_buffer {
+            continue;
+        }
+
+        match layer.namespace() {
+            PANEL_NAMESPACE => presence.system_rail = true,
+            DOCK_NAMESPACE => presence.task_shelf = true,
+            LEGACY_PANEL_NAMESPACE => presence.legacy_panel = true,
+            LEGACY_DOCK_NAMESPACE => presence.legacy_dock = true,
+            _ => {}
+        }
+    }
+
+    presence
 }
 
 /// Read exclusive zones claimed by the FocalDesk panel and dock on `output`.
@@ -170,5 +253,39 @@ mod tests {
         ));
         assert!(input_region_contains(DOCK_NAMESPACE, (38.0, 40.0).into()));
         assert!(!input_region_contains("untrusted", (1.0, 1.0).into()));
+    }
+
+    #[test]
+    fn modern_shell_components_control_fallbacks_independently() {
+        let no_shell = TrustedShellPresence::default().internal_chrome();
+        assert!(no_shell.topbar);
+        assert!(no_shell.sidebar_buttons);
+        assert!(no_shell.workspace_slots);
+
+        let rail_only = TrustedShellPresence {
+            system_rail: true,
+            ..TrustedShellPresence::default()
+        }
+        .internal_chrome();
+        assert!(!rail_only.topbar);
+        assert!(!rail_only.workspace_slots);
+        assert!(rail_only.sidebar_buttons);
+
+        let shelf_only = TrustedShellPresence {
+            task_shelf: true,
+            ..TrustedShellPresence::default()
+        }
+        .internal_chrome();
+        assert!(shelf_only.topbar);
+        assert!(shelf_only.workspace_slots);
+        assert!(!shelf_only.sidebar_buttons);
+
+        let complete_shell = TrustedShellPresence {
+            system_rail: true,
+            task_shelf: true,
+            ..TrustedShellPresence::default()
+        }
+        .internal_chrome();
+        assert!(!complete_shell.any());
     }
 }

@@ -3243,17 +3243,15 @@ impl DesktopState {
         let x = rel.x.round() as i32;
         let y = rel.y.round() as i32;
 
-        let reservation = self
+        let presence = self
             .outputs
             .get(&output_id)
-            .map(|output| {
-                crate::core::wayland::trusted_shell::reservation_for_output(&output.handle)
-            })
+            .map(|output| crate::core::wayland::trusted_shell::presence_for_output(&output.handle))
             .unwrap_or_default();
         let new_hovered = self
             .ui
             .hit_test(x, y)
-            .filter(|element| !Self::external_shell_owns_element(reservation, element.kind))
+            .filter(|element| !Self::external_shell_owns_element(presence, element.kind))
             .map(|element| element.id);
         self.ui.hovered = new_hovered;
 
@@ -3340,39 +3338,24 @@ impl DesktopState {
         let y = local.y.round() as i32;
         let element = self.ui.hit_test(x, y)?;
         let output = self.outputs.get(&output_id)?;
-        let reservation =
-            crate::core::wayland::trusted_shell::reservation_for_output(&output.handle);
-        (!Self::external_shell_owns_element(reservation, element.kind)).then_some(element)
+        let presence = crate::core::wayland::trusted_shell::presence_for_output(&output.handle);
+        (!Self::external_shell_owns_element(presence, element.kind)).then_some(element)
     }
 
     fn external_shell_owns_element(
-        reservation: crate::core::wayland::trusted_shell::TrustedShellReservation,
+        presence: crate::core::wayland::trusted_shell::TrustedShellPresence,
         kind: UiElementKind,
     ) -> bool {
-        if reservation.right > 0 {
-            return matches!(
-                kind,
-                UiElementKind::SidebarButton
-                    | UiElementKind::WorkspaceSlot
-                    | UiElementKind::TopbarIndicator
-                    | UiElementKind::TopbarButton
-                    | UiElementKind::TopbarFlowField
-                    | UiElementKind::Clock
-            );
+        let visibility = presence.internal_chrome();
+        match kind {
+            UiElementKind::SidebarButton => !visibility.sidebar_buttons,
+            UiElementKind::WorkspaceSlot => !visibility.workspace_slots,
+            UiElementKind::TopbarIndicator
+            | UiElementKind::TopbarButton
+            | UiElementKind::TopbarFlowField
+            | UiElementKind::Clock => !visibility.topbar,
+            _ => false,
         }
-        (reservation.left > 0
-            && matches!(
-                kind,
-                UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot
-            ))
-            || (reservation.top > 0
-                && matches!(
-                    kind,
-                    UiElementKind::TopbarIndicator
-                        | UiElementKind::TopbarButton
-                        | UiElementKind::TopbarFlowField
-                        | UiElementKind::Clock
-                ))
     }
 
     fn configured_chrome_items(
@@ -3468,6 +3451,9 @@ impl DesktopState {
         let output = self.outputs.get(&output_id)?;
         let trusted_shell =
             crate::core::wayland::trusted_shell::reservation_for_output(&output.handle);
+        let shell_presence =
+            crate::core::wayland::trusted_shell::presence_for_output(&output.handle);
+        let internal_chrome = shell_presence.internal_chrome();
         let semantic_layout = self
             .theme
             .active_theme()
@@ -3495,15 +3481,20 @@ impl DesktopState {
             options.layout_config(),
         );
 
-        // The alternative GTK shell does not use the compositor's etched top/left
-        // frame.  Its rail reserves the right edge directly, so make the desktop
-        // recess describe that real layer-shell work area instead of retaining the
-        // built-in chrome's default topbar/sidebar offsets.  The legacy external
-        // panel/dock keep their framed layout through the top/left path above.
-        if trusted_shell.right > 0 || trusted_shell.bottom > 0 {
+        // Combine external exclusive edges with whichever native fallback
+        // components remain visible. This keeps windows clear of a surviving
+        // rail and of a restored topbar/sidebar when only one shell client dies.
+        if shell_presence.is_active() {
+            let mut combined = trusted_shell;
+            if internal_chrome.topbar {
+                combined.top = layout.work_area.recess.loc.y;
+            }
+            if internal_chrome.sidebar() {
+                combined.left = layout.work_area.recess.loc.x;
+            }
             let work = crate::core::wayland::trusted_shell::work_area_for_output(
                 Rectangle::from_size(output.logical_size),
-                trusted_shell,
+                combined,
             );
             layout.work_area.outer = work;
             layout.work_area.inner_frame = work;
@@ -6279,6 +6270,15 @@ impl DesktopState {
 
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
+        let Some(output) = self.outputs.get(&output_id) else {
+            return false;
+        };
+        if !crate::core::wayland::trusted_shell::presence_for_output(&output.handle)
+            .internal_chrome()
+            .topbar
+        {
+            return false;
+        }
         let Some(layout) = self.chrome_layout_for_output(output_id) else {
             return false;
         };
@@ -11199,15 +11199,13 @@ mod tests {
     }
 
     #[test]
-    fn external_shell_reservations_disable_only_owned_legacy_hit_regions() {
-        use crate::core::wayland::trusted_shell::TrustedShellReservation;
+    fn external_shell_presence_disables_only_owned_hit_regions() {
+        use crate::core::wayland::trusted_shell::TrustedShellPresence;
         use focaldesk_ui::types::UiElementKind;
 
-        let panel = TrustedShellReservation {
-            top: 64,
-            left: 0,
-            right: 0,
-            bottom: 0,
+        let panel = TrustedShellPresence {
+            legacy_panel: true,
+            ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
             panel,
@@ -11218,11 +11216,9 @@ mod tests {
             UiElementKind::SidebarButton
         ));
 
-        let dock = TrustedShellReservation {
-            top: 0,
-            left: 76,
-            right: 0,
-            bottom: 0,
+        let dock = TrustedShellPresence {
+            legacy_dock: true,
+            ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
             dock,
@@ -11233,18 +11229,33 @@ mod tests {
             UiElementKind::Clock
         ));
 
-        let rail = TrustedShellReservation {
-            top: 0,
-            left: 0,
-            right: 72,
-            bottom: 0,
+        let rail = TrustedShellPresence {
+            system_rail: true,
+            ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
             rail,
-            UiElementKind::SidebarButton
+            UiElementKind::WorkspaceSlot
         ));
         assert!(super::DesktopState::external_shell_owns_element(
             rail,
+            UiElementKind::Clock
+        ));
+        assert!(!super::DesktopState::external_shell_owns_element(
+            rail,
+            UiElementKind::SidebarButton
+        ));
+
+        let shelf = TrustedShellPresence {
+            task_shelf: true,
+            ..TrustedShellPresence::default()
+        };
+        assert!(super::DesktopState::external_shell_owns_element(
+            shelf,
+            UiElementKind::SidebarButton
+        ));
+        assert!(!super::DesktopState::external_shell_owns_element(
+            shelf,
             UiElementKind::Clock
         ));
     }

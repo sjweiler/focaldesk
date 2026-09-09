@@ -4,6 +4,7 @@ use crate::core::app::App;
 use crate::core::layout::LayoutSnapshot;
 use crate::core::output::OutputState; // if still needed (ideally not)
 use crate::core::ui_state::UiState;
+use crate::core::wayland::trusted_shell::InternalChromeVisibility;
 use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::types::{ElementId, UiElementKind};
 use image::GenericImageView;
@@ -155,6 +156,21 @@ impl ClientCompositingMode {
     }
 }
 
+fn internal_chrome_element_visible(
+    visibility: InternalChromeVisibility,
+    kind: UiElementKind,
+) -> bool {
+    match kind {
+        UiElementKind::SidebarButton => visibility.sidebar_buttons,
+        UiElementKind::WorkspaceSlot => visibility.workspace_slots,
+        UiElementKind::TopbarIndicator
+        | UiElementKind::TopbarButton
+        | UiElementKind::TopbarFlowField
+        | UiElementKind::Clock => visibility.topbar,
+        _ => true,
+    }
+}
+
 impl FrameCtx {
     pub fn new(
         output_size: (i32, i32),
@@ -245,8 +261,9 @@ pub struct RenderInputs<'a> {
     pub current_workspace: WorkspaceId,
     /// A fullscreen client on this output owns the entire display, including the shell chrome.
     pub fullscreen_client: bool,
-    /// False when trusted standalone panel/dock layer surfaces own the shell presentation.
-    pub draw_internal_chrome: bool,
+    /// Per-component fallback visibility after renderable trusted shell surfaces
+    /// have claimed their corresponding presentation roles.
+    pub internal_chrome: InternalChromeVisibility,
     // 👇 ADD THESE
     pub dialogs: &'a [Dialog],
     pub active_dialog: Option<DialogId>,
@@ -1260,6 +1277,7 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         fonts: &FontSystem,
         desktop_output: &focaldesk_ui::desktop_output::DesktopOutput,
+        internal_chrome: InternalChromeVisibility,
         output_size: Size<i32, Logical>,
         theme: &FlowTheme,
         scale: Scale<f64>,
@@ -1270,6 +1288,7 @@ impl RenderState {
 
         let Some(el) = desktop_output.chrome_elements().find(|el| {
             el.hovered
+                && internal_chrome_element_visible(internal_chrome, el.kind)
                 && matches!(
                     el.kind,
                     UiElementKind::SidebarButton
@@ -2346,7 +2365,7 @@ impl RenderState {
             // Chrome draws opaque bevels over the work region; clients must be composited
             // after that shell (and work-area wallpaper), or they are fully covered.
             if !inputs.fullscreen_client {
-                if inputs.draw_internal_chrome {
+                if inputs.internal_chrome.any() {
                     self.draw_chrome_below_work_wallpaper(
                         frame,
                         inputs.ctx,
@@ -2358,6 +2377,7 @@ impl RenderState {
                         inputs.sidebar_pulse,
                         inputs.topbar_pulse,
                         inputs.clock_pulse,
+                        inputs.internal_chrome,
                         theme,
                     );
                 }
@@ -2372,7 +2392,7 @@ impl RenderState {
                 );
 
                 // Work-area glass must sit under client surfaces (trim/icons stay above).
-                if inputs.draw_internal_chrome
+                if inputs.internal_chrome.any()
                     && matches!(inputs.chrome_glass_pass, ChromeGlassPass::InBaseSdr)
                 {
                     self.draw_work_area_glass_layer(frame, &inputs, theme)?;
@@ -2381,7 +2401,7 @@ impl RenderState {
         }
 
         if matches!(stage, OutputRenderStage::LinearGlassUnderClients) {
-            if !inputs.fullscreen_client && inputs.draw_internal_chrome {
+            if !inputs.fullscreen_client && inputs.internal_chrome.any() {
                 self.draw_work_area_glass_layer(frame, &inputs, theme)?;
             }
             return Ok(());
@@ -2435,7 +2455,7 @@ impl RenderState {
             stage,
             OutputRenderStage::All | OutputRenderStage::ChromeOverlay
         ) && !inputs.fullscreen_client
-            && inputs.draw_internal_chrome
+            && inputs.internal_chrome.any()
         {
             self.draw_chrome_trim_glass_icons(
                 frame,
@@ -2450,6 +2470,7 @@ impl RenderState {
                 inputs.fonts,
                 inputs.notification_unread_count,
                 inputs.update_available_count,
+                inputs.internal_chrome,
                 theme,
                 inputs.client_compositing.ui_textures_linear(),
             );
@@ -4109,6 +4130,7 @@ impl RenderState {
         sidebar_pulse: Option<SidebarPulseFrame>,
         topbar_pulse: Option<TopbarPulseFrame>,
         clock_pulse: Option<ClockPulseFrame>,
+        internal_chrome: InternalChromeVisibility,
         theme: &FlowTheme,
     ) {
         let legacy_theme = chrome_theme_from_flow_theme(theme);
@@ -4145,52 +4167,56 @@ impl RenderState {
         // 1. STRUCTURAL SHELL
         //
 
-        let _ = Self::draw_top_bar(
-            frame,
-            top_bar,
-            layout.topbar.outer,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.top_bar,
-        );
+        if internal_chrome.topbar {
+            let _ = Self::draw_top_bar(
+                frame,
+                top_bar,
+                layout.topbar.outer,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.top_bar,
+            );
 
-        let _ = Self::draw_beveled_panel(
-            frame,
-            &beveled,
-            layout.topbar.outer,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.frame_outer,
-        );
+            let _ = Self::draw_beveled_panel(
+                frame,
+                &beveled,
+                layout.topbar.outer,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.frame_outer,
+            );
 
-        let _ = Self::draw_beveled_panel(
-            frame,
-            &beveled,
-            layout.topbar.inner,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.frame_inner,
-        );
+            let _ = Self::draw_beveled_panel(
+                frame,
+                &beveled,
+                layout.topbar.inner,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.frame_inner,
+            );
+        }
 
-        let _ = Self::draw_beveled_panel_with_radius(
-            frame,
-            &beveled,
-            layout.sidebar.outer,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.sidebar,
-            SIDEBAR_CORNER_RADIUS,
-        );
+        if internal_chrome.sidebar() {
+            let _ = Self::draw_beveled_panel_with_radius(
+                frame,
+                &beveled,
+                layout.sidebar.outer,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.sidebar,
+                SIDEBAR_CORNER_RADIUS,
+            );
 
-        let _ = Self::draw_beveled_panel_with_radius(
-            frame,
-            &beveled,
-            layout.sidebar.inner,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.panel_inner,
-            (SIDEBAR_CORNER_RADIUS - 4.0).max(0.0),
-        );
+            let _ = Self::draw_beveled_panel_with_radius(
+                frame,
+                &beveled,
+                layout.sidebar.inner,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.panel_inner,
+                (SIDEBAR_CORNER_RADIUS - 4.0).max(0.0),
+            );
+        }
 
         let _ = Self::draw_beveled_panel(
             frame,
@@ -4223,31 +4249,117 @@ impl RenderState {
         // 2. TOP BAR DETAILS
         //
 
-        let _ = Self::draw_beveled_panel(
-            frame,
-            &beveled,
-            layout.topbar.title,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.panel_inner,
-        );
+        if internal_chrome.topbar {
+            let _ = Self::draw_beveled_panel(
+                frame,
+                &beveled,
+                layout.topbar.title,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.panel_inner,
+            );
 
-        let ai_button = layout.topbar.ai_button;
-        Self::draw_recessed_button(
-            frame,
-            button,
-            ai_button,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.button,
-        );
+            let ai_button = layout.topbar.ai_button;
+            Self::draw_recessed_button(
+                frame,
+                button,
+                ai_button,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.button,
+            );
 
-        if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
-            if pulse_frame.target == TopbarPulseTarget::AiButton {
+            if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
+                if pulse_frame.target == TopbarPulseTarget::AiButton {
+                    let _ = Self::draw_sidebar_pulse(
+                        frame,
+                        pulse_shader,
+                        ai_button,
+                        pulse_frame.click_local,
+                        pulse_frame.elapsed,
+                        ctx.output_scale,
+                        damage,
+                    );
+                }
+            }
+
+            let _ = Self::draw_beveled_panel(
+                frame,
+                &beveled,
+                layout.topbar.trim,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.trim,
+            );
+
+            if let Some(rect) = layout.topbar.light {
+                let _ = Self::draw_light_channel(
+                    frame,
+                    light,
+                    rect,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.light,
+                );
+            }
+
+            for (i, rect) in layout.topbar.status_wells.iter().enumerate() {
+                Self::draw_recessed_button(
+                    frame,
+                    button,
+                    *rect,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.button,
+                );
+
+                let _ = Self::draw_light_channel(
+                    frame,
+                    light,
+                    inset_rect(*rect, 3),
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.light,
+                );
+
+                if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
+                    if pulse_frame.target == TopbarPulseTarget::Indicator(i) {
+                        let _ = Self::draw_sidebar_pulse(
+                            frame,
+                            pulse_shader,
+                            *rect,
+                            pulse_frame.click_local,
+                            pulse_frame.elapsed,
+                            ctx.output_scale,
+                            damage,
+                        );
+                    }
+                }
+            }
+
+            Self::draw_recessed_button(
+                frame,
+                button,
+                layout.topbar.clock_well,
+                ctx.output_scale,
+                damage,
+                &legacy_theme.button,
+            );
+
+            let _ = Self::draw_light_channel(
+                frame,
+                light,
+                inset_rect(layout.topbar.clock_well, 3),
+                ctx.output_scale,
+                damage,
+                &legacy_theme.light,
+            );
+
+            if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, clock_pulse) {
                 let _ = Self::draw_sidebar_pulse(
                     frame,
                     pulse_shader,
-                    ai_button,
+                    layout.topbar.clock_well,
                     pulse_frame.click_local,
                     pulse_frame.elapsed,
                     ctx.output_scale,
@@ -4256,189 +4368,107 @@ impl RenderState {
             }
         }
 
-        let _ = Self::draw_beveled_panel(
-            frame,
-            &beveled,
-            layout.topbar.trim,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.trim,
-        );
-
-        if let Some(rect) = layout.topbar.light {
-            let _ = Self::draw_light_channel(
-                frame,
-                light,
-                rect,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.light,
-            );
-        }
-
-        for (i, rect) in layout.topbar.status_wells.iter().enumerate() {
-            Self::draw_recessed_button(
-                frame,
-                button,
-                *rect,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.button,
-            );
-
-            let _ = Self::draw_light_channel(
-                frame,
-                light,
-                inset_rect(*rect, 3),
-                ctx.output_scale,
-                damage,
-                &legacy_theme.light,
-            );
-
-            if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, topbar_pulse) {
-                if pulse_frame.target == TopbarPulseTarget::Indicator(i) {
-                    let _ = Self::draw_sidebar_pulse(
-                        frame,
-                        pulse_shader,
-                        *rect,
-                        pulse_frame.click_local,
-                        pulse_frame.elapsed,
-                        ctx.output_scale,
-                        damage,
-                    );
-                }
-            }
-        }
-
-        Self::draw_recessed_button(
-            frame,
-            button,
-            layout.topbar.clock_well,
-            ctx.output_scale,
-            damage,
-            &legacy_theme.button,
-        );
-
-        let _ = Self::draw_light_channel(
-            frame,
-            light,
-            inset_rect(layout.topbar.clock_well, 3),
-            ctx.output_scale,
-            damage,
-            &legacy_theme.light,
-        );
-
-        if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, clock_pulse) {
-            let _ = Self::draw_sidebar_pulse(
-                frame,
-                pulse_shader,
-                layout.topbar.clock_well,
-                pulse_frame.click_local,
-                pulse_frame.elapsed,
-                ctx.output_scale,
-                damage,
-            );
-        }
-
         //
         // 3. SIDEBAR MODULESFtopbar
         //
 
-        for (i, slot) in layout.sidebar.slots.iter().enumerate() {
-            let outer = slot.outer;
-            let inner = slot.inner;
-            let well = slot.icon_well;
+        if internal_chrome.sidebar() {
+            for (i, slot) in layout.sidebar.slots.iter().enumerate() {
+                let outer = slot.outer;
+                let inner = slot.inner;
+                let well = slot.icon_well;
 
-            let hovered = sidebar_hover_slot == Some(i);
+                let hovered = sidebar_hover_slot == Some(i);
 
-            let _ = Self::draw_beveled_panel(
-                frame,
-                &beveled,
-                outer,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.module,
-            );
-            let _ = Self::draw_beveled_panel(
-                frame,
-                &beveled,
-                inner,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.module_inner,
-            );
-            Self::draw_recessed_button(
-                frame,
-                button,
-                well,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.button,
-            );
+                let _ = Self::draw_beveled_panel(
+                    frame,
+                    &beveled,
+                    outer,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.module,
+                );
+                let _ = Self::draw_beveled_panel(
+                    frame,
+                    &beveled,
+                    inner,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.module_inner,
+                );
+                Self::draw_recessed_button(
+                    frame,
+                    button,
+                    well,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.button,
+                );
 
-            //if hovered {
-            let hover = if hovered { 1.0 } else { 0.0 };
+                //if hovered {
+                let hover = if hovered { 1.0 } else { 0.0 };
 
-            let glow_rect = inset_rect(well, 3);
+                let glow_rect = inset_rect(well, 3);
 
-            let mut light_style = legacy_theme.light;
+                let mut light_style = legacy_theme.light;
 
-            // baseline glow
-            light_style.glow_color[3] = 0.08 + hover * 0.55;
-            light_style.core_color[3] = 0.18 + hover * 0.55;
+                // baseline glow
+                light_style.glow_color[3] = 0.08 + hover * 0.55;
+                light_style.core_color[3] = 0.18 + hover * 0.55;
 
-            // hover boost
-            light_style.glow_radius = 8.0 + hover * 6.0;
-            light_style.core_inset = 3.0 - hover * 0.75;
+                // hover boost
+                light_style.glow_radius = 8.0 + hover * 6.0;
+                light_style.core_inset = 3.0 - hover * 0.75;
 
-            let _ = Self::draw_light_channel(
-                frame,
-                light,
-                glow_rect,
-                ctx.output_scale,
-                damage,
-                &light_style,
-            );
+                let _ = Self::draw_light_channel(
+                    frame,
+                    light,
+                    glow_rect,
+                    ctx.output_scale,
+                    damage,
+                    &light_style,
+                );
 
-            if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, sidebar_pulse) {
-                if pulse_frame.slot == i {
-                    let _ = Self::draw_sidebar_pulse(
-                        frame,
-                        pulse_shader,
-                        outer,
-                        pulse_frame.click_local,
-                        pulse_frame.elapsed,
-                        ctx.output_scale,
-                        damage,
-                    );
+                if let (Some(pulse_shader), Some(pulse_frame)) = (pulse, sidebar_pulse) {
+                    if pulse_frame.slot == i {
+                        let _ = Self::draw_sidebar_pulse(
+                            frame,
+                            pulse_shader,
+                            outer,
+                            pulse_frame.click_local,
+                            pulse_frame.elapsed,
+                            ctx.output_scale,
+                            damage,
+                        );
+                    }
                 }
+
+                //let glow_rect = inset_rect(*well, 3);
+                //let _ = Self::draw_light_channel(frame, light, glow_rect, damage, &legacy_theme.light);
+                // }
             }
 
-            //let glow_rect = inset_rect(*well, 3);
-            //let _ = Self::draw_light_channel(frame, light, glow_rect, damage, &legacy_theme.light);
-            // }
-        }
+            if let Some(rect) = layout.sidebar.light {
+                let _ = Self::draw_light_channel(
+                    frame,
+                    light,
+                    rect,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.light,
+                );
+            }
 
-        if let Some(rect) = layout.sidebar.light {
-            let _ = Self::draw_light_channel(
-                frame,
-                light,
-                rect,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.light,
-            );
-        }
-
-        for rect in &layout.sidebar.caps {
-            let _ = Self::draw_beveled_panel(
-                frame,
-                &beveled,
-                *rect,
-                ctx.output_scale,
-                damage,
-                &legacy_theme.corner_cap,
-            );
+            for rect in &layout.sidebar.caps {
+                let _ = Self::draw_beveled_panel(
+                    frame,
+                    &beveled,
+                    *rect,
+                    ctx.output_scale,
+                    damage,
+                    &legacy_theme.corner_cap,
+                );
+            }
         }
 
         //
@@ -4484,6 +4514,7 @@ impl RenderState {
         fonts: &FontSystem,
         notification_unread_count: usize,
         update_available_count: usize,
+        internal_chrome: InternalChromeVisibility,
         theme: &FlowTheme,
         linear_target: bool,
     ) {
@@ -4530,10 +4561,14 @@ impl RenderState {
             );
         }
 
-        let lightbar_rect =
-            Rectangle::from_loc_and_size(layout.topbar.outer.loc, (layout.topbar.outer.size.w, 10));
-        if damage_intersects(lightbar_rect) {
-            self.draw_active_lightbar(frame, ctx, layout, wide_gamut);
+        if internal_chrome.topbar {
+            let lightbar_rect = Rectangle::from_loc_and_size(
+                layout.topbar.outer.loc,
+                (layout.topbar.outer.size.w, 10),
+            );
+            if damage_intersects(lightbar_rect) {
+                self.draw_active_lightbar(frame, ctx, layout, wide_gamut);
+            }
         }
 
         if let Some(atlas) = ui_state.chrome.atlas.as_ref() {
@@ -4554,7 +4589,7 @@ impl RenderState {
             let workspace_number = current_workspace.0 as usize;
             let active_theme = theme;
 
-            if damage_intersects(layout.topbar.title) {
+            if internal_chrome.topbar && damage_intersects(layout.topbar.title) {
                 let _ = self.draw_topbar_identity(
                     frame,
                     fonts,
@@ -4578,7 +4613,7 @@ impl RenderState {
             .expect("glass shader not compiled");
 
             for el in desktop_output.chrome_elements() {
-                if !el.visible {
+                if !el.visible || !internal_chrome_element_visible(internal_chrome, el.kind) {
                     continue;
                 }
 
@@ -4929,6 +4964,7 @@ impl RenderState {
                 frame,
                 fonts,
                 desktop_output,
+                internal_chrome,
                 output_logical_size,
                 active_theme,
                 ctx.output_scale,

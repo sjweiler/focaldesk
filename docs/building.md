@@ -188,10 +188,12 @@ These recipes install:
 FocalDesk leaves the platform sleep mode unchanged, including firmware-backed
 `deep` sleep. The DRM backend retains the libseat-owned DRM device across
 suspend, reconstructs scanout state after session activation, and forces a
-complete post-resume modeset. The post-resume NVIDIA renderer uses implicit KMS
-synchronization to avoid driver failures while attaching an explicit plane
-fence. `install-desktop` removes the legacy FocalDesk-owned NVIDIA `s2idle`
-override if an older installation left it behind.
+complete post-resume modeset. NVIDIA renderers use implicit KMS synchronization
+in every login so a suspend-induced driver failure cannot poison a later
+session's initial modeset. The rail and dock are restarted after the first
+recovered page flip to discard their independent GTK GPU caches.
+`install-desktop` removes the legacy FocalDesk-owned NVIDIA `s2idle` override if
+an older installation left it behind.
 
 Log out, select **FocalDesk** in the display manager, and sign in. Keep a known
 working session installed so you can recover from compositor or driver failures.

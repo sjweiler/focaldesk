@@ -3,8 +3,8 @@
 
 use crate::backend::common::{
     bootstrap_compositor_core, is_nonfatal_wayland_io_error, physical_size_mm_from_pixels,
-    refresh_portal_services, spawn_session_sleep_watch, stop_focaldesk_session_target,
-    SessionSleepEvent,
+    refresh_portal_services, restart_shell_surfaces_after_gpu_resume, spawn_session_sleep_watch,
+    stop_focaldesk_session_target, SessionSleepEvent,
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
@@ -1706,6 +1706,14 @@ fn nvidia_dual_head_hdr_allowed() -> bool {
     crate::core::color::hdr_nvidia_dual_enabled()
 }
 
+fn disable_explicit_kms_fences(gpu_vendor_id: Option<u32>) -> bool {
+    // NVIDIA 595 can leave plane-fence semaphore creation broken for the rest
+    // of the boot after S3. This must cover newly logged-in compositor
+    // processes too, not only the renderer recreated by the session that
+    // actually crossed suspend.
+    gpu_vendor_id == Some(PCI_VENDOR_NVIDIA)
+}
+
 /// NVIDIA HDR requires the driver override in every topology. Non-exclusive
 /// topologies additionally require an explicit dual-head override so ordinary
 /// sessions do not inherit the risk of live multi-output KMS changes.
@@ -1812,9 +1820,10 @@ mod output_render_scheduling_tests {
 mod hdr_tests {
     use super::{
         configured_display_hdr_requested, deferred_topology_refresh_ready,
-        exclusive_hdr_prepare_decision, hdr_active_status_verified, hdr_commit_stalled,
-        hdr_detection::parse_edid_hdr_support, hdr_driver_allows_output_with_override,
-        hdr_failure_persist_action, hdr_verification_complete, merge_disconnected_display_configs,
+        disable_explicit_kms_fences, exclusive_hdr_prepare_decision, hdr_active_status_verified,
+        hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
+        hdr_driver_allows_output_with_override, hdr_failure_persist_action,
+        hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
         select_requested_drm_mode_index, should_defer_drm_topology_change,
@@ -2130,6 +2139,14 @@ mod hdr_tests {
             false,
             false,
         ));
+    }
+
+    #[test]
+    fn nvidia_uses_implicit_kms_sync_for_every_session() {
+        assert!(disable_explicit_kms_fences(Some(PCI_VENDOR_NVIDIA)));
+        assert!(!disable_explicit_kms_fences(Some(0x1002)));
+        assert!(!disable_explicit_kms_fences(Some(0x8086)));
+        assert!(!disable_explicit_kms_fences(None));
     }
 
     #[test]
@@ -4711,7 +4728,7 @@ fn create_drm_renderer(
         // renderer without ExportFence finishes GLES synchronously and gives
         // Smithay a signaled, non-exportable SyncPoint, preserving atomic KMS
         // while making the submission use implicit synchronization.
-        flog_warn!("Disabled explicit KMS input fences for the post-resume NVIDIA renderer");
+        flog_warn!("Disabled explicit KMS input fences for the NVIDIA renderer");
     }
 
     Ok((renderer, render_node))
@@ -4722,7 +4739,7 @@ fn recreate_drm_renderer_after_resume(
     node: DrmNode,
     display_handle: &DisplayHandle,
 ) -> Result<()> {
-    let disable_explicit_kms_fences = device.gpu_vendor_id == Some(PCI_VENDOR_NVIDIA);
+    let disable_explicit_kms_fences = disable_explicit_kms_fences(device.gpu_vendor_id);
     let (mut renderer, render_node) =
         create_drm_renderer(&device.gbm, node, disable_explicit_kms_fences)?;
     match renderer.bind_wl_display(display_handle) {
@@ -4797,7 +4814,8 @@ fn device_added(
         DrmDevice::new(fd.clone(), true).context("Failed to create DrmDevice for added node")?;
     let gbm = GbmDevice::new(fd.clone()).context("Failed to create GBM device for node")?;
 
-    let (mut renderer, render_node_for_gpu) = create_drm_renderer(&gbm, node, false)?;
+    let (mut renderer, render_node_for_gpu) =
+        create_drm_renderer(&gbm, node, disable_explicit_kms_fences(gpu_vendor_id))?;
 
     match renderer.bind_wl_display(&data.core.display.handle()) {
         Ok(_) => flog("EGL Wayland display bound for DRM renderer"),
@@ -5703,6 +5721,7 @@ fn device_added(
                         DrmLifecycle::Running,
                         "first post-resume page flip completed",
                     );
+                    restart_shell_surfaces_after_gpu_resume();
                 }
                 if recover_exclusive
                     && !state.exclusive_hdr_recovery_nodes.contains(&node)

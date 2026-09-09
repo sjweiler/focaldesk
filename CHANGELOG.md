@@ -75,8 +75,10 @@ version numbers where practical.
   overrides the platform's firmware-backed deep-sleep policy with `s2idle`.
   Firmware-backed resume also recreates the EGL/GL renderer instead of reusing
   a context that NVIDIA may have invalidated while asleep. NVIDIA's recreated
-  renderer uses implicit KMS synchronization after resume, avoiding the driver
-  regression that rejects otherwise-valid `IN_FENCE_FD` plane fences.
+  renderers use implicit KMS synchronization in every session, avoiding the
+  driver regression that rejects otherwise-valid `IN_FENCE_FD` plane fences
+  for the rest of the boot. The external GTK rail and dock are restarted after
+  the first recovered page flip so they cannot retain partial GPU caches.
 - Extended Wayland color-management negotiation and HDR calibration controls,
   including RGB color-representation advertising, per-output client metadata,
   live KMS metadata refresh, and session-only calibration patterns.

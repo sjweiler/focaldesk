@@ -1510,7 +1510,9 @@ pub fn run_linear_staged_pass(
         .outputs
         .get(&output_id)
         .map(|output| {
-            !crate::core::wayland::trusted_shell::reservation_for_output(&output.handle).is_active()
+            crate::core::wayland::trusted_shell::presence_for_output(&output.handle)
+                .internal_chrome()
+                .any()
         })
         .unwrap_or(true);
     let active_workspace = state

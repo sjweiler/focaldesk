@@ -257,11 +257,12 @@ That recipe builds a release binary and installs it to
 FocalDesk leaves the platform sleep mode unchanged, including firmware-backed
 `deep` sleep. It pauses rendering and DRM commits, waits for libseat to restore
 device ownership, resets connector and plane state, reprobes DRM resources,
-invalidates GPU caches, and submits a fresh modeset. After deep resume on
-NVIDIA, the recreated renderer uses implicit synchronization so a broken plane
-fence cannot prevent that modeset. The installer also removes the legacy
-FocalDesk-owned NVIDIA `s2idle` override if an older installation left it
-behind.
+invalidates GPU caches, and submits a fresh modeset. NVIDIA renderers use
+implicit KMS synchronization so the driver's plane-fence state cannot prevent
+resume or a later logout/login modeset. Once the first recovered page flip
+completes, FocalDesk restarts its GPU-rendered rail and dock to replace any
+partial client-side caches. The installer also removes the legacy
+FocalDesk-owned NVIDIA `s2idle` override if an older installation left it behind.
 Re-run `just install-desktop-session` after changing the session file.
 
 To build and install the file manager prototype:

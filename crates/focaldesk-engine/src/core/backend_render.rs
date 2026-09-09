@@ -675,13 +675,14 @@ pub fn draw_output_stage(
         state.notification_snapshots.clone()
     };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
-    let draw_internal_chrome = state
+    let internal_chrome = state
         .outputs
         .get(&prepared.frame_ctx.rendering_output)
         .map(|output| {
-            !crate::core::wayland::trusted_shell::reservation_for_output(&output.handle).is_active()
+            crate::core::wayland::trusted_shell::presence_for_output(&output.handle)
+                .internal_chrome()
         })
-        .unwrap_or(true);
+        .unwrap_or_default();
 
     let semantic_metrics = state
         .theme
@@ -720,7 +721,7 @@ pub fn draw_output_stage(
         ui_focus: state.ui.focused,
         current_workspace: active_workspace,
         fullscreen_client,
-        draw_internal_chrome,
+        internal_chrome,
         // 👇 ADD THESE
         dialogs: &state.dialogs,
         active_dialog: state.active_dialog,

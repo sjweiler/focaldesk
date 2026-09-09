@@ -610,6 +610,33 @@ pub(crate) fn stop_focaldesk_session_target() {
     }
 }
 
+/// Restart the two GPU-rendered shell surfaces after the compositor has
+/// recovered scanout from suspend. Their GTK renderers are separate processes
+/// and can retain partially invalid NVIDIA resources even after the compositor
+/// has replaced its own EGL context.
+pub(crate) fn restart_shell_surfaces_after_gpu_resume() {
+    let status = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "restart",
+            "--no-block",
+            "focaldesk-system-rail.service",
+            "focaldesk-task-shelf.service",
+        ])
+        .status();
+    match status {
+        Ok(status) if status.success() => {
+            flog("restarted GPU-rendered shell surfaces after resume")
+        }
+        Ok(status) => flog(format!(
+            "failed to restart GPU-rendered shell surfaces: systemctl exited with {status}"
+        )),
+        Err(err) => flog(format!(
+            "failed to restart GPU-rendered shell surfaces: systemctl: {err}"
+        )),
+    }
+}
+
 fn publish_portal_environment(wayland_display: &str) {
     std::env::set_var("WAYLAND_DISPLAY", wayland_display);
     // The first component selects Focaldesk's portal routing (including the

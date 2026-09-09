@@ -19,8 +19,10 @@ compositor's GPU lifetime.
 The former independent GLES renderer remains available for legacy diagnostics
 by setting `FOCALDESK_SHELL_FORCE_GLES=1`; it retains the old `focal-panel` and
 `focal-dock` namespaces. The compositor retains its native chrome as a startup
-fallback and stops drawing it once a renderable trusted shell surface claims
-the work area.
+and crash fallback. Ownership is tracked per renderable surface: the system
+rail suppresses the native status/workspace controls, while the task shelf
+suppresses the native application dock. If either client disappears, only its
+corresponding compositor fallback returns.
 
 Only the trusted panel and dock namespaces contribute to FocalDesk's internal
 work-area calculation. Other layer-shell clients continue to render through
