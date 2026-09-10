@@ -21,7 +21,7 @@ is available, the script starts a private headless Weston session.
 
 Environment:
   FOCALDESK_SMOKE_CLIENT          Optional native Wayland client command
-  FOCALDESK_SMOKE_START_TIMEOUT   Compositor startup timeout (default: 30)
+  FOCALDESK_SMOKE_START_TIMEOUT   Host and compositor startup timeout (default: 30)
   FOCALDESK_SMOKE_CLIENT_SECONDS  Client observation time (default: 5)
 EOF
 }
@@ -155,7 +155,7 @@ if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" \
     weston --backend=headless-backend.so --use-gl --socket="$WAYLAND_DISPLAY" --idle-time=0 \
         --width=1280 --height=720 >"$ARTIFACTS/host.log" 2>&1 &
     HOST_PID=$!
-    wait_for_path "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" 15 \
+    wait_for_path "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" "$START_TIMEOUT" \
         || fail "headless Weston did not create its Wayland socket"
     pass "private headless Wayland host"
 else
