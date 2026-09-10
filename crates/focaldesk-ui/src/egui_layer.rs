@@ -1202,7 +1202,7 @@ fn dump_egui_mesh_png(
     let origin = [min[0] - margin, min[1] - margin];
     let mut out = image::RgbaImage::new(width, height);
 
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0 {
         let [Some(a), Some(b), Some(c)] = [
             vertices.get(triangle[0] as usize),
             vertices.get(triangle[1] as usize),

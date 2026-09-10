@@ -415,7 +415,7 @@ where
 
     debug_img.save("/tmp/atlas-debug.png").unwrap();
 
-    for px in atlas_rgba.chunks_exact_mut(4) {
+    for px in atlas_rgba.as_chunks_mut::<4>().0 {
         px.swap(0, 2); // swap R and B
     }
 
