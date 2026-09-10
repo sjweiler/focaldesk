@@ -29,6 +29,25 @@ const MAX_METADATA_BYTES: usize = 4096;
 const MAX_CONNECTIONS: usize = 64;
 const DEFAULT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerAccess {
+    Full,
+    HealthcheckOnly,
+}
+
+fn peer_access(peer_uid: u32, service_uid: u32) -> Option<PeerAccess> {
+    if peer_uid == service_uid {
+        Some(PeerAccess::Full)
+    } else if peer_uid == 0 {
+        // The display manager's PAM session hook runs as root and uses Ping
+        // to confirm that the credential-backed broker is ready before it
+        // removes the staged master key. Root never receives secret access.
+        Some(PeerAccess::HealthcheckOnly)
+    } else {
+        None
+    }
+}
+
 fn io_timeout() -> std::time::Duration {
     std::env::var("FOCALD_SECRETS_IPC_TIMEOUT_MS")
         .ok()
@@ -200,27 +219,34 @@ pub async fn serve(listener: UnixListener, shared: Shared) {
 async fn handle_conn(mut stream: UnixStream, shared: Shared) -> std::io::Result<()> {
     let timeout = io_timeout();
     let cred = stream.peer_cred()?;
-    // Hard invariant regardless of ACL contents: same-uid peers only.
     // SAFETY: geteuid is always safe to call.
-    if cred.uid() != unsafe { libc::geteuid() } {
-        log::warn!("ipc: rejecting cross-uid peer (uid {})", cred.uid());
-        return Ok(());
-    }
+    let service_uid = unsafe { libc::geteuid() };
+    let access = match peer_access(cred.uid(), service_uid) {
+        Some(access) => access,
+        None => {
+            log::warn!("ipc: rejecting cross-uid peer (uid {})", cred.uid());
+            return Ok(());
+        }
+    };
     let pid = cred.pid().unwrap_or(-1);
-    // Pin the pid immediately: holding a pidfd keeps the kernel's struct pid
-    // referenced, so the number cannot be recycled while we resolve identity
-    // or serve requests. A peer that already exited gets rejected outright.
-    // SAFETY: pidfd_open returns a new fd or -1; we take ownership on success.
-    let _pidfd: OwnedFd = {
+    let (_pidfd, identity) = if access == PeerAccess::Full {
+        // Pin the pid immediately: holding a pidfd keeps the kernel's struct
+        // pid referenced, so the number cannot be recycled while we resolve
+        // identity or serve requests. A peer that already exited is rejected.
+        // SAFETY: pidfd_open returns a new fd or -1; we take ownership on success.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
         if fd < 0 {
             log::warn!("ipc: peer pid {pid} gone before identification; rejecting");
             return Ok(());
         }
-        unsafe { OwnedFd::from_raw_fd(fd as i32) }
+        let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        let identity = crate::acl::identify_peer(shared.dbus_conn().await.as_ref(), pid).await;
+        log::debug!("ipc: peer pid={pid} identity={identity}");
+        (Some(pidfd), Some(identity))
+    } else {
+        log::debug!("ipc: root healthcheck peer pid={pid}");
+        (None, None)
     };
-    let identity = crate::acl::identify_peer(shared.dbus_conn().await.as_ref(), pid).await;
-    log::debug!("ipc: peer pid={pid} identity={identity}");
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -247,7 +273,12 @@ async fn handle_conn(mut stream: UnixStream, shared: Shared) -> std::io::Result<
             })??;
 
         let resp = match serde_json::from_slice::<Request>(&body) {
-            Ok(req) => dispatch(req, &identity, &shared).await,
+            Ok(Request::Ping) => Response::ok(),
+            Ok(_) if access == PeerAccess::HealthcheckOnly => {
+                log::warn!("ipc: rejecting non-ping request from root healthcheck peer");
+                Response::err("root peer is limited to ping")
+            }
+            Ok(req) => dispatch(req, identity.as_deref().unwrap_or_default(), &shared).await,
             Err(e) => Response::err(format!("bad request: {e}")),
         };
         let out = Zeroizing::new(serde_json::to_vec(&resp)?);
@@ -429,4 +460,24 @@ fn valid_key(key: &str) -> bool {
 fn denied(identity: &str, key: &str, op: &str) -> Response {
     log::warn!("acl: DENY {op} key={key} identity={identity}");
     Response::err("access denied")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{peer_access, PeerAccess};
+
+    #[test]
+    fn same_uid_gets_full_access() {
+        assert_eq!(peer_access(1000, 1000), Some(PeerAccess::Full));
+    }
+
+    #[test]
+    fn root_gets_healthcheck_only_access() {
+        assert_eq!(peer_access(0, 1000), Some(PeerAccess::HealthcheckOnly));
+    }
+
+    #[test]
+    fn unrelated_uid_is_rejected() {
+        assert_eq!(peer_access(1001, 1000), None);
+    }
 }

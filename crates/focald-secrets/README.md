@@ -93,10 +93,12 @@ allow_write = []
 Peer identity: SO_PEERCRED pid, immediately pinned with `pidfd_open` (pid
 numbers can't be recycled while the pidfd is held, closing the TOCTOU window)
 → `org.freedesktop.systemd1` `GetUnitByPID` (`unit:<name>`) → fallback
-`exe:/proc/<pid>/exe`. Cross-uid peers are rejected
-before any ACL check. Grants keyed to interpreter binaries (`exe:.../python3`
-etc.) match every script that interpreter runs and are warned about at config
-load — use `unit:` identities for anything real.
+`exe:/proc/<pid>/exe`. Cross-uid peers are rejected before any ACL check, with
+one narrow exception: the root PAM session hook may send the non-secret `ping`
+request that confirms credential-backed startup. Root cannot use any secret
+operation through that connection. Grants keyed to interpreter binaries
+(`exe:.../python3` etc.) match every script that interpreter runs and are
+warned about at config load — use `unit:` identities for anything real.
 The D-Bus surface intentionally has no per-application ACL — it exists for
 third-party compatibility and matches the standard Secret Service trust model
 (any same-user client can access unlocked public items). Native broker records

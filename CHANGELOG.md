@@ -65,6 +65,9 @@ version numbers where practical.
 
 ### Changed
 
+- Restricted the root PAM session hook's native credential-broker access to a
+  non-secret readiness ping; all secret operations remain limited to same-UID
+  peers and their configured ACL grants.
 - Upgraded the PolicyKit D-Bus binding to `zbus_polkit` 5.1.0, closing the
   PID-reuse authorization bypass reported as RUSTSEC-2026-0278.
 - DRM suspend/resume now uses explicit lifecycle states, abandons stale flip

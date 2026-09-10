@@ -32,6 +32,12 @@ connections and enforces bounded frame and idle timeouts, a 1 MiB frame limit,
 and a 700 KiB value limit. Secret Service session creation is count- and
 rate-limited.
 
+Native IPC rejects cross-UID clients before ACL evaluation. The only exception
+is the root-owned PAM session hook: it may send `ping` while waiting for the
+credential-backed broker to become ready, but every secret operation on that
+connection is rejected. Same-UID clients continue through peer identity
+resolution and the native ACL as usual.
+
 Records created through the native API carry the reserved `focald:key`
 attribute. They are deliberately hidden from the standard Secret Service API;
 Secret Service clients cannot create or add that reserved attribute.
@@ -93,8 +99,9 @@ The policy uses `pam_focald_secrets.so` after `pam_systemd.so` to stage a
 root-only credential. A system path unit watches that credential and starts the
 broker only after the key exists; the broker then creates the per-user client
 socket. This prevents ordinary desktop clients from activating a keyless
-broker before PAM has unlocked it. The hook waits for a broker ping before
-removing the staged credential. Focaldesk then owns
+broker before PAM has unlocked it. The root-owned hook waits for the broker's
+non-secret `ping` response before removing the staged credential; that
+connection cannot perform secret operations. Focaldesk then owns
 `org.freedesktop.secrets`, so Chrome and other Secret Service clients use the
 Focaldesk store without a second keyring prompt.
 
