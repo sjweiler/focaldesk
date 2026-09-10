@@ -336,7 +336,7 @@ fn read_capture_frames(
                 let mut file = File::from(fd);
                 let mut pixels = vec![0_u8; len as usize];
                 file.read_exact(&mut pixels)?;
-                for pixel in pixels.chunks_exact_mut(4) {
+                for pixel in pixels.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                 }
                 let stride = NonZeroUsize::new(stride as usize).context("zero frame stride")?;

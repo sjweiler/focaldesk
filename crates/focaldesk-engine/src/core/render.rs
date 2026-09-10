@@ -1069,7 +1069,7 @@ impl RenderState {
         if needs_upload {
             let (w, h) = lut.atlas_size();
             let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-            for chunk in lut.rgb.chunks_exact(3) {
+            for chunk in lut.rgb.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             let texture = renderer.import_memory(
@@ -1384,7 +1384,7 @@ impl RenderState {
         }
 
         let mut rgba = img.rgba.clone();
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
         let w = img.width as i32;
@@ -2083,7 +2083,7 @@ impl RenderState {
         //let rgba = img.to_rgba8();
         let mut rgba = img.to_rgba8();
 
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px.swap(0, 2); // swap R and B
         }
 

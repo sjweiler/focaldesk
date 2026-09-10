@@ -3224,7 +3224,7 @@ fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
     let mut monitor_name = None;
     let mut descriptor_serial = None;
 
-    for descriptor in edid[54..126].chunks_exact(18) {
+    for descriptor in edid[54..126].as_chunks::<18>().0 {
         if descriptor[0..3] != [0, 0, 0] {
             continue;
         }
@@ -3888,14 +3888,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             // awaiting vblank retains its cleanup work for the next loop iteration.
             data.core.state.materialize_full_redraw_damage();
 
-            for (_node, device) in data.backend.devices.iter_mut() {
+            for device in data.backend.devices.values_mut() {
                 let gpu_vendor_id = device.gpu_vendor_id;
                 let exclusive_hdr_output = device.exclusive_hdr_output.clone();
                 let all_outputs_stable = device.surfaces.values().all(|surface| {
                     surface.stable_vblank_count >= HDR_MIN_STABLE_VBLANKS
                         && surface.frame_queued_at.is_none()
                 });
-                for (_crtc, surface) in device.surfaces.iter_mut() {
+                for surface in device.surfaces.values_mut() {
                     if surface.frame_queued_at.is_some() {
                         // Wait for the matching vblank before preparing another buffer for this
                         // CRTC. Other outputs remain independent and continue rendering.

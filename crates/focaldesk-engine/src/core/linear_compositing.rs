@@ -2101,7 +2101,9 @@ mod tests {
         );
         assert_eq!(pixels.len(), 8 * 6 * 4);
         assert!(pixels
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .all(|pixel| { pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3] }));
     }
 

@@ -255,7 +255,7 @@ impl Canvas {
             }
             xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
-            for pair in xs.chunks_exact(2) {
+            for pair in xs.as_chunks::<2>().0 {
                 for x in pair[0].round() as i32..pair[1].round() as i32 {
                     self.blend(ox + x, oy + y, 255);
                 }

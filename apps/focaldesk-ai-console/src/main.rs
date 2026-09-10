@@ -1349,11 +1349,10 @@ fn provider_telemetry_text(telemetry: Option<&ProviderTelemetry>) -> String {
     let Some(telemetry) = telemetry else {
         return "Health: telemetry unavailable".to_string();
     };
-    let average_latency = if telemetry.requests == 0 {
-        0
-    } else {
-        telemetry.total_latency_ms / telemetry.requests
-    };
+    let average_latency = telemetry
+        .total_latency_ms
+        .checked_div(telemetry.requests)
+        .unwrap_or(0);
     let mut text = format!(
         "Health: {}\nRequests: {} ({} succeeded, {} failed, {} cancelled)\nRetries: {} · Timeouts: {} · Average latency: {} ms\nTraffic: {} bytes in / {} bytes out\nReported tokens: {} in / {} out",
         provider_health(telemetry),
@@ -3294,7 +3293,7 @@ fn load_state() -> PersistedState {
 
 fn compact_placeholder_conversations(state: &mut PersistedState) {
     if state.conversations.len() <= 1 {
-        state.app_state.active_conversation = state.app_state.active_conversation.min(0);
+        state.app_state.active_conversation = 0;
         return;
     }
 

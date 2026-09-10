@@ -1250,7 +1250,7 @@ impl DesktopState {
     }
 
     pub fn process_pending_ui_actions(&mut self) {
-        let actions: Vec<_> = self.pending_ui_actions.drain(..).collect();
+        let actions = std::mem::take(&mut self.pending_ui_actions);
         for action in actions {
             self.dispatch_ui_action(action);
         }
@@ -1409,7 +1409,7 @@ impl DesktopState {
                 .any(|output| output.hdr_kms_applied || output.hdr_transition_target == Some(true)),
         };
         let apps: Vec<(u64, String, Vec<String>, LaunchSource)> =
-            self.pending_app_launches.drain(..).collect();
+            std::mem::take(&mut self.pending_app_launches);
         for (launch_trace_id, app, args, source) in apps {
             flog_info!(
                 "dequeuing app launch trace_id={} app={}",

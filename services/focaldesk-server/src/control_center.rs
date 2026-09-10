@@ -183,11 +183,12 @@ impl TelemetryCollector {
         let percent = previous.map_or(0, |old| {
             let total = current.total.saturating_sub(old.total);
             let idle = current.idle.saturating_sub(old.idle);
-            if total == 0 {
-                0
-            } else {
-                (((total.saturating_sub(idle)) * 100) / total).min(100) as u8
-            }
+            total
+                .saturating_sub(idle)
+                .saturating_mul(100)
+                .checked_div(total)
+                .unwrap_or(0)
+                .min(100) as u8
         });
         *previous = Some(current);
         percent
@@ -657,11 +658,11 @@ fn collect_gpu() -> (GpuInfo, u8, u8, u16) {
     let total = read_trimmed(device.join("mem_info_vram_total"))
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let vram = if total == 0 {
-        0
-    } else {
-        ((used * 100) / total).min(100) as u8
-    };
+    let vram = used
+        .saturating_mul(100)
+        .checked_div(total)
+        .unwrap_or(0)
+        .min(100) as u8;
     let temperature = read_gpu_temperature(device);
     let vendor = match pci.split(':').next() {
         Some("10DE") => "NVIDIA",
