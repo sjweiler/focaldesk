@@ -231,6 +231,10 @@ pub struct RenderState {
     //pub chrome_svg: ChromeSvgCache,
     pub font_atlas_texture: Option<GlesTexture>,
     pub fonts_prewarm_done: bool,
+    pub(crate) prepared_lock_theme: Option<BuiltInThemeId>,
+    pub(crate) prepared_lock_message: String,
+    pub(crate) prepared_lock_password: String,
+    pub(crate) prepared_lock_password_visible: bool,
     pub portal_capture_blit_id: Id,
     output_icc_lut_gpu: HashMap<OutputId, OutputIccLutGpu>,
     pub icc_lut_fallback_logged: std::collections::HashSet<OutputId>,
@@ -1048,6 +1052,10 @@ impl RenderState {
 
             font_atlas_texture: None,
             fonts_prewarm_done: false,
+            prepared_lock_theme: None,
+            prepared_lock_message: String::new(),
+            prepared_lock_password: String::new(),
+            prepared_lock_password_visible: false,
             portal_capture_blit_id: Id::new(),
             output_icc_lut_gpu: HashMap::new(),
             icc_lut_fallback_logged: std::collections::HashSet::new(),
@@ -1917,9 +1925,17 @@ impl RenderState {
         self.sw_cursor_cache_key = None;
         self.font_atlas_texture = None;
         self.fonts_prewarm_done = false;
+        self.invalidate_font_text_caches();
         self.output_icc_lut_gpu.clear();
         self.icc_lut_fallback_logged.clear();
         self.redraw_all = true;
+    }
+
+    pub(crate) fn invalidate_font_text_caches(&mut self) {
+        self.prepared_lock_theme = None;
+        self.prepared_lock_message.clear();
+        self.prepared_lock_password.clear();
+        self.prepared_lock_password_visible = false;
     }
 
     fn draw_clock_text(

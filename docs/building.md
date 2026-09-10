@@ -132,6 +132,11 @@ performance:
 cargo build --release --workspace
 ```
 
+The workspace release profile enables thin link-time optimization and uses one
+code-generation unit. This favors runtime performance and cross-crate
+optimization at the cost of a slower release build; development builds keep
+Cargo's normal faster iteration profile.
+
 The repository also provides a `justfile`:
 
 ```sh

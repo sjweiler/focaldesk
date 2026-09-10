@@ -295,11 +295,11 @@ pub fn prepare_output(
         .ensure_wallpaper_loaded(renderer, wallpaper_path.as_deref());
 
     if !state.render.fonts_prewarm_done {
+        state.render.invalidate_font_text_caches();
         prewarm_font_glyphs(state)?;
+        prepare_portal_chrome_glyphs(state)?;
         state.render.fonts_prewarm_done = true;
     }
-
-    prepare_portal_chrome_glyphs(state, scale_factor)?;
 
     prepare_lock_screen_glyphs(state)?;
 
@@ -430,36 +430,54 @@ fn prepare_lock_screen_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn st
         .builtin_id()
         .unwrap_or(BuiltInThemeId::Classic);
 
-    state
-        .fonts
-        .prepare_text("FOCALDESK LOCKED", style_for(FontRole::Title, 18, theme_id))?;
-    state
-        .fonts
-        .prepare_text("ShowHide", style_for(FontRole::Label, 14, theme_id))?;
-    state.fonts.prepare_text(
-        "Enter passwordAuthenticatingUnlockedWrong password",
-        style_for(FontRole::Label, 15, theme_id),
-    )?;
-    state.fonts.prepare_text(
-        &state.lock_screen.message,
-        style_for(FontRole::Label, 15, theme_id),
-    )?;
+    if state.render.prepared_lock_theme != Some(theme_id) {
+        state
+            .fonts
+            .prepare_text("FOCALDESK LOCKED", style_for(FontRole::Title, 18, theme_id))?;
+        state
+            .fonts
+            .prepare_text("ShowHide", style_for(FontRole::Label, 14, theme_id))?;
+        state.fonts.prepare_text(
+            "Enter passwordAuthenticatingUnlockedWrong password",
+            style_for(FontRole::Label, 15, theme_id),
+        )?;
+        state.render.prepared_lock_theme = Some(theme_id);
+    }
 
-    let password_display = if state.lock_screen.password_visible {
-        state.lock_screen.password.as_str().to_string()
-    } else {
-        "*".repeat(state.lock_screen.password.chars().count().min(48))
-    };
-    state
-        .fonts
-        .prepare_text(&password_display, style_for(FontRole::Body, 22, theme_id))?;
+    if state.render.prepared_lock_message != state.lock_screen.message {
+        state.fonts.prepare_text(
+            &state.lock_screen.message,
+            style_for(FontRole::Label, 15, theme_id),
+        )?;
+        state
+            .render
+            .prepared_lock_message
+            .clone_from(&state.lock_screen.message);
+    }
+
+    if state.render.prepared_lock_password_visible != state.lock_screen.password_visible
+        || state.render.prepared_lock_password != state.lock_screen.password.as_str()
+    {
+        let password_display = if state.lock_screen.password_visible {
+            state.lock_screen.password.as_str().to_string()
+        } else {
+            "*".repeat(state.lock_screen.password.chars().count().min(48))
+        };
+        state
+            .fonts
+            .prepare_text(&password_display, style_for(FontRole::Body, 22, theme_id))?;
+        state
+            .render
+            .prepared_lock_password
+            .replace_range(.., state.lock_screen.password.as_str());
+        state.render.prepared_lock_password_visible = state.lock_screen.password_visible;
+    }
 
     Ok(())
 }
 
 fn prepare_portal_chrome_glyphs(
     state: &mut DesktopState,
-    scale_factor: f64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use chrono::Local;
 
@@ -481,7 +499,6 @@ fn prepare_portal_chrome_glyphs(
     let meta = format!("OUT {output_number} · WS 1");
     state.fonts.prepare_text(&meta, meta_style)?;
 
-    let _ = scale_factor;
     Ok(())
 }
 
@@ -504,13 +521,15 @@ pub fn import_output_client_surfaces(
     let Some(output) = state.outputs.get(&output_id) else {
         return;
     };
-    let mapped = state.space.elements().count();
-    if mapped > 0 {
-        focaldesk_logging::flog_info!(
-            "import client surfaces output={} mapped_windows={}",
-            output_id.0,
-            mapped
-        );
+    if focaldesk_logging::enabled(FLogLevel::Info) {
+        let mapped = state.space.elements().count();
+        if mapped > 0 {
+            focaldesk_logging::flog_info!(
+                "import client surfaces output={} mapped_windows={}",
+                output_id.0,
+                mapped
+            );
+        }
     }
     state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
 }

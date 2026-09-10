@@ -43,6 +43,13 @@ cached base and only decode its damaged regions into the FP16 scene. Theme,
 layout, hover, and conservatively classified changes advance the generation;
 each scanout or capture target refreshes independently when it falls behind.
 
+The compositor also retains the built shell UI for an output while its logical
+size, scale, theme, chrome metrics, item configuration, and calculated geometry
+remain unchanged. Lock-screen text preparation follows the same invalidation
+model: static labels are prepared once per theme, while the message and password
+glyphs are refreshed only when their source values change. Renderer resets
+invalidate these text caches together with the font atlas.
+
 After that base decode, the bundled wallpaper receives a display-aware creative
 grade over only its work-area rectangle. On wide-gamut SDR outputs, cyan and
 orange artwork accents expand selectively into Display P3 while luminance stays

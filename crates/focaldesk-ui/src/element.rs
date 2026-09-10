@@ -54,7 +54,7 @@ pub struct UiElement {
 /// Runtime owners can add, remove, reorder, hide, or update these items without
 /// coupling their behavior to a slot index. [`UiElement`] remains the laid-out,
 /// interactive representation used for hit testing and rendering.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChromeItem {
     pub id: ElementId,
     pub icon: IconId,

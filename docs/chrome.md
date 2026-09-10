@@ -68,6 +68,12 @@ projection into the model; input and
 rendering then read the same output-owned component state instead of keeping a
 second set of compositor-side chrome components.
 
+The compatibility tree and output-owned model are synchronized only when an
+input that affects them changes: output size or scale, active theme, chrome
+metrics, item configuration, or calculated layout geometry. Ordinary frames
+reuse the existing model, so persistent ownership does not add a full UI-tree
+rebuild to the rendering hot path.
+
 The model is created when an output is registered and removed when a DRM
 device disappears. This keeps hover state, layout metrics, scale, theme, and
 rendering resources scoped to the correct display and prevents stale UI state

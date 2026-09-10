@@ -408,68 +408,98 @@ pub fn install_panic_hook() {
 #[macro_export]
 macro_rules! flog_critical {
     ($($arg:tt)*) => {
-        $crate::logging::flog(
-            $crate::logging::FLogLevel::Critical,
-            format!($($arg)*)
-        )
+        if $crate::logging::enabled($crate::logging::FLogLevel::Critical) {
+            $crate::logging::flog(
+                $crate::logging::FLogLevel::Critical,
+                format!($($arg)*)
+            )
+        }
     };
 }
 
 #[macro_export]
 macro_rules! flog_error {
     ($($arg:tt)*) => {
-        $crate::logging::flog(
-            $crate::logging::FLogLevel::Error,
-            format!($($arg)*)
-        )
+        if $crate::logging::enabled($crate::logging::FLogLevel::Error) {
+            $crate::logging::flog(
+                $crate::logging::FLogLevel::Error,
+                format!($($arg)*)
+            )
+        }
     };
 }
 
 #[macro_export]
 macro_rules! flog_warn {
     ($($arg:tt)*) => {
-        $crate::logging::flog(
-            $crate::logging::FLogLevel::Warn,
-            format!($($arg)*)
-        )
+        if $crate::logging::enabled($crate::logging::FLogLevel::Warn) {
+            $crate::logging::flog(
+                $crate::logging::FLogLevel::Warn,
+                format!($($arg)*)
+            )
+        }
     };
 }
 
 #[macro_export]
 macro_rules! flog_info {
     ($($arg:tt)*) => {
-        $crate::logging::flog(
-            $crate::logging::FLogLevel::Info,
-            format!($($arg)*)
-        )
+        if $crate::logging::enabled($crate::logging::FLogLevel::Info) {
+            $crate::logging::flog(
+                $crate::logging::FLogLevel::Info,
+                format!($($arg)*)
+            )
+        }
     };
 }
 
 #[macro_export]
 macro_rules! flog_debug {
     ($($arg:tt)*) => {
-        $crate::logging::flog(
-            $crate::logging::FLogLevel::Debug,
-            format!($($arg)*)
-        )
+        if $crate::logging::enabled($crate::logging::FLogLevel::Debug) {
+            $crate::logging::flog(
+                $crate::logging::FLogLevel::Debug,
+                format!($($arg)*)
+            )
+        }
     };
 }
 
 #[macro_export]
 macro_rules! flog_trace {
     ($($arg:tt)*) => {
-        $crate::logging::flog(
-            $crate::logging::FLogLevel::Trace,
-            format!($($arg)*)
-        )
+        if $crate::logging::enabled($crate::logging::FLogLevel::Trace) {
+            $crate::logging::flog(
+                $crate::logging::FLogLevel::Trace,
+                format!($($arg)*)
+            )
+        }
     };
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{init_default_logging, write_private_atomic};
+    use super::{
+        current_log_level, init_default_logging, set_log_level, write_private_atomic, FLogLevel,
+    };
+    use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
+
+    #[test]
+    fn disabled_log_macro_does_not_format_arguments() {
+        let previous = current_log_level();
+        set_log_level(FLogLevel::Critical);
+        let evaluated = Cell::new(false);
+
+        crate::flog_info!("{}", {
+            evaluated.set(true);
+            "expensive diagnostic"
+        });
+
+        set_log_level(previous);
+        assert!(!evaluated.get());
+    }
 
     #[test]
     fn crash_reports_are_replaced_atomically_with_private_permissions() {

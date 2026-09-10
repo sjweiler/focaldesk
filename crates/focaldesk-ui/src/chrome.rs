@@ -69,7 +69,7 @@ impl ClockCache {
 }
 
 /// Simple chrome config (tune to your design).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChromeMetrics {
     pub sidebar_w: i32,
     pub topbar_h: i32,

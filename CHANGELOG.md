@@ -111,6 +111,10 @@ version numbers where practical.
 - Indexed damage state per surface-tree root, reused traversal storage, reduced
   client-damage expansion to a one-pixel rounding guard, and made rectangle
   compaction transitive without overlap-inflated full-frame decisions.
+- Reduced steady-state compositor overhead by reusing unchanged per-output
+  chrome layouts, preparing static shell glyphs only when their inputs change,
+  and avoiding message formatting for disabled log levels. Release builds now
+  use thin link-time optimization with a single code-generation unit.
 
 ## Historical tags
 

@@ -99,7 +99,7 @@ pub enum VoiceCaptureStatus {
     Stopping,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UiBuildOptions {
     pub hdr_supported: bool,
     pub hdr_requested: bool,

@@ -34,7 +34,7 @@ pub enum SystemCommand {
     Lock,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiAction {
     LaunchApp(String),
     ToggleSetting(SettingKey),

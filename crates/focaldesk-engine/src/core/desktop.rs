@@ -796,6 +796,16 @@ struct DesktopIpcWatcher {
     response: mpsc::Sender<IpcResponse>,
 }
 
+struct UiBuildCache {
+    output_id: OutputId,
+    options: UiBuildOptions,
+    layout: ChromeLayout,
+    logical_size: Size<i32, Logical>,
+    scale_factor: f64,
+    metrics: ChromeMetrics,
+    theme_id: FlowThemeId,
+}
+
 pub struct DesktopState {
     // smithay protocol state
     pub display_handle: DisplayHandle,
@@ -812,6 +822,7 @@ pub struct DesktopState {
     pub xwayland_loop_handle: Option<LoopHandle<'static, DesktopState>>,
     pub winit_scale_factor: f64,
     pub ui: UiTree,
+    ui_build_cache: Option<UiBuildCache>,
     /// Persistent compositor-owned desktop UI, one model per output.
     /// `UiTree` remains the compatibility projection for accessibility and
     /// legacy rendering while the component renderer is being migrated.
@@ -3352,13 +3363,11 @@ impl DesktopState {
             status_items: None,
         };
 
-        let default_layout = build_chrome_layout(
-            output.logical_size,
-            self.chrome.metrics.topbar_h,
-            self.chrome.metrics.sidebar_w,
-        );
         options.sidebar_items = Some(Self::configured_chrome_items(
-            default_sidebar_items(&options, default_layout.sidebar.slots.len()),
+            default_sidebar_items(
+                &options,
+                focaldesk_ui::chrome_layout::DEFAULT_SIDEBAR_SLOT_COUNT,
+            ),
             &self.chrome_items.sidebar,
         ));
         options.status_items = Some(Self::configured_chrome_items(
@@ -3446,31 +3455,50 @@ impl DesktopState {
         let Some(layout) = self.chrome_layout_for_output_with_options(output_id, &options) else {
             return None;
         };
-        // ChromeLayout's Smithay coordinate marker is not Clone. Derive the owned copy needed by
-        // DesktopOutput from the already-built options; this is allocation-free and still avoids
-        // rebuilding UiBuildOptions or the UI tree.
-        let Some(desktop_layout) = self.chrome_layout_for_output_with_options(output_id, &options)
-        else {
-            return None;
-        };
-        build_ui_for_output_with_options(&mut self.ui, &layout, options);
-        if let Some(output) = self.outputs.get(&output_id) {
+        let (logical_size, scale_factor) = self
+            .outputs
+            .get(&output_id)
+            .map(|output| (output.logical_size, output.scale_factor))?;
+        let metrics = self.chrome.metrics.clone();
+        let theme_id = self.theme.active_theme().id.clone();
+        let cache_hit = self.desktop_outputs.contains_key(&output_id)
+            && self.ui_build_cache.as_ref().is_some_and(|cached| {
+                cached.output_id == output_id
+                    && cached.options == options
+                    && cached.layout.same_geometry(&layout)
+                    && cached.logical_size == logical_size
+                    && cached.scale_factor == scale_factor
+                    && cached.metrics == metrics
+                    && cached.theme_id == theme_id
+            });
+
+        if !cache_hit {
+            build_ui_for_output_with_options(&mut self.ui, &layout, options.clone());
             let config = focaldesk_ui::desktop_output::DesktopOutputConfig {
                 show_topbar: true,
                 show_sidebar: true,
-                theme_id: self.theme.active_theme().id.clone(),
+                theme_id: theme_id.clone(),
             };
             let desktop_output = self.desktop_outputs.entry(output_id).or_insert_with(|| {
                 focaldesk_ui::desktop_output::DesktopOutput::new(output_id, config)
             });
-            desktop_output.config.theme_id = self.theme.active_theme().id.clone();
+            desktop_output.config.theme_id = theme_id.clone();
             desktop_output.sync_chrome(
-                Rectangle::from_loc_and_size((0, 0), output.logical_size),
-                output.scale_factor,
-                self.chrome.metrics.clone(),
-                desktop_layout,
+                Rectangle::from_loc_and_size((0, 0), logical_size),
+                scale_factor,
+                metrics.clone(),
+                layout.clone_logical(),
                 &self.ui,
             );
+            self.ui_build_cache = Some(UiBuildCache {
+                output_id,
+                options,
+                layout: layout.clone_logical(),
+                logical_size,
+                scale_factor,
+                metrics,
+                theme_id,
+            });
         }
         if output_id == self.focused_output {
             self.publish_accessibility_tree();
@@ -7089,6 +7117,7 @@ impl DesktopState {
             xwayland_loop_handle: None,
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
+            ui_build_cache: None,
             desktop_outputs: IndexMap::new(),
             accessibility: crate::core::accessibility::AccessibilityBridge::new(),
             active_workspace: WorkspaceId(1),
@@ -7622,7 +7651,7 @@ impl DesktopState {
     }
 
     pub fn handle_commit(&mut self, surface: &WlSurface) {
-        let handle_commit_started = Instant::now();
+        let handle_commit_started = focaldesk_logging::enabled(FLogLevel::Info).then(Instant::now);
         flog_info!("surface commit surface={:?}", surface.id());
         tracing::trace!(
             target: "focaldesk",
@@ -7824,11 +7853,13 @@ impl DesktopState {
             self.refresh_window_preferred_color_output(&window);
         }
 
-        flog_info!(
-            "handle_commit complete surface={:?} elapsed_ms={}",
-            surface.id(),
-            handle_commit_started.elapsed().as_millis()
-        );
+        if let Some(started) = handle_commit_started {
+            flog_info!(
+                "handle_commit complete surface={:?} elapsed_ms={}",
+                surface.id(),
+                started.elapsed().as_millis()
+            );
+        }
     }
 
     pub(crate) fn window_for_wl_surface(&self, surface: &WlSurface) -> Option<Window> {

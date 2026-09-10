@@ -177,6 +177,108 @@ pub struct ChromeDecorationLayout<Kind = Logical> {
     pub corner_joint_caps: Vec<Rectangle<i32, Kind>>,
 }
 
+impl ChromeLayout<Logical> {
+    /// Clone logical geometry without requiring Smithay's marker type to implement `Clone`.
+    pub fn clone_logical(&self) -> Self {
+        Self {
+            topbar: TopBarLayout {
+                outer: self.topbar.outer,
+                ai_button: self.topbar.ai_button,
+                inner: self.topbar.inner,
+                title: self.topbar.title,
+                trim: self.topbar.trim,
+                status_wells: self.topbar.status_wells.clone(),
+                clock_well: self.topbar.clock_well,
+                light: self.topbar.light,
+            },
+            sidebar: SidebarLayout {
+                outer: self.sidebar.outer,
+                inner: self.sidebar.inner,
+                slots: self
+                    .sidebar
+                    .slots
+                    .iter()
+                    .map(|slot| SidebarSlotLayout {
+                        outer: slot.outer,
+                        inner: slot.inner,
+                        icon_well: slot.icon_well,
+                    })
+                    .collect(),
+                light: self.sidebar.light,
+                caps: self.sidebar.caps.clone(),
+            },
+            work_area: WorkAreaLayout {
+                outer: self.work_area.outer,
+                inner_frame: self.work_area.inner_frame,
+                recess: self.work_area.recess,
+                glass: self.work_area.glass,
+                trim: self.work_area.trim,
+            },
+            decoration: ChromeDecorationLayout {
+                corner_caps: self.decoration.corner_caps.clone(),
+                corner_joint_caps: self.decoration.corner_joint_caps.clone(),
+            },
+        }
+    }
+
+    /// Compare logical geometry without requiring equality on Smithay's marker type.
+    pub fn same_geometry(&self, other: &Self) -> bool {
+        fn rect_key(rect: Rectangle<i32, Logical>) -> [i32; 4] {
+            [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h]
+        }
+        fn rects_equal(
+            left: &[Rectangle<i32, Logical>],
+            right: &[Rectangle<i32, Logical>],
+        ) -> bool {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| rect_key(*left) == rect_key(*right))
+        }
+        fn optional_rects_equal(
+            left: Option<Rectangle<i32, Logical>>,
+            right: Option<Rectangle<i32, Logical>>,
+        ) -> bool {
+            left.map(rect_key) == right.map(rect_key)
+        }
+
+        rect_key(self.topbar.outer) == rect_key(other.topbar.outer)
+            && rect_key(self.topbar.ai_button) == rect_key(other.topbar.ai_button)
+            && rect_key(self.topbar.inner) == rect_key(other.topbar.inner)
+            && rect_key(self.topbar.title) == rect_key(other.topbar.title)
+            && rect_key(self.topbar.trim) == rect_key(other.topbar.trim)
+            && rects_equal(&self.topbar.status_wells, &other.topbar.status_wells)
+            && rect_key(self.topbar.clock_well) == rect_key(other.topbar.clock_well)
+            && optional_rects_equal(self.topbar.light, other.topbar.light)
+            && rect_key(self.sidebar.outer) == rect_key(other.sidebar.outer)
+            && rect_key(self.sidebar.inner) == rect_key(other.sidebar.inner)
+            && self.sidebar.slots.len() == other.sidebar.slots.len()
+            && self
+                .sidebar
+                .slots
+                .iter()
+                .zip(&other.sidebar.slots)
+                .all(|(left, right)| {
+                    rect_key(left.outer) == rect_key(right.outer)
+                        && rect_key(left.inner) == rect_key(right.inner)
+                        && rect_key(left.icon_well) == rect_key(right.icon_well)
+                })
+            && optional_rects_equal(self.sidebar.light, other.sidebar.light)
+            && rects_equal(&self.sidebar.caps, &other.sidebar.caps)
+            && rect_key(self.work_area.outer) == rect_key(other.work_area.outer)
+            && rect_key(self.work_area.inner_frame) == rect_key(other.work_area.inner_frame)
+            && rect_key(self.work_area.recess) == rect_key(other.work_area.recess)
+            && rect_key(self.work_area.glass) == rect_key(other.work_area.glass)
+            && optional_rects_equal(self.work_area.trim, other.work_area.trim)
+            && rects_equal(&self.decoration.corner_caps, &other.decoration.corner_caps)
+            && rects_equal(
+                &self.decoration.corner_joint_caps,
+                &other.decoration.corner_joint_caps,
+            )
+    }
+}
+
 fn inset_rect<Kind>(rect: Rectangle<i32, Kind>, inset: i32) -> Rectangle<i32, Kind> {
     let x = rect.loc.x + inset;
     let y = rect.loc.y + inset;
@@ -457,6 +559,30 @@ mod tests {
     fn work_area_glass_matches_work_recess() {
         let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
         assert_eq!(layout.work_area.glass, layout.work_area.recess);
+    }
+
+    #[test]
+    fn logical_layout_copy_preserves_all_geometry() {
+        let layout = build_chrome_layout_with_config(
+            Size::from((1920, 1080)),
+            64,
+            76,
+            ChromeLayoutConfig {
+                status_item_count: 8,
+                sidebar_item_count: 6,
+            },
+        );
+        let copy = layout.clone_logical();
+
+        assert!(layout.same_geometry(&copy));
+    }
+
+    #[test]
+    fn logical_layout_comparison_detects_changes() {
+        let layout = build_chrome_layout(Size::from((1920, 1080)), 64, 76);
+        let changed = build_chrome_layout(Size::from((2560, 1440)), 64, 76);
+
+        assert!(!layout.same_geometry(&changed));
     }
 
     #[test]
