@@ -4212,6 +4212,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             texture,
                             surface.size,
                             encoding,
+                            prepared.frame_ctx.damage.clone(),
                             now,
                         );
                     }

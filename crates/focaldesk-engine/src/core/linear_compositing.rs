@@ -1507,14 +1507,8 @@ pub fn run_linear_staged_pass(
         .glass
         .to_physical_precise_round(prepared.frame_ctx.output_scale);
     let internal_chrome = state
-        .outputs
-        .get(&output_id)
-        .map(|output| {
-            crate::core::wayland::trusted_shell::presence_for_output(&output.handle)
-                .internal_chrome()
-                .any()
-        })
-        .unwrap_or(true);
+        .internal_chrome_visibility_for_output(output_id, prepared.frame_ctx.now)
+        .any();
     let active_workspace = state
         .outputs
         .get(&output_id)
@@ -1934,7 +1928,7 @@ pub fn render_output_offscreen(
     now: Instant,
     dt: Duration,
     portal_capture: bool,
-) -> Result<SyncPoint> {
+) -> Result<(SyncPoint, Vec<Rectangle<i32, Physical>>)> {
     let client_to_scene = state.render.chrome_shaders.client_to_scene_linear.clone();
     let srgb_to_linear = state.render.chrome_shaders.srgb_to_linear.clone();
     let use_linear = use_linear_sdr_path(renderer, targets, buffer_size)
@@ -1963,7 +1957,7 @@ pub fn render_output_offscreen(
     )
     .map_err(|err| anyhow!("{err}"))?;
 
-    if use_linear && targets.linear_offscreen.is_some() {
+    let sync = if use_linear && targets.linear_offscreen.is_some() {
         run_linear_staged_pass(
             state,
             renderer,
@@ -1976,7 +1970,7 @@ pub fn render_output_offscreen(
             output_state,
             client_to_scene.as_ref().unwrap(),
             srgb_to_linear.as_ref().unwrap(),
-        )
+        )?
     } else {
         run_sdr_pass(
             state,
@@ -1988,8 +1982,9 @@ pub fn render_output_offscreen(
             ui_state,
             scene,
             output_state,
-        )
-    }
+        )?
+    };
+    Ok((sync, prepared.frame_ctx.damage))
 }
 
 pub fn run_sdr_pass(

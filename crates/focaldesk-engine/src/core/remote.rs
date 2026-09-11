@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use focaldesk_remote_protocol::{
-    send_fd, write_message, Event, OutputTransform, PixelFormat, Request,
+    send_fd, write_message, DamageRect, Event, OutputTransform, PixelFormat, Request,
 };
 use focaldesk_types::OutputId;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -94,7 +94,18 @@ impl LocalRemoteCapture {
                     let transform = protocol_transform(output.handle.current_transform());
                     let session_id = self.next_session_id;
                     self.next_session_id = self.next_session_id.saturating_add(1);
-                    let consumer_id = state.output_capture_broker.register(output_id, 2);
+                    let consumer_id = match state.output_capture_broker.register(output_id, 2) {
+                        Ok(consumer_id) => consumer_id,
+                        Err(error) => {
+                            let _ = outbound.try_send(RemoteOutbound {
+                                event: Event::Error {
+                                    message: error.to_string(),
+                                },
+                                fd: None,
+                            });
+                            continue;
+                        }
+                    };
                     self.sessions.insert(
                         session_id,
                         RemoteSession {
@@ -162,6 +173,18 @@ impl LocalRemoteCapture {
             };
             let width = frame.geometry.size.w.max(0) as u32;
             let height = frame.geometry.size.h.max(0) as u32;
+            let damage = frame
+                .damage
+                .iter()
+                .filter_map(|rect| {
+                    Some(DamageRect {
+                        x: u32::try_from(rect.loc.x).ok()?,
+                        y: u32::try_from(rect.loc.y).ok()?,
+                        width: u32::try_from(rect.size.w).ok()?,
+                        height: u32::try_from(rect.size.h).ok()?,
+                    })
+                })
+                .collect();
             let message = RemoteOutbound {
                 event: Event::FrameReady {
                     session_id,
@@ -174,12 +197,20 @@ impl LocalRemoteCapture {
                     scale: frame.geometry.scale,
                     transform: protocol_transform(frame.geometry.transform),
                     full_refresh: frame.full_refresh,
+                    damage,
                 },
                 fd: Some(fd),
             };
             match outbound.try_send(message) {
                 Ok(()) => {}
-                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Full(_)) => {
+                    if let Ok(output_id) = state
+                        .output_capture_broker
+                        .request_full_refresh(consumer_id)
+                    {
+                        state.mark_output_full_damage(output_id, DamageSource::Unknown);
+                    }
+                }
                 Err(TrySendError::Disconnected(_)) => disconnected.push(session_id),
             }
         }

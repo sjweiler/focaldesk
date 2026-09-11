@@ -93,7 +93,15 @@ impl ImageCopyCaptureHandler for DesktopState {
             focaldesk_logging::flog("portal capture session has no matching output");
             return;
         };
-        let consumer_id = self.output_capture_broker.register(output_id, 1);
+        let consumer_id = match self.output_capture_broker.register(output_id, 1) {
+            Ok(consumer_id) => consumer_id,
+            Err(error) => {
+                focaldesk_logging::flog(format!(
+                    "portal capture consumer registration failed: {error}"
+                ));
+                return;
+            }
+        };
         self.image_copy_capture_sessions
             .push(portal::PortalCaptureSession {
                 session,

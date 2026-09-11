@@ -3179,15 +3179,11 @@ impl DesktopState {
         let x = rel.x.round() as i32;
         let y = rel.y.round() as i32;
 
-        let presence = self
-            .outputs
-            .get(&output_id)
-            .map(|output| crate::core::wayland::trusted_shell::presence_for_output(&output.handle))
-            .unwrap_or_default();
+        let internal_chrome = self.internal_chrome_visibility_for_output(output_id, Instant::now());
         let new_hovered = self
             .ui
             .hit_test(x, y)
-            .filter(|element| !Self::external_shell_owns_element(presence, element.kind))
+            .filter(|element| !Self::external_shell_owns_element(internal_chrome, element.kind))
             .map(|element| element.id);
         self.ui.hovered = new_hovered;
 
@@ -3273,16 +3269,14 @@ impl DesktopState {
         let x = local.x.round() as i32;
         let y = local.y.round() as i32;
         let element = self.ui.hit_test(x, y)?;
-        let output = self.outputs.get(&output_id)?;
-        let presence = crate::core::wayland::trusted_shell::presence_for_output(&output.handle);
-        (!Self::external_shell_owns_element(presence, element.kind)).then_some(element)
+        let internal_chrome = self.internal_chrome_visibility_for_output(output_id, Instant::now());
+        (!Self::external_shell_owns_element(internal_chrome, element.kind)).then_some(element)
     }
 
     fn external_shell_owns_element(
-        presence: crate::core::wayland::trusted_shell::TrustedShellPresence,
+        visibility: crate::core::wayland::trusted_shell::InternalChromeVisibility,
         kind: UiElementKind,
     ) -> bool {
-        let visibility = presence.internal_chrome();
         match kind {
             UiElementKind::SidebarButton => !visibility.sidebar_buttons,
             UiElementKind::WorkspaceSlot => !visibility.workspace_slots,
@@ -3292,6 +3286,22 @@ impl DesktopState {
             | UiElementKind::Clock => !visibility.topbar,
             _ => false,
         }
+    }
+
+    pub(crate) fn internal_chrome_visibility_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> crate::core::wayland::trusted_shell::InternalChromeVisibility {
+        let presence = self
+            .outputs
+            .get(&output_id)
+            .map(|output| crate::core::wayland::trusted_shell::presence_for_output(&output.handle))
+            .unwrap_or_default();
+        presence.internal_chrome_with_startup_policy(
+            now.saturating_duration_since(self.render.start_time),
+            self.backend_kind == BackendKind::Drm,
+        )
     }
 
     fn configured_chrome_items(
@@ -6223,11 +6233,8 @@ impl DesktopState {
 
         let px = local.x.round() as i32;
         let py = local.y.round() as i32;
-        let Some(output) = self.outputs.get(&output_id) else {
-            return false;
-        };
-        if !crate::core::wayland::trusted_shell::presence_for_output(&output.handle)
-            .internal_chrome()
+        if !self
+            .internal_chrome_visibility_for_output(output_id, Instant::now())
             .topbar
         {
             return false;
@@ -11163,11 +11170,11 @@ mod tests {
             ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
-            panel,
+            panel.internal_chrome(),
             UiElementKind::TopbarIndicator
         ));
         assert!(!super::DesktopState::external_shell_owns_element(
-            panel,
+            panel.internal_chrome(),
             UiElementKind::SidebarButton
         ));
 
@@ -11176,11 +11183,11 @@ mod tests {
             ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
-            dock,
+            dock.internal_chrome(),
             UiElementKind::SidebarButton
         ));
         assert!(!super::DesktopState::external_shell_owns_element(
-            dock,
+            dock.internal_chrome(),
             UiElementKind::Clock
         ));
 
@@ -11189,15 +11196,15 @@ mod tests {
             ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
-            rail,
+            rail.internal_chrome(),
             UiElementKind::WorkspaceSlot
         ));
         assert!(super::DesktopState::external_shell_owns_element(
-            rail,
+            rail.internal_chrome(),
             UiElementKind::Clock
         ));
         assert!(!super::DesktopState::external_shell_owns_element(
-            rail,
+            rail.internal_chrome(),
             UiElementKind::SidebarButton
         ));
 
@@ -11206,11 +11213,11 @@ mod tests {
             ..TrustedShellPresence::default()
         };
         assert!(super::DesktopState::external_shell_owns_element(
-            shelf,
+            shelf.internal_chrome(),
             UiElementKind::SidebarButton
         ));
         assert!(!super::DesktopState::external_shell_owns_element(
-            shelf,
+            shelf.internal_chrome(),
             UiElementKind::Clock
         ));
     }

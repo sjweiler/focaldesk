@@ -694,14 +694,10 @@ pub fn draw_output_stage(
         state.notification_snapshots.clone()
     };
     let lock_screen = state.lock_screen.snapshot(prepared.frame_ctx.now);
-    let internal_chrome = state
-        .outputs
-        .get(&prepared.frame_ctx.rendering_output)
-        .map(|output| {
-            crate::core::wayland::trusted_shell::presence_for_output(&output.handle)
-                .internal_chrome()
-        })
-        .unwrap_or_default();
+    let internal_chrome = state.internal_chrome_visibility_for_output(
+        prepared.frame_ctx.rendering_output,
+        prepared.frame_ctx.now,
+    );
 
     let semantic_metrics = state
         .theme

@@ -4,7 +4,7 @@ use std::time::Instant;
 use focaldesk_types::OutputId;
 use smithay::utils::{Physical, Rectangle};
 
-use super::{CaptureFrame, CaptureGeometry};
+use super::{CaptureError, CaptureFrame, CaptureGeometry};
 
 /// Capture queues stay deliberately shallow so a stalled consumer cannot retain
 /// an unbounded number of GPU buffers.
@@ -39,20 +39,29 @@ impl<B> Default for OutputCaptureBroker<B> {
 }
 
 impl<B> OutputCaptureBroker<B> {
-    pub fn register(&mut self, output_id: OutputId, queue_depth: usize) -> CaptureConsumerId {
+    pub fn register(
+        &mut self,
+        output_id: OutputId,
+        queue_depth: usize,
+    ) -> Result<CaptureConsumerId, CaptureError> {
+        if !(1..=MAX_CAPTURE_QUEUE_DEPTH).contains(&queue_depth) {
+            return Err(CaptureError::InvalidQueueDepth {
+                requested: queue_depth,
+            });
+        }
         let id = CaptureConsumerId(self.next_consumer_id);
         self.next_consumer_id = self.next_consumer_id.saturating_add(1);
         self.consumers.insert(
             id,
             CaptureConsumer {
                 output_id,
-                queue_limit: queue_depth.clamp(1, MAX_CAPTURE_QUEUE_DEPTH),
+                queue_limit: queue_depth,
                 queue: VecDeque::new(),
                 last_geometry: None,
                 needs_full_refresh: true,
             },
         );
-        id
+        Ok(id)
     }
 
     pub fn remove(&mut self, consumer_id: CaptureConsumerId) -> bool {
@@ -61,6 +70,21 @@ impl<B> OutputCaptureBroker<B> {
 
     pub fn contains(&self, consumer_id: CaptureConsumerId) -> bool {
         self.consumers.contains_key(&consumer_id)
+    }
+
+    /// Discard queued incremental state and require the consumer's next frame
+    /// to contain a complete output refresh.
+    pub fn request_full_refresh(
+        &mut self,
+        consumer_id: CaptureConsumerId,
+    ) -> Result<OutputId, CaptureError> {
+        let consumer = self
+            .consumers
+            .get_mut(&consumer_id)
+            .ok_or(CaptureError::UnknownConsumer(consumer_id))?;
+        consumer.queue.clear();
+        consumer.needs_full_refresh = true;
+        Ok(consumer.output_id)
     }
 
     pub fn latest_frame(&self, consumer_id: CaptureConsumerId) -> Option<&CaptureFrame<B>> {
@@ -115,7 +139,17 @@ impl<B: Clone> OutputCaptureBroker<B> {
         geometry: CaptureGeometry,
         damage: Vec<Rectangle<i32, Physical>>,
         captured_at: Instant,
-    ) -> u64 {
+    ) -> Option<u64> {
+        let has_publishable_consumer = self.consumers.values().any(|consumer| {
+            consumer.output_id == output_id
+                && (!damage.is_empty()
+                    || consumer.needs_full_refresh
+                    || consumer.last_geometry != Some(geometry))
+        });
+        if !has_publishable_consumer {
+            return None;
+        }
+
         let serial = self.output_serials.entry(output_id).or_insert(0);
         *serial = serial.saturating_add(1);
         let serial = *serial;
@@ -126,6 +160,9 @@ impl<B: Clone> OutputCaptureBroker<B> {
             .filter(|consumer| consumer.output_id == output_id)
         {
             let geometry_changed = consumer.last_geometry != Some(geometry);
+            if damage.is_empty() && !consumer.needs_full_refresh && !geometry_changed {
+                continue;
+            }
             let queue_was_full = consumer.queue.len() >= consumer.queue_limit;
             if queue_was_full {
                 consumer.queue.pop_front();
@@ -148,7 +185,7 @@ impl<B: Clone> OutputCaptureBroker<B> {
             consumer.queue.push_back(frame);
         }
 
-        serial
+        Some(serial)
     }
 }
 
@@ -176,8 +213,8 @@ mod tests {
     #[test]
     fn registration_and_removal_are_isolated() {
         let mut broker = OutputCaptureBroker::<u8>::default();
-        let first = broker.register(OutputId(1), 1);
-        let second = broker.register(OutputId(2), 1);
+        let first = broker.register(OutputId(1), 1).unwrap();
+        let second = broker.register(OutputId(2), 1).unwrap();
         broker.publish(OutputId(1), 7, geometry(100), damage(), Instant::now());
 
         assert!(broker.latest_frame(first).is_some());
@@ -190,7 +227,7 @@ mod tests {
     #[test]
     fn first_and_geometry_changed_frames_are_full_refreshes() {
         let mut broker = OutputCaptureBroker::<u8>::default();
-        let consumer = broker.register(OutputId(1), 2);
+        let consumer = broker.register(OutputId(1), 2).unwrap();
         broker.publish(OutputId(1), 1, geometry(100), damage(), Instant::now());
         assert!(broker.poll_frame(consumer).unwrap().full_refresh);
 
@@ -206,7 +243,9 @@ mod tests {
     #[test]
     fn queue_is_bounded_and_overflow_recovers_with_full_frame() {
         let mut broker = OutputCaptureBroker::<u8>::default();
-        let consumer = broker.register(OutputId(1), usize::MAX);
+        let consumer = broker
+            .register(OutputId(1), MAX_CAPTURE_QUEUE_DEPTH)
+            .unwrap();
         for buffer in 0..4 {
             broker.publish(OutputId(1), buffer, geometry(100), damage(), Instant::now());
         }
@@ -222,7 +261,7 @@ mod tests {
     #[test]
     fn taking_latest_after_skips_forces_recovery() {
         let mut broker = OutputCaptureBroker::<u8>::default();
-        let consumer = broker.register(OutputId(1), 2);
+        let consumer = broker.register(OutputId(1), 2).unwrap();
         broker.publish(OutputId(1), 1, geometry(100), damage(), Instant::now());
         broker.publish(OutputId(1), 2, geometry(100), damage(), Instant::now());
 
@@ -230,5 +269,52 @@ mod tests {
         assert_eq!(latest.buffer, 2);
         assert!(latest.full_refresh);
         assert!(broker.poll_frame(consumer).is_none());
+    }
+
+    #[test]
+    fn invalid_queue_depth_is_rejected() {
+        let mut broker = OutputCaptureBroker::<u8>::default();
+        assert_eq!(
+            broker.register(OutputId(1), 0),
+            Err(CaptureError::InvalidQueueDepth { requested: 0 })
+        );
+        assert_eq!(
+            broker.register(OutputId(1), MAX_CAPTURE_QUEUE_DEPTH + 1),
+            Err(CaptureError::InvalidQueueDepth {
+                requested: MAX_CAPTURE_QUEUE_DEPTH + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn idle_frames_are_not_queued_after_initial_refresh() {
+        let mut broker = OutputCaptureBroker::<u8>::default();
+        let consumer = broker.register(OutputId(1), 2).unwrap();
+
+        assert_eq!(
+            broker.publish(OutputId(1), 1, geometry(100), Vec::new(), Instant::now()),
+            Some(1)
+        );
+        assert!(broker.poll_frame(consumer).unwrap().full_refresh);
+
+        assert_eq!(
+            broker.publish(OutputId(1), 2, geometry(100), Vec::new(), Instant::now()),
+            None
+        );
+        assert!(broker.poll_frame(consumer).is_none());
+    }
+
+    #[test]
+    fn requested_refresh_discards_incremental_state() {
+        let mut broker = OutputCaptureBroker::<u8>::default();
+        let consumer = broker.register(OutputId(1), 2).unwrap();
+        broker.publish(OutputId(1), 1, geometry(100), damage(), Instant::now());
+        broker.poll_frame(consumer).unwrap();
+        broker.publish(OutputId(1), 2, geometry(100), damage(), Instant::now());
+
+        assert_eq!(broker.request_full_refresh(consumer), Ok(OutputId(1)));
+        assert!(broker.poll_frame(consumer).is_none());
+        broker.publish(OutputId(1), 3, geometry(100), damage(), Instant::now());
+        assert!(broker.poll_frame(consumer).unwrap().full_refresh);
     }
 }

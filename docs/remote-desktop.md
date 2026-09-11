@@ -2,7 +2,8 @@
 
 FocalDesk has an experimental Phase 3 remote-desktop path for viewing one
 physical output through RDP. It is deliberately narrow: one view-only client,
-one selected output, full-frame bitmap updates, and a loopback-only listener.
+one selected output, damage-region bitmap updates with safe full-refresh
+recovery, and a loopback-only listener.
 Input, clipboard synchronization, direct LAN exposure, independent login
 sessions, and production authentication are not implemented.
 
@@ -12,6 +13,12 @@ sessions, and production authentication are not implemented.
 receives frames through a private Unix socket using versioned, size-bounded JSON
 messages and sealed `memfd` file descriptors. The compositor checks the peer UID
 and executable or systemd-unit identity before allowing capture.
+
+The compositor sends compacted renderer damage with each full shared-memory
+frame. The RDP service crops bitmap updates to those regions and forces a full
+refresh after startup, resize, reconnect, compositor queue pressure, or a
+skipped service-side frame. Idle compositor frames do not generate remote
+updates.
 
 The IronRDP dependency graph also contains an RSA implementation for its
 Hybrid/CredSSP mode. FocalDesk does not enable that mode: it selects TLS security

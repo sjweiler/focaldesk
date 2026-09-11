@@ -232,6 +232,7 @@ pub fn publish_portal_capture_source(
     texture: GlesTexture,
     size: Size<i32, Physical>,
     encoding: PortalCaptureEncoding,
+    damage: Vec<Rectangle<i32, Physical>>,
     captured_at: Instant,
 ) {
     let Some(output) = state.outputs.get(&output_id) else {
@@ -242,7 +243,6 @@ pub fn publish_portal_capture_source(
         scale: output.scale_factor,
         transform: output.handle.current_transform(),
     };
-    let damage = output.pending_damage.clone();
     state.output_capture_broker.publish(
         output_id,
         PortalCaptureSource {
@@ -864,7 +864,7 @@ fn render_fresh_portal_source(
     dt: Duration,
 ) -> Result<(GlesTexture, PortalCaptureEncoding), Box<dyn std::error::Error>> {
     let mut targets = portal_offscreen_targets_for_output(state, renderer, output_id, render_size);
-    let sync = render_output_offscreen(
+    let (sync, _damage) = render_output_offscreen(
         state,
         renderer,
         &mut targets,

@@ -4,6 +4,8 @@
 //! module narrows that mechanism to the two FocalDesk namespaces so an unrelated
 //! layer-shell client cannot silently move the desktop work area.
 
+use std::time::Duration;
+
 use smithay::{
     backend::renderer::utils::RendererSurfaceStateUserData,
     desktop::layer_map_for_output,
@@ -18,6 +20,10 @@ pub const DOCK_NAMESPACE: &str = "focaldesk-task-shelf";
 pub const LEGACY_PANEL_NAMESPACE: &str = "focal-panel";
 pub const LEGACY_DOCK_NAMESPACE: &str = "focal-dock";
 pub const SYSTEM_RAIL_INPUT_WIDTH: i32 = 64;
+/// Give the production shell clients time to map before exposing the native
+/// chrome fallback. The fallback remains immediate for a client loss later in
+/// the session.
+pub const NATIVE_CHROME_STARTUP_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TrustedShellPresence {
@@ -37,6 +43,18 @@ impl TrustedShellPresence {
             topbar: !self.system_rail && !self.legacy_panel,
             sidebar_buttons: !self.task_shelf && !self.legacy_dock,
             workspace_slots: !self.system_rail && !self.legacy_dock,
+        }
+    }
+
+    pub fn internal_chrome_with_startup_policy(
+        self,
+        session_age: Duration,
+        external_shell_expected: bool,
+    ) -> InternalChromeVisibility {
+        if external_shell_expected && session_age < NATIVE_CHROME_STARTUP_GRACE {
+            InternalChromeVisibility::hidden()
+        } else {
+            self.internal_chrome()
         }
     }
 }
@@ -59,6 +77,14 @@ impl Default for InternalChromeVisibility {
 }
 
 impl InternalChromeVisibility {
+    pub const fn hidden() -> Self {
+        Self {
+            topbar: false,
+            sidebar_buttons: false,
+            workspace_slots: false,
+        }
+    }
+
     pub fn sidebar(self) -> bool {
         self.sidebar_buttons || self.workspace_slots
     }
@@ -287,5 +313,23 @@ mod tests {
         }
         .internal_chrome();
         assert!(!complete_shell.any());
+    }
+
+    #[test]
+    fn production_startup_grace_hides_native_chrome_until_clients_can_map() {
+        let no_shell = TrustedShellPresence::default();
+        assert_eq!(
+            no_shell.internal_chrome_with_startup_policy(
+                NATIVE_CHROME_STARTUP_GRACE - Duration::from_millis(1),
+                true,
+            ),
+            InternalChromeVisibility::hidden()
+        );
+        assert!(no_shell
+            .internal_chrome_with_startup_policy(NATIVE_CHROME_STARTUP_GRACE, true)
+            .any());
+        assert!(no_shell
+            .internal_chrome_with_startup_policy(Duration::ZERO, false)
+            .any());
     }
 }

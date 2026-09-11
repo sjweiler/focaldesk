@@ -86,8 +86,10 @@ current workflow and limitations.
 
 - Permissioned local automation and optional AI-assisted workflows.
 - Additional capture consumers and remote desktop support. The detailed design
-  is tracked in [Remote Desktop Roadmap](docs/remote-desktop-roadmap.md); it is
-  not implemented functionality.
+  is tracked in [Remote Desktop Roadmap](docs/remote-desktop-roadmap.md). A
+  loopback-only, single-output, view-only Phase 3 service is implemented;
+  efficient transport, input, clipboard, production authentication, settings,
+  indicators, and multi-monitor support remain planned.
 - Broader protocol, distribution, hardware, and application compatibility.
 
 ## Release readiness

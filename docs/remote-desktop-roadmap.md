@@ -161,7 +161,7 @@ All messages require explicit size limits. File descriptors and shared buffers m
 ### Phase 1: Shared output-capture broker
 
 - [x] Add common capture frame, consumer, and session types.
-- [ ] Add a common capture error type before expanding the consumer APIs.
+- [x] Add a common capture error type before expanding the consumer APIs.
 - [x] Add an `OutputCaptureBroker` owned by the compositor state.
 - [x] Register and remove capture consumers without leaking sessions or buffers.
 - [x] Extract reusable output-export logic from portal capture.
@@ -257,9 +257,9 @@ public internet.
 
 ### Phase 4: Efficient damage and encoding
 
-- [ ] Pass the renderer's actual compacted damage rectangles to capture consumers.
-- [ ] Do not produce remote updates when an output has no damage.
-- [ ] Send changed rectangles instead of full frames where supported.
+- [x] Pass the renderer's actual compacted damage rectangles to capture consumers.
+- [x] Do not produce remote updates when an output has no damage.
+- [x] Send changed rectangles instead of full frames where supported.
 - [ ] Force a complete refresh after dropped updates, resize, reconnect, or decoder loss.
 - [ ] Keep no more than one or two pending frames per client.
 - [ ] Collect frame latency, dropped-frame, damage-area, and queue-depth metrics.
@@ -501,6 +501,7 @@ The first supported release should not ship until:
 
 ## Immediate Next Step
 
-Finish the remaining common capture types in Phase 1, exercise capture on both DRM
-and nested backends, and verify Phase 3 interoperability with at least two RDP clients.
-Then begin Phase 4 damage-only updates and bounded encoding metrics.
+Exercise capture on both DRM and nested backends and verify Phase 3
+interoperability with at least two RDP clients. Then finish Phase 4 recovery
+feedback, encoding metrics, and DMA-BUF transport while retaining shared-memory
+and software-encoding fallbacks.

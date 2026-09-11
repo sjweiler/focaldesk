@@ -9,9 +9,10 @@ use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, Ms
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_DAMAGE_RECTS: usize = 64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -39,6 +40,14 @@ pub enum OutputTransform {
     Flipped270,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DamageRect {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -61,6 +70,7 @@ pub enum Event {
         scale: f64,
         transform: OutputTransform,
         full_refresh: bool,
+        damage: Vec<DamageRect>,
     },
     CaptureStopped {
         session_id: u64,
@@ -209,6 +219,31 @@ mod tests {
         let expected = Request::StartCapture { output_id: 7 };
         write_message(&server, &expected).unwrap();
         assert_eq!(read_message::<Request>(&client).unwrap(), expected);
+    }
+
+    #[test]
+    fn damaged_frame_round_trips_with_version_envelope() {
+        let (server, client) = UnixStream::pair().unwrap();
+        let expected = Event::FrameReady {
+            session_id: 3,
+            frame_serial: 9,
+            width: 1920,
+            height: 1080,
+            stride: 7680,
+            len: 8_294_400,
+            format: PixelFormat::Rgba8888,
+            scale: 1.0,
+            transform: OutputTransform::Normal,
+            full_refresh: false,
+            damage: vec![DamageRect {
+                x: 10,
+                y: 20,
+                width: 30,
+                height: 40,
+            }],
+        };
+        write_message(&server, &expected).unwrap();
+        assert_eq!(read_message::<Event>(&client).unwrap(), expected);
     }
 
     #[test]

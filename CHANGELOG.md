@@ -10,6 +10,9 @@ version numbers where practical.
 
 ### Added
 
+- Added compacted compositor-damage metadata to the versioned remote-capture
+  protocol and damage-region RDP bitmap updates, with bounded queues, idle-frame
+  suppression, and full-refresh recovery after skipped frames or resize.
 - Added durable desktop-session restoration behind the existing Settings
   switch, with atomic checkpoints, trusted desktop-entry relaunches, workspace
   and output recovery, and Wayland/XWayland window-state placement.
@@ -65,6 +68,9 @@ version numbers where practical.
 
 ### Changed
 
+- Delayed compositor-native panel and dock fallbacks briefly during production
+  session startup, preventing partially initialized chrome from flashing while
+  the GTK system rail and task shelf start; crash fallback remains immediate.
 - Restricted the root PAM session hook's native credential-broker access to a
   non-secret readiness ping; all secret operations remain limited to same-UID
   peers and their configured ACL grants.

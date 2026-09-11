@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use focaldesk_remote_protocol::{receive_fd, Event, Request, MAX_FRAME_BYTES};
+use focaldesk_remote_protocol::{DamageRect, MAX_DAMAGE_RECTS};
 use ironrdp_server::{
     BitmapUpdate, CredentialDecision, CredentialValidationError, CredentialValidator, Credentials,
     DesktopSize, DisplayUpdate, PixelFormat, RdpServer, RdpServerDisplay, RdpServerDisplayUpdates,
@@ -37,6 +38,8 @@ struct RemoteFrame {
     height: u16,
     stride: NonZeroUsize,
     pixels: Bytes,
+    damage: Vec<DamageRect>,
+    full_refresh: bool,
 }
 
 struct DisplayHandler {
@@ -49,6 +52,7 @@ struct DisplayUpdates {
     frames: watch::Receiver<Option<RemoteFrame>>,
     last_serial: Option<u64>,
     pending_after_resize: Option<RemoteFrame>,
+    pending_bitmaps: std::collections::VecDeque<BitmapUpdate>,
 }
 
 #[async_trait::async_trait]
@@ -63,6 +67,7 @@ impl RdpServerDisplay for DisplayHandler {
             frames: self.frames.clone(),
             last_serial: None,
             pending_after_resize: None,
+            pending_bitmaps: std::collections::VecDeque::new(),
         }))
     }
 }
@@ -70,12 +75,16 @@ impl RdpServerDisplay for DisplayHandler {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for DisplayUpdates {
     async fn next_update(&mut self) -> anyhow::Result<Option<DisplayUpdate>> {
+        if let Some(bitmap) = self.pending_bitmaps.pop_front() {
+            return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
+        }
         if let Some(frame) = self.pending_after_resize.take() {
-            self.last_serial = Some(frame.serial);
-            return Ok(Some(DisplayUpdate::Bitmap(bitmap(frame))));
+            self.queue_frame(frame, true)?;
+            return Ok(self.pending_bitmaps.pop_front().map(DisplayUpdate::Bitmap));
         }
         loop {
-            if let Some(frame) = self.frames.borrow_and_update().clone() {
+            let latest = { self.frames.borrow_and_update().clone() };
+            if let Some(frame) = latest {
                 if self.last_serial != Some(frame.serial) {
                     let next_size = DesktopSize {
                         width: frame.width,
@@ -83,11 +92,18 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
                     };
                     if next_size != self.size {
                         self.size = next_size;
+                        self.pending_bitmaps.clear();
                         self.pending_after_resize = Some(frame);
                         return Ok(Some(DisplayUpdate::Resize(next_size)));
                     }
-                    self.last_serial = Some(frame.serial);
-                    return Ok(Some(DisplayUpdate::Bitmap(bitmap(frame))));
+                    let force_full = frame.full_refresh
+                        || self
+                            .last_serial
+                            .is_none_or(|last| last.saturating_add(1) != frame.serial);
+                    self.queue_frame(frame, force_full)?;
+                    if let Some(bitmap) = self.pending_bitmaps.pop_front() {
+                        return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
+                    }
                 }
             }
             if self.frames.changed().await.is_err() {
@@ -97,16 +113,92 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
     }
 }
 
-fn bitmap(frame: RemoteFrame) -> BitmapUpdate {
-    BitmapUpdate {
-        x: 0,
-        y: 0,
-        width: NonZeroU16::new(frame.width).expect("validated frame width"),
-        height: NonZeroU16::new(frame.height).expect("validated frame height"),
-        format: PixelFormat::BgrA32,
-        data: frame.pixels,
-        stride: frame.stride,
+impl DisplayUpdates {
+    fn queue_frame(&mut self, frame: RemoteFrame, force_full: bool) -> Result<()> {
+        self.last_serial = Some(frame.serial);
+        self.pending_bitmaps = bitmap_updates(frame, force_full)?.into();
+        Ok(())
     }
+}
+
+fn bitmap_updates(frame: RemoteFrame, force_full: bool) -> Result<Vec<BitmapUpdate>> {
+    if force_full {
+        return Ok(vec![BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(frame.width).expect("validated frame width"),
+            height: NonZeroU16::new(frame.height).expect("validated frame height"),
+            format: PixelFormat::BgrA32,
+            data: frame.pixels,
+            stride: frame.stride,
+        }]);
+    }
+
+    frame
+        .damage
+        .iter()
+        .copied()
+        .map(|damage| bitmap_region(&frame, damage))
+        .collect()
+}
+
+fn bitmap_region(frame: &RemoteFrame, damage: DamageRect) -> Result<BitmapUpdate> {
+    let right = damage
+        .x
+        .checked_add(damage.width)
+        .context("damage x overflow")?;
+    let bottom = damage
+        .y
+        .checked_add(damage.height)
+        .context("damage y overflow")?;
+    if damage.width == 0
+        || damage.height == 0
+        || right > u32::from(frame.width)
+        || bottom > u32::from(frame.height)
+    {
+        bail!("invalid remote damage rectangle");
+    }
+
+    let row_bytes = usize::try_from(damage.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .context("damage row size overflow")?;
+    let mut pixels = Vec::with_capacity(
+        row_bytes
+            .checked_mul(damage.height as usize)
+            .context("damage buffer size overflow")?,
+    );
+    for y in damage.y..bottom {
+        let start = (y as usize)
+            .checked_mul(frame.stride.get())
+            .and_then(|offset| offset.checked_add(damage.x as usize * 4))
+            .context("damage offset overflow")?;
+        let end = start
+            .checked_add(row_bytes)
+            .context("damage end overflow")?;
+        pixels.extend_from_slice(
+            frame
+                .pixels
+                .get(start..end)
+                .context("damage rectangle exceeds frame buffer")?,
+        );
+    }
+
+    Ok(BitmapUpdate {
+        x: u16::try_from(damage.x).context("damage x exceeds RDP limit")?,
+        y: u16::try_from(damage.y).context("damage y exceeds RDP limit")?,
+        width: NonZeroU16::new(
+            u16::try_from(damage.width).context("damage width exceeds RDP limit")?,
+        )
+        .context("zero damage width")?,
+        height: NonZeroU16::new(
+            u16::try_from(damage.height).context("damage height exceeds RDP limit")?,
+        )
+        .context("zero damage height")?,
+        format: PixelFormat::BgrA32,
+        data: pixels.into(),
+        stride: NonZeroUsize::new(row_bytes).context("zero damage stride")?,
+    })
 }
 
 struct ExpiringTokenValidator {
@@ -321,6 +413,8 @@ fn read_capture_frames(
                 height,
                 stride,
                 len,
+                damage,
+                full_refresh,
                 ..
             } => {
                 let width = u16::try_from(width).context("frame width exceeds RDP limit")?;
@@ -331,6 +425,9 @@ fn read_capture_frames(
                     .context("frame size overflow")?;
                 if len != expected || len > MAX_FRAME_BYTES {
                     bail!("invalid shared frame length");
+                }
+                if damage.is_empty() || damage.len() > MAX_DAMAGE_RECTS {
+                    bail!("invalid remote damage rectangle count");
                 }
                 let fd = receive_fd(stream)?;
                 let mut file = File::from(fd);
@@ -348,6 +445,8 @@ fn read_capture_frames(
                     height,
                     stride,
                     pixels: pixels.into(),
+                    damage,
+                    full_refresh,
                 }));
             }
             Event::CaptureStopped { .. } => bail!("capture stopped"),
@@ -475,6 +574,12 @@ mod tests {
                     scale: 1.0,
                     transform: focaldesk_remote_protocol::OutputTransform::Normal,
                     full_refresh: true,
+                    damage: vec![DamageRect {
+                        x: 0,
+                        y: 0,
+                        width: 2,
+                        height: 1,
+                    }],
                 },
             )
             .unwrap();
@@ -487,5 +592,35 @@ mod tests {
         let frame = received.borrow().clone().unwrap();
         assert_eq!(frame.serial, 7);
         assert_eq!(frame.pixels.as_ref(), &[3, 2, 1, 4, 7, 6, 5, 8]);
+    }
+
+    #[test]
+    fn incremental_frame_becomes_damage_sized_bitmap_updates() {
+        let frame = RemoteFrame {
+            serial: 1,
+            width: 3,
+            height: 2,
+            stride: NonZeroUsize::new(12).unwrap(),
+            pixels: Bytes::from_static(&[
+                1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                24,
+            ]),
+            damage: vec![DamageRect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 2,
+            }],
+            full_refresh: false,
+        };
+
+        let updates = bitmap_updates(frame, false).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].x, 1);
+        assert_eq!(updates[0].y, 0);
+        assert_eq!(updates[0].width.get(), 1);
+        assert_eq!(updates[0].height.get(), 2);
+        assert_eq!(updates[0].stride.get(), 4);
+        assert_eq!(updates[0].data.as_ref(), &[5, 6, 7, 8, 17, 18, 19, 20]);
     }
 }

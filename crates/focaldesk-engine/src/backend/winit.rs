@@ -283,7 +283,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let (renderer, mut framebuffer) = backend.bind()?;
 
-                let _sync = render_output_offscreen(
+                let (_sync, capture_damage) = render_output_offscreen(
                     &mut nested.state,
                     renderer,
                     &mut render_targets,
@@ -315,6 +315,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         capture_texture,
                         buffer_size_phys,
                         encoding,
+                        capture_damage,
                         now,
                     );
                 }

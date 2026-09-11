@@ -19,7 +19,11 @@ compositor's GPU lifetime.
 The former independent GLES renderer remains available for legacy diagnostics
 by setting `FOCALDESK_SHELL_FORCE_GLES=1`; it retains the old `focal-panel` and
 `focal-dock` namespaces. The compositor retains its native chrome as a startup
-and crash fallback. Ownership is tracked per renderable surface: the system
+failure and crash fallback. In a production DRM session, native chrome stays
+hidden for a short startup grace period so its intermediate resource-loading
+frames cannot flash before the GTK clients map; if a client still has not
+appeared when the grace period expires, its fallback becomes visible. Ownership
+is tracked per renderable surface: the system
 rail suppresses the native status/workspace controls, while the task shelf
 suppresses the native application dock. If either client disappears, only its
 corresponding compositor fallback returns.
