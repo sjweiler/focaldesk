@@ -5,22 +5,19 @@ use focaldesk_logging::flog;
 #[allow(unused_imports)]
 use smithay::backend::renderer::buffer_type;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
-#[allow(unused_imports)]
 use smithay::reexports::calloop::Interest;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-#[allow(unused_imports)]
 use smithay::reexports::wayland_server::Resource;
-#[allow(unused_imports)]
 use smithay::wayland::compositor::{
     add_blocker, add_destruction_hook, add_pre_commit_hook, with_states, BufferAssignment,
     CompositorClientState, SurfaceAttributes,
 };
 use smithay::wayland::compositor::{CompositorHandler, CompositorState as SmithayCompositorState};
 use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::drm_syncobj::DrmSyncobjCachedState;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::XWaylandClientData;
 use std::sync::atomic::AtomicUsize;
-#[allow(unused_imports)]
 use std::sync::atomic::Ordering;
 
 use smithay::desktop::layer_map_for_output;
@@ -32,7 +29,6 @@ use smithay::reexports::wayland_server::Client;
 
 #[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static XWAYLAND_BUFFER_LOGS: AtomicUsize = AtomicUsize::new(0);
-#[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static DMABUF_BLOCKER_LOGS: AtomicUsize = AtomicUsize::new(0);
 
 impl CompositorHandler for DesktopState {
@@ -60,10 +56,14 @@ impl CompositorHandler for DesktopState {
             state.handle_surface_destroyed(&id);
         });
         add_pre_commit_hook::<DesktopState, _>(surface, |state, _dh, surface| {
-            #[cfg(not(feature = "xwayland"))]
-            let _ = state;
-            let maybe_dmabuf = with_states(surface, |states| {
-                states
+            let (maybe_dmabuf, acquire_point) = with_states(surface, |states| {
+                let acquire_point = states
+                    .cached_state
+                    .get::<DrmSyncobjCachedState>()
+                    .pending()
+                    .acquire_point
+                    .clone();
+                let dmabuf = states
                     .cached_state
                     .get::<SurfaceAttributes>()
                     .pending()
@@ -72,50 +72,62 @@ impl CompositorHandler for DesktopState {
                     .and_then(|assignment| match assignment {
                         BufferAssignment::NewBuffer(buffer) => get_dmabuf(buffer).cloned().ok(),
                         _ => None,
-                    })
+                    });
+                (dmabuf, acquire_point)
             });
 
-            if let Some(dmabuf) = maybe_dmabuf {
-                #[cfg(not(feature = "xwayland"))]
-                let _ = &dmabuf;
-                #[cfg(feature = "xwayland")]
-                if let Some(client) = surface.client() {
-                    if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                        let Some(handle) = state.xwayland_loop_handle.clone() else {
-                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
-                            if seq < 100 {
-                                flog("dmabuf read blocker skipped: no compositor source loop");
-                            }
-                            return;
-                        };
+            let blocker_handle = state.surface_blocker_loop_handle.clone();
+            #[cfg(feature = "xwayland")]
+            let blocker_handle = blocker_handle.or_else(|| state.xwayland_loop_handle.clone());
 
-                        let res = handle.insert_source(source, move |_, _, data| {
-                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
-                            if seq < 100 {
-                                flog("dmabuf read blocker cleared");
-                            }
-                            let dh = data.display_handle.clone();
-                            data.client_compositor_state(&client)
-                                .blocker_cleared(data, &dh);
-                            Ok(())
-                        });
-                        if res.is_ok() {
-                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
-                            if seq < 100 {
-                                flog("dmabuf read blocker added");
-                            }
-                            add_blocker(surface, blocker);
-                        } else {
-                            let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
-                            if seq < 100 {
-                                flog("dmabuf read blocker source insert failed");
+            if state.drm_syncobj_state.is_some() {
+                if let Some(acquire_point) = acquire_point {
+                    if !state.wgpu_explicit_sync_seen {
+                        focaldesk_logging::flog(
+                            "wgpu explicit-sync acquire point observed; using asynchronous commit blockers",
+                        );
+                    }
+                    state.wgpu_explicit_sync_seen = true;
+                    if let (Some(handle), Some(client)) = (blocker_handle.clone(), surface.client())
+                    {
+                        if let Ok((blocker, source)) = acquire_point.generate_blocker() {
+                            let result = handle.insert_source(source, move |_, _, data| {
+                                let dh = data.display_handle.clone();
+                                data.client_compositor_state(&client)
+                                    .blocker_cleared(data, &dh);
+                                Ok(())
+                            });
+                            if result.is_ok() {
+                                add_blocker(surface, blocker);
+                                return;
                             }
                         }
-                    } else {
+                    }
+                    // Preserve correctness if an event source cannot be installed.
+                    if let Err(error) = acquire_point.wait(i64::MAX) {
+                        focaldesk_logging::flog_warn!(
+                            "explicit-sync acquire fallback wait failed: {error}"
+                        );
+                    }
+                }
+            }
+
+            if let (Some(dmabuf), Some(handle), Some(client)) =
+                (maybe_dmabuf, blocker_handle, surface.client())
+            {
+                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
+                    let result = handle.insert_source(source, move |_, _, data| {
+                        let dh = data.display_handle.clone();
+                        data.client_compositor_state(&client)
+                            .blocker_cleared(data, &dh);
+                        Ok(())
+                    });
+                    if result.is_ok() {
                         let seq = DMABUF_BLOCKER_LOGS.fetch_add(1, Ordering::Relaxed);
                         if seq < 100 {
-                            flog("dmabuf read blocker already ready");
+                            focaldesk_logging::flog("dmabuf read blocker added");
                         }
+                        add_blocker(surface, blocker);
                     }
                 }
             }

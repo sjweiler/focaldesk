@@ -2919,6 +2919,7 @@ name = "focaldesk-render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ash",
  "bytemuck",
  "pollster",
  "tracing",

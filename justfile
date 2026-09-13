@@ -14,6 +14,16 @@ nested-smoke-no-build:
 nested-wgpu:
     cargo run -p focaldesk-desktop --no-default-features --features wgpu
 
+nested-wgpu-smoke:
+    bash scripts/nested-wgpu-smoke.sh
+
+nested-wgpu-smoke-no-build:
+    bash scripts/nested-wgpu-smoke.sh --no-build
+
+# Compile the real DRM/KMS backend with its render-node-matched Vulkan device.
+drm-wgpu-check:
+    cargo check -p focaldesk-desktop --no-default-features --features drm-wgpu,xwayland
+
 nested-compat-matrix:
     bash scripts/nested-compat-matrix.sh
 

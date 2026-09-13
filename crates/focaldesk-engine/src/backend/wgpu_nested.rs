@@ -1,28 +1,37 @@
 //! Nested Vulkan backend built on FocalDesk's renderer boundary and wgpu.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::core::fonts::{FontId, TextStyle};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_render::{
-    FramePixelFormat, FrameTransform, LinuxDmabuf, PresentRenderer, PresentResult, TextureQuad,
-    WgpuVulkanRenderer,
+    FramePixelFormat, FrameRetention, FrameTransform, LinuxDmabuf, PresentRenderer, PresentResult,
+    SolidQuad, TextureQuad, WgpuVulkanRenderer,
 };
 use focaldesk_types::OutputId;
+use focaldesk_ui::atlas::IconId;
+use focaldesk_ui::types::UiElementKind;
+use image::GenericImageView;
 use smithay::backend::allocator::dmabuf::{DmabufMappingMode, DmabufSyncFlags};
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
+use smithay::backend::drm::{DrmDeviceFd, DrmNode};
 use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
 use smithay::desktop::{layer_map_for_output, PopupManager};
+use smithay::reexports::calloop::EventLoop as CalloopEventLoop;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
-use smithay::utils::{Logical, Physical, Point, Size, Transform};
+use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
-use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::dmabuf::{get_dmabuf, DmabufFeedbackBuilder};
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 use smithay::wayland::shm::with_buffer_contents;
@@ -45,6 +54,28 @@ use crate::core::input::{
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+
+#[derive(Default)]
+struct WgpuShellAssets {
+    wallpaper_path: Option<String>,
+    wallpaper: Option<WgpuWallpaper>,
+    icons: HashMap<IconId, WgpuIcon>,
+    unavailable_icons: HashSet<IconId>,
+    font_atlas_initialized: bool,
+    font_atlas_pending: Option<Vec<u8>>,
+}
+
+struct WgpuWallpaper {
+    cache_key: u64,
+    width: u32,
+    height: u32,
+    pending_pixels: Option<Vec<u8>>,
+}
+
+struct WgpuIcon {
+    cache_key: u64,
+    pending_pixels: Option<Vec<u8>>,
+}
 
 fn hashed_cache_key(namespace: u8, value: &impl Hash) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -85,6 +116,8 @@ struct NestedVulkanApp {
     logged_dmabuf_import: bool,
     modifiers: FlowModifiers,
     surface_commits: HashMap<ObjectId, CommitCounter>,
+    shell_assets: WgpuShellAssets,
+    surface_blocker_loop: Option<CalloopEventLoop<'static, crate::core::desktop::DesktopState>>,
     fatal_error: Option<anyhow::Error>,
 }
 
@@ -99,6 +132,13 @@ impl NestedVulkanApp {
         let Some(desktop) = self.desktop.as_mut() else {
             return Ok(false);
         };
+
+        if let Some(event_loop) = self.surface_blocker_loop.as_mut() {
+            event_loop.dispatch(Some(Duration::ZERO), &mut desktop.state)?;
+        }
+        if let Some(renderer) = self.renderer.as_ref() {
+            renderer.poll()?;
+        }
 
         while let Some(stream) = desktop.listener.accept()? {
             let client_state = client_state_from_stream(&stream);
@@ -136,7 +176,7 @@ impl NestedVulkanApp {
             warn!(%error, "ignoring nonfatal Wayland flush error");
         }
 
-        Ok(desktop.state.needs_redraw() || !desktop.clients.is_empty())
+        Ok(desktop.state.needs_redraw())
     }
 
     fn resize_output(&mut self, width: u32, height: u32, scale_factor: f64) {
@@ -221,7 +261,7 @@ impl ApplicationHandler for NestedVulkanApp {
                 return;
             }
         };
-        let dmabuf_formats = [
+        let mut dmabuf_formats = vec![
             Format {
                 code: Fourcc::Argb8888,
                 modifier: Modifier::Linear,
@@ -230,15 +270,92 @@ impl ApplicationHandler for NestedVulkanApp {
                 code: Fourcc::Xrgb8888,
                 modifier: Modifier::Linear,
             },
+            Format {
+                code: Fourcc::Abgr8888,
+                modifier: Modifier::Linear,
+            },
+            Format {
+                code: Fourcc::Xbgr8888,
+                modifier: Modifier::Linear,
+            },
         ];
-        let dmabuf_global = desktop
-            .state
-            .dmabuf_state
-            .create_global::<crate::core::desktop::DesktopState>(
-                &desktop.display.handle(),
-                dmabuf_formats,
-            );
+        for capability in renderer.dmabuf_formats() {
+            let modifier = Modifier::from(capability.modifier);
+            let codes = match capability.format {
+                FramePixelFormat::Bgra8Srgb => [Fourcc::Argb8888, Fourcc::Xrgb8888],
+                FramePixelFormat::Rgba8Srgb => [Fourcc::Abgr8888, Fourcc::Xbgr8888],
+            };
+            dmabuf_formats.extend(codes.map(|code| Format { code, modifier }));
+        }
+        dmabuf_formats
+            .sort_unstable_by_key(|format| (format.code as u32, u64::from(format.modifier)));
+        dmabuf_formats.dedup();
+
+        let drm_node = renderer
+            .drm_render_node()
+            .and_then(|node| DrmNode::from_dev_id(libc::makedev(node.major, node.minor)).ok());
+        let dmabuf_global = if let Some(node) = drm_node {
+            let feedback =
+                match DmabufFeedbackBuilder::new(node.dev_id(), dmabuf_formats.iter().copied())
+                    .build()
+                {
+                    Ok(feedback) => feedback,
+                    Err(error) => {
+                        self.fail(event_loop, error.into());
+                        return;
+                    }
+                };
+            desktop
+                .state
+                .dmabuf_state
+                .create_global_with_default_feedback::<crate::core::desktop::DesktopState>(
+                    &desktop.display.handle(),
+                    &feedback,
+                )
+        } else {
+            desktop
+                .state
+                .dmabuf_state
+                .create_global::<crate::core::desktop::DesktopState>(
+                    &desktop.display.handle(),
+                    dmabuf_formats.iter().copied(),
+                )
+        };
         desktop.state.dmabuf_global = Some(dmabuf_global);
+        desktop.state.dmabuf_node = drm_node;
+        desktop.state.wgpu_dmabuf_formats = dmabuf_formats;
+
+        if let Some(path) = drm_node.and_then(|node| node.dev_path()) {
+            if let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) {
+                let owned: OwnedFd = file.into();
+                let device = DrmDeviceFd::new(DeviceFd::from(owned));
+                if supports_syncobj_eventfd(&device) {
+                    desktop.state.drm_syncobj_state = Some(DrmSyncobjState::new::<
+                        crate::core::desktop::DesktopState,
+                    >(
+                        &desktop.display.handle(), device
+                    ));
+                }
+            }
+        }
+
+        let surface_blocker_loop = match CalloopEventLoop::try_new() {
+            Ok(event_loop) => event_loop,
+            Err(error) => {
+                self.fail(event_loop, error.into());
+                return;
+            }
+        };
+        desktop.state.surface_blocker_loop_handle = Some(surface_blocker_loop.handle());
+
+        let dmabuf_format_count = desktop.state.wgpu_dmabuf_formats.len();
+        let dmabuf_modifier_count = desktop
+            .state
+            .wgpu_dmabuf_formats
+            .iter()
+            .filter(|format| format.modifier != Modifier::Linear)
+            .count();
+        let explicit_sync = desktop.state.drm_syncobj_state.is_some();
 
         let info = renderer.info();
         info!(
@@ -248,6 +365,11 @@ impl ApplicationHandler for NestedVulkanApp {
             driver_info = %info.driver_info,
             surface_format = %info.surface_format,
             direct_dmabuf_import = renderer.supports_direct_dmabuf_import(),
+            dmabuf_format_count,
+            dmabuf_modifier_count,
+            explicit_sync,
+            retained_output_damage = true,
+            native_shell_geometry = true,
             wayland_display = %desktop.wayland_display,
             "initialized nested wgpu Vulkan compositor"
         );
@@ -255,6 +377,7 @@ impl ApplicationHandler for NestedVulkanApp {
         window.request_redraw();
         self.renderer = Some(renderer);
         self.desktop = Some(desktop);
+        self.surface_blocker_loop = Some(surface_blocker_loop);
         self.window = Some(window);
     }
 
@@ -381,17 +504,44 @@ impl ApplicationHandler for NestedVulkanApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let mut surfaces = match self.desktop.as_ref() {
-                    Some(desktop) => collect_shm_surfaces(desktop, &mut self.surface_commits),
-                    None => Vec::new(),
-                };
+                let (background, overlay) = self
+                    .desktop
+                    .as_mut()
+                    .map(collect_shell_quads)
+                    .unwrap_or_default();
+                let damage = self
+                    .desktop
+                    .as_ref()
+                    .and_then(|desktop| desktop.state.outputs.get(&desktop.state.primary_output))
+                    .map(|output| {
+                        output
+                            .pending_damage
+                            .iter()
+                            .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let mut surfaces = Vec::new();
+                let mut shell_surface_count = 0;
+                if let Some(desktop) = self.desktop.as_mut() {
+                    prepare_shell_text(desktop, &mut self.shell_assets);
+                    append_wallpaper_quads(desktop, &mut self.shell_assets, &mut surfaces);
+                    append_shell_icon_quads(desktop, &mut self.shell_assets, &mut surfaces);
+                    append_topbar_text_quads(desktop, &mut self.shell_assets, &mut surfaces);
+                    shell_surface_count = surfaces.len();
+                    surfaces.extend(collect_shm_surfaces(desktop, &mut self.surface_commits));
+                }
+                let client_surface_count = surfaces.len() - shell_surface_count;
+                let overlay_after_surface = surfaces.len();
+                if let Some(desktop) = self.desktop.as_ref() {
+                    append_notification_text_quads(desktop, &mut self.shell_assets, &mut surfaces);
+                }
                 // Object IDs are unique while alive, but keep long-running
                 // sessions bounded if clients churn through huge buffer pools.
                 // Clearing is safe: the next use conservatively uploads fully.
                 if self.surface_commits.len() > 4096 {
                     self.surface_commits.clear();
                 }
-                let client_surface_count = surfaces.len();
                 let cursor_present = self.desktop.as_mut().is_some_and(|desktop| {
                     append_cursor_texture_quads(desktop, &mut self.surface_commits, &mut surfaces)
                 });
@@ -399,7 +549,15 @@ impl ApplicationHandler for NestedVulkanApp {
                     .renderer
                     .as_mut()
                     .context("renderer missing after nested window initialization")
-                    .and_then(|renderer| renderer.present_frame(&surfaces));
+                    .and_then(|renderer| {
+                        renderer.present_frame(
+                            &background,
+                            &surfaces,
+                            &overlay,
+                            overlay_after_surface,
+                            &damage,
+                        )
+                    });
                 match result {
                     Ok(PresentResult::Presented) => {
                         if !self.logged_dmabuf_import {
@@ -465,13 +623,568 @@ impl ApplicationHandler for NestedVulkanApp {
         warn!("nested wgpu Vulkan window suspended");
         self.desktop = None;
         self.renderer = None;
+        self.surface_blocker_loop = None;
         self.window = None;
         self.logged_first_present = false;
         self.logged_first_surface_present = false;
         self.logged_first_cursor_present = false;
         self.logged_dmabuf_import = false;
+        self.shell_assets = WgpuShellAssets::default();
         self.surface_commits.clear();
     }
+}
+
+const WGPU_LABEL_STYLE: TextStyle = TextStyle {
+    font: FontId::IbmPlexSansMedium,
+    size_px: 15,
+    letter_spacing_64: 0,
+};
+const WGPU_BODY_STYLE: TextStyle = TextStyle {
+    font: FontId::IbmPlexSansRegular,
+    size_px: 13,
+    letter_spacing_64: 0,
+};
+
+fn clipped_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn prepare_shell_text(desktop: &mut NestedDesktop, assets: &mut WgpuShellAssets) {
+    let mut strings = vec![("FOCALDESK".to_string(), WGPU_LABEL_STYLE)];
+    strings.extend(
+        desktop
+            .state
+            .ui
+            .elements
+            .iter()
+            .filter(|element| element.visible)
+            .filter_map(|element| {
+                element
+                    .label
+                    .as_deref()
+                    .map(|label| (clipped_text(label, 48), WGPU_LABEL_STYLE))
+            }),
+    );
+    for notification in desktop.state.notification_snapshots.iter().take(3) {
+        strings.push((clipped_text(&notification.title, 38), WGPU_LABEL_STYLE));
+        strings.push((clipped_text(&notification.body, 52), WGPU_BODY_STYLE));
+    }
+    for (text, style) in strings {
+        if let Err(error) = desktop.state.fonts.prepare_text(&text, style) {
+            warn!(%error, "failed to prepare wgpu shell text");
+        }
+    }
+    if desktop.state.fonts.atlas_dirty || !assets.font_atlas_initialized {
+        let alpha = desktop.state.fonts.atlas_pixels();
+        let mut rgba = Vec::with_capacity(alpha.len() * 4);
+        for &value in alpha {
+            rgba.extend_from_slice(&[value, value, value, value]);
+        }
+        assets.font_atlas_pending = Some(rgba);
+        assets.font_atlas_initialized = true;
+        desktop.state.fonts.clear_dirty();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_text_quads(
+    desktop: &NestedDesktop,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+    text: &str,
+    mut cursor_x: i32,
+    baseline_y: i32,
+    style: TextStyle,
+    color: [f32; 4],
+    scale: f64,
+) {
+    let (atlas_width, atlas_height) = desktop.state.fonts.atlas_size();
+    for ch in text.chars() {
+        if ch == ' ' {
+            cursor_x += style.size_px as i32 / 2;
+            continue;
+        }
+        let Some(glyph) = desktop.state.fonts.glyph((style.font, style.size_px, ch)) else {
+            continue;
+        };
+        let advance = (glyph.advance + f32::from(style.letter_spacing_64) / 64.0).round() as i32;
+        if glyph.w == 0 || glyph.h == 0 {
+            cursor_x += advance;
+            continue;
+        }
+        let rect = Rectangle::<i32, Logical>::from_loc_and_size(
+            (
+                cursor_x + glyph.xmin,
+                baseline_y - glyph.ymin - glyph.h as i32,
+            ),
+            (glyph.w as i32, glyph.h as i32),
+        )
+        .to_physical_precise_round(Scale::from(scale));
+        let upload_pending = assets.font_atlas_pending.is_some();
+        output.push(TextureQuad {
+            cache_key: hashed_cache_key(4, &"font-atlas"),
+            pixels: assets.font_atlas_pending.take().unwrap_or_default(),
+            width: atlas_width,
+            height: atlas_height,
+            stride: atlas_width.saturating_mul(4),
+            format: FramePixelFormat::Rgba8Srgb,
+            dmabuf: None,
+            damage: if upload_pending {
+                vec![[0, 0, atlas_width, atlas_height]]
+            } else {
+                Vec::new()
+            },
+            destination: [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
+            source_uv: [
+                glyph.atlas_x as f32 / atlas_width as f32,
+                glyph.atlas_y as f32 / atlas_height as f32,
+                (glyph.atlas_x + glyph.w) as f32 / atlas_width as f32,
+                (glyph.atlas_y + glyph.h) as f32 / atlas_height as f32,
+            ],
+            transform: FrameTransform::Normal,
+            tint: color,
+            retention: None,
+        });
+        cursor_x += advance;
+    }
+}
+
+fn append_topbar_text_quads(
+    desktop: &NestedDesktop,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+) {
+    let output_id = desktop.state.primary_output;
+    let Some(output_state) = desktop.state.outputs.get(&output_id) else {
+        return;
+    };
+    let visibility = desktop
+        .state
+        .internal_chrome_visibility_for_output(output_id, Instant::now());
+    if !visibility.topbar {
+        return;
+    }
+    let Some(layout) = desktop.state.chrome_layout_for_output(output_id) else {
+        return;
+    };
+    let theme = desktop.state.theme.active_theme();
+    append_text_quads(
+        desktop,
+        assets,
+        output,
+        "FOCALDESK",
+        layout.topbar.title.loc.x + 12,
+        layout.topbar.title.loc.y + layout.topbar.title.size.h / 2 + 5,
+        WGPU_LABEL_STYLE,
+        theme.text.title,
+        output_state.scale_factor,
+    );
+    for element in desktop
+        .state
+        .ui
+        .elements
+        .iter()
+        .filter(|element| element.visible)
+    {
+        let Some(label) = element.label.as_deref() else {
+            continue;
+        };
+        append_text_quads(
+            desktop,
+            assets,
+            output,
+            &clipped_text(label, 48),
+            element.bounds.x + 6,
+            element.bounds.y + element.bounds.h / 2 + 5,
+            WGPU_LABEL_STYLE,
+            theme.text.normal,
+            output_state.scale_factor,
+        );
+    }
+}
+
+fn append_notification_text_quads(
+    desktop: &NestedDesktop,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+) {
+    if desktop.state.lock_screen.active && desktop.state.privacy.hide_lock_screen_notifications {
+        return;
+    }
+    let output_id = desktop.state.primary_output;
+    let Some(output_state) = desktop.state.outputs.get(&output_id) else {
+        return;
+    };
+    let Some(layout) = desktop.state.chrome_layout_for_output(output_id) else {
+        return;
+    };
+    let theme = desktop.state.theme.active_theme();
+    let card_width = 320.min((output_state.logical_size.w - 24).max(1));
+    let x = (output_state.logical_size.w - card_width - 12).max(0) + 14;
+    let mut y = layout.topbar.outer.size.h + 12;
+    for notification in desktop.state.notification_snapshots.iter().take(3) {
+        append_text_quads(
+            desktop,
+            assets,
+            output,
+            &clipped_text(&notification.title, 38),
+            x,
+            y + 25,
+            WGPU_LABEL_STYLE,
+            theme.text.title,
+            output_state.scale_factor,
+        );
+        append_text_quads(
+            desktop,
+            assets,
+            output,
+            &clipped_text(&notification.body, 52),
+            x,
+            y + 52,
+            WGPU_BODY_STYLE,
+            theme.text.normal,
+            output_state.scale_factor,
+        );
+        y += 92;
+    }
+}
+
+fn append_wallpaper_quads(
+    desktop: &mut NestedDesktop,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+) {
+    let output_id = desktop.state.primary_output;
+    let theme = desktop.state.theme.active_theme();
+    let path = theme.wallpaper.path.clone();
+    if assets.wallpaper_path != path {
+        assets.wallpaper_path.clone_from(&path);
+        assets.wallpaper = path.as_deref().and_then(|path| {
+            let image = match image::open(path) {
+                Ok(image) => image,
+                Err(error) => {
+                    warn!(%path, %error, "failed to decode wgpu wallpaper");
+                    return None;
+                }
+            };
+            let (width, height) = image.dimensions();
+            Some(WgpuWallpaper {
+                cache_key: hashed_cache_key(2, &path),
+                width,
+                height,
+                pending_pixels: Some(image.to_rgba8().into_raw()),
+            })
+        });
+    }
+    let Some(asset) = assets.wallpaper.as_mut() else {
+        return;
+    };
+    let Some(layout) = desktop.state.chrome_layout_for_output(output_id) else {
+        return;
+    };
+    let Some(output_state) = desktop.state.outputs.get(&output_id) else {
+        return;
+    };
+    let mode = match theme.wallpaper.fit {
+        focaldesk_themes::ThemeWallpaperFit::Fill => crate::core::wallpaper::WallpaperMode::Fill,
+        focaldesk_themes::ThemeWallpaperFit::Fit => crate::core::wallpaper::WallpaperMode::Fit,
+        focaldesk_themes::ThemeWallpaperFit::Stretch => {
+            crate::core::wallpaper::WallpaperMode::Stretch
+        }
+        focaldesk_themes::ThemeWallpaperFit::Center => {
+            crate::core::wallpaper::WallpaperMode::Center
+        }
+        focaldesk_themes::ThemeWallpaperFit::Tile => crate::core::wallpaper::WallpaperMode::Tile,
+    };
+    let work = layout.work_area.recess;
+    let blits = crate::core::wallpaper::compute_wallpaper_blits(
+        crate::core::wallpaper::SizeI {
+            w: asset.width as i32,
+            h: asset.height as i32,
+        },
+        crate::core::wallpaper::RectI {
+            x: work.loc.x,
+            y: work.loc.y,
+            w: work.size.w,
+            h: work.size.h,
+        },
+        mode,
+    );
+    let tint = theme.wallpaper.tint_color;
+    let dim = (1.0 - theme.wallpaper.dim).clamp(0.0, 1.0);
+    let tint = [
+        dim * ((1.0 - tint[3]) + tint[0] * tint[3]),
+        dim * ((1.0 - tint[3]) + tint[1] * tint[3]),
+        dim * ((1.0 - tint[3]) + tint[2] * tint[3]),
+        1.0,
+    ];
+    let upload_pending = asset.pending_pixels.is_some();
+    for (index, blit) in blits.into_iter().enumerate() {
+        let destination = Rectangle::<i32, Logical>::from_loc_and_size(
+            (blit.dst.x, blit.dst.y),
+            (blit.dst.w, blit.dst.h),
+        )
+        .to_physical_precise_round(output_state.scale);
+        output.push(TextureQuad {
+            cache_key: asset.cache_key,
+            pixels: if index == 0 {
+                asset.pending_pixels.take().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
+            width: asset.width,
+            height: asset.height,
+            stride: asset.width.saturating_mul(4),
+            format: FramePixelFormat::Rgba8Srgb,
+            dmabuf: None,
+            damage: if index == 0 && upload_pending {
+                vec![[0, 0, asset.width, asset.height]]
+            } else {
+                Vec::new()
+            },
+            destination: [
+                destination.loc.x,
+                destination.loc.y,
+                destination.size.w,
+                destination.size.h,
+            ],
+            source_uv: [blit.uv.u0, blit.uv.v0, blit.uv.u1, blit.uv.v1],
+            transform: FrameTransform::Normal,
+            tint,
+            retention: None,
+        });
+    }
+}
+
+fn append_shell_icon_quads(
+    desktop: &NestedDesktop,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+) {
+    let output_id = desktop.state.primary_output;
+    let Some(output_state) = desktop.state.outputs.get(&output_id) else {
+        return;
+    };
+    let scale = output_state.scale_factor;
+    let visibility = desktop
+        .state
+        .internal_chrome_visibility_for_output(output_id, Instant::now());
+    let theme = desktop.state.theme.active_theme();
+    for element in desktop.state.ui.elements.iter().filter(|element| {
+        element.visible
+            && match element.kind {
+                UiElementKind::SidebarButton | UiElementKind::WorkspaceSlot => visibility.sidebar(),
+                UiElementKind::TopbarIndicator
+                | UiElementKind::TopbarButton
+                | UiElementKind::TopbarFlowField
+                | UiElementKind::Clock
+                | UiElementKind::OutputLabel => visibility.topbar,
+            }
+    }) {
+        let Some(icon) = element.icon else {
+            continue;
+        };
+        if !assets.icons.contains_key(&icon) && !assets.unavailable_icons.contains(&icon) {
+            match focaldesk_ui::atlas::rasterize_icon_rgba(icon, 48) {
+                Ok(mut pixels) => {
+                    for pixel in pixels.chunks_exact_mut(4) {
+                        let alpha = u16::from(pixel[3]);
+                        pixel[0] = (u16::from(pixel[0]) * alpha / 255) as u8;
+                        pixel[1] = (u16::from(pixel[1]) * alpha / 255) as u8;
+                        pixel[2] = (u16::from(pixel[2]) * alpha / 255) as u8;
+                    }
+                    assets.icons.insert(
+                        icon,
+                        WgpuIcon {
+                            cache_key: hashed_cache_key(3, &icon),
+                            pending_pixels: Some(pixels),
+                        },
+                    );
+                }
+                Err(error) => {
+                    trace!(?icon, %error, "wgpu icon has no raster source");
+                    assets.unavailable_icons.insert(icon);
+                    continue;
+                }
+            }
+        }
+        let Some(asset) = assets.icons.get_mut(&icon) else {
+            continue;
+        };
+        let state_scale = if element.active {
+            element.press_scale
+        } else if element.hovered || element.selected {
+            element.hover_scale
+        } else {
+            1.0
+        };
+        let icon_size = ((element.bounds.w.min(element.bounds.h) - 10).max(1) as f32 * state_scale)
+            .round() as i32;
+        let rect = Rectangle::<i32, Logical>::from_loc_and_size(
+            (
+                element.bounds.x + (element.bounds.w - icon_size) / 2,
+                element.bounds.y + (element.bounds.h - icon_size) / 2,
+            ),
+            (icon_size, icon_size),
+        )
+        .to_physical_precise_round(Scale::from(scale));
+        let upload_pending = asset.pending_pixels.is_some();
+        let tint = if !element.enabled {
+            theme.icons.disabled
+        } else if element.active || element.selected {
+            theme.icons.active
+        } else if element.hovered {
+            theme.icons.hover
+        } else {
+            theme.icons.inactive
+        };
+        output.push(TextureQuad {
+            cache_key: asset.cache_key,
+            pixels: asset.pending_pixels.take().unwrap_or_default(),
+            width: 48,
+            height: 48,
+            stride: 48 * 4,
+            format: FramePixelFormat::Rgba8Srgb,
+            dmabuf: None,
+            damage: if upload_pending {
+                vec![[0, 0, 48, 48]]
+            } else {
+                Vec::new()
+            },
+            destination: [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
+            source_uv: [0.0, 0.0, 1.0, 1.0],
+            transform: FrameTransform::Normal,
+            tint,
+            retention: None,
+        });
+    }
+}
+
+fn premultiplied(mut color: [f32; 4]) -> [f32; 4] {
+    color[0] *= color[3];
+    color[1] *= color[3];
+    color[2] *= color[3];
+    color
+}
+
+fn solid_quad(rect: Rectangle<i32, Logical>, scale: f64, color: [f32; 4]) -> SolidQuad {
+    let rect = rect.to_physical_precise_round(Scale::from(scale));
+    SolidQuad {
+        destination: [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
+        color: premultiplied(color),
+        corner_radius: 0.0,
+    }
+}
+
+fn rounded_solid_quad(
+    rect: Rectangle<i32, Logical>,
+    scale: f64,
+    color: [f32; 4],
+    radius: f32,
+) -> SolidQuad {
+    let mut quad = solid_quad(rect, scale, color);
+    quad.corner_radius = radius * scale as f32;
+    quad
+}
+
+/// Build the compositor-native shell geometry used while the GLES chrome is
+/// being ported. Client content remains between the background and overlay
+/// lists, so notification cards stay above application windows.
+fn collect_shell_quads(desktop: &mut NestedDesktop) -> (Vec<SolidQuad>, Vec<SolidQuad>) {
+    let output_id = desktop.state.primary_output;
+    let Some(layout) = desktop.state.rebuild_ui_tree_for_output(output_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Some(output) = desktop.state.outputs.get(&output_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    let scale = output.scale_factor;
+    let buffer_size = output.physical_size;
+    let visibility = desktop
+        .state
+        .internal_chrome_visibility_for_output(output_id, Instant::now());
+    let theme = desktop.state.theme.active_theme();
+    let chrome = theme.chrome;
+    let mut background = vec![SolidQuad {
+        destination: [0, 0, buffer_size.w, buffer_size.h],
+        color: premultiplied(theme.background.color),
+        corner_radius: 0.0,
+    }];
+
+    for (rect, color) in [
+        (layout.work_area.outer, chrome.bg_color),
+        (layout.work_area.inner_frame, chrome.trim_color),
+        (layout.work_area.recess, theme.background.color),
+    ] {
+        background.push(solid_quad(rect, scale, color));
+    }
+    if let Some(trim) = layout.work_area.trim {
+        background.push(solid_quad(trim, scale, chrome.accent_color));
+    }
+
+    if visibility.topbar {
+        background.push(rounded_solid_quad(
+            layout.topbar.outer,
+            scale,
+            chrome.bg_color,
+            chrome.corner_radius,
+        ));
+        for (rect, color) in [
+            (layout.topbar.inner, chrome.panel_color),
+            (layout.topbar.title, chrome.bg_color),
+            (layout.topbar.trim, chrome.trim_color),
+            (layout.topbar.ai_button, chrome.trim_color),
+            (layout.topbar.clock_well, chrome.bg_color),
+        ] {
+            background.push(solid_quad(rect, scale, color));
+        }
+        for &well in &layout.topbar.status_wells {
+            background.push(solid_quad(well, scale, chrome.bg_color));
+        }
+        if let Some(light) = layout.topbar.light {
+            background.push(solid_quad(light, scale, chrome.accent_color));
+        }
+    }
+
+    if visibility.sidebar() {
+        background.push(rounded_solid_quad(
+            layout.sidebar.outer,
+            scale,
+            chrome.bg_color,
+            focaldesk_ui::chrome_layout::SIDEBAR_CORNER_RADIUS,
+        ));
+        background.push(solid_quad(layout.sidebar.inner, scale, chrome.panel_color));
+        for slot in &layout.sidebar.slots {
+            background.push(solid_quad(slot.outer, scale, chrome.trim_color));
+            background.push(solid_quad(slot.inner, scale, chrome.panel_color));
+            background.push(solid_quad(slot.icon_well, scale, chrome.bg_color));
+        }
+        if let Some(light) = layout.sidebar.light {
+            background.push(solid_quad(light, scale, chrome.accent_color));
+        }
+        for &cap in &layout.sidebar.caps {
+            background.push(solid_quad(cap, scale, chrome.trim_color));
+        }
+    }
+
+    let mut overlay = Vec::new();
+    if !(desktop.state.lock_screen.active && desktop.state.privacy.hide_lock_screen_notifications) {
+        let card_width = 320.min((output.logical_size.w - 24).max(1));
+        let card_height = 82;
+        let x = (output.logical_size.w - card_width - 12).max(0);
+        let mut y = layout.topbar.outer.size.h + 12;
+        for _ in desktop.state.notification_snapshots.iter().take(3) {
+            let card = Rectangle::from_loc_and_size((x, y), (card_width, card_height));
+            let stripe = Rectangle::from_loc_and_size((x, y), (4, card_height));
+            let mut card_color = theme.dialog.panel_color;
+            card_color[3] = card_color[3].min(0.96);
+            overlay.push(rounded_solid_quad(card, scale, card_color, 10.0));
+            overlay.push(solid_quad(stripe, scale, chrome.accent_color));
+            y += card_height + 10;
+        }
+    }
+
+    (background, overlay)
 }
 
 fn append_cursor_texture_quads(
@@ -534,6 +1247,8 @@ fn append_cursor_texture_quads(
         destination: [x, y, image.width as i32, image.height as i32],
         source_uv: [0.0, 0.0, 1.0, 1.0],
         transform: FrameTransform::Normal,
+        tint: [1.0; 4],
+        retention: None,
     });
     true
 }
@@ -726,8 +1441,10 @@ fn dmabuf_surface_frame(
     let size = dmabuf.size();
     let format = dmabuf.format();
     if dmabuf.num_planes() != 1
-        || format.modifier != Modifier::Linear
-        || !matches!(format.code, Fourcc::Argb8888 | Fourcc::Xrgb8888)
+        || !matches!(
+            format.code,
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
+        )
         || size.w <= 0
         || size.h <= 0
     {
@@ -742,27 +1459,32 @@ fn dmabuf_surface_frame(
         .ok()?
         .checked_mul(usize::try_from(size.h).ok()?)?;
 
-    dmabuf
-        .sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ)
-        .ok()?;
-    let pixels = (|| {
-        let mapping = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
-        if byte_len > mapping.length() {
-            return None;
-        }
-        // SAFETY: the mapping is readable for `mapping.length()` bytes and
-        // remains alive until the owned copy has completed.
-        let source = unsafe { std::slice::from_raw_parts(mapping.ptr().cast::<u8>(), byte_len) };
-        Some(source.to_vec())
-    })();
-    let sync_ended = dmabuf
-        .sync_plane(0, DmabufSyncFlags::END | DmabufSyncFlags::READ)
-        .is_ok();
-    let mut pixels = pixels.filter(|_| sync_ended)?;
+    let mut pixels = if format.modifier == Modifier::Linear {
+        dmabuf
+            .sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ)
+            .ok()?;
+        let pixels = (|| {
+            let mapping = dmabuf.map_plane(0, DmabufMappingMode::READ).ok()?;
+            if byte_len > mapping.length() {
+                return None;
+            }
+            // SAFETY: the mapping is readable for `mapping.length()` bytes and
+            // remains alive until the owned copy has completed.
+            let source =
+                unsafe { std::slice::from_raw_parts(mapping.ptr().cast::<u8>(), byte_len) };
+            Some(source.to_vec())
+        })();
+        let sync_ended = dmabuf
+            .sync_plane(0, DmabufSyncFlags::END | DmabufSyncFlags::READ)
+            .is_ok();
+        pixels.filter(|_| sync_ended)?
+    } else {
+        Vec::new()
+    };
     let fd = dmabuf.handles().next()?.try_clone_to_owned().ok()?;
 
     #[cfg(target_endian = "little")]
-    if format.code == Fourcc::Xrgb8888 {
+    if matches!(format.code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888) {
         for row in pixels.chunks_exact_mut(stride as usize) {
             for pixel in row[..size.w as usize * 4].chunks_exact_mut(4) {
                 pixel[3] = 255;
@@ -774,16 +1496,20 @@ fn dmabuf_surface_frame(
     for row in pixels.chunks_exact_mut(stride as usize) {
         for pixel in row[..size.w as usize * 4].chunks_exact_mut(4) {
             let [a, r, g, b] = [pixel[0], pixel[1], pixel[2], pixel[3]];
-            pixel.copy_from_slice(&[
-                b,
-                g,
-                r,
-                if format.code == Fourcc::Xrgb8888 {
-                    255
-                } else {
-                    a
-                },
-            ]);
+            let alpha = if matches!(format.code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888) {
+                255
+            } else {
+                a
+            };
+            match format.code {
+                Fourcc::Argb8888 | Fourcc::Xrgb8888 => {
+                    pixel.copy_from_slice(&[b, g, r, alpha]);
+                }
+                Fourcc::Abgr8888 | Fourcc::Xbgr8888 => {
+                    pixel.copy_from_slice(&[r, g, b, alpha]);
+                }
+                _ => unreachable!("format was validated above"),
+            }
         }
     }
 
@@ -808,7 +1534,11 @@ fn dmabuf_surface_frame(
         width: size.w as u32,
         height: size.h as u32,
         stride,
-        format: FramePixelFormat::Bgra8Srgb,
+        format: match format.code {
+            Fourcc::Argb8888 | Fourcc::Xrgb8888 => FramePixelFormat::Bgra8Srgb,
+            Fourcc::Abgr8888 | Fourcc::Xbgr8888 => FramePixelFormat::Rgba8Srgb,
+            _ => unreachable!("format was validated above"),
+        },
         dmabuf: Some(LinuxDmabuf {
             fd: Arc::new(fd),
             modifier: format.modifier.into(),
@@ -818,6 +1548,8 @@ fn dmabuf_surface_frame(
         destination,
         source_uv,
         transform,
+        tint: [1.0; 4],
+        retention: Some(FrameRetention::new(buffer.clone())),
     })
 }
 
@@ -904,6 +1636,8 @@ fn shm_surface_frame(
             destination,
             source_uv,
             transform,
+            tint: [1.0; 4],
+            retention: Some(FrameRetention::new(buffer.clone())),
         })
     })
     .ok()

@@ -48,7 +48,6 @@ use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
-#[cfg(feature = "xwayland")]
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
@@ -820,6 +819,7 @@ pub struct DesktopState {
     pub xwayland_display: Option<String>,
     #[cfg(feature = "xwayland")]
     pub xwayland_loop_handle: Option<LoopHandle<'static, DesktopState>>,
+    pub surface_blocker_loop_handle: Option<LoopHandle<'static, DesktopState>>,
     pub winit_scale_factor: f64,
     pub ui: UiTree,
     ui_build_cache: Option<UiBuildCache>,
@@ -846,6 +846,9 @@ pub struct DesktopState {
     pub dmabuf_state: smithay::wayland::dmabuf::DmabufState,
     pub dmabuf_global: Option<DmabufGlobal>,
     pub dmabuf_node: Option<smithay::backend::drm::DrmNode>,
+    pub wgpu_dmabuf_formats: Vec<smithay::backend::allocator::Format>,
+    pub drm_syncobj_state: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
+    pub wgpu_explicit_sync_seen: bool,
     pub portal_dmabuf_formats: Vec<(Fourcc, Vec<Modifier>)>,
     pub shm_state: smithay::wayland::shm::ShmState,
     pub seat_state: smithay::input::SeatState<Self>,
@@ -7159,6 +7162,7 @@ impl DesktopState {
             xwayland_display: None,
             #[cfg(feature = "xwayland")]
             xwayland_loop_handle: None,
+            surface_blocker_loop_handle: None,
             winit_scale_factor: 1.0,
             ui: UiTree::default(),
             ui_build_cache: None,
@@ -7179,6 +7183,9 @@ impl DesktopState {
             dmabuf_state: init.dmabuf_state,
             dmabuf_global: None,
             dmabuf_node: None,
+            wgpu_dmabuf_formats: Vec::new(),
+            drm_syncobj_state: None,
+            wgpu_explicit_sync_seen: false,
             portal_dmabuf_formats: Vec::new(),
             shm_state: init.shm_state,
             seat_state: init.seat_state,

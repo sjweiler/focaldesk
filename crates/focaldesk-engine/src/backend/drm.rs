@@ -8,7 +8,11 @@ use crate::backend::common::{
 };
 use crate::backend::drm::drm::buffer::DrmModifier;
 use drm::control::{connector, crtc, property};
+#[cfg(feature = "wgpu")]
+use smithay::backend::allocator::dmabuf::AsDmabuf;
 use smithay::backend::allocator::Allocator;
+#[cfg(feature = "wgpu")]
+use smithay::backend::allocator::Buffer as AllocatorBuffer;
 use smithay::backend::input::{InputEvent, KeyState, SwitchState, SwitchToggleEvent};
 use smithay::reexports::drm::control::Device as _;
 use smithay::reexports::input::event::switch::Switch as InputSwitch;
@@ -662,6 +666,8 @@ pub struct DrmDeviceState {
     pub render_node: Option<DrmNode>,
     pub gpu_vendor_id: Option<u32>,
     pub renderer: GlesRenderer,
+    #[cfg(feature = "wgpu")]
+    pub wgpu_render_device: Option<focaldesk_render::WgpuDrmRenderDevice>,
     pub gbm: GbmDevice<DrmDeviceFd>,
     pub drm_output_manager: FlowDrmOutputManager,
     pub surfaces: HashMap<drm::control::crtc::Handle, DrmSurfaceState>,
@@ -3889,6 +3895,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             data.core.state.materialize_full_redraw_damage();
 
             for device in data.backend.devices.values_mut() {
+                #[cfg(feature = "wgpu")]
+                if let Some(wgpu) = device.wgpu_render_device.as_ref() {
+                    if let Err(error) = wgpu.poll() {
+                        flog_warn!("DRM wgpu Vulkan device poll failed: {error}");
+                    }
+                }
                 let gpu_vendor_id = device.gpu_vendor_id;
                 let exclusive_hdr_output = device.exclusive_hdr_output.clone();
                 let all_outputs_stable = device.surfaces.values().all(|surface| {
@@ -4818,6 +4830,36 @@ fn device_added(
     let (mut renderer, render_node_for_gpu) =
         create_drm_renderer(&gbm, node, disable_explicit_kms_fences(gpu_vendor_id))?;
 
+    #[cfg(feature = "wgpu")]
+    let wgpu_render_device = {
+        let selected_node = render_node_for_gpu.unwrap_or(node);
+        let dev_id = selected_node.dev_id();
+        let render_node = focaldesk_render::DrmRenderNode {
+            major: libc::major(dev_id),
+            minor: libc::minor(dev_id),
+        };
+        match focaldesk_render::WgpuDrmRenderDevice::new(render_node) {
+            Ok(device) => {
+                let info = device.info();
+                flog(format!(
+                    "DRM wgpu Vulkan device ready: node={}.{} adapter={} driver={} formats={}",
+                    render_node.major,
+                    render_node.minor,
+                    info.adapter_name,
+                    info.driver,
+                    device.dmabuf_formats().len(),
+                ));
+                Some(device)
+            }
+            Err(error) => {
+                flog_warn!(
+                    "DRM wgpu Vulkan device initialization failed; retaining GLES composition: {error}"
+                );
+                None
+            }
+        }
+    };
+
     match renderer.bind_wl_display(&data.core.display.handle()) {
         Ok(_) => flog("EGL Wayland display bound for DRM renderer"),
         Err(err) => flog(&format!(
@@ -5221,12 +5263,56 @@ fn device_added(
 
             let tex_phys_size: Size<i32, Physical> = Size::from((i32::from(w), i32::from(h)));
 
-            let _gbm_buffer = allocator.create_buffer(
+            let gbm_probe_buffer = allocator.create_buffer(
                 tex_phys_size.w as u32,
                 tex_phys_size.h as u32,
                 Fourcc::Argb8888,
                 &[DrmModifier::Linear],
             )?;
+            #[cfg(feature = "wgpu")]
+            if let Some(wgpu) = wgpu_render_device.as_ref() {
+                match gbm_probe_buffer.export() {
+                    Ok(dmabuf) if dmabuf.num_planes() == 1 => {
+                        let target = dmabuf
+                            .handles()
+                            .next()
+                            .and_then(|fd| fd.try_clone_to_owned().ok())
+                            .zip(dmabuf.strides().next())
+                            .zip(dmabuf.offsets().next());
+                        if let Some(((fd, stride), offset)) = target {
+                            let target = focaldesk_render::LinuxDmabuf {
+                                fd: std::sync::Arc::new(fd),
+                                modifier: dmabuf.format().modifier.into(),
+                                offset: u64::from(offset),
+                            };
+                            match wgpu.clear_dmabuf_target(
+                                &target,
+                                tex_phys_size.w as u32,
+                                tex_phys_size.h as u32,
+                                stride,
+                                focaldesk_render::FramePixelFormat::Bgra8Srgb,
+                                [0.0, 0.0, 0.0, 1.0],
+                            ) {
+                                Ok(()) => flog(format!(
+                                    "DRM wgpu Vulkan-to-GBM render-target probe passed: output={output_name} modifier={:?}",
+                                    dmabuf.format().modifier
+                                )),
+                                Err(error) => flog_warn!(
+                                    "DRM wgpu Vulkan-to-GBM probe failed on {output_name}; retaining GLES composition: {error}"
+                                ),
+                            }
+                        }
+                    }
+                    Ok(_) => flog_warn!(
+                        "DRM wgpu Vulkan-to-GBM probe skipped: allocator returned a multi-plane target"
+                    ),
+                    Err(error) => flog_warn!(
+                        "DRM wgpu Vulkan-to-GBM export failed; retaining GLES composition: {error}"
+                    ),
+                }
+            }
+            #[cfg(not(feature = "wgpu"))]
+            let _ = gbm_probe_buffer;
             let linear_sdr_supported = supports_linear_sdr(&mut renderer, tex_phys_size);
             flog(&format!(
                 "Linear SDR probe: output={output_name} format={:?} supported={linear_sdr_supported}",
@@ -5751,6 +5837,8 @@ fn device_added(
         render_node: render_node_for_gpu,
         gpu_vendor_id,
         renderer,
+        #[cfg(feature = "wgpu")]
+        wgpu_render_device,
         gbm: gbm.clone(),
         drm_output_manager,
         surfaces,

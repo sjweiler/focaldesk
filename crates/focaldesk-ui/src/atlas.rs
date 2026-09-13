@@ -266,6 +266,55 @@ fn rasterize_svg_bytes(svg_bytes: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(img.into_raw())
 }
 
+/// Rasterize a renderer-neutral white icon for backends that apply tint while
+/// sampling. The GLES atlas remains the fast path for the established backend.
+pub fn rasterize_icon_rgba(icon: IconId, size: u32) -> Result<Vec<u8>> {
+    let source: &[u8] = match icon {
+        IconId::Launcher => include_bytes!("../../../assets/svg/launcher.svg"),
+        IconId::AiConsole => include_bytes!("../../../assets/icons/bot.svg"),
+        IconId::Overflow => include_bytes!("../../../assets/svg/overflow.svg"),
+        IconId::Settings => include_bytes!("../../../assets/svg/settings.svg"),
+        IconId::Battery => include_bytes!("../../../assets/svg/battery.svg"),
+        IconId::BatteryOff => include_bytes!("../../../assets/svg/battery-off.svg"),
+        IconId::LinePower => include_bytes!("../../../assets/svg/plug.svg"),
+        IconId::FocusPip => include_bytes!("../../../assets/svg/focus_pip.svg"),
+        IconId::Ethernet => include_bytes!("../../../assets/svg/ethernet.svg"),
+        IconId::EthernetOff => include_bytes!("../../../assets/svg/ethernet-disabled.svg"),
+        IconId::Wifi => include_bytes!("../../../assets/svg/wifi.svg"),
+        IconId::WifiOff => include_bytes!("../../../assets/svg/wifi-off.svg"),
+        IconId::Bluetooth => include_bytes!("../../../assets/svg/bluetooth.svg"),
+        IconId::BluetoothOff => include_bytes!("../../../assets/svg/bluetooth-off.svg"),
+        IconId::AssignToSlot => include_bytes!("../../../assets/svg/assign-to-slot.svg"),
+        IconId::Slot(1) => include_bytes!("../../../assets/svg/slot-1.svg"),
+        IconId::Slot(2) => include_bytes!("../../../assets/svg/slot-2.svg"),
+        IconId::Slot(3) => include_bytes!("../../../assets/svg/slot-3.svg"),
+        IconId::Slot(4) => include_bytes!("../../../assets/svg/slot-4.svg"),
+        IconId::Slot(5) => include_bytes!("../../../assets/svg/slot-5.svg"),
+        IconId::Slot(6) => include_bytes!("../../../assets/svg/slot-6.svg"),
+        IconId::Slot(7) => include_bytes!("../../../assets/svg/slot-7.svg"),
+        IconId::Slot(8) => include_bytes!("../../../assets/svg/slot-8.svg"),
+        IconId::Slot(9) => include_bytes!("../../../assets/svg/slot-9.svg"),
+        IconId::Microphone => include_bytes!("../../../assets/svg/microphone.svg"),
+        IconId::MicrophoneOff => include_bytes!("../../../assets/svg/microphone-off.svg"),
+        IconId::Video => include_bytes!("../../../assets/svg/video.svg"),
+        IconId::VideoOff => include_bytes!("../../../assets/svg/video-off.svg"),
+        IconId::Speaker => include_bytes!("../../../assets/svg/volume.svg"),
+        IconId::SpeakerOff => include_bytes!("../../../assets/svg/volume-off.svg"),
+        IconId::Notifications => include_bytes!("../../../assets/svg/notifications.svg"),
+        IconId::Updates => include_bytes!("../../../assets/svg/updates.svg"),
+        IconId::Power => include_bytes!("../../../assets/svg/power-menu.svg"),
+        IconId::HDR => include_bytes!("../../../assets/svg/hdr-enabled.svg"),
+        IconId::Browser => include_bytes!("../../../assets/svg/browser.svg"),
+        IconId::Terminal => include_bytes!("../../../assets/svg/terminal.svg"),
+        IconId::Files => include_bytes!("../../../assets/svg/files.svg"),
+        IconId::Email => include_bytes!("../../../assets/svg/email.svg"),
+        IconId::Plus => include_bytes!("../../../assets/svg/plus.svg"),
+        IconId::Minus => include_bytes!("../../../assets/svg/minus.svg"),
+        _ => return Err(anyhow!("icon has no renderer-neutral SVG source: {icon:?}")),
+    };
+    rasterize_svg_bytes(&style_svg_white(source)?, size, size)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn blit_rgba(
     atlas: &mut [u8],

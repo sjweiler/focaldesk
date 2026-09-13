@@ -1,7 +1,8 @@
 use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::allocator::{Buffer, Fourcc, Modifier};
+use smithay::backend::allocator::Buffer;
 use smithay::backend::renderer::ImportDma;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
+use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};
 
 use crate::core::desktop::DesktopState;
 use focaldesk_logging::flog;
@@ -30,16 +31,12 @@ impl DmabufHandler for DesktopState {
         // pins a stale EGLImage in the renderer dmabuf cache. Textures are imported when
         // building render elements on the bound frame instead.
         let Some(ctx) = self.portal_dispatch_ctx.as_mut() else {
-            // The nested wgpu backend currently advertises only the formats it
-            // can synchronize, linearly map, and upload. Its global is created
-            // by that backend, so this branch remains unreachable for nested
+            // The nested wgpu backend records exactly the single-plane Vulkan
+            // format/modifier pairs it advertised. Its global is created by
+            // that backend, so this branch remains unreachable for nested
             // backends that do not advertise linux-dmabuf.
             let format = dmabuf.format();
-            if self.backend_kind == focaldesk_flow::keybinds::BackendKind::Winit
-                && dmabuf.num_planes() == 1
-                && format.modifier == Modifier::Linear
-                && matches!(format.code, Fourcc::Argb8888 | Fourcc::Xrgb8888)
-            {
+            if dmabuf.num_planes() == 1 && self.wgpu_dmabuf_formats.contains(&format) {
                 if seq < 200 {
                     flog(format!(
                         "linux-dmabuf accepted by nested wgpu format={format:?}"
@@ -76,5 +73,11 @@ impl DmabufHandler for DesktopState {
             ));
             notifier.failed();
         }
+    }
+}
+
+impl DrmSyncobjHandler for DesktopState {
+    fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
+        self.drm_syncobj_state.as_mut()
     }
 }

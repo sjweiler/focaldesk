@@ -162,17 +162,46 @@ just nested-wgpu
 
 It currently composites `ARGB8888` and `XRGB8888` Wayland SHM window trees,
 including subsurfaces, popups, viewport crops/scaling, and layer-shell trees.
-It also advertises single-plane linear `ARGB8888`/`XRGB8888` DMA-BUFs. Those
-buffers are imported as Vulkan textures without a GPU copy when wgpu reports
-the required external-memory extensions; a synchronized linear mapping/upload
-keeps the same protocol path working on adapters without them. To try the SHM
+It also advertises single-plane `ARGB8888`/`XRGB8888` and
+`ABGR8888`/`XBGR8888` DMA-BUFs. Supported tiled modifiers are queried from the
+selected Vulkan physical device and published through linux-dmabuf feedback.
+Those buffers are imported as Vulkan textures without a GPU copy; a synchronized
+linear mapping/upload keeps the linear protocol path working on adapters without
+external-memory support. When the Vulkan render node supports DRM syncobj
+eventfds, `linux-drm-syncobj-v1` is exposed and acquire/release timeline points
+are honored with asynchronous commit blockers and submission-bound buffer
+retention. To try the SHM
 path, find the `wayland_display` value in the initialization log and launch
 `WAYLAND_DISPLAY=focaldesk-1 weston-simple-shm`. Host keyboard, pointer,
 buttons, scrolling, focus, and cursor surfaces are wired through the normal
 compositor input path. Buffer transforms and viewport texture coordinates are
-supported. Tiled/multi-plane DMA-BUFs and shell UI are not wired yet. The
+supported. A first native shell pass draws themed topbar, sidebar, work-area,
+status-well, and notification-card geometry around the client stack. The output
+scene is retained between frames, so unchanged clients do not cause continuous
+redraws and dirty output regions are recomposed through GPU scissors.
+Wallpaper images honor the configured fit mode and tint/dim values; shell SVG
+icons and cached font-atlas text are rendered with live UI-state colors. Rounded
+panels are antialiased in the solid-quad shader. Multi-plane DMA-BUFs and full
+shell effect parity are not wired yet. The
 established winit/GLES backend remains the nested compositor used for full
 compatibility testing.
+
+Run the accelerated-client matrix with `just nested-wgpu-smoke`. It exercises
+Weston's DMA-BUF demo plus GTK4 and Chromium/Chrome when installed, verifies a
+direct non-linear Vulkan import when the adapter advertises one, and preserves
+logs under `target/nested-wgpu-smoke`.
+
+The real DRM/KMS backend has an opt-in Vulkan bring-up build:
+
+```sh
+just drm-wgpu-check
+```
+
+This selects and creates a Vulkan device by the exact DRM render-node identity
+already chosen by the KMS backend, keeps it polled in the DRM render loop, and
+performs a bounded Vulkan clear into the output's real GBM allocation probe.
+GLES remains the scanout presenter until full Vulkan scene composition and
+explicit Vulkan/KMS fences are connected to `DrmOutput`.
 
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are

@@ -8,9 +8,14 @@ An experimental `focaldesk-render` boundary now contains a Vulkan-only wgpu
 nested compositor implementation. It selects a Vulkan adapter, owns the wgpu
 surface and pipelines, handles resize and surface-loss recovery, and composites
 Wayland `ARGB8888`/`XRGB8888` surface trees with premultiplied alpha. SHM
-buffers use damage-aware uploads. Single-plane linear DMA-BUFs use wgpu-hal's
-Vulkan external-memory import when supported, with a synchronized mapped upload
-as a compatibility fallback. Window
+buffers use damage-aware uploads. Single-plane BGRA and RGBA DMA-BUF modifier
+support is queried from Vulkan and advertised with linux-dmabuf feedback.
+DMA-BUFs use wgpu-hal's Vulkan external-memory import, with a synchronized
+mapped upload for linear buffers as a compatibility fallback. The Vulkan render
+node also backs `linux-drm-syncobj-v1`: acquire timeline points install
+asynchronous Smithay commit blockers, and client buffers remain retained until
+wgpu reports completion of the submission that sampled them. That permits the
+release timeline point to signal without a compositor-thread GPU idle wait. Window
 subsurfaces and popups follow Smithay's surface stacking and committed offsets,
 and normal-orientation viewport crops/scaling are mapped into texture
 coordinates. Layer-shell surfaces are placed around the window stack according
@@ -28,9 +33,26 @@ uploads only accumulated damage rectangles when a cached upload buffer returns.
 Unused entries age out of the cache. All eight Wayland buffer rotations and
 reflections are applied while mapping viewport texture coordinates.
 
-This remains an early vertical slice. It does not yet render FocalDesk shell UI,
-tiled or multi-plane DMA-BUFs, output-damage-only frames, or color-managed/HDR
-output.
+The Vulkan path also has a retained output scene. Pending physical output
+damage is clamped and applied as render-pass scissors; the complete retained
+scene is then sampled into whichever swapchain image was acquired. This avoids
+depending on swapchain-image preservation while limiting scene recomposition to
+dirty pixels. With no compositor damage, connected idle clients no longer
+schedule frames continuously.
+
+The shell pass now renders configured wallpaper fit/tint/dim behavior, cached
+font-atlas text, state-tinted SVG icons, antialiased rounded panels, and
+notification text above clients while keeping cursors foremost. Advanced GLES
+effect parity, multi-plane DMA-BUFs, and color-managed/HDR output remain.
+
+When `drm-wgpu` is combined with the real DRM backend, FocalDesk creates a
+Vulkan device matched by DRM render-node major/minor and polls it from the DRM
+render loop. At output initialization it imports the backend's real single-plane
+GBM allocation into Vulkan as a color attachment and submits a bounded render
+probe. This establishes the correct multi-GPU ownership and target-import
+boundary. The current KMS frame still comes from the established GLES
+offscreen/DrmOutput path; full Vulkan scene output plus explicit Vulkan/KMS
+fences is the next DRM migration stage.
 
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 
