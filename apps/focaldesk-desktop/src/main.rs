@@ -4,6 +4,8 @@ use tracing::info;
 
 #[cfg(feature = "drm")]
 use focaldesk_engine::backend::drm;
+#[cfg(all(not(feature = "drm"), not(feature = "winit"), feature = "wgpu"))]
+use focaldesk_engine::backend::wgpu_nested;
 #[cfg(all(not(feature = "drm"), feature = "winit"))]
 use focaldesk_engine::backend::winit;
 #[cfg(feature = "drm")]
@@ -59,3 +61,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(target: "focaldesk", session_id = session_id(), backend = "winit", "starting FocalDesk");
     winit::run()
 }
+
+#[cfg(all(not(feature = "drm"), not(feature = "winit"), feature = "wgpu"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    init_default_logging();
+    startup_banner(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        "nested-wgpu-vulkan",
+    );
+    info!(target: "focaldesk", session_id = session_id(), backend = "nested-wgpu-vulkan", "starting FocalDesk");
+    wgpu_nested::run()
+}
+
+#[cfg(not(any(feature = "drm", feature = "winit", feature = "wgpu")))]
+compile_error!("enable one of the `drm`, `winit`, or `wgpu` backend features");

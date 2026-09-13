@@ -19,6 +19,7 @@ anyhow = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize.workspace = true
 focaldesk-ui = { path = "../focaldesk-ui" }
+focaldesk-render = { path = "../focaldesk-render", default-features = false, optional = true }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-flow = { path = "../focaldesk-flow" }
@@ -66,5 +67,6 @@ md5 = "0.7"
 [features]
 default = ["winit"]
 winit = ["dep:winit"]
+wgpu = ["dep:winit", "dep:focaldesk-render", "focaldesk-render/wgpu"]
 xwayland = ["smithay/xwayland"]
 drm = []

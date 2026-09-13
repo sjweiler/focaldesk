@@ -4,6 +4,19 @@
 
 FocalDesk uses a GPU-accelerated rendering pipeline built on OpenGL ES.
 
+An experimental `focaldesk-render` boundary now contains a Vulkan-only wgpu
+nested compositor implementation. It selects a Vulkan adapter, owns the wgpu
+surface and pipelines, handles resize and surface-loss recovery, and composites
+root Wayland `ARGB8888`/`XRGB8888` SHM buffers with premultiplied alpha. The
+production DRM/KMS and established nested compositor paths continue to use
+OpenGL ES.
+
+The wgpu path is intentionally an early vertical slice. It does not yet render
+subsurfaces, popups, layer-shell surfaces, FocalDesk shell UI, cursor/input,
+viewport transforms, DMA-BUFs, damage-only updates, or color-managed/HDR
+output. SHM textures and bind groups are currently rebuilt for every frame;
+resource caching comes after surface-tree semantics are in place.
+
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 
 Rendering is designed to be modular so additional effects, color management, HDR, and future rendering backends can be added without redesigning the compositor.

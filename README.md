@@ -22,7 +22,8 @@ tracked in [Known Issues](docs/known-issues.md).
 
 ## Features
 
-- Custom Wayland compositor with direct DRM/KMS and nested winit backends.
+- Custom Wayland compositor with direct DRM/KMS and nested winit backends, plus
+  an experimental nested wgpu/Vulkan presentation path.
 - Keyboard-oriented workspaces and multi-monitor window management.
 - XWayland support for X11 applications, including tested Wine/DXVK workflows.
 - OpenGL ES rendering with shell effects, damage tracking, and experimental HDR

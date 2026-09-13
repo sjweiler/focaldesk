@@ -151,6 +151,23 @@ Run the winit backend inside an existing Wayland session:
 cargo run -p focaldesk-desktop --no-default-features --features winit,xwayland
 ```
 
+An experimental wgpu compositor backend is also available. It deliberately
+enables only wgpu's Vulkan backend, opens a nested window, advertises its own
+Wayland socket, logs the selected adapter and driver, and presents frames while
+handling resize and surface-loss events:
+
+```sh
+just nested-wgpu
+```
+
+It currently composites root `ARGB8888` and `XRGB8888` Wayland SHM buffers. To
+try that path, find the `wayland_display` value in the initialization log and
+launch an SHM client against it, for example
+`WAYLAND_DISPLAY=focaldesk-1 weston-simple-shm`. Input, subsurfaces, popups,
+layer-shell surfaces, DMA-BUF import, and shell UI are not wired yet. The
+established winit/GLES backend remains the nested compositor used for full
+compatibility testing.
+
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are
 not available in nested mode.

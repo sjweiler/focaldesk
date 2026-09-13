@@ -10,6 +10,10 @@ nested-smoke:
 nested-smoke-no-build:
     bash scripts/nested-smoke.sh --no-build
 
+# Experimental Vulkan compositor with initial root-SHM surface support.
+nested-wgpu:
+    cargo run -p focaldesk-desktop --no-default-features --features wgpu
+
 nested-compat-matrix:
     bash scripts/nested-compat-matrix.sh
 
