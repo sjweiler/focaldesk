@@ -1,12 +1,12 @@
 use std::time::Instant;
 
-use focaldesk_themes::{FlowTheme, FlowThemeId};
+use focaldesk_themes::{FlowTheme, FlowThemeId, ThemePaint};
 use focaldesk_types::OutputId;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::Texture;
-use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
-use smithay::utils::{Logical, Physical, Rectangle, Size};
+use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture, Uniform};
+use smithay::utils::{Buffer, Logical, Physical, Rectangle, Size};
 
 use crate::atlas::IconAtlas;
 use crate::chrome::ChromeMetrics;
@@ -302,10 +302,105 @@ impl DesktopOutput {
     fn render_background(
         &self,
         frame: &mut GlesFrame<'_, '_>,
-        _frame_ctx: &DesktopFrameCtx,
+        frame_ctx: &DesktopFrameCtx,
         theme: &FlowTheme,
         damage: &[Rectangle<i32, Physical>],
     ) -> Result<(), smithay::backend::renderer::gles::GlesError> {
+        if let Some(intent) = &theme.editor_paint
+            && !matches!(intent.paint, ThemePaint::Solid { .. })
+            && let Some(program) = &self.chrome_shaders.theme_gradient
+        {
+            let (kind, direction, center, radius, premultiplied, stops) = match &intent.paint {
+                ThemePaint::LinearGradient {
+                    angle,
+                    interpolation,
+                    stops,
+                } => {
+                    let radians = angle.to_radians();
+                    (
+                        1.0,
+                        [radians.cos(), radians.sin()],
+                        [0.5, 0.5],
+                        1.0,
+                        interpolation.premultiplied_alpha,
+                        stops,
+                    )
+                }
+                ThemePaint::RadialGradient {
+                    center,
+                    radius,
+                    interpolation,
+                    stops,
+                } => (
+                    2.0,
+                    [1.0, 0.0],
+                    [center.0, center.1],
+                    *radius,
+                    interpolation.premultiplied_alpha,
+                    stops,
+                ),
+                ThemePaint::Solid { .. } => unreachable!(),
+            };
+            let mut positions = [1.0_f32; 8];
+            let mut colors = [[0.0_f32; 4]; 8];
+            for (index, stop) in stops.iter().enumerate().take(8) {
+                positions[index] = stop.position;
+                let mut color = intent
+                    .compositor_sample(stop.position)
+                    .expect("validated gradient stop")
+                    .components();
+                if !theme.semantic_colors_linear {
+                    for channel in &mut color[..3] {
+                        *channel = linear_to_srgb(*channel);
+                    }
+                }
+                colors[index] = color;
+            }
+            if let Some(last) = stops.len().checked_sub(1) {
+                for index in stops.len()..8 {
+                    colors[index] = colors[last];
+                }
+            }
+            let size = Size::<i32, Buffer>::from(frame_ctx.output_size);
+            let destination = Rectangle::from_loc_and_size((0, 0), frame_ctx.output_size);
+            let source = Rectangle::<f64, Buffer>::from_loc_and_size(
+                (0.0, 0.0),
+                (f64::from(size.w), f64::from(size.h)),
+            );
+            return frame.render_pixel_shader_to(
+                program,
+                source,
+                destination,
+                size,
+                Some(damage),
+                1.0,
+                &[
+                    Uniform::new("u_size", [size.w as f32, size.h as f32]),
+                    Uniform::new("u_kind", kind),
+                    Uniform::new("u_direction", direction),
+                    Uniform::new("u_center", center),
+                    Uniform::new("u_radius", radius),
+                    Uniform::new("u_stop_count", stops.len() as f32),
+                    Uniform::new(
+                        "u_positions0",
+                        [positions[0], positions[1], positions[2], positions[3]],
+                    ),
+                    Uniform::new(
+                        "u_positions1",
+                        [positions[4], positions[5], positions[6], positions[7]],
+                    ),
+                    Uniform::new("u_premultiplied", if premultiplied { 1.0 } else { 0.0 }),
+                    Uniform::new("u_color0", colors[0]),
+                    Uniform::new("u_color1", colors[1]),
+                    Uniform::new("u_color2", colors[2]),
+                    Uniform::new("u_color3", colors[3]),
+                    Uniform::new("u_color4", colors[4]),
+                    Uniform::new("u_color5", colors[5]),
+                    Uniform::new("u_color6", colors[6]),
+                    Uniform::new("u_color7", colors[7]),
+                ],
+            );
+        }
         let c = theme.background.color;
         frame.clear(Color32F::new(c[0], c[1], c[2], c[3]), damage)
     }
@@ -503,6 +598,14 @@ impl DesktopOutput {
         }
 
         self.workarea.hit_test(point)
+    }
+}
+
+fn linear_to_srgb(channel: f32) -> f32 {
+    if channel <= 0.003_130_8 {
+        12.92 * channel
+    } else {
+        1.055 * channel.powf(1.0 / 2.4) - 0.055
     }
 }
 

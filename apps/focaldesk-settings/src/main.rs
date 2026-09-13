@@ -107,6 +107,97 @@ const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("focus_next", "Focus next window", "Super+F8"),
 ];
 
+fn normalized_shortcut(shortcut: &str) -> Result<String, String> {
+    let mut modifiers = Vec::new();
+    let mut key = None;
+    for component in shortcut.split('+').map(str::trim) {
+        if component.is_empty() {
+            return Err("Shortcut contains an empty component".into());
+        }
+        let modifier = match component.to_ascii_lowercase().as_str() {
+            "shift" => Some("Shift"),
+            "ctrl" | "control" => Some("Ctrl"),
+            "alt" => Some("Alt"),
+            "super" | "logo" | "meta" => Some("Super"),
+            _ => None,
+        };
+        if let Some(modifier) = modifier {
+            if modifiers.contains(&modifier) {
+                return Err(format!("Modifier {modifier} is repeated"));
+            }
+            modifiers.push(modifier);
+        } else if key.replace(component.to_ascii_lowercase()).is_some() {
+            return Err("Shortcut must contain exactly one non-modifier key".into());
+        }
+    }
+    let key = key.ok_or_else(|| "Shortcut needs a non-modifier key".to_string())?;
+    modifiers.sort_by_key(|modifier| match *modifier {
+        "Ctrl" => 0,
+        "Alt" => 1,
+        "Shift" => 2,
+        _ => 3,
+    });
+    modifiers.push(&key);
+    Ok(modifiers.join("+"))
+}
+
+fn refresh_shortcut_feedback(entries: &[(String, gtk::Entry)]) -> bool {
+    let mut seen = std::collections::HashMap::<String, String>::new();
+    let mut valid = true;
+    for (action, entry) in entries {
+        let shortcut = entry.text();
+        let error = match normalized_shortcut(shortcut.trim()) {
+            Ok(normalized) => seen
+                .insert(normalized, action.clone())
+                .map(|other| format!("Conflicts with {}", other.replace('_', " "))),
+            Err(error) => Some(error),
+        };
+        if let Some(error) = error {
+            valid = false;
+            entry.add_css_class("error");
+            entry.set_tooltip_text(Some(&error));
+        } else {
+            entry.remove_css_class("error");
+            entry.set_tooltip_text(None);
+        }
+    }
+    valid
+}
+
+fn captured_shortcut(key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> Option<String> {
+    let name = key.name()?.to_string();
+    if matches!(
+        name.as_str(),
+        "Shift_L"
+            | "Shift_R"
+            | "Control_L"
+            | "Control_R"
+            | "Alt_L"
+            | "Alt_R"
+            | "Super_L"
+            | "Super_R"
+            | "Meta_L"
+            | "Meta_R"
+    ) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        parts.push("Ctrl".to_string());
+    }
+    if state.contains(gtk::gdk::ModifierType::ALT_MASK) {
+        parts.push("Alt".to_string());
+    }
+    if state.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
+        parts.push("Shift".to_string());
+    }
+    if state.intersects(gtk::gdk::ModifierType::SUPER_MASK | gtk::gdk::ModifierType::META_MASK) {
+        parts.push("Super".to_string());
+    }
+    parts.push(name);
+    Some(parts.join("+"))
+}
+
 #[derive(Debug, Clone)]
 struct WifiNetwork {
     active: bool,
@@ -2977,6 +3068,9 @@ impl ThemeEditorDraft {
     }
 
     fn add_stop(&mut self) {
+        if self.stops.len() >= focaldesk_themes::MAX_GRADIENT_STOPS {
+            return;
+        }
         self.commit_current_color();
         let position = if self.stops.len() < 2 {
             0.5
@@ -8311,7 +8405,7 @@ fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     shortcuts_group.set_description(Some(
         "Use combinations such as Super+Enter, Ctrl+Alt+D, or Print.",
     ));
-    let mut shortcut_entries = Vec::new();
+    let shortcut_entries = Rc::new(RefCell::new(Vec::<(String, gtk::Entry)>::new()));
     for &(action, label, default_shortcut) in EDITABLE_KEYBINDINGS {
         let entry = add_entry_row(&shortcuts_group, label, default_shortcut);
         let value = settings
@@ -8322,19 +8416,37 @@ fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             .cloned()
             .unwrap_or_else(|| default_shortcut.to_string());
         entry.set_text(&value);
-        {
-            let settings = settings.clone();
-            entry.connect_changed(move |entry| {
+        shortcut_entries
+            .borrow_mut()
+            .push((action.to_string(), entry));
+    }
+    for (action, entry) in shortcut_entries.borrow().iter() {
+        let action = action.clone();
+        let settings = settings.clone();
+        let all_entries = shortcut_entries.clone();
+        entry.connect_changed(move |entry| {
+            if refresh_shortcut_feedback(&all_entries.borrow()) {
                 settings
                     .borrow_mut()
                     .input
                     .keybindings
-                    .insert(action.to_string(), entry.text().trim().to_string());
+                    .insert(action.clone(), entry.text().trim().to_string());
                 persist_settings(&settings.borrow());
-            });
-        }
-        shortcut_entries.push((action, default_shortcut, entry));
+            }
+        });
+
+        let controller = gtk::EventControllerKey::new();
+        let entry_for_capture = entry.clone();
+        controller.connect_key_pressed(move |_, key, _, state| {
+            let Some(shortcut) = captured_shortcut(key, state) else {
+                return gtk::glib::Propagation::Proceed;
+            };
+            entry_for_capture.set_text(&shortcut);
+            gtk::glib::Propagation::Stop
+        });
+        entry.add_controller(controller);
     }
+    refresh_shortcut_feedback(&shortcut_entries.borrow());
 
     let reset = add_button_row(
         &shortcuts_group,
@@ -8344,14 +8456,19 @@ fn keyboard_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
     );
     {
         let settings = settings.clone();
+        let shortcut_entries = shortcut_entries.clone();
         reset.connect_clicked(move |_| {
             settings.borrow_mut().input.keybindings.clear();
-            for &(action, default_shortcut, ref entry) in &shortcut_entries {
+            for ((action, entry), (_, _, default_shortcut)) in shortcut_entries
+                .borrow()
+                .iter()
+                .zip(EDITABLE_KEYBINDINGS.iter())
+            {
                 settings
                     .borrow_mut()
                     .input
                     .keybindings
-                    .insert(action.to_string(), default_shortcut.to_string());
+                    .insert(action.clone(), (*default_shortcut).to_string());
                 entry.set_text(default_shortcut);
             }
             persist_settings(&settings.borrow());
@@ -9541,6 +9658,18 @@ fn displays_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_normalization_detects_aliases_duplicates_and_extra_keys() {
+        assert_eq!(
+            normalized_shortcut("Meta+Shift+Return").unwrap(),
+            "Shift+Super+return"
+        );
+        assert_eq!(normalized_shortcut("Alt+Control+d").unwrap(), "Ctrl+Alt+d");
+        assert!(normalized_shortcut("Super+Super+Q").is_err());
+        assert!(normalized_shortcut("Ctrl+Q+W").is_err());
+        assert!(normalized_shortcut("Ctrl+Alt").is_err());
+    }
 
     #[test]
     fn audio_volume_parsers_accept_wpctl_and_pactl_output() {

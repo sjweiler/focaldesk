@@ -17,7 +17,8 @@ work.
 The long-term direction is a fast, keyboard-friendly, retro-futuristic desktop
 with structured workspaces, clear system feedback, and permissioned automation.
 See the [project vision](docs/vision.md), [architecture](docs/architecture.md),
-and [roadmap](ROADMAP.md) for the intended direction.
+and [roadmap](ROADMAP.md) for the intended direction. Alpha limitations are
+tracked in [Known Issues](docs/known-issues.md).
 
 ## Features
 
@@ -61,7 +62,7 @@ release.
 | PipeWire/portal screen capture | Experimental |
 | Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |
 | HDR and color management | Experimental and hardware-dependent; HDR10 verified on Fedora 44 with NVIDIA 595, including Google Chrome ([details](docs/hdr.md#known-working-configuration)) |
-| Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradient rendering is not yet compositor-native |
+| Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradients render compositor-side with up to eight stops |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |
 

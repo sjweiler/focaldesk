@@ -66,6 +66,7 @@ pub fn eagle_theme() -> FlowTheme {
         },
 
         semantic: None,
+        editor_paint: None,
         semantic_colors_linear: false,
 
         spacing: 6,
@@ -134,6 +135,7 @@ pub fn moonbase_theme() -> FlowTheme {
         },
 
         semantic: None,
+        editor_paint: None,
         semantic_colors_linear: false,
 
         spacing: 10,
@@ -202,6 +204,7 @@ pub fn classic_theme() -> FlowTheme {
         },
 
         semantic: None,
+        editor_paint: None,
         semantic_colors_linear: false,
 
         spacing: 12,

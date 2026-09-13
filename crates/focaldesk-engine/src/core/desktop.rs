@@ -1613,6 +1613,16 @@ impl DesktopState {
         }
     }
 
+    /// Persist the latest desktop state before a backend tears the session down.
+    ///
+    /// Periodic checkpoints keep the on-disk snapshot current during normal
+    /// operation, but a final forced write closes the window between the last
+    /// checkpoint and every graceful backend exit (including host-window close
+    /// and compositor-quit shortcuts).
+    pub(crate) fn checkpoint_session_for_shutdown(&mut self) {
+        self.checkpoint_session(true);
+    }
+
     fn restored_output_id(&self, connector: Option<&str>) -> OutputId {
         connector
             .and_then(|connector| {
@@ -2349,7 +2359,7 @@ impl DesktopState {
                         protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
                         preview_active: self.theme.editor_preview_active(),
                         applied_revision: self.theme.editor_revision(),
-                        gradient_rendering: false,
+                        gradient_rendering: true,
                         semantic_rendering: true,
                         wallpaper_processing: true,
                         layout_metrics: true,
@@ -2394,7 +2404,7 @@ impl DesktopState {
                             protocol_version: THEME_EDITOR_PROTOCOL_VERSION,
                             preview_active: self.theme.editor_preview_active(),
                             applied_revision: self.theme.editor_revision(),
-                            gradient_rendering: false,
+                            gradient_rendering: true,
                             semantic_rendering: true,
                             wallpaper_processing: true,
                             layout_metrics: true,
@@ -3642,13 +3652,40 @@ impl DesktopState {
             .workspace_names
             .iter()
             .enumerate()
-            .map(
-                |(index, name)| focaldesk_ui::egui_panels::WorkspaceEntryView {
+            .map(|(index, name)| {
+                let workspace = WorkspaceId((index + 1) as u32);
+                let windows = self
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        window.mapped
+                            && !window.minimized
+                            && window.workspace == workspace
+                            && window.output.unwrap_or_else(|| {
+                                self.preferred_output_id_for_window(&window.window)
+                            }) == output_id
+                    })
+                    .filter_map(|window| {
+                        let rect = self.global_window_bbox(&window.window)?;
+                        let clipped = rect.intersection(frame_ctx.work)?;
+                        let work_width = frame_ctx.work.size.w.max(1) as f32;
+                        let work_height = frame_ctx.work.size.h.max(1) as f32;
+                        Some(focaldesk_ui::egui_panels::WorkspaceWindowPreview {
+                            title: window.title(),
+                            x: (clipped.loc.x - frame_ctx.work.loc.x) as f32 / work_width,
+                            y: (clipped.loc.y - frame_ctx.work.loc.y) as f32 / work_height,
+                            width: clipped.size.w as f32 / work_width,
+                            height: clipped.size.h as f32 / work_height,
+                        })
+                    })
+                    .collect();
+                focaldesk_ui::egui_panels::WorkspaceEntryView {
                     number: (index + 1) as u32,
                     name: name.clone(),
                     active: active_workspace.0 == (index + 1) as u32,
-                },
-            )
+                    windows,
+                }
+            })
             .collect();
 
         let actions = {

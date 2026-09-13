@@ -37,6 +37,10 @@ pub struct FlowTheme {
     /// to use the legacy fields above until an editor document is previewed.
     #[serde(default)]
     pub semantic: Option<crate::SemanticTheme>,
+    /// Full-fidelity primary editor paint used by compositor-native gradient
+    /// rendering. Built-in and legacy themes leave this unset.
+    #[serde(default)]
+    pub editor_paint: Option<crate::ThemePaintIntent>,
     /// Runtime-only marker set when the compositor prepares a theme for a
     /// linear FP16 target. Theme files always deserialize into the SDR path.
     #[serde(skip)]

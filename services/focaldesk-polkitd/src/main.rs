@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use zbus::zvariant::{OwnedObjectPath, OwnedValue, Str};
 use zbus::{Connection, DBusError, interface, proxy};
 use zbus_polkit::policykit1::{AuthorityProxy, Subject};
@@ -33,7 +34,10 @@ enum AgentError {
     Failed(String),
 }
 
-struct AuthenticationAgent;
+#[derive(Clone, Default)]
+struct AuthenticationAgent {
+    cancellations: Arc<Mutex<HashMap<String, futures_channel::oneshot::Sender<()>>>>,
+}
 
 #[derive(Debug)]
 enum AuthenticationOutcome {
@@ -77,7 +81,18 @@ impl AuthenticationAgent {
             ));
         };
 
-        match run_agent_session(identity_str, cookie.clone(), message, icon_name).await {
+        let (cancel_tx, cancel_rx) = futures_channel::oneshot::channel();
+        self.cancellations
+            .lock()
+            .map_err(|_| AgentError::Failed("authentication registry is unavailable".into()))?
+            .insert(cookie.clone(), cancel_tx);
+        let outcome =
+            run_agent_session(identity_str, cookie.clone(), message, icon_name, cancel_rx).await;
+        if let Ok(mut cancellations) = self.cancellations.lock() {
+            cancellations.remove(&cookie);
+        }
+
+        match outcome {
             Ok(AuthenticationOutcome::Authorized) => {
                 // PolkitAgentSession's helper reports successful authentication
                 // to polkitd as part of the conversation. Do not send a duplicate
@@ -96,11 +111,17 @@ impl AuthenticationAgent {
     }
 
     async fn cancel_authentication(&self, cookie: String) {
-        // Session cancellation from polkitd's side (e.g. the requesting app gave
-        // up) isn't wired to the in-flight glib-thread Session yet; the dialog
-        // will simply time out or the user will cancel it manually. Tracking
-        // in-flight sessions by cookie to cancel them here is a follow-up.
-        flog_warn!("polkit CancelAuthentication for cookie {cookie} (not yet actioned)");
+        let cancellation = self
+            .cancellations
+            .lock()
+            .ok()
+            .and_then(|mut cancellations| cancellations.remove(&cookie));
+        if let Some(cancellation) = cancellation {
+            let _ = cancellation.send(());
+            flog_info!("polkit CancelAuthentication delivered for cookie {cookie}");
+        } else {
+            flog_warn!("polkit CancelAuthentication had no active cookie {cookie}");
+        }
     }
 }
 
@@ -122,6 +143,7 @@ async fn run_agent_session(
     cookie: String,
     message: String,
     icon_name: String,
+    cancellation: futures_channel::oneshot::Receiver<()>,
 ) -> Result<AuthenticationOutcome> {
     flog_info!("polkit agent session: dispatching to glib thread, identity={identity_str}");
     let outcome = glib::MainContext::default()
@@ -142,6 +164,15 @@ async fn run_agent_session(
             let done_tx = Rc::new(RefCell::new(Some(done_tx)));
             let conversation_failure = Rc::new(RefCell::new(None::<String>));
 
+            {
+                let session = session.clone();
+                glib::MainContext::default().spawn_local(async move {
+                    if cancellation.await.is_ok() {
+                        session.cancel();
+                    }
+                });
+            }
+
             session.connect_show_info(|_, text| flog_info!("polkit: {text}"));
             session.connect_show_error(|_, text| flog_warn!("polkit: {text}"));
 
@@ -152,49 +183,69 @@ async fn run_agent_session(
                 session.connect_request(move |session, prompt, echo_on| {
                     flog_info!("polkit agent session: request signal fired, prompt={prompt:?} echo_on={echo_on}");
                     let request_id = next_request_id();
-                    let response = focaldesk_ipc::dialog::send_dialog_request(
-                        &DialogIpcRequest::PolkitAuthPrompt {
+                    let request = DialogIpcRequest::PolkitAuthPrompt {
                             request_id,
                             message: message.clone(),
                             icon_name: icon_name.clone(),
                             prompt: prompt.to_string(),
                             echo_on,
-                        },
-                    );
-                    flog_info!(
-                        "polkit agent session: dialog IPC returned an {}",
-                        match &response {
-                            Ok(DialogIpcResponse::PolkitAuthAnswer {
-                                answer: Some(_), ..
-                            }) => "answer",
-                            Ok(DialogIpcResponse::PolkitAuthAnswer { answer: None, .. }) =>
-                                "empty answer",
-                            Ok(_) => "unexpected response",
-                            Err(_) => "error",
-                        }
-                    );
-                    match response {
-                        Ok(DialogIpcResponse::PolkitAuthAnswer {
-                            answer: Some(text), ..
-                        }) => session.response(&text),
-                        Ok(DialogIpcResponse::PolkitAuthAnswer { answer: None, .. }) => {
-                            session.cancel()
-                        }
-                        Ok(DialogIpcResponse::Error { message }) => {
-                            *conversation_failure.borrow_mut() = Some(message);
-                            session.cancel();
-                        }
-                        Ok(other) => {
-                            *conversation_failure.borrow_mut() =
-                                Some(format!("unexpected dialog response: {other:?}"));
-                            session.cancel();
-                        }
-                        Err(err) => {
-                            *conversation_failure.borrow_mut() =
-                                Some(format!("dialog IPC failed: {err}"));
-                            session.cancel();
-                        }
+                        };
+                    let (response_tx, response_rx) = futures_channel::oneshot::channel();
+                    let spawn = std::thread::Builder::new()
+                        .name("focaldesk-polkit-dialog".into())
+                        .spawn(move || {
+                            let _ = response_tx.send(
+                                focaldesk_ipc::dialog::send_dialog_request(&request)
+                            );
+                        });
+                    if let Err(error) = spawn {
+                        *conversation_failure.borrow_mut() =
+                            Some(format!("failed to start dialog request: {error}"));
+                        session.cancel();
+                        return;
                     }
+
+                    let session = session.clone();
+                    let conversation_failure = conversation_failure.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        let response = response_rx.await.unwrap_or_else(|_| {
+                            Err("dialog request ended without a response".into())
+                        });
+                        flog_info!(
+                            "polkit agent session: dialog IPC returned an {}",
+                            match &response {
+                                Ok(DialogIpcResponse::PolkitAuthAnswer {
+                                    answer: Some(_), ..
+                                }) => "answer",
+                                Ok(DialogIpcResponse::PolkitAuthAnswer { answer: None, .. }) =>
+                                    "empty answer",
+                                Ok(_) => "unexpected response",
+                                Err(_) => "error",
+                            }
+                        );
+                        match response {
+                            Ok(DialogIpcResponse::PolkitAuthAnswer {
+                                answer: Some(text), ..
+                            }) => session.response(&text),
+                            Ok(DialogIpcResponse::PolkitAuthAnswer { answer: None, .. }) => {
+                                session.cancel()
+                            }
+                            Ok(DialogIpcResponse::Error { message }) => {
+                                *conversation_failure.borrow_mut() = Some(message);
+                                session.cancel();
+                            }
+                            Ok(other) => {
+                                *conversation_failure.borrow_mut() =
+                                    Some(format!("unexpected dialog response: {other:?}"));
+                                session.cancel();
+                            }
+                            Err(err) => {
+                                *conversation_failure.borrow_mut() =
+                                    Some(format!("dialog IPC failed: {err}"));
+                                session.cancel();
+                            }
+                        }
+                    });
                 });
             }
 
@@ -316,7 +367,7 @@ async fn main() -> Result<()> {
         .context("connect to system bus")?;
     connection
         .object_server()
-        .at(AGENT_OBJECT_PATH, AuthenticationAgent)
+        .at(AGENT_OBJECT_PATH, AuthenticationAgent::default())
         .await
         .context("export AuthenticationAgent object")?;
 

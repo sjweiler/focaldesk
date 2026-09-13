@@ -12,10 +12,11 @@ truth for what is usable today.
   and exercise multi-monitor hotplug, scale, transform, and mixed-refresh
   behavior on recorded hardware configurations.
 - Harden XWayland, portal capture, session startup, and user-service lifecycle.
-- Continue migrating legacy `config.toml` users to the canonical `settings.json`
-  configuration path.
+- [x] Migrate legacy `config.toml` users atomically to the canonical
+  `settings.json` configuration path while retaining a recovery copy.
 - Keep AI and automation actions explicit, permission-gated, and auditable.
-- Establish repeatable alpha releases and installation verification.
+- [x] Establish repeatable alpha release automation and manifest-driven
+  installation verification and uninstall checks.
 - Keep the workspace warning-free under the CI-enforced `-D warnings` policy.
 
 ## Rendering and display work
@@ -45,20 +46,20 @@ truth for what is usable today.
 
 ## Desktop experience
 
-- Expand the completed workspace-slot controls with overview thumbnails and
-  animated transitions.
-- Expand the completed keybinding editor with shortcut capture, conflict
-  feedback, and configurable pointer gestures.
+- [x] Expand the completed workspace-slot controls with animated window-layout
+  overview thumbnails.
+- Add full-desktop workspace transition animations.
+- [x] Expand the completed keybinding editor with direct shortcut capture and
+  conflict feedback.
+- Add configurable pointer gestures.
 - Mature the launcher, Settings application, file manager, notifications, power
   handling, lock screen, and accessibility behavior.
 - Improve first-run setup, recovery, and uninstall workflows.
 
 ## Theme editor phases
 
-The editor authoring phases below are implemented. Compositor-native gradient
-rendering remains outstanding: gradient sources round-trip through TOML and
-packages and render in the editor, but the compositor currently samples a
-representative color. See the [Theme Editor guide](docs/theme-editor.md) for the
+The editor authoring phases and compositor-native primary-paint gradients below
+are implemented. See the [Theme Editor guide](docs/theme-editor.md) for the
 current workflow and limitations.
 
 1. sRGB saturation/value square with a separate hue slider.
@@ -79,8 +80,8 @@ current workflow and limitations.
 - Version IPC messages and document compatibility expectations.
 - Narrow service privileges and validate socket ownership and permissions.
 - Expand permission policy for automation, capture, files, and model providers.
-- Define retention and deletion behavior for logs, clipboard history, AI memory,
-  and permission records.
+- [x] Define retention and deletion behavior for logs, clipboard history, AI
+  memory, and permission records.
 
 ## Longer-term exploration
 

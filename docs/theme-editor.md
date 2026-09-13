@@ -26,12 +26,12 @@ The state-matrix preview and compositor status report contrast issues for
 primary text. Treat those reports as authoring guidance: the editor does not
 silently rewrite a theme's colors.
 
-The compositor currently reports its supported editor capabilities. Semantic
-colors, wallpaper processing, layout metrics, and typography metrics are
-rendered by the current implementation. Gradient documents are preserved and
-previewed in the editor, while the compositor currently samples them to a
-single representative color; its status therefore reports gradient rendering
-as unavailable.
+The compositor reports its supported editor capabilities. Semantic colors,
+wallpaper processing, layout metrics, typography metrics, and the primary
+linear or radial paint are rendered by the current implementation. The primary
+paint is drawn as the compositor-owned desktop background behind the configured
+wallpaper. Gradients support two through eight ordered stops, their authored
+interpolation space and alpha mode, linear angle, and radial center/radius.
 
 ## Save, preview, and apply
 

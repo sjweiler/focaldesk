@@ -15,7 +15,9 @@ pub use theme::{
     WallpaperTheme,
 };
 
-pub use document::{ThemeDocument, ThemeWallpaper, ThemeWallpaperFit, THEME_DOCUMENT_VERSION};
+pub use document::{
+    ThemeDocument, ThemeWallpaper, ThemeWallpaperFit, MAX_GRADIENT_STOPS, THEME_DOCUMENT_VERSION,
+};
 
 pub use export::{builtin_theme_css, write_builtin_theme_css};
 pub use gtk::{gtk_app_css, gtk_app_prefers_dark, GtkAppThemeOptions};

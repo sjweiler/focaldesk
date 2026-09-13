@@ -3,7 +3,9 @@
 FocalDesk uses a nested smoke test for repeatable compositor checks before
 hardware-session testing. The harness runs inside an existing Wayland session
 or starts a private headless Weston host when no Wayland display is available.
-It does not install or enable desktop services.
+Stale or non-responsive host sockets are rejected with a connection probe and
+also fall back to Weston. The harness does not install or enable desktop
+services.
 
 ## Run the automated smoke test
 
@@ -38,6 +40,17 @@ To reuse an existing build:
 ```sh
 just nested-smoke-no-build
 ```
+
+To run every supported toolkit/browser sample currently installed on the test
+machine and retain separate artifacts for each client:
+
+```sh
+just nested-compat-matrix
+```
+
+The matrix discovers Weston SHM, GTK 4, Qt 6 QML, Firefox, and Chromium clients.
+Absence is reported rather than treated as coverage; record the resulting
+`target/compat-matrix/summary.txt` with the tested package versions.
 
 To choose a client or artifact directory:
 

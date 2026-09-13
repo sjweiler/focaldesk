@@ -143,3 +143,6 @@ jobs:
 
       - name: Markdown links
         run: bash scripts/check-markdown-links.sh
+
+      - name: Install and uninstall lifecycle
+        run: bash scripts/test-install-lifecycle.sh

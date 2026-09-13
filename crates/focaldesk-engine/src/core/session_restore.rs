@@ -394,4 +394,26 @@ mod tests {
         assert!(!path.exists());
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn unchanged_periodic_snapshot_is_not_rewritten_but_forced_snapshot_is() {
+        let dir = std::env::temp_dir().join(format!(
+            "focaldesk-session-save-test-{}",
+            std::process::id()
+        ));
+        let path = dir.join("session.json");
+        let snapshot = SessionSnapshot::new(
+            vec!["Work".into()],
+            Vec::new(),
+            vec![saved("org.test.App", 0)],
+        );
+        let (mut state, _) = SessionRestoreState::load(path.clone(), true);
+
+        assert!(state.save(&snapshot, false).unwrap());
+        assert!(!state.save(&snapshot, false).unwrap());
+        assert!(state.save(&snapshot, true).unwrap());
+        assert_eq!(load_snapshot(&path), Some(snapshot));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -34,6 +34,7 @@ static TRACING_INSTALLED: OnceLock<()> = OnceLock::new();
 static LOG_GUARD: OnceLock<Mutex<Option<tracing_appender::non_blocking::WorkerGuard>>> =
     OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
 pub fn session_id() -> u32 {
     std::process::id()
@@ -159,12 +160,38 @@ fn open_log_file() -> Option<File> {
             let _ = create_dir_all(parent);
         }
 
-        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = rotate_log_file(&path, MAX_LOG_BYTES);
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)
+        {
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
             return Some(file);
         }
     }
 
     None
+}
+
+fn rotate_log_file(path: &Path, max_bytes: u64) -> std::io::Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_file() || metadata.len() <= max_bytes {
+        return Ok(false);
+    }
+    let rotated = PathBuf::from(format!("{}.1", path.display()));
+    match fs::remove_file(&rotated) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    fs::rename(path, rotated)?;
+    Ok(true)
 }
 
 fn make_writer() -> BoxMakeWriter {
@@ -480,7 +507,8 @@ macro_rules! flog_trace {
 #[cfg(test)]
 mod tests {
     use super::{
-        current_log_level, init_default_logging, set_log_level, write_private_atomic, FLogLevel,
+        current_log_level, init_default_logging, rotate_log_file, set_log_level,
+        write_private_atomic, FLogLevel,
     };
     use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt;
@@ -499,6 +527,25 @@ mod tests {
 
         set_log_level(previous);
         assert!(!evaluated.get());
+    }
+
+    #[test]
+    fn oversized_fallback_log_rotates_once() {
+        let directory = std::env::temp_dir().join(format!(
+            "focaldesk-log-rotation-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("focaldesk.log");
+        std::fs::write(&path, b"12345").unwrap();
+
+        assert!(rotate_log_file(&path, 4).unwrap());
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(path.with_extension("log.1")).unwrap(),
+            b"12345"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

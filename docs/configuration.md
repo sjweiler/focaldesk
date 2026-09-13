@@ -12,7 +12,7 @@ working configuration before testing a new revision.
 | Path | Purpose | Editing guidance |
 | --- | --- | --- |
 | `$XDG_CONFIG_HOME/focaldesk/settings.json` | Canonical desktop, shell, application, input, workspace, privacy, power, debug, and chrome settings | Prefer the Settings application |
-| `$XDG_CONFIG_HOME/focaldesk/config.toml` | Legacy typed shell configuration | Read only as a migration fallback; new saves go to `settings.json` |
+| `$XDG_CONFIG_HOME/focaldesk/config.toml` | Legacy typed shell configuration | Automatically copied into `settings.json` once; retained as a recovery copy |
 | `$XDG_CONFIG_HOME/focaldesk/displays.json` | Detected output topology and runtime display choices | Generated; do not edit while FocalDesk is running |
 | `$XDG_DATA_HOME/focaldesk/themes/` | Theme packages installed by the Theme Editor | Manage through Theme Editor import and uninstall actions |
 | `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions; stored mode `0600` | Manage through the permission UI when possible |
@@ -26,7 +26,8 @@ An invalid file may also cause the affected component to use defaults, so check
 the logs after hand-editing configuration.
 
 The GTK shell clients read geometry and presentation from the `desktop_config`
-object in `settings.json`. Existing `config.toml` files remain readable until a
+object in `settings.json`. Existing `config.toml` files are migrated atomically
+without overwriting unrelated canonical settings and remain readable until a
 setting is saved:
 
 ```json
@@ -148,3 +149,11 @@ Console state, AI permission records, and AI memory are created with private
 per-user permissions. Clipboard capture is limited to one MiB and two seconds
 per selection. Back up the entire `focaldesk` directory when preserving an
 alpha installation across upgrades.
+
+Clipboard history keeps at most 50 entries and automatically deletes entries
+older than 30 days. The local fallback log rotates at 8 MiB and retains one
+previous file; journald retention remains controlled by the operating system.
+Saved AI permission decisions remain until explicitly revoked in Settings so a
+denial cannot silently expire. Removing a decision restores the default
+ask/deny policy, and `just uninstall-purge` deletes all FocalDesk permission
+records along with other user state.

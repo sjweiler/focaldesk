@@ -179,6 +179,7 @@ fn project_editor_document(
             .resolve(crate::InteractionState::Disabled),
     );
     theme.semantic = Some(document.semantic.clone());
+    theme.editor_paint = Some(document.intent.clone());
     theme.semantic_colors_linear = false;
     Ok(theme)
 }
@@ -240,5 +241,9 @@ mod tests {
         assert_eq!(semantic.layout.bar_height, 52.0);
         assert_eq!(semantic.wallpaper.blur, 12.0);
         assert_eq!(manager.active_theme().wallpaper.blur, 12.0);
+        assert_eq!(
+            manager.active_theme().editor_paint.as_ref(),
+            Some(&document.intent)
+        );
     }
 }

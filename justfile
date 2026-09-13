@@ -10,6 +10,24 @@ nested-smoke:
 nested-smoke-no-build:
     bash scripts/nested-smoke.sh --no-build
 
+nested-compat-matrix:
+    bash scripts/nested-compat-matrix.sh
+
+release-readiness:
+    bash scripts/check-release-readiness.sh
+
+verify-install scope="all":
+    bash scripts/verify-installation.sh "{{ scope }}"
+
+test-install-lifecycle:
+    bash scripts/test-install-lifecycle.sh
+
+uninstall scope="all":
+    bash scripts/uninstall.sh --scope "{{ scope }}"
+
+uninstall-purge scope="all":
+    bash scripts/uninstall.sh --scope "{{ scope }}" --purge
+
 # Install Fedora packages needed to compile the patched capture stack.
 install-wide-gamut-capture-build-deps:
     sudo dnf install -y cmake git meson ninja-build

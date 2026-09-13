@@ -348,5 +348,6 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             nested.state.send_frame_callbacks(frame_time_ms);
         }
     }
+    nested.state.checkpoint_session_for_shutdown();
     Ok(())
 }

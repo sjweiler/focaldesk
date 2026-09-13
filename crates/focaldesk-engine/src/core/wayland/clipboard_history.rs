@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 const MAX_ENTRIES: usize = 50;
+const RETENTION_SECS: u64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClipboardEntry {
@@ -26,6 +27,7 @@ pub struct ClipboardHistory {
 impl ClipboardHistory {
     /// Add a new entry unless its text is identical to the most recent one.
     pub fn push(&mut self, mime_type: String, text: String) -> u64 {
+        self.prune_at(now_secs());
         if let Some(front) = self.entries.front() {
             if front.text == text {
                 return front.id;
@@ -39,10 +41,7 @@ impl ClipboardHistory {
             id,
             mime_type,
             text,
-            timestamp_secs: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            timestamp_secs: now_secs(),
         });
 
         while self.entries.len() > MAX_ENTRIES {
@@ -80,10 +79,14 @@ impl ClipboardHistory {
         let Some(path) = Self::path() else {
             return Self::default();
         };
-        match fs::read_to_string(&path) {
+        let mut history = match fs::read_to_string(&path) {
             Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
             Err(_) => Self::default(),
+        };
+        if history.prune_at(now_secs()) {
+            history.save();
         }
+        history
     }
 
     pub fn save(&self) {
@@ -102,6 +105,22 @@ impl ClipboardHistory {
             let _ = write_private_atomic(&path, json.as_bytes());
         }
     }
+
+    fn prune_at(&mut self, now_secs: u64) -> bool {
+        let original_len = self.entries.len();
+        self.entries.retain(|entry| {
+            now_secs.saturating_sub(entry.timestamp_secs) <= RETENTION_SECS
+                && entry.timestamp_secs <= now_secs.saturating_add(24 * 60 * 60)
+        });
+        self.entries.len() != original_len
+    }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -162,5 +181,31 @@ mod tests {
 
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir(directory);
+    }
+
+    #[test]
+    fn clipboard_history_prunes_entries_older_than_thirty_days() {
+        let now = 1_800_000_000;
+        let mut history = ClipboardHistory {
+            entries: VecDeque::from([
+                ClipboardEntry {
+                    id: 2,
+                    mime_type: "text/plain".into(),
+                    text: "current".into(),
+                    timestamp_secs: now - RETENTION_SECS,
+                },
+                ClipboardEntry {
+                    id: 1,
+                    mime_type: "text/plain".into(),
+                    text: "expired".into(),
+                    timestamp_secs: now - RETENTION_SECS - 1,
+                },
+            ]),
+            next_id: 3,
+        };
+
+        assert!(history.prune_at(now));
+        assert_eq!(history.entries.len(), 1);
+        assert_eq!(history.entries[0].text, "current");
     }
 }

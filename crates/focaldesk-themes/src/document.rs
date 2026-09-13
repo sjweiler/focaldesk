@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const THEME_DOCUMENT_VERSION: u32 = 1;
+pub const MAX_GRADIENT_STOPS: usize = 8;
 
 /// Portable, versioned source document used by the FocalDesk theme editor.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,6 +145,9 @@ fn validate_stops(stops: &[crate::GradientStop]) -> anyhow::Result<()> {
     if stops.len() < 2 {
         bail!("gradients require at least two stops");
     }
+    if stops.len() > MAX_GRADIENT_STOPS {
+        bail!("gradients support at most {MAX_GRADIENT_STOPS} stops");
+    }
     let mut previous = None;
     for stop in stops {
         if !stop.position.is_finite() || !(0.0..=1.0).contains(&stop.position) {
@@ -217,10 +221,17 @@ mod tests {
         assert!(document.validate().is_err());
 
         document.format_version = THEME_DOCUMENT_VERSION;
-        let ThemePaint::LinearGradient { stops, .. } = &mut document.intent.paint else {
-            unreachable!()
-        };
-        stops[1].position = -0.1;
+        if let ThemePaint::LinearGradient { stops, .. } = &mut document.intent.paint {
+            stops[1].position = -0.1;
+        }
+        assert!(document.validate().is_err());
+
+        if let ThemePaint::LinearGradient { stops, .. } = &mut document.intent.paint {
+            stops[1].position = 1.0;
+            while stops.len() <= MAX_GRADIENT_STOPS {
+                stops.push(stops[1]);
+            }
+        }
         assert!(document.validate().is_err());
     }
 

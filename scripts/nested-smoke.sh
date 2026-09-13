@@ -145,8 +145,29 @@ fi
 COMPOSITOR="$ROOT/target/debug/focaldesk-desktop"
 [[ -x "$COMPOSITOR" ]] || fail "missing compositor binary: $COMPOSITOR"
 
+HOST_USABLE=1
 if [[ -z "${XDG_RUNTIME_DIR:-}" || -z "${WAYLAND_DISPLAY:-}" \
     || ! -S "${XDG_RUNTIME_DIR:-/nonexistent}/${WAYLAND_DISPLAY:-missing}" ]]; then
+    HOST_USABLE=0
+elif command -v wayland-info >/dev/null; then
+    if ! timeout 5 wayland-info >/dev/null 2>&1; then
+        HOST_USABLE=0
+        echo "STALE host Wayland socket $WAYLAND_DISPLAY; using private Weston" \
+            | tee -a "$ARTIFACTS/summary.txt"
+    fi
+elif command -v weston-simple-shm >/dev/null; then
+    set +e
+    (timeout 1 weston-simple-shm >/dev/null 2>&1) 2>/dev/null
+    PROBE_STATUS=$?
+    set -e
+    if [[ "$PROBE_STATUS" -ne 0 && "$PROBE_STATUS" -ne 124 ]]; then
+        HOST_USABLE=0
+        echo "STALE host Wayland socket $WAYLAND_DISPLAY; using private Weston" \
+            | tee -a "$ARTIFACTS/summary.txt"
+    fi
+fi
+
+if [[ "$HOST_USABLE" -eq 0 ]]; then
     command -v weston >/dev/null || fail "no host Wayland display and weston is unavailable"
     TEMP_RUNTIME="$(mktemp -d "${TMPDIR:-/tmp}/focaldesk-smoke-runtime.XXXXXX")"
     chmod 700 "$TEMP_RUNTIME"

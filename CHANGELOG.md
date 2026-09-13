@@ -10,6 +10,21 @@ version numbers where practical.
 
 ### Added
 
+- Added manifest-driven installation verification and a scoped uninstaller that
+  preserves user data by default, plus a repeatable install-lifecycle test.
+- Added automatic, atomic migration from legacy `config.toml` desktop settings
+  into `settings.json` while retaining the legacy source as a recovery copy.
+- Added a maintained alpha known-issues document.
+- Added a tag-driven, prerelease packaging workflow and a multi-client nested
+  compatibility matrix with per-client diagnostic artifacts.
+- Added 30-day clipboard-history pruning, bounded fallback-log rotation, and
+  documented retention/deletion semantics for permission records.
+- Added remote frame latency, drop, damage-area, refresh, and queue-depth
+  telemetry with bounded periodic reporting.
+- Added compositor-native linear and radial theme paint with up to eight stops,
+  authored geometry, wide-gamut/HDR values, and alpha interpolation modes.
+- Added animated workspace overview cards with normalized live window-layout
+  thumbnails and window summaries.
 - Added compacted compositor-damage metadata to the versioned remote-capture
   protocol and damage-region RDP bitmap updates, with bounded queues, idle-frame
   suppression, and full-refresh recovery after skipped frames or resize.
@@ -68,6 +83,12 @@ version numbers where practical.
 
 ### Changed
 
+- PolicyKit cancellation now reaches the matching in-flight authentication
+  session, and dialog IPC waits no longer block the GLib authentication loop.
+- Settings can capture shortcuts directly from key presses and reports invalid
+  or conflicting combinations before persisting them.
+- The nested compatibility harness now probes an apparent host Wayland socket
+  and falls back to private Weston when the socket is stale or non-responsive.
 - Delayed compositor-native panel and dock fallbacks briefly during production
   session startup, preventing partially initialized chrome from flashing while
   the GTK system rail and task shelf start; crash fallback remains immediate.

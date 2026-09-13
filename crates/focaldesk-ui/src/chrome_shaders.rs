@@ -20,6 +20,7 @@ pub struct ChromeShaders {
     pub amber_lightbar: Option<GlesPixelProgram>,
     pub font_text: Option<GlesTexProgram>,
     pub rounded_rect: Option<GlesPixelProgram>,
+    pub theme_gradient: Option<GlesPixelProgram>,
     pub wallpaper_tint: Option<GlesTexProgram>,
     /// Adds wide-gamut SDR accents and conservative HDR10 highlight lifts
     /// from the SDR wallpaper after the retained base is decoded into the
@@ -163,6 +164,7 @@ impl ChromeShaders {
             amber_lightbar: None,
             font_text: None,
             rounded_rect: None,
+            theme_gradient: None,
             wallpaper_tint: None,
             wallpaper_creative_grade: None,
             srgb_to_linear: None,
@@ -600,6 +602,31 @@ impl ChromeShaders {
                     UniformName::new("u_size", UniformType::_2f), // rect size in pixels
                     UniformName::new("u_radius", UniformType::_1f), // corner radius
                     UniformName::new("u_color", UniformType::_4f), // fill color (rgba)
+                ],
+            )?);
+        }
+
+        if self.theme_gradient.is_none() {
+            self.theme_gradient = Some(renderer.compile_custom_pixel_shader(
+                THEME_GRADIENT_FRAG,
+                &[
+                    UniformName::new("u_size", UniformType::_2f),
+                    UniformName::new("u_kind", UniformType::_1f),
+                    UniformName::new("u_direction", UniformType::_2f),
+                    UniformName::new("u_center", UniformType::_2f),
+                    UniformName::new("u_radius", UniformType::_1f),
+                    UniformName::new("u_stop_count", UniformType::_1f),
+                    UniformName::new("u_positions0", UniformType::_4f),
+                    UniformName::new("u_positions1", UniformType::_4f),
+                    UniformName::new("u_premultiplied", UniformType::_1f),
+                    UniformName::new("u_color0", UniformType::_4f),
+                    UniformName::new("u_color1", UniformType::_4f),
+                    UniformName::new("u_color2", UniformType::_4f),
+                    UniformName::new("u_color3", UniformType::_4f),
+                    UniformName::new("u_color4", UniformType::_4f),
+                    UniformName::new("u_color5", UniformType::_4f),
+                    UniformName::new("u_color6", UniformType::_4f),
+                    UniformName::new("u_color7", UniformType::_4f),
                 ],
             )?);
         }
@@ -2266,6 +2293,74 @@ void main() {
 }
 "#;
 
+const THEME_GRADIENT_FRAG: &str = r#"
+#ifdef GL_ES
+precision highp float;
+#endif
+
+varying vec2 v_coords;
+uniform vec2 u_size;
+uniform float u_kind;
+uniform vec2 u_direction;
+uniform vec2 u_center;
+uniform float u_radius;
+uniform float u_stop_count;
+uniform vec4 u_positions0;
+uniform vec4 u_positions1;
+uniform float u_premultiplied;
+uniform vec4 u_color0;
+uniform vec4 u_color1;
+uniform vec4 u_color2;
+uniform vec4 u_color3;
+uniform vec4 u_color4;
+uniform vec4 u_color5;
+uniform vec4 u_color6;
+uniform vec4 u_color7;
+
+vec4 between_stops(vec4 left, vec4 right, float left_pos, float right_pos, float t) {
+    float amount = right_pos <= left_pos
+        ? 1.0
+        : clamp((t - left_pos) / (right_pos - left_pos), 0.0, 1.0);
+    if (u_premultiplied > 0.5) {
+        float alpha = mix(left.a, right.a, amount);
+        vec3 premultiplied = mix(left.rgb * left.a, right.rgb * right.a, amount);
+        return vec4(alpha > 0.00001 ? premultiplied / alpha : vec3(0.0), alpha);
+    }
+    return mix(left, right, amount);
+}
+
+vec4 sample_ramp(float t) {
+    if (t <= u_positions0.x) return u_color0;
+    if (u_stop_count <= 2.0 || t <= u_positions0.y)
+        return between_stops(u_color0, u_color1, u_positions0.x, u_positions0.y, t);
+    if (u_stop_count <= 3.0 || t <= u_positions0.z)
+        return between_stops(u_color1, u_color2, u_positions0.y, u_positions0.z, t);
+    if (u_stop_count <= 4.0 || t <= u_positions0.w)
+        return between_stops(u_color2, u_color3, u_positions0.z, u_positions0.w, t);
+    if (u_stop_count <= 5.0 || t <= u_positions1.x)
+        return between_stops(u_color3, u_color4, u_positions0.w, u_positions1.x, t);
+    if (u_stop_count <= 6.0 || t <= u_positions1.y)
+        return between_stops(u_color4, u_color5, u_positions1.x, u_positions1.y, t);
+    if (u_stop_count <= 7.0 || t <= u_positions1.z)
+        return between_stops(u_color5, u_color6, u_positions1.y, u_positions1.z, t);
+    return between_stops(u_color6, u_color7, u_positions1.z, u_positions1.w, t);
+}
+
+void main() {
+    float t;
+    if (u_kind < 1.5) {
+        vec2 offset = normalize(u_direction) * length(u_size) * 0.5;
+        vec2 point = v_coords * u_size - u_size * 0.5;
+        t = dot(point, offset) / max(2.0 * dot(offset, offset), 0.00001) + 0.5;
+    } else {
+        vec2 point = (v_coords - u_center) * u_size;
+        t = length(point) / max(u_radius * max(u_size.x, u_size.y), 0.00001);
+    }
+    vec4 color = sample_ramp(t);
+    gl_FragColor = vec4(color.rgb * color.a, color.a);
+}
+"#;
+
 // make rectangle have rounded corners
 const ROUNDED_RECT_FRAG: &str = r#"
 #ifdef GL_ES
@@ -3043,6 +3138,15 @@ void main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_gradient_shader_supports_linear_radial_and_premultiplied_ramps() {
+        assert!(THEME_GRADIENT_FRAG.contains("u_kind < 1.5"));
+        assert!(THEME_GRADIENT_FRAG.contains("u_center"));
+        assert!(THEME_GRADIENT_FRAG.contains("u_radius"));
+        assert!(THEME_GRADIENT_FRAG.contains("left.rgb * left.a"));
+        assert!(THEME_GRADIENT_FRAG.contains("u_color7"));
+    }
 
     fn shader_sources() -> [&'static str; 27] {
         [

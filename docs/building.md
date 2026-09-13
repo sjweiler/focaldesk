@@ -290,20 +290,29 @@ Do not use `cargo update` as a general build-repair step: it changes
 run the complete check suite. For ordinary build failures, first use the locked
 versions already committed to the repository.
 
-## Uninstall a local development installation
+## Verify or uninstall an installation
 
-FocalDesk does not yet provide a packaged uninstaller. Disable user services
-before removing files:
+Verify installed files and their expected permission modes:
 
 ```sh
-systemctl --user disable --now focaldesk-session.target
-systemctl --user daemon-reload
+just verify-install user
+just verify-install system
 ```
 
-Then remove only the FocalDesk files installed by the relevant `just` recipes.
-The system session files are listed above, and per-user files are placed under
-`~/.local/bin` and `~/.config/systemd/user`. Preserve
-`~/.config/focaldesk` if you want to keep settings and AI permission records.
+The uninstaller removes only paths recorded in the reviewed manifests under
+`packaging/`. It disables FocalDesk user services first and preserves settings,
+secrets, installed themes, logs, and session state by default:
+
+```sh
+just uninstall user
+just uninstall system
+```
+
+System removal asks for `sudo` only for system-owned files. To also delete all
+FocalDesk user configuration and state, use `just uninstall-purge`; this is
+irreversible and requires a separate confirmation. The generated
+`~/.config/xdg-desktop-portal-wlr/config` is retained because the user may have
+customized it or another compositor may use it.
 
 ## Next steps
 

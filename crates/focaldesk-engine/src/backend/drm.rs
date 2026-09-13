@@ -4471,6 +4471,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.core.state.send_frame_callbacks(frame_time_ms);
     }
 
+    data.core.state.checkpoint_session_for_shutdown();
+
     // The main loop above only exits while the machine stays up via Logout
     // (`running = false`); Suspend/Hibernate keep the compositor alive across
     // resume, and Restart/Shutdown take the whole machine down via powerd, so

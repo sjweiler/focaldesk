@@ -6,7 +6,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -40,11 +40,68 @@ struct RemoteFrame {
     pixels: Bytes,
     damage: Vec<DamageRect>,
     full_refresh: bool,
+    received_at: Instant,
+}
+
+#[derive(Default)]
+struct RemoteMetrics {
+    frames_received: u64,
+    frames_encoded: u64,
+    frames_dropped: u64,
+    full_refreshes: u64,
+    damage_pixels: u64,
+    total_latency_micros: u128,
+    max_latency_micros: u128,
+    max_queue_depth: usize,
+}
+
+impl RemoteMetrics {
+    fn record_received(&mut self) {
+        self.frames_received = self.frames_received.saturating_add(1);
+    }
+
+    fn record_encoded(&mut self, frame: &RemoteFrame, queue_depth: usize, dropped: u64) {
+        self.frames_encoded = self.frames_encoded.saturating_add(1);
+        self.frames_dropped = self.frames_dropped.saturating_add(dropped);
+        self.full_refreshes = self
+            .full_refreshes
+            .saturating_add(u64::from(frame.full_refresh || dropped > 0));
+        self.damage_pixels = self.damage_pixels.saturating_add(
+            frame
+                .damage
+                .iter()
+                .map(|rect| u64::from(rect.width) * u64::from(rect.height))
+                .sum::<u64>(),
+        );
+        let latency = frame.received_at.elapsed().as_micros();
+        self.total_latency_micros = self.total_latency_micros.saturating_add(latency);
+        self.max_latency_micros = self.max_latency_micros.max(latency);
+        self.max_queue_depth = self.max_queue_depth.max(queue_depth);
+    }
+
+    fn log_if_due(&self) {
+        if self.frames_encoded == 0 || !self.frames_encoded.is_multiple_of(120) {
+            return;
+        }
+        let average_latency_micros = self.total_latency_micros / u128::from(self.frames_encoded);
+        info!(
+            frames_received = self.frames_received,
+            frames_encoded = self.frames_encoded,
+            frames_dropped = self.frames_dropped,
+            full_refreshes = self.full_refreshes,
+            damage_pixels = self.damage_pixels,
+            average_latency_micros,
+            max_latency_micros = self.max_latency_micros,
+            max_queue_depth = self.max_queue_depth,
+            "remote encoding metrics"
+        );
+    }
 }
 
 struct DisplayHandler {
     initial_size: DesktopSize,
     frames: watch::Receiver<Option<RemoteFrame>>,
+    metrics: Arc<Mutex<RemoteMetrics>>,
 }
 
 struct DisplayUpdates {
@@ -53,6 +110,7 @@ struct DisplayUpdates {
     last_serial: Option<u64>,
     pending_after_resize: Option<RemoteFrame>,
     pending_bitmaps: std::collections::VecDeque<BitmapUpdate>,
+    metrics: Arc<Mutex<RemoteMetrics>>,
 }
 
 #[async_trait::async_trait]
@@ -68,6 +126,7 @@ impl RdpServerDisplay for DisplayHandler {
             last_serial: None,
             pending_after_resize: None,
             pending_bitmaps: std::collections::VecDeque::new(),
+            metrics: self.metrics.clone(),
         }))
     }
 }
@@ -79,7 +138,7 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
             return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
         }
         if let Some(frame) = self.pending_after_resize.take() {
-            self.queue_frame(frame, true)?;
+            self.queue_frame(frame, true, 0)?;
             return Ok(self.pending_bitmaps.pop_front().map(DisplayUpdate::Bitmap));
         }
         loop {
@@ -96,11 +155,12 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
                         self.pending_after_resize = Some(frame);
                         return Ok(Some(DisplayUpdate::Resize(next_size)));
                     }
-                    let force_full = frame.full_refresh
-                        || self
-                            .last_serial
-                            .is_none_or(|last| last.saturating_add(1) != frame.serial);
-                    self.queue_frame(frame, force_full)?;
+                    let dropped = self.last_serial.map_or(0, |last| {
+                        frame.serial.saturating_sub(last.saturating_add(1))
+                    });
+                    let force_full =
+                        frame.full_refresh || self.last_serial.is_none() || dropped > 0;
+                    self.queue_frame(frame, force_full, dropped)?;
                     if let Some(bitmap) = self.pending_bitmaps.pop_front() {
                         return Ok(Some(DisplayUpdate::Bitmap(bitmap)));
                     }
@@ -114,9 +174,13 @@ impl RdpServerDisplayUpdates for DisplayUpdates {
 }
 
 impl DisplayUpdates {
-    fn queue_frame(&mut self, frame: RemoteFrame, force_full: bool) -> Result<()> {
+    fn queue_frame(&mut self, frame: RemoteFrame, force_full: bool, dropped: u64) -> Result<()> {
         self.last_serial = Some(frame.serial);
-        self.pending_bitmaps = bitmap_updates(frame, force_full)?.into();
+        self.pending_bitmaps = bitmap_updates(frame.clone(), force_full)?.into();
+        if let Ok(mut metrics) = self.metrics.lock() {
+            metrics.record_encoded(&frame, self.pending_bitmaps.len(), dropped);
+            metrics.log_if_due();
+        }
         Ok(())
     }
 }
@@ -311,11 +375,13 @@ async fn main() -> Result<()> {
     };
     let initial_size = checked_size(width, height)?;
     let (frames_tx, frames_rx) = watch::channel(None);
-    spawn_capture_reader(stream, config.output_id, frames_tx)?;
+    let metrics = Arc::new(Mutex::new(RemoteMetrics::default()));
+    spawn_capture_reader(stream, config.output_id, frames_tx, metrics.clone())?;
 
     let display = DisplayHandler {
         initial_size,
         frames: frames_rx,
+        metrics,
     };
     let validator = Arc::new(ExpiringTokenValidator {
         token: Zeroizing::new(token),
@@ -372,6 +438,7 @@ fn spawn_capture_reader(
     initial_stream: UnixStream,
     output_id: u64,
     frames: watch::Sender<Option<RemoteFrame>>,
+    metrics: Arc<Mutex<RemoteMetrics>>,
 ) -> Result<()> {
     thread::Builder::new()
         .name("focaldesk-remoted-capture".into())
@@ -390,7 +457,7 @@ fn spawn_capture_reader(
                         }
                     },
                 };
-                if let Err(error) = read_capture_frames(&active, &frames, &serial) {
+                if let Err(error) = read_capture_frames(&active, &frames, &serial, &metrics) {
                     warn!(%error, "compositor capture disconnected");
                     frames.send_replace(None);
                     thread::sleep(RECONNECT_DELAY);
@@ -404,6 +471,7 @@ fn read_capture_frames(
     stream: &UnixStream,
     frames: &watch::Sender<Option<RemoteFrame>>,
     serial: &AtomicU64,
+    metrics: &Arc<Mutex<RemoteMetrics>>,
 ) -> Result<()> {
     loop {
         match focaldesk_remote_protocol::read_message::<Event>(stream)? {
@@ -447,7 +515,11 @@ fn read_capture_frames(
                     pixels: pixels.into(),
                     damage,
                     full_refresh,
+                    received_at: Instant::now(),
                 }));
+                if let Ok(mut metrics) = metrics.lock() {
+                    metrics.record_received();
+                }
             }
             Event::CaptureStopped { .. } => bail!("capture stopped"),
             Event::Error { message } => bail!(message),
@@ -587,11 +659,13 @@ mod tests {
         });
         let (frames, received) = watch::channel(None);
         let serial = AtomicU64::new(7);
-        assert!(read_capture_frames(&receiver, &frames, &serial).is_err());
+        let metrics = Arc::new(Mutex::new(RemoteMetrics::default()));
+        assert!(read_capture_frames(&receiver, &frames, &serial, &metrics).is_err());
         writer.join().unwrap();
         let frame = received.borrow().clone().unwrap();
         assert_eq!(frame.serial, 7);
         assert_eq!(frame.pixels.as_ref(), &[3, 2, 1, 4, 7, 6, 5, 8]);
+        assert_eq!(metrics.lock().unwrap().frames_received, 1);
     }
 
     #[test]
@@ -612,6 +686,7 @@ mod tests {
                 height: 2,
             }],
             full_refresh: false,
+            received_at: Instant::now(),
         };
 
         let updates = bitmap_updates(frame, false).unwrap();
@@ -622,5 +697,34 @@ mod tests {
         assert_eq!(updates[0].height.get(), 2);
         assert_eq!(updates[0].stride.get(), 4);
         assert_eq!(updates[0].data.as_ref(), &[5, 6, 7, 8, 17, 18, 19, 20]);
+    }
+
+    #[test]
+    fn remote_metrics_track_drops_damage_latency_and_queue_depth() {
+        let frame = RemoteFrame {
+            serial: 4,
+            width: 10,
+            height: 10,
+            stride: NonZeroUsize::new(40).unwrap(),
+            pixels: Bytes::from(vec![0; 400]),
+            damage: vec![DamageRect {
+                x: 2,
+                y: 3,
+                width: 4,
+                height: 5,
+            }],
+            full_refresh: false,
+            received_at: Instant::now(),
+        };
+        let mut metrics = RemoteMetrics::default();
+        metrics.record_received();
+        metrics.record_encoded(&frame, 2, 3);
+
+        assert_eq!(metrics.frames_received, 1);
+        assert_eq!(metrics.frames_encoded, 1);
+        assert_eq!(metrics.frames_dropped, 3);
+        assert_eq!(metrics.full_refreshes, 1);
+        assert_eq!(metrics.damage_pixels, 20);
+        assert_eq!(metrics.max_queue_depth, 2);
     }
 }

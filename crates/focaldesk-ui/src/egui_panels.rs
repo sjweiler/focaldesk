@@ -383,6 +383,16 @@ pub struct WorkspaceEntryView {
     pub number: u32,
     pub name: String,
     pub active: bool,
+    pub windows: Vec<WorkspaceWindowPreview>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceWindowPreview {
+    pub title: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
 }
 
 #[derive(Default)]
@@ -521,10 +531,74 @@ impl WorkspacesPanel {
                 ui.label("Choose a workspace for this display");
                 ui.add_space(8.0);
                 for entry in &self.entries {
-                    let label = format!("{}  {}", entry.number, entry.name);
-                    if ui.selectable_label(entry.active, label).clicked() {
+                    let desired = egui::vec2(ui.available_width(), 104.0);
+                    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+                    let animation = ui.ctx().animate_bool_with_time(
+                        egui::Id::new(("workspace-thumbnail", entry.number)),
+                        entry.active || response.hovered(),
+                        0.18,
+                    );
+                    let background = egui::Color32::from_rgb(
+                        (28.0 + 18.0 * animation) as u8,
+                        (34.0 + 22.0 * animation) as u8,
+                        (46.0 + 30.0 * animation) as u8,
+                    );
+                    ui.painter().rect_filled(rect, 7.0, background);
+                    ui.painter().rect_stroke(
+                        rect,
+                        7.0,
+                        egui::Stroke::new(
+                            if entry.active { 2.0 } else { 1.0 },
+                            if entry.active {
+                                egui::Color32::from_rgb(84, 188, 255)
+                            } else {
+                                egui::Color32::from_gray(82)
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    let preview = egui::Rect::from_min_max(
+                        rect.min + egui::vec2(12.0, 30.0),
+                        rect.max - egui::vec2(12.0, 10.0),
+                    );
+                    ui.painter()
+                        .rect_filled(preview, 3.0, egui::Color32::from_rgb(12, 16, 24));
+                    for (index, window) in entry.windows.iter().enumerate() {
+                        let window_rect = egui::Rect::from_min_size(
+                            egui::pos2(
+                                preview.left() + window.x * preview.width(),
+                                preview.top() + window.y * preview.height(),
+                            ),
+                            egui::vec2(
+                                (window.width * preview.width()).max(3.0),
+                                (window.height * preview.height()).max(3.0),
+                            ),
+                        )
+                        .intersect(preview);
+                        let color = if index % 2 == 0 {
+                            egui::Color32::from_rgb(54, 102, 142)
+                        } else {
+                            egui::Color32::from_rgb(76, 82, 116)
+                        };
+                        ui.painter().rect_filled(window_rect, 2.0, color);
+                    }
+                    ui.painter().text(
+                        rect.min + egui::vec2(12.0, 8.0),
+                        egui::Align2::LEFT_TOP,
+                        format!("{}  {}", entry.number, entry.name),
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::WHITE,
+                    );
+                    let window_summary = match entry.windows.as_slice() {
+                        [] => "Empty".to_string(),
+                        [window] => window.title.clone(),
+                        windows => format!("{} windows", windows.len()),
+                    };
+                    response.clone().on_hover_text(window_summary);
+                    if response.clicked() {
                         selected = Some(entry.number);
                     }
+                    ui.add_space(6.0);
                 }
             });
 

@@ -260,9 +260,9 @@ public internet.
 - [x] Pass the renderer's actual compacted damage rectangles to capture consumers.
 - [x] Do not produce remote updates when an output has no damage.
 - [x] Send changed rectangles instead of full frames where supported.
-- [ ] Force a complete refresh after dropped updates, resize, reconnect, or decoder loss.
-- [ ] Keep no more than one or two pending frames per client.
-- [ ] Collect frame latency, dropped-frame, damage-area, and queue-depth metrics.
+- [x] Force a complete refresh after dropped updates, resize, reconnect, or decoder loss.
+- [x] Keep no more than one or two pending frames per client.
+- [x] Collect frame latency, dropped-frame, damage-area, and queue-depth metrics.
 - [ ] Add DMA-BUF transport from compositor to service.
 - [ ] Investigate direct DMA-BUF import into the selected hardware encoder.
 - [ ] Keep shared memory and software encoding as compatibility fallbacks.
@@ -502,6 +502,6 @@ The first supported release should not ship until:
 ## Immediate Next Step
 
 Exercise capture on both DRM and nested backends and verify Phase 3
-interoperability with at least two RDP clients. Then finish Phase 4 recovery
-feedback, encoding metrics, and DMA-BUF transport while retaining shared-memory
-and software-encoding fallbacks.
+interoperability with at least two RDP clients. Then finish Phase 4 encoding
+DMA-BUF transport while retaining shared-memory and software-encoding
+fallbacks.
