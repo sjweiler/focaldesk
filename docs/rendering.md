@@ -7,15 +7,23 @@ FocalDesk uses a GPU-accelerated rendering pipeline built on OpenGL ES.
 An experimental `focaldesk-render` boundary now contains a Vulkan-only wgpu
 nested compositor implementation. It selects a Vulkan adapter, owns the wgpu
 surface and pipelines, handles resize and surface-loss recovery, and composites
-root Wayland `ARGB8888`/`XRGB8888` SHM buffers with premultiplied alpha. The
-production DRM/KMS and established nested compositor paths continue to use
-OpenGL ES.
+Wayland `ARGB8888`/`XRGB8888` SHM surface trees with premultiplied alpha. Window
+subsurfaces and popups follow Smithay's surface stacking and committed offsets,
+and normal-orientation viewport crops/scaling are mapped into texture
+coordinates. Layer-shell surfaces are placed around the window stack according
+to their background, bottom, top, or overlay layer. The production DRM/KMS and
+established nested compositor paths continue to use OpenGL ES.
 
-The wgpu path is intentionally an early vertical slice. It does not yet render
-subsurfaces, popups, layer-shell surfaces, FocalDesk shell UI, cursor/input,
-viewport transforms, DMA-BUFs, damage-only updates, or color-managed/HDR
-output. SHM textures and bind groups are currently rebuilt for every frame;
-resource caching comes after surface-tree semantics are in place.
+The nested wgpu path forwards host keyboard, pointer, button, and scroll events
+through the compositor's normal focus and Wayland seat path. Its themed cursor
+is composited as a final scaled RGBA texture with the cursor hotspot applied;
+client-provided cursor surfaces currently fall back to the corresponding theme
+cursor.
+
+This remains an early vertical slice. It does not yet render FocalDesk shell UI,
+transformed buffers, DMA-BUFs, damage-only updates, or color-managed/HDR output.
+SHM textures and bind groups are currently rebuilt for every frame; resource
+caching comes after the remaining surface semantics are in place.
 
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 

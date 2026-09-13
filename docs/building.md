@@ -160,13 +160,15 @@ handling resize and surface-loss events:
 just nested-wgpu
 ```
 
-It currently composites root `ARGB8888` and `XRGB8888` Wayland SHM buffers. To
-try that path, find the `wayland_display` value in the initialization log and
-launch an SHM client against it, for example
-`WAYLAND_DISPLAY=focaldesk-1 weston-simple-shm`. Input, subsurfaces, popups,
-layer-shell surfaces, DMA-BUF import, and shell UI are not wired yet. The
-established winit/GLES backend remains the nested compositor used for full
-compatibility testing.
+It currently composites `ARGB8888` and `XRGB8888` Wayland SHM window trees,
+including subsurfaces, popups, and normal-orientation viewport crops/scaling,
+plus SHM layer-shell trees. To try that path, find the `wayland_display` value
+in the initialization log and launch an SHM client against it, for example
+`WAYLAND_DISPLAY=focaldesk-1 weston-simple-shm`. Host keyboard, pointer,
+buttons, scrolling, focus, and the themed software cursor are wired through the
+normal compositor input path. Transformed buffers, client cursor surfaces,
+DMA-BUF import, and shell UI are not wired yet. The established winit/GLES
+backend remains the nested compositor used for full compatibility testing.
 
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are

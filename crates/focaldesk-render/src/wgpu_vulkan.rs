@@ -17,7 +17,9 @@ use wgpu::{
 };
 use winit::window::Window;
 
-use crate::{GraphicsApi, PresentRenderer, PresentResult, RendererInfo, ShmSurfaceFrame};
+use crate::{
+    FramePixelFormat, GraphicsApi, PresentRenderer, PresentResult, RendererInfo, TextureQuad,
+};
 
 fn surface_extent(width: u32, height: u32) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
@@ -241,7 +243,7 @@ impl PresentRenderer for WgpuVulkanRenderer {
         self.configure_surface();
     }
 
-    fn present_frame(&mut self, surfaces: &[ShmSurfaceFrame]) -> Result<PresentResult> {
+    fn present_frame(&mut self, surfaces: &[TextureQuad]) -> Result<PresentResult> {
         let (frame, reconfigure_after_present) = match self.surface.get_current_texture() {
             CurrentSurfaceTexture::Success(frame) => (frame, false),
             CurrentSurfaceTexture::Suboptimal(frame) => (frame, true),
@@ -277,6 +279,10 @@ impl PresentRenderer for WgpuVulkanRenderer {
                 || surface.stride < row_bytes
                 || surface.destination[2] <= 0
                 || surface.destination[3] <= 0
+                || !surface
+                    .source_uv
+                    .iter()
+                    .all(|coordinate| coordinate.is_finite())
             {
                 continue;
             }
@@ -308,7 +314,10 @@ impl PresentRenderer for WgpuVulkanRenderer {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: TextureDimension::D2,
-                format: TextureFormat::Bgra8UnormSrgb,
+                format: match surface.format {
+                    FramePixelFormat::Bgra8Srgb => TextureFormat::Bgra8UnormSrgb,
+                    FramePixelFormat::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
+                },
                 usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -348,6 +357,7 @@ impl PresentRenderer for WgpuVulkanRenderer {
             });
 
             let [x, y, width, height] = surface.destination;
+            let [u0, v0, u1, v1] = surface.source_uv;
             let left = x as f32 / self.config.width as f32 * 2.0 - 1.0;
             let right = (x as f32 + width as f32) / self.config.width as f32 * 2.0 - 1.0;
             let top = 1.0 - y as f32 / self.config.height as f32 * 2.0;
@@ -356,27 +366,27 @@ impl PresentRenderer for WgpuVulkanRenderer {
             surface_vertices.extend_from_slice(&[
                 SurfaceVertex {
                     position: [left, top],
-                    uv: [0.0, 0.0],
+                    uv: [u0, v0],
                 },
                 SurfaceVertex {
                     position: [left, bottom],
-                    uv: [0.0, 1.0],
+                    uv: [u0, v1],
                 },
                 SurfaceVertex {
                     position: [right, bottom],
-                    uv: [1.0, 1.0],
+                    uv: [u1, v1],
                 },
                 SurfaceVertex {
                     position: [left, top],
-                    uv: [0.0, 0.0],
+                    uv: [u0, v0],
                 },
                 SurfaceVertex {
                     position: [right, bottom],
-                    uv: [1.0, 1.0],
+                    uv: [u1, v1],
                 },
                 SurfaceVertex {
                     position: [right, top],
-                    uv: [1.0, 0.0],
+                    uv: [u1, v0],
                 },
             ]);
             surface_ranges.push(start..surface_vertices.len() as u32);

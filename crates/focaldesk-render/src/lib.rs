@@ -34,17 +34,27 @@ pub enum PresentResult {
     Skipped,
 }
 
-/// One premultiplied BGRA8 shared-memory surface ready for composition.
+/// Pixel layout and transfer function for a compositor texture upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FramePixelFormat {
+    Bgra8Srgb,
+    Rgba8Srgb,
+}
+
+/// One premultiplied texture quad ready for composition.
 ///
 /// The destination is expressed in physical output pixels. `stride` may be
-/// wider than `width * 4`, as permitted by `wl_shm`.
+/// wider than `width * 4`.
 #[derive(Clone, Debug)]
-pub struct ShmSurfaceFrame {
+pub struct TextureQuad {
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
+    pub format: FramePixelFormat,
     pub destination: [i32; 4],
+    /// Normalized texture coordinates `[left, top, right, bottom]`.
+    pub source_uv: [f32; 4],
 }
 
 /// The small presentation-facing portion of a FocalDesk renderer.
@@ -54,5 +64,5 @@ pub struct ShmSurfaceFrame {
 pub trait PresentRenderer {
     fn info(&self) -> &RendererInfo;
     fn resize(&mut self, width: u32, height: u32);
-    fn present_frame(&mut self, surfaces: &[ShmSurfaceFrame]) -> anyhow::Result<PresentResult>;
+    fn present_frame(&mut self, surfaces: &[TextureQuad]) -> anyhow::Result<PresentResult>;
 }
