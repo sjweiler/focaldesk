@@ -161,14 +161,18 @@ just nested-wgpu
 ```
 
 It currently composites `ARGB8888` and `XRGB8888` Wayland SHM window trees,
-including subsurfaces, popups, and normal-orientation viewport crops/scaling,
-plus SHM layer-shell trees. To try that path, find the `wayland_display` value
-in the initialization log and launch an SHM client against it, for example
+including subsurfaces, popups, viewport crops/scaling, and layer-shell trees.
+It also advertises single-plane linear `ARGB8888`/`XRGB8888` DMA-BUFs. Those
+buffers are imported as Vulkan textures without a GPU copy when wgpu reports
+the required external-memory extensions; a synchronized linear mapping/upload
+keeps the same protocol path working on adapters without them. To try the SHM
+path, find the `wayland_display` value in the initialization log and launch
 `WAYLAND_DISPLAY=focaldesk-1 weston-simple-shm`. Host keyboard, pointer,
-buttons, scrolling, focus, and the themed software cursor are wired through the
-normal compositor input path. Transformed buffers, client cursor surfaces,
-DMA-BUF import, and shell UI are not wired yet. The established winit/GLES
-backend remains the nested compositor used for full compatibility testing.
+buttons, scrolling, focus, and cursor surfaces are wired through the normal
+compositor input path. Buffer transforms and viewport texture coordinates are
+supported. Tiled/multi-plane DMA-BUFs and shell UI are not wired yet. The
+established winit/GLES backend remains the nested compositor used for full
+compatibility testing.
 
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are

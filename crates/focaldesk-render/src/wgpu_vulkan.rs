@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
@@ -5,24 +6,43 @@ use wgpu::util::{BufferInitDescriptor, DeviceExt};
 use wgpu::{
     Backends, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
     BindingResource, BindingType, BlendState, BufferUsages, Color, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, CurrentSurfaceTexture, DeviceDescriptor, Extent3d, FilterMode,
-    FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
+    CommandEncoderDescriptor, CurrentSurfaceTexture, DeviceDescriptor, Extent3d, Features,
+    FilterMode, FragmentState, InstanceDescriptor, LoadOp, MultisampleState, Operations,
     PipelineCompilationOptions, PipelineLayoutDescriptor, PowerPreference, PrimitiveState,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipelineDescriptor,
     RequestAdapterOptions, SamplerBindingType, SamplerDescriptor, ShaderModuleDescriptor,
     ShaderSource, ShaderStages, StoreOp, Surface, SurfaceConfiguration, TexelCopyBufferLayout,
     TexelCopyTextureInfo, TextureAspect, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureSampleType, TextureUsages, TextureViewDescriptor, TextureViewDimension,
+    TextureSampleType, TextureUsages, TextureUses, TextureViewDescriptor, TextureViewDimension,
     VertexBufferLayout, VertexState, VertexStepMode,
 };
 use winit::window::Window;
 
 use crate::{
-    FramePixelFormat, GraphicsApi, PresentRenderer, PresentResult, RendererInfo, TextureQuad,
+    FramePixelFormat, FrameTransform, GraphicsApi, PresentRenderer, PresentResult, RendererInfo,
+    TextureQuad,
 };
 
 fn surface_extent(width: u32, height: u32) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
+}
+
+fn transformed_uv(source: [f32; 4], transform: FrameTransform) -> [[f32; 2]; 4] {
+    let [u0, v0, u1, v1] = source;
+    let tl = [u0, v0];
+    let tr = [u1, v0];
+    let br = [u1, v1];
+    let bl = [u0, v1];
+    match transform {
+        FrameTransform::Normal => [tl, tr, br, bl],
+        FrameTransform::Rotate90 => [bl, tl, tr, br],
+        FrameTransform::Rotate180 => [br, bl, tl, tr],
+        FrameTransform::Rotate270 => [tr, br, bl, tl],
+        FrameTransform::Flipped => [tr, tl, bl, br],
+        FrameTransform::Flipped90 => [tl, bl, br, tr],
+        FrameTransform::Flipped180 => [bl, br, tr, tl],
+        FrameTransform::Flipped270 => [br, tr, tl, bl],
+    }
 }
 
 #[repr(C)]
@@ -34,6 +54,23 @@ struct SurfaceVertex {
 
 const SURFACE_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
+
+struct CachedTexture {
+    _texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    width: u32,
+    height: u32,
+    format: FramePixelFormat,
+    external: bool,
+    last_used_frame: u64,
+}
+
+fn texture_format(format: FramePixelFormat) -> TextureFormat {
+    match format {
+        FramePixelFormat::Bgra8Srgb => TextureFormat::Bgra8UnormSrgb,
+        FramePixelFormat::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
+    }
+}
 
 /// Vulkan-only wgpu renderer used to establish the nested presentation path.
 pub struct WgpuVulkanRenderer {
@@ -47,12 +84,26 @@ pub struct WgpuVulkanRenderer {
     surface_pipeline: wgpu::RenderPipeline,
     surface_bind_group_layout: wgpu::BindGroupLayout,
     surface_sampler: wgpu::Sampler,
+    texture_cache: HashMap<u64, CachedTexture>,
+    frame_no: u64,
+    dmabuf_imports: u64,
+    dmabuf_fallbacks: u64,
     info: RendererInfo,
 }
 
 impl WgpuVulkanRenderer {
     pub fn new(window: Arc<Window>) -> Result<Self> {
         pollster::block_on(Self::new_async(window))
+    }
+
+    pub fn supports_direct_dmabuf_import(&self) -> bool {
+        self.device
+            .features()
+            .contains(Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+    }
+
+    pub fn dmabuf_import_stats(&self) -> (u64, u64) {
+        (self.dmabuf_imports, self.dmabuf_fallbacks)
     }
 
     async fn new_async(window: Arc<Window>) -> Result<Self> {
@@ -78,9 +129,12 @@ impl WgpuVulkanRenderer {
             adapter_info.backend
         );
 
+        let dmabuf_feature = Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        let required_features = adapter.features() & dmabuf_feature;
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 label: Some("focaldesk-wgpu-vulkan-device"),
+                required_features,
                 ..Default::default()
             })
             .await
@@ -211,6 +265,10 @@ impl WgpuVulkanRenderer {
             surface_pipeline,
             surface_bind_group_layout,
             surface_sampler,
+            texture_cache: HashMap::new(),
+            frame_no: 0,
+            dmabuf_imports: 0,
+            dmabuf_fallbacks: 0,
             info,
         })
     }
@@ -226,6 +284,72 @@ impl WgpuVulkanRenderer {
             .context("recreate lost Vulkan presentation surface")?;
         self.configure_surface();
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn import_dmabuf_texture(&self, surface: &TextureQuad) -> Result<Option<wgpu::Texture>> {
+        use wgpu::hal::{self, api::Vulkan};
+
+        let Some(dmabuf) = surface.dmabuf.as_ref() else {
+            return Ok(None);
+        };
+        if !self
+            .device
+            .features()
+            .contains(Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            return Ok(None);
+        }
+        let fd = dmabuf.fd.try_clone().context("duplicate DMA-BUF fd")?;
+        let descriptor = TextureDescriptor {
+            label: Some("focaldesk-dmabuf-texture"),
+            size: Extent3d {
+                width: surface.width,
+                height: surface.height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: texture_format(surface.format),
+            usage: TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let hal_descriptor = hal::TextureDescriptor {
+            label: descriptor.label,
+            size: descriptor.size,
+            mip_level_count: descriptor.mip_level_count,
+            sample_count: descriptor.sample_count,
+            dimension: descriptor.dimension,
+            format: descriptor.format,
+            usage: TextureUses::RESOURCE,
+            memory_flags: hal::MemoryFlags::empty(),
+            view_formats: descriptor.view_formats.to_vec(),
+        };
+        // SAFETY: the fd is an owned duplicate of the single-plane DMA-BUF
+        // described by `surface`. The dimensions, format, modifier, stride,
+        // and offset were validated by the Wayland DMA-BUF protocol handler.
+        // Both HAL calls use this device and ownership of the duplicate passes
+        // to Vulkan on successful import.
+        let texture = unsafe {
+            let hal_device = self
+                .device
+                .as_hal::<Vulkan>()
+                .context("wgpu Vulkan HAL device is unavailable")?;
+            let hal_texture = hal_device.texture_from_dmabuf_fd(
+                fd,
+                &hal_descriptor,
+                dmabuf.modifier,
+                u64::from(surface.stride),
+                dmabuf.offset,
+            )?;
+            self.device.create_texture_from_hal::<Vulkan>(
+                hal_texture,
+                &descriptor,
+                TextureUses::RESOURCE,
+            )
+        };
+        Ok(Some(texture))
     }
 }
 
@@ -265,7 +389,8 @@ impl PresentRenderer for WgpuVulkanRenderer {
         let view = frame.texture.create_view(&TextureViewDescriptor::default());
 
         let mut surface_vertices = Vec::with_capacity(surfaces.len() * 6);
-        let mut surface_bind_groups = Vec::with_capacity(surfaces.len());
+        self.frame_no = self.frame_no.wrapping_add(1);
+        let mut surface_cache_keys = Vec::with_capacity(surfaces.len());
         let mut surface_ranges = Vec::with_capacity(surfaces.len());
         let max_texture_dimension = self.device.limits().max_texture_dimension_2d;
         for surface in surfaces {
@@ -304,60 +429,115 @@ impl PresentRenderer for WgpuVulkanRenderer {
                 continue;
             }
 
-            let texture = self.device.create_texture(&TextureDescriptor {
-                label: Some("focaldesk-wayland-shm-texture"),
-                size: Extent3d {
-                    width: surface.width,
-                    height: surface.height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: TextureDimension::D2,
-                format: match surface.format {
-                    FramePixelFormat::Bgra8Srgb => TextureFormat::Bgra8UnormSrgb,
-                    FramePixelFormat::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
-                },
-                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-                view_formats: &[],
-            });
-            self.queue.write_texture(
-                TexelCopyTextureInfo {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: TextureAspect::All,
-                },
-                &surface.pixels,
-                TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(surface.stride),
-                    rows_per_image: Some(surface.height),
-                },
-                Extent3d {
-                    width: surface.width,
-                    height: surface.height,
-                    depth_or_array_layers: 1,
-                },
-            );
-            let texture_view = texture.create_view(&TextureViewDescriptor::default());
-            let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
-                label: Some("focaldesk-wayland-shm-bind-group"),
-                layout: &self.surface_bind_group_layout,
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        resource: BindingResource::TextureView(&texture_view),
+            let recreate = self
+                .texture_cache
+                .get(&surface.cache_key)
+                .is_none_or(|cached| {
+                    cached.width != surface.width
+                        || cached.height != surface.height
+                        || cached.format != surface.format
+                });
+            if recreate {
+                let upload_descriptor = TextureDescriptor {
+                    label: Some("focaldesk-compositor-texture"),
+                    size: Extent3d {
+                        width: surface.width,
+                        height: surface.height,
+                        depth_or_array_layers: 1,
                     },
-                    BindGroupEntry {
-                        binding: 1,
-                        resource: BindingResource::Sampler(&self.surface_sampler),
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: texture_format(surface.format),
+                    usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                    view_formats: &[],
+                };
+                #[cfg(unix)]
+                let (texture, external) = match self.import_dmabuf_texture(surface) {
+                    Ok(Some(texture)) => {
+                        self.dmabuf_imports = self.dmabuf_imports.saturating_add(1);
+                        (texture, true)
+                    }
+                    Ok(None) => (self.device.create_texture(&upload_descriptor), false),
+                    Err(error) => {
+                        self.dmabuf_fallbacks = self.dmabuf_fallbacks.saturating_add(1);
+                        tracing::warn!(%error, "Vulkan DMA-BUF import failed; using upload fallback");
+                        (self.device.create_texture(&upload_descriptor), false)
+                    }
+                };
+                #[cfg(not(unix))]
+                let (texture, external) = (self.device.create_texture(&upload_descriptor), false);
+                let texture_view = texture.create_view(&TextureViewDescriptor::default());
+                let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+                    label: Some("focaldesk-compositor-texture-bind-group"),
+                    layout: &self.surface_bind_group_layout,
+                    entries: &[
+                        BindGroupEntry {
+                            binding: 0,
+                            resource: BindingResource::TextureView(&texture_view),
+                        },
+                        BindGroupEntry {
+                            binding: 1,
+                            resource: BindingResource::Sampler(&self.surface_sampler),
+                        },
+                    ],
+                });
+                self.texture_cache.insert(
+                    surface.cache_key,
+                    CachedTexture {
+                        _texture: texture,
+                        bind_group,
+                        width: surface.width,
+                        height: surface.height,
+                        format: surface.format,
+                        external,
+                        last_used_frame: self.frame_no,
                     },
-                ],
-            });
+                );
+            }
+            let cached = self
+                .texture_cache
+                .get_mut(&surface.cache_key)
+                .expect("cache entry was just validated");
+            cached.last_used_frame = self.frame_no;
+            let full_damage = [[0, 0, surface.width, surface.height]];
+            let damage = if cached.external {
+                [].as_slice()
+            } else if recreate {
+                full_damage.as_slice()
+            } else {
+                surface.damage.as_slice()
+            };
+            for &[x, y, width, height] in damage {
+                let width = width.min(surface.width.saturating_sub(x));
+                let height = height.min(surface.height.saturating_sub(y));
+                if width == 0 || height == 0 {
+                    continue;
+                }
+                let offset = u64::from(y) * u64::from(surface.stride) + u64::from(x) * 4;
+                self.queue.write_texture(
+                    TexelCopyTextureInfo {
+                        texture: &cached._texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x, y, z: 0 },
+                        aspect: TextureAspect::All,
+                    },
+                    &surface.pixels,
+                    TexelCopyBufferLayout {
+                        offset,
+                        bytes_per_row: Some(surface.stride),
+                        rows_per_image: Some(height),
+                    },
+                    Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
 
             let [x, y, width, height] = surface.destination;
-            let [u0, v0, u1, v1] = surface.source_uv;
+            let [uv_tl, uv_tr, uv_br, uv_bl] = transformed_uv(surface.source_uv, surface.transform);
             let left = x as f32 / self.config.width as f32 * 2.0 - 1.0;
             let right = (x as f32 + width as f32) / self.config.width as f32 * 2.0 - 1.0;
             let top = 1.0 - y as f32 / self.config.height as f32 * 2.0;
@@ -366,32 +546,36 @@ impl PresentRenderer for WgpuVulkanRenderer {
             surface_vertices.extend_from_slice(&[
                 SurfaceVertex {
                     position: [left, top],
-                    uv: [u0, v0],
+                    uv: uv_tl,
                 },
                 SurfaceVertex {
                     position: [left, bottom],
-                    uv: [u0, v1],
+                    uv: uv_bl,
                 },
                 SurfaceVertex {
                     position: [right, bottom],
-                    uv: [u1, v1],
+                    uv: uv_br,
                 },
                 SurfaceVertex {
                     position: [left, top],
-                    uv: [u0, v0],
+                    uv: uv_tl,
                 },
                 SurfaceVertex {
                     position: [right, bottom],
-                    uv: [u1, v1],
+                    uv: uv_br,
                 },
                 SurfaceVertex {
                     position: [right, top],
-                    uv: [u1, v0],
+                    uv: uv_tr,
                 },
             ]);
             surface_ranges.push(start..surface_vertices.len() as u32);
-            surface_bind_groups.push(bind_group);
+            surface_cache_keys.push(surface.cache_key);
         }
+        let active_keys: HashSet<_> = surface_cache_keys.iter().copied().collect();
+        self.texture_cache.retain(|key, cached| {
+            active_keys.contains(key) || self.frame_no.wrapping_sub(cached.last_used_frame) <= 120
+        });
         let surface_vertex_buffer = (!surface_vertices.is_empty()).then(|| {
             self.device.create_buffer_init(&BufferInitDescriptor {
                 label: Some("focaldesk-wayland-shm-vertices"),
@@ -429,8 +613,8 @@ impl PresentRenderer for WgpuVulkanRenderer {
             if let Some(vertex_buffer) = surface_vertex_buffer.as_ref() {
                 pass.set_pipeline(&self.surface_pipeline);
                 pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-                for (bind_group, vertices) in surface_bind_groups.iter().zip(surface_ranges.iter())
-                {
+                for (cache_key, vertices) in surface_cache_keys.iter().zip(surface_ranges.iter()) {
+                    let bind_group = &self.texture_cache[cache_key].bind_group;
                     pass.set_bind_group(0, bind_group, &[]);
                     pass.draw(vertices.clone(), 0..1);
                 }
@@ -456,5 +640,46 @@ mod tests {
         assert_eq!(surface_extent(1920, 1080), Some((1920, 1080)));
         assert_eq!(surface_extent(0, 1080), None);
         assert_eq!(surface_extent(1920, 0), None);
+    }
+
+    #[test]
+    fn wayland_transforms_map_texture_corners() {
+        let source = [0.1, 0.2, 0.8, 0.9];
+        let tl = [0.1, 0.2];
+        let tr = [0.8, 0.2];
+        let br = [0.8, 0.9];
+        let bl = [0.1, 0.9];
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Normal),
+            [tl, tr, br, bl]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Rotate90),
+            [bl, tl, tr, br]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Rotate180),
+            [br, bl, tl, tr]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Rotate270),
+            [tr, br, bl, tl]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Flipped),
+            [tr, tl, bl, br]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Flipped90),
+            [tl, bl, br, tr]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Flipped180),
+            [bl, br, tr, tl]
+        );
+        assert_eq!(
+            transformed_uv(source, FrameTransform::Flipped270),
+            [br, tr, tl, bl]
+        );
     }
 }

@@ -1,6 +1,6 @@
 use focaldesk_flow::keybinds::BackendKind;
 use smithay::input::{
-    pointer::{CursorIcon, CursorImageStatus},
+    pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     Seat, SeatHandler, SeatState,
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -44,13 +44,27 @@ impl SeatHandler for DesktopState {
                 self.cursor_manager.set_icon(icon);
                 self.drm_submit_hw_cursor = true;
             }
-            CursorImageStatus::Surface(_) => {
+            CursorImageStatus::Surface(_) if self.backend_kind == BackendKind::Drm => {
                 // XWayland subsurface cursors: keep the theme cursor on the KMS plane.
                 // Rendering client cursor surfaces in-frame was hiding the HW cursor entirely.
                 self.render.clear_sw_cursor_texture();
                 self.cursor_manager.set_visible(true);
                 self.cursor_manager.set_icon(CursorIcon::Pointer);
                 self.drm_submit_hw_cursor = true;
+            }
+            CursorImageStatus::Surface(surface) => {
+                let hotspot = smithay::wayland::compositor::with_states(&surface, |states| {
+                    states
+                        .data_map
+                        .get::<CursorImageSurfaceData>()
+                        .and_then(|attributes| attributes.lock().ok().map(|attrs| attrs.hotspot))
+                        .unwrap_or_default()
+                });
+                self.render.sw_cursor_texture = None;
+                self.render.sw_cursor_surface_elements.clear();
+                self.render.sw_cursor_surface = Some(surface);
+                self.render.sw_cursor_hotspot = (hotspot.x, hotspot.y);
+                self.cursor_manager.set_visible(true);
             }
         }
         self.mark_focused_output_full_damage(crate::core::desktop::DamageSource::Cursor);

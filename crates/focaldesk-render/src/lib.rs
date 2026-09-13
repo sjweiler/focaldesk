@@ -5,6 +5,11 @@
 //! the GLES renderer can later implement the same boundary without depending
 //! on wgpu.
 
+#[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
+use std::sync::Arc;
+
 #[cfg(feature = "wgpu")]
 mod wgpu_vulkan;
 
@@ -35,10 +40,32 @@ pub enum PresentResult {
 }
 
 /// Pixel layout and transfer function for a compositor texture upload.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FramePixelFormat {
     Bgra8Srgb,
     Rgba8Srgb,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FrameTransform {
+    #[default]
+    Normal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
+    Flipped,
+    Flipped90,
+    Flipped180,
+    Flipped270,
+}
+
+/// A single-plane Linux DMA-BUF which may be imported directly by a renderer.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct LinuxDmabuf {
+    pub fd: Arc<OwnedFd>,
+    pub modifier: u64,
+    pub offset: u64,
 }
 
 /// One premultiplied texture quad ready for composition.
@@ -47,20 +74,29 @@ pub enum FramePixelFormat {
 /// wider than `width * 4`.
 #[derive(Clone, Debug)]
 pub struct TextureQuad {
+    /// Stable content identity. Reusing it allows the renderer to retain the GPU texture.
+    pub cache_key: u64,
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub stride: u32,
     pub format: FramePixelFormat,
+    /// Optional zero-copy source. `pixels` remains a synchronized fallback for
+    /// devices or format/modifier combinations that reject external import.
+    #[cfg(unix)]
+    pub dmabuf: Option<LinuxDmabuf>,
+    /// Changed buffer-coordinate rectangles. Empty means the cached pixels are unchanged.
+    pub damage: Vec<[u32; 4]>,
     pub destination: [i32; 4],
     /// Normalized texture coordinates `[left, top, right, bottom]`.
     pub source_uv: [f32; 4],
+    pub transform: FrameTransform,
 }
 
 /// The small presentation-facing portion of a FocalDesk renderer.
 ///
-/// Scene textures, imported DMA-BUFs, synchronization, and drawing commands
-/// will be added here as those compositor paths are ported.
+/// Shell scene textures and higher-level drawing commands will be added here as
+/// those compositor paths are ported.
 pub trait PresentRenderer {
     fn info(&self) -> &RendererInfo;
     fn resize(&mut self, width: u32, height: u32);
