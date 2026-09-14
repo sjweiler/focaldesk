@@ -191,7 +191,7 @@ pub struct EdidHdrMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HdrMetadataConfig {
+pub(crate) struct HdrMetadataConfig {
     peak_nits: u16,
     min_luminance: u16,
     max_fall: u16,
@@ -232,7 +232,7 @@ impl HdrSupport {
     /// An absent `max bpc` property means the driver manages link depth.  In
     /// that case a successfully initialized 10-bit KMS scanout is the proof we
     /// use.  If the property does exist, its range must include 10 bpc.
-    fn bpc_control_allows_ten_bit(&self) -> bool {
+    pub(crate) fn bpc_control_allows_ten_bit(&self) -> bool {
         self.max_bpc
             .as_ref()
             .is_none_or(|range| range.min <= 10 && range.max >= 10)
@@ -792,7 +792,7 @@ pub(crate) fn configured_display_scale(displays: &[DisplayConfig], name: &str) -
     scale
 }
 
-fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> bool {
+pub(crate) fn configured_display_hdr_requested(displays: &[DisplayConfig], name: &str) -> bool {
     displays
         .iter()
         .find(|display| display.name == name)
@@ -901,7 +901,7 @@ fn configured_display_color_profile(displays: &[DisplayConfig], name: &str) -> D
         .unwrap_or_default()
 }
 
-fn configured_hdr_appearance(displays: &[DisplayConfig], name: &str) -> HdrAppearance {
+pub(crate) fn configured_hdr_appearance(displays: &[DisplayConfig], name: &str) -> HdrAppearance {
     displays
         .iter()
         .find(|display| display.name == name)
@@ -2507,7 +2507,7 @@ pub(crate) fn connector_edid(
     None
 }
 
-mod hdr_detection {
+pub(crate) mod hdr_detection {
     use super::*;
 
     pub(crate) fn connector_hdr_support(
@@ -3014,7 +3014,7 @@ mod hdr_detection {
             selected.map(|value| value.value())
         }
 
-        fn build_connector_hdr_state(
+        pub(crate) fn build_connector_hdr_state(
             device: &impl drm::control::Device,
             connector: connector::Handle,
             support: &HdrSupport,

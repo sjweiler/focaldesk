@@ -19,7 +19,8 @@ mod ash_drm;
 
 #[cfg(all(feature = "ash-drm", unix))]
 pub use ash_drm::{
-    AshDrmCapture, AshDrmOutputLut, AshDrmRenderer, AshDrmSubmission, AshDrmTransfer,
+    AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut, AshDrmRenderer, AshDrmSubmission,
+    AshDrmTransfer,
 };
 
 #[cfg(feature = "wgpu")]
@@ -75,6 +76,7 @@ pub struct TextureColorTransform {
     pub transfer: FrameTransferFunction,
     pub client_to_scene: [[f32; 3]; 3],
     pub reference_white_nits: f32,
+    pub source_peak_nits: f32,
     pub linear_to_scene_scale: f32,
     pub source_bits: f32,
 }
@@ -85,6 +87,7 @@ impl Default for TextureColorTransform {
             transfer: FrameTransferFunction::Srgb,
             client_to_scene: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             reference_white_nits: 80.0,
+            source_peak_nits: 80.0,
             linear_to_scene_scale: 1.0,
             source_bits: 0.0,
         }

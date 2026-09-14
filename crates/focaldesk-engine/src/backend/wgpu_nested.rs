@@ -1826,6 +1826,7 @@ fn texture_color_transform(color: SurfaceColorRenderState) -> TextureColorTransf
         transfer,
         client_to_scene: color.client_to_scene,
         reference_white_nits: color.description.reference_white_nits.max(1.0),
+        source_peak_nits: color.source_peak_nits.max(1.0),
         linear_to_scene_scale: color.description.linear_to_scene_scale(),
         source_bits: color.src_bits,
     }

@@ -9,6 +9,13 @@ content handling. These paths are under active development and should not be
 treated as color-accurate or production-ready without measurement on the target
 hardware.
 
+Both DRM renderers perform the final HDR10 conversion in a shader. The raw
+Vulkan renderer composites into FP16, tone-maps and converts the scene to
+BT.2020/PQ, writes a 10-bit GBM buffer, and uses Smithay's atomic DRM state for
+link depth, connector colorspace, and HDR static metadata. Vulkan WSI colorspace
+extensions are not involved because KMS, rather than a Vulkan swapchain, owns
+presentation.
+
 ## Known working configuration
 
 As of August 20, 2026, HDR10 has been observed working in a native FocalDesk

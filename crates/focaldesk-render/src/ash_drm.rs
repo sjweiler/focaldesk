@@ -23,6 +23,10 @@ const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
 const ARGB8888: u32 = u32::from_le_bytes(*b"AR24");
 const XBGR8888: u32 = u32::from_le_bytes(*b"XB24");
 const ABGR8888: u32 = u32::from_le_bytes(*b"AB24");
+const XRGB2101010: u32 = u32::from_le_bytes(*b"XR30");
+const ARGB2101010: u32 = u32::from_le_bytes(*b"AR30");
+const XBGR2101010: u32 = u32::from_le_bytes(*b"XB30");
+const ABGR2101010: u32 = u32::from_le_bytes(*b"AB30");
 const GPU_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DAMAGE_HISTORY_LIMIT: usize = 64;
 type DamageRect = [i32; 4];
@@ -218,7 +222,15 @@ const OUTPUT_SHADER: &str = r#"
 @group(0) @binding(1) var scene_sampler: sampler;
 @group(0) @binding(2) var lut: texture_2d<f32>;
 
-struct Push { grid: vec4<f32> }
+struct Push {
+    params0: vec4<f32>,
+    params1: vec4<f32>,
+    params2: vec4<f32>,
+    matrix0: vec4<f32>,
+    matrix1: vec4<f32>,
+    matrix2: vec4<f32>,
+    luma: vec4<f32>,
+}
 var<immediate> pc: Push;
 
 struct Out {
@@ -246,7 +258,7 @@ fn gamma22_encode(value: f32) -> f32 {
 }
 
 fn encode_color(color: vec3<f32>) -> vec3<f32> {
-    if pc.grid.y > 0.5 {
+    if pc.params0.y == 1.0 || pc.params0.y > 3.5 {
         return vec3(gamma22_encode(color.r), gamma22_encode(color.g), gamma22_encode(color.b));
     }
     return vec3(srgb_encode(color.r), srgb_encode(color.g), srgb_encode(color.b));
@@ -257,14 +269,14 @@ fn srgb_decode(value: f32) -> f32 {
 }
 
 fn lut_sample_at(cell: vec3<f32>) -> vec3<f32> {
-    let n = pc.grid.x;
+    let n = pc.params0.x;
     let bounded = clamp(cell, vec3(0.0), vec3(n - 1.0));
     let coordinate = vec2<i32>(i32(bounded.y * n + bounded.x), i32(bounded.z));
     return textureLoad(lut, coordinate, 0).rgb;
 }
 
 fn lut_lookup(color: vec3<f32>) -> vec3<f32> {
-    let n = pc.grid.x;
+    let n = pc.params0.x;
     let position = clamp(color, vec3(0.0), vec3(1.0)) * (n - 1.0);
     let low = clamp(floor(position + vec3(0.00001)), vec3(0.0), vec3(n - 1.0));
     let fraction = clamp(position - low, vec3(0.0), vec3(1.0));
@@ -284,12 +296,108 @@ fn lut_lookup(color: vec3<f32>) -> vec3<f32> {
     return mix(mix(c00, c10, fraction.y), mix(c01, c11, fraction.y), fraction.z);
 }
 
+fn pq_oetf(nits: f32) -> f32 {
+    let l = max(nits, 0.0) / 10000.0;
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let lm = pow(l, m1);
+    return pow((c1 + c2 * lm) / (1.0 + c3 * lm), m2);
+}
+
+fn tone_map_nits(value: f32, source_peak: f32, display_peak: f32, white: f32) -> f32 {
+    let knee = max(white, display_peak * 0.8);
+    if value <= knee || display_peak <= knee || source_peak <= display_peak {
+        return min(value, display_peak);
+    }
+    let peak = max(source_peak, knee + 0.0001);
+    let range = max(display_peak - knee, 0.0001);
+    let denominator = 1.0 - exp(-(peak - knee) / range);
+    let numerator = 1.0 - exp(-(value - knee) / range);
+    return min(knee + range * numerator / max(denominator, 0.0001), display_peak);
+}
+
+fn pq_dither(pixel: vec2<f32>) -> f32 {
+    let p = floor(pixel);
+    let a = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+    let b = fract(52.9829189 * fract(dot(p, vec2(0.00583715, 0.06711056)) + 0.38196601));
+    return (a - b) / 1023.0;
+}
+
+fn calibration_nits(uv: vec2<f32>, pattern: f32) -> vec3<f32> {
+    if pattern < 1.5 {
+        if uv.y < 0.5 {
+            if uv.x < 0.25 { return vec3(100.0); }
+            if uv.x < 0.5 { return vec3(203.0); }
+            if uv.x < 0.75 { return vec3(300.0); }
+            return vec3(pc.params0.z);
+        }
+        if uv.x < 0.25 { return vec3(200.0 / 0.2627, 0.0, 0.0); }
+        if uv.x < 0.5 { return vec3(0.0, 200.0 / 0.6780, 0.0); }
+        if uv.x < 0.75 { return vec3(0.0, 0.0, 200.0 / 0.0593); }
+        return vec3(clamp((uv.x - 0.75) * 4.0, 0.0, 1.0) * pc.params0.z);
+    }
+    if pattern < 2.5 {
+        let black = max(pc.params1.x, 0.001);
+        if uv.x < 0.25 { return vec3(0.0); }
+        if uv.x < 0.5 { return vec3(black); }
+        if uv.x < 0.75 { return vec3(black * 2.0); }
+        return vec3(black * 4.0);
+    }
+    if pattern < 3.5 { return vec3(pc.params1.y); }
+    if pattern < 4.5 {
+        let d = abs(uv - vec2(0.5));
+        return select(vec3(0.0), vec3(pc.params0.z), d.x < 0.158114 && d.y < 0.158114);
+    }
+    return vec3(pc.params0.w);
+}
+
+fn encode_pq(scene_linear: vec3<f32>, pixel: vec2<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let calibration = pc.params2.y > 0.5;
+    var nits: vec3<f32>;
+    if calibration {
+        nits = calibration_nits(uv, pc.params2.y);
+    } else {
+        var bt2020 = max(vec3(
+            dot(pc.matrix0.xyz, scene_linear),
+            dot(pc.matrix1.xyz, scene_linear),
+            dot(pc.matrix2.xyz, scene_linear)), vec3(0.0));
+        let scene_y = max(dot(bt2020, pc.luma.xyz), 0.0);
+        bt2020 = max(vec3(scene_y) + (bt2020 - vec3(scene_y)) * pc.params1.w, vec3(0.0));
+        nits = bt2020 * pc.params1.y;
+    }
+    var y = max(dot(nits, pc.luma.xyz), 0.0);
+    if y > 0.0001 {
+        if !calibration && y < pc.params1.y {
+            let normalized = clamp(y / pc.params1.y, 0.0, 1.0);
+            let shaped = pow(normalized, pc.params2.x) * pc.params1.y;
+            nits *= shaped / y;
+            y = shaped;
+        }
+        let mapped = tone_map_nits(
+            y, max(pc.params1.z, pc.params0.z), pc.params0.z, pc.params1.y);
+        nits *= mapped / y;
+    }
+    nits = min(nits, vec3(10000.0));
+    var pq = vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b));
+    if !calibration { pq += vec3(pq_dither(pixel)); }
+    return clamp(pq, vec3(0.0), vec3(1.0));
+}
+
 @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
     let sampled = textureSample(scene, scene_sampler, in.uv);
     if sampled.a <= 0.0 { return vec4(0.0); }
     let straight = sampled.rgb / sampled.a;
+    if pc.params0.y > 1.5 {
+        return vec4(encode_pq(straight, in.position.xy, in.uv) * sampled.a, sampled.a);
+    }
     let encoded = encode_color(straight);
     let corrected = lut_lookup(encoded);
+    if pc.params0.y > 2.5 {
+        return vec4(corrected * sampled.a, sampled.a);
+    }
     let linear = vec3(srgb_decode(corrected.r), srgb_decode(corrected.g), srgb_decode(corrected.b));
     return vec4(linear * sampled.a, sampled.a);
 }
@@ -421,12 +529,33 @@ pub struct AshDrmOutputLut<'a> {
     pub rgb: &'a [u8],
 }
 
+/// Parameters for the final scene-linear to BT.2020/ST 2084 output pass.
+#[derive(Clone, Copy, Debug)]
+pub struct AshDrmHdrOutput {
+    pub peak_nits: f32,
+    pub full_frame_peak_nits: f32,
+    pub black_level_nits: f32,
+    pub reference_white_nits: f32,
+    pub source_peak_nits: f32,
+    pub saturation: f32,
+    pub midtone_gamma: f32,
+    pub calibration_pattern: f32,
+    pub scene_to_bt2020: [[f32; 3]; 3],
+    pub bt2020_luma: [f32; 3],
+}
+
 /// Electrical SDR encoding expected by the selected output profile.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum AshDrmTransfer {
     #[default]
     Srgb,
     Gamma22,
+    /// Explicit sRGB encoding for a non-sRGB UNORM attachment.
+    SrgbUnorm,
+    /// Explicit gamma 2.2 encoding for a non-sRGB UNORM attachment.
+    Gamma22Unorm,
+    /// SMPTE ST 2084 carried in a BT.2020 RGB KMS framebuffer.
+    Pq,
 }
 
 impl AshDrmCapture {
@@ -676,7 +805,7 @@ impl AshDrmRenderer {
         let output_layouts = [output_descriptor_layout];
         let output_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-            .size(16)];
+            .size(112)];
         let output_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default()
@@ -780,6 +909,26 @@ impl AshDrmRenderer {
                 ABGR8888,
                 vk::Format::R8G8B8A8_SRGB,
                 vk::Format::R8G8B8A8_UNORM,
+            ),
+            (
+                XRGB2101010,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+            ),
+            (
+                ARGB2101010,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+                vk::Format::A2R10G10B10_UNORM_PACK32,
+            ),
+            (
+                XBGR2101010,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+            ),
+            (
+                ABGR2101010,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
+                vk::Format::A2B10G10R10_UNORM_PACK32,
             ),
         ] {
             let format = if usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
@@ -930,6 +1079,7 @@ impl AshDrmRenderer {
         output_matrix: [[f32; 3]; 3],
         output_transfer: AshDrmTransfer,
         output_lut: Option<AshDrmOutputLut<'_>>,
+        hdr_output: Option<AshDrmHdrOutput>,
     ) -> Result<AshDrmSubmission> {
         self.poll()?;
         ensure!(
@@ -1344,6 +1494,7 @@ impl AshDrmRenderer {
                 output_descriptor,
                 output_grid_size,
                 output_transfer,
+                hdr_output,
             );
         }
 
@@ -1840,6 +1991,7 @@ impl AshDrmRenderer {
         scene_descriptor: vk::DescriptorSet,
         grid_size: u32,
         output_transfer: AshDrmTransfer,
+        hdr_output: Option<AshDrmHdrOutput>,
     ) {
         unsafe {
             self.device.cmd_begin_render_pass(
@@ -1876,21 +2028,60 @@ impl AshDrmRenderer {
                 &[scene_descriptor],
                 &[],
             );
+            let hdr = hdr_output.unwrap_or(AshDrmHdrOutput {
+                peak_nits: 1.0,
+                full_frame_peak_nits: 1.0,
+                black_level_nits: 0.0,
+                reference_white_nits: 1.0,
+                source_peak_nits: 1.0,
+                saturation: 1.0,
+                midtone_gamma: 1.0,
+                calibration_pattern: 0.0,
+                scene_to_bt2020: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                bt2020_luma: [0.2627, 0.6780, 0.0593],
+            });
+            let push = [
+                grid_size as f32,
+                match output_transfer {
+                    AshDrmTransfer::Srgb => 0.0,
+                    AshDrmTransfer::Gamma22 => 1.0,
+                    AshDrmTransfer::Pq => 2.0,
+                    AshDrmTransfer::SrgbUnorm => 3.0,
+                    AshDrmTransfer::Gamma22Unorm => 4.0,
+                },
+                hdr.peak_nits,
+                hdr.full_frame_peak_nits,
+                hdr.black_level_nits,
+                hdr.reference_white_nits,
+                hdr.source_peak_nits,
+                hdr.saturation,
+                hdr.midtone_gamma,
+                hdr.calibration_pattern,
+                0.0,
+                0.0,
+                hdr.scene_to_bt2020[0][0],
+                hdr.scene_to_bt2020[0][1],
+                hdr.scene_to_bt2020[0][2],
+                0.0,
+                hdr.scene_to_bt2020[1][0],
+                hdr.scene_to_bt2020[1][1],
+                hdr.scene_to_bt2020[1][2],
+                0.0,
+                hdr.scene_to_bt2020[2][0],
+                hdr.scene_to_bt2020[2][1],
+                hdr.scene_to_bt2020[2][2],
+                0.0,
+                hdr.bt2020_luma[0],
+                hdr.bt2020_luma[1],
+                hdr.bt2020_luma[2],
+                0.0,
+            ];
             self.device.cmd_push_constants(
                 command,
                 self.output_layout,
                 vk::ShaderStageFlags::FRAGMENT,
                 0,
-                as_bytes(&[
-                    grid_size as f32,
-                    if output_transfer == AshDrmTransfer::Gamma22 {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                    0.0,
-                    0.0,
-                ]),
+                as_bytes(&push),
             );
             self.device.cmd_draw(command, 3, 1, 0, 0);
             self.device.cmd_end_render_pass(command);
@@ -2829,6 +3020,8 @@ fn vk_format(fourcc: u32) -> Result<vk::Format> {
     match fourcc {
         XRGB8888 | ARGB8888 => Ok(vk::Format::B8G8R8A8_SRGB),
         XBGR8888 | ABGR8888 => Ok(vk::Format::R8G8B8A8_SRGB),
+        XRGB2101010 | ARGB2101010 => Ok(vk::Format::A2R10G10B10_UNORM_PACK32),
+        XBGR2101010 | ABGR2101010 => Ok(vk::Format::A2B10G10R10_UNORM_PACK32),
         _ => bail!("unsupported DRM target fourcc 0x{fourcc:08x}"),
     }
 }
@@ -3077,7 +3270,8 @@ mod tests {
     use super::{
         compile_shader, effective_damage_regions, identity_output_lut, multiply_3x3, ndc_rect,
         texture_vk_format, transformed_uv, validate_output_lut, vk_format, AshDrmCapture,
-        AshDrmOutputLut, ARGB8888, MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER, TEXTURE_SHADER,
+        AshDrmOutputLut, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER,
+        TEXTURE_SHADER,
     };
     use crate::{FramePixelFormat, FrameTransform};
     use std::collections::VecDeque;
@@ -3108,6 +3302,18 @@ mod tests {
             ash::vk::Format::R8G8B8A8_UNORM
         );
         assert_eq!(vk_format(ARGB8888).unwrap(), ash::vk::Format::B8G8R8A8_SRGB);
+        assert_eq!(
+            vk_format(ARGB2101010).unwrap(),
+            ash::vk::Format::A2R10G10B10_UNORM_PACK32
+        );
+    }
+
+    #[test]
+    fn pq_output_pass_tone_maps_and_dithers_for_ten_bit_scanout() {
+        assert!(OUTPUT_SHADER.contains("fn pq_oetf"));
+        assert!(OUTPUT_SHADER.contains("fn tone_map_nits"));
+        assert!(OUTPUT_SHADER.contains("/ 1023.0"));
+        assert!(OUTPUT_SHADER.contains("dot(pc.matrix0.xyz, scene_linear)"));
     }
 
     #[test]

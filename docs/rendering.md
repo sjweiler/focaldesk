@@ -76,9 +76,13 @@ Eight-bit tagged sources use the same neutral-axis code-value dither as GLES.
 Wallpaper, solids, and shell meshes enter the same retained FP16 linear scene.
 A post-composition pass applies the selected output transform and encodes through
 the monitor's 33³ ICC LUT atlas (or an identity cube when no profile is selected)
-before the sRGB KMS attachment writes the intended device code. HDR sources are
-preserved in the FP16 scene, but extended-range tone mapping, PQ scanout, and KMS
-HDR metadata remain on the GLES path.
+before the sRGB KMS attachment writes the intended device code. On a configured
+HDR10 output, raw Vulkan instead prefers a 10-bit GBM scanout, tone-maps the FP16
+scene using the output appearance controls and visible client peak, converts the
+scene to BT.2020, applies ST 2084 PQ with neutral 10-bit dithering, and queues
+BT.2020 RGB, link depth, and HDR static metadata through Smithay's atomic KMS
+state. Failure to obtain a 10-bit buffer or stage the connector properties keeps
+that output in SDR rather than presenting PQ pixels without HDR signaling.
 
 Raw Vulkan submissions and KMS presents have bounded progress deadlines. A
 stalled GPU fence recreates the Vulkan device and scanout in-process, while a

@@ -12,7 +12,8 @@ use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_render::{
-    AshDrmCapture, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer, DrmRenderTarget,
+    AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer,
+    DrmRenderTarget,
 };
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -47,18 +48,25 @@ use super::common::{
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    configured_display_scale, connector_edid, dispatch_backend_input_event, load_display_config,
-    parse_edid_identity, select_connector_mode,
+    configured_display_hdr_requested, configured_display_scale, configured_hdr_appearance,
+    connector_edid, dispatch_backend_input_event, hdr_detection, load_display_config,
+    parse_edid_identity, select_connector_mode, HdrSupport,
 };
 use super::wgpu_nested::VulkanSceneBuilder;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
-const SCANOUT_FORMATS: [Fourcc; 4] = [
+const SDR_SCANOUT_FORMATS: [Fourcc; 4] = [
     Fourcc::Xrgb8888,
     Fourcc::Argb8888,
     Fourcc::Xbgr8888,
     Fourcc::Abgr8888,
+];
+const HDR_SCANOUT_FORMATS: [Fourcc; 4] = [
+    Fourcc::Xrgb2101010,
+    Fourcc::Argb2101010,
+    Fourcc::Xbgr2101010,
+    Fourcc::Abgr2101010,
 ];
 type VulkanScanout = GbmBufferedSurface<GbmAllocator<DrmDeviceFd>, ()>;
 
@@ -121,6 +129,9 @@ struct OutputConfig {
     edid: Option<Vec<u8>>,
     color_profile: focaldesk_settings_core::DisplayColorProfile,
     icc_profile_path: Option<String>,
+    hdr_support: HdrSupport,
+    hdr_requested: bool,
+    hdr_appearance: focaldesk_settings_core::HdrAppearance,
 }
 
 struct VulkanOutput {
@@ -133,6 +144,7 @@ struct VulkanOutput {
     scanout: VulkanScanout,
     frame_pending: bool,
     present_started_at: Option<Instant>,
+    hdr_metadata_blob: Option<u64>,
 }
 
 struct VulkanDrmData {
@@ -250,6 +262,9 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             .map(|(width, height)| (width as i32, height as i32))
             .unwrap_or(fallback_mm);
         let edid = connector_edid(drm, *handle);
+        let hdr_support = hdr_detection::connector_hdr_support(drm, *handle, edid.as_deref());
+        let hdr_requested = configured_display_hdr_requested(&configured, &name);
+        let hdr_appearance = configured_hdr_appearance(&configured, &name);
         let identity = edid.as_deref().and_then(parse_edid_identity);
         let make = identity
             .as_ref()
@@ -289,6 +304,9 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
                 .map(|display| display.color_profile)
                 .unwrap_or_default(),
             icc_profile_path: saved.and_then(|display| display.icc_profile_path.clone()),
+            hdr_support,
+            hdr_requested,
+            hdr_appearance,
         });
     }
     if outputs.is_empty() {
@@ -383,10 +401,18 @@ fn initialize_vulkan_outputs(
         let gbm = GbmDevice::new(fd.clone())
             .with_context(|| format!("create GBM device for Vulkan output {}", config.name))?;
         let allocator = GbmAllocator::new(gbm, GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT);
+        let prefer_hdr = config.hdr_requested
+            && config.hdr_support.can_signal_hdr10()
+            && config.hdr_support.bpc_control_allows_ten_bit();
+        let mut scanout_formats = Vec::with_capacity(8);
+        if prefer_hdr {
+            scanout_formats.extend(HDR_SCANOUT_FORMATS);
+        }
+        scanout_formats.extend(SDR_SCANOUT_FORMATS);
         let scanout = VulkanScanout::new(
             drm_surface,
             allocator,
-            &SCANOUT_FORMATS,
+            &scanout_formats,
             render_formats.clone(),
         )?;
         if !plane_has_input_fence(drm, scanout.plane())? {
@@ -437,16 +463,72 @@ fn initialize_vulkan_outputs(
             config.serial_number,
             config.edid,
         );
+        let ten_bit_scanout = HDR_SCANOUT_FORMATS.contains(&scanout.format());
+        let mut hdr_active = false;
+        let hdr_metadata_blob = if prefer_hdr && ten_bit_scanout {
+            let staged = (|| -> Result<u64> {
+                let metadata = hdr_detection::hdr_kms::create_hdr_metadata_blob(
+                    drm,
+                    &config.hdr_support,
+                    hdr_detection::hdr_kms::hdr_metadata_config(config.hdr_appearance),
+                )?;
+                let state = match hdr_detection::hdr_kms::build_connector_hdr_state(
+                    drm,
+                    config.connector,
+                    &config.hdr_support,
+                    true,
+                    Some(metadata),
+                )? {
+                    Some(state) => state,
+                    None => {
+                        hdr_detection::hdr_kms::destroy_hdr_metadata_blob(drm, Some(metadata));
+                        return Err(anyhow!("HDR connector exposes no programmable KMS state"));
+                    }
+                };
+                if let Err(error) = scanout.surface().use_hdr_state(state) {
+                    hdr_detection::hdr_kms::destroy_hdr_metadata_blob(drm, Some(metadata));
+                    return Err(anyhow!("queue raw Vulkan HDR KMS state: {error}"));
+                }
+                Ok(metadata)
+            })();
+            match staged {
+                Ok(metadata) => {
+                    hdr_active = true;
+                    Some(metadata)
+                }
+                Err(error) => {
+                    flog_warn!(
+                        "Raw Vulkan HDR setup failed on {}; using SDR: {error:#}",
+                        config.name
+                    );
+                    None
+                }
+            }
+        } else {
+            if config.hdr_requested {
+                flog_warn!(
+                    "Raw Vulkan HDR unavailable on {}; using SDR (signaling={} ten_bit_scanout={ten_bit_scanout})",
+                    config.name,
+                    config.hdr_support.can_signal_hdr10(),
+                );
+            }
+            None
+        };
         if let Some(output) = desktop.state.outputs.get_mut(&config.output_id) {
             output.color_profile_override = config.color_profile;
             output.icc_profile_path = config.icc_profile_path;
+            output.hdr_supported = config.hdr_support.is_detected();
+            output.hdr_requested = config.hdr_requested && output.hdr_supported;
+            output.hdr_kms_applied = hdr_active;
+            output.hdr_enabled = hdr_active;
+            output.hdr_appearance = config.hdr_appearance.validate().unwrap_or_default();
         }
         desktop.state.refresh_output_color(config.output_id);
         if config.primary {
             configured_primary = Some(config.output_id);
         }
         flog(format!(
-            "Raw Vulkan DRM output configured: {} {}x{}@{}Hz scale={} origin={},{}",
+            "Raw Vulkan DRM output configured: {} {}x{}@{}Hz scale={} origin={},{} format={:?} hdr={hdr_active}",
             config.name,
             config.width,
             config.height,
@@ -454,6 +536,7 @@ fn initialize_vulkan_outputs(
             config.scale,
             config.origin.x,
             config.origin.y,
+            scanout.format(),
         ));
         outputs.push(VulkanOutput {
             name: config.name,
@@ -465,6 +548,7 @@ fn initialize_vulkan_outputs(
             scanout,
             frame_pending: false,
             present_started_at: None,
+            hdr_metadata_blob,
         });
     }
     desktop.state.primary_output = configured_primary.unwrap_or(outputs[0].output_id);
@@ -492,6 +576,10 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         if let Some(state) = data.desktop.state.outputs.get(&output.output_id) {
             data.desktop.state.space.unmap_output(&state.handle);
         }
+        hdr_detection::hdr_kms::destroy_hdr_metadata_blob(
+            &data.drm,
+            output.hdr_metadata_blob.take(),
+        );
         data.desktop.state.outputs.shift_remove(&output.output_id);
         data.desktop
             .state
@@ -1024,7 +1112,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .output_capture_broker
                     .has_consumers_for_output(output_id))
                 && !data.capture_pending.contains(&output_id);
-            let output_matrix = data
+            let sdr_output_matrix = data
                 .desktop
                 .state
                 .outputs
@@ -1067,6 +1155,55 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     _ => AshDrmTransfer::Srgb,
                 })
                 .unwrap_or_default();
+            let visible_source_peak = scene
+                .surfaces
+                .iter()
+                .map(|surface| surface.color_transform.source_peak_nits)
+                .filter(|peak| peak.is_finite() && *peak > 0.0)
+                .reduce(f32::max);
+            let hdr_output = data
+                .desktop
+                .state
+                .outputs
+                .get(&output_id)
+                .and_then(|output| {
+                    let active =
+                        output.hdr_requested && output.hdr_supported && output.hdr_kms_applied;
+                    active.then(|| {
+                        let appearance = output.hdr_appearance.validate().unwrap_or_default();
+                        let (scene_to_bt2020, _, bt2020_luma) =
+                            crate::core::color::hdr10_pq_encode_transforms(
+                                output.color_description.primaries,
+                            );
+                        AshDrmHdrOutput {
+                            peak_nits: appearance.peak_nits,
+                            full_frame_peak_nits: appearance.full_frame_peak_nits,
+                            black_level_nits: appearance.black_level_nits,
+                            reference_white_nits: appearance.reference_white_nits,
+                            source_peak_nits: visible_source_peak.unwrap_or(appearance.peak_nits),
+                            saturation: appearance.saturation,
+                            midtone_gamma: appearance.midtone_gamma,
+                            calibration_pattern: output.hdr_calibration_pattern.shader_value(),
+                            scene_to_bt2020,
+                            bt2020_luma,
+                        }
+                    })
+                });
+            let output_matrix = if hdr_output.is_some() {
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+            } else {
+                sdr_output_matrix
+            };
+            let output_transfer = if hdr_output.is_some() {
+                AshDrmTransfer::Pq
+            } else if HDR_SCANOUT_FORMATS.contains(&data.outputs[index].scanout.format()) {
+                match output_transfer {
+                    AshDrmTransfer::Gamma22 => AshDrmTransfer::Gamma22Unorm,
+                    _ => AshDrmTransfer::SrgbUnorm,
+                }
+            } else {
+                output_transfer
+            };
             let output = &mut data.outputs[index];
             let (dmabuf, _) = match output.scanout.next_buffer() {
                 Ok(next) => next,
@@ -1093,6 +1230,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 output_matrix,
                 output_transfer,
                 output_lut,
+                hdr_output,
             )?;
             if capture_requested {
                 data.capture_pending.insert(output_id);
