@@ -3633,16 +3633,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .xwayland_event_loop
             .dispatch(Some(Duration::ZERO), &mut data.core.state)?;
 
-        data.core.state.process_settings_ipc_requests();
-        data.core.state.process_clipboard_captures();
-        data.core.state.process_chrome_timers();
-        data.core.state.process_notification_timers();
-        data.core.state.process_idle_timers();
-        data.core.state.process_power_timers();
-        data.core.state.process_media_device_timers();
-        data.core.state.process_network_state_timers();
-        data.core.state.process_update_state_timers();
-        data.core.state.process_lock_timers();
+        crate::backend::common::pump_desktop_services(&mut data.core.state);
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
         process_deferred_drm_topology_change(&mut data, &loop_handle);

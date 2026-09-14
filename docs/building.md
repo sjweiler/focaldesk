@@ -206,9 +206,12 @@ imports those DMA-BUFs as color attachments. Each queue submission exports a
 sync-file that Smithay passes to KMS as the primary plane input fence. It does
 not use Vulkan display WSI and does not create EGL or GLES objects. The Vulkan
 backend creates one scanout path per enabled connected output and honors saved
-mode, scale, logical position, and primary-output settings. Use the GLES
-renderer for HDR, output capture, XWayland, or live hotplug until those
-lifecycle paths are implemented for Vulkan.
+mode, scale, logical position, and primary-output settings. Builds with the
+`xwayland` feature run the same XWayland startup and event loop as the GLES DRM
+backend. Use the GLES renderer for HDR, output capture, or egui shader-effect
+parity until those renderer paths are implemented for Vulkan.
+Connector hotplug and display-settings changes rebuild the Vulkan KMS topology.
+Egui panels use the raw Vulkan mesh pipeline and do not depend on EGL.
 
 `cargo check -p focaldesk-desktop --no-default-features --features drm-vulkan,xwayland`
 verifies the combined build without installing it. The legacy `drm-wgpu`

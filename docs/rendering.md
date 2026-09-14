@@ -33,12 +33,10 @@ uploads only accumulated damage rectangles when a cached upload buffer returns.
 Unused entries age out of the cache. All eight Wayland buffer rotations and
 reflections are applied while mapping viewport texture coordinates.
 
-The Vulkan path also has a retained output scene. Pending physical output
-damage is clamped and applied as render-pass scissors; the complete retained
-scene is then sampled into whichever swapchain image was acquired. This avoids
-depending on swapchain-image preservation while limiting scene recomposition to
-dirty pixels. With no compositor damage, connected idle clients no longer
-schedule frames continuously.
+The Vulkan path also has a retained output scene. With no compositor damage,
+connected idle clients do not schedule frames continuously. A damaged output is
+currently recomposed in full into its acquired GBM buffer; buffer-age-aware
+partial repaint remains a GLES-only optimization.
 
 The shell pass now renders configured wallpaper fit/tint/dim behavior, cached
 font-atlas text, state-tinted SVG icons, antialiased rounded panels, and
@@ -58,9 +56,14 @@ Vulkan display surface, Vulkan WSI swapchain, GLES copy, or EGL import bridge.
 backend creates an explicit-sync GBM swapchain for every enabled connected
 output and applies the saved mode, fractional scale, logical position, and
 primary-output selection from `displays.json`. It resets every compositor-owned
-swapchain across libseat pause/resume and shares the established DRM input
-dispatcher used by the GLES backend. GLES remains the recovery renderer and
-retains HDR, capture, XWayland, and live-hotplug support.
+swapchain across libseat pause/resume, shares the established DRM input
+dispatcher and deferred action pumps used by the GLES backend, and runs the
+normal XWayland lifecycle when that feature is enabled. GLES remains the
+recovery renderer and retains HDR and output-capture support. Udev connector
+events and display-settings IPC updates rebuild the raw Vulkan KMS topology.
+The Vulkan renderer paints egui panels as native indexed Vulkan meshes, with
+retained texture updates, physical-pixel scaling, and per-mesh clipping; it does
+not create an EGL or GLES context for panel rendering.
 
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 

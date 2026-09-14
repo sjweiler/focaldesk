@@ -162,16 +162,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "xwayland")]
         xwayland_event_loop.dispatch(Some(Duration::ZERO), &mut nested.state)?;
 
-        nested.state.process_settings_ipc_requests();
-        nested.state.process_clipboard_captures();
-        nested.state.process_chrome_timers();
-        nested.state.process_notification_timers();
-        nested.state.process_idle_timers();
-        nested.state.process_power_timers();
-        nested.state.process_media_device_timers();
-        nested.state.process_network_state_timers();
-        nested.state.process_update_state_timers();
-        nested.state.process_lock_timers();
+        crate::backend::common::pump_desktop_services(&mut nested.state);
 
         if !dispatch_backend_events(&mut nested.state, &mut event_loop, &mut window_focused)? {
             break;

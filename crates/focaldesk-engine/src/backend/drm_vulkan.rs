@@ -6,7 +6,7 @@ use std::error::Error;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
@@ -25,7 +25,7 @@ use smithay::backend::input::{
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::sync::{Fence, Interrupted, SyncPoint};
 use smithay::backend::session::{libseat::LibSeatSession, Event as SessionEvent, Session};
-use smithay::backend::udev::primary_gpu;
+use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::drm::control::{connector, crtc, plane, Device as _, Mode};
@@ -39,8 +39,11 @@ use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
-    physical_size_mm_from_pixels, stop_focaldesk_session_target, NestedDesktop,
+    physical_size_mm_from_pixels, pump_desktop_services, spawn_session_sleep_watch,
+    stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
 };
+#[cfg(feature = "xwayland")]
+use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
     configured_display_scale, dispatch_backend_input_event, load_display_config,
     select_connector_mode,
@@ -122,14 +125,68 @@ struct VulkanOutput {
 
 struct VulkanDrmData {
     desktop: NestedDesktop,
+    #[cfg(feature = "xwayland")]
+    xwayland_event_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
     renderer: AshDrmRenderer,
     scene_builder: VulkanSceneBuilder,
     drm: DrmDevice,
+    drm_fd: DrmDeviceFd,
+    primary_node: DrmNode,
+    session: LibSeatSession,
     outputs: Vec<VulkanOutput>,
     libinput: Libinput,
     session_active: bool,
+    resume_pending: bool,
+    resume_retry_at: Option<Instant>,
+    topology_refresh_pending: bool,
     fatal_error: Option<anyhow::Error>,
     surface_blocker_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
+}
+
+fn pause_vulkan_session(data: &mut VulkanDrmData, reason: &str) {
+    if !data.session_active {
+        return;
+    }
+    data.resume_pending = false;
+    data.resume_retry_at = None;
+    data.session_active = false;
+    for output in &mut data.outputs {
+        if output.frame_pending {
+            if let Err(error) = output.scanout.frame_submitted() {
+                flog_warn!(
+                    "retiring pre-pause Vulkan frame on {} failed: {error}",
+                    output.name
+                );
+            }
+            output.frame_pending = false;
+        }
+    }
+    data.drm.pause();
+    data.libinput.suspend();
+    data.desktop.state.handle_session_suspend();
+    flog_warn!("raw Vulkan DRM session paused: {reason}");
+}
+
+fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
+    if !data.session.is_active() {
+        return Err(anyhow!("libseat has not restored device ownership"));
+    }
+    data.drm.activate(true).context("reactivate DRM device")?;
+    for output in &mut data.outputs {
+        output.scanout.reset_buffers();
+        output.frame_pending = false;
+    }
+    data.libinput
+        .resume()
+        .map_err(|()| anyhow!("resume libinput"))?;
+    data.session_active = true;
+    data.resume_pending = false;
+    data.resume_retry_at = None;
+    data.topology_refresh_pending = true;
+    data.desktop.state.handle_session_resume();
+    data.desktop.state.mark_redraw();
+    flog(format!("raw Vulkan DRM session resumed: {reason}"));
+    Ok(())
 }
 
 fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
@@ -263,38 +320,14 @@ fn advertise_dmabuf(
     Ok(())
 }
 
-/// Run the raw-Vulkan compositor with Smithay/libseat KMS ownership and one
-/// explicit-sync GBM swapchain per configured output.
-pub fn run() -> Result<(), Box<dyn Error>> {
-    flog_warn!("FOCALDESK: entered raw ash DRM backend (Smithay KMS + GBM scanout)");
-    let mut event_loop: EventLoop<VulkanDrmData> = EventLoop::try_new()?;
-    let loop_handle = event_loop.handle();
-    let (mut session, session_notifier) =
-        LibSeatSession::new().map_err(|error| anyhow!("initialize libseat: {error}"))?;
-    let primary_path: PathBuf = primary_gpu(session.seat())?
-        .ok_or_else(|| anyhow!("no primary GPU found for seat {}", session.seat()))?;
-    let node = DrmNode::from_path(&primary_path).context("identify primary DRM node")?;
-    let fd = session
-        .open(&primary_path, OFlags::RDWR | OFlags::CLOEXEC)
-        .with_context(|| format!("open primary DRM node {}", primary_path.display()))?;
-    let fd = DrmDeviceFd::new(DeviceFd::from(fd));
-    let (mut drm, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
-    let output_configs = select_outputs(&drm)?;
-    let renderer = AshDrmRenderer::new(node.major(), node.minor())?;
-    let render_formats = ash_formats(&renderer);
-    if render_formats.is_empty() {
-        return Err(anyhow!("Vulkan device exposes no renderable DRM scanout modifiers").into());
-    }
-    let has_syncobj = drm
-        .get_driver_capability(DriverCapability::SyncObj)
-        .is_ok_and(|supported| supported != 0);
-    if !drm.is_atomic() || !has_syncobj {
-        return Err(anyhow!(
-            "raw Vulkan DRM requires atomic KMS and DRM syncobj; refusing an implicit blocking fallback"
-        ).into());
-    }
-
-    let mut desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
+fn initialize_vulkan_outputs(
+    desktop: &mut NestedDesktop,
+    renderer: &AshDrmRenderer,
+    drm: &mut DrmDevice,
+    fd: &DrmDeviceFd,
+    output_configs: Vec<OutputConfig>,
+) -> Result<Vec<VulkanOutput>> {
+    let render_formats = ash_formats(renderer);
     let mut outputs = Vec::with_capacity(output_configs.len());
     let mut configured_primary = None;
     for config in output_configs {
@@ -308,12 +341,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             &SCANOUT_FORMATS,
             render_formats.clone(),
         )?;
-        if !plane_has_input_fence(&drm, scanout.plane())? {
+        if !plane_has_input_fence(drm, scanout.plane())? {
             return Err(anyhow!(
                 "raw Vulkan DRM output {} has no primary-plane IN_FENCE_FD",
                 config.name
-            )
-            .into());
+            ));
         }
 
         let physical_size =
@@ -377,6 +409,85 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     desktop.state.primary_output = configured_primary.unwrap_or(outputs[0].output_id);
     desktop.state.focused_output = desktop.state.primary_output;
     desktop.state.mark_redraw();
+    Ok(outputs)
+}
+
+fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
+    // Probe first so a transient connector read failure never destroys the
+    // currently working topology.
+    let output_configs = match select_outputs(&data.drm) {
+        Ok(configs) => configs,
+        Err(error) => {
+            flog_warn!("raw Vulkan DRM topology rebuild deferred: {error:#}");
+            return Ok(false);
+        }
+    };
+    let snapshot = data.desktop.state.snapshot_output_topology();
+    for output in &mut data.outputs {
+        if output.frame_pending {
+            let _ = output.scanout.frame_submitted();
+        }
+        if let Some(state) = data.desktop.state.outputs.get(&output.output_id) {
+            data.desktop.state.space.unmap_output(&state.handle);
+        }
+        data.desktop.state.outputs.shift_remove(&output.output_id);
+        data.desktop
+            .state
+            .desktop_outputs
+            .shift_remove(&output.output_id);
+        data.desktop
+            .output_state
+            .outputs
+            .shift_remove(&output.output_id);
+    }
+    data.outputs.clear();
+    data.scene_builder.clear();
+    data.outputs = initialize_vulkan_outputs(
+        &mut data.desktop,
+        &data.renderer,
+        &mut data.drm,
+        &data.drm_fd,
+        output_configs,
+    )?;
+    data.desktop.state.restore_output_topology(snapshot);
+    data.desktop.state.mark_redraw();
+    Ok(true)
+}
+
+/// Run the raw-Vulkan compositor with Smithay/libseat KMS ownership and one
+/// explicit-sync GBM swapchain per configured output.
+pub fn run() -> Result<(), Box<dyn Error>> {
+    flog_warn!("FOCALDESK: entered raw ash DRM backend (Smithay KMS + GBM scanout)");
+    let mut event_loop: EventLoop<VulkanDrmData> = EventLoop::try_new()?;
+    let loop_handle = event_loop.handle();
+    let (mut session, session_notifier) =
+        LibSeatSession::new().map_err(|error| anyhow!("initialize libseat: {error}"))?;
+    let primary_path: PathBuf = primary_gpu(session.seat())?
+        .ok_or_else(|| anyhow!("no primary GPU found for seat {}", session.seat()))?;
+    let node = DrmNode::from_path(&primary_path).context("identify primary DRM node")?;
+    let fd = session
+        .open(&primary_path, OFlags::RDWR | OFlags::CLOEXEC)
+        .with_context(|| format!("open primary DRM node {}", primary_path.display()))?;
+    let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+    let (mut drm, drm_notifier) = DrmDevice::new(fd.clone(), true)?;
+    let renderer = AshDrmRenderer::new(node.major(), node.minor())?;
+    let render_formats = ash_formats(&renderer);
+    if render_formats.is_empty() {
+        return Err(anyhow!("Vulkan device exposes no renderable DRM scanout modifiers").into());
+    }
+    let has_syncobj = drm
+        .get_driver_capability(DriverCapability::SyncObj)
+        .is_ok_and(|supported| supported != 0);
+    if !drm.is_atomic() || !has_syncobj {
+        return Err(anyhow!(
+            "raw Vulkan DRM requires atomic KMS and DRM syncobj; refusing an implicit blocking fallback"
+        ).into());
+    }
+
+    let mut desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
+    let output_configs = select_outputs(&drm)?;
+    let outputs =
+        initialize_vulkan_outputs(&mut desktop, &renderer, &mut drm, &fd, output_configs)?;
     advertise_dmabuf(&mut desktop, &renderer, node)?;
     if let Ok(sync_fd) = fd.as_fd().try_clone_to_owned() {
         let sync_device = DrmDeviceFd::new(DeviceFd::from(sync_fd));
@@ -390,6 +501,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
     let surface_blocker_loop = EventLoop::try_new()?;
     desktop.state.surface_blocker_loop_handle = Some(surface_blocker_loop.handle());
+    #[cfg(feature = "xwayland")]
+    let xwayland_event_loop = EventLoop::try_new()?;
 
     let mut libinput =
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
@@ -397,17 +510,48 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         .udev_assign_seat(&session.seat())
         .map_err(|error| anyhow!("assign libinput seat: {error:?}"))?;
     let input_backend = LibinputInputBackend::new(libinput.clone());
+    let mut input_session = session.clone();
+    let udev = UdevBackend::new(session.seat())
+        .map_err(|error| anyhow!("initialize udev backend: {error}"))?;
     let mut data = VulkanDrmData {
         desktop,
+        #[cfg(feature = "xwayland")]
+        xwayland_event_loop,
         renderer,
         scene_builder: VulkanSceneBuilder::default(),
         drm,
+        drm_fd: fd,
+        primary_node: node,
+        session: session.clone(),
         outputs,
         libinput,
         session_active: session.is_active(),
+        resume_pending: false,
+        resume_retry_at: None,
+        topology_refresh_pending: false,
         fatal_error: None,
         surface_blocker_loop,
     };
+
+    #[cfg(feature = "xwayland")]
+    {
+        start_xwayland(
+            &mut data.desktop.state,
+            &data.desktop.display.handle(),
+            data.xwayland_event_loop.handle(),
+        )?;
+        finish_xwayland_startup(
+            &mut data.xwayland_event_loop,
+            &mut data.desktop.display,
+            &mut data.desktop.state,
+            Duration::from_secs(30),
+        )?;
+        if let Some(display) = data.desktop.state.xwayland_display.as_deref() {
+            flog(format!(
+                "Raw Vulkan DRM: XWayland active on DISPLAY={display}"
+            ));
+        }
+    }
 
     let _input_token = loop_handle.insert_source(input_backend, move |event, _, data| {
         if let InputEvent::Keyboard { event, .. } = &event {
@@ -422,7 +566,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         _ => None,
                     };
                     if let Some(vt) = vt {
-                        if let Err(error) = session.change_vt(vt) {
+                        if let Err(error) = input_session.change_vt(vt) {
                             flog_warn!("VT switch to {vt} failed: {error:?}");
                         }
                         return;
@@ -461,42 +605,33 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let _session_token =
         loop_handle.insert_source(session_notifier, |event, _, data| match event {
             SessionEvent::PauseSession => {
-                data.session_active = false;
-                for output in &mut data.outputs {
-                    if output.frame_pending {
-                        if let Err(error) = output.scanout.frame_submitted() {
-                            flog_warn!(
-                                "retiring pre-pause Vulkan frame on {} failed: {error}",
-                                output.name
-                            );
-                        }
-                        output.frame_pending = false;
-                    }
-                }
-                data.drm.pause();
-                data.libinput.suspend();
-                data.desktop.state.handle_session_suspend();
-                flog_warn!("raw Vulkan DRM session paused");
+                pause_vulkan_session(data, "libseat PauseSession");
             }
             SessionEvent::ActivateSession => {
-                if let Err(error) = data.drm.activate(true) {
-                    data.fatal_error = Some(anyhow!("reactivate DRM device: {error}"));
-                    return;
-                }
-                for output in &mut data.outputs {
-                    output.scanout.reset_buffers();
-                    output.frame_pending = false;
-                }
-                if let Err(error) = data.libinput.resume() {
-                    data.fatal_error = Some(anyhow!("resume libinput: {error:?}"));
-                    return;
-                }
-                data.session_active = true;
-                data.desktop.state.handle_session_resume();
-                data.desktop.state.mark_redraw();
-                flog("raw Vulkan DRM session resumed");
+                data.resume_pending = true;
+                data.resume_retry_at = Some(Instant::now() + Duration::from_millis(250));
+                flog_warn!("raw Vulkan DRM ownership restored; scheduling settled resume");
             }
         })?;
+
+    let _udev_token = loop_handle.insert_source(udev, |event, _, data| {
+        let device_id = match event {
+            UdevEvent::Added { device_id, .. }
+            | UdevEvent::Changed { device_id }
+            | UdevEvent::Removed { device_id } => device_id,
+        };
+        let Ok(node) = DrmNode::from_dev_id(device_id) else {
+            return;
+        };
+        if node == data.primary_node {
+            data.topology_refresh_pending = true;
+            flog(format!(
+                "raw Vulkan DRM connector event on {node:?}; scheduling topology rebuild"
+            ));
+        }
+    })?;
+
+    let sleep_notifications = spawn_session_sleep_watch().ok();
 
     flog_warn!(
         "Raw Vulkan DRM ready: outputs={} renderer={} (no Vulkan display WSI)",
@@ -504,9 +639,57 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.renderer.info().adapter_name
     );
     while data.desktop.state.running {
+        if let Some(rx) = sleep_notifications.as_ref() {
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    SessionSleepEvent::GoingToSleep => {
+                        pause_vulkan_session(&mut data, "login1 PrepareForSleep(true)");
+                    }
+                    SessionSleepEvent::WokeUp => {
+                        data.resume_pending = true;
+                        data.resume_retry_at = Some(Instant::now() + Duration::from_millis(250));
+                    }
+                }
+            }
+        }
+        if data.resume_pending
+            && data
+                .resume_retry_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            if let Err(error) = resume_vulkan_session(&mut data, "settled resume") {
+                flog_warn!("raw Vulkan DRM resume deferred: {error:#}");
+                data.resume_retry_at = Some(Instant::now() + Duration::from_millis(500));
+            }
+        }
+
+        #[cfg(feature = "xwayland")]
+        data.xwayland_event_loop
+            .dispatch(Some(Duration::ZERO), &mut data.desktop.state)?;
+
+        pump_desktop_services(&mut data.desktop.state);
+        if data.desktop.state.take_display_reconfigure_request() {
+            data.topology_refresh_pending = true;
+            flog("raw Vulkan DRM display settings changed; scheduling topology rebuild");
+        }
+
         event_loop.dispatch(Some(FRAME_INTERVAL), &mut data)?;
+        if data.topology_refresh_pending && data.session_active && !data.resume_pending {
+            data.topology_refresh_pending = false;
+            match rebuild_vulkan_outputs(&mut data) {
+                Ok(true) => flog("raw Vulkan DRM topology rebuild complete"),
+                Ok(false) => {}
+                Err(error) => {
+                    data.fatal_error = Some(error.context(
+                        "raw Vulkan DRM topology rebuild failed after retiring old scanout",
+                    ));
+                }
+            }
+        }
         data.surface_blocker_loop
             .dispatch(Some(Duration::ZERO), &mut data.desktop.state)?;
+        data.desktop.state.process_hdr_safe_session_action();
+        data.desktop.state.process_deferred_ui_and_launches();
         data.renderer.poll()?;
         if let Some(error) = data.fatal_error.take() {
             return Err(error.into());
@@ -533,10 +716,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     return Err(error.into());
                 }
             }
+            crate::core::wayland::color_management_protocol::flush_pending_image_description_info_done(
+                &mut data.desktop.state,
+            );
         }
         data.desktop.state.process_deferred_window_ops();
         data.desktop.state.refresh_space();
         data.desktop.state.tick_layout();
+        crate::core::portal::remove_dead_portal_sessions(&mut data.desktop.state);
         data.desktop.display.flush_clients()?;
         if !data.desktop.state.needs_redraw()
             && !data.outputs.iter().any(|output| {
@@ -576,6 +763,11 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 &scene.surfaces,
                 &scene.overlay,
                 scene.overlay_after_surface,
+                &scene.foreground,
+                scene.foreground_after_surface,
+                &scene.egui_textures,
+                &scene.egui_meshes,
+                scene.egui_before_surface,
                 &scene.damage,
             )?;
             let sync = SyncPoint::from(KmsFence(submission.fence_fd));

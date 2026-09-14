@@ -1,6 +1,7 @@
 //! egui overlay — rendered last, above dialogs and compositor chrome.
 
 use std::{
+    collections::HashMap,
     mem,
     sync::{
         Arc, RwLock,
@@ -51,6 +52,8 @@ pub struct EguiLayer {
 
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
+    vulkan_textures: HashMap<TextureId, VulkanEguiTexture>,
+    vulkan_textures_uploaded: bool,
     pending_damage_pts: Option<Rect>,
     glow_painter: Option<Painter>,
     wants_pointer_input: bool,
@@ -65,6 +68,35 @@ pub struct EguiLayer {
     pub screen_height_pts: f32,
     pub last_frame_ctx: Option<DesktopFrameCtx>,
     accessibility: EguiAccessibility,
+}
+
+#[derive(Clone, Debug)]
+pub struct VulkanEguiTexture {
+    pub cache_key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct VulkanEguiVertex {
+    pub position: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [u8; 4],
+}
+
+#[derive(Clone, Debug)]
+pub struct VulkanEguiMesh {
+    pub texture_key: u64,
+    pub clip_rect: [i32; 4],
+    pub vertices: Vec<VulkanEguiVertex>,
+    pub indices: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VulkanEguiPaint {
+    pub textures: Vec<VulkanEguiTexture>,
+    pub meshes: Vec<VulkanEguiMesh>,
 }
 
 #[derive(Clone)]
@@ -260,6 +292,8 @@ impl Default for EguiLayer {
             actions: Vec::new(),
             textures_delta: TexturesDelta::default(),
             primitives: Vec::new(),
+            vulkan_textures: HashMap::new(),
+            vulkan_textures_uploaded: false,
             pending_damage_pts: None,
             glow_painter: None,
             wants_pointer_input: false,
@@ -681,9 +715,93 @@ impl EguiLayer {
     pub fn clear_paint(&mut self) {
         self.remember_current_paint_damage();
         self.primitives.clear();
+        self.vulkan_textures_uploaded = false;
         self.wants_pointer_input = false;
         self.wants_keyboard_input = false;
         self.accessibility.set_inactive();
+    }
+
+    /// Take egui's tessellated output in a backend-neutral form suitable for a
+    /// native Vulkan mesh pass. Coordinates and clipping are converted from
+    /// logical points to physical output pixels here so every renderer consumes
+    /// the same scale calculation.
+    pub fn take_vulkan_paint(&mut self, scale: f32) -> VulkanEguiPaint {
+        let mut changed = Vec::new();
+        for (id, delta) in self.textures_delta.set.drain(..) {
+            let [width, height] = delta.image.size();
+            let patch = image_delta_rgba_raw(&delta.image);
+            if let Some([x, y]) = delta.pos {
+                if let Some(texture) = self.vulkan_textures.get_mut(&id) {
+                    let patch_stride = width.saturating_mul(4);
+                    for row in 0..height {
+                        let source = row.saturating_mul(patch_stride);
+                        let destination = (y + row)
+                            .saturating_mul(texture.width as usize)
+                            .saturating_add(x)
+                            .saturating_mul(4);
+                        let count =
+                            patch_stride.min(texture.pixels.len().saturating_sub(destination));
+                        if count > 0 && source + count <= patch.len() {
+                            texture.pixels[destination..destination + count]
+                                .copy_from_slice(&patch[source..source + count]);
+                        }
+                    }
+                    changed.push(id);
+                }
+            } else {
+                self.vulkan_textures.insert(
+                    id,
+                    VulkanEguiTexture {
+                        cache_key: vulkan_texture_key(id),
+                        width: width as u32,
+                        height: height as u32,
+                        pixels: patch,
+                    },
+                );
+                changed.push(id);
+            }
+        }
+        for id in self.textures_delta.free.drain(..) {
+            self.vulkan_textures.remove(&id);
+        }
+
+        let textures = if self.vulkan_textures_uploaded {
+            changed
+                .into_iter()
+                .filter_map(|id| self.vulkan_textures.get(&id).cloned())
+                .collect()
+        } else {
+            self.vulkan_textures_uploaded = true;
+            self.vulkan_textures.values().cloned().collect()
+        };
+        let meshes = self
+            .primitives
+            .iter()
+            .filter_map(|clipped| {
+                let Primitive::Mesh(mesh) = &clipped.primitive else {
+                    return None;
+                };
+                let min_x = (clipped.clip_rect.min.x * scale).floor() as i32;
+                let min_y = (clipped.clip_rect.min.y * scale).floor() as i32;
+                let max_x = (clipped.clip_rect.max.x * scale).ceil() as i32;
+                let max_y = (clipped.clip_rect.max.y * scale).ceil() as i32;
+                Some(VulkanEguiMesh {
+                    texture_key: vulkan_texture_key(mesh.texture_id),
+                    clip_rect: [min_x, min_y, max_x - min_x, max_y - min_y],
+                    vertices: mesh
+                        .vertices
+                        .iter()
+                        .map(|vertex| VulkanEguiVertex {
+                            position: [vertex.pos.x * scale, vertex.pos.y * scale],
+                            uv: [vertex.uv.x, vertex.uv.y],
+                            color: vertex.color.to_array(),
+                        })
+                        .collect(),
+                    indices: mesh.indices.clone(),
+                })
+            })
+            .collect();
+        VulkanEguiPaint { textures, meshes }
     }
 
     pub fn render(
@@ -996,6 +1114,8 @@ impl EguiLayer {
         }
         self.textures_delta = TexturesDelta::default();
         self.primitives.clear();
+        self.vulkan_textures.clear();
+        self.vulkan_textures_uploaded = false;
 
         let ctx = Context::default();
         ctx.set_fonts(focaldesk_egui_fonts());
@@ -1051,6 +1171,16 @@ fn image_delta_rgba_raw(image: &ImageData) -> Vec<u8> {
             .srgba_pixels(None)
             .flat_map(|pixel| pixel.to_array())
             .collect(),
+    }
+}
+
+fn vulkan_texture_key(id: TextureId) -> u64 {
+    const EGUI_TEXTURE_NAMESPACE: u64 = 0xe601_0000_0000_0000;
+    match id {
+        TextureId::Managed(id) => EGUI_TEXTURE_NAMESPACE | (id & 0x0000_7fff_ffff_ffff),
+        TextureId::User(id) => {
+            EGUI_TEXTURE_NAMESPACE | 0x0000_8000_0000_0000 | (id & 0x7fff_ffff_ffff)
+        }
     }
 }
 
@@ -1335,6 +1465,31 @@ mod egui_vertex_layout_tests {
             node.role() == egui::accesskit::Role::Button
                 && node.label() == Some("Accessible action")
         }));
+    }
+
+    #[test]
+    fn vulkan_paint_exports_scaled_meshes_and_texture_updates() {
+        let mut layer = EguiLayer::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(30.0, 40.0));
+        let mut mesh = egui::Mesh::default();
+        mesh.add_colored_rect(rect, egui::Color32::WHITE);
+        layer.primitives.push(egui::ClippedPrimitive {
+            clip_rect: rect,
+            primitive: egui::epaint::Primitive::Mesh(mesh),
+        });
+        layer.textures_delta.set.push((
+            egui::TextureId::default(),
+            egui::epaint::ImageDelta::full(
+                egui::ColorImage::new([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        ));
+        let paint = layer.take_vulkan_paint(2.0);
+
+        assert!(!paint.textures.is_empty());
+        assert!(!paint.meshes.is_empty());
+        assert_eq!(paint.meshes[0].vertices[0].position, [20.0, 40.0]);
+        assert_eq!(paint.meshes[0].clip_rect, [20, 40, 60, 80]);
     }
 
     #[test]

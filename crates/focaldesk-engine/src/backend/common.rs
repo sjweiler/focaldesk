@@ -75,6 +75,21 @@ pub(crate) fn physical_size_mm_from_pixels(size: Size<i32, Physical>) -> (i32, i
     (width.max(1), height.max(1))
 }
 
+/// Advance compositor services that are independent of the presentation API.
+/// Every backend must call this once before dispatching its input/event sources.
+pub(crate) fn pump_desktop_services(state: &mut DesktopState) {
+    state.process_settings_ipc_requests();
+    state.process_clipboard_captures();
+    state.process_chrome_timers();
+    state.process_notification_timers();
+    state.process_idle_timers();
+    state.process_power_timers();
+    state.process_media_device_timers();
+    state.process_network_state_timers();
+    state.process_update_state_timers();
+    state.process_lock_timers();
+}
+
 pub(crate) struct BootstrapOutput {
     pub name: String,
     pub buffer_size: Size<i32, Physical>,

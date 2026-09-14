@@ -13,8 +13,8 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use ash::{ext, khr, vk, Entry};
 
 use crate::{
-    DrmRenderTarget, FramePixelFormat, FrameRetention, FrameTransform, RendererInfo, SolidQuad,
-    TextureQuad,
+    DrmRenderTarget, FramePixelFormat, FrameRetention, FrameTransform, MeshVertex, RendererInfo,
+    SolidQuad, TextureQuad, TexturedMesh,
 };
 
 const XRGB8888: u32 = u32::from_le_bytes(*b"XR24");
@@ -74,6 +74,32 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>,
 }
 "#;
 
+const MESH_SHADER: &str = r#"
+@group(0) @binding(0) var image: texture_2d<f32>;
+@group(0) @binding(1) var image_sampler: sampler;
+
+struct Push { screen: vec4<f32> }
+var<immediate> pc: Push;
+
+struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32> }
+
+@vertex fn vs_main(
+    @location(0) position: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) color: vec4<f32>,
+) -> Out {
+    var out: Out;
+    out.position = vec4(position * pc.screen.xy + pc.screen.zw, 0.0, 1.0);
+    out.uv = uv;
+    out.color = color;
+    return out;
+}
+
+@fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
+    return textureSample(image, image_sampler, in.uv) * in.color;
+}
+"#;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct TargetKey {
     device: u64,
@@ -91,9 +117,16 @@ struct ImageResource {
     view: vk::ImageView,
 }
 
+#[derive(Clone, Copy)]
 struct BufferResource {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
+}
+
+struct PreparedMesh {
+    vertex: vk::Buffer,
+    index: vk::Buffer,
+    index_count: u32,
 }
 
 struct TextureResource {
@@ -137,6 +170,7 @@ struct Pipelines {
     render_pass: vk::RenderPass,
     solid: vk::Pipeline,
     texture: vk::Pipeline,
+    mesh: vk::Pipeline,
 }
 
 /// Completed raw-Vulkan submission and the sync-file KMS must wait on.
@@ -381,26 +415,30 @@ impl AshDrmRenderer {
 
     fn formats_for_usage(&self, usage: vk::ImageUsageFlags) -> Vec<(u32, u64)> {
         let mut formats = Vec::new();
+        // The raw DRM path currently composites the established encoded-SDR
+        // scene directly into an UNORM KMS buffer. Sampling through an SRGB
+        // view would decode clients/wallpaper/UI to linear without a matching
+        // output encode, making the entire desktop severely dark.
         for (fourcc, render_format, sample_format) in [
             (
                 XRGB8888,
                 vk::Format::B8G8R8A8_UNORM,
-                vk::Format::B8G8R8A8_SRGB,
+                vk::Format::B8G8R8A8_UNORM,
             ),
             (
                 ARGB8888,
                 vk::Format::B8G8R8A8_UNORM,
-                vk::Format::B8G8R8A8_SRGB,
+                vk::Format::B8G8R8A8_UNORM,
             ),
             (
                 XBGR8888,
                 vk::Format::R8G8B8A8_UNORM,
-                vk::Format::R8G8B8A8_SRGB,
+                vk::Format::R8G8B8A8_UNORM,
             ),
             (
                 ABGR8888,
                 vk::Format::R8G8B8A8_UNORM,
-                vk::Format::R8G8B8A8_SRGB,
+                vk::Format::R8G8B8A8_UNORM,
             ),
         ] {
             let format = if usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT) {
@@ -501,6 +539,11 @@ impl AshDrmRenderer {
         surfaces: &[TextureQuad],
         overlay: &[SolidQuad],
         overlay_after_surface: usize,
+        foreground: &[SolidQuad],
+        foreground_after_surface: usize,
+        mesh_textures: &[TextureQuad],
+        meshes: &[TexturedMesh],
+        mesh_before_surface: usize,
         _damage: &[[i32; 4]],
     ) -> Result<AshDrmSubmission> {
         self.poll()?;
@@ -582,9 +625,69 @@ impl AshDrmRenderer {
                 });
             textures.push(draw);
         }
+        for texture in mesh_textures {
+            let compatible = self
+                .texture_cache
+                .get(&texture.cache_key)
+                .is_some_and(|cached| {
+                    cached.width == texture.width
+                        && cached.height == texture.height
+                        && cached.format == texture.format
+                        && cached.modifier.is_none()
+                });
+            if !compatible || !texture.damage.is_empty() {
+                if let Some(resource) = self.prepare_texture(command, texture, &mut staging)? {
+                    let cached = CachedTexture {
+                        resource,
+                        width: texture.width,
+                        height: texture.height,
+                        format: texture.format,
+                        modifier: None,
+                        last_used_frame: self.frame_no,
+                    };
+                    if let Some(old) = self.texture_cache.insert(texture.cache_key, cached) {
+                        retired_textures.push(old.resource);
+                    }
+                }
+            }
+        }
+        let mesh_draws = meshes
+            .iter()
+            .map(|mesh| {
+                self.texture_cache.get_mut(&mesh.texture_key).map(|cached| {
+                    cached.last_used_frame = self.frame_no;
+                    DrawTexture {
+                        image: cached.resource.image.image,
+                        descriptor_set: cached.resource.descriptor_set,
+                        foreign: cached.resource.foreign,
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut prepared_meshes = Vec::with_capacity(meshes.len());
+        for mesh in meshes {
+            if mesh.vertices.is_empty() || mesh.indices.is_empty() {
+                prepared_meshes.push(None);
+                continue;
+            }
+            let vertex = self.create_host_buffer(
+                as_bytes(&mesh.vertices),
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+            )?;
+            let index = self
+                .create_host_buffer(as_bytes(&mesh.indices), vk::BufferUsageFlags::INDEX_BUFFER)?;
+            prepared_meshes.push(Some(PreparedMesh {
+                vertex: vertex.buffer,
+                index: index.buffer,
+                index_count: mesh.indices.len() as u32,
+            }));
+            staging.push(vertex);
+            staging.push(index);
+        }
         let active_keys = surfaces
             .iter()
             .map(|surface| surface.cache_key)
+            .chain(meshes.iter().map(|mesh| mesh.texture_key))
             .collect::<HashSet<_>>();
         self.texture_cache.retain(|key, cached| {
             let keep = active_keys.contains(key)
@@ -719,6 +822,20 @@ impl AshDrmRenderer {
             if index == overlay_after_surface {
                 self.draw_solids(command, format, overlay, target.width, target.height);
             }
+            if index == foreground_after_surface {
+                self.draw_solids(command, format, foreground, target.width, target.height);
+            }
+            if index == mesh_before_surface {
+                self.draw_meshes(
+                    command,
+                    format,
+                    meshes,
+                    &mesh_draws,
+                    &prepared_meshes,
+                    target.width,
+                    target.height,
+                );
+            }
             if let Some(texture) = texture {
                 self.draw_texture(
                     command,
@@ -732,6 +849,20 @@ impl AshDrmRenderer {
         }
         if overlay_after_surface >= surfaces.len() {
             self.draw_solids(command, format, overlay, target.width, target.height);
+        }
+        if foreground_after_surface >= surfaces.len() {
+            self.draw_solids(command, format, foreground, target.width, target.height);
+        }
+        if mesh_before_surface >= surfaces.len() {
+            self.draw_meshes(
+                command,
+                format,
+                meshes,
+                &mesh_draws,
+                &prepared_meshes,
+                target.width,
+                target.height,
+            );
         }
         unsafe { self.device.cmd_end_render_pass(command) };
 
@@ -864,15 +995,24 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
-        let solid = self.create_pipeline(render_pass, self.solid_layout, SOLID_SHADER, false)?;
-        let texture =
-            self.create_pipeline(render_pass, self.texture_layout, TEXTURE_SHADER, true)?;
+        let solid =
+            self.create_pipeline(render_pass, self.solid_layout, SOLID_SHADER, false, false)?;
+        let texture = self.create_pipeline(
+            render_pass,
+            self.texture_layout,
+            TEXTURE_SHADER,
+            true,
+            false,
+        )?;
+        let mesh =
+            self.create_pipeline(render_pass, self.texture_layout, MESH_SHADER, true, true)?;
         self.pipelines.insert(
             format,
             Pipelines {
                 render_pass,
                 solid,
                 texture,
+                mesh,
             },
         );
         Ok(())
@@ -884,6 +1024,7 @@ impl AshDrmRenderer {
         layout: vk::PipelineLayout,
         source: &str,
         blend: bool,
+        mesh_input: bool,
     ) -> Result<vk::Pipeline> {
         let vertex_words = compile_shader(source, naga::ShaderStage::Vertex, "vs_main")?;
         let fragment_words = compile_shader(source, naga::ShaderStage::Fragment, "fs_main")?;
@@ -919,7 +1060,38 @@ impl AshDrmRenderer {
             .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
             .alpha_blend_op(vk::BlendOp::ADD)
             .color_write_mask(vk::ColorComponentFlags::RGBA)];
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let vertex_bindings = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<MeshVertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        }];
+        let vertex_attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R8G8B8A8_UNORM,
+                offset: 16,
+            },
+        ];
+        let vertex_input = if mesh_input {
+            vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&vertex_bindings)
+                .vertex_attribute_descriptions(&vertex_attributes)
+        } else {
+            vk::PipelineVertexInputStateCreateInfo::default()
+        };
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewport = vk::PipelineViewportStateCreateInfo::default()
@@ -1029,6 +1201,85 @@ impl AshDrmRenderer {
                 as_bytes(&push),
             );
             self.device.cmd_draw(command, 6, 1, 0, 0);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_meshes(
+        &self,
+        command: vk::CommandBuffer,
+        format: vk::Format,
+        meshes: &[TexturedMesh],
+        textures: &[Option<DrawTexture>],
+        prepared: &[Option<PreparedMesh>],
+        width: u32,
+        height: u32,
+    ) {
+        let screen = [2.0 / width as f32, -2.0 / height as f32, -1.0, 1.0];
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipelines[&format].mesh,
+            );
+            self.device.cmd_push_constants(
+                command,
+                self.texture_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&screen),
+            );
+        }
+        for ((mesh, texture), prepared) in meshes.iter().zip(textures).zip(prepared) {
+            let (Some(texture), Some(prepared)) = (texture, prepared) else {
+                continue;
+            };
+            let [x, y, w, h] = mesh.clip_rect;
+            let x0 = x.clamp(0, width as i32);
+            let y0 = y.clamp(0, height as i32);
+            let x1 = x.saturating_add(w).clamp(x0, width as i32);
+            let y1 = y.saturating_add(h).clamp(y0, height as i32);
+            if x1 <= x0 || y1 <= y0 {
+                continue;
+            }
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: x0, y: y0 },
+                extent: vk::Extent2D {
+                    width: (x1 - x0) as u32,
+                    height: (y1 - y0) as u32,
+                },
+            };
+            unsafe {
+                self.device.cmd_set_scissor(command, 0, &[scissor]);
+                self.device.cmd_bind_descriptor_sets(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.texture_layout,
+                    0,
+                    &[texture.descriptor_set],
+                    &[],
+                );
+                self.device
+                    .cmd_bind_vertex_buffers(command, 0, &[prepared.vertex], &[0]);
+                self.device.cmd_bind_index_buffer(
+                    command,
+                    prepared.index,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                self.device
+                    .cmd_draw_indexed(command, prepared.index_count, 1, 0, 0, 0);
+            }
+        }
+        unsafe {
+            self.device.cmd_set_scissor(
+                command,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D::default(),
+                    extent: vk::Extent2D { width, height },
+                }],
+            );
         }
     }
 
@@ -1356,11 +1607,19 @@ impl AshDrmRenderer {
     }
 
     fn create_staging(&self, bytes: &[u8]) -> Result<BufferResource> {
+        self.create_host_buffer(bytes, vk::BufferUsageFlags::TRANSFER_SRC)
+    }
+
+    fn create_host_buffer(
+        &self,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<BufferResource> {
         let buffer = unsafe {
             self.device.create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(bytes.len() as u64)
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .usage(usage)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 None,
             )
@@ -1495,6 +1754,7 @@ impl Drop for AshDrmRenderer {
             for (_, pipeline) in self.pipelines.drain() {
                 self.device.destroy_pipeline(pipeline.solid, None);
                 self.device.destroy_pipeline(pipeline.texture, None);
+                self.device.destroy_pipeline(pipeline.mesh, None);
                 self.device.destroy_render_pass(pipeline.render_pass, None);
             }
             self.device.destroy_sampler(self.sampler, None);
@@ -1543,8 +1803,11 @@ fn vk_format(fourcc: u32) -> Result<vk::Format> {
 
 fn texture_vk_format(format: FramePixelFormat) -> vk::Format {
     match format {
-        FramePixelFormat::Bgra8Srgb => vk::Format::B8G8R8A8_SRGB,
-        FramePixelFormat::Rgba8Srgb => vk::Format::R8G8B8A8_SRGB,
+        // Preserve encoded SDR samples. The KMS attachment is UNORM and the
+        // current compositor pass intentionally matches the GLES encoded-SDR
+        // path; a future linear-light pass must add an explicit output encode.
+        FramePixelFormat::Bgra8Srgb => vk::Format::B8G8R8A8_UNORM,
+        FramePixelFormat::Rgba8Srgb => vk::Format::R8G8B8A8_UNORM,
     }
 }
 
@@ -1611,12 +1874,15 @@ fn as_bytes<T>(value: &[T]) -> &[u8] {
 
 #[cfg(test)]
 mod tests {
-    use super::{compile_shader, ndc_rect, transformed_uv, SOLID_SHADER, TEXTURE_SHADER};
-    use crate::FrameTransform;
+    use super::{
+        compile_shader, ndc_rect, texture_vk_format, transformed_uv, MESH_SHADER, SOLID_SHADER,
+        TEXTURE_SHADER,
+    };
+    use crate::{FramePixelFormat, FrameTransform};
 
     #[test]
     fn raw_vulkan_shaders_compile_to_spirv() {
-        for source in [SOLID_SHADER, TEXTURE_SHADER] {
+        for source in [SOLID_SHADER, TEXTURE_SHADER, MESH_SHADER] {
             let vertex = compile_shader(source, naga::ShaderStage::Vertex, "vs_main").unwrap();
             let fragment = compile_shader(source, naga::ShaderStage::Fragment, "fs_main").unwrap();
             assert_eq!(vertex.first().copied(), Some(0x0723_0203));
@@ -1627,6 +1893,18 @@ mod tests {
     #[test]
     fn output_rect_is_converted_to_vulkan_clip_space() {
         assert_eq!(ndc_rect([0, 0, 100, 50], 100, 50), [-1.0, 1.0, 2.0, -2.0]);
+    }
+
+    #[test]
+    fn encoded_sdr_textures_are_not_decoded_without_an_output_encode() {
+        assert_eq!(
+            texture_vk_format(FramePixelFormat::Bgra8Srgb),
+            ash::vk::Format::B8G8R8A8_UNORM
+        );
+        assert_eq!(
+            texture_vk_format(FramePixelFormat::Rgba8Srgb),
+            ash::vk::Format::R8G8B8A8_UNORM
+        );
     }
 
     #[test]

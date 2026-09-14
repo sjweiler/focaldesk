@@ -163,6 +163,25 @@ pub struct SolidQuad {
     pub corner_radius: f32,
 }
 
+/// One vertex in a compositor-owned textured triangle mesh. Positions are in
+/// physical output pixels and colors are premultiplied sRGBA.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MeshVertex {
+    pub position: [f32; 2],
+    pub uv: [f32; 2],
+    pub color: [u8; 4],
+}
+
+/// Indexed triangles referencing a texture already supplied for this frame.
+#[derive(Clone, Debug, Default)]
+pub struct TexturedMesh {
+    pub texture_key: u64,
+    pub clip_rect: [i32; 4],
+    pub vertices: Vec<MeshVertex>,
+    pub indices: Vec<u32>,
+}
+
 /// The small presentation-facing portion of a FocalDesk renderer.
 ///
 /// Shell scene textures and higher-level drawing commands will be added here as

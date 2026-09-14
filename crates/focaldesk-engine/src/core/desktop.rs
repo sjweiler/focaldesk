@@ -973,6 +973,10 @@ pub struct DesktopState {
     settings_ipc_rx: mpsc::Receiver<DesktopIpcMessage>,
     settings_ipc_watchers: Vec<DesktopIpcWatcher>,
     settings_ipc_config: FocalDeskConfig,
+    /// A display IPC update changed the logical topology. DRM backends consume
+    /// this to rebuild their physical KMS/scanout objects from the persisted
+    /// display configuration instead of waiting for a udev connector event.
+    display_reconfigure_requested: bool,
 
     /// Undecorated winit window: set on left-press over chrome top bar; backend calls platform window drag.
     host_window_drag_requested: bool,
@@ -2886,6 +2890,7 @@ impl DesktopState {
         }
 
         if changed {
+            self.display_reconfigure_requested = true;
             crate::core::wayland::color_management_protocol::notify_preferred_color_changed(self);
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
             self.cursor_manager.set_base_size_and_scale(
@@ -2906,6 +2911,10 @@ impl DesktopState {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn take_display_reconfigure_request(&mut self) -> bool {
+        std::mem::take(&mut self.display_reconfigure_requested)
     }
 
     fn set_hdr_appearance(
@@ -3708,6 +3717,12 @@ impl DesktopState {
         };
         for action in actions {
             self.queue_ui_action(action);
+        }
+    }
+
+    pub fn sync_egui_for_output(&mut self, output_id: OutputId, now: Instant) {
+        if let Some(frame_ctx) = self.egui_frame_ctx_for_output(output_id, now) {
+            self.sync_egui(&frame_ctx);
         }
     }
 
@@ -7297,6 +7312,7 @@ impl DesktopState {
             settings_ipc_rx: start_desktop_settings_ipc(),
             settings_ipc_watchers: Vec::new(),
             settings_ipc_config: load_config(),
+            display_reconfigure_requested: false,
             host_window_drag_requested: false,
             pending_compositor_move: None,
             pending_xdg_move: None,

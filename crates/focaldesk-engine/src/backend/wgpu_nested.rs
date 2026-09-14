@@ -11,11 +11,12 @@ use crate::core::fonts::{FontId, TextStyle};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_render::{
-    FramePixelFormat, FrameRetention, FrameTransform, LinuxDmabuf, PresentRenderer, PresentResult,
-    SolidQuad, TextureQuad, WgpuVulkanRenderer,
+    FramePixelFormat, FrameRetention, FrameTransform, LinuxDmabuf, MeshVertex, PresentRenderer,
+    PresentResult, SolidQuad, TextureQuad, TexturedMesh, WgpuVulkanRenderer,
 };
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
+use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::types::UiElementKind;
 use image::GenericImageView;
 use smithay::backend::allocator::dmabuf::{DmabufMappingMode, DmabufSyncFlags};
@@ -75,6 +76,11 @@ pub(crate) struct VulkanCompositorScene {
     pub surfaces: Vec<TextureQuad>,
     pub overlay: Vec<SolidQuad>,
     pub overlay_after_surface: usize,
+    pub foreground: Vec<SolidQuad>,
+    pub foreground_after_surface: usize,
+    pub egui_textures: Vec<TextureQuad>,
+    pub egui_meshes: Vec<TexturedMesh>,
+    pub egui_before_surface: usize,
     pub damage: Vec<[i32; 4]>,
     pub client_surface_count: usize,
     pub cursor_present: bool,
@@ -84,6 +90,7 @@ pub(crate) struct VulkanCompositorScene {
 pub(crate) struct VulkanSceneBuilder {
     assets: WgpuShellAssets,
     surface_commits: HashMap<ObjectId, CommitCounter>,
+    logged_egui_mesh: bool,
 }
 
 impl VulkanSceneBuilder {
@@ -100,6 +107,7 @@ impl VulkanSceneBuilder {
         state: &mut crate::core::desktop::DesktopState,
         output_id: focaldesk_types::OutputId,
     ) -> VulkanCompositorScene {
+        state.sync_egui_for_output(output_id, Instant::now());
         let damage = state
             .outputs
             .get(&output_id)
@@ -123,6 +131,21 @@ impl VulkanSceneBuilder {
         let client_surface_count = surfaces.len() - shell_surface_count;
         let overlay_after_surface = surfaces.len();
         append_notification_text_quads(&desktop, &mut self.assets, &mut surfaces);
+        let foreground_after_surface = surfaces.len();
+        let foreground = collect_modal_quads(&desktop);
+        append_modal_text_quads(&desktop, &mut self.assets, &mut surfaces);
+        let egui_before_surface = surfaces.len();
+        let (egui_textures, egui_meshes) = collect_egui_meshes(&mut desktop);
+        if !self.logged_egui_mesh && !egui_meshes.is_empty() {
+            info!(
+                target: "focaldesk",
+                output = ?output_id,
+                meshes = egui_meshes.len(),
+                texture_updates = egui_textures.len(),
+                "native Vulkan egui panel pass active"
+            );
+            self.logged_egui_mesh = true;
+        }
         if self.surface_commits.len() > 4096 {
             self.surface_commits.clear();
         }
@@ -133,15 +156,74 @@ impl VulkanSceneBuilder {
             surfaces,
             overlay,
             overlay_after_surface,
+            foreground,
+            foreground_after_surface,
+            egui_textures,
+            egui_meshes,
+            egui_before_surface,
             damage,
             client_surface_count,
             cursor_present,
         }
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         *self = Self::default();
     }
+}
+
+fn collect_egui_meshes(
+    desktop: &mut WgpuSceneDesktop<'_>,
+) -> (Vec<TextureQuad>, Vec<TexturedMesh>) {
+    let Some(output) = desktop.state.outputs.get(&desktop.output_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    let scale = output.scale_factor as f32;
+    let Some(desktop_output) = desktop.state.desktop_outputs.get_mut(&desktop.output_id) else {
+        return (Vec::new(), Vec::new());
+    };
+    if !desktop_output.egui.has_open_panels() {
+        return (Vec::new(), Vec::new());
+    }
+    let paint = desktop_output.egui.take_vulkan_paint(scale);
+    let textures = paint
+        .textures
+        .into_iter()
+        .map(|texture| TextureQuad {
+            cache_key: texture.cache_key,
+            pixels: texture.pixels,
+            width: texture.width,
+            height: texture.height,
+            stride: texture.width.saturating_mul(4),
+            format: FramePixelFormat::Rgba8Srgb,
+            dmabuf: None,
+            damage: vec![[0, 0, texture.width, texture.height]],
+            destination: [0, 0, texture.width as i32, texture.height as i32],
+            source_uv: [0.0, 0.0, 1.0, 1.0],
+            transform: FrameTransform::Normal,
+            tint: [1.0; 4],
+            retention: None,
+        })
+        .collect();
+    let meshes = paint
+        .meshes
+        .into_iter()
+        .map(|mesh| TexturedMesh {
+            texture_key: mesh.texture_key,
+            clip_rect: mesh.clip_rect,
+            vertices: mesh
+                .vertices
+                .into_iter()
+                .map(|vertex| MeshVertex {
+                    position: vertex.position,
+                    uv: vertex.uv,
+                    color: vertex.color,
+                })
+                .collect(),
+            indices: mesh.indices,
+        })
+        .collect();
+    (textures, meshes)
 }
 
 struct WgpuWallpaper {
@@ -714,6 +796,37 @@ fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShell
         strings.push((clipped_text(&notification.title, 38), WGPU_LABEL_STYLE));
         strings.push((clipped_text(&notification.body, 52), WGPU_BODY_STYLE));
     }
+    if let Some(dialog) = desktop
+        .state
+        .active_dialog
+        .and_then(|id| desktop.state.dialogs.iter().find(|dialog| dialog.id == id))
+    {
+        strings.push((clipped_text(&dialog.title, 64), WGPU_LABEL_STYLE));
+        strings.extend(
+            dialog
+                .message
+                .lines()
+                .map(|line| (clipped_text(line, 72), WGPU_BODY_STYLE)),
+        );
+        strings.extend(
+            dialog
+                .buttons
+                .iter()
+                .map(|button| (clipped_text(&button.label, 24), WGPU_LABEL_STYLE)),
+        );
+    }
+    let lock = desktop.state.lock_screen.snapshot(Instant::now());
+    if lock.active {
+        strings.push(("FOCALDESK LOCKED".to_string(), WGPU_LABEL_STYLE));
+        strings.push((clipped_text(&lock.message, 64), WGPU_LABEL_STYLE));
+        strings.push(("Show".to_string(), WGPU_LABEL_STYLE));
+        strings.push(("Hide".to_string(), WGPU_LABEL_STYLE));
+        if lock.password_visible {
+            strings.push((clipped_text(&lock.password_text, 48), WGPU_LABEL_STYLE));
+        } else if lock.password_len > 0 {
+            strings.push(("*".repeat(lock.password_len.min(48)), WGPU_LABEL_STYLE));
+        }
+    }
     for (text, style) in strings {
         if let Err(error) = desktop.state.fonts.prepare_text(&text, style) {
             warn!(%error, "failed to prepare wgpu shell text");
@@ -892,6 +1005,195 @@ fn append_notification_text_quads(
         );
         y += 92;
     }
+}
+
+fn append_modal_text_quads(
+    desktop: &WgpuSceneDesktop<'_>,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+) {
+    let Some(output_state) = desktop.state.outputs.get(&desktop.output_id) else {
+        return;
+    };
+    let scale = output_state.scale_factor;
+    let screen = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), output_state.logical_size);
+    let theme = desktop.state.theme.active_theme();
+
+    if let Some(dialog) = desktop
+        .state
+        .active_dialog
+        .and_then(|id| desktop.state.dialogs.iter().find(|dialog| dialog.id == id))
+        .filter(|dialog| dialog.owner_output == desktop.output_id)
+    {
+        let layout = layout_dialog(dialog, screen);
+        append_text_quads(
+            desktop,
+            assets,
+            output,
+            &clipped_text(&dialog.title, 64),
+            layout.title_rect.loc.x,
+            layout.title_rect.loc.y + layout.title_rect.size.h - 8,
+            WGPU_LABEL_STYLE,
+            theme.dialog.title_color,
+            scale,
+        );
+        let mut y = layout.message_rect.loc.y + 20;
+        for line in dialog.message.lines() {
+            append_text_quads(
+                desktop,
+                assets,
+                output,
+                &clipped_text(line, 72),
+                layout.message_rect.loc.x,
+                y,
+                WGPU_BODY_STYLE,
+                theme.dialog.text_color,
+                scale,
+            );
+            y += 22;
+        }
+        for (index, rect) in &layout.button_rects {
+            if let Some(button) = dialog.buttons.get(*index) {
+                append_text_quads(
+                    desktop,
+                    assets,
+                    output,
+                    &clipped_text(&button.label, 24),
+                    rect.loc.x + 12,
+                    rect.loc.y + rect.size.h / 2 + 5,
+                    WGPU_LABEL_STYLE,
+                    theme.dialog.text_color,
+                    scale,
+                );
+            }
+        }
+    }
+
+    let lock = desktop.state.lock_screen.snapshot(Instant::now());
+    if !lock.active {
+        return;
+    }
+    let panel_w = screen.size.w.min(460).max(1);
+    let panel_h = screen.size.h.min(190).max(1);
+    let panel_x = (screen.size.w - panel_w) / 2;
+    let panel_y = (screen.size.h - panel_h) / 2;
+    append_text_quads(
+        desktop,
+        assets,
+        output,
+        "FOCALDESK LOCKED",
+        panel_x + 28,
+        panel_y + 48,
+        WGPU_LABEL_STYLE,
+        theme.text.title,
+        scale,
+    );
+    let password = if lock.password_visible {
+        clipped_text(&lock.password_text, 48)
+    } else {
+        "*".repeat(lock.password_len.min(48))
+    };
+    append_text_quads(
+        desktop,
+        assets,
+        output,
+        &password,
+        panel_x + 46,
+        panel_y + 103,
+        WGPU_LABEL_STYLE,
+        theme.text.normal,
+        scale,
+    );
+    append_text_quads(
+        desktop,
+        assets,
+        output,
+        if lock.password_visible {
+            "Hide"
+        } else {
+            "Show"
+        },
+        panel_x + panel_w - 94,
+        panel_y + 103,
+        WGPU_LABEL_STYLE,
+        theme.text.normal,
+        scale,
+    );
+    append_text_quads(
+        desktop,
+        assets,
+        output,
+        if lock.authenticating {
+            "Authenticating"
+        } else {
+            lock.message.as_str()
+        },
+        panel_x + 28,
+        panel_y + 150,
+        WGPU_LABEL_STYLE,
+        theme.text.dim,
+        scale,
+    );
+}
+
+fn collect_modal_quads(desktop: &WgpuSceneDesktop<'_>) -> Vec<SolidQuad> {
+    let Some(output) = desktop.state.outputs.get(&desktop.output_id) else {
+        return Vec::new();
+    };
+    let scale = output.scale_factor;
+    let screen = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), output.logical_size);
+    let theme = desktop.state.theme.active_theme();
+    let mut quads = Vec::new();
+    if let Some(dialog) = desktop
+        .state
+        .active_dialog
+        .and_then(|id| desktop.state.dialogs.iter().find(|dialog| dialog.id == id))
+    {
+        quads.push(solid_quad(screen, scale, [0.0, 0.0, 0.0, 0.45]));
+        if dialog.owner_output == desktop.output_id {
+            let layout = layout_dialog(dialog, screen);
+            quads.push(rounded_solid_quad(
+                layout.bounds,
+                scale,
+                theme.dialog.panel_color,
+                8.0,
+            ));
+            for (_, rect) in &layout.button_rects {
+                quads.push(rounded_solid_quad(
+                    *rect,
+                    scale,
+                    theme.dialog.button_color,
+                    4.0,
+                ));
+            }
+        }
+    }
+
+    let lock = desktop.state.lock_screen.snapshot(Instant::now());
+    if lock.active {
+        quads.push(solid_quad(screen, scale, [0.005, 0.008, 0.014, 0.92]));
+        let panel_w = screen.size.w.min(460).max(1);
+        let panel_h = screen.size.h.min(190).max(1);
+        let panel_x = (screen.size.w - panel_w) / 2;
+        let panel_y = (screen.size.h - panel_h) / 2;
+        let panel = Rectangle::from_loc_and_size((panel_x, panel_y), (panel_w, panel_h));
+        let mut panel_color = theme.chrome.panel_color;
+        panel_color[3] = 0.96;
+        quads.push(rounded_solid_quad(panel, scale, panel_color, 12.0));
+        quads.push(rounded_solid_quad(
+            Rectangle::from_loc_and_size((panel_x + 28, panel_y + 72), (panel_w - 56, 48)),
+            scale,
+            [0.02, 0.03, 0.05, 0.96],
+            8.0,
+        ));
+        quads.push(rounded_solid_quad(
+            Rectangle::from_loc_and_size((panel_x + panel_w - 110, panel_y + 80), (68, 32)),
+            scale,
+            [0.08, 0.11, 0.16, 0.96],
+            6.0,
+        ));
+    }
+    quads
 }
 
 fn append_wallpaper_quads(
