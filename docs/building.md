@@ -208,8 +208,9 @@ not use Vulkan display WSI and does not create EGL or GLES objects. The Vulkan
 backend creates one scanout path per enabled connected output and honors saved
 mode, scale, logical position, and primary-output settings. Builds with the
 `xwayland` feature run the same XWayland startup and event loop as the GLES DRM
-backend. Use the GLES renderer for HDR, zero-copy DMA-BUF portal capture, or
-egui shader-effect parity until those renderer paths are implemented for Vulkan.
+backend. Vulkan applies saved SDR monitor ICC profiles in its FP16 final-output
+pass. Use the GLES renderer for HDR, zero-copy DMA-BUF portal capture, or egui
+shader-effect parity until those renderer paths are implemented for Vulkan.
 Connector hotplug and display-settings changes rebuild the Vulkan KMS topology.
 Egui panels use the raw Vulkan mesh pipeline and do not depend on EGL.
 

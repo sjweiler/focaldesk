@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
@@ -171,6 +172,88 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>,
 }
 "#;
 
+const OUTPUT_SHADER: &str = r#"
+@group(0) @binding(0) var scene: texture_2d<f32>;
+@group(0) @binding(1) var scene_sampler: sampler;
+@group(0) @binding(2) var lut: texture_2d<f32>;
+
+struct Push { grid: vec4<f32> }
+var<immediate> pc: Push;
+
+struct Out {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex fn vs_main(@builtin(vertex_index) i: u32) -> Out {
+    let positions = array<vec2<f32>, 3>(
+        vec2(-1.0, -1.0), vec2(-1.0, 3.0), vec2(3.0, -1.0));
+    let uvs = array<vec2<f32>, 3>(
+        vec2(0.0, 0.0), vec2(0.0, 2.0), vec2(2.0, 0.0));
+    var out: Out;
+    out.position = vec4(positions[i], 0.0, 1.0);
+    out.uv = uvs[i];
+    return out;
+}
+
+fn srgb_encode(value: f32) -> f32 {
+    return select(value * 12.92, 1.055 * pow(max(value, 0.0), 1.0 / 2.4) - 0.055, value > 0.0031308);
+}
+
+fn gamma22_encode(value: f32) -> f32 {
+    return pow(max(value, 0.0), 1.0 / 2.2);
+}
+
+fn encode_color(color: vec3<f32>) -> vec3<f32> {
+    if pc.grid.y > 0.5 {
+        return vec3(gamma22_encode(color.r), gamma22_encode(color.g), gamma22_encode(color.b));
+    }
+    return vec3(srgb_encode(color.r), srgb_encode(color.g), srgb_encode(color.b));
+}
+
+fn srgb_decode(value: f32) -> f32 {
+    return select(value / 12.92, pow((value + 0.055) / 1.055, 2.4), value > 0.04045);
+}
+
+fn lut_sample_at(cell: vec3<f32>) -> vec3<f32> {
+    let n = pc.grid.x;
+    let bounded = clamp(cell, vec3(0.0), vec3(n - 1.0));
+    let coordinate = vec2<i32>(i32(bounded.y * n + bounded.x), i32(bounded.z));
+    return textureLoad(lut, coordinate, 0).rgb;
+}
+
+fn lut_lookup(color: vec3<f32>) -> vec3<f32> {
+    let n = pc.grid.x;
+    let position = clamp(color, vec3(0.0), vec3(1.0)) * (n - 1.0);
+    let low = clamp(floor(position + vec3(0.00001)), vec3(0.0), vec3(n - 1.0));
+    let fraction = clamp(position - low, vec3(0.0), vec3(1.0));
+    let high = min(low + vec3(1.0), vec3(n - 1.0));
+    let c000 = lut_sample_at(vec3(low.x, low.y, low.z));
+    let c100 = lut_sample_at(vec3(high.x, low.y, low.z));
+    let c010 = lut_sample_at(vec3(low.x, high.y, low.z));
+    let c110 = lut_sample_at(vec3(high.x, high.y, low.z));
+    let c001 = lut_sample_at(vec3(low.x, low.y, high.z));
+    let c101 = lut_sample_at(vec3(high.x, low.y, high.z));
+    let c011 = lut_sample_at(vec3(low.x, high.y, high.z));
+    let c111 = lut_sample_at(vec3(high.x, high.y, high.z));
+    let c00 = mix(c000, c100, fraction.x);
+    let c10 = mix(c010, c110, fraction.x);
+    let c01 = mix(c001, c101, fraction.x);
+    let c11 = mix(c011, c111, fraction.x);
+    return mix(mix(c00, c10, fraction.y), mix(c01, c11, fraction.y), fraction.z);
+}
+
+@fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
+    let sampled = textureSample(scene, scene_sampler, in.uv);
+    if sampled.a <= 0.0 { return vec4(0.0); }
+    let straight = sampled.rgb / sampled.a;
+    let encoded = encode_color(straight);
+    let corrected = lut_lookup(encoded);
+    let linear = vec3(srgb_decode(corrected.r), srgb_decode(corrected.g), srgb_decode(corrected.b));
+    return vec4(linear * sampled.a, sampled.a);
+}
+"#;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct TargetKey {
     device: u64,
@@ -228,13 +311,29 @@ struct ImportedTarget {
     last_frame: u64,
 }
 
+struct LinearScene {
+    resource: TextureResource,
+    width: u32,
+    height: u32,
+    initialized: bool,
+}
+
+struct OutputResources {
+    lut: ImageResource,
+    descriptor_set: vk::DescriptorSet,
+    scene_image: vk::Image,
+    fingerprint: u64,
+    grid_size: u32,
+}
+
 struct PendingFrame {
     submitted_at: Instant,
     fence: vk::Fence,
     command: vk::CommandBuffer,
     semaphore: vk::Semaphore,
-    framebuffer: vk::Framebuffer,
+    framebuffers: Vec<vk::Framebuffer>,
     retired_textures: Vec<TextureResource>,
+    retired_outputs: Vec<OutputResources>,
     staging: Vec<BufferResource>,
     capture: Option<PendingCapture>,
     _retentions: Vec<FrameRetention>,
@@ -250,10 +349,12 @@ struct PendingCapture {
 }
 
 struct Pipelines {
-    render_pass: vk::RenderPass,
+    scene_render_pass: vk::RenderPass,
+    output_render_pass: vk::RenderPass,
     solid: vk::Pipeline,
     texture: vk::Pipeline,
     mesh: vk::Pipeline,
+    output: vk::Pipeline,
 }
 
 /// Completed raw-Vulkan submission and the sync-file KMS must wait on.
@@ -270,6 +371,21 @@ pub struct AshDrmCapture {
     pub height: u32,
     pub fourcc: u32,
     pub pixels: Vec<u8>,
+}
+
+/// Encoded output-space RGB cube used for a post-composition ICC correction.
+#[derive(Clone, Copy, Debug)]
+pub struct AshDrmOutputLut<'a> {
+    pub grid_size: u32,
+    pub rgb: &'a [u8],
+}
+
+/// Electrical SDR encoding expected by the selected output profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AshDrmTransfer {
+    #[default]
+    Srgb,
+    Gamma22,
 }
 
 impl AshDrmCapture {
@@ -307,11 +423,15 @@ pub struct AshDrmRenderer {
     command_pool: vk::CommandPool,
     descriptor_pool: vk::DescriptorPool,
     descriptor_layout: vk::DescriptorSetLayout,
+    output_descriptor_layout: vk::DescriptorSetLayout,
     solid_layout: vk::PipelineLayout,
     texture_layout: vk::PipelineLayout,
+    output_layout: vk::PipelineLayout,
     sampler: vk::Sampler,
     pipelines: HashMap<vk::Format, Pipelines>,
     targets: HashMap<TargetKey, ImportedTarget>,
+    linear_scenes: HashMap<u64, LinearScene>,
+    output_resources: HashMap<u64, OutputResources>,
     texture_cache: HashMap<u64, CachedTexture>,
     frame_no: u64,
     pending: Vec<PendingFrame>,
@@ -369,6 +489,21 @@ impl AshDrmRenderer {
         let (physical_device, properties) = selected.ok_or_else(|| {
             anyhow!("no Vulkan physical device matches DRM node {drm_major}:{drm_minor}")
         })?;
+        let linear_features = unsafe {
+            instance.get_physical_device_format_properties(
+                physical_device,
+                vk::Format::R16G16B16A16_SFLOAT,
+            )
+        }
+        .optimal_tiling_features;
+        ensure!(
+            linear_features.contains(
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT
+                    | vk::FormatFeatureFlags::SAMPLED_IMAGE
+                    | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            ),
+            "Vulkan device cannot render and sample the FP16 compositor scene"
+        );
 
         let extensions =
             unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
@@ -436,6 +571,28 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
+        let output_descriptor_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(2)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                ]),
+                None,
+            )
+        }?;
         let descriptor_pool = unsafe {
             device.create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
@@ -475,6 +632,18 @@ impl AshDrmRenderer {
                 None,
             )
         }?;
+        let output_layouts = [output_descriptor_layout];
+        let output_range = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+            .size(16)];
+        let output_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&output_layouts)
+                    .push_constant_ranges(&output_range),
+                None,
+            )
+        }?;
         let sampler = unsafe {
             device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -502,11 +671,15 @@ impl AshDrmRenderer {
             command_pool,
             descriptor_pool,
             descriptor_layout,
+            output_descriptor_layout,
             solid_layout,
             texture_layout,
+            output_layout,
             sampler,
             pipelines: HashMap::new(),
             targets: HashMap::new(),
+            linear_scenes: HashMap::new(),
+            output_resources: HashMap::new(),
             texture_cache: HashMap::new(),
             frame_no: 0,
             pending: Vec::new(),
@@ -714,12 +887,26 @@ impl AshDrmRenderer {
         stream_id: u64,
         capture_id: Option<u64>,
         output_matrix: [[f32; 3]; 3],
+        output_transfer: AshDrmTransfer,
+        output_lut: Option<AshDrmOutputLut<'_>>,
     ) -> Result<AshDrmSubmission> {
         self.poll()?;
         ensure!(
             target.width > 0 && target.height > 0,
             "zero-sized DRM render target"
         );
+        let identity_lut;
+        let output_lut = if let Some(lut) = output_lut {
+            validate_output_lut(lut)?;
+            lut
+        } else {
+            identity_lut = identity_output_lut();
+            AshDrmOutputLut {
+                grid_size: 2,
+                rgb: &identity_lut,
+            }
+        };
+        let lut_fingerprint = output_lut_fingerprint(output_lut);
         let format = vk_format(target.fourcc)?;
         self.ensure_pipelines(format)?;
         let target_key = target_key(target)?;
@@ -742,6 +929,35 @@ impl AshDrmRenderer {
         let target_view = self.targets[&target_key].image.view;
         let initialized = self.targets[&target_key].initialized;
         let last_target_frame = self.targets[&target_key].last_frame;
+        let linear_compatible = self
+            .linear_scenes
+            .get(&stream_id)
+            .is_some_and(|scene| scene.width == target.width && scene.height == target.height);
+        let retired_linear = if linear_compatible {
+            None
+        } else {
+            let image = self.create_owned_image(
+                target.width,
+                target.height,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            )?;
+            let resource = self.texture_resource(image, false)?;
+            self.linear_scenes
+                .insert(
+                    stream_id,
+                    LinearScene {
+                        resource,
+                        width: target.width,
+                        height: target.height,
+                        initialized: false,
+                    },
+                )
+                .map(|scene| scene.resource)
+        };
+        let linear_image = self.linear_scenes[&stream_id].resource.image.image;
+        let linear_view = self.linear_scenes[&stream_id].resource.image.view;
+        let linear_initialized = self.linear_scenes[&stream_id].initialized;
 
         self.frame_no = self.frame_no.wrapping_add(1);
         let stream_frame = self
@@ -751,10 +967,18 @@ impl AshDrmRenderer {
             .or_insert(1);
         let stream_frame = *stream_frame;
         let history = self.damage_history.entry(stream_id).or_default();
-        let render_areas = effective_damage_regions(
+        let output_areas = effective_damage_regions(
             initialized,
             last_target_frame,
             history,
+            damage,
+            target.width,
+            target.height,
+        );
+        let scene_areas = effective_damage_regions(
+            linear_initialized,
+            0,
+            &DamageHistory::new(),
             damage,
             target.width,
             target.height,
@@ -779,7 +1003,21 @@ impl AshDrmRenderer {
 
         let mut textures = Vec::with_capacity(surfaces.len());
         let mut retired_textures = Vec::new();
+        if let Some(resource) = retired_linear {
+            retired_textures.push(resource);
+        }
         let mut staging = Vec::new();
+        let retired_output = self.prepare_output_resources(
+            command,
+            stream_id,
+            linear_image,
+            linear_view,
+            output_lut,
+            lut_fingerprint,
+            &mut staging,
+        )?;
+        let output_descriptor = self.output_resources[&stream_id].descriptor_set;
+        let output_grid_size = self.output_resources[&stream_id].grid_size;
         for surface in surfaces {
             let modifier = surface.dmabuf.as_ref().map(|dmabuf| dmabuf.modifier);
             let compatible = self
@@ -961,21 +1199,52 @@ impl AshDrmRenderer {
             );
         }
 
-        let framebuffer = unsafe {
+        let linear_to_attachment = vk::ImageMemoryBarrier::default()
+            .src_access_mask(if linear_initialized {
+                vk::AccessFlags::SHADER_READ
+            } else {
+                vk::AccessFlags::empty()
+            })
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(if linear_initialized {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            })
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(linear_image)
+            .subresource_range(color_range());
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                command,
+                if linear_initialized {
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                } else {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                },
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[linear_to_attachment],
+            );
+        }
+
+        let scene_framebuffer = unsafe {
             self.device.create_framebuffer(
                 &vk::FramebufferCreateInfo::default()
-                    .render_pass(self.pipelines[&format].render_pass)
-                    .attachments(&[target_view])
+                    .render_pass(self.pipelines[&format].scene_render_pass)
+                    .attachments(&[linear_view])
                     .width(target.width)
                     .height(target.height)
                     .layers(1),
                 None,
             )
         }?;
-        for render_area in render_areas {
+        for render_area in scene_areas {
             self.record_scene_pass(
                 command,
-                framebuffer,
+                scene_framebuffer,
                 format,
                 render_area,
                 target.width,
@@ -992,6 +1261,48 @@ impl AshDrmRenderer {
                 &prepared_meshes,
                 mesh_before_surface,
                 output_matrix,
+            );
+        }
+        let linear_to_sample = vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(linear_image)
+            .subresource_range(color_range());
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[linear_to_sample],
+            );
+        }
+        let output_framebuffer = unsafe {
+            self.device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(self.pipelines[&format].output_render_pass)
+                    .attachments(&[target_view])
+                    .width(target.width)
+                    .height(target.height)
+                    .layers(1),
+                None,
+            )
+        }?;
+        for render_area in output_areas {
+            self.record_output_pass(
+                command,
+                output_framebuffer,
+                format,
+                render_area,
+                target.width,
+                target.height,
+                output_descriptor,
+                output_grid_size,
+                output_transfer,
             );
         }
 
@@ -1122,6 +1433,7 @@ impl AshDrmRenderer {
         let rendered_target = self.targets.get_mut(&target_key).unwrap();
         rendered_target.initialized = true;
         rendered_target.last_frame = stream_frame;
+        self.linear_scenes.get_mut(&stream_id).unwrap().initialized = true;
 
         let mut export = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
@@ -1163,8 +1475,9 @@ impl AshDrmRenderer {
             fence,
             command,
             semaphore,
-            framebuffer,
+            framebuffers: vec![scene_framebuffer, output_framebuffer],
             retired_textures,
+            retired_outputs: retired_output.into_iter().collect(),
             staging,
             capture,
             _retentions: retentions,
@@ -1176,8 +1489,8 @@ impl AshDrmRenderer {
         if self.pipelines.contains_key(&format) {
             return Ok(());
         }
-        let attachment = [vk::AttachmentDescription::default()
-            .format(format)
+        let scene_attachment = [vk::AttachmentDescription::default()
+            .format(vk::Format::R16G16B16A16_SFLOAT)
             .samples(vk::SampleCountFlags::TYPE_1)
             .load_op(vk::AttachmentLoadOp::CLEAR)
             .store_op(vk::AttachmentStoreOp::STORE)
@@ -1190,32 +1503,66 @@ impl AshDrmRenderer {
         let subpass = [vk::SubpassDescription::default()
             .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
             .color_attachments(&color_ref)];
-        let render_pass = unsafe {
+        let scene_render_pass = unsafe {
             self.device.create_render_pass(
                 &vk::RenderPassCreateInfo::default()
-                    .attachments(&attachment)
+                    .attachments(&scene_attachment)
                     .subpasses(&subpass),
                 None,
             )
         }?;
-        let solid =
-            self.create_pipeline(render_pass, self.solid_layout, SOLID_SHADER, false, false)?;
+        let output_attachment = [vk::AttachmentDescription::default()
+            .format(format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let output_render_pass = unsafe {
+            self.device.create_render_pass(
+                &vk::RenderPassCreateInfo::default()
+                    .attachments(&output_attachment)
+                    .subpasses(&subpass),
+                None,
+            )
+        }?;
+        let solid = self.create_pipeline(
+            scene_render_pass,
+            self.solid_layout,
+            SOLID_SHADER,
+            false,
+            false,
+        )?;
         let texture = self.create_pipeline(
-            render_pass,
+            scene_render_pass,
             self.texture_layout,
             TEXTURE_SHADER,
             true,
             false,
         )?;
-        let mesh =
-            self.create_pipeline(render_pass, self.texture_layout, MESH_SHADER, true, true)?;
+        let mesh = self.create_pipeline(
+            scene_render_pass,
+            self.texture_layout,
+            MESH_SHADER,
+            true,
+            true,
+        )?;
+        let output = self.create_pipeline(
+            output_render_pass,
+            self.output_layout,
+            OUTPUT_SHADER,
+            false,
+            false,
+        )?;
         self.pipelines.insert(
             format,
             Pipelines {
-                render_pass,
+                scene_render_pass,
+                output_render_pass,
                 solid,
                 texture,
                 mesh,
+                output,
             },
         );
         Ok(())
@@ -1365,7 +1712,7 @@ impl AshDrmRenderer {
             self.device.cmd_begin_render_pass(
                 command,
                 &vk::RenderPassBeginInfo::default()
-                    .render_pass(self.pipelines[&format].render_pass)
+                    .render_pass(self.pipelines[&format].scene_render_pass)
                     .framebuffer(framebuffer)
                     .render_area(render_area)
                     .clear_values(&clear),
@@ -1438,6 +1785,75 @@ impl AshDrmRenderer {
             );
         }
         unsafe { self.device.cmd_end_render_pass(command) };
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_output_pass(
+        &self,
+        command: vk::CommandBuffer,
+        framebuffer: vk::Framebuffer,
+        format: vk::Format,
+        render_area: vk::Rect2D,
+        width: u32,
+        height: u32,
+        scene_descriptor: vk::DescriptorSet,
+        grid_size: u32,
+        output_transfer: AshDrmTransfer,
+    ) {
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                command,
+                &vk::RenderPassBeginInfo::default()
+                    .render_pass(self.pipelines[&format].output_render_pass)
+                    .framebuffer(framebuffer)
+                    .render_area(render_area),
+                vk::SubpassContents::INLINE,
+            );
+            self.device.cmd_set_viewport(
+                command,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            self.device.cmd_set_scissor(command, 0, &[render_area]);
+            self.device.cmd_bind_pipeline(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipelines[&format].output,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                command,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.output_layout,
+                0,
+                &[scene_descriptor],
+                &[],
+            );
+            self.device.cmd_push_constants(
+                command,
+                self.output_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                as_bytes(&[
+                    grid_size as f32,
+                    if output_transfer == AshDrmTransfer::Gamma22 {
+                        1.0
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                ]),
+            );
+            self.device.cmd_draw(command, 3, 1, 0, 0);
+            self.device.cmd_end_render_pass(command);
+        }
     }
 
     fn draw_solids(
@@ -1599,6 +2015,144 @@ impl AshDrmRenderer {
             }
         }
         unsafe { self.device.cmd_set_scissor(command, 0, &[damage_clip]) }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_output_resources(
+        &mut self,
+        command: vk::CommandBuffer,
+        stream_id: u64,
+        scene_image: vk::Image,
+        scene_view: vk::ImageView,
+        lut: AshDrmOutputLut<'_>,
+        fingerprint: u64,
+        staging: &mut Vec<BufferResource>,
+    ) -> Result<Option<OutputResources>> {
+        let compatible = self
+            .output_resources
+            .get(&stream_id)
+            .is_some_and(|resource| {
+                resource.scene_image == scene_image && resource.fingerprint == fingerprint
+            });
+        if compatible {
+            return Ok(None);
+        }
+
+        let atlas_width = lut
+            .grid_size
+            .checked_mul(lut.grid_size)
+            .context("ICC LUT atlas width overflow")?;
+        let mut rgba = Vec::with_capacity(lut.rgb.len() / 3 * 4);
+        for rgb in lut.rgb.chunks_exact(3) {
+            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+        }
+        let image = self.create_owned_image(
+            atlas_width,
+            lut.grid_size,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        )?;
+        let stage = self.create_staging(&rgba)?;
+        let to_copy = vk::ImageMemoryBarrier::default()
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image.image)
+            .subresource_range(color_range());
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_copy],
+            );
+            self.device.cmd_copy_buffer_to_image(
+                command,
+                stage.buffer,
+                image.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::BufferImageCopy::default()
+                    .buffer_row_length(atlas_width)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .layer_count(1),
+                    )
+                    .image_extent(vk::Extent3D {
+                        width: atlas_width,
+                        height: lut.grid_size,
+                        depth: 1,
+                    })],
+            );
+            let to_sample = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image(image.image)
+                .subresource_range(color_range());
+            self.device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[to_sample],
+            );
+        }
+        staging.push(stage);
+
+        let layouts = [self.output_descriptor_layout];
+        let descriptor_set = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }?[0];
+        let scene_info = [vk::DescriptorImageInfo::default()
+            .image_view(scene_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        let lut_info = [vk::DescriptorImageInfo::default()
+            .image_view(image.view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        unsafe {
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&scene_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&sampler_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(2)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&lut_info),
+                ],
+                &[],
+            );
+        }
+        Ok(self.output_resources.insert(
+            stream_id,
+            OutputResources {
+                lut: image,
+                descriptor_set,
+                scene_image,
+                fingerprint,
+                grid_size: lut.grid_size,
+            },
+        ))
     }
 
     fn prepare_texture(
@@ -2042,6 +2596,12 @@ impl AshDrmRenderer {
                 self.device.destroy_buffer(capture.buffer.buffer, None);
                 self.device.free_memory(capture.buffer.memory, None);
             }
+            for output in frame.retired_outputs {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[output.descriptor_set])
+                    .ok();
+                self.destroy_image(output.lut);
+            }
             for texture in frame.retired_textures {
                 if texture.image.image == vk::Image::null() {
                     continue;
@@ -2058,7 +2618,9 @@ impl AshDrmRenderer {
                 self.device.destroy_buffer(buffer.buffer, None);
                 self.device.free_memory(buffer.memory, None);
             }
-            self.device.destroy_framebuffer(frame.framebuffer, None);
+            for framebuffer in frame.framebuffers {
+                self.device.destroy_framebuffer(framebuffer, None);
+            }
             self.device.destroy_semaphore(frame.semaphore, None);
             self.device.destroy_fence(frame.fence, None);
             self.device
@@ -2100,6 +2662,14 @@ impl Drop for AshDrmRenderer {
             self.device.device_wait_idle().ok();
             for frame in self.pending.drain(..) {
                 // Inline cleanup avoids borrowing all of self during drain.
+                for output in frame.retired_outputs {
+                    self.device
+                        .free_descriptor_sets(self.descriptor_pool, &[output.descriptor_set])
+                        .ok();
+                    self.device.destroy_image_view(output.lut.view, None);
+                    self.device.destroy_image(output.lut.image, None);
+                    self.device.free_memory(output.lut.memory, None);
+                }
                 for texture in frame.retired_textures {
                     if texture.image.image != vk::Image::null() {
                         self.device
@@ -2118,7 +2688,9 @@ impl Drop for AshDrmRenderer {
                     self.device.destroy_buffer(capture.buffer.buffer, None);
                     self.device.free_memory(capture.buffer.memory, None);
                 }
-                self.device.destroy_framebuffer(frame.framebuffer, None);
+                for framebuffer in frame.framebuffers {
+                    self.device.destroy_framebuffer(framebuffer, None);
+                }
                 self.device.destroy_semaphore(frame.semaphore, None);
                 self.device.destroy_fence(frame.fence, None);
                 self.device
@@ -2128,6 +2700,23 @@ impl Drop for AshDrmRenderer {
                 self.device.destroy_image_view(target.image.view, None);
                 self.device.destroy_image(target.image.image, None);
                 self.device.free_memory(target.image.memory, None);
+            }
+            for (_, output) in self.output_resources.drain() {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[output.descriptor_set])
+                    .ok();
+                self.device.destroy_image_view(output.lut.view, None);
+                self.device.destroy_image(output.lut.image, None);
+                self.device.free_memory(output.lut.memory, None);
+            }
+            for (_, scene) in self.linear_scenes.drain() {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[scene.resource.descriptor_set])
+                    .ok();
+                self.device
+                    .destroy_image_view(scene.resource.image.view, None);
+                self.device.destroy_image(scene.resource.image.image, None);
+                self.device.free_memory(scene.resource.image.memory, None);
             }
             for (_, cached) in self.texture_cache.drain() {
                 self.device
@@ -2142,16 +2731,24 @@ impl Drop for AshDrmRenderer {
                 self.device.destroy_pipeline(pipeline.solid, None);
                 self.device.destroy_pipeline(pipeline.texture, None);
                 self.device.destroy_pipeline(pipeline.mesh, None);
-                self.device.destroy_render_pass(pipeline.render_pass, None);
+                self.device.destroy_pipeline(pipeline.output, None);
+                self.device
+                    .destroy_render_pass(pipeline.scene_render_pass, None);
+                self.device
+                    .destroy_render_pass(pipeline.output_render_pass, None);
             }
             self.device.destroy_sampler(self.sampler, None);
             self.device.destroy_pipeline_layout(self.solid_layout, None);
             self.device
                 .destroy_pipeline_layout(self.texture_layout, None);
             self.device
+                .destroy_pipeline_layout(self.output_layout, None);
+            self.device
                 .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_layout, None);
+            self.device
+                .destroy_descriptor_set_layout(self.output_descriptor_layout, None);
             self.device.destroy_command_pool(self.command_pool, None);
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
@@ -2369,6 +2966,43 @@ fn as_bytes<T>(value: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(value.as_ptr().cast(), std::mem::size_of_val(value)) }
 }
 
+fn validate_output_lut(lut: AshDrmOutputLut<'_>) -> Result<()> {
+    ensure!(
+        (2..=65).contains(&lut.grid_size),
+        "ICC LUT grid must contain between 2 and 65 samples per axis"
+    );
+    let expected = usize::try_from(lut.grid_size)
+        .ok()
+        .and_then(|grid| grid.checked_pow(3))
+        .and_then(|samples| samples.checked_mul(3))
+        .context("ICC LUT dimensions overflow")?;
+    ensure!(
+        lut.rgb.len() == expected,
+        "ICC LUT contains {} bytes; expected {expected}",
+        lut.rgb.len()
+    );
+    Ok(())
+}
+
+fn output_lut_fingerprint(lut: AshDrmOutputLut<'_>) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    lut.grid_size.hash(&mut hasher);
+    lut.rgb.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn identity_output_lut() -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(2 * 2 * 2 * 3);
+    for blue in [0, 255] {
+        for green in [0, 255] {
+            for red in [0, 255] {
+                rgb.extend_from_slice(&[red, green, blue]);
+            }
+        }
+    }
+    rgb
+}
+
 fn write_push_matrix(destination: &mut [f32], matrix: [[f32; 3]; 3]) {
     debug_assert!(destination.len() >= 12);
     for (row, values) in matrix.into_iter().enumerate() {
@@ -2381,15 +3015,16 @@ fn write_push_matrix(destination: &mut [f32], matrix: [[f32; 3]; 3]) {
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_shader, effective_damage_regions, ndc_rect, texture_vk_format, transformed_uv,
-        vk_format, AshDrmCapture, ARGB8888, MESH_SHADER, SOLID_SHADER, TEXTURE_SHADER,
+        compile_shader, effective_damage_regions, identity_output_lut, ndc_rect, texture_vk_format,
+        transformed_uv, validate_output_lut, vk_format, AshDrmCapture, AshDrmOutputLut, ARGB8888,
+        MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER, TEXTURE_SHADER,
     };
     use crate::{FramePixelFormat, FrameTransform};
     use std::collections::VecDeque;
 
     #[test]
     fn raw_vulkan_shaders_compile_to_spirv() {
-        for source in [SOLID_SHADER, TEXTURE_SHADER, MESH_SHADER] {
+        for source in [SOLID_SHADER, TEXTURE_SHADER, MESH_SHADER, OUTPUT_SHADER] {
             let vertex = compile_shader(source, naga::ShaderStage::Vertex, "vs_main").unwrap();
             let fragment = compile_shader(source, naga::ShaderStage::Fragment, "fs_main").unwrap();
             assert_eq!(vertex.first().copied(), Some(0x0723_0203));
@@ -2413,6 +3048,27 @@ mod tests {
             ash::vk::Format::R8G8B8A8_UNORM
         );
         assert_eq!(vk_format(ARGB8888).unwrap(), ash::vk::Format::B8G8R8A8_SRGB);
+    }
+
+    #[test]
+    fn identity_output_lut_matches_rgb_cube_atlas_order() {
+        assert_eq!(
+            identity_output_lut(),
+            vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 0, 255, 255, 0, 0, 0, 255, 255, 0, 255, 0, 255, 255,
+                255, 255, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn output_lut_rejects_incomplete_cube() {
+        let error = validate_output_lut(AshDrmOutputLut {
+            grid_size: 2,
+            rgb: &[0; 21],
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("expected 24"));
     }
 
     #[test]

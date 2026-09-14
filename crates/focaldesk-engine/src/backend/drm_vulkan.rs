@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::{flog, flog_warn};
-use focaldesk_render::{AshDrmCapture, AshDrmRenderer, DrmRenderTarget};
+use focaldesk_render::{
+    AshDrmCapture, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer, DrmRenderTarget,
+};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{
@@ -1034,6 +1036,37 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     )
                 })
                 .unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+            let output_lut = data
+                .desktop
+                .state
+                .outputs
+                .get(&output_id)
+                .and_then(|output| output.output_icc_lut.as_ref())
+                .filter(|_| crate::core::icc_lut::icc_lut_shader_enabled())
+                .map(|lut| AshDrmOutputLut {
+                    grid_size: lut.grid_size,
+                    rgb: &lut.rgb,
+                });
+            let output_transfer = data
+                .desktop
+                .state
+                .outputs
+                .get(&output_id)
+                .map(|output| output.color_description.transfer)
+                .filter(|transfer| {
+                    matches!(
+                        transfer,
+                        crate::core::color::TransferFunction::Srgb
+                            | crate::core::color::TransferFunction::Bt1886
+                            | crate::core::color::TransferFunction::Gamma22
+                            | crate::core::color::TransferFunction::Linear
+                    )
+                })
+                .map(|transfer| match transfer {
+                    crate::core::color::TransferFunction::Gamma22 => AshDrmTransfer::Gamma22,
+                    _ => AshDrmTransfer::Srgb,
+                })
+                .unwrap_or_default();
             let output = &mut data.outputs[index];
             let (dmabuf, _) = match output.scanout.next_buffer() {
                 Ok(next) => next,
@@ -1058,6 +1091,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 output_id.0,
                 capture_requested.then_some(output_id.0),
                 output_matrix,
+                output_transfer,
+                output_lut,
             )?;
             if capture_requested {
                 data.capture_pending.insert(output_id);
