@@ -88,6 +88,7 @@ struct Push {
     uv1: vec4<f32>,
     tint: vec4<f32>,
     matrix0: vec4<f32>, matrix1: vec4<f32>, matrix2: vec4<f32>,
+    params: vec4<f32>,
 }
 var<immediate> pc: Push;
 
@@ -95,12 +96,52 @@ fn srgb_decode(value: f32) -> f32 {
     return select(value / 12.92, pow((value + 0.055) / 1.055, 2.4), value > 0.04045);
 }
 
-fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>) -> vec4<f32> {
+fn decode_channel(value: f32) -> f32 {
+    let mode = pc.params.x;
+    if mode < 0.5 { return srgb_decode(value); }
+    if mode < 1.5 { return value * pc.params.z; }
+    if mode < 2.5 { return pow(max(value, 0.0), 2.2); }
+    if mode < 3.5 {
+        let m1 = 2610.0 / 16384.0;
+        let m2 = 2523.0 / 32.0;
+        let c1 = 3424.0 / 4096.0;
+        let c2 = 2413.0 / 128.0;
+        let c3 = 2392.0 / 128.0;
+        let p = pow(clamp(value, 0.0, 1.0), 1.0 / m2);
+        let normalized = pow(max(p - c1, 0.0) / max(c2 - c3 * p, 0.000001), 1.0 / m1);
+        return normalized * 10000.0 / max(pc.params.y, 1.0);
+    }
+    if mode < 4.5 { return srgb_decode(value); }
+    if mode < 5.5 { return pow(max(value, 0.0), 2.4); }
+    let a = 0.17883277;
+    let b = 0.28466892;
+    let c0 = 0.55991073;
+    let low = value * value / 3.0;
+    let high = (exp((value - c0) / a) + b) / 12.0;
+    let scene = select(low, high, value >= 0.5);
+    let reference = (exp((0.75 - c0) / a) + b) / 12.0;
+    return pow(max(scene, 0.0), 1.2) / pow(reference, 1.2);
+}
+
+fn dither_code_value(color: vec3<f32>, position: vec2<f32>) -> vec3<f32> {
+    if pc.params.w <= 1.0 { return color; }
+    let code_step = 1.0 / (pow(2.0, pc.params.w) - 1.0);
+    let pixel = floor(position);
+    let a = fract(52.9829189 * fract(dot(pixel, vec2(0.06711056, 0.00583715))));
+    let b = fract(52.9829189 * fract(dot(pixel, vec2(0.00583715, 0.06711056)) + 0.38196601));
+    return clamp(color + vec3((a - b) * code_step), vec3(0.0), vec3(1.0));
+}
+
+fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>, position: vec2<f32>) -> vec4<f32> {
     let alpha = sampled.a * tint.a;
     if alpha <= 0.0 { return vec4(0.0); }
-    let sampled_straight = sampled.rgb / sampled.a;
+    var sampled_straight = sampled.rgb / sampled.a;
+    let mode = pc.params.x;
+    let extended = (mode >= 0.5 && mode < 1.5) || (mode >= 3.5 && mode < 4.5);
+    if !extended { sampled_straight = clamp(sampled_straight, vec3(0.0), vec3(1.0)); }
+    sampled_straight = dither_code_value(sampled_straight, position);
     let tint_straight = tint.rgb / tint.a;
-    let sampled_linear = vec3(srgb_decode(sampled_straight.r), srgb_decode(sampled_straight.g), srgb_decode(sampled_straight.b));
+    let sampled_linear = vec3(decode_channel(sampled_straight.r), decode_channel(sampled_straight.g), decode_channel(sampled_straight.b));
     let tint_linear = vec3(srgb_decode(tint_straight.r), srgb_decode(tint_straight.g), srgb_decode(tint_straight.b));
     let linear = sampled_linear * tint_linear;
     let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
@@ -123,7 +164,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>,
 }
 
 @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
-    return decode_modulated_color(textureSample(image, image_sampler, in.uv), in.tint);
+    return decode_modulated_color(textureSample(image, image_sampler, in.uv), in.tint, in.position.xy);
 }
 "#;
 
@@ -616,7 +657,7 @@ impl AshDrmRenderer {
             .size(96)];
         let texture_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .size(112)];
+            .size(128)];
         let solid_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&solid_range),
@@ -1908,12 +1949,19 @@ impl AshDrmRenderer {
         output_matrix: [[f32; 3]; 3],
     ) {
         let uvs = transformed_uv(surface.source_uv, surface.transform);
-        let mut push = [0.0f32; 28];
+        let mut push = [0.0f32; 32];
         push[..4].copy_from_slice(&ndc_rect(surface.destination, width, height));
         push[4..8].copy_from_slice(&[uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1]]);
         push[8..12].copy_from_slice(&[uvs[2][0], uvs[2][1], uvs[3][0], uvs[3][1]]);
         push[12..16].copy_from_slice(&surface.tint);
-        write_push_matrix(&mut push[16..], output_matrix);
+        let matrix = multiply_3x3(output_matrix, surface.color_transform.client_to_scene);
+        write_push_matrix(&mut push[16..28], matrix);
+        push[28..].copy_from_slice(&[
+            surface.color_transform.transfer as u32 as f32,
+            surface.color_transform.reference_white_nits.max(1.0),
+            surface.color_transform.linear_to_scene_scale,
+            surface.color_transform.source_bits,
+        ]);
         unsafe {
             self.device.cmd_bind_pipeline(
                 command,
@@ -3012,12 +3060,24 @@ fn write_push_matrix(destination: &mut [f32], matrix: [[f32; 3]; 3]) {
     }
 }
 
+fn multiply_3x3(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut result = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            result[row][column] = left[row][0] * right[0][column]
+                + left[row][1] * right[1][column]
+                + left[row][2] * right[2][column];
+        }
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_shader, effective_damage_regions, identity_output_lut, ndc_rect, texture_vk_format,
-        transformed_uv, validate_output_lut, vk_format, AshDrmCapture, AshDrmOutputLut, ARGB8888,
-        MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER, TEXTURE_SHADER,
+        compile_shader, effective_damage_regions, identity_output_lut, multiply_3x3, ndc_rect,
+        texture_vk_format, transformed_uv, validate_output_lut, vk_format, AshDrmCapture,
+        AshDrmOutputLut, ARGB8888, MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER, TEXTURE_SHADER,
     };
     use crate::{FramePixelFormat, FrameTransform};
     use std::collections::VecDeque;
@@ -3069,6 +3129,16 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("expected 24"));
+    }
+
+    #[test]
+    fn client_and_output_gamut_matrices_are_composed_in_draw_order() {
+        let output = [[2.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 4.0]];
+        let client = [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]];
+        assert_eq!(
+            multiply_3x3(output, client),
+            [[2.0, 4.0, 6.0], [12.0, 15.0, 18.0], [28.0, 32.0, 36.0]]
+        );
     }
 
     #[test]

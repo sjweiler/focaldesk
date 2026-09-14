@@ -55,6 +55,42 @@ pub enum FramePixelFormat {
     Rgba8Srgb,
 }
 
+/// Transfer decoding used to move a client buffer into scene-linear light.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum FrameTransferFunction {
+    #[default]
+    Srgb = 0,
+    Linear = 1,
+    Gamma22 = 2,
+    St2084Pq = 3,
+    ExtendedSrgb = 4,
+    Bt1886 = 5,
+    Hlg = 6,
+}
+
+/// Per-texture transform from decoded client RGB into the linear scene gamut.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextureColorTransform {
+    pub transfer: FrameTransferFunction,
+    pub client_to_scene: [[f32; 3]; 3],
+    pub reference_white_nits: f32,
+    pub linear_to_scene_scale: f32,
+    pub source_bits: f32,
+}
+
+impl Default for TextureColorTransform {
+    fn default() -> Self {
+        Self {
+            transfer: FrameTransferFunction::Srgb,
+            client_to_scene: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            reference_white_nits: 80.0,
+            linear_to_scene_scale: 1.0,
+            source_bits: 0.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FrameTransform {
     #[default]
@@ -141,6 +177,8 @@ pub struct TextureQuad {
     pub height: u32,
     pub stride: u32,
     pub format: FramePixelFormat,
+    /// Decode and gamut transform for this texture. Shell assets use sRGB.
+    pub color_transform: TextureColorTransform,
     /// Optional zero-copy source. `pixels` remains a synchronized fallback for
     /// devices or format/modifier combinations that reject external import.
     #[cfg(unix)]

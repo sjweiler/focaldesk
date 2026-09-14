@@ -69,13 +69,16 @@ retained texture updates, physical-pixel scaling, and per-mesh clipping; it does
 not create an EGL or GLES context for panel rendering.
 DRM connector EDID supplies the same monitor make, model, serial, physical size,
 and ICC-profile matching inputs used by the GLES backend. The selected profile
-is retained in output state. Vulkan SDR composition un-premultiplies and decodes
-sRGB clients, wallpaper, solids, and shell meshes, blends them in linear light,
-and applies the selected output-primaries matrix into one retained FP16 scene per
-output. A post-composition pass encodes that scene through the monitor's 33³ ICC
-LUT atlas (or an identity cube when no profile is selected) before the sRGB KMS
-attachment performs the matching scanout encode. Extended-range HDR composition,
-PQ scanout, and KMS HDR metadata remain on the GLES path.
+is retained in output state. Vulkan composition un-premultiplies client buffers,
+decodes committed sRGB, BT.1886, gamma 2.2, linear/scRGB, PQ, extended-sRGB, and
+HLG transfer functions, and applies each surface's client-to-scene gamut matrix.
+Eight-bit tagged sources use the same neutral-axis code-value dither as GLES.
+Wallpaper, solids, and shell meshes enter the same retained FP16 linear scene.
+A post-composition pass applies the selected output transform and encodes through
+the monitor's 33³ ICC LUT atlas (or an identity cube when no profile is selected)
+before the sRGB KMS attachment writes the intended device code. HDR sources are
+preserved in the FP16 scene, but extended-range tone mapping, PQ scanout, and KMS
+HDR metadata remain on the GLES path.
 
 Raw Vulkan submissions and KMS presents have bounded progress deadlines. A
 stalled GPU fence recreates the Vulkan device and scanout in-process, while a

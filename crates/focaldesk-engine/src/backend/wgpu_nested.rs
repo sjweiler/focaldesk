@@ -11,8 +11,9 @@ use crate::core::fonts::{FontId, TextStyle};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_render::{
-    FramePixelFormat, FrameRetention, FrameTransform, LinuxDmabuf, MeshVertex, PresentRenderer,
-    PresentResult, SolidQuad, TextureQuad, TexturedMesh, WgpuVulkanRenderer,
+    FramePixelFormat, FrameRetention, FrameTransferFunction, FrameTransform, LinuxDmabuf,
+    MeshVertex, PresentRenderer, PresentResult, SolidQuad, TextureColorTransform, TextureQuad,
+    TexturedMesh, WgpuVulkanRenderer,
 };
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
@@ -22,6 +23,7 @@ use image::GenericImageView;
 use smithay::backend::allocator::dmabuf::{DmabufMappingMode, DmabufSyncFlags};
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode};
+use smithay::backend::renderer::element::Id as RenderElementId;
 use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
 use smithay::desktop::{layer_map_for_output, PopupManager};
 use smithay::reexports::calloop::EventLoop as CalloopEventLoop;
@@ -50,6 +52,7 @@ use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
     BootstrapOutput, NestedDesktop,
 };
+use crate::core::color::{SurfaceColorRenderState, TransferFunction};
 use crate::core::input::{
     FlowInputEvent, FlowKeyState, FlowModifiers, FlowMouseButton, FlowScrollDelta,
 };
@@ -196,6 +199,7 @@ fn collect_egui_meshes(
             height: texture.height,
             stride: texture.width.saturating_mul(4),
             format: FramePixelFormat::Rgba8Srgb,
+            color_transform: Default::default(),
             dmabuf: None,
             damage: vec![[0, 0, texture.width, texture.height]],
             destination: [0, 0, texture.width as i32, texture.height as i32],
@@ -886,6 +890,7 @@ fn append_text_quads(
             height: atlas_height,
             stride: atlas_width.saturating_mul(4),
             format: FramePixelFormat::Rgba8Srgb,
+            color_transform: Default::default(),
             dmabuf: None,
             damage: if upload_pending {
                 vec![[0, 0, atlas_width, atlas_height]]
@@ -1283,6 +1288,7 @@ fn append_wallpaper_quads(
             height: asset.height,
             stride: asset.width.saturating_mul(4),
             format: FramePixelFormat::Rgba8Srgb,
+            color_transform: Default::default(),
             dmabuf: None,
             damage: if index == 0 && upload_pending {
                 vec![[0, 0, asset.width, asset.height]]
@@ -1392,6 +1398,7 @@ fn append_shell_icon_quads(
             height: 48,
             stride: 48 * 4,
             format: FramePixelFormat::Rgba8Srgb,
+            color_transform: Default::default(),
             dmabuf: None,
             damage: if upload_pending {
                 vec![[0, 0, 48, 48]]
@@ -1564,6 +1571,7 @@ fn append_cursor_texture_quads(
             origin,
             scale,
             surface_commits,
+            &desktop.state.surface_colors,
             &mut cursor_surfaces,
         );
         output.extend(cursor_surfaces.into_iter().rev());
@@ -1586,6 +1594,7 @@ fn append_cursor_texture_quads(
         height: image.height,
         stride: image.width.saturating_mul(4),
         format: FramePixelFormat::Rgba8Srgb,
+        color_transform: Default::default(),
         dmabuf: None,
         damage: Vec::new(),
         destination: [x, y, image.width as i32, image.height as i32],
@@ -1613,6 +1622,7 @@ fn collect_shm_surfaces(
             &[WlrLayer::Background, WlrLayer::Bottom],
             scale,
             surface_commits,
+            &desktop.state.surface_colors,
             &mut output,
         );
     }
@@ -1639,6 +1649,7 @@ fn collect_shm_surfaces(
                 popup_origin,
                 scale,
                 surface_commits,
+                &desktop.state.surface_colors,
                 &mut window_surfaces,
             );
         }
@@ -1647,6 +1658,7 @@ fn collect_shm_surfaces(
             window_origin,
             scale,
             surface_commits,
+            &desktop.state.surface_colors,
             &mut window_surfaces,
         );
         output.extend(window_surfaces.into_iter().rev());
@@ -1657,6 +1669,7 @@ fn collect_shm_surfaces(
             &[WlrLayer::Top, WlrLayer::Overlay],
             scale,
             surface_commits,
+            &desktop.state.surface_colors,
             &mut output,
         );
     }
@@ -1668,6 +1681,7 @@ fn collect_shm_layers(
     layer_kinds: &[WlrLayer],
     scale: f64,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
+    surface_colors: &HashMap<RenderElementId, SurfaceColorRenderState>,
     output: &mut Vec<TextureQuad>,
 ) {
     let layer_map = layer_map_for_output(output_handle);
@@ -1685,6 +1699,7 @@ fn collect_shm_layers(
                     popup_origin,
                     scale,
                     surface_commits,
+                    surface_colors,
                     &mut layer_surfaces,
                 );
             }
@@ -1693,6 +1708,7 @@ fn collect_shm_layers(
                 geometry.loc,
                 scale,
                 surface_commits,
+                surface_colors,
                 &mut layer_surfaces,
             );
             output.extend(layer_surfaces.into_iter().rev());
@@ -1705,6 +1721,7 @@ fn collect_shm_surface_tree(
     origin: Point<i32, Logical>,
     scale: f64,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
+    surface_colors: &HashMap<RenderElementId, SurfaceColorRenderState>,
     output: &mut Vec<TextureQuad>,
 ) {
     with_surface_tree_downward(
@@ -1720,7 +1737,7 @@ fn collect_shm_surface_tree(
                 None => TraversalAction::SkipChildren,
             }
         },
-        |_, states, location| {
+        |surface, states, location| {
             let Some(renderer_state) = states.data_map.get::<RendererSurfaceStateUserData>() else {
                 return;
             };
@@ -1749,6 +1766,11 @@ fn collect_shm_surface_tree(
                 .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
                 .collect::<Vec<_>>();
             let surface_location = *location + view.offset;
+            let color_transform = surface_colors
+                .get(&RenderElementId::from_wayland_resource(surface))
+                .copied()
+                .map(texture_color_transform)
+                .unwrap_or_default();
             drop(renderer_state);
 
             let destination = [
@@ -1763,11 +1785,24 @@ fn collect_shm_surface_tree(
                 ((view.src.loc.x + view.src.size.w) / f64::from(buffer_size.w)) as f32,
                 ((view.src.loc.y + view.src.size.h) / f64::from(buffer_size.h)) as f32,
             ];
-            let frame =
-                shm_surface_frame(&buffer, destination, source_uv, transform, damage.clone())
-                    .or_else(|| {
-                        dmabuf_surface_frame(&buffer, destination, source_uv, transform, damage)
-                    });
+            let frame = shm_surface_frame(
+                &buffer,
+                destination,
+                source_uv,
+                transform,
+                damage.clone(),
+                color_transform,
+            )
+            .or_else(|| {
+                dmabuf_surface_frame(
+                    &buffer,
+                    destination,
+                    source_uv,
+                    transform,
+                    damage,
+                    color_transform,
+                )
+            });
             if let Some(frame) = frame {
                 output.push(frame);
                 surface_commits.insert(buffer_id, current_commit);
@@ -1777,12 +1812,32 @@ fn collect_shm_surface_tree(
     );
 }
 
+fn texture_color_transform(color: SurfaceColorRenderState) -> TextureColorTransform {
+    let transfer = match color.description.transfer {
+        TransferFunction::Srgb => FrameTransferFunction::Srgb,
+        TransferFunction::Bt1886 => FrameTransferFunction::Bt1886,
+        TransferFunction::Gamma22 => FrameTransferFunction::Gamma22,
+        TransferFunction::Linear => FrameTransferFunction::Linear,
+        TransferFunction::St2084Pq => FrameTransferFunction::St2084Pq,
+        TransferFunction::Hlg => FrameTransferFunction::Hlg,
+        TransferFunction::SrgbHdr => FrameTransferFunction::ExtendedSrgb,
+    };
+    TextureColorTransform {
+        transfer,
+        client_to_scene: color.client_to_scene,
+        reference_white_nits: color.description.reference_white_nits.max(1.0),
+        linear_to_scene_scale: color.description.linear_to_scene_scale(),
+        source_bits: color.src_bits,
+    }
+}
+
 fn dmabuf_surface_frame(
     buffer: &smithay::backend::renderer::utils::Buffer,
     destination: [i32; 4],
     mut source_uv: [f32; 4],
     transform: FrameTransform,
     damage: Vec<[i32; 4]>,
+    color_transform: TextureColorTransform,
 ) -> Option<TextureQuad> {
     let dmabuf = get_dmabuf(buffer).ok()?;
     let size = dmabuf.size();
@@ -1886,6 +1941,7 @@ fn dmabuf_surface_frame(
             Fourcc::Abgr8888 | Fourcc::Xbgr8888 => FramePixelFormat::Rgba8Srgb,
             _ => unreachable!("format was validated above"),
         },
+        color_transform,
         dmabuf: Some(LinuxDmabuf {
             fd: Arc::new(fd),
             modifier: format.modifier.into(),
@@ -1906,6 +1962,7 @@ fn shm_surface_frame(
     source_uv: [f32; 4],
     transform: FrameTransform,
     damage: Vec<[i32; 4]>,
+    color_transform: TextureColorTransform,
 ) -> Option<TextureQuad> {
     with_buffer_contents(buffer, |ptr, len, data| {
         if !matches!(
@@ -1978,6 +2035,7 @@ fn shm_surface_frame(
             height: data.height as u32,
             stride: data.stride as u32,
             format: FramePixelFormat::Bgra8Srgb,
+            color_transform,
             dmabuf: None,
             damage,
             destination,
@@ -2002,4 +2060,40 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.into());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod color_transform_tests {
+    use super::texture_color_transform;
+    use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
+    use focaldesk_render::FrameTransferFunction;
+
+    #[test]
+    fn display_p3_surface_keeps_its_client_to_scene_matrix() {
+        let color = SurfaceColorRenderState::for_description(
+            ColorDescription::DISPLAY_P3_SRGB,
+            RenderingIntent::Relative,
+        );
+        let texture = texture_color_transform(color);
+        assert_eq!(texture.transfer, FrameTransferFunction::Srgb);
+        assert_eq!(texture.client_to_scene, color.client_to_scene);
+        assert_ne!(
+            texture.client_to_scene,
+            [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+        );
+    }
+
+    #[test]
+    fn pq_surface_keeps_reference_white_for_absolute_decode() {
+        let color = SurfaceColorRenderState::for_description(
+            ColorDescription::bt2020_pq_hdr(600.0, 300.0),
+            RenderingIntent::Perceptual,
+        );
+        let texture = texture_color_transform(color);
+        assert_eq!(texture.transfer, FrameTransferFunction::St2084Pq);
+        assert_eq!(
+            texture.reference_white_nits,
+            color.description.reference_white_nits
+        );
+    }
 }
