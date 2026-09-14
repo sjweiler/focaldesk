@@ -45,14 +45,22 @@ font-atlas text, state-tinted SVG icons, antialiased rounded panels, and
 notification text above clients while keeping cursors foremost. Advanced GLES
 effect parity, multi-plane DMA-BUFs, and color-managed/HDR output remain.
 
-When `drm-wgpu` is combined with the real DRM backend, FocalDesk creates a
-Vulkan device matched by DRM render-node major/minor and polls it from the DRM
-render loop. At output initialization it imports the backend's real single-plane
-GBM allocation into Vulkan as a color attachment and submits a bounded render
-probe. This establishes the correct multi-GPU ownership and target-import
-boundary. The current KMS frame still comes from the established GLES
-offscreen/DrmOutput path; full Vulkan scene output plus explicit Vulkan/KMS
-fences is the next DRM migration stage.
+The real DRM executable contains two independent rendering paths. The existing
+path uses Smithay's EGL/GLES renderer with GBM and KMS. The Vulkan path uses raw
+ash while retaining Smithay as the DRM/KMS owner. GBM swapchain DMA-BUFs are
+imported with explicit DRM modifiers, rendered as Vulkan color attachments,
+released to the foreign queue family, and submitted to atomic KMS with an
+exported sync-file. Client DMA-BUF textures use the corresponding foreign queue
+ownership transfers; SHM textures use Vulkan staging uploads. There is no
+Vulkan display surface, Vulkan WSI swapchain, GLES copy, or EGL import bridge.
+
+`focaldmd` selects the renderer before the user session starts. The Vulkan DRM
+backend creates an explicit-sync GBM swapchain for every enabled connected
+output and applies the saved mode, fractional scale, logical position, and
+primary-output selection from `displays.json`. It resets every compositor-owned
+swapchain across libseat pause/resume and shares the established DRM input
+dispatcher used by the GLES backend. GLES remains the recovery renderer and
+retains HDR, capture, XWayland, and live-hotplug support.
 
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 

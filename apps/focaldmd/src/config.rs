@@ -10,6 +10,22 @@ use serde::Deserialize;
 
 const CONFIG_PATH: &str = "/etc/focaldmd.toml";
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionRenderer {
+    Gles,
+    Vulkan,
+}
+
+impl SessionRenderer {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gles => "gles",
+            Self::Vulkan => "vulkan",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -19,6 +35,8 @@ pub struct Config {
     pub greeter_cmd: String,
     /// Command exec'd for the authenticated user's session (focaldesk).
     pub session_cmd: String,
+    /// DRM renderer selected for the authenticated desktop session.
+    pub renderer: SessionRenderer,
     /// Extra environment variables exported to the authenticated user's
     /// session. This is the native-display-manager equivalent of variables
     /// set by a GDM session wrapper.
@@ -53,6 +71,7 @@ impl Default for Config {
             greeter_user: "focaldm".into(),
             greeter_cmd: "/usr/libexec/focaldm-greeter".into(),
             session_cmd: "/usr/local/bin/focaldesk-desktop".into(),
+            renderer: SessionRenderer::Gles,
             session_environment: BTreeMap::new(),
             socket_path: PathBuf::from("/run/focaldmd/greeter.sock"),
             pam_service: "focaldmd".into(),
@@ -80,7 +99,13 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, SessionRenderer};
+
+    #[test]
+    fn parses_vulkan_session_renderer() {
+        let cfg: Config = toml::from_str("renderer = \"vulkan\"").expect("parse focaldmd config");
+        assert_eq!(cfg.renderer, SessionRenderer::Vulkan);
+    }
 
     #[test]
     fn parses_session_environment() {

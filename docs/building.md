@@ -191,17 +191,28 @@ Weston's DMA-BUF demo plus GTK4 and Chromium/Chrome when installed, verifies a
 direct non-linear Vulkan import when the adapter advertises one, and preserves
 logs under `target/nested-wgpu-smoke`.
 
-The real DRM/KMS backend has an opt-in Vulkan bring-up build:
+The desktop build contains both DRM renderers. `focaldmd` selects one for the
+authenticated session with its top-level `renderer` setting:
 
-```sh
-just drm-wgpu-check
+```toml
+# /etc/focaldmd.toml
+renderer = "gles"    # recovery/default renderer
+# renderer = "vulkan" # direct Vulkan DRM renderer
 ```
 
-This selects and creates a Vulkan device by the exact DRM render-node identity
-already chosen by the KMS backend, keeps it polled in the DRM render loop, and
-performs a bounded Vulkan clear into the output's real GBM allocation probe.
-GLES remains the scanout presenter until full Vulkan scene composition and
-explicit Vulkan/KMS fences are connected to `DrmOutput`.
+`just install-desktop` builds both paths into the same binary. The Vulkan path
+uses raw ash: Smithay owns atomic KMS, GBM allocates scanout buffers, and Vulkan
+imports those DMA-BUFs as color attachments. Each queue submission exports a
+sync-file that Smithay passes to KMS as the primary plane input fence. It does
+not use Vulkan display WSI and does not create EGL or GLES objects. The Vulkan
+backend creates one scanout path per enabled connected output and honors saved
+mode, scale, logical position, and primary-output settings. Use the GLES
+renderer for HDR, output capture, XWayland, or live hotplug until those
+lifecycle paths are implemented for Vulkan.
+
+`cargo check -p focaldesk-desktop --no-default-features --features drm-vulkan,xwayland`
+verifies the combined build without installing it. The legacy `drm-wgpu`
+feature remains as a build-script compatibility alias.
 
 This is the recommended development path because a compositor crash only closes
 the nested window. Backend-specific DRM/KMS shortcuts such as screenshots are

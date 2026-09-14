@@ -21,9 +21,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [features]
-default = ["drm", "xwayland"]
+default = ["drm-vulkan", "xwayland"]
 winit = ["focaldesk-engine/winit"]
 wgpu = ["focaldesk-engine/wgpu"]
 drm = ["focaldesk-engine/drm"]
-drm-wgpu = ["drm", "wgpu", "focaldesk-engine/drm-wgpu"]
+drm-vulkan = ["drm", "wgpu", "focaldesk-engine/drm-vulkan"]
+drm-wgpu = ["drm-vulkan"]
 xwayland = ["focaldesk-engine/xwayland"]

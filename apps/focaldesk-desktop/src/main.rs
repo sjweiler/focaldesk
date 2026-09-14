@@ -4,6 +4,8 @@ use tracing::info;
 
 #[cfg(feature = "drm")]
 use focaldesk_engine::backend::drm;
+#[cfg(all(feature = "drm", feature = "drm-vulkan"))]
+use focaldesk_engine::backend::drm_vulkan;
 #[cfg(all(not(feature = "drm"), not(feature = "winit"), feature = "wgpu"))]
 use focaldesk_engine::backend::wgpu_nested;
 #[cfg(all(not(feature = "drm"), feature = "winit"))]
@@ -42,13 +44,41 @@ fn spawn_polkit_agent() -> std::io::Result<Child> {
 #[cfg(feature = "drm")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_default_logging();
-    startup_banner(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"), "drm");
-    info!(target: "focaldesk", session_id = session_id(), backend = "drm", "starting FocalDesk");
+    let renderer = std::env::var("FOCALDESK_DRM_RENDERER")
+        .unwrap_or_else(|_| "gles".to_string())
+        .to_ascii_lowercase();
+    if renderer != "gles" && renderer != "vulkan" {
+        return Err(format!(
+            "invalid FOCALDESK_DRM_RENDERER={renderer:?}; expected gles or vulkan"
+        )
+        .into());
+    }
+    startup_banner(
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        if renderer == "vulkan" {
+            "drm-vulkan"
+        } else {
+            "drm-gles"
+        },
+    );
+    info!(target: "focaldesk", session_id = session_id(), backend = "drm", %renderer, "starting FocalDesk");
     // A PolicyKit agent must register from the graphical login session. A
     // systemd --user service belongs to user@.service instead, and polkit
     // rejects it because the caller and registered sessions differ.
     let mut polkit_agent = spawn_polkit_agent()?;
-    let result = drm::run();
+    let result = if renderer == "vulkan" {
+        #[cfg(feature = "drm-vulkan")]
+        {
+            drm_vulkan::run()
+        }
+        #[cfg(not(feature = "drm-vulkan"))]
+        {
+            Err("the installed desktop was built without Vulkan DRM support".into())
+        }
+    } else {
+        drm::run()
+    };
     let _ = polkit_agent.kill();
     let _ = polkit_agent.wait();
     result

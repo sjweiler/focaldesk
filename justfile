@@ -20,9 +20,12 @@ nested-wgpu-smoke:
 nested-wgpu-smoke-no-build:
     bash scripts/nested-wgpu-smoke.sh --no-build
 
-# Compile the real DRM/KMS backend with its render-node-matched Vulkan device.
-drm-wgpu-check:
-    cargo check -p focaldesk-desktop --no-default-features --features drm-wgpu,xwayland
+# Compile the real DRM/KMS backend with its render-node-matched raw ash device.
+drm-vulkan-check:
+    cargo check -p focaldesk-desktop --no-default-features --features drm-vulkan,xwayland
+
+# Compatibility name retained for existing local workflows.
+drm-wgpu-check: drm-vulkan-check
 
 nested-compat-matrix:
     bash scripts/nested-compat-matrix.sh

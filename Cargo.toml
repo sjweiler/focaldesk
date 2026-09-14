@@ -91,6 +91,7 @@ smithay = { git = "https://github.com/Smithay/smithay", rev = "a394efa7058e987c8
 anyhow = "1"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
 ash = "0.38"
+naga = { version = "30.0.1", features = ["wgsl-in", "spv-out"] }
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 nix = "0.27"

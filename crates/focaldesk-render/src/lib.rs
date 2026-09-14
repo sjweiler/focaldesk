@@ -14,8 +14,14 @@ use std::sync::Arc;
 #[cfg(feature = "wgpu")]
 mod wgpu_vulkan;
 
+#[cfg(all(feature = "ash-drm", unix))]
+mod ash_drm;
+
+#[cfg(all(feature = "ash-drm", unix))]
+pub use ash_drm::{AshDrmRenderer, AshDrmSubmission};
+
 #[cfg(feature = "wgpu")]
-pub use wgpu_vulkan::{WgpuDrmRenderDevice, WgpuVulkanRenderer};
+pub use wgpu_vulkan::WgpuVulkanRenderer;
 
 /// Information useful for diagnostics and backend capability decisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,6 +89,19 @@ pub struct LinuxDmabufFormat {
 pub struct DrmRenderNode {
     pub major: u32,
     pub minor: u32,
+}
+
+/// DMA-BUF target owned by the compositor's DRM/GBM swapchain.
+#[cfg(unix)]
+#[derive(Clone, Debug)]
+pub struct DrmRenderTarget {
+    pub planes: Vec<Arc<OwnedFd>>,
+    pub offsets: Vec<u32>,
+    pub strides: Vec<u32>,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Keeps compositor-owned resources alive until the GPU finishes a frame.

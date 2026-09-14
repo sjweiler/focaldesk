@@ -70,4 +70,7 @@ winit = ["dep:winit"]
 wgpu = ["dep:winit", "dep:focaldesk-render", "focaldesk-render/wgpu"]
 xwayland = ["smithay/xwayland"]
 drm = []
-drm-wgpu = ["drm", "wgpu"]
+drm-vulkan = ["drm", "wgpu", "focaldesk-render/ash-drm"]
+# Compatibility alias for existing build scripts. The DRM renderer is raw ash;
+# wgpu is used only by the nested backend and shared scene extraction code.
+drm-wgpu = ["drm-vulkan"]

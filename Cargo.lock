@@ -2921,6 +2921,8 @@ dependencies = [
  "anyhow",
  "ash",
  "bytemuck",
+ "libc",
+ "naga",
  "pollster",
  "tracing",
  "wgpu",

@@ -65,6 +65,85 @@ struct WgpuShellAssets {
     font_atlas_pending: Option<Vec<u8>>,
 }
 
+struct WgpuSceneDesktop<'a> {
+    state: &'a mut crate::core::desktop::DesktopState,
+    output_id: focaldesk_types::OutputId,
+}
+
+pub(crate) struct VulkanCompositorScene {
+    pub background: Vec<SolidQuad>,
+    pub surfaces: Vec<TextureQuad>,
+    pub overlay: Vec<SolidQuad>,
+    pub overlay_after_surface: usize,
+    pub damage: Vec<[i32; 4]>,
+    pub client_surface_count: usize,
+    pub cursor_present: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct VulkanSceneBuilder {
+    assets: WgpuShellAssets,
+    surface_commits: HashMap<ObjectId, CommitCounter>,
+}
+
+impl VulkanSceneBuilder {
+    pub fn build(
+        &mut self,
+        state: &mut crate::core::desktop::DesktopState,
+    ) -> VulkanCompositorScene {
+        let output_id = state.primary_output;
+        self.build_for_output(state, output_id)
+    }
+
+    pub fn build_for_output(
+        &mut self,
+        state: &mut crate::core::desktop::DesktopState,
+        output_id: focaldesk_types::OutputId,
+    ) -> VulkanCompositorScene {
+        let damage = state
+            .outputs
+            .get(&output_id)
+            .map(|output| {
+                output
+                    .pending_damage
+                    .iter()
+                    .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut desktop = WgpuSceneDesktop { state, output_id };
+        let (background, overlay) = collect_shell_quads(&mut desktop);
+        prepare_shell_text(&mut desktop, &mut self.assets);
+        let mut surfaces = Vec::new();
+        append_wallpaper_quads(&mut desktop, &mut self.assets, &mut surfaces);
+        append_shell_icon_quads(&desktop, &mut self.assets, &mut surfaces);
+        append_topbar_text_quads(&desktop, &mut self.assets, &mut surfaces);
+        let shell_surface_count = surfaces.len();
+        surfaces.extend(collect_shm_surfaces(&desktop, &mut self.surface_commits));
+        let client_surface_count = surfaces.len() - shell_surface_count;
+        let overlay_after_surface = surfaces.len();
+        append_notification_text_quads(&desktop, &mut self.assets, &mut surfaces);
+        if self.surface_commits.len() > 4096 {
+            self.surface_commits.clear();
+        }
+        let cursor_present =
+            append_cursor_texture_quads(&mut desktop, &mut self.surface_commits, &mut surfaces);
+        VulkanCompositorScene {
+            background,
+            surfaces,
+            overlay,
+            overlay_after_surface,
+            damage,
+            client_surface_count,
+            cursor_present,
+        }
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 struct WgpuWallpaper {
     cache_key: u64,
     width: u32,
@@ -115,8 +194,7 @@ struct NestedVulkanApp {
     logged_first_cursor_present: bool,
     logged_dmabuf_import: bool,
     modifiers: FlowModifiers,
-    surface_commits: HashMap<ObjectId, CommitCounter>,
-    shell_assets: WgpuShellAssets,
+    scene_builder: VulkanSceneBuilder,
     surface_blocker_loop: Option<CalloopEventLoop<'static, crate::core::desktop::DesktopState>>,
     fatal_error: Option<anyhow::Error>,
 }
@@ -504,62 +582,30 @@ impl ApplicationHandler for NestedVulkanApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let (background, overlay) = self
+                let scene = self
                     .desktop
                     .as_mut()
-                    .map(collect_shell_quads)
-                    .unwrap_or_default();
-                let damage = self
-                    .desktop
-                    .as_ref()
-                    .and_then(|desktop| desktop.state.outputs.get(&desktop.state.primary_output))
-                    .map(|output| {
-                        output
-                            .pending_damage
-                            .iter()
-                            .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                let mut surfaces = Vec::new();
-                let mut shell_surface_count = 0;
-                if let Some(desktop) = self.desktop.as_mut() {
-                    prepare_shell_text(desktop, &mut self.shell_assets);
-                    append_wallpaper_quads(desktop, &mut self.shell_assets, &mut surfaces);
-                    append_shell_icon_quads(desktop, &mut self.shell_assets, &mut surfaces);
-                    append_topbar_text_quads(desktop, &mut self.shell_assets, &mut surfaces);
-                    shell_surface_count = surfaces.len();
-                    surfaces.extend(collect_shm_surfaces(desktop, &mut self.surface_commits));
-                }
-                let client_surface_count = surfaces.len() - shell_surface_count;
-                let overlay_after_surface = surfaces.len();
-                if let Some(desktop) = self.desktop.as_ref() {
-                    append_notification_text_quads(desktop, &mut self.shell_assets, &mut surfaces);
-                }
-                // Object IDs are unique while alive, but keep long-running
-                // sessions bounded if clients churn through huge buffer pools.
-                // Clearing is safe: the next use conservatively uploads fully.
-                if self.surface_commits.len() > 4096 {
-                    self.surface_commits.clear();
-                }
-                let cursor_present = self.desktop.as_mut().is_some_and(|desktop| {
-                    append_cursor_texture_quads(desktop, &mut self.surface_commits, &mut surfaces)
-                });
+                    .map(|desktop| self.scene_builder.build(&mut desktop.state));
                 let result = self
                     .renderer
                     .as_mut()
                     .context("renderer missing after nested window initialization")
                     .and_then(|renderer| {
+                        let scene = scene.as_ref().context("desktop scene is unavailable")?;
                         renderer.present_frame(
-                            &background,
-                            &surfaces,
-                            &overlay,
-                            overlay_after_surface,
-                            &damage,
+                            &scene.background,
+                            &scene.surfaces,
+                            &scene.overlay,
+                            scene.overlay_after_surface,
+                            &scene.damage,
                         )
                     });
                 match result {
                     Ok(PresentResult::Presented) => {
+                        let client_surface_count =
+                            scene.as_ref().map_or(0, |scene| scene.client_surface_count);
+                        let cursor_present =
+                            scene.as_ref().is_some_and(|scene| scene.cursor_present);
                         if !self.logged_dmabuf_import {
                             if let Some(renderer) = self.renderer.as_ref() {
                                 let (imports, fallbacks) = renderer.dmabuf_import_stats();
@@ -629,8 +675,7 @@ impl ApplicationHandler for NestedVulkanApp {
         self.logged_first_surface_present = false;
         self.logged_first_cursor_present = false;
         self.logged_dmabuf_import = false;
-        self.shell_assets = WgpuShellAssets::default();
-        self.surface_commits.clear();
+        self.scene_builder.clear();
     }
 }
 
@@ -649,7 +694,7 @@ fn clipped_text(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-fn prepare_shell_text(desktop: &mut NestedDesktop, assets: &mut WgpuShellAssets) {
+fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShellAssets) {
     let mut strings = vec![("FOCALDESK".to_string(), WGPU_LABEL_STYLE)];
     strings.extend(
         desktop
@@ -688,7 +733,7 @@ fn prepare_shell_text(desktop: &mut NestedDesktop, assets: &mut WgpuShellAssets)
 
 #[allow(clippy::too_many_arguments)]
 fn append_text_quads(
-    desktop: &NestedDesktop,
+    desktop: &WgpuSceneDesktop<'_>,
     assets: &mut WgpuShellAssets,
     output: &mut Vec<TextureQuad>,
     text: &str,
@@ -750,11 +795,11 @@ fn append_text_quads(
 }
 
 fn append_topbar_text_quads(
-    desktop: &NestedDesktop,
+    desktop: &WgpuSceneDesktop<'_>,
     assets: &mut WgpuShellAssets,
     output: &mut Vec<TextureQuad>,
 ) {
-    let output_id = desktop.state.primary_output;
+    let output_id = desktop.output_id;
     let Some(output_state) = desktop.state.outputs.get(&output_id) else {
         return;
     };
@@ -804,14 +849,14 @@ fn append_topbar_text_quads(
 }
 
 fn append_notification_text_quads(
-    desktop: &NestedDesktop,
+    desktop: &WgpuSceneDesktop<'_>,
     assets: &mut WgpuShellAssets,
     output: &mut Vec<TextureQuad>,
 ) {
     if desktop.state.lock_screen.active && desktop.state.privacy.hide_lock_screen_notifications {
         return;
     }
-    let output_id = desktop.state.primary_output;
+    let output_id = desktop.output_id;
     let Some(output_state) = desktop.state.outputs.get(&output_id) else {
         return;
     };
@@ -850,11 +895,11 @@ fn append_notification_text_quads(
 }
 
 fn append_wallpaper_quads(
-    desktop: &mut NestedDesktop,
+    desktop: &mut WgpuSceneDesktop<'_>,
     assets: &mut WgpuShellAssets,
     output: &mut Vec<TextureQuad>,
 ) {
-    let output_id = desktop.state.primary_output;
+    let output_id = desktop.output_id;
     let theme = desktop.state.theme.active_theme();
     let path = theme.wallpaper.path.clone();
     if assets.wallpaper_path != path {
@@ -957,11 +1002,11 @@ fn append_wallpaper_quads(
 }
 
 fn append_shell_icon_quads(
-    desktop: &NestedDesktop,
+    desktop: &WgpuSceneDesktop<'_>,
     assets: &mut WgpuShellAssets,
     output: &mut Vec<TextureQuad>,
 ) {
-    let output_id = desktop.state.primary_output;
+    let output_id = desktop.output_id;
     let Some(output_state) = desktop.state.outputs.get(&output_id) else {
         return;
     };
@@ -1090,8 +1135,8 @@ fn rounded_solid_quad(
 /// Build the compositor-native shell geometry used while the GLES chrome is
 /// being ported. Client content remains between the background and overlay
 /// lists, so notification cards stay above application windows.
-fn collect_shell_quads(desktop: &mut NestedDesktop) -> (Vec<SolidQuad>, Vec<SolidQuad>) {
-    let output_id = desktop.state.primary_output;
+fn collect_shell_quads(desktop: &mut WgpuSceneDesktop<'_>) -> (Vec<SolidQuad>, Vec<SolidQuad>) {
+    let output_id = desktop.output_id;
     let Some(layout) = desktop.state.rebuild_ui_tree_for_output(output_id) else {
         return (Vec::new(), Vec::new());
     };
@@ -1188,20 +1233,17 @@ fn collect_shell_quads(desktop: &mut NestedDesktop) -> (Vec<SolidQuad>, Vec<Soli
 }
 
 fn append_cursor_texture_quads(
-    desktop: &mut NestedDesktop,
+    desktop: &mut WgpuSceneDesktop<'_>,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
     output: &mut Vec<TextureQuad>,
 ) -> bool {
-    if !desktop.state.cursor_manager.visible() {
+    if !desktop.state.cursor_manager.visible()
+        || !desktop.state.output_contains_pointer(desktop.output_id)
+    {
         return false;
     }
     let (pointer_x, pointer_y) = desktop.state.cursor_manager.position();
-    let Some(output_state) = desktop
-        .state
-        .outputs
-        .get(&desktop.state.focused_output)
-        .or_else(|| desktop.state.outputs.get(&desktop.state.primary_output))
-    else {
+    let Some(output_state) = desktop.state.outputs.get(&desktop.output_id) else {
         return false;
     };
     let scale = output_state.scale_factor;
@@ -1254,10 +1296,10 @@ fn append_cursor_texture_quads(
 }
 
 fn collect_shm_surfaces(
-    desktop: &NestedDesktop,
+    desktop: &WgpuSceneDesktop<'_>,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
 ) -> Vec<TextureQuad> {
-    let output_state = desktop.state.outputs.get(&desktop.state.primary_output);
+    let output_state = desktop.state.outputs.get(&desktop.output_id);
     let scale = output_state
         .map(|output| output.scale_factor)
         .unwrap_or(1.0);
@@ -1279,7 +1321,10 @@ fn collect_shm_surfaces(
         let Some(root) = window.wl_surface() else {
             continue;
         };
-        let window_origin = window_location - window.geometry().loc;
+        let output_origin = output_state
+            .map(|output| output.logical_origin)
+            .unwrap_or_default();
+        let window_origin = window_location - window.geometry().loc - output_origin;
 
         // Smithay's downward traversal and popup iterator are front-to-back,
         // while wgpu draws in painter's order. Build one front-to-back window

@@ -551,6 +551,18 @@ fn session_exec_spec(cfg: &Config, user: &nix::unistd::User) -> ExecSpec {
             None => env.push((key.clone(), value.clone())),
         }
     }
+    // Renderer selection is a first-class focaldmd setting rather than a
+    // display-manager-specific wrapper or inherited login environment.
+    match env
+        .iter_mut()
+        .find(|(existing, _)| existing == "FOCALDESK_DRM_RENDERER")
+    {
+        Some(slot) => slot.1 = cfg.renderer.as_str().to_string(),
+        None => env.push((
+            "FOCALDESK_DRM_RENDERER".to_string(),
+            cfg.renderer.as_str().to_string(),
+        )),
+    }
 
     ExecSpec {
         program: cfg.session_cmd.clone(),

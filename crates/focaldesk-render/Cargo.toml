@@ -8,6 +8,8 @@ license = "MIT"
 [dependencies]
 anyhow.workspace = true
 ash = { workspace = true, optional = true }
+naga = { workspace = true, optional = true }
+libc = { version = "0.2", optional = true }
 bytemuck = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
 tracing.workspace = true
@@ -17,3 +19,4 @@ winit = { version = "0.30", optional = true }
 [features]
 default = []
 wgpu = ["dep:ash", "dep:bytemuck", "dep:pollster", "dep:wgpu", "dep:winit"]
+ash-drm = ["dep:ash", "dep:libc", "dep:naga"]

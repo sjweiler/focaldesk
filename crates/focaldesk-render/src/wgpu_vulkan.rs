@@ -178,186 +178,6 @@ fn texture_format(format: FramePixelFormat) -> TextureFormat {
     }
 }
 
-/// Vulkan device selected by DRM render-node identity. This is the ownership
-/// seam used by the real KMS backend before scanout-target composition moves
-/// out of the established GLES presenter.
-pub struct WgpuDrmRenderDevice {
-    _instance: wgpu::Instance,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    dmabuf_formats: Vec<LinuxDmabufFormat>,
-    drm_render_node: DrmRenderNode,
-    info: RendererInfo,
-}
-
-impl WgpuDrmRenderDevice {
-    pub fn new(drm_render_node: DrmRenderNode) -> Result<Self> {
-        pollster::block_on(Self::new_async(drm_render_node))
-    }
-
-    async fn new_async(drm_render_node: DrmRenderNode) -> Result<Self> {
-        let mut descriptor = InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = Backends::VULKAN;
-        let instance = wgpu::Instance::new(descriptor);
-        let mut selected = None;
-        for adapter in instance.enumerate_adapters(Backends::VULKAN).await {
-            let (formats, node) = vulkan_dmabuf_capabilities(&adapter);
-            if node == Some(drm_render_node) {
-                selected = Some((adapter, formats));
-                break;
-            }
-        }
-        let (adapter, dmabuf_formats) = selected
-            .context("no Vulkan adapter matched the DRM render node selected by the KMS backend")?;
-        let adapter_info = adapter.get_info();
-        let required_features = adapter.features() & Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
-        let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
-                label: Some("focaldesk-drm-wgpu-vulkan-device"),
-                required_features,
-                ..Default::default()
-            })
-            .await
-            .context("create Vulkan device for DRM/KMS composition")?;
-        Ok(Self {
-            _instance: instance,
-            device,
-            queue,
-            dmabuf_formats,
-            drm_render_node,
-            info: RendererInfo {
-                api: GraphicsApi::Vulkan,
-                adapter_name: adapter_info.name,
-                driver: adapter_info.driver,
-                driver_info: adapter_info.driver_info,
-                surface_format: format!("{:?} DRM target", TextureFormat::Bgra8UnormSrgb),
-            },
-        })
-    }
-
-    pub fn info(&self) -> &RendererInfo {
-        &self.info
-    }
-
-    pub fn dmabuf_formats(&self) -> &[LinuxDmabufFormat] {
-        &self.dmabuf_formats
-    }
-
-    pub fn drm_render_node(&self) -> DrmRenderNode {
-        self.drm_render_node
-    }
-
-    pub fn poll(&self) -> Result<()> {
-        self.device
-            .poll(wgpu::PollType::Poll)
-            .context("poll DRM Vulkan render device")?;
-        Ok(())
-    }
-
-    /// Validate the real DRM allocator hand-off by rendering into a
-    /// single-plane GBM DMA-BUF selected by the KMS backend.
-    #[cfg(unix)]
-    pub fn clear_dmabuf_target(
-        &self,
-        dmabuf: &crate::LinuxDmabuf,
-        width: u32,
-        height: u32,
-        stride: u32,
-        format: FramePixelFormat,
-        color: [f64; 4],
-    ) -> Result<()> {
-        use wgpu::hal::{self, api::Vulkan};
-
-        ensure!(width > 0 && height > 0, "DRM target must not be empty");
-        ensure!(
-            stride >= width.saturating_mul(4),
-            "DRM target stride is too small"
-        );
-        let descriptor = TextureDescriptor {
-            label: Some("focaldesk-drm-wgpu-gbm-target"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: texture_format(format),
-            usage: TextureUsages::RENDER_ATTACHMENT,
-            view_formats: &[],
-        };
-        let hal_descriptor = hal::TextureDescriptor {
-            label: descriptor.label,
-            size: descriptor.size,
-            mip_level_count: descriptor.mip_level_count,
-            sample_count: descriptor.sample_count,
-            dimension: descriptor.dimension,
-            format: descriptor.format,
-            usage: TextureUses::COLOR_TARGET,
-            memory_flags: hal::MemoryFlags::empty(),
-            view_formats: descriptor.view_formats.to_vec(),
-        };
-        let fd = dmabuf.fd.try_clone().context("duplicate GBM DMA-BUF fd")?;
-        // SAFETY: the GBM allocation is alive for the duration of this call;
-        // the owned fd duplicate and its complete single-plane layout are
-        // passed to the Vulkan device selected from the same DRM render node.
-        let texture = unsafe {
-            let hal_device = self
-                .device
-                .as_hal::<Vulkan>()
-                .context("wgpu Vulkan HAL device is unavailable")?;
-            let hal_texture = hal_device.texture_from_dmabuf_fd(
-                fd,
-                &hal_descriptor,
-                dmabuf.modifier,
-                u64::from(stride),
-                dmabuf.offset,
-            )?;
-            self.device.create_texture_from_hal::<Vulkan>(
-                hal_texture,
-                &descriptor,
-                TextureUses::COLOR_TARGET,
-            )
-        };
-        let view = texture.create_view(&TextureViewDescriptor::default());
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("focaldesk-drm-wgpu-gbm-probe"),
-            });
-        {
-            let _pass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("focaldesk-drm-wgpu-gbm-probe-clear"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: color[0],
-                            g: color[1],
-                            b: color[2],
-                            a: color[3],
-                        }),
-                        store: StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-        }
-        let submission = self.queue.submit([encoder.finish()]);
-        self.device
-            .poll(wgpu::PollType::Wait {
-                submission_index: Some(submission),
-                timeout: Some(std::time::Duration::from_secs(5)),
-            })
-            .context("wait for Vulkan GBM target probe")?;
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
 fn vulkan_dmabuf_capabilities(
     adapter: &wgpu::Adapter,
 ) -> (Vec<LinuxDmabufFormat>, Option<DrmRenderNode>) {
@@ -475,9 +295,8 @@ fn vulkan_dmabuf_capabilities(
 
 /// Vulkan-only wgpu renderer used to establish the nested presentation path.
 pub struct WgpuVulkanRenderer {
-    instance: wgpu::Instance,
-    window: Arc<Window>,
     surface: Surface<'static>,
+    instance: wgpu::Instance,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: SurfaceConfiguration,
@@ -494,6 +313,8 @@ pub struct WgpuVulkanRenderer {
     dmabuf_formats: Vec<LinuxDmabufFormat>,
     drm_render_node: Option<DrmRenderNode>,
     info: RendererInfo,
+    // Must outlive `surface`; struct fields are dropped in declaration order.
+    target: Arc<Window>,
 }
 
 impl WgpuVulkanRenderer {
@@ -526,13 +347,13 @@ impl WgpuVulkanRenderer {
         Ok(())
     }
 
-    async fn new_async(window: Arc<Window>) -> Result<Self> {
+    async fn new_async(target: Arc<Window>) -> Result<Self> {
         let mut instance_descriptor = InstanceDescriptor::new_without_display_handle();
         instance_descriptor.backends = Backends::VULKAN;
         let instance = wgpu::Instance::new(instance_descriptor);
         let surface = instance
-            .create_surface(window.clone())
-            .context("create Vulkan presentation surface")?;
+            .create_surface(target.clone())
+            .context("create nested Vulkan presentation surface")?;
 
         let adapter = instance
             .request_adapter(&RequestAdapterOptions {
@@ -541,7 +362,7 @@ impl WgpuVulkanRenderer {
                 ..Default::default()
             })
             .await
-            .context("find a Vulkan adapter capable of presenting to the nested window")?;
+            .context("find a Vulkan adapter capable of presenting to the selected surface")?;
         let adapter_info = adapter.get_info();
         ensure!(
             adapter_info.backend == wgpu::Backend::Vulkan,
@@ -565,11 +386,11 @@ impl WgpuVulkanRenderer {
             .await
             .context("create wgpu Vulkan device")?;
 
-        let size = window.inner_size();
+        let size = target.inner_size();
         let (width, height) = surface_extent(size.width, size.height).unwrap_or((1, 1));
         let mut config = surface
             .get_default_config(&adapter, width, height)
-            .context("Vulkan adapter cannot configure the nested window surface")?;
+            .context("Vulkan adapter cannot configure the selected presentation surface")?;
         config.present_mode = wgpu::PresentMode::Fifo;
         config.desired_maximum_frame_latency = 2;
         surface.configure(&device, &config);
@@ -714,9 +535,8 @@ impl WgpuVulkanRenderer {
         };
 
         Ok(Self {
-            instance,
-            window,
             surface,
+            instance,
             device,
             queue,
             config,
@@ -733,6 +553,7 @@ impl WgpuVulkanRenderer {
             dmabuf_formats,
             drm_render_node,
             info,
+            target,
         })
     }
 
@@ -743,8 +564,8 @@ impl WgpuVulkanRenderer {
     fn recreate_surface(&mut self) -> Result<()> {
         self.surface = self
             .instance
-            .create_surface(self.window.clone())
-            .context("recreate lost Vulkan presentation surface")?;
+            .create_surface(self.target.clone())
+            .context("recreate nested Vulkan presentation surface")?;
         self.configure_surface();
         Ok(())
     }
