@@ -2487,13 +2487,13 @@ where
 }
 
 #[derive(Debug, Clone)]
-struct EdidMonitorIdentity {
-    make: String,
-    model: String,
-    serial_number: String,
+pub(crate) struct EdidMonitorIdentity {
+    pub(crate) make: String,
+    pub(crate) model: String,
+    pub(crate) serial_number: String,
 }
 
-fn connector_edid(
+pub(crate) fn connector_edid(
     device: &impl drm::control::Device,
     connector: connector::Handle,
 ) -> Option<Vec<u8>> {
@@ -3205,7 +3205,7 @@ mod hdr_detection {
     }
 }
 
-fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
+pub(crate) fn parse_edid_identity(edid: &[u8]) -> Option<EdidMonitorIdentity> {
     if edid.len() < 128 || edid.get(0..8)? != [0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00] {
         return None;
     }

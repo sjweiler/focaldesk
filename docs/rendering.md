@@ -67,6 +67,13 @@ display-settings IPC updates rebuild the raw Vulkan KMS topology.
 The Vulkan renderer paints egui panels as native indexed Vulkan meshes, with
 retained texture updates, physical-pixel scaling, and per-mesh clipping; it does
 not create an EGL or GLES context for panel rendering.
+DRM connector EDID supplies the same monitor make, model, serial, physical size,
+and ICC-profile matching inputs used by the GLES backend. The selected profile
+is retained in output state. Vulkan SDR composition un-premultiplies and decodes
+sRGB clients, wallpaper, solids, and shell meshes, blends them in linear light,
+applies the selected output-primaries matrix, and uses an sRGB KMS attachment for
+the matching output encode. Arbitrary ICC LUT/TRC transforms and extended-range
+HDR scanout still require the FP16 output pipeline.
 
 Raw Vulkan submissions and KMS presents have bounded progress deadlines. A
 stalled GPU fence recreates the Vulkan device and scanout in-process, while a

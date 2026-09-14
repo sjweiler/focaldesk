@@ -900,7 +900,7 @@ fn append_text_quads(
                 (glyph.atlas_y + glyph.h) as f32 / atlas_height as f32,
             ],
             transform: FrameTransform::Normal,
-            tint: color,
+            tint: premultiplied(color),
             retention: None,
         });
         cursor_x += advance;
@@ -1297,7 +1297,7 @@ fn append_wallpaper_quads(
             ],
             source_uv: [blit.uv.u0, blit.uv.v0, blit.uv.u1, blit.uv.v1],
             transform: FrameTransform::Normal,
-            tint,
+            tint: premultiplied(tint),
             retention: None,
         });
     }
@@ -1401,7 +1401,7 @@ fn append_shell_icon_quads(
             destination: [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h],
             source_uv: [0.0, 0.0, 1.0, 1.0],
             transform: FrameTransform::Normal,
-            tint,
+            tint: premultiplied(tint),
             retention: None,
         });
     }

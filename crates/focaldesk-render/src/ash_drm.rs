@@ -28,10 +28,29 @@ type DamageRect = [i32; 4];
 type DamageHistory = VecDeque<(u64, Vec<DamageRect>)>;
 
 const SOLID_SHADER: &str = r#"
-struct Push { rect: vec4<f32>, color: vec4<f32> }
+struct Push {
+    rect: vec4<f32>, color: vec4<f32>, geometry: vec4<f32>,
+    matrix0: vec4<f32>, matrix1: vec4<f32>, matrix2: vec4<f32>,
+}
 var<immediate> pc: Push;
 
-struct Out { @builtin(position) position: vec4<f32>, @location(0) color: vec4<f32> }
+fn srgb_decode(value: f32) -> f32 {
+    return select(value / 12.92, pow((value + 0.055) / 1.055, 2.4), value > 0.04045);
+}
+
+fn decode_color(color: vec4<f32>) -> vec4<f32> {
+    if color.a <= 0.0 { return vec4(0.0); }
+    let straight = color.rgb / color.a;
+    let linear = vec3(srgb_decode(straight.r), srgb_decode(straight.g), srgb_decode(straight.b));
+    let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
+    return vec4(mapped * color.a, color.a);
+}
+
+struct Out {
+    @builtin(position) position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) local: vec2<f32>,
+}
 
 @vertex fn vs_main(@builtin(vertex_index) i: u32) -> Out {
     let corners = array<vec2<f32>, 6>(
@@ -41,10 +60,21 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) color: vec4<f3
     var out: Out;
     out.position = vec4(pc.rect.xy + p * pc.rect.zw, 0.0, 1.0);
     out.color = pc.color;
+    out.local = p * pc.geometry.xy;
     return out;
 }
 
-@fragment fn fs_main(in: Out) -> @location(0) vec4<f32> { return in.color; }
+@fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
+    let radius = min(pc.geometry.z, min(pc.geometry.x, pc.geometry.y) * 0.5);
+    if radius <= 0.0 {
+        return decode_color(in.color);
+    }
+    let half_size = pc.geometry.xy * 0.5;
+    let q = abs(in.local - half_size) - (half_size - vec2(radius));
+    let distance = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
+    let coverage = 1.0 - smoothstep(-0.75, 0.75, distance);
+    return decode_color(in.color) * coverage;
+}
 "#;
 
 const TEXTURE_SHADER: &str = r#"
@@ -56,8 +86,25 @@ struct Push {
     uv0: vec4<f32>,
     uv1: vec4<f32>,
     tint: vec4<f32>,
+    matrix0: vec4<f32>, matrix1: vec4<f32>, matrix2: vec4<f32>,
 }
 var<immediate> pc: Push;
+
+fn srgb_decode(value: f32) -> f32 {
+    return select(value / 12.92, pow((value + 0.055) / 1.055, 2.4), value > 0.04045);
+}
+
+fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>) -> vec4<f32> {
+    let alpha = sampled.a * tint.a;
+    if alpha <= 0.0 { return vec4(0.0); }
+    let sampled_straight = sampled.rgb / sampled.a;
+    let tint_straight = tint.rgb / tint.a;
+    let sampled_linear = vec3(srgb_decode(sampled_straight.r), srgb_decode(sampled_straight.g), srgb_decode(sampled_straight.b));
+    let tint_linear = vec3(srgb_decode(tint_straight.r), srgb_decode(tint_straight.g), srgb_decode(tint_straight.b));
+    let linear = sampled_linear * tint_linear;
+    let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
+    return vec4(mapped * alpha, alpha);
+}
 
 struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) tint: vec4<f32> }
 
@@ -75,7 +122,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>,
 }
 
 @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
-    return textureSample(image, image_sampler, in.uv) * in.tint;
+    return decode_modulated_color(textureSample(image, image_sampler, in.uv), in.tint);
 }
 "#;
 
@@ -83,8 +130,27 @@ const MESH_SHADER: &str = r#"
 @group(0) @binding(0) var image: texture_2d<f32>;
 @group(0) @binding(1) var image_sampler: sampler;
 
-struct Push { screen: vec4<f32> }
+struct Push {
+    screen: vec4<f32>,
+    matrix0: vec4<f32>, matrix1: vec4<f32>, matrix2: vec4<f32>,
+}
 var<immediate> pc: Push;
+
+fn srgb_decode(value: f32) -> f32 {
+    return select(value / 12.92, pow((value + 0.055) / 1.055, 2.4), value > 0.04045);
+}
+
+fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>) -> vec4<f32> {
+    let alpha = sampled.a * tint.a;
+    if alpha <= 0.0 { return vec4(0.0); }
+    let sampled_straight = sampled.rgb / sampled.a;
+    let tint_straight = tint.rgb / tint.a;
+    let sampled_linear = vec3(srgb_decode(sampled_straight.r), srgb_decode(sampled_straight.g), srgb_decode(sampled_straight.b));
+    let tint_linear = vec3(srgb_decode(tint_straight.r), srgb_decode(tint_straight.g), srgb_decode(tint_straight.b));
+    let linear = sampled_linear * tint_linear;
+    let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
+    return vec4(mapped * alpha, alpha);
+}
 
 struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32> }
 
@@ -101,7 +167,7 @@ struct Out { @builtin(position) position: vec4<f32>, @location(0) uv: vec2<f32>,
 }
 
 @fragment fn fs_main(in: Out) -> @location(0) vec4<f32> {
-    return textureSample(image, image_sampler, in.uv) * in.color;
+    return decode_modulated_color(textureSample(image, image_sampler, in.uv), in.color);
 }
 "#;
 
@@ -390,10 +456,10 @@ impl AshDrmRenderer {
         }?;
         let solid_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .size(32)];
+            .size(96)];
         let texture_range = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
-            .size(64)];
+            .size(112)];
         let solid_layout = unsafe {
             device.create_pipeline_layout(
                 &vk::PipelineLayoutCreateInfo::default().push_constant_ranges(&solid_range),
@@ -476,29 +542,29 @@ impl AshDrmRenderer {
 
     fn formats_for_usage(&self, usage: vk::ImageUsageFlags) -> Vec<(u32, u64)> {
         let mut formats = Vec::new();
-        // The raw DRM path currently composites the established encoded-SDR
-        // scene directly into an UNORM KMS buffer. Sampling through an SRGB
-        // view would decode clients/wallpaper/UI to linear without a matching
-        // output encode, making the entire desktop severely dark.
+        // Client buffers remain UNORM and are decoded explicitly after
+        // un-premultiplication in the fragment shaders. Rendering through an
+        // SRGB view provides the paired linear-to-sRGB encode on attachment
+        // writes while retaining the DRM buffer's established byte layout.
         for (fourcc, render_format, sample_format) in [
             (
                 XRGB8888,
-                vk::Format::B8G8R8A8_UNORM,
+                vk::Format::B8G8R8A8_SRGB,
                 vk::Format::B8G8R8A8_UNORM,
             ),
             (
                 ARGB8888,
-                vk::Format::B8G8R8A8_UNORM,
+                vk::Format::B8G8R8A8_SRGB,
                 vk::Format::B8G8R8A8_UNORM,
             ),
             (
                 XBGR8888,
-                vk::Format::R8G8B8A8_UNORM,
+                vk::Format::R8G8B8A8_SRGB,
                 vk::Format::R8G8B8A8_UNORM,
             ),
             (
                 ABGR8888,
-                vk::Format::R8G8B8A8_UNORM,
+                vk::Format::R8G8B8A8_SRGB,
                 vk::Format::R8G8B8A8_UNORM,
             ),
         ] {
@@ -647,6 +713,7 @@ impl AshDrmRenderer {
         damage: &[[i32; 4]],
         stream_id: u64,
         capture_id: Option<u64>,
+        output_matrix: [[f32; 3]; 3],
     ) -> Result<AshDrmSubmission> {
         self.poll()?;
         ensure!(
@@ -924,6 +991,7 @@ impl AshDrmRenderer {
                 &mesh_draws,
                 &prepared_meshes,
                 mesh_before_surface,
+                output_matrix,
             );
         }
 
@@ -1286,6 +1354,7 @@ impl AshDrmRenderer {
         mesh_draws: &[Option<DrawTexture>],
         prepared_meshes: &[Option<PreparedMesh>],
         mesh_before_surface: usize,
+        output_matrix: [[f32; 3]; 3],
     ) {
         let clear = [vk::ClearValue {
             color: vk::ClearColorValue {
@@ -1316,13 +1385,13 @@ impl AshDrmRenderer {
             );
             self.device.cmd_set_scissor(command, 0, &[render_area]);
         }
-        self.draw_solids(command, format, background, width, height);
+        self.draw_solids(command, format, background, width, height, output_matrix);
         for (index, (surface, texture)) in surfaces.iter().zip(textures).enumerate() {
             if index == overlay_after_surface {
-                self.draw_solids(command, format, overlay, width, height);
+                self.draw_solids(command, format, overlay, width, height, output_matrix);
             }
             if index == foreground_after_surface {
-                self.draw_solids(command, format, foreground, width, height);
+                self.draw_solids(command, format, foreground, width, height, output_matrix);
             }
             if index == mesh_before_surface {
                 self.draw_meshes(
@@ -1334,17 +1403,26 @@ impl AshDrmRenderer {
                     width,
                     height,
                     render_area,
+                    output_matrix,
                 );
             }
             if let Some(texture) = texture {
-                self.draw_texture(command, format, surface, texture, width, height);
+                self.draw_texture(
+                    command,
+                    format,
+                    surface,
+                    texture,
+                    width,
+                    height,
+                    output_matrix,
+                );
             }
         }
         if overlay_after_surface >= surfaces.len() {
-            self.draw_solids(command, format, overlay, width, height);
+            self.draw_solids(command, format, overlay, width, height, output_matrix);
         }
         if foreground_after_surface >= surfaces.len() {
-            self.draw_solids(command, format, foreground, width, height);
+            self.draw_solids(command, format, foreground, width, height, output_matrix);
         }
         if mesh_before_surface >= surfaces.len() {
             self.draw_meshes(
@@ -1356,6 +1434,7 @@ impl AshDrmRenderer {
                 width,
                 height,
                 render_area,
+                output_matrix,
             );
         }
         unsafe { self.device.cmd_end_render_pass(command) };
@@ -1368,6 +1447,7 @@ impl AshDrmRenderer {
         solids: &[SolidQuad],
         width: u32,
         height: u32,
+        output_matrix: [[f32; 3]; 3],
     ) {
         unsafe {
             self.device.cmd_bind_pipeline(
@@ -1378,9 +1458,16 @@ impl AshDrmRenderer {
         };
         for solid in solids {
             let rect = ndc_rect(solid.destination, width, height);
-            let mut push = [0.0f32; 8];
+            let mut push = [0.0f32; 24];
             push[..4].copy_from_slice(&rect);
-            push[4..].copy_from_slice(&solid.color);
+            push[4..8].copy_from_slice(&solid.color);
+            push[8..].copy_from_slice(&[
+                solid.destination[2].max(0) as f32,
+                solid.destination[3].max(0) as f32,
+                solid.corner_radius.max(0.0),
+                0.0,
+            ]);
+            write_push_matrix(&mut push[12..], output_matrix);
             unsafe {
                 self.device.cmd_push_constants(
                     command,
@@ -1402,13 +1489,15 @@ impl AshDrmRenderer {
         texture: &DrawTexture,
         width: u32,
         height: u32,
+        output_matrix: [[f32; 3]; 3],
     ) {
         let uvs = transformed_uv(surface.source_uv, surface.transform);
-        let mut push = [0.0f32; 16];
+        let mut push = [0.0f32; 28];
         push[..4].copy_from_slice(&ndc_rect(surface.destination, width, height));
         push[4..8].copy_from_slice(&[uvs[0][0], uvs[0][1], uvs[1][0], uvs[1][1]]);
         push[8..12].copy_from_slice(&[uvs[2][0], uvs[2][1], uvs[3][0], uvs[3][1]]);
-        push[12..].copy_from_slice(&surface.tint);
+        push[12..16].copy_from_slice(&surface.tint);
+        write_push_matrix(&mut push[16..], output_matrix);
         unsafe {
             self.device.cmd_bind_pipeline(
                 command,
@@ -1445,8 +1534,11 @@ impl AshDrmRenderer {
         width: u32,
         height: u32,
         damage_clip: vk::Rect2D,
+        output_matrix: [[f32; 3]; 3],
     ) {
-        let screen = [2.0 / width as f32, -2.0 / height as f32, -1.0, 1.0];
+        let mut screen = [0.0_f32; 16];
+        screen[..4].copy_from_slice(&[2.0 / width as f32, -2.0 / height as f32, -1.0, 1.0]);
+        write_push_matrix(&mut screen[4..], output_matrix);
         unsafe {
             self.device.cmd_bind_pipeline(
                 command,
@@ -2090,17 +2182,17 @@ fn compile_shader(source: &str, stage: naga::ShaderStage, entry_point: &str) -> 
 
 fn vk_format(fourcc: u32) -> Result<vk::Format> {
     match fourcc {
-        XRGB8888 | ARGB8888 => Ok(vk::Format::B8G8R8A8_UNORM),
-        XBGR8888 | ABGR8888 => Ok(vk::Format::R8G8B8A8_UNORM),
+        XRGB8888 | ARGB8888 => Ok(vk::Format::B8G8R8A8_SRGB),
+        XBGR8888 | ABGR8888 => Ok(vk::Format::R8G8B8A8_SRGB),
         _ => bail!("unsupported DRM target fourcc 0x{fourcc:08x}"),
     }
 }
 
 fn texture_vk_format(format: FramePixelFormat) -> vk::Format {
     match format {
-        // Preserve encoded SDR samples. The KMS attachment is UNORM and the
-        // current compositor pass intentionally matches the GLES encoded-SDR
-        // path; a future linear-light pass must add an explicit output encode.
+        // Preserve encoded SDR samples for explicit un-premultiply and decode
+        // in the fragment shaders. Sampling through SRGB views would decode
+        // premultiplied RGB before alpha is removed and produce dark fringes.
         FramePixelFormat::Bgra8Srgb => vk::Format::B8G8R8A8_UNORM,
         FramePixelFormat::Rgba8Srgb => vk::Format::R8G8B8A8_UNORM,
     }
@@ -2277,11 +2369,20 @@ fn as_bytes<T>(value: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(value.as_ptr().cast(), std::mem::size_of_val(value)) }
 }
 
+fn write_push_matrix(destination: &mut [f32], matrix: [[f32; 3]; 3]) {
+    debug_assert!(destination.len() >= 12);
+    for (row, values) in matrix.into_iter().enumerate() {
+        let start = row * 4;
+        destination[start..start + 3].copy_from_slice(&values);
+        destination[start + 3] = 0.0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         compile_shader, effective_damage_regions, ndc_rect, texture_vk_format, transformed_uv,
-        AshDrmCapture, ARGB8888, MESH_SHADER, SOLID_SHADER, TEXTURE_SHADER,
+        vk_format, AshDrmCapture, ARGB8888, MESH_SHADER, SOLID_SHADER, TEXTURE_SHADER,
     };
     use crate::{FramePixelFormat, FrameTransform};
     use std::collections::VecDeque;
@@ -2302,7 +2403,7 @@ mod tests {
     }
 
     #[test]
-    fn encoded_sdr_textures_are_not_decoded_without_an_output_encode() {
+    fn encoded_sdr_textures_pair_manual_decode_with_srgb_output_encode() {
         assert_eq!(
             texture_vk_format(FramePixelFormat::Bgra8Srgb),
             ash::vk::Format::B8G8R8A8_UNORM
@@ -2311,6 +2412,7 @@ mod tests {
             texture_vk_format(FramePixelFormat::Rgba8Srgb),
             ash::vk::Format::R8G8B8A8_UNORM
         );
+        assert_eq!(vk_format(ARGB8888).unwrap(), ash::vk::Format::B8G8R8A8_SRGB);
     }
 
     #[test]

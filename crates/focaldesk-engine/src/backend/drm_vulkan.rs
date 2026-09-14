@@ -45,8 +45,8 @@ use super::common::{
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    configured_display_scale, dispatch_backend_input_event, load_display_config,
-    select_connector_mode,
+    configured_display_scale, connector_edid, dispatch_backend_input_event, load_display_config,
+    parse_edid_identity, select_connector_mode,
 };
 use super::wgpu_nested::VulkanSceneBuilder;
 
@@ -112,6 +112,13 @@ struct OutputConfig {
     origin: Point<i32, Logical>,
     primary: bool,
     output_id: OutputId,
+    physical_size_mm: (i32, i32),
+    make: String,
+    model: String,
+    serial_number: String,
+    edid: Option<Vec<u8>>,
+    color_profile: focaldesk_settings_core::DisplayColorProfile,
+    icc_profile_path: Option<String>,
 }
 
 struct VulkanOutput {
@@ -231,6 +238,29 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
         let crtc = selected_crtc.context("connected DRM output has no compatible CRTC")?;
         used_crtcs.insert(crtc);
         let (width, height) = mode.size();
+        let fallback_mm = physical_size_mm_from_pixels(Size::<i32, Physical>::from((
+            width as i32,
+            height as i32,
+        )));
+        let physical_size_mm = info
+            .size()
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .map(|(width, height)| (width as i32, height as i32))
+            .unwrap_or(fallback_mm);
+        let edid = connector_edid(drm, *handle);
+        let identity = edid.as_deref().and_then(parse_edid_identity);
+        let make = identity
+            .as_ref()
+            .map(|identity| identity.make.clone())
+            .unwrap_or_else(|| "FocalDesk".to_string());
+        let model = identity
+            .as_ref()
+            .map(|identity| identity.model.clone())
+            .unwrap_or_else(|| info.interface().as_str().to_string());
+        let serial_number = identity
+            .as_ref()
+            .map(|identity| identity.serial_number.clone())
+            .unwrap_or_else(|| name.clone());
         let scale = configured_display_scale(&configured, &name);
         let logical_width = (f64::from(width) / scale).round() as i32;
         let origin = saved
@@ -248,6 +278,15 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             origin,
             primary: saved.is_some_and(|display| display.primary),
             output_id: OutputId(outputs.len() as u64 + 1),
+            physical_size_mm,
+            make,
+            model,
+            serial_number,
+            edid,
+            color_profile: saved
+                .map(|display| display.color_profile)
+                .unwrap_or_default(),
+            icc_profile_path: saved.and_then(|display| display.icc_profile_path.clone()),
         });
     }
     if outputs.is_empty() {
@@ -357,15 +396,14 @@ fn initialize_vulkan_outputs(
 
         let physical_size =
             Size::<i32, Physical>::from((config.width as i32, config.height as i32));
-        let (mm_width, mm_height) = physical_size_mm_from_pixels(physical_size);
         let output = Output::new(
             config.name.clone(),
             PhysicalProperties {
-                size: (mm_width, mm_height).into(),
+                size: config.physical_size_mm.into(),
                 subpixel: Subpixel::Unknown,
-                make: "FocalDesk".into(),
-                model: "Vulkan DRM".into(),
-                serial_number: config.name.clone(),
+                make: config.make.clone(),
+                model: config.model.clone(),
+                serial_number: config.serial_number.clone(),
             },
         );
         let wl_mode = WlMode {
@@ -390,6 +428,18 @@ fn initialize_vulkan_outputs(
             physical_size,
             config.scale,
         );
+        desktop.state.set_output_monitor_identity(
+            config.output_id,
+            config.make,
+            config.model,
+            config.serial_number,
+            config.edid,
+        );
+        if let Some(output) = desktop.state.outputs.get_mut(&config.output_id) {
+            output.color_profile_override = config.color_profile;
+            output.icc_profile_path = config.icc_profile_path;
+        }
+        desktop.state.refresh_output_color(config.output_id);
         if config.primary {
             configured_primary = Some(config.output_id);
         }
@@ -972,6 +1022,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .output_capture_broker
                     .has_consumers_for_output(output_id))
                 && !data.capture_pending.contains(&output_id);
+            let output_matrix = data
+                .desktop
+                .state
+                .outputs
+                .get(&output_id)
+                .map(|output| {
+                    crate::core::color::scene_to_output_matrix(
+                        output.color_description,
+                        crate::core::color::RenderingIntent::Relative,
+                    )
+                })
+                .unwrap_or([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
             let output = &mut data.outputs[index];
             let (dmabuf, _) = match output.scanout.next_buffer() {
                 Ok(next) => next,
@@ -995,6 +1057,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 &scene.damage,
                 output_id.0,
                 capture_requested.then_some(output_id.0),
+                output_matrix,
             )?;
             if capture_requested {
                 data.capture_pending.insert(output_id);
