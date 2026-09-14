@@ -72,6 +72,12 @@ impl<B> OutputCaptureBroker<B> {
         self.consumers.contains_key(&consumer_id)
     }
 
+    pub fn has_consumers_for_output(&self, output_id: OutputId) -> bool {
+        self.consumers
+            .values()
+            .any(|consumer| consumer.output_id == output_id)
+    }
+
     /// Discard queued incremental state and require the consumer's next frame
     /// to contain a complete output refresh.
     pub fn request_full_refresh(
@@ -215,6 +221,9 @@ mod tests {
         let mut broker = OutputCaptureBroker::<u8>::default();
         let first = broker.register(OutputId(1), 1).unwrap();
         let second = broker.register(OutputId(2), 1).unwrap();
+        assert!(broker.has_consumers_for_output(OutputId(1)));
+        assert!(broker.has_consumers_for_output(OutputId(2)));
+        assert!(!broker.has_consumers_for_output(OutputId(3)));
         broker.publish(OutputId(1), 7, geometry(100), damage(), Instant::now());
 
         assert!(broker.latest_frame(first).is_some());

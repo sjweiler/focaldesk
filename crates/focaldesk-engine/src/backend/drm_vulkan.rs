@@ -1,7 +1,7 @@
 //! Raw Vulkan DRM backend: Smithay/libseat own KMS, GBM owns scanout, and
 //! ash only renders into DMA-BUFs and exports explicit fences.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::{flog, flog_warn};
-use focaldesk_render::{AshDrmRenderer, DrmRenderTarget};
+use focaldesk_render::{AshDrmCapture, AshDrmRenderer, DrmRenderTarget};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{
@@ -51,6 +51,7 @@ use super::drm::{
 use super::wgpu_nested::VulkanSceneBuilder;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 const SCANOUT_FORMATS: [Fourcc; 4] = [
     Fourcc::Xrgb8888,
     Fourcc::Argb8888,
@@ -118,9 +119,11 @@ struct VulkanOutput {
     width: u32,
     height: u32,
     output_id: OutputId,
+    origin: Point<i32, Logical>,
     crtc: crtc::Handle,
     scanout: VulkanScanout,
     frame_pending: bool,
+    present_started_at: Option<Instant>,
 }
 
 struct VulkanDrmData {
@@ -139,6 +142,8 @@ struct VulkanDrmData {
     resume_pending: bool,
     resume_retry_at: Option<Instant>,
     topology_refresh_pending: bool,
+    capture_pending: HashSet<OutputId>,
+    screenshot_all_captures: HashMap<OutputId, (u32, u32, Vec<u8>)>,
     fatal_error: Option<anyhow::Error>,
     surface_blocker_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
 }
@@ -159,6 +164,7 @@ fn pause_vulkan_session(data: &mut VulkanDrmData, reason: &str) {
                 );
             }
             output.frame_pending = false;
+            output.present_started_at = None;
         }
     }
     data.drm.pause();
@@ -175,6 +181,7 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
     for output in &mut data.outputs {
         output.scanout.reset_buffers();
         output.frame_pending = false;
+        output.present_started_at = None;
     }
     data.libinput
         .resume()
@@ -401,9 +408,11 @@ fn initialize_vulkan_outputs(
             width: config.width,
             height: config.height,
             output_id: config.output_id,
+            origin: config.origin,
             crtc: config.crtc,
             scanout,
             frame_pending: false,
+            present_started_at: None,
         });
     }
     desktop.state.primary_output = configured_primary.unwrap_or(outputs[0].output_id);
@@ -423,6 +432,7 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         }
     };
     let snapshot = data.desktop.state.snapshot_output_topology();
+    crate::core::portal::invalidate_portal_output_state(&mut data.desktop.state);
     for output in &mut data.outputs {
         if output.frame_pending {
             let _ = output.scanout.frame_submitted();
@@ -441,6 +451,8 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
             .shift_remove(&output.output_id);
     }
     data.outputs.clear();
+    data.capture_pending.clear();
+    data.screenshot_all_captures.clear();
     data.scene_builder.clear();
     data.outputs = initialize_vulkan_outputs(
         &mut data.desktop,
@@ -452,6 +464,172 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
     data.desktop.state.restore_output_topology(snapshot);
     data.desktop.state.mark_redraw();
     Ok(true)
+}
+
+fn save_vulkan_screenshot(
+    data: &mut VulkanDrmData,
+    output_id: OutputId,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let name = data
+        .outputs
+        .iter()
+        .find(|output| output.output_id == output_id)
+        .map(|output| output.name.as_str())
+        .unwrap_or("output");
+    data.desktop.state.screenshot_seq += 1;
+    match crate::core::screenshot::save_srgb_rgba8_screenshot(
+        width,
+        height,
+        rgba,
+        name,
+        data.desktop.state.screenshot_seq,
+    ) {
+        Ok(path) => flog(format!("Screenshot saved to {}", path.display())),
+        Err(error) => flog_warn!("Vulkan screenshot failed: {error:#}"),
+    }
+}
+
+fn finish_all_outputs_screenshot(data: &mut VulkanDrmData) {
+    if data.outputs.is_empty()
+        || data
+            .outputs
+            .iter()
+            .any(|output| !data.screenshot_all_captures.contains_key(&output.output_id))
+    {
+        return;
+    }
+    let min_x = data
+        .outputs
+        .iter()
+        .map(|output| output.origin.x)
+        .min()
+        .unwrap_or(0);
+    let min_y = data
+        .outputs
+        .iter()
+        .map(|output| output.origin.y)
+        .min()
+        .unwrap_or(0);
+    let max_x = data
+        .outputs
+        .iter()
+        .map(|output| output.origin.x.saturating_add(output.width as i32))
+        .max()
+        .unwrap_or(0);
+    let max_y = data
+        .outputs
+        .iter()
+        .map(|output| output.origin.y.saturating_add(output.height as i32))
+        .max()
+        .unwrap_or(0);
+    let Ok(width) = u32::try_from(max_x.saturating_sub(min_x)) else {
+        return;
+    };
+    let Ok(height) = u32::try_from(max_y.saturating_sub(min_y)) else {
+        return;
+    };
+    let Some(byte_len) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+    else {
+        return;
+    };
+    let mut desktop = vec![0_u8; byte_len];
+    for output in &data.outputs {
+        let Some((source_width, source_height, pixels)) =
+            data.screenshot_all_captures.get(&output.output_id)
+        else {
+            return;
+        };
+        let dst_x = output.origin.x.saturating_sub(min_x) as usize;
+        let dst_y = output.origin.y.saturating_sub(min_y) as usize;
+        for row in 0..*source_height as usize {
+            let src_start = row * *source_width as usize * 4;
+            let src_end = src_start + *source_width as usize * 4;
+            let dst_start = ((dst_y + row) * width as usize + dst_x) * 4;
+            let dst_end = dst_start + *source_width as usize * 4;
+            if src_end > pixels.len() || dst_end > desktop.len() {
+                flog_warn!("Vulkan all-output screenshot layout exceeded its canvas");
+                return;
+            }
+            desktop[dst_start..dst_end].copy_from_slice(&pixels[src_start..src_end]);
+        }
+    }
+    data.desktop.state.screenshot_seq += 1;
+    match crate::core::screenshot::save_srgb_rgba8_screenshot(
+        width,
+        height,
+        &desktop,
+        "all-outputs",
+        data.desktop.state.screenshot_seq,
+    ) {
+        Ok(path) => flog(format!(
+            "All-outputs screenshot saved to {}",
+            path.display()
+        )),
+        Err(error) => flog_warn!("Vulkan all-output screenshot failed: {error:#}"),
+    }
+    data.desktop.state.screenshot_all_requested = false;
+    data.screenshot_all_captures.clear();
+}
+
+fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
+    let output_id = OutputId(capture.id);
+    data.capture_pending.remove(&output_id);
+    let width = capture.width;
+    let height = capture.height;
+    let rgba = match capture.into_rgba8() {
+        Ok(pixels) => pixels,
+        Err(error) => {
+            flog_warn!("Vulkan capture conversion failed: {error:#}");
+            return;
+        }
+    };
+    if data.desktop.state.screenshot_request() == Some(output_id) {
+        save_vulkan_screenshot(data, output_id, width, height, &rgba);
+        data.desktop.state.clear_screenshot_request(output_id);
+    }
+    crate::core::portal::complete_pending_portal_captures_from_rgba(
+        &mut data.desktop.state,
+        output_id,
+        width,
+        height,
+        &rgba,
+    );
+    crate::core::remote::export_rgba_frame(
+        &mut data.desktop.state,
+        output_id,
+        width,
+        height,
+        &rgba,
+    );
+    if data.desktop.state.screenshot_all_requested {
+        data.screenshot_all_captures
+            .insert(output_id, (width, height, rgba));
+        finish_all_outputs_screenshot(data);
+    }
+}
+
+fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
+    flog_warn!("raw Vulkan renderer failed; recreating device and scanout: {reason:#}");
+    data.renderer.abandon_device();
+    let replacement = AshDrmRenderer::new(data.primary_node.major(), data.primary_node.minor())
+        .context("recreate raw Vulkan device")?;
+    let abandoned = std::mem::replace(&mut data.renderer, replacement);
+    drop(abandoned);
+    match rebuild_vulkan_outputs(data)? {
+        true => {
+            data.desktop.state.mark_redraw();
+            flog("raw Vulkan device and KMS scanout recovered in-process");
+            Ok(())
+        }
+        false => Err(anyhow!(
+            "cannot recover Vulkan renderer without an enabled connected output"
+        )),
+    }
 }
 
 /// Run the raw-Vulkan compositor with Smithay/libseat KMS ownership and one
@@ -485,6 +663,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let mut desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
+    desktop.state.cpu_output_capture_available = true;
     let output_configs = select_outputs(&drm)?;
     let outputs =
         initialize_vulkan_outputs(&mut desktop, &renderer, &mut drm, &fd, output_configs)?;
@@ -529,6 +708,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         resume_pending: false,
         resume_retry_at: None,
         topology_refresh_pending: false,
+        capture_pending: HashSet::new(),
+        screenshot_all_captures: HashMap::new(),
         fatal_error: None,
         surface_blocker_loop,
     };
@@ -590,7 +771,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 return;
             };
             match output.scanout.frame_submitted() {
-                Ok(_) => output.frame_pending = false,
+                Ok(_) => {
+                    output.frame_pending = false;
+                    output.present_started_at = None;
+                }
                 Err(error) => {
                     data.fatal_error = Some(anyhow!(
                         "complete Vulkan DRM frame on {}: {error}",
@@ -690,7 +874,33 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .dispatch(Some(Duration::ZERO), &mut data.desktop.state)?;
         data.desktop.state.process_hdr_safe_session_action();
         data.desktop.state.process_deferred_ui_and_launches();
-        data.renderer.poll()?;
+        if let Err(error) = data.renderer.poll() {
+            recover_vulkan_renderer(&mut data, &error)?;
+            continue;
+        }
+        while let Some(capture) = data.renderer.take_completed_capture() {
+            finish_vulkan_capture(&mut data, capture);
+        }
+        if let Some(output_name) = data.outputs.iter().find_map(|output| {
+            (output.frame_pending
+                && output
+                    .present_started_at
+                    .is_some_and(|started| started.elapsed() >= KMS_PRESENT_TIMEOUT))
+            .then(|| output.name.clone())
+        }) {
+            flog_warn!(
+                "Vulkan KMS present on {} exceeded {} ms; rebuilding scanout",
+                output_name,
+                KMS_PRESENT_TIMEOUT.as_millis()
+            );
+            if !rebuild_vulkan_outputs(&mut data)? {
+                return Err(anyhow!(
+                    "cannot recover stalled Vulkan KMS present without a connected output"
+                )
+                .into());
+            }
+            continue;
+        }
         if let Some(error) = data.fatal_error.take() {
             return Err(error.into());
         }
@@ -748,6 +958,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let scene = data
                 .scene_builder
                 .build_for_output(&mut data.desktop.state, output_id);
+            let capture_requested = (data.desktop.state.screenshot_request() == Some(output_id)
+                || data.desktop.state.screenshot_all_requested
+                || data
+                    .desktop
+                    .state
+                    .pending_portal_captures
+                    .iter()
+                    .any(|capture| capture.output_id == output_id)
+                || data
+                    .desktop
+                    .state
+                    .output_capture_broker
+                    .has_consumers_for_output(output_id))
+                && !data.capture_pending.contains(&output_id);
             let output = &mut data.outputs[index];
             let (dmabuf, _) = match output.scanout.next_buffer() {
                 Ok(next) => next,
@@ -769,18 +993,26 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 &scene.egui_meshes,
                 scene.egui_before_surface,
                 &scene.damage,
+                output_id.0,
+                capture_requested.then_some(output_id.0),
             )?;
+            if capture_requested {
+                data.capture_pending.insert(output_id);
+            }
             let sync = SyncPoint::from(KmsFence(submission.fence_fd));
-            let full_damage = vec![Rectangle::from_loc_and_size(
-                (0, 0),
-                (output.width as i32, output.height as i32),
-            )];
-            match output
-                .scanout
-                .queue_buffer(Some(sync), Some(full_damage), ())
-            {
+            let kms_damage = scene
+                .damage
+                .iter()
+                .filter(|[_, _, width, height]| *width > 0 && *height > 0)
+                .map(|[x, y, width, height]| {
+                    Rectangle::from_loc_and_size((*x, *y), (*width, *height))
+                })
+                .collect::<Vec<_>>();
+            let kms_damage = (!kms_damage.is_empty()).then_some(kms_damage);
+            match output.scanout.queue_buffer(Some(sync), kms_damage, ()) {
                 Ok(()) => {
                     output.frame_pending = true;
+                    output.present_started_at = Some(Instant::now());
                     data.desktop.state.clear_output_repaint_request(output_id);
                     presented_any = true;
                 }

@@ -44,6 +44,8 @@ struct RemoteOutbound {
 
 struct RemoteSession {
     consumer_id: CaptureConsumerId,
+    output_id: OutputId,
+    next_frame_serial: u64,
     outbound: SyncSender<RemoteOutbound>,
 }
 
@@ -110,6 +112,8 @@ impl LocalRemoteCapture {
                         session_id,
                         RemoteSession {
                             consumer_id,
+                            output_id,
+                            next_frame_serial: 1,
                             outbound: outbound.clone(),
                         },
                     );
@@ -220,6 +224,68 @@ impl LocalRemoteCapture {
             }
         }
     }
+
+    fn export_rgba_frame(
+        &mut self,
+        state: &mut DesktopState,
+        output_id: OutputId,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) {
+        let Some(output) = state.outputs.get(&output_id) else {
+            return;
+        };
+        let scale = output.scale_factor;
+        let transform = protocol_transform(output.handle.current_transform());
+        let session_ids = self
+            .sessions
+            .iter()
+            .filter_map(|(id, session)| (session.output_id == output_id).then_some(*id))
+            .collect::<Vec<_>>();
+        let mut disconnected = Vec::new();
+        for session_id in session_ids {
+            let Some(session) = self.sessions.get_mut(&session_id) else {
+                continue;
+            };
+            let Ok(fd) = sealed_memfd(pixels) else {
+                continue;
+            };
+            let serial = session.next_frame_serial;
+            session.next_frame_serial = session.next_frame_serial.saturating_add(1);
+            let outbound = RemoteOutbound {
+                event: Event::FrameReady {
+                    session_id,
+                    frame_serial: serial,
+                    width,
+                    height,
+                    stride: width.saturating_mul(4),
+                    len: pixels.len() as u64,
+                    format: PixelFormat::Rgba8888,
+                    scale,
+                    transform,
+                    full_refresh: true,
+                    damage: vec![DamageRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    }],
+                },
+                fd: Some(fd),
+            };
+            match session.outbound.try_send(outbound) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => disconnected.push(session_id),
+            }
+        }
+        for session_id in disconnected {
+            if let Some(session) = self.sessions.remove(&session_id) {
+                state.output_capture_broker.remove(session.consumer_id);
+            }
+        }
+    }
 }
 
 pub fn process_commands(state: &mut DesktopState) {
@@ -235,6 +301,20 @@ pub fn export_frames(state: &mut DesktopState, renderer: &mut GlesRenderer) {
         return;
     };
     remote.export_frames(state, renderer);
+    state.local_remote_capture = Some(remote);
+}
+
+pub fn export_rgba_frame(
+    state: &mut DesktopState,
+    output_id: OutputId,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) {
+    let Some(mut remote) = state.local_remote_capture.take() else {
+        return;
+    };
+    remote.export_rgba_frame(state, output_id, width, height, pixels);
     state.local_remote_capture = Some(remote);
 }
 

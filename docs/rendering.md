@@ -34,9 +34,10 @@ Unused entries age out of the cache. All eight Wayland buffer rotations and
 reflections are applied while mapping viewport texture coordinates.
 
 The Vulkan path also has a retained output scene. With no compositor damage,
-connected idle clients do not schedule frames continuously. A damaged output is
-currently recomposed in full into its acquired GBM buffer; buffer-age-aware
-partial repaint remains a GLES-only optimization.
+connected idle clients do not schedule frames continuously. Each output keeps
+bounded damage history for its GBM buffers, repaints the regions an acquired
+buffer missed, and falls back to a full repaint if that history is incomplete.
+The same current-frame regions are forwarded as KMS damage clips.
 
 The shell pass now renders configured wallpaper fit/tint/dim behavior, cached
 font-atlas text, state-tinted SVG icons, antialiased rounded panels, and
@@ -59,11 +60,18 @@ primary-output selection from `displays.json`. It resets every compositor-owned
 swapchain across libseat pause/resume, shares the established DRM input
 dispatcher and deferred action pumps used by the GLES backend, and runs the
 normal XWayland lifecycle when that feature is enabled. GLES remains the
-recovery renderer and retains HDR and output-capture support. Udev connector
-events and display-settings IPC updates rebuild the raw Vulkan KMS topology.
+recovery renderer and retains HDR and zero-copy DMA-BUF capture support. Raw
+Vulkan supports screenshots, SHM portal capture, and the local remote-frame
+transport through asynchronous output readback. Udev connector events and
+display-settings IPC updates rebuild the raw Vulkan KMS topology.
 The Vulkan renderer paints egui panels as native indexed Vulkan meshes, with
 retained texture updates, physical-pixel scaling, and per-mesh clipping; it does
 not create an EGL or GLES context for panel rendering.
+
+Raw Vulkan submissions and KMS presents have bounded progress deadlines. A
+stalled GPU fence recreates the Vulkan device and scanout in-process, while a
+missing vblank rebuilds the KMS scanout. The renderer skips blocking Vulkan
+teardown for a wedged device.
 
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 

@@ -850,6 +850,9 @@ pub struct DesktopState {
     pub drm_syncobj_state: Option<smithay::wayland::drm_syncobj::DrmSyncobjState>,
     pub wgpu_explicit_sync_seen: bool,
     pub portal_dmabuf_formats: Vec<(Fourcc, Vec<Modifier>)>,
+    /// The backend can satisfy image-copy-capture frames from an RGBA readback
+    /// without the GLES portal dispatch context.
+    pub cpu_output_capture_available: bool,
     pub shm_state: smithay::wayland::shm::ShmState,
     pub seat_state: smithay::input::SeatState<Self>,
     pub output_manager_state: smithay::wayland::output::OutputManagerState,
@@ -7202,6 +7205,7 @@ impl DesktopState {
             drm_syncobj_state: None,
             wgpu_explicit_sync_seen: false,
             portal_dmabuf_formats: Vec::new(),
+            cpu_output_capture_available: false,
             shm_state: init.shm_state,
             seat_state: init.seat_state,
             output_manager_state: init.output_manager_state,

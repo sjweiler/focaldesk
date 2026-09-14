@@ -14,6 +14,7 @@ use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::path::PathBuf;
 
 const DISPLAY_P3_PNG_GAMMA: u32 = 45_455;
 
@@ -103,6 +104,29 @@ pub fn write_display_p3_png(path: &Path, width: u32, height: u32, pixels: &[u16]
     let file = File::create(path).with_context(|| format!("create {}", path.display()))?;
     encode_display_p3_png(BufWriter::new(file), width, height, pixels)
         .with_context(|| format!("encode {}", path.display()))
+}
+
+/// Save an encoded-sRGB RGBA8 compositor readback using the desktop's standard
+/// Display-P3 screenshot format and naming convention.
+pub fn save_srgb_rgba8_screenshot(
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+    output_name: &str,
+    seq: u64,
+) -> Result<PathBuf> {
+    use chrono::Local;
+
+    let rgb16 = srgb_rgba8_to_display_p3_rgb16(pixels, width as usize, height as usize)?;
+    let screenshot_dir =
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+            .join("Pictures")
+            .join("Screenshots");
+    std::fs::create_dir_all(&screenshot_dir)?;
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let path = screenshot_dir.join(format!("focaldesk-{output_name}-{timestamp}-{seq}.png"));
+    write_display_p3_png(&path, width, height, &rgb16)?;
+    Ok(path)
 }
 
 fn encode_display_p3_png(

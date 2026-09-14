@@ -381,7 +381,7 @@ pub fn try_render_portal_frame(
     output_id: OutputId,
     consumer_id: CaptureConsumerId,
 ) {
-    if state.portal_dispatch_ctx.is_none() {
+    if state.portal_dispatch_ctx.is_none() && !state.cpu_output_capture_available {
         frame.fail(CaptureFailureReason::Unknown);
         return;
     }
@@ -391,6 +391,42 @@ pub fn try_render_portal_frame(
         consumer_id,
         frame,
     });
+    if state.cpu_output_capture_available {
+        state.mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+    }
+}
+
+/// Complete raw-renderer portal requests from an encoded-sRGB RGBA8 output
+/// readback. Raw Vulkan advertises SHM-only constraints, so receiving any other
+/// buffer is a protocol/client mismatch rather than a reason to invoke GLES.
+pub fn complete_pending_portal_captures_from_rgba(
+    state: &mut DesktopState,
+    output_id: OutputId,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) {
+    let (for_output, rest): (Vec<_>, Vec<_>) = state
+        .pending_portal_captures
+        .drain(..)
+        .partition(|capture| capture.output_id == output_id);
+    state.pending_portal_captures = rest;
+    for capture in for_output {
+        let buffer = capture.frame.buffer();
+        let expected = Size::<i32, Buffer>::from((width as i32, height as i32));
+        if capture_buffer_size(&buffer) != Some(expected)
+            || write_rgba_to_shm_buffer_ordered(&buffer, expected, rgba, false).is_err()
+        {
+            capture.frame.fail(CaptureFailureReason::BufferConstraints);
+            continue;
+        }
+        capture.frame.success(
+            Transform::Normal,
+            None::<Vec<Rectangle<i32, Buffer>>>,
+            Duration::ZERO,
+        );
+    }
+    state.compositor_ready = true;
 }
 
 /// Fail in-flight frames and discard GPU resources indexed by the old OutputIds.
@@ -1104,6 +1140,15 @@ fn write_rgba_to_shm_buffer(
     buffer_size: Size<i32, Buffer>,
     rgba: &[u8],
 ) -> Result<(), ()> {
+    write_rgba_to_shm_buffer_ordered(buffer, buffer_size, rgba, true)
+}
+
+fn write_rgba_to_shm_buffer_ordered(
+    buffer: &smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer,
+    buffer_size: Size<i32, Buffer>,
+    rgba: &[u8],
+    flip_y: bool,
+) -> Result<(), ()> {
     let width = buffer_size.w as usize;
     let height = buffer_size.h as usize;
 
@@ -1125,7 +1170,7 @@ fn write_rgba_to_shm_buffer(
         match format {
             wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {
                 for y in 0..height {
-                    let src_y = height - 1 - y;
+                    let src_y = if flip_y { height - 1 - y } else { y };
                     for x in 0..width {
                         let si = (src_y * width + x) * 4;
                         let di = y * stride + x * 4;

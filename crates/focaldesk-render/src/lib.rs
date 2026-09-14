@@ -18,7 +18,7 @@ mod wgpu_vulkan;
 mod ash_drm;
 
 #[cfg(all(feature = "ash-drm", unix))]
-pub use ash_drm::{AshDrmRenderer, AshDrmSubmission};
+pub use ash_drm::{AshDrmCapture, AshDrmRenderer, AshDrmSubmission};
 
 #[cfg(feature = "wgpu")]
 pub use wgpu_vulkan::WgpuVulkanRenderer;
