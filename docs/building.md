@@ -209,10 +209,12 @@ backend creates one scanout path per enabled connected output and honors saved
 mode, scale, logical position, and primary-output settings. Builds with the
 `xwayland` feature run the same XWayland startup and event loop as the GLES DRM
 backend. Vulkan applies saved SDR monitor ICC profiles in its FP16 final-output
-pass. Use the GLES renderer for HDR, zero-copy DMA-BUF portal capture, or egui
-shader-effect parity until those renderer paths are implemented for Vulkan.
+pass and supports guarded 10-bit HDR10/PQ scanout with atomic KMS metadata. Use
+the GLES renderer when zero-copy DMA-BUF portal capture or complete shell shader
+effect parity is required.
 Connector hotplug and display-settings changes rebuild the Vulkan KMS topology.
-Egui panels use the raw Vulkan mesh pipeline and do not depend on EGL.
+Egui panels use a cropped CPU-raster compatibility overlay on raw DRM and do not
+depend on EGL.
 
 `cargo check -p focaldesk-desktop --no-default-features --features drm-vulkan,xwayland`
 verifies the combined build without installing it. The legacy `drm-wgpu`

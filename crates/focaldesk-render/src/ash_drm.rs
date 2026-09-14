@@ -8,7 +8,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
@@ -187,13 +188,15 @@ fn srgb_decode(value: f32) -> f32 {
 }
 
 fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>) -> vec4<f32> {
-    let alpha = sampled.a * tint.a;
+    // egui's font atlas and vertex colors are both premultiplied sRGBA. Its
+    // reference painters multiply them in gamma space first; doing two
+    // independent unpremultiply/decode operations loses the font coverage
+    // contract (and mishandles additive Color32 values).
+    let encoded = sampled * tint;
+    let alpha = encoded.a;
     if alpha <= 0.0 { return vec4(0.0); }
-    let sampled_straight = sampled.rgb / sampled.a;
-    let tint_straight = tint.rgb / tint.a;
-    let sampled_linear = vec3(srgb_decode(sampled_straight.r), srgb_decode(sampled_straight.g), srgb_decode(sampled_straight.b));
-    let tint_linear = vec3(srgb_decode(tint_straight.r), srgb_decode(tint_straight.g), srgb_decode(tint_straight.b));
-    let linear = sampled_linear * tint_linear;
+    let straight = clamp(encoded.rgb / alpha, vec3(0.0), vec3(1.0));
+    let linear = vec3(srgb_decode(straight.r), srgb_decode(straight.g), srgb_decode(straight.b));
     let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
     return vec4(mapped * alpha, alpha);
 }
@@ -974,7 +977,7 @@ impl AshDrmRenderer {
                 if !modifier
                     .drm_format_modifier_tiling_features
                     .contains(required_feature)
-                    || modifier.drm_format_modifier_plane_count != 1
+                    || modifier.drm_format_modifier_plane_count == 0
                 {
                     return None;
                 }
@@ -1220,7 +1223,12 @@ impl AshDrmRenderer {
                         && cached.format == surface.format
                         && cached.modifier == modifier
                 });
-            if !compatible || !surface.damage.is_empty() {
+            // A DMA-BUF is shared memory: client damage changes its contents,
+            // not its identity or import metadata. Keep the Vulkan image/view
+            // and sample the updated allocation instead of importing and
+            // retiring a new external image every frame.
+            let external = surface.dmabuf.is_some();
+            if texture_needs_refresh(compatible, external, !surface.damage.is_empty()) {
                 if let Some(resource) = self.prepare_texture(command, surface, &mut staging)? {
                     let cached = CachedTexture {
                         resource,
@@ -2105,17 +2113,7 @@ impl AshDrmRenderer {
             )
         };
         for solid in solids {
-            let rect = ndc_rect(solid.destination, width, height);
-            let mut push = [0.0f32; 24];
-            push[..4].copy_from_slice(&rect);
-            push[4..8].copy_from_slice(&solid.color);
-            push[8..].copy_from_slice(&[
-                solid.destination[2].max(0) as f32,
-                solid.destination[3].max(0) as f32,
-                solid.corner_radius.max(0.0),
-                0.0,
-            ]);
-            write_push_matrix(&mut push[12..], output_matrix);
+            let push = solid_push_constants(solid, width, height, output_matrix);
             unsafe {
                 self.device.cmd_push_constants(
                     command,
@@ -2192,7 +2190,7 @@ impl AshDrmRenderer {
         output_matrix: [[f32; 3]; 3],
     ) {
         let mut screen = [0.0_f32; 16];
-        screen[..4].copy_from_slice(&[2.0 / width as f32, -2.0 / height as f32, -1.0, 1.0]);
+        screen[..4].copy_from_slice(&mesh_clip_transform(width, height));
         write_push_matrix(&mut screen[4..], output_matrix);
         unsafe {
             self.device.cmd_bind_pipeline(
@@ -2410,10 +2408,10 @@ impl AshDrmRenderer {
         #[cfg(unix)]
         if let Some(dmabuf) = &surface.dmabuf {
             let target = DrmRenderTarget {
-                planes: vec![dmabuf.fd.clone()],
-                offsets: vec![dmabuf.offset as u32],
-                strides: vec![surface.stride],
-                fourcc: texture_fourcc(surface.format),
+                planes: dmabuf.planes.clone(),
+                offsets: dmabuf.offsets.clone(),
+                strides: dmabuf.strides.clone(),
+                fourcc: dmabuf.fourcc,
                 modifier: dmabuf.modifier,
                 width: surface.width,
                 height: surface.height,
@@ -2548,14 +2546,19 @@ impl AshDrmRenderer {
             "DMA-BUF plane metadata mismatch"
         );
         ensure!(
-            target.planes.len() == 1,
-            "multi-plane Vulkan DMA-BUF import is not implemented"
+            dmabuf_planes_share_object(&target.planes)?,
+            "disjoint per-plane DMA-BUF memory is not implemented"
         );
-        let layouts = [vk::SubresourceLayout {
-            offset: u64::from(target.offsets[0]),
-            row_pitch: u64::from(target.strides[0]),
-            ..Default::default()
-        }];
+        let layouts = target
+            .offsets
+            .iter()
+            .zip(&target.strides)
+            .map(|(&offset, &stride)| vk::SubresourceLayout {
+                offset: u64::from(offset),
+                row_pitch: u64::from(stride),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
         let mut modifier = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
             .drm_format_modifier(target.modifier)
             .plane_layouts(&layouts);
@@ -2643,12 +2646,14 @@ impl AshDrmRenderer {
         };
         unsafe { self.device.bind_image_memory(image, memory, 0) }
             .context("bind imported DMA-BUF image")?;
+        let components = texture_components(target.fourcc);
         let view = unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
                     .view_type(vk::ImageViewType::TYPE_2D)
                     .format(format)
+                    .components(components)
                     .subresource_range(color_range()),
                 None,
             )
@@ -3033,14 +3038,19 @@ fn texture_vk_format(format: FramePixelFormat) -> vk::Format {
         // premultiplied RGB before alpha is removed and produce dark fringes.
         FramePixelFormat::Bgra8Srgb => vk::Format::B8G8R8A8_UNORM,
         FramePixelFormat::Rgba8Srgb => vk::Format::R8G8B8A8_UNORM,
+        FramePixelFormat::Bgra10Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
+        FramePixelFormat::Rgba10Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
     }
 }
 
-fn texture_fourcc(format: FramePixelFormat) -> u32 {
-    match format {
-        FramePixelFormat::Bgra8Srgb => ARGB8888,
-        FramePixelFormat::Rgba8Srgb => ABGR8888,
-    }
+fn texture_components(fourcc: u32) -> vk::ComponentMapping {
+    vk::ComponentMapping::default().a(
+        if matches!(fourcc, XRGB8888 | XBGR8888 | XRGB2101010 | XBGR2101010) {
+            vk::ComponentSwizzle::ONE
+        } else {
+            vk::ComponentSwizzle::IDENTITY
+        },
+    )
 }
 
 fn target_key(target: &DrmRenderTarget) -> Result<TargetKey> {
@@ -3061,6 +3071,27 @@ fn target_key(target: &DrmRenderTarget) -> Result<TargetKey> {
     })
 }
 
+#[cfg(unix)]
+fn dmabuf_planes_share_object(planes: &[Arc<OwnedFd>]) -> Result<bool> {
+    let Some(first) = planes.first() else {
+        return Ok(false);
+    };
+    let identity = fd_identity(first.as_raw_fd())?;
+    planes.iter().skip(1).try_fold(true, |same, plane| {
+        Ok(same && fd_identity(plane.as_raw_fd())? == identity)
+    })
+}
+
+#[cfg(unix)]
+fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
+    let mut value = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd, value.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("stat DMA-BUF plane");
+    }
+    let value = unsafe { value.assume_init() };
+    Ok((value.st_dev, value.st_ino))
+}
+
 fn color_range() -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3072,10 +3103,33 @@ fn ndc_rect(rect: [i32; 4], width: u32, height: u32) -> [f32; 4] {
     let [x, y, w, h] = rect;
     [
         x as f32 / width as f32 * 2.0 - 1.0,
-        1.0 - y as f32 / height as f32 * 2.0,
+        y as f32 / height as f32 * 2.0 - 1.0,
         w as f32 / width as f32 * 2.0,
-        -(h as f32 / height as f32 * 2.0),
+        h as f32 / height as f32 * 2.0,
     ]
+}
+
+fn mesh_clip_transform(width: u32, height: u32) -> [f32; 4] {
+    [2.0 / width as f32, 2.0 / height as f32, -1.0, -1.0]
+}
+
+fn solid_push_constants(
+    solid: &SolidQuad,
+    width: u32,
+    height: u32,
+    output_matrix: [[f32; 3]; 3],
+) -> [f32; 24] {
+    let mut push = [0.0f32; 24];
+    push[..4].copy_from_slice(&ndc_rect(solid.destination, width, height));
+    push[4..8].copy_from_slice(&solid.color);
+    push[8..12].copy_from_slice(&[
+        solid.destination[2].max(0) as f32,
+        solid.destination[3].max(0) as f32,
+        solid.corner_radius.max(0.0),
+        0.0,
+    ]);
+    write_push_matrix(&mut push[12..], output_matrix);
+    push
 }
 
 fn effective_damage_regions(
@@ -3265,16 +3319,24 @@ fn multiply_3x3(left: [[f32; 3]; 3], right: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
     result
 }
 
+fn texture_needs_refresh(compatible: bool, external: bool, damaged: bool) -> bool {
+    !compatible || (!external && damaged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_shader, effective_damage_regions, identity_output_lut, multiply_3x3, ndc_rect,
-        texture_vk_format, transformed_uv, validate_output_lut, vk_format, AshDrmCapture,
-        AshDrmOutputLut, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER,
-        TEXTURE_SHADER,
+        compile_shader, dmabuf_planes_share_object, effective_damage_regions, identity_output_lut,
+        mesh_clip_transform, multiply_3x3, ndc_rect, solid_push_constants, texture_components,
+        texture_needs_refresh, texture_vk_format, transformed_uv, validate_output_lut, vk_format,
+        AshDrmCapture, AshDrmOutputLut, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER,
+        SOLID_SHADER, TEXTURE_SHADER, XRGB2101010, XRGB8888,
     };
-    use crate::{FramePixelFormat, FrameTransform};
+    use crate::{FramePixelFormat, FrameTransform, SolidQuad};
     use std::collections::VecDeque;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
 
     #[test]
     fn raw_vulkan_shaders_compile_to_spirv() {
@@ -3287,8 +3349,46 @@ mod tests {
     }
 
     #[test]
+    fn external_textures_are_reimported_only_when_their_identity_changes() {
+        assert!(texture_needs_refresh(false, true, false));
+        assert!(texture_needs_refresh(false, true, true));
+        assert!(!texture_needs_refresh(true, true, true));
+        assert!(texture_needs_refresh(true, false, true));
+        assert!(!texture_needs_refresh(true, false, false));
+    }
+
+    #[test]
+    fn auxiliary_planes_must_share_one_dma_buf_memory_object() {
+        let (first, second) = UnixStream::pair().unwrap();
+        let first: OwnedFd = first.into();
+        let duplicate = first.try_clone().unwrap();
+        assert!(dmabuf_planes_share_object(&[Arc::new(first), Arc::new(duplicate)]).unwrap());
+
+        let second: OwnedFd = second.into();
+        let (third, _) = UnixStream::pair().unwrap();
+        let third: OwnedFd = third.into();
+        assert!(!dmabuf_planes_share_object(&[Arc::new(second), Arc::new(third)]).unwrap());
+    }
+
+    #[test]
     fn output_rect_is_converted_to_vulkan_clip_space() {
-        assert_eq!(ndc_rect([0, 0, 100, 50], 100, 50), [-1.0, 1.0, 2.0, -2.0]);
+        assert_eq!(ndc_rect([0, 0, 100, 50], 100, 50), [-1.0, -1.0, 2.0, 2.0]);
+        assert_eq!(ndc_rect([0, 40, 100, 10], 100, 50), [-1.0, 0.6, 2.0, 0.4]);
+        assert_eq!(mesh_clip_transform(100, 50), [0.02, 0.04, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn solid_push_constants_pack_geometry_before_the_matrix() {
+        let solid = SolidQuad {
+            destination: [10, 20, 30, 40],
+            color: [0.1, 0.2, 0.3, 0.4],
+            corner_radius: 5.0,
+        };
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let push = solid_push_constants(&solid, 100, 100, identity);
+        assert_eq!(&push[4..8], &solid.color);
+        assert_eq!(&push[8..12], &[30.0, 40.0, 5.0, 0.0]);
+        assert_eq!(&push[12..16], &[1.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -3301,10 +3401,34 @@ mod tests {
             texture_vk_format(FramePixelFormat::Rgba8Srgb),
             ash::vk::Format::R8G8B8A8_UNORM
         );
+        assert_eq!(
+            texture_vk_format(FramePixelFormat::Bgra10Unorm),
+            ash::vk::Format::A2R10G10B10_UNORM_PACK32
+        );
+        assert_eq!(
+            texture_vk_format(FramePixelFormat::Rgba10Unorm),
+            ash::vk::Format::A2B10G10R10_UNORM_PACK32
+        );
         assert_eq!(vk_format(ARGB8888).unwrap(), ash::vk::Format::B8G8R8A8_SRGB);
         assert_eq!(
             vk_format(ARGB2101010).unwrap(),
             ash::vk::Format::A2R10G10B10_UNORM_PACK32
+        );
+    }
+
+    #[test]
+    fn xrgb_client_buffers_are_sampled_as_opaque() {
+        assert_eq!(
+            texture_components(XRGB8888).a,
+            ash::vk::ComponentSwizzle::ONE
+        );
+        assert_eq!(
+            texture_components(XRGB2101010).a,
+            ash::vk::ComponentSwizzle::ONE
+        );
+        assert_eq!(
+            texture_components(ARGB8888).a,
+            ash::vk::ComponentSwizzle::IDENTITY
         );
     }
 

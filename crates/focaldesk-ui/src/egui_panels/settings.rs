@@ -1343,6 +1343,7 @@ impl SettingsPanel {
         let mut open = self.open;
         let mut close_requested = false;
         let response = egui::Window::new("FocalDesk Settings")
+            .fade_in(false)
             .default_pos(egui::pos2(
                 frame_ctx.work.loc.x as f32 + 24.0,
                 frame_ctx.work.loc.y as f32 + 24.0,

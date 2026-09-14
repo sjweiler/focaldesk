@@ -54,6 +54,8 @@ pub enum PresentResult {
 pub enum FramePixelFormat {
     Bgra8Srgb,
     Rgba8Srgb,
+    Bgra10Unorm,
+    Rgba10Unorm,
 }
 
 /// Transfer decoding used to move a client buffer into scene-linear light.
@@ -107,13 +109,17 @@ pub enum FrameTransform {
     Flipped270,
 }
 
-/// A single-plane Linux DMA-BUF which may be imported directly by a renderer.
+/// A Linux DMA-BUF which may be imported directly by a renderer.
 #[cfg(unix)]
 #[derive(Clone, Debug)]
 pub struct LinuxDmabuf {
-    pub fd: Arc<OwnedFd>,
+    pub planes: Vec<Arc<OwnedFd>>,
+    /// Exact DRM fourcc supplied by the client. In particular, XRGB/XBGR must
+    /// not be reinterpreted as their alpha-bearing counterparts.
+    pub fourcc: u32,
     pub modifier: u64,
-    pub offset: u64,
+    pub offsets: Vec<u32>,
+    pub strides: Vec<u32>,
 }
 
 /// A Linux DMA-BUF format/modifier pair accepted by the Vulkan renderer.

@@ -108,6 +108,7 @@ impl EguiPanelView for NotificationHistoryPanel {
         }
         let mut open = self.open;
         egui::Window::new(self.title())
+            .fade_in(false)
             .default_pos(egui::pos2(
                 (frame_ctx.work.loc.x + frame_ctx.work.size.w - 360) as f32,
                 (frame_ctx.work.loc.y + 24) as f32,
@@ -237,6 +238,7 @@ impl EguiPanelView for UpdatesPanel {
         let selected_count = self.selected.len();
 
         egui::Window::new(self.title())
+            .fade_in(false)
             .default_pos(egui::pos2(
                 (frame_ctx.work.loc.x + frame_ctx.work.size.w - 420) as f32,
                 (frame_ctx.work.loc.y + 24) as f32,
@@ -462,6 +464,7 @@ impl WorkspaceDialog {
         };
 
         egui::Window::new(title)
+            .fade_in(false)
             .collapsible(false)
             .resizable(false)
             .default_width(320.0)
@@ -519,6 +522,7 @@ impl WorkspacesPanel {
         let mut open = self.open;
         let mut selected = None;
         egui::Window::new("Workspaces")
+            .fade_in(false)
             .collapsible(false)
             .resizable(false)
             .default_width(340.0)
@@ -679,6 +683,7 @@ impl EguiPanelView for PowerPanel {
         let mut close_requested = false;
 
         let response = egui::Window::new("Power Menu")
+            .fade_in(false)
             .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
             .default_width(panel_width)
             .resizable(false)
@@ -689,7 +694,7 @@ impl EguiPanelView for PowerPanel {
                 ui.horizontal(|ui| {
                     ui.heading("Power");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("X").clicked() {
+                        if panel_close_button(ui).clicked() {
                             close_requested = true;
                         }
                     });
@@ -751,6 +756,7 @@ impl EguiPanelView for AudioPanel {
         let mut close_requested = false;
 
         let response = egui::Window::new("Audio")
+            .fade_in(false)
             .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
             .default_width(panel_width)
             .resizable(false)
@@ -761,7 +767,7 @@ impl EguiPanelView for AudioPanel {
                 ui.horizontal(|ui| {
                     ui.heading("Audio");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("X").clicked() {
+                        if panel_close_button(ui).clicked() {
                             close_requested = true;
                         }
                     });
@@ -817,6 +823,7 @@ impl EguiPanelView for ClipboardPanel {
         let mut close_requested = false;
 
         let response = egui::Window::new("Clipboard")
+            .fade_in(false)
             .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
             .default_width(panel_width)
             .resizable(false)
@@ -827,7 +834,7 @@ impl EguiPanelView for ClipboardPanel {
                 ui.horizontal(|ui| {
                     ui.heading("Clipboard");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.small_button("X").clicked() {
+                        if panel_close_button(ui).clicked() {
                             close_requested = true;
                         }
                     });
@@ -881,6 +888,7 @@ impl EguiPanelView for NetworkPanel {
         let mut close_requested = false;
 
         let response = egui::Window::new("Network")
+            .fade_in(false)
             .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
             .default_width(panel_width)
             .resizable(false)
@@ -936,6 +944,7 @@ impl EguiPanelView for BluetoothPanel {
         let mut close_requested = false;
 
         let response = egui::Window::new("Bluetooth")
+            .fade_in(false)
             .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
             .default_width(panel_width)
             .resizable(false)
@@ -994,6 +1003,7 @@ impl EguiPanelView for CalendarPanel {
         let mut close_requested = false;
 
         let response = egui::Window::new("Calendar")
+            .fade_in(false)
             .default_pos(egui::pos2(x.max(16.0), y.max(16.0)))
             .default_width(panel_width)
             .resizable(false)
@@ -1086,11 +1096,43 @@ fn panel_header(ui: &mut egui::Ui, title: &str, close_requested: &mut bool) {
     ui.horizontal(|ui| {
         ui.heading(title);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("X").clicked() {
+            if panel_close_button(ui).clicked() {
                 *close_requested = true;
             }
         });
     });
+}
+
+/// A close control that stays visible even if the renderer loses egui's font
+/// atlas. The icon is geometry painted directly into the mesh, not a glyph.
+fn panel_close_button(ui: &mut egui::Ui) -> egui::Response {
+    let size = egui::vec2(26.0, 26.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let visuals = ui.style().interact(&response);
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(6),
+        visuals.bg_fill,
+        egui::Stroke::new(1.0, visuals.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
+    let inset = 7.0;
+    let stroke = egui::Stroke::new(2.0, visuals.fg_stroke.color);
+    ui.painter().line_segment(
+        [
+            rect.left_top() + egui::vec2(inset, inset),
+            rect.right_bottom() - egui::vec2(inset, inset),
+        ],
+        stroke,
+    );
+    ui.painter().line_segment(
+        [
+            rect.right_top() + egui::vec2(-inset, inset),
+            rect.left_bottom() + egui::vec2(inset, -inset),
+        ],
+        stroke,
+    );
+    response.on_hover_text("Close")
 }
 
 fn power_button(ui: &mut egui::Ui, label: &str) -> egui::Response {
@@ -1117,6 +1159,7 @@ impl EguiPanelView for DebugPanel {
         }
 
         egui::Window::new("Debug")
+            .fade_in(false)
             .open(&mut self.open)
             .show(ctx, |ui| {
                 ui.heading("Debug");

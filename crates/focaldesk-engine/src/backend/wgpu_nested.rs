@@ -18,6 +18,7 @@ use focaldesk_render::{
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::dialog_layout::layout_dialog;
+use focaldesk_ui::egui_layer::rasterize_vulkan_paint;
 use focaldesk_ui::types::UiElementKind;
 use image::GenericImageView;
 use smithay::backend::allocator::dmabuf::{DmabufMappingMode, DmabufSyncFlags};
@@ -93,6 +94,7 @@ pub(crate) struct VulkanCompositorScene {
 pub(crate) struct VulkanSceneBuilder {
     assets: WgpuShellAssets,
     surface_commits: HashMap<ObjectId, CommitCounter>,
+    rejected_surface_buffers: HashSet<ObjectId>,
     logged_egui_mesh: bool,
 }
 
@@ -109,6 +111,17 @@ impl VulkanSceneBuilder {
         &mut self,
         state: &mut crate::core::desktop::DesktopState,
         output_id: focaldesk_types::OutputId,
+    ) -> VulkanCompositorScene {
+        self.build_for_output_with_cursor_policy(state, output_id, true, true, false)
+    }
+
+    pub fn build_for_output_with_cursor_policy(
+        &mut self,
+        state: &mut crate::core::desktop::DesktopState,
+        output_id: focaldesk_types::OutputId,
+        software_cursor: bool,
+        cpu_dmabuf_fallback: bool,
+        rasterize_egui: bool,
     ) -> VulkanCompositorScene {
         state.sync_egui_for_output(output_id, Instant::now());
         let damage = state
@@ -130,7 +143,12 @@ impl VulkanSceneBuilder {
         append_shell_icon_quads(&desktop, &mut self.assets, &mut surfaces);
         append_topbar_text_quads(&desktop, &mut self.assets, &mut surfaces);
         let shell_surface_count = surfaces.len();
-        surfaces.extend(collect_shm_surfaces(&desktop, &mut self.surface_commits));
+        surfaces.extend(collect_shm_surfaces(
+            &desktop,
+            &mut self.surface_commits,
+            &mut self.rejected_surface_buffers,
+            cpu_dmabuf_fallback,
+        ));
         let client_surface_count = surfaces.len() - shell_surface_count;
         let overlay_after_surface = surfaces.len();
         append_notification_text_quads(&desktop, &mut self.assets, &mut surfaces);
@@ -138,9 +156,33 @@ impl VulkanSceneBuilder {
         let foreground = collect_modal_quads(&desktop);
         append_modal_text_quads(&desktop, &mut self.assets, &mut surfaces);
         let egui_before_surface = surfaces.len();
-        let (egui_textures, egui_meshes) = collect_egui_meshes(&mut desktop);
+        let (egui_textures, egui_meshes, egui_raster) =
+            collect_egui_meshes(&mut desktop, rasterize_egui);
+        if let Some(raster) = egui_raster {
+            surfaces.push(TextureQuad {
+                cache_key: hashed_cache_key(6, &desktop.output_id.0),
+                pixels: raster.pixels,
+                width: raster.width,
+                height: raster.height,
+                stride: raster.width.saturating_mul(4),
+                format: FramePixelFormat::Rgba8Srgb,
+                color_transform: Default::default(),
+                dmabuf: None,
+                damage: vec![[0, 0, raster.width, raster.height]],
+                destination: [
+                    raster.origin[0],
+                    raster.origin[1],
+                    raster.width as i32,
+                    raster.height as i32,
+                ],
+                source_uv: [0.0, 0.0, 1.0, 1.0],
+                transform: FrameTransform::Normal,
+                tint: [1.0; 4],
+                retention: None,
+            });
+        }
         if !self.logged_egui_mesh && !egui_meshes.is_empty() {
-            info!(
+            warn!(
                 target: "focaldesk",
                 output = ?output_id,
                 meshes = egui_meshes.len(),
@@ -151,9 +193,16 @@ impl VulkanSceneBuilder {
         }
         if self.surface_commits.len() > 4096 {
             self.surface_commits.clear();
+            self.rejected_surface_buffers.clear();
         }
-        let cursor_present =
-            append_cursor_texture_quads(&mut desktop, &mut self.surface_commits, &mut surfaces);
+        let cursor_present = software_cursor
+            && append_cursor_texture_quads(
+                &mut desktop,
+                &mut self.surface_commits,
+                &mut self.rejected_surface_buffers,
+                cpu_dmabuf_fallback,
+                &mut surfaces,
+            );
         VulkanCompositorScene {
             background,
             surfaces,
@@ -177,23 +226,33 @@ impl VulkanSceneBuilder {
 
 fn collect_egui_meshes(
     desktop: &mut WgpuSceneDesktop<'_>,
-) -> (Vec<TextureQuad>, Vec<TexturedMesh>) {
+    rasterize: bool,
+) -> (
+    Vec<TextureQuad>,
+    Vec<TexturedMesh>,
+    Option<focaldesk_ui::egui_layer::VulkanEguiRaster>,
+) {
     let Some(output) = desktop.state.outputs.get(&desktop.output_id) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), None);
     };
     let scale = output.scale_factor as f32;
     let Some(desktop_output) = desktop.state.desktop_outputs.get_mut(&desktop.output_id) else {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), None);
     };
     if !desktop_output.egui.has_open_panels() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), None);
     }
     let paint = desktop_output.egui.take_vulkan_paint(scale);
+    if rasterize {
+        let raster = rasterize_vulkan_paint(&paint);
+        return (Vec::new(), Vec::new(), raster);
+    }
+    let scoped_key = |key| hashed_cache_key(5, &(desktop.output_id.0, key));
     let textures = paint
         .textures
         .into_iter()
         .map(|texture| TextureQuad {
-            cache_key: texture.cache_key,
+            cache_key: scoped_key(texture.cache_key),
             pixels: texture.pixels,
             width: texture.width,
             height: texture.height,
@@ -201,7 +260,10 @@ fn collect_egui_meshes(
             format: FramePixelFormat::Rgba8Srgb,
             color_transform: Default::default(),
             dmabuf: None,
-            damage: vec![[0, 0, texture.width, texture.height]],
+            damage: texture
+                .upload
+                .then_some(vec![[0, 0, texture.width, texture.height]])
+                .unwrap_or_default(),
             destination: [0, 0, texture.width as i32, texture.height as i32],
             source_uv: [0.0, 0.0, 1.0, 1.0],
             transform: FrameTransform::Normal,
@@ -213,7 +275,7 @@ fn collect_egui_meshes(
         .meshes
         .into_iter()
         .map(|mesh| TexturedMesh {
-            texture_key: mesh.texture_key,
+            texture_key: scoped_key(mesh.texture_key),
             clip_rect: mesh.clip_rect,
             vertices: mesh
                 .vertices
@@ -227,7 +289,7 @@ fn collect_egui_meshes(
             indices: mesh.indices,
         })
         .collect();
-    (textures, meshes)
+    (textures, meshes, None)
 }
 
 struct WgpuWallpaper {
@@ -448,6 +510,8 @@ impl ApplicationHandler for NestedVulkanApp {
             let codes = match capability.format {
                 FramePixelFormat::Bgra8Srgb => [Fourcc::Argb8888, Fourcc::Xrgb8888],
                 FramePixelFormat::Rgba8Srgb => [Fourcc::Abgr8888, Fourcc::Xbgr8888],
+                FramePixelFormat::Bgra10Unorm => [Fourcc::Argb2101010, Fourcc::Xrgb2101010],
+                FramePixelFormat::Rgba10Unorm => [Fourcc::Abgr2101010, Fourcc::Xbgr2101010],
             };
             dmabuf_formats.extend(codes.map(|code| Format { code, modifier }));
         }
@@ -1544,6 +1608,8 @@ fn collect_shell_quads(desktop: &mut WgpuSceneDesktop<'_>) -> (Vec<SolidQuad>, V
 fn append_cursor_texture_quads(
     desktop: &mut WgpuSceneDesktop<'_>,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
+    rejected_surface_buffers: &mut HashSet<ObjectId>,
+    cpu_dmabuf_fallback: bool,
     output: &mut Vec<TextureQuad>,
 ) -> bool {
     if !desktop.state.cursor_manager.visible()
@@ -1571,6 +1637,8 @@ fn append_cursor_texture_quads(
             origin,
             scale,
             surface_commits,
+            rejected_surface_buffers,
+            cpu_dmabuf_fallback,
             &desktop.state.surface_colors,
             &mut cursor_surfaces,
         );
@@ -1609,6 +1677,8 @@ fn append_cursor_texture_quads(
 fn collect_shm_surfaces(
     desktop: &WgpuSceneDesktop<'_>,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
+    rejected_surface_buffers: &mut HashSet<ObjectId>,
+    cpu_dmabuf_fallback: bool,
 ) -> Vec<TextureQuad> {
     let output_state = desktop.state.outputs.get(&desktop.output_id);
     let scale = output_state
@@ -1622,6 +1692,8 @@ fn collect_shm_surfaces(
             &[WlrLayer::Background, WlrLayer::Bottom],
             scale,
             surface_commits,
+            rejected_surface_buffers,
+            cpu_dmabuf_fallback,
             &desktop.state.surface_colors,
             &mut output,
         );
@@ -1649,6 +1721,8 @@ fn collect_shm_surfaces(
                 popup_origin,
                 scale,
                 surface_commits,
+                rejected_surface_buffers,
+                cpu_dmabuf_fallback,
                 &desktop.state.surface_colors,
                 &mut window_surfaces,
             );
@@ -1658,6 +1732,8 @@ fn collect_shm_surfaces(
             window_origin,
             scale,
             surface_commits,
+            rejected_surface_buffers,
+            cpu_dmabuf_fallback,
             &desktop.state.surface_colors,
             &mut window_surfaces,
         );
@@ -1669,6 +1745,8 @@ fn collect_shm_surfaces(
             &[WlrLayer::Top, WlrLayer::Overlay],
             scale,
             surface_commits,
+            rejected_surface_buffers,
+            cpu_dmabuf_fallback,
             &desktop.state.surface_colors,
             &mut output,
         );
@@ -1681,6 +1759,8 @@ fn collect_shm_layers(
     layer_kinds: &[WlrLayer],
     scale: f64,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
+    rejected_surface_buffers: &mut HashSet<ObjectId>,
+    cpu_dmabuf_fallback: bool,
     surface_colors: &HashMap<RenderElementId, SurfaceColorRenderState>,
     output: &mut Vec<TextureQuad>,
 ) {
@@ -1699,6 +1779,8 @@ fn collect_shm_layers(
                     popup_origin,
                     scale,
                     surface_commits,
+                    rejected_surface_buffers,
+                    cpu_dmabuf_fallback,
                     surface_colors,
                     &mut layer_surfaces,
                 );
@@ -1708,6 +1790,8 @@ fn collect_shm_layers(
                 geometry.loc,
                 scale,
                 surface_commits,
+                rejected_surface_buffers,
+                cpu_dmabuf_fallback,
                 surface_colors,
                 &mut layer_surfaces,
             );
@@ -1721,6 +1805,8 @@ fn collect_shm_surface_tree(
     origin: Point<i32, Logical>,
     scale: f64,
     surface_commits: &mut HashMap<ObjectId, CommitCounter>,
+    rejected_surface_buffers: &mut HashSet<ObjectId>,
+    cpu_dmabuf_fallback: bool,
     surface_colors: &HashMap<RenderElementId, SurfaceColorRenderState>,
     output: &mut Vec<TextureQuad>,
 ) {
@@ -1801,11 +1887,20 @@ fn collect_shm_surface_tree(
                     transform,
                     damage,
                     color_transform,
+                    cpu_dmabuf_fallback,
                 )
             });
             if let Some(frame) = frame {
                 output.push(frame);
                 surface_commits.insert(buffer_id, current_commit);
+            } else if rejected_surface_buffers.insert(buffer_id.clone()) {
+                let dmabuf_format = get_dmabuf(&buffer).ok().map(|dmabuf| dmabuf.format());
+                warn!(
+                    target: "focaldesk",
+                    buffer = ?buffer_id,
+                    ?dmabuf_format,
+                    "raw Vulkan rejected a committed client buffer"
+                );
             }
         },
         |_, _, _| true,
@@ -1839,30 +1934,44 @@ fn dmabuf_surface_frame(
     transform: FrameTransform,
     damage: Vec<[i32; 4]>,
     color_transform: TextureColorTransform,
+    cpu_fallback: bool,
 ) -> Option<TextureQuad> {
     let dmabuf = get_dmabuf(buffer).ok()?;
     let size = dmabuf.size();
     let format = dmabuf.format();
-    if dmabuf.num_planes() != 1
-        || !matches!(
-            format.code,
-            Fourcc::Argb8888 | Fourcc::Xrgb8888 | Fourcc::Abgr8888 | Fourcc::Xbgr8888
-        )
-        || size.w <= 0
+    if !matches!(
+        format.code,
+        Fourcc::Argb8888
+            | Fourcc::Xrgb8888
+            | Fourcc::Abgr8888
+            | Fourcc::Xbgr8888
+            | Fourcc::Argb2101010
+            | Fourcc::Xrgb2101010
+            | Fourcc::Abgr2101010
+            | Fourcc::Xbgr2101010
+    ) || size.w <= 0
         || size.h <= 0
     {
         return None;
     }
 
-    let stride = dmabuf.strides().next()?;
+    let strides = dmabuf.strides().collect::<Vec<_>>();
+    let offsets = dmabuf.offsets().collect::<Vec<_>>();
+    let handles = dmabuf
+        .handles()
+        .map(|fd| fd.try_clone_to_owned().ok().map(Arc::new))
+        .collect::<Option<Vec<_>>>()?;
+    if handles.is_empty() || handles.len() != strides.len() || handles.len() != offsets.len() {
+        return None;
+    }
+    let stride = strides[0];
     if stride < (size.w as u32).saturating_mul(4) {
         return None;
     }
-    let byte_len = usize::try_from(stride)
-        .ok()?
-        .checked_mul(usize::try_from(size.h).ok()?)?;
-
-    let mut pixels = if format.modifier == Modifier::Linear {
+    let mut pixels = if cpu_fallback && format.modifier == Modifier::Linear {
+        let byte_len = usize::try_from(stride)
+            .ok()?
+            .checked_mul(usize::try_from(size.h).ok()?)?;
         dmabuf
             .sync_plane(0, DmabufSyncFlags::START | DmabufSyncFlags::READ)
             .ok()?;
@@ -1884,8 +1993,6 @@ fn dmabuf_surface_frame(
     } else {
         Vec::new()
     };
-    let fd = dmabuf.handles().next()?.try_clone_to_owned().ok()?;
-
     #[cfg(target_endian = "little")]
     if matches!(format.code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888) {
         for row in pixels.chunks_exact_mut(stride as usize) {
@@ -1940,13 +2047,17 @@ fn dmabuf_surface_frame(
         format: match format.code {
             Fourcc::Argb8888 | Fourcc::Xrgb8888 => FramePixelFormat::Bgra8Srgb,
             Fourcc::Abgr8888 | Fourcc::Xbgr8888 => FramePixelFormat::Rgba8Srgb,
+            Fourcc::Argb2101010 | Fourcc::Xrgb2101010 => FramePixelFormat::Bgra10Unorm,
+            Fourcc::Abgr2101010 | Fourcc::Xbgr2101010 => FramePixelFormat::Rgba10Unorm,
             _ => unreachable!("format was validated above"),
         },
         color_transform,
         dmabuf: Some(LinuxDmabuf {
-            fd: Arc::new(fd),
+            planes: handles,
+            fourcc: format.code as u32,
             modifier: format.modifier.into(),
-            offset: u64::from(dmabuf.offsets().next()?),
+            offsets,
+            strides,
         }),
         damage,
         destination,

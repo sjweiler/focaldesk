@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,7 +22,9 @@ use smithay::backend::allocator::{
     gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
     Buffer as _, Format, Fourcc, Modifier,
 };
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface};
+use smithay::backend::drm::{
+    DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface, PlaneClaim,
+};
 use smithay::backend::input::{
     InputEvent, KeyState, KeyboardKeyEvent, SwitchState, SwitchToggleEvent,
 };
@@ -31,8 +34,8 @@ use smithay::backend::session::{libseat::LibSeatSession, Event as SessionEvent, 
 use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
-use smithay::reexports::drm::control::{connector, crtc, plane, Device as _, Mode};
-use smithay::reexports::drm::{Device as _, DriverCapability};
+use smithay::reexports::drm::control::{connector, crtc, dumbbuffer, plane, Device as _, Mode};
+use smithay::reexports::drm::{buffer::Buffer as _, Device as _, DriverCapability};
 use smithay::reexports::input::event::switch::Switch as InputSwitch;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
@@ -145,6 +148,27 @@ struct VulkanOutput {
     frame_pending: bool,
     present_started_at: Option<Instant>,
     hdr_metadata_blob: Option<u64>,
+    cursor: Option<KmsCursor>,
+}
+
+struct KmsCursor {
+    fd: DrmDeviceFd,
+    _claim: PlaneClaim,
+    buffer: Option<dumbbuffer::DumbBuffer>,
+    size: (u32, u32),
+    uploaded_key: Option<u64>,
+    last_location: Option<(i32, i32)>,
+    enabled: bool,
+    failure_logged: bool,
+    retry_after: Option<Instant>,
+}
+
+impl Drop for KmsCursor {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            let _ = self.fd.destroy_dumb_buffer(buffer);
+        }
+    }
 }
 
 struct VulkanDrmData {
@@ -357,6 +381,96 @@ fn plane_has_input_fence(drm: &DrmDevice, plane: plane::Handle) -> Result<bool> 
     }))
 }
 
+fn create_kms_cursor(
+    drm: &DrmDevice,
+    fd: &DrmDeviceFd,
+    scanout: &VulkanScanout,
+) -> Result<Option<KmsCursor>> {
+    let Some(info) = scanout.surface().planes().cursor.iter().find(|info| {
+        info.formats
+            .iter()
+            .any(|format| format.code == Fourcc::Argb8888)
+    }) else {
+        return Ok(None);
+    };
+    let Some(claim) = scanout.surface().claim_plane(info.handle) else {
+        return Ok(None);
+    };
+    let size = drm.cursor_size();
+    if size.w == 0 || size.h == 0 {
+        return Ok(None);
+    }
+    let buffer = fd
+        .create_dumb_buffer((size.w, size.h), Fourcc::Argb8888, 32)
+        .context("allocate KMS cursor buffer")?;
+    Ok(Some(KmsCursor {
+        fd: fd.clone(),
+        _claim: claim,
+        buffer: Some(buffer),
+        size: (size.w, size.h),
+        uploaded_key: None,
+        last_location: None,
+        enabled: false,
+        failure_logged: false,
+        retry_after: None,
+    }))
+}
+
+fn cursor_image_key(icon: focaldesk_cursor::CursorIcon, width: u32, height: u32) -> u64 {
+    let mut hash = DefaultHasher::new();
+    icon.hash(&mut hash);
+    width.hash(&mut hash);
+    height.hash(&mut hash);
+    hash.finish()
+}
+
+fn upload_kms_cursor(cursor: &mut KmsCursor, rgba: &[u8], width: u32, height: u32) -> Result<()> {
+    let (buffer_width, buffer_height) = cursor.size;
+    if width > buffer_width || height > buffer_height {
+        return Err(anyhow!(
+            "cursor image {width}x{height} exceeds KMS plane {buffer_width}x{buffer_height}"
+        ));
+    }
+    let buffer = cursor
+        .buffer
+        .as_mut()
+        .context("KMS cursor buffer missing")?;
+    let pitch = buffer.pitch() as usize;
+    let mut mapping = cursor
+        .fd
+        .map_dumb_buffer(buffer)
+        .context("map KMS cursor buffer")?;
+    copy_cursor_rgba_to_argb(mapping.as_mut(), pitch, rgba, width, height)?;
+    Ok(())
+}
+
+fn copy_cursor_rgba_to_argb(
+    destination: &mut [u8],
+    pitch: usize,
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+) -> Result<()> {
+    let row_bytes = width as usize * 4;
+    let required_source = row_bytes * height as usize;
+    let required_destination = pitch * height as usize;
+    if rgba.len() < required_source || destination.len() < required_destination {
+        return Err(anyhow!("cursor pixel buffer is truncated"));
+    }
+    destination.fill(0);
+    for row in 0..height as usize {
+        let source = &rgba[row * row_bytes..(row + 1) * row_bytes];
+        let row_destination = &mut destination[row * pitch..row * pitch + row_bytes];
+        for (src, dst) in source
+            .chunks_exact(4)
+            .zip(row_destination.chunks_exact_mut(4))
+        {
+            dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
+        }
+    }
+    Ok(())
+}
+
 fn advertise_dmabuf(
     desktop: &mut NestedDesktop,
     renderer: &AshDrmRenderer,
@@ -384,6 +498,156 @@ fn advertise_dmabuf(
     desktop.state.dmabuf_node = Some(node);
     desktop.state.wgpu_dmabuf_formats = formats;
     Ok(())
+}
+
+fn update_kms_cursor(data: &mut VulkanDrmData) {
+    let visible = data.desktop.state.cursor_manager.visible();
+    let custom_surface = data.desktop.state.render.sw_cursor_surface.is_some();
+    let (pointer_x, pointer_y) = data.desktop.state.cursor_manager.position();
+    let icon = data.desktop.state.cursor_manager.current_flow_icon();
+    let image = if visible && !custom_surface {
+        data.desktop
+            .state
+            .cursor_manager
+            .current_image()
+            .ok()
+            .map(|image| {
+                (
+                    image.width,
+                    image.height,
+                    image.hotspot_x,
+                    image.hotspot_y,
+                    image.rgba.clone(),
+                )
+            })
+    } else {
+        None
+    };
+    let mut hardware_active = false;
+    for output in &mut data.outputs {
+        let owns_pointer = data.desktop.state.output_contains_pointer(output.output_id);
+        let Some(cursor) = output.cursor.as_mut() else {
+            continue;
+        };
+        // The legacy cursor ioctls below still become atomic plane commits on
+        // atomic-KMS drivers.  Issuing one while the primary-plane page flip is
+        // outstanding races that commit and commonly returns EBUSY.  Keep the
+        // last accepted cursor visible and apply the newest pointer state from
+        // the vblank handler once the primary commit has retired.  Pointer
+        // motion is naturally coalesced because CursorManager stores only its
+        // latest position.
+        if output.frame_pending {
+            hardware_active |= owns_pointer && cursor.enabled;
+            continue;
+        }
+        if cursor
+            .retry_after
+            .is_some_and(|retry| Instant::now() < retry)
+        {
+            hardware_active |= owns_pointer && cursor.enabled;
+            continue;
+        }
+        if !visible || custom_surface || !owns_pointer {
+            if cursor.enabled {
+                #[allow(deprecated)]
+                let cleared = cursor
+                    .fd
+                    .set_cursor(output.crtc, Option::<&dumbbuffer::DumbBuffer>::None);
+                if cleared.is_ok() {
+                    cursor.enabled = false;
+                    cursor.last_location = None;
+                    cursor.retry_after = None;
+                }
+            }
+            continue;
+        }
+        let Some((width, height, hotspot_x, hotspot_y, ref rgba)) = image else {
+            continue;
+        };
+        let Some(output_state) = data.desktop.state.outputs.get(&output.output_id) else {
+            continue;
+        };
+        let key = cursor_image_key(icon, width, height);
+        if cursor.uploaded_key != Some(key) {
+            if let Err(error) = upload_kms_cursor(cursor, rgba, width, height) {
+                cursor.retry_after = Some(Instant::now() + Duration::from_millis(250));
+                if !cursor.failure_logged {
+                    flog_warn!("KMS cursor upload failed on {}: {error:#}", output.name);
+                    cursor.failure_logged = true;
+                }
+                continue;
+            }
+            cursor.uploaded_key = Some(key);
+        }
+        let x = ((pointer_x - f64::from(output_state.logical_origin.x)) * output_state.scale_factor)
+            .round() as i32
+            - hotspot_x as i32;
+        let y = ((pointer_y - f64::from(output_state.logical_origin.y)) * output_state.scale_factor)
+            .round() as i32
+            - hotspot_y as i32;
+        if cursor.enabled
+            && cursor.uploaded_key == Some(key)
+            && cursor.last_location == Some((x, y))
+        {
+            hardware_active = true;
+            continue;
+        }
+        let first_enable = !cursor.enabled;
+        #[allow(deprecated)]
+        let result = (|| {
+            if first_enable {
+                let buffer = cursor
+                    .buffer
+                    .as_ref()
+                    .context("KMS cursor buffer missing")?;
+                cursor
+                    .fd
+                    .set_cursor(output.crtc, Some(buffer))
+                    .context("enable KMS cursor")?;
+            }
+            cursor
+                .fd
+                .move_cursor(output.crtc, (x, y))
+                .context("move KMS cursor")
+        })();
+        match result {
+            Ok(()) => {
+                cursor.enabled = true;
+                cursor.last_location = Some((x, y));
+                cursor.failure_logged = false;
+                cursor.retry_after = None;
+                hardware_active = true;
+                if first_enable {
+                    flog(format!("KMS hardware cursor active on {}", output.name));
+                }
+            }
+            Err(error) => {
+                let busy = error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(|cause| cause.raw_os_error() == Some(libc::EBUSY));
+                cursor.retry_after = Some(
+                    Instant::now()
+                        + if busy {
+                            FRAME_INTERVAL
+                        } else {
+                            Duration::from_millis(250)
+                        },
+                );
+                if !cursor.failure_logged {
+                    flog_warn!(
+                        "KMS cursor move failed on {}; using software fallback: {error}",
+                        output.name
+                    );
+                    cursor.failure_logged = true;
+                }
+            }
+        }
+    }
+    data.desktop
+        .state
+        .cursor_manager
+        .set_hardware_cursor_ready(hardware_active);
 }
 
 fn initialize_vulkan_outputs(
@@ -421,6 +685,13 @@ fn initialize_vulkan_outputs(
                 config.name
             ));
         }
+        let cursor = match create_kms_cursor(drm, fd, &scanout) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                flog_warn!("KMS cursor unavailable on {}: {error:#}", config.name);
+                None
+            }
+        };
 
         let physical_size =
             Size::<i32, Physical>::from((config.width as i32, config.height as i32));
@@ -549,8 +820,13 @@ fn initialize_vulkan_outputs(
             frame_pending: false,
             present_started_at: None,
             hdr_metadata_blob,
+            cursor,
         });
     }
+    desktop
+        .state
+        .cursor_manager
+        .set_hardware_cursor_ready(false);
     desktop.state.primary_output = configured_primary.unwrap_or(outputs[0].output_id);
     desktop.state.focused_output = desktop.state.primary_output;
     desktop.state.mark_redraw();
@@ -755,6 +1031,10 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
 
 fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
     flog_warn!("raw Vulkan renderer failed; recreating device and scanout: {reason:#}");
+    // The replacement renderer starts with an empty texture cache. Make egui
+    // resend its retained font/image atlases instead of referring to cache keys
+    // that only existed on the abandoned Vulkan device.
+    data.desktop.state.invalidate_gpu_state();
     data.renderer.abandon_device();
     let replacement = AshDrmRenderer::new(data.primary_node.major(), data.primary_node.minor())
         .context("recreate raw Vulkan device")?;
@@ -903,19 +1183,30 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
         }
         dispatch_backend_input_event::<LibinputInputBackend>(&mut data.desktop.state, &event);
+        update_kms_cursor(data);
     })?;
 
     let _drm_token = loop_handle.insert_source(drm_notifier, |event, _, data| match event {
         DrmEvent::VBlank(crtc) => {
-            let Some(output) = data.outputs.iter_mut().find(|output| output.crtc == crtc) else {
+            let Some(index) = data.outputs.iter().position(|output| output.crtc == crtc) else {
                 return;
             };
-            match output.scanout.frame_submitted() {
+            let completion = {
+                let output = &mut data.outputs[index];
+                output.scanout.frame_submitted()
+            };
+            match completion {
                 Ok(_) => {
+                    let output = &mut data.outputs[index];
                     output.frame_pending = false;
                     output.present_started_at = None;
+                    // A cursor update may have been deferred while this atomic
+                    // primary-plane commit was pending.  Submit the newest
+                    // coalesced position now that the CRTC is idle.
+                    update_kms_cursor(data);
                 }
                 Err(error) => {
+                    let output = &data.outputs[index];
                     data.fatal_error = Some(anyhow!(
                         "complete Vulkan DRM frame on {}: {error}",
                         output.name
@@ -1095,9 +1386,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
-            let scene = data
-                .scene_builder
-                .build_for_output(&mut data.desktop.state, output_id);
+            let software_cursor = data.desktop.state.cursor_manager.software_cursor_needed();
+            let scene = data.scene_builder.build_for_output_with_cursor_policy(
+                &mut data.desktop.state,
+                output_id,
+                software_cursor,
+                false,
+                true,
+            );
             let capture_requested = (data.desktop.state.screenshot_request() == Some(output_id)
                 || data.desktop.state.screenshot_all_requested
                 || data
@@ -1271,4 +1567,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
     stop_focaldesk_session_target();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copy_cursor_rgba_to_argb;
+
+    #[test]
+    fn cursor_upload_converts_rgba_to_little_endian_argb_and_keeps_pitch_padding_clear() {
+        let mut destination = vec![0xff; 16];
+        copy_cursor_rgba_to_argb(&mut destination, 8, &[10, 20, 30, 40, 50, 60, 70, 80], 2, 1)
+            .unwrap();
+        assert_eq!(
+            destination,
+            [30, 20, 10, 40, 70, 60, 50, 80, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn cursor_upload_rejects_truncated_pixels() {
+        assert!(copy_cursor_rgba_to_argb(&mut [0; 4], 4, &[0; 3], 1, 1).is_err());
+    }
 }

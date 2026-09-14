@@ -64,9 +64,15 @@ recovery renderer and retains HDR and zero-copy DMA-BUF capture support. Raw
 Vulkan supports screenshots, SHM portal capture, and the local remote-frame
 transport through asynchronous output readback. Udev connector events and
 display-settings IPC updates rebuild the raw Vulkan KMS topology.
-The Vulkan renderer paints egui panels as native indexed Vulkan meshes, with
-retained texture updates, physical-pixel scaling, and per-mesh clipping; it does
-not create an EGL or GLES context for panel rendering.
+The raw DRM backend programs themed pointers on an atomic KMS cursor plane, so
+motion does not wait for Vulkan composition or the primary-plane page flip.
+Client-provided cursor surfaces, oversized cursors, allocation failures, and
+drivers that reject cursor-plane updates fall back to the software texture path.
+The Vulkan scene bridge retains egui texture updates, physical-pixel scaling,
+and per-mesh clipping. Raw DRM currently rasterizes those meshes into a cropped
+premultiplied overlay before its Ash texture pass because the native indexed
+mesh path is not yet reliable on the supported DRM drivers. This compatibility
+path does not create an EGL or GLES context.
 DRM connector EDID supplies the same monitor make, model, serial, physical size,
 and ICC-profile matching inputs used by the GLES backend. The selected profile
 is retained in output state. Vulkan composition un-premultiplies client buffers,

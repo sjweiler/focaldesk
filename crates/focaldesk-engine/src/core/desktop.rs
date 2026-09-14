@@ -6895,7 +6895,9 @@ impl DesktopState {
             return true;
         }
 
-        false
+        self.focus_window_id(id);
+        self.pending_compositor_move = Some((id, position));
+        true
     }
 
     fn try_begin_compositor_move(&mut self, id: WindowId) {
@@ -8530,13 +8532,34 @@ impl DesktopState {
             }) => {
                 let delta = pos - pointer_start;
                 let new_loc = (initial_location.to_f64() + delta).to_i32_round();
-                if let Some(w) = self.window(window_id) {
-                    let window = w.window.clone();
+                if let Some(window) = self.window(window_id).map(|w| w.window.clone()) {
                     let old_bbox = self.global_window_bbox(&window);
                     let new_loc = self.clamp_window_location_to_work_recess(&window, new_loc, pos);
                     self.map_window_bbox_location(window.clone(), new_loc, false);
                     self.space.refresh();
                     self.refresh_window_preferred_color_output(&window);
+
+                    // The renderer and focus model associate a window with an output as
+                    // well as a workspace. Hand that association over while the pointer
+                    // crosses an output boundary so the dragged window remains visible
+                    // throughout the grab instead of disappearing until button release.
+                    let target_output = self.output_under_pointer(pos);
+                    let target_workspace = target_output
+                        .and_then(|id| self.outputs.get(&id))
+                        .map(|output| output.active_workspace);
+                    let mut changed_output = false;
+                    if let Some(managed) = self.window_mut(window_id) {
+                        if target_output.is_some() && managed.output != target_output {
+                            managed.set_output(target_output);
+                            changed_output = true;
+                        }
+                        if let Some(target_workspace) = target_workspace {
+                            if managed.workspace != target_workspace {
+                                managed.set_workspace(target_workspace);
+                                changed_output = true;
+                            }
+                        }
+                    }
                     let new_bbox = self
                         .window(window_id)
                         .and_then(|w| self.global_window_bbox(&w.window));
@@ -8545,6 +8568,9 @@ impl DesktopState {
                     }
                     if let Some(new_bbox) = new_bbox {
                         self.mark_window_bbox_damage_source(new_bbox, DamageSource::WindowMove);
+                    }
+                    if changed_output {
+                        self.mark_all_outputs_full_damage(DamageSource::WindowMove);
                     }
                     return old_bbox.is_some() || new_bbox.is_some();
                 }
@@ -8677,9 +8703,14 @@ impl DesktopState {
                 // workspace that output is currently showing; otherwise it keeps the source
                 // workspace number and becomes invisible on every output (including the one
                 // it was dragged from, since it no longer sits within that output's bounds).
+                let target_output = self.output_under_pointer(self.pointer_pos);
                 let target_workspace = self.workspace_under_pointer(self.pointer_pos);
                 if let Some(managed) = self.window_mut(window_id) {
-                    if managed.workspace != target_workspace {
+                    if target_output.is_some()
+                        && (managed.output != target_output
+                            || managed.workspace != target_workspace)
+                    {
+                        managed.set_output(target_output);
                         managed.set_workspace(target_workspace);
                         self.mark_all_outputs_full_damage(DamageSource::Unknown);
                     }
@@ -8804,6 +8835,13 @@ impl DesktopState {
                 if let Some(id) = self.output_under_pointer(position) {
                     self.set_focused_output(id);
                 }
+                // Keep the visible cursor in lockstep with the compositor's
+                // logical pointer before an overlay gets a chance to consume
+                // the event. The old ordering returned from the egui branch
+                // first, leaving the KMS/software cursor frozen at the panel
+                // edge while egui received an invisible moving pointer.
+                self.cursor_manager.move_to(position.x, position.y);
+                self.drm_submit_hw_cursor = true;
                 let cursor_owner_damage = self.update_cursor_owner_damage();
                 let stale_cursor_damage = self.clear_stale_software_cursor_damage();
                 if self.egui_open_on_output(self.focused_output) {
@@ -8823,8 +8861,6 @@ impl DesktopState {
                     self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
                 }
-                self.cursor_manager.move_to(position.x, position.y);
-                self.drm_submit_hw_cursor = true;
                 const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
                 if self.input.pointer_left_down {
                     if let Some((id, start)) = self.pending_xdg_move {

@@ -76,6 +76,9 @@ pub struct VulkanEguiTexture {
     pub width: u32,
     pub height: u32,
     pub pixels: Vec<u8>,
+    /// The retained pixels changed and must replace an existing GPU texture.
+    /// Unchanged textures are still exported so a renderer cache miss can heal.
+    pub upload: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -97,6 +100,170 @@ pub struct VulkanEguiMesh {
 pub struct VulkanEguiPaint {
     pub textures: Vec<VulkanEguiTexture>,
     pub meshes: Vec<VulkanEguiMesh>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VulkanEguiRaster {
+    pub origin: [i32; 2],
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// Rasterize retained egui meshes into one premultiplied sRGBA overlay.
+///
+/// Raw Ash uses this path until its native atlas mesh sampler is reliable on
+/// all DRM drivers. The GLES painter and nested Vulkan mesh path are unchanged.
+pub fn rasterize_vulkan_paint(paint: &VulkanEguiPaint) -> Option<VulkanEguiRaster> {
+    let textures = paint
+        .textures
+        .iter()
+        .map(|texture| (texture.cache_key, texture))
+        .collect::<HashMap<_, _>>();
+    let mut bounds: Option<[i32; 4]> = None;
+    for mesh in &paint.meshes {
+        let [clip_x, clip_y, clip_w, clip_h] = mesh.clip_rect;
+        if clip_w <= 0 || clip_h <= 0 || mesh.vertices.is_empty() {
+            continue;
+        }
+        let min_x = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position[0].floor() as i32)
+            .min()?
+            .max(clip_x);
+        let min_y = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position[1].floor() as i32)
+            .min()?
+            .max(clip_y);
+        let max_x = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position[0].ceil() as i32)
+            .max()?
+            .min(clip_x.saturating_add(clip_w));
+        let max_y = mesh
+            .vertices
+            .iter()
+            .map(|vertex| vertex.position[1].ceil() as i32)
+            .max()?
+            .min(clip_y.saturating_add(clip_h));
+        if min_x >= max_x || min_y >= max_y {
+            continue;
+        }
+        bounds = Some(match bounds {
+            Some([x0, y0, x1, y1]) => [x0.min(min_x), y0.min(min_y), x1.max(max_x), y1.max(max_y)],
+            None => [min_x, min_y, max_x, max_y],
+        });
+    }
+    let [origin_x, origin_y, max_x, max_y] = bounds?;
+    let width = u32::try_from(max_x.saturating_sub(origin_x)).ok()?;
+    let height = u32::try_from(max_y.saturating_sub(origin_y)).ok()?;
+    if width == 0 || height == 0 || width > 8192 || height > 8192 {
+        return None;
+    }
+    let byte_len = usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?
+        .checked_mul(4)?;
+    let mut pixels = vec![0_u8; byte_len];
+
+    for mesh in &paint.meshes {
+        let Some(texture) = textures.get(&mesh.texture_key) else {
+            continue;
+        };
+        let texture_len = usize::try_from(texture.width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(texture.height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .and_then(|pixels| pixels.checked_mul(4));
+        if texture.width == 0 || texture.height == 0 || texture_len != Some(texture.pixels.len()) {
+            continue;
+        }
+        let [clip_x, clip_y, clip_w, clip_h] = mesh.clip_rect;
+        let clip_x1 = clip_x.saturating_add(clip_w);
+        let clip_y1 = clip_y.saturating_add(clip_h);
+        for triangle in mesh.indices.as_chunks::<3>().0 {
+            let [Some(a), Some(b), Some(c)] = [
+                mesh.vertices.get(triangle[0] as usize),
+                mesh.vertices.get(triangle[1] as usize),
+                mesh.vertices.get(triangle[2] as usize),
+            ] else {
+                continue;
+            };
+            let [ax, ay] = a.position;
+            let [bx, by] = b.position;
+            let [cx, cy] = c.position;
+            let x0 = (ax.min(bx).min(cx).floor() as i32)
+                .max(origin_x)
+                .max(clip_x);
+            let y0 = (ay.min(by).min(cy).floor() as i32)
+                .max(origin_y)
+                .max(clip_y);
+            let x1 = (ax.max(bx).max(cx).ceil() as i32).min(max_x).min(clip_x1);
+            let y1 = (ay.max(by).max(cy).ceil() as i32).min(max_y).min(clip_y1);
+            let denominator = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+            if denominator.abs() < f32::EPSILON {
+                continue;
+            }
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let px = x as f32 + 0.5;
+                    let py = y as f32 + 0.5;
+                    let wa = ((by - cy) * (px - cx) + (cx - bx) * (py - cy)) / denominator;
+                    let wb = ((cy - ay) * (px - cx) + (ax - cx) * (py - cy)) / denominator;
+                    let wc = 1.0 - wa - wb;
+                    if wa < -0.001 || wb < -0.001 || wc < -0.001 {
+                        continue;
+                    }
+                    let u = wa * a.uv[0] + wb * b.uv[0] + wc * c.uv[0];
+                    let v = wa * a.uv[1] + wb * b.uv[1] + wc * c.uv[1];
+                    let tx = ((u * texture.width as f32).floor() as i64)
+                        .clamp(0, i64::from(texture.width) - 1)
+                        as usize;
+                    let ty = ((v * texture.height as f32).floor() as i64)
+                        .clamp(0, i64::from(texture.height) - 1)
+                        as usize;
+                    let source = (ty * texture.width as usize + tx) * 4;
+                    let vertex_color = [0, 1, 2, 3].map(|channel| {
+                        (wa * f32::from(a.color[channel])
+                            + wb * f32::from(b.color[channel])
+                            + wc * f32::from(c.color[channel]))
+                        .round()
+                        .clamp(0.0, 255.0) as u8
+                    });
+                    let source_color = [0, 1, 2, 3].map(|channel| {
+                        ((u16::from(texture.pixels[source + channel])
+                            * u16::from(vertex_color[channel]))
+                            / 255) as u8
+                    });
+                    if source_color[3] == 0 {
+                        continue;
+                    }
+                    let destination =
+                        (((y - origin_y) as u32 * width + (x - origin_x) as u32) * 4) as usize;
+                    let inverse_alpha = 255_u16 - u16::from(source_color[3]);
+                    for channel in 0..4 {
+                        pixels[destination + channel] = (u16::from(source_color[channel])
+                            + (u16::from(pixels[destination + channel]) * inverse_alpha) / 255)
+                            .min(255) as u8;
+                    }
+                }
+            }
+        }
+    }
+
+    Some(VulkanEguiRaster {
+        origin: [origin_x, origin_y],
+        width,
+        height,
+        pixels,
+    })
 }
 
 #[derive(Clone)]
@@ -555,6 +722,17 @@ impl EguiLayer {
 
     /// Run egui panel logic and collect [`UiAction`]s (without painting).
     pub fn update_panels(&mut self, frame_ctx: &DesktopFrameCtx) {
+        self.update_panels_once(frame_ctx);
+        // An egui Window can spend its first frame determining its persisted/default
+        // size and return no paint primitives. The GL backend naturally receives a
+        // following redraw, but raw DRM is damage-driven and can otherwise retain
+        // only the shell backdrop indefinitely. Resolve that layout pass immediately.
+        if self.has_open_panels() && self.primitives.is_empty() {
+            self.update_panels_once(frame_ctx);
+        }
+    }
+
+    fn update_panels_once(&mut self, frame_ctx: &DesktopFrameCtx) {
         self.last_frame_ctx = Some(frame_ctx.clone());
         self.prepare_raw_input(frame_ctx);
         self.accessibility.append_actions(&mut self.raw_input);
@@ -726,6 +904,10 @@ impl EguiLayer {
     /// logical points to physical output pixels here so every renderer consumes
     /// the same scale calculation.
     pub fn take_vulkan_paint(&mut self, scale: f32) -> VulkanEguiPaint {
+        // Raw Vulkan does not call `render`, so collect the same one-shot atlas
+        // and mesh diagnostics here. This makes a broken native egui pass
+        // inspectable without enabling or falling back to GLES.
+        self.log_debug_dumps();
         let mut changed = Vec::new();
         for (id, delta) in self.textures_delta.set.drain(..) {
             let [width, height] = delta.image.size();
@@ -756,6 +938,7 @@ impl EguiLayer {
                         width: width as u32,
                         height: height as u32,
                         pixels: patch,
+                        upload: false,
                     },
                 );
                 changed.push(id);
@@ -765,15 +948,20 @@ impl EguiLayer {
             self.vulkan_textures.remove(&id);
         }
 
-        let textures = if self.vulkan_textures_uploaded {
-            changed
-                .into_iter()
-                .filter_map(|id| self.vulkan_textures.get(&id).cloned())
-                .collect()
-        } else {
-            self.vulkan_textures_uploaded = true;
-            self.vulkan_textures.values().cloned().collect()
-        };
+        let force_upload = !self.vulkan_textures_uploaded;
+        self.vulkan_textures_uploaded = true;
+        let changed = changed
+            .into_iter()
+            .collect::<std::collections::HashSet<_>>();
+        let textures = self
+            .vulkan_textures
+            .iter()
+            .map(|(id, texture)| {
+                let mut texture = texture.clone();
+                texture.upload = force_upload || changed.contains(id);
+                texture
+            })
+            .collect();
         let meshes = self
             .primitives
             .iter()
@@ -1406,7 +1594,7 @@ fn egui_work_rect(frame_ctx: &DesktopFrameCtx) -> egui::Rect {
 
 #[cfg(test)]
 mod egui_vertex_layout_tests {
-    use super::EguiLayer;
+    use super::{EguiLayer, rasterize_vulkan_paint};
     use crate::desktop_frame::DesktopFrameCtx;
     use crate::types::PanelKind;
     use egui::epaint::Vertex;
@@ -1490,6 +1678,74 @@ mod egui_vertex_layout_tests {
         assert!(!paint.meshes.is_empty());
         assert_eq!(paint.meshes[0].vertices[0].position, [20.0, 40.0]);
         assert_eq!(paint.meshes[0].clip_rect, [20, 40, 60, 80]);
+    }
+
+    #[test]
+    fn vulkan_paint_exports_the_font_atlas_used_by_text_meshes() {
+        let mut layer = EguiLayer::default();
+        let now = Instant::now();
+        let frame = DesktopFrameCtx {
+            output_size: (800, 600),
+            output_scale: Scale::from(1.0),
+            work: Rectangle::from_loc_and_size((0, 0), (800, 600)),
+            active_output: OutputId(1),
+            rendering_output: OutputId(1),
+            now,
+            start_time: now,
+            flip_egui_y: false,
+            portal_capture: false,
+        };
+        layer.open_panel(PanelKind::Power, OutputId(1));
+        layer.update_panels(&frame);
+        assert!(layer.has_open_panels());
+        assert!(
+            !layer.primitives.is_empty(),
+            "power panel emitted no primitives"
+        );
+
+        let paint = layer.take_vulkan_paint(1.0);
+        let texture_keys = paint
+            .textures
+            .iter()
+            .map(|texture| texture.cache_key)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(!paint.meshes.is_empty());
+        assert!(
+            paint
+                .meshes
+                .iter()
+                .flat_map(|mesh| &mesh.vertices)
+                .any(|vertex| vertex.color[3] >= 200),
+            "a newly opened panel must be opaque on its first rendered frame"
+        );
+        assert!(
+            paint
+                .meshes
+                .iter()
+                .flat_map(|mesh| &mesh.vertices)
+                .any(|vertex| vertex.color[3] >= 200
+                    && vertex.color[..3].iter().copied().max().unwrap_or(0) >= 180),
+            "the first rendered frame must contain visible panel text"
+        );
+        assert!(
+            paint
+                .meshes
+                .iter()
+                .all(|mesh| texture_keys.contains(&mesh.texture_key))
+        );
+        assert!(paint.textures.iter().any(|texture| {
+            texture
+                .pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
+        }));
+
+        let raster = rasterize_vulkan_paint(&paint).expect("power panel raster");
+        assert!(raster.width >= 200);
+        assert!(raster.height >= 300);
+        assert!(raster.pixels.chunks_exact(4).any(|pixel| {
+            pixel[3] >= 200 && pixel[..3].iter().copied().max().unwrap_or(0) >= 180
+        }));
     }
 
     #[test]

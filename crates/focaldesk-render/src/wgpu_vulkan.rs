@@ -175,6 +175,9 @@ fn texture_format(format: FramePixelFormat) -> TextureFormat {
     match format {
         FramePixelFormat::Bgra8Srgb => TextureFormat::Bgra8UnormSrgb,
         FramePixelFormat::Rgba8Srgb => TextureFormat::Rgba8UnormSrgb,
+        FramePixelFormat::Bgra10Unorm | FramePixelFormat::Rgba10Unorm => {
+            TextureFormat::Rgb10a2Unorm
+        }
     }
 }
 
@@ -577,6 +580,12 @@ impl WgpuVulkanRenderer {
         let Some(dmabuf) = surface.dmabuf.as_ref() else {
             return Ok(None);
         };
+        // wgpu-hal's helper accepts only a single memory plane. Raw ash handles
+        // modifier layouts with auxiliary planes; keep the nested backend on
+        // its synchronized CPU fallback for those buffers.
+        if dmabuf.planes.len() != 1 || dmabuf.offsets.len() != 1 || dmabuf.strides.len() != 1 {
+            return Ok(None);
+        }
         if !self
             .device
             .features()
@@ -584,7 +593,9 @@ impl WgpuVulkanRenderer {
         {
             return Ok(None);
         }
-        let fd = dmabuf.fd.try_clone().context("duplicate DMA-BUF fd")?;
+        let fd = dmabuf.planes[0]
+            .try_clone()
+            .context("duplicate DMA-BUF fd")?;
         let descriptor = TextureDescriptor {
             label: Some("focaldesk-dmabuf-texture"),
             size: Extent3d {
@@ -624,8 +635,8 @@ impl WgpuVulkanRenderer {
                 fd,
                 &hal_descriptor,
                 dmabuf.modifier,
-                u64::from(surface.stride),
-                dmabuf.offset,
+                u64::from(dmabuf.strides[0]),
+                u64::from(dmabuf.offsets[0]),
             )?;
             self.device.create_texture_from_hal::<Vulkan>(
                 hal_texture,
