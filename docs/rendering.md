@@ -2,7 +2,10 @@
 
 # Rendering Pipeline
 
-FocalDesk uses a GPU-accelerated rendering pipeline built on OpenGL ES.
+FocalDesk has two native DRM rendering paths: the established Smithay GLES
+renderer and a raw-Ash Vulkan renderer. `focaldmd` selects the path before the
+user session starts. GLES remains the recovery renderer while Vulkan parity and
+hardware coverage continue to mature.
 
 An experimental `focaldesk-render` boundary now contains a Vulkan-only wgpu
 nested compositor implementation. It selects a Vulkan adapter, owns the wgpu
@@ -19,8 +22,8 @@ release timeline point to signal without a compositor-thread GPU idle wait. Wind
 subsurfaces and popups follow Smithay's surface stacking and committed offsets,
 and normal-orientation viewport crops/scaling are mapped into texture
 coordinates. Layer-shell surfaces are placed around the window stack according
-to their background, bottom, top, or overlay layer. The production DRM/KMS and
-established nested compositor paths continue to use OpenGL ES.
+to their background, bottom, top, or overlay layer. This wgpu renderer remains
+a nested development backend; production DRM Vulkan uses raw Ash instead.
 
 The nested wgpu path forwards host keyboard, pointer, button, and scroll events
 through the compositor's normal focus and Wayland seat path. Its themed cursor
@@ -42,7 +45,8 @@ The same current-frame regions are forwarded as KMS damage clips.
 The shell pass now renders configured wallpaper fit/tint/dim behavior, cached
 font-atlas text, state-tinted SVG icons, antialiased rounded panels, and
 notification text above clients while keeping cursors foremost. Advanced GLES
-effect parity, multi-plane DMA-BUFs, and HDR output remain.
+effect parity and disjoint or YUV multi-plane DMA-BUF import remain. Raw Vulkan
+HDR10/PQ output is implemented independently of the nested wgpu renderer.
 
 The real DRM executable contains two independent rendering paths. The existing
 path uses Smithay's EGL/GLES renderer with GBM and KMS. The Vulkan path uses raw
@@ -60,8 +64,9 @@ primary-output selection from `displays.json`. It resets every compositor-owned
 swapchain across libseat pause/resume, shares the established DRM input
 dispatcher and deferred action pumps used by the GLES backend, and runs the
 normal XWayland lifecycle when that feature is enabled. GLES remains the
-recovery renderer and retains HDR and zero-copy DMA-BUF capture support. Raw
-Vulkan supports screenshots, SHM portal capture, and the local remote-frame
+recovery renderer and retains its HDR and zero-copy DMA-BUF capture support.
+Raw Vulkan has its own HDR10/PQ path and supports screenshots, SHM portal
+capture, and the local remote-frame
 transport through asynchronous output readback. Udev connector events and
 display-settings IPC updates rebuild the raw Vulkan KMS topology.
 The raw DRM backend programs themed pointers on an atomic KMS cursor plane, so
@@ -89,6 +94,10 @@ scene to BT.2020, applies ST 2084 PQ with neutral 10-bit dithering, and queues
 BT.2020 RGB, link depth, and HDR static metadata through Smithay's atomic KMS
 state. Failure to obtain a 10-bit buffer or stage the connector properties keeps
 that output in SDR rather than presenting PQ pixels without HDR signaling.
+
+RGB modifiers with auxiliary memory planes are imported directly when all plane
+layouts refer to the same DMA-BUF memory object. Disjoint per-plane memory and
+YUV formats such as NV12/P010 remain unsupported and are rejected safely.
 
 Raw Vulkan submissions and KMS presents have bounded progress deadlines. A
 stalled GPU fence recreates the Vulkan device and scanout in-process, while a

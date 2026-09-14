@@ -18,12 +18,14 @@ presentation.
 
 ## Known working configuration
 
-As of August 20, 2026, HDR10 has been observed working in a native FocalDesk
-session on Fedora 44 with the proprietary NVIDIA 595 driver series, including
-HDR content in Google Chrome. This is a successful compatibility result, not a
-blanket support guarantee: the GPU model, display, connector, mode, kernel,
-Chrome version, FocalDesk revision, and single- or multi-output topology can all
-affect the result.
+As of September 14, 2026, HDR10 has been observed working through both native
+DRM renderers on Fedora 44, kernel 7.1.8, a GeForce RTX 4090, and the NVIDIA open
+kernel module/595.91.07 userspace driver. The raw-Ash Vulkan test used two active
+outputs with HDR requested on one output; sRGB and Display-P3 images, video, and
+the compositor egui overlay rendered correctly. Earlier GLES testing also
+included HDR content in Google Chrome. These are successful compatibility
+results, not a blanket support guarantee: the display, connector, mode, kernel,
+application version, and output topology can all affect the result.
 
 For a reproducible compatibility report, record those details together with the
 driver's complete version and whether Chrome was running as a native Wayland or

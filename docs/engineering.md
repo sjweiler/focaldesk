@@ -17,13 +17,17 @@ compositor, session, rendering, IPC, and desktop-service behavior. Smithay provi
 without requiring a C-based integration layer or inheriting assumptions from an existing compositor ecosystem. This was not a
 judgment that wlroots is unsuitable in general. It was a decision based on architectural fit and long-term maintainability for
 FocalDesk.
-### Why I Chose OpenGL ES Instead of Vulkan
-FocalDesk needed the simplest rendering solution that could perform desktop composition reliably. Its rendering workload primarily
-consists of compositing window textures, drawing desktop elements, applying shaders, handling transparency and rounded geometry, and
-presenting frames through DRM/KMS. OpenGL ES provides the required capabilities without the additional resource management,
-synchronization, and implementation complexity of Vulkan. Vulkan would not inherently improve HDR support or provide a meaningful
-user-visible advantage for FocalDesk’s current rendering workload. OpenGL ES therefore offers the better balance of capability,
-reliability, and maintainability.
+### Why I Keep GLES and Built a Raw Vulkan Renderer
+FocalDesk began with Smithay's GLES renderer because it was the shortest path to reliable desktop composition and remains the broadest
+compatibility and recovery option. The Vulkan work first used wgpu in a nested backend to validate scene construction, client-buffer
+imports, and input without risking the active KMS session. The production Vulkan backend instead uses Ash directly: Smithay owns DRM/KMS,
+GBM allocates scanout buffers, and Vulkan imports those buffers, performs FP16 composition and HDR10/PQ encoding, exports explicit fences,
+and hands them back to atomic KMS. This is more implementation work, but it exposes the exact external-memory, queue-ownership,
+synchronization, 10-bit format, and KMS handoff needed by this compositor.
+
+Raw Vulkan did not make HDR possible by itself; both renderer paths can perform the required color conversion. It made FocalDesk's HDR
+pipeline easier to control and diagnose end to end without depending on the abstraction and backend behavior of the experimental wgpu
+path. GLES is therefore retained rather than replaced, and the two DRM renderers provide an intentional compatibility/recovery choice.
 ### Why I Built a Session Manager
 FocalDesk includes its own session manager so it can control the complete lifecycle of a desktop session. The session manager starts
 required desktop services, tracks their state, coordinates startup and shutdown, handles failures, and ensures that components

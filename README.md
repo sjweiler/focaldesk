@@ -22,12 +22,13 @@ tracked in [Known Issues](docs/known-issues.md).
 
 ## Features
 
-- Custom Wayland compositor with direct DRM/KMS and nested winit backends, plus
-  an experimental nested wgpu/Vulkan presentation path.
+- Custom Wayland compositor with selectable GLES and raw-Ash Vulkan DRM/KMS
+  renderers, plus nested winit and experimental nested wgpu/Vulkan backends.
 - Keyboard-oriented workspaces and multi-monitor window management.
 - XWayland support for X11 applications, including tested Wine/DXVK workflows.
-- OpenGL ES rendering with shell effects, damage tracking, and experimental HDR
-  and color-management paths.
+- GLES and Vulkan rendering with damage tracking and experimental HDR and color
+  management; GLES remains the compatibility path while raw Vulkan parity is
+  completed.
 - First-party launcher, Settings, file manager, login greeter, and AI Console.
 - Versioned theme editor with semantic surface tokens, wide-gamut/HDR paint
   intent, live compositor preview, wallpaper processing, and portable theme
@@ -62,7 +63,7 @@ release.
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
 | Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |
-| HDR and color management | Experimental and hardware-dependent; HDR10 verified on Fedora 44 with NVIDIA 595, including Google Chrome ([details](docs/hdr.md#known-working-configuration)) |
+| HDR and color management | Experimental and hardware-dependent; HDR10 verified through both GLES and raw Ash Vulkan on Fedora 44 with NVIDIA 595 ([details](docs/hdr.md#known-working-configuration)) |
 | Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradients render compositor-side with up to eight stops |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |

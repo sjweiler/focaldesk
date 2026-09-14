@@ -10,6 +10,12 @@ version numbers where practical.
 
 ### Added
 
+- Added a selectable raw-Ash Vulkan DRM renderer with GBM DMA-BUF scanout,
+  explicit synchronization, multi-output layout and scaling, XWayland,
+  damage-aware retained FP16 composition, SDR/ICC color management, guarded
+  HDR10/PQ output, hardware-cursor fallback, capture readback, and bounded GPU
+  and KMS recovery. Hardware validation on Fedora 44/NVIDIA 595 confirmed mixed
+  HDR/SDR output, sRGB and Display-P3 images, video, and compositor egui panels.
 - Added manifest-driven installation verification and a scoped uninstaller that
   preserves user data by default, plus a repeatable install-lifecycle test.
 - Added automatic, atomic migration from legacy `config.toml` desktop settings
