@@ -2133,7 +2133,7 @@ mod tests {
         assert_eq!(hdr_reference_white_nits(100.0), 100.0);
         assert_eq!(
             crate::core::color::hdr_conservative_peak_nits(1_000.0),
-            crate::core::color::HDR_CONSERVATIVE_PEAK_NITS
+            1_000.0
         );
     }
 

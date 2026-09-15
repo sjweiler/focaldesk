@@ -54,7 +54,12 @@ ash while retaining Smithay as the DRM/KMS owner. GBM swapchain DMA-BUFs are
 imported with explicit DRM modifiers, rendered as Vulkan color attachments,
 released to the foreign queue family, and submitted to atomic KMS with an
 exported sync-file. Client DMA-BUF textures use the corresponding foreign queue
-ownership transfers; SHM textures use Vulkan staging uploads. There is no
+ownership transfers. Their implicit writer fences are deduplicated, exported
+from the DMA-BUF reservation objects, and imported as temporary Vulkan acquire
+semaphores before fragment sampling. The completed Vulkan read fence is
+published back to each reservation object for implicit consumers. Explicit
+`linux-drm-syncobj-v1` commit blockers and Wayland buffer retention remain in
+place. SHM textures use Vulkan staging uploads. There is no
 Vulkan display surface, Vulkan WSI swapchain, GLES copy, or EGL import bridge.
 
 `focaldmd` selects the renderer before the user session starts. The Vulkan DRM
@@ -103,6 +108,20 @@ Raw Vulkan submissions and KMS presents have bounded progress deadlines. A
 stalled GPU fence recreates the Vulkan device and scanout in-process, while a
 missing vblank rebuilds the KMS scanout. The renderer skips blocking Vulkan
 teardown for a wedged device.
+
+Active raw-Vulkan HDR outputs also receive periodic connector-property
+readback. If a monitor picture-mode change or link retrain drops BT.2020,
+10-bit link depth, or HDR static metadata while scanout keeps running, the
+backend re-arms the properties with a PQ frame and verifies the following
+vblank. Three unsuccessful repairs trigger a bounded output rebuild.
+
+The Settings `Auto`, `sRGB`, and `Display P3` gamut choices only replace the
+compositor's output color transform and ICC LUT. They apply in place and do
+not recreate GBM buffers, modeset the connector, or interrupt active HDR.
+
+Screenshot and SHM capture readback accepts both 8-bit and packed 10-bit RGB
+scanout layouts. Unsupported conversion errors retire one-shot screenshot
+requests instead of leaving a continuous per-frame capture loop active.
 
 The renderer is responsible for composing application surfaces, shell UI, shaders, cursors, and desktop effects into the final image presented through DRM/KMS or other backends.
 

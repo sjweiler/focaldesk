@@ -256,8 +256,10 @@ just install-desktop
 just install-desktop-session
 ```
 
-That recipe builds a release binary and installs it to
-`/usr/local/bin/focaldesk-desktop` (same path as the Wayland session `Exec=`).
+That recipe builds and installs the compositor to
+`/usr/local/bin/focaldesk-desktop` (the Wayland session `Exec=`), and installs
+the matching `/usr/local/bin/focaldesk-settings` so display configuration
+schema changes cannot be lost by an older Settings application.
 FocalDesk leaves the platform sleep mode unchanged, including firmware-backed
 `deep` sleep. It pauses rendering and DRM commits, waits for libseat to restore
 device ownership, resets connector and plane state, reprobes DRM resources,

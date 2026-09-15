@@ -30,8 +30,25 @@ const XBGR2101010: u32 = u32::from_le_bytes(*b"XB30");
 const ABGR2101010: u32 = u32::from_le_bytes(*b"AB30");
 const GPU_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DAMAGE_HISTORY_LIMIT: usize = 64;
+const DMA_BUF_SYNC_READ: u32 = 1;
 type DamageRect = [i32; 4];
 type DamageHistory = VecDeque<(u64, Vec<DamageRect>)>;
+
+#[repr(C)]
+struct DmaBufExportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+nix::ioctl_readwrite!(dma_buf_export_sync_file, b'b', 2, DmaBufExportSyncFile);
+
+#[repr(C)]
+struct DmaBufImportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+nix::ioctl_write_ptr!(dma_buf_import_sync_file, b'b', 3, DmaBufImportSyncFile);
 
 const SOLID_SHADER: &str = r#"
 struct Push {
@@ -483,6 +500,7 @@ struct PendingFrame {
     fence: vk::Fence,
     command: vk::CommandBuffer,
     semaphore: vk::Semaphore,
+    wait_semaphores: Vec<vk::Semaphore>,
     framebuffers: Vec<vk::Framebuffer>,
     retired_textures: Vec<TextureResource>,
     retired_outputs: Vec<OutputResources>,
@@ -574,6 +592,30 @@ impl AshDrmCapture {
             XBGR8888 | ABGR8888 => {
                 for pixel in self.pixels.chunks_exact_mut(4) {
                     pixel[3] = 255;
+                }
+            }
+            XRGB2101010 | ARGB2101010 | XBGR2101010 | ABGR2101010 => {
+                // All supported ten-bit DRM formats are one little-endian
+                // packed u32 per pixel. Normalize the RGB fields to eight bit
+                // for the existing screenshot/SHM capture contract. Captures
+                // are opaque regardless of the scanout format's alpha bits.
+                for pixel in self.pixels.chunks_exact_mut(4) {
+                    let packed = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
+                    let (r, g, b) = if matches!(self.fourcc, XRGB2101010 | ARGB2101010) {
+                        (
+                            (packed >> 20) & 0x3ff,
+                            (packed >> 10) & 0x3ff,
+                            packed & 0x3ff,
+                        )
+                    } else {
+                        (
+                            packed & 0x3ff,
+                            (packed >> 10) & 0x3ff,
+                            (packed >> 20) & 0x3ff,
+                        )
+                    };
+                    let to_u8 = |value: u32| ((value * 255 + 511) / 1023) as u8;
+                    pixel.copy_from_slice(&[to_u8(r), to_u8(g), to_u8(b), 255]);
                 }
             }
             fourcc => bail!("unsupported Vulkan capture fourcc 0x{fourcc:08x}"),
@@ -1635,29 +1677,102 @@ impl AshDrmRenderer {
         rendered_target.last_frame = stream_frame;
         self.linear_scenes.get_mut(&stream_id).unwrap().initialized = true;
 
+        // Vulkan external-memory imports do not implicitly wait for writers in
+        // the DMA-BUF reservation object. Snapshot each distinct client
+        // buffer's writer fences and import them as temporary binary
+        // semaphores. The queue-family barriers above transfer ownership but
+        // are not a substitute for producer synchronization.
+        let mut implicit_dmabuf_ids = HashSet::new();
+        let mut implicit_dmabufs = Vec::new();
+        for (surface, texture) in surfaces.iter().zip(&textures) {
+            let Some(dmabuf) = surface.dmabuf.as_ref() else {
+                continue;
+            };
+            if !texture.is_some_and(|texture| texture.foreign) {
+                continue;
+            }
+            let Some(plane) = dmabuf.planes.first() else {
+                continue;
+            };
+            let identity = fd_identity(plane.as_raw_fd())?;
+            if implicit_dmabuf_ids.insert(identity) {
+                implicit_dmabufs.push(plane.clone());
+            }
+        }
+        let mut wait_semaphores = Vec::with_capacity(implicit_dmabufs.len());
+        for dmabuf in &implicit_dmabufs {
+            let Some(sync_file) = export_dmabuf_read_fence(dmabuf.as_raw_fd())? else {
+                continue;
+            };
+            match self.import_sync_file_semaphore(sync_file) {
+                Ok(semaphore) => wait_semaphores.push(semaphore),
+                Err(error) => {
+                    unsafe {
+                        for semaphore in wait_semaphores.drain(..) {
+                            self.device.destroy_semaphore(semaphore, None);
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+
         let mut export = vk::ExportSemaphoreCreateInfo::default()
             .handle_types(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
-        let semaphore = unsafe {
+        let semaphore = match unsafe {
             self.device.create_semaphore(
                 &vk::SemaphoreCreateInfo::default().push_next(&mut export),
                 None,
             )
-        }?;
-        let fence = unsafe {
+        } {
+            Ok(semaphore) => semaphore,
+            Err(error) => {
+                unsafe {
+                    for wait in wait_semaphores.drain(..) {
+                        self.device.destroy_semaphore(wait, None);
+                    }
+                }
+                return Err(error).context("create Vulkan KMS release semaphore");
+            }
+        };
+        let fence = match unsafe {
             self.device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
-        }?;
+        } {
+            Ok(fence) => fence,
+            Err(error) => {
+                unsafe {
+                    for wait in wait_semaphores.drain(..) {
+                        self.device.destroy_semaphore(wait, None);
+                    }
+                    self.device.destroy_semaphore(semaphore, None);
+                }
+                return Err(error).context("create Vulkan completion fence");
+            }
+        };
         let signal = [semaphore];
         let commands = [command];
-        unsafe {
+        let wait_stages = vec![vk::PipelineStageFlags::FRAGMENT_SHADER; wait_semaphores.len()];
+        if let Err(error) = unsafe {
             self.device.queue_submit(
                 self.queue,
                 &[vk::SubmitInfo::default()
+                    .wait_semaphores(&wait_semaphores)
+                    .wait_dst_stage_mask(&wait_stages)
                     .command_buffers(&commands)
                     .signal_semaphores(&signal)],
                 fence,
             )
-        }?;
+        } {
+            unsafe {
+                for wait in wait_semaphores.drain(..) {
+                    self.device.destroy_semaphore(wait, None);
+                }
+                self.device.destroy_semaphore(semaphore, None);
+                self.device.destroy_fence(fence, None);
+            }
+            return Err(error).context("submit raw Vulkan composition");
+        }
         let raw_fd = unsafe {
             self.external_semaphore_fd.get_semaphore_fd(
                 &vk::SemaphoreGetFdInfoKHR::default()
@@ -1666,6 +1781,19 @@ impl AshDrmRenderer {
             )
         }?;
         let fence_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        // Publish the Vulkan read completion back into the implicit-sync
+        // reservation objects. Wayland buffer retention already prevents
+        // normal reuse, while this also protects implicit consumers which use
+        // the DMA-BUF reservation state directly.
+        for dmabuf in &implicit_dmabufs {
+            let result = fence_fd
+                .try_clone()
+                .context("duplicate Vulkan release fence")
+                .and_then(|release| import_dmabuf_read_fence(dmabuf.as_raw_fd(), release));
+            if let Err(error) = result {
+                tracing::warn!(%error, "failed to publish Vulkan read fence to DMA-BUF");
+            }
+        }
         let retentions = surfaces
             .iter()
             .filter_map(|surface| surface.retention.clone())
@@ -1675,6 +1803,7 @@ impl AshDrmRenderer {
             fence,
             command,
             semaphore,
+            wait_semaphores,
             framebuffers: vec![scene_framebuffer, output_framebuffer],
             retired_textures,
             retired_outputs: retired_output.into_iter().collect(),
@@ -2795,6 +2924,29 @@ impl AshDrmRenderer {
         Ok(BufferResource { buffer, memory })
     }
 
+    fn import_sync_file_semaphore(&self, sync_file: OwnedFd) -> Result<vk::Semaphore> {
+        let semaphore = unsafe {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .context("create DMA-BUF acquire semaphore")?;
+        let raw_fd = sync_file.into_raw_fd();
+        let import = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(raw_fd);
+        if let Err(error) = unsafe { self.external_semaphore_fd.import_semaphore_fd(&import) } {
+            // Vulkan consumes a SYNC_FD only after a successful import.
+            unsafe {
+                drop(OwnedFd::from_raw_fd(raw_fd));
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            return Err(error).context("import DMA-BUF acquire sync file into Vulkan");
+        }
+        Ok(semaphore)
+    }
+
     fn read_completed_capture(&self, capture: &PendingCapture) -> Result<AshDrmCapture> {
         let ptr = unsafe {
             self.device.map_memory(
@@ -2865,6 +3017,9 @@ impl AshDrmRenderer {
             for framebuffer in frame.framebuffers {
                 self.device.destroy_framebuffer(framebuffer, None);
             }
+            for semaphore in frame.wait_semaphores {
+                self.device.destroy_semaphore(semaphore, None);
+            }
             self.device.destroy_semaphore(frame.semaphore, None);
             self.device.destroy_fence(frame.fence, None);
             self.device
@@ -2934,6 +3089,9 @@ impl Drop for AshDrmRenderer {
                 }
                 for framebuffer in frame.framebuffers {
                     self.device.destroy_framebuffer(framebuffer, None);
+                }
+                for semaphore in frame.wait_semaphores {
+                    self.device.destroy_semaphore(semaphore, None);
                 }
                 self.device.destroy_semaphore(frame.semaphore, None);
                 self.device.destroy_fence(frame.fence, None);
@@ -3090,6 +3248,42 @@ fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
     }
     let value = unsafe { value.assume_init() };
     Ok((value.st_dev, value.st_ino))
+}
+
+#[cfg(unix)]
+fn export_dmabuf_read_fence(fd: RawFd) -> Result<Option<OwnedFd>> {
+    let mut export = DmaBufExportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: -1,
+    };
+    match unsafe { dma_buf_export_sync_file(fd, &mut export) } {
+        Ok(_) => {
+            ensure!(export.fd >= 0, "DMA-BUF fence export returned no sync file");
+            Ok(Some(unsafe { OwnedFd::from_raw_fd(export.fd) }))
+        }
+        Err(nix::errno::Errno::ENOTTY | nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {
+            // Old kernels or non-DMA-BUF test descriptors cannot provide a
+            // reservation fence. Explicit-sync commit blockers and Wayland
+            // buffer retention remain in force for those inputs.
+            Ok(None)
+        }
+        Err(error) => Err(error).context("export DMA-BUF implicit read fence"),
+    }
+}
+
+#[cfg(unix)]
+fn import_dmabuf_read_fence(dmabuf_fd: RawFd, sync_fd: OwnedFd) -> Result<()> {
+    let import = DmaBufImportSyncFile {
+        flags: DMA_BUF_SYNC_READ,
+        fd: sync_fd.as_raw_fd(),
+    };
+    match unsafe { dma_buf_import_sync_file(dmabuf_fd, &import) } {
+        Ok(_) => Ok(()),
+        Err(nix::errno::Errno::ENOTTY | nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {
+            Ok(())
+        }
+        Err(error) => Err(error).context("import Vulkan read fence into DMA-BUF"),
+    }
 }
 
 fn color_range() -> vk::ImageSubresourceRange {
@@ -3326,11 +3520,12 @@ fn texture_needs_refresh(compatible: bool, external: bool, damaged: bool) -> boo
 #[cfg(test)]
 mod tests {
     use super::{
-        compile_shader, dmabuf_planes_share_object, effective_damage_regions, identity_output_lut,
+        compile_shader, dmabuf_planes_share_object, effective_damage_regions,
+        export_dmabuf_read_fence, identity_output_lut, import_dmabuf_read_fence,
         mesh_clip_transform, multiply_3x3, ndc_rect, solid_push_constants, texture_components,
         texture_needs_refresh, texture_vk_format, transformed_uv, validate_output_lut, vk_format,
         AshDrmCapture, AshDrmOutputLut, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER,
-        SOLID_SHADER, TEXTURE_SHADER, XRGB2101010, XRGB8888,
+        SOLID_SHADER, TEXTURE_SHADER, XBGR2101010, XRGB2101010, XRGB8888,
     };
     use crate::{FramePixelFormat, FrameTransform, SolidQuad};
     use std::collections::VecDeque;
@@ -3368,6 +3563,17 @@ mod tests {
         let (third, _) = UnixStream::pair().unwrap();
         let third: OwnedFd = third.into();
         assert!(!dmabuf_planes_share_object(&[Arc::new(second), Arc::new(third)]).unwrap());
+    }
+
+    #[test]
+    fn non_dmabuf_descriptors_report_no_implicit_fence_support() {
+        use std::os::fd::AsRawFd;
+
+        let (descriptor, sync_file) = UnixStream::pair().unwrap();
+        assert!(export_dmabuf_read_fence(descriptor.as_raw_fd())
+            .unwrap()
+            .is_none());
+        import_dmabuf_read_fence(descriptor.as_raw_fd(), sync_file.into()).unwrap();
     }
 
     #[test]
@@ -3489,6 +3695,29 @@ mod tests {
             pixels: vec![10, 20, 30, 99],
         };
         assert_eq!(capture.into_rgba8().unwrap(), vec![30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn ten_bit_scanout_capture_is_normalized_to_rgba8() {
+        let packed = (1023_u32 << 20) | (512_u32 << 10);
+        let capture = AshDrmCapture {
+            id: 8,
+            width: 1,
+            height: 1,
+            fourcc: XRGB2101010,
+            pixels: packed.to_le_bytes().to_vec(),
+        };
+        assert_eq!(capture.into_rgba8().unwrap(), vec![255, 128, 0, 255]);
+
+        let packed = 1023_u32 | (512_u32 << 10);
+        let capture = AshDrmCapture {
+            id: 9,
+            width: 1,
+            height: 1,
+            fourcc: XBGR2101010,
+            pixels: packed.to_le_bytes().to_vec(),
+        };
+        assert_eq!(capture.into_rgba8().unwrap(), vec![255, 128, 0, 255]);
     }
 
     #[test]

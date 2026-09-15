@@ -51,14 +51,18 @@ use super::common::{
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    configured_display_hdr_requested, configured_display_scale, configured_hdr_appearance,
-    connector_edid, dispatch_backend_input_event, hdr_detection, load_display_config,
-    parse_edid_identity, select_connector_mode, HdrSupport,
+    connector_edid, dispatch_backend_input_event, display_matches_monitor,
+    hdr_appearance_from_support, hdr_detection, load_display_config,
+    merge_disconnected_display_configs, parse_edid_identity, select_connector_mode,
+    write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
 };
 use super::wgpu_nested::VulkanSceneBuilder;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
+const HDR_STATE_VALIDATION_INTERVAL: Duration = Duration::from_secs(2);
+const HDR_REARM_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
+const HDR_REARM_ATTEMPTS_BEFORE_REBUILD: u8 = 3;
 const SDR_SCANOUT_FORMATS: [Fourcc; 4] = [
     Fourcc::Xrgb8888,
     Fourcc::Argb8888,
@@ -119,6 +123,7 @@ struct OutputConfig {
     connector: connector::Handle,
     crtc: crtc::Handle,
     mode: Mode,
+    available_modes: Vec<DisplayModeConfig>,
     width: u32,
     height: u32,
     scale: f64,
@@ -139,6 +144,7 @@ struct OutputConfig {
 
 struct VulkanOutput {
     name: String,
+    connector: connector::Handle,
     width: u32,
     height: u32,
     output_id: OutputId,
@@ -148,6 +154,12 @@ struct VulkanOutput {
     frame_pending: bool,
     present_started_at: Option<Instant>,
     hdr_metadata_blob: Option<u64>,
+    hdr_support: HdrSupport,
+    next_hdr_validation: Instant,
+    hdr_last_validation_ok: bool,
+    hdr_rearm_pending: bool,
+    hdr_rearm_attempts: u8,
+    hdr_transition_retry_at: Option<Instant>,
     cursor: Option<KmsCursor>,
 }
 
@@ -187,6 +199,7 @@ struct VulkanDrmData {
     resume_pending: bool,
     resume_retry_at: Option<Instant>,
     topology_refresh_pending: bool,
+    hdr_recovery_rebuild_attempted: bool,
     capture_pending: HashSet<OutputId>,
     screenshot_all_captures: HashMap<OutputId, (u32, u32, Vec<u8>)>,
     fatal_error: Option<anyhow::Error>,
@@ -256,14 +269,20 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
         }
         let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
         let saved = configured.iter().find(|display| display.name == name);
-        if saved.is_some_and(|display| !display.enabled) {
+        let edid = connector_edid(drm, *handle);
+        let hdr_support = hdr_detection::connector_hdr_support(drm, *handle, edid.as_deref());
+        let identity = edid.as_deref().and_then(parse_edid_identity);
+        let saved_monitor = configured
+            .iter()
+            .find(|display| display_matches_monitor(display, identity.as_ref()));
+        if saved_monitor.is_some_and(|display| !display.enabled) {
             flog(format!(
                 "Raw Vulkan DRM leaving configured-disabled output {name} off"
             ));
             continue;
         }
-        let requested_mode =
-            saved.map(|display| (display.mode_width, display.mode_height, display.refresh_mhz));
+        let requested_mode = saved_monitor
+            .map(|display| (display.mode_width, display.mode_height, display.refresh_mhz));
         let mode = select_connector_mode(info.modes(), requested_mode)
             .context("connected DRM output has no mode")?;
         let selected_crtc = info.encoders().iter().find_map(|encoder| {
@@ -285,11 +304,13 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             .filter(|(width, height)| *width > 0 && *height > 0)
             .map(|(width, height)| (width as i32, height as i32))
             .unwrap_or(fallback_mm);
-        let edid = connector_edid(drm, *handle);
-        let hdr_support = hdr_detection::connector_hdr_support(drm, *handle, edid.as_deref());
-        let hdr_requested = configured_display_hdr_requested(&configured, &name);
-        let hdr_appearance = configured_hdr_appearance(&configured, &name);
-        let identity = edid.as_deref().and_then(parse_edid_identity);
+        let hdr_requested = saved_monitor
+            .map(|display| display.hdr_requested || display.hdr_enabled)
+            .unwrap_or(false);
+        let hdr_appearance = saved_monitor
+            .map(|display| display.hdr_appearance)
+            .and_then(|appearance| appearance.validate().ok())
+            .unwrap_or_else(|| hdr_appearance_from_support(&hdr_support));
         let make = identity
             .as_ref()
             .map(|identity| identity.make.clone())
@@ -302,7 +323,10 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             .as_ref()
             .map(|identity| identity.serial_number.clone())
             .unwrap_or_else(|| name.clone());
-        let scale = configured_display_scale(&configured, &name);
+        let scale = saved_monitor
+            .map(|display| display.scale)
+            .filter(|scale| scale.is_finite() && (1.0..=4.0).contains(scale))
+            .unwrap_or(1.0);
         let logical_width = (f64::from(width) / scale).round() as i32;
         let origin = saved
             .map(|display| Point::from((display.logical_x, display.logical_y)))
@@ -313,6 +337,18 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             connector: *handle,
             crtc,
             mode,
+            available_modes: info
+                .modes()
+                .iter()
+                .map(|candidate| {
+                    let (width, height) = candidate.size();
+                    DisplayModeConfig {
+                        width: i32::from(width),
+                        height: i32::from(height),
+                        refresh_mhz: (candidate.vrefresh() as i32).max(1) * 1_000,
+                    }
+                })
+                .collect(),
             width: u32::from(width),
             height: u32::from(height),
             scale,
@@ -324,10 +360,10 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             model,
             serial_number,
             edid,
-            color_profile: saved
+            color_profile: saved_monitor
                 .map(|display| display.color_profile)
                 .unwrap_or_default(),
-            icc_profile_path: saved.and_then(|display| display.icc_profile_path.clone()),
+            icc_profile_path: saved_monitor.and_then(|display| display.icc_profile_path.clone()),
             hdr_support,
             hdr_requested,
             hdr_appearance,
@@ -338,6 +374,47 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             "no enabled connected DRM output with a usable mode"
         ))
     } else {
+        let snapshots = outputs
+            .iter()
+            .map(|output| {
+                let saved = configured
+                    .iter()
+                    .find(|display| display.name == output.name);
+                let metadata = output.hdr_support.edid_hdr_metadata;
+                DisplayConfig {
+                    name: output.name.clone(),
+                    monitor_make: Some(output.make.clone()),
+                    monitor_model: Some(output.model.clone()),
+                    monitor_serial: Some(output.serial_number.clone()),
+                    enabled: true,
+                    mode_width: output.width as i32,
+                    mode_height: output.height as i32,
+                    refresh_mhz: (output.mode.vrefresh() as i32).max(1) * 1_000,
+                    available_modes: output.available_modes.clone(),
+                    scale: output.scale,
+                    logical_x: output.origin.x,
+                    logical_y: output.origin.y,
+                    physical_width_mm: Some(output.physical_size_mm.0),
+                    physical_height_mm: Some(output.physical_size_mm.1),
+                    primary: output.primary,
+                    transform: saved
+                        .map(|display| display.transform.clone())
+                        .unwrap_or(super::drm::DisplayTransform::Normal),
+                    hdr_supported: output.hdr_support.is_detected(),
+                    hdr_max_luminance_nits: metadata.map(|value| f32::from(value.max_luminance)),
+                    hdr_max_fall_nits: metadata.map(|value| f32::from(value.max_fall)),
+                    hdr_requested: output.hdr_requested,
+                    hdr_enabled: false,
+                    hdr_appearance: output.hdr_appearance,
+                    color_profile: output.color_profile,
+                    icc_profile_path: output.icc_profile_path.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let snapshots = merge_disconnected_display_configs(snapshots, &configured);
+        if let Err(error) = write_display_config(&snapshots) {
+            flog_warn!("Raw Vulkan could not refresh display inventory: {error:#}");
+        }
         Ok(outputs)
     }
 }
@@ -811,6 +888,7 @@ fn initialize_vulkan_outputs(
         ));
         outputs.push(VulkanOutput {
             name: config.name,
+            connector: config.connector,
             width: config.width,
             height: config.height,
             output_id: config.output_id,
@@ -820,6 +898,12 @@ fn initialize_vulkan_outputs(
             frame_pending: false,
             present_started_at: None,
             hdr_metadata_blob,
+            hdr_support: config.hdr_support,
+            next_hdr_validation: Instant::now() + HDR_STATE_VALIDATION_INTERVAL,
+            hdr_last_validation_ok: false,
+            hdr_rearm_pending: false,
+            hdr_rearm_attempts: 0,
+            hdr_transition_retry_at: None,
             cursor,
         });
     }
@@ -880,6 +964,224 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
     data.desktop.state.restore_output_topology(snapshot);
     data.desktop.state.mark_redraw();
     Ok(true)
+}
+
+/// A sink-side picture-mode change or link retrain can leave scanout running
+/// while silently dropping connector colorspace or HDR metadata. Periodically
+/// verify the live properties and re-arm them with the next atomic frame.
+/// Rendering stays PQ while repair is pending, preventing an SDR frame from
+/// being committed at the same time as restored HDR signaling.
+fn maintain_vulkan_hdr_state(data: &mut VulkanDrmData) {
+    let now = Instant::now();
+    for index in 0..data.outputs.len() {
+        let output_id = data.outputs[index].output_id;
+        let hdr_expected = data
+            .desktop
+            .state
+            .outputs
+            .get(&output_id)
+            .is_some_and(|output| {
+                output.hdr_requested && output.hdr_supported && output.hdr_kms_applied
+            });
+        if !hdr_expected || data.outputs[index].hdr_metadata_blob.is_none() {
+            data.outputs[index].hdr_rearm_pending = false;
+            data.outputs[index].hdr_rearm_attempts = 0;
+            data.outputs[index].next_hdr_validation = now + HDR_STATE_VALIDATION_INTERVAL;
+            continue;
+        }
+        if data.outputs[index].frame_pending || now < data.outputs[index].next_hdr_validation {
+            continue;
+        }
+
+        let connector = data.outputs[index].connector;
+        let require_max_bpc = data.outputs[index].hdr_support.max_bpc.is_some();
+        match hdr_detection::hdr_kms::validate_connector_hdr_state(
+            &data.drm,
+            connector,
+            true,
+            require_max_bpc,
+        ) {
+            Ok(_) => {
+                data.outputs[index].hdr_last_validation_ok = true;
+                if data.outputs[index].hdr_rearm_pending {
+                    flog_warn!(
+                        "Raw Vulkan HDR signaling recovered on {} after {} re-arm attempt(s)",
+                        data.outputs[index].name,
+                        data.outputs[index].hdr_rearm_attempts
+                    );
+                }
+                data.outputs[index].hdr_rearm_pending = false;
+                data.outputs[index].hdr_rearm_attempts = 0;
+                data.outputs[index].next_hdr_validation = now + HDR_STATE_VALIDATION_INTERVAL;
+            }
+            Err(readback_error) => {
+                data.outputs[index].hdr_last_validation_ok = false;
+                let attempts = data.outputs[index].hdr_rearm_attempts;
+                if attempts >= HDR_REARM_ATTEMPTS_BEFORE_REBUILD {
+                    if data.hdr_recovery_rebuild_attempted {
+                        flog_warn!(
+                            "Raw Vulkan HDR signaling remains invalid on {} after a recovery rebuild ({readback_error:#}); retaining PQ scanout and continuing bounded re-arm attempts",
+                            data.outputs[index].name
+                        );
+                    } else {
+                        flog_warn!(
+                            "Raw Vulkan HDR signaling remained invalid on {} after {} re-arm attempts ({readback_error:#}); scheduling one output rebuild",
+                            data.outputs[index].name,
+                            attempts
+                        );
+                        data.hdr_recovery_rebuild_attempted = true;
+                        data.topology_refresh_pending = true;
+                    }
+                    data.outputs[index].hdr_rearm_pending = false;
+                    data.outputs[index].hdr_rearm_attempts = 0;
+                    data.outputs[index].next_hdr_validation = now + HDR_STATE_VALIDATION_INTERVAL;
+                    continue;
+                }
+
+                let metadata_blob = data.outputs[index]
+                    .hdr_metadata_blob
+                    .expect("HDR expectation requires a metadata blob");
+                let staged = hdr_detection::hdr_kms::build_connector_hdr_state(
+                    &data.drm,
+                    connector,
+                    &data.outputs[index].hdr_support,
+                    true,
+                    Some(metadata_blob),
+                )
+                .and_then(|state| {
+                    state.ok_or_else(|| anyhow!("connector exposes no programmable HDR state"))
+                })
+                .and_then(|state| {
+                    data.outputs[index]
+                        .scanout
+                        .surface()
+                        .use_hdr_state(state)
+                        .map_err(|error| anyhow!("queue HDR connector re-arm: {error}"))
+                });
+
+                data.outputs[index].hdr_rearm_pending = true;
+                data.outputs[index].hdr_rearm_attempts = attempts.saturating_add(1);
+                data.outputs[index].next_hdr_validation = now + HDR_REARM_VERIFY_TIMEOUT;
+                match staged {
+                    Ok(()) => {
+                        flog_warn!(
+                            "Raw Vulkan HDR signaling lost on {} ({readback_error:#}); staged atomic re-arm attempt {}",
+                            data.outputs[index].name,
+                            data.outputs[index].hdr_rearm_attempts
+                        );
+                        data.desktop.state.mark_output_full_damage(
+                            output_id,
+                            crate::core::desktop::DamageSource::Unknown,
+                        );
+                    }
+                    Err(stage_error) => {
+                        flog_warn!(
+                            "Raw Vulkan HDR re-arm staging failed on {} after invalid readback ({readback_error:#}): {stage_error:#}",
+                            data.outputs[index].name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    let active_hdr_outputs = data.outputs.iter().filter(|output| {
+        data.desktop
+            .state
+            .outputs
+            .get(&output.output_id)
+            .is_some_and(|state| {
+                state.hdr_requested && state.hdr_supported && state.hdr_kms_applied
+            })
+    });
+    let mut active_count = 0;
+    let all_active_valid = active_hdr_outputs.fold(true, |all_valid, output| {
+        active_count += 1;
+        all_valid && output.hdr_last_validation_ok
+    });
+    if active_count > 0 && all_active_valid {
+        data.hdr_recovery_rebuild_attempted = false;
+    }
+}
+
+/// Stage connector HDR changes requested by the desktop state.
+///
+/// Raw Vulkan used to program HDR only while creating an output. Clearing
+/// `hdr_requested` for logout, suspend, restart, or shutdown therefore never
+/// queued the matching SDR connector state, and the pending session action
+/// waited forever for `hdr_kms_applied` to become false.
+fn stage_vulkan_hdr_transitions(data: &mut VulkanDrmData) {
+    for index in 0..data.outputs.len() {
+        let output_id = data.outputs[index].output_id;
+        let Some(state) = data.desktop.state.outputs.get(&output_id) else {
+            continue;
+        };
+        if data.outputs[index].frame_pending || state.hdr_transition_target.is_some() {
+            continue;
+        }
+        if data.outputs[index]
+            .hdr_transition_retry_at
+            .is_some_and(|retry_at| Instant::now() < retry_at)
+        {
+            continue;
+        }
+
+        let target = state.hdr_requested
+            && state.hdr_supported
+            && data.outputs[index].hdr_metadata_blob.is_some()
+            && HDR_SCANOUT_FORMATS.contains(&data.outputs[index].scanout.format());
+        if target == state.hdr_kms_applied {
+            continue;
+        }
+
+        let output = &mut data.outputs[index];
+        let connector_state = hdr_detection::hdr_kms::build_connector_hdr_state(
+            &data.drm,
+            output.connector,
+            &output.hdr_support,
+            target,
+            if target {
+                output.hdr_metadata_blob
+            } else {
+                None
+            },
+        );
+        let staged = connector_state.and_then(|connector_state| {
+            let Some(connector_state) = connector_state else {
+                return Err(anyhow!("connector exposes no programmable HDR state"));
+            };
+            output
+                .scanout
+                .surface()
+                .use_hdr_state(connector_state)
+                .map_err(|error| anyhow!("queue connector HDR transition: {error}"))
+        });
+
+        match staged {
+            Ok(()) => {
+                data.outputs[index].hdr_transition_retry_at = None;
+                if let Some(state) = data.desktop.state.outputs.get_mut(&output_id) {
+                    state.hdr_transition_target = Some(target);
+                }
+                data.desktop.state.mark_output_full_damage(
+                    output_id,
+                    crate::core::desktop::DamageSource::Unknown,
+                );
+                flog_warn!(
+                    "Raw Vulkan HDR KMS transition staged on {}: target={target}",
+                    data.outputs[index].name
+                );
+            }
+            Err(error) => {
+                data.outputs[index].hdr_transition_retry_at =
+                    Some(Instant::now() + HDR_REARM_VERIFY_TIMEOUT);
+                flog_warn!(
+                    "Raw Vulkan HDR KMS transition staging failed on {}: {error:#}",
+                    data.outputs[index].name
+                );
+            }
+        }
+    }
 }
 
 fn save_vulkan_screenshot(
@@ -1001,6 +1303,11 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
         Ok(pixels) => pixels,
         Err(error) => {
             flog_warn!("Vulkan capture conversion failed: {error:#}");
+            data.desktop.state.clear_screenshot_request(output_id);
+            if data.desktop.state.screenshot_all_requested {
+                data.desktop.state.screenshot_all_requested = false;
+                data.screenshot_all_captures.clear();
+            }
             return;
         }
     };
@@ -1128,6 +1435,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         resume_pending: false,
         resume_retry_at: None,
         topology_refresh_pending: false,
+        hdr_recovery_rebuild_attempted: false,
         capture_pending: HashSet::new(),
         screenshot_all_captures: HashMap::new(),
         fatal_error: None,
@@ -1200,6 +1508,26 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     let output = &mut data.outputs[index];
                     output.frame_pending = false;
                     output.present_started_at = None;
+                    if let Some(state) = data.desktop.state.outputs.get_mut(&output.output_id) {
+                        if let Some(target) = state.hdr_transition_target.take() {
+                            state.hdr_kms_applied = target;
+                            state.hdr_enabled = target;
+                            if !target {
+                                state.hdr_verification_pending = false;
+                                output.hdr_last_validation_ok = false;
+                                output.hdr_rearm_pending = false;
+                                output.hdr_rearm_attempts = 0;
+                            }
+                            output.hdr_transition_retry_at = None;
+                            flog_warn!(
+                                "Raw Vulkan HDR KMS transition completed on {}: active={target}",
+                                output.name
+                            );
+                        }
+                    }
+                    if output.hdr_rearm_pending {
+                        output.next_hdr_validation = Instant::now();
+                    }
                     // A cursor update may have been deferred while this atomic
                     // primary-plane commit was pending.  Submit the newest
                     // coalesced position now that the CRTC is idle.
@@ -1305,6 +1633,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .dispatch(Some(Duration::ZERO), &mut data.desktop.state)?;
         data.desktop.state.process_hdr_safe_session_action();
         data.desktop.state.process_deferred_ui_and_launches();
+        stage_vulkan_hdr_transitions(&mut data);
         if let Err(error) = data.renderer.poll() {
             recover_vulkan_renderer(&mut data, &error)?;
             continue;
@@ -1338,6 +1667,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if !data.session_active {
             continue;
         }
+        maintain_vulkan_hdr_state(&mut data);
         while let Some(stream) = data.desktop.listener.accept()? {
             let client_state = client_state_from_stream(&stream);
             let client = data

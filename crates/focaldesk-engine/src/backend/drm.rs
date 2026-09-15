@@ -132,6 +132,12 @@ pub struct DisplayModeConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DisplayConfig {
     pub name: String,
+    #[serde(default)]
+    pub monitor_make: Option<String>,
+    #[serde(default)]
+    pub monitor_model: Option<String>,
+    #[serde(default)]
+    pub monitor_serial: Option<String>,
     pub enabled: bool,
 
     pub mode_width: i32,
@@ -153,6 +159,10 @@ pub struct DisplayConfig {
 
     #[serde(default)]
     pub hdr_supported: bool,
+    #[serde(default)]
+    pub hdr_max_luminance_nits: Option<f32>,
+    #[serde(default)]
+    pub hdr_max_fall_nits: Option<f32>,
     #[serde(default)]
     pub hdr_requested: bool,
     #[serde(default)]
@@ -313,6 +323,7 @@ pub struct DrmSurfaceState {
     pub mode: WlMode,
     pub available_modes: Vec<DisplayModeConfig>,
     pub size: Size<i32, Physical>,
+    pub physical_size_mm: (i32, i32),
     pub output_id: OutputId,
     pub origin: Point<i32, Logical>,
     pub present_render_id: Id,
@@ -800,6 +811,31 @@ pub(crate) fn configured_display_hdr_requested(displays: &[DisplayConfig], name:
         .unwrap_or(false)
 }
 
+pub(crate) fn display_matches_monitor(
+    display: &DisplayConfig,
+    identity: Option<&EdidMonitorIdentity>,
+) -> bool {
+    let Some(identity) = identity else {
+        return false;
+    };
+    display.monitor_make.as_deref() == Some(identity.make.as_str())
+        && display.monitor_model.as_deref() == Some(identity.model.as_str())
+        && display.monitor_serial.as_deref() == Some(identity.serial_number.as_str())
+}
+
+pub(crate) fn hdr_appearance_from_support(support: &HdrSupport) -> HdrAppearance {
+    support
+        .edid_hdr_metadata
+        .map(|metadata| {
+            HdrAppearance::from_edid(
+                f32::from(metadata.max_luminance),
+                f32::from(metadata.max_fall),
+                f32::from(metadata.min_luminance) / 10_000.0,
+            )
+        })
+        .unwrap_or_default()
+}
+
 /// Remember that exclusive HDR verified on this connector so the next ordinary
 /// session can Apply Requested HDR10 even if exclusive mode is not re-armed.
 fn enable_persisted_hdr_request(output_name: &str) {
@@ -910,7 +946,7 @@ pub(crate) fn configured_hdr_appearance(displays: &[DisplayConfig], name: &str) 
         .unwrap_or_default()
 }
 
-fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
+pub(crate) fn write_display_config(displays: &[DisplayConfig]) -> Result<()> {
     let path = display_config_path();
     let dir = path
         .parent()
@@ -1821,17 +1857,18 @@ mod output_render_scheduling_tests {
 mod hdr_tests {
     use super::{
         configured_display_hdr_requested, deferred_topology_refresh_ready,
-        disable_explicit_kms_fences, exclusive_hdr_prepare_decision, hdr_active_status_verified,
-        hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
+        disable_explicit_kms_fences, display_matches_monitor, exclusive_hdr_prepare_decision,
+        hdr_active_status_verified, hdr_commit_stalled, hdr_detection::parse_edid_hdr_support,
         hdr_driver_allows_output_with_override, hdr_failure_persist_action,
         hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
         select_requested_drm_mode_index, should_defer_drm_topology_change,
         should_remove_drm_device, DisplayConfig, DisplayTransform, DrmLifecycle, DrmModeCandidate,
-        EdidHdrMetadata, ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport,
-        DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS,
-        HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
+        EdidHdrMetadata, EdidMonitorIdentity, ExclusiveHdrPrepareDecision, HdrBpcRange,
+        HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE,
+        HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS,
+        OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance};
     use std::time::{Duration, Instant};
@@ -1839,6 +1876,9 @@ mod hdr_tests {
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
         DisplayConfig {
             name: "DP-1".into(),
+            monitor_make: None,
+            monitor_model: None,
+            monitor_serial: None,
             enabled: true,
             mode_width: 2560,
             mode_height: 1440,
@@ -1852,6 +1892,8 @@ mod hdr_tests {
             primary: true,
             transform: DisplayTransform::Normal,
             hdr_supported: true,
+            hdr_max_luminance_nits: None,
+            hdr_max_fall_nits: None,
             hdr_requested,
             hdr_enabled,
             hdr_appearance: HdrAppearance::default(),
@@ -1871,6 +1913,28 @@ mod hdr_tests {
             &[display_config(false, true)],
             "DP-1"
         ));
+    }
+
+    #[test]
+    fn monitor_specific_settings_require_the_same_edid_identity() {
+        let identity = EdidMonitorIdentity {
+            make: "TCL".into(),
+            model: "32R84".into(),
+            serial_number: "W000012X00125".into(),
+        };
+        let mut display = display_config(false, false);
+        assert!(!display_matches_monitor(&display, Some(&identity)));
+
+        display.monitor_make = Some(identity.make.clone());
+        display.monitor_model = Some(identity.model.clone());
+        display.monitor_serial = Some(identity.serial_number.clone());
+        assert!(display_matches_monitor(&display, Some(&identity)));
+
+        let other = EdidMonitorIdentity {
+            serial_number: "another-panel".into(),
+            ..identity
+        };
+        assert!(!display_matches_monitor(&display, Some(&other)));
     }
 
     #[test]
@@ -2406,15 +2470,26 @@ pub(crate) fn collect_display_configs(
                 .find(|display| display.name == output_name)
                 .is_some_and(|display| display.primary);
         }
-        let color_profile = configured_display_color_profile(configured_displays, &output_name);
-        let hdr_appearance = configured_hdr_appearance(configured_displays, &output_name);
-        let icc_profile_path = configured_displays
-            .iter()
-            .find(|display| display.name == output_name)
-            .and_then(|display| display.icc_profile_path.clone());
+        let color_profile = core_output
+            .map(|output| output.color_profile_override)
+            .unwrap_or_default();
+        let hdr_appearance = core_output
+            .map(|output| output.hdr_appearance)
+            .and_then(|appearance| appearance.validate().ok())
+            .unwrap_or_default();
+        let icc_profile_path = core_output.and_then(|output| output.icc_profile_path.clone());
 
         displays.push(DisplayConfig {
             name: output_name,
+            monitor_make: core_output
+                .map(|output| output.monitor_make.clone())
+                .filter(|value| !value.is_empty()),
+            monitor_model: core_output
+                .map(|output| output.monitor_model.clone())
+                .filter(|value| !value.is_empty()),
+            monitor_serial: core_output
+                .map(|output| output.monitor_serial.clone())
+                .filter(|value| !value.is_empty()),
             enabled: true,
 
             mode_width: w,
@@ -2427,14 +2502,17 @@ pub(crate) fn collect_display_configs(
             logical_x,
             logical_y,
 
-            physical_width_mm: None, // we’ll fix this next
-            physical_height_mm: None,
+            physical_width_mm: Some(surface.physical_size_mm.0),
+            physical_height_mm: Some(surface.physical_size_mm.1),
 
             primary,
 
             transform: DisplayTransform::Normal,
 
             hdr_supported,
+            hdr_max_luminance_nits: core_output
+                .and_then(|output| output.edid_hdr_max_luminance_nits),
+            hdr_max_fall_nits: core_output.and_then(|output| output.edid_hdr_max_fall_nits),
             hdr_requested,
             hdr_enabled,
             hdr_appearance,
@@ -2446,7 +2524,7 @@ pub(crate) fn collect_display_configs(
     merge_disconnected_display_configs(displays, configured_displays)
 }
 
-fn merge_disconnected_display_configs(
+pub(crate) fn merge_disconnected_display_configs(
     mut displays: Vec<DisplayConfig>,
     configured_displays: &[DisplayConfig],
 ) -> Vec<DisplayConfig> {
@@ -2456,8 +2534,26 @@ fn merge_disconnected_display_configs(
         .iter()
         .map(|display| display.name.clone())
         .collect();
+    let connected_monitors: std::collections::HashSet<_> = displays
+        .iter()
+        .filter_map(|display| {
+            Some((
+                display.monitor_make.as_ref()?.clone(),
+                display.monitor_model.as_ref()?.clone(),
+                display.monitor_serial.as_ref()?.clone(),
+            ))
+        })
+        .collect();
     for configured in configured_displays {
-        if connected_names.contains(&configured.name) {
+        let same_monitor_is_connected = configured
+            .monitor_make
+            .as_ref()
+            .zip(configured.monitor_model.as_ref())
+            .zip(configured.monitor_serial.as_ref())
+            .is_some_and(|((make, model), serial)| {
+                connected_monitors.contains(&(make.clone(), model.clone(), serial.clone()))
+            });
+        if connected_names.contains(&configured.name) || same_monitor_is_connected {
             continue;
         }
         let mut disconnected = configured.clone();
@@ -5045,16 +5141,24 @@ fn device_added(
             edid.as_deref(),
         );
         hdr_detection::log_hdr_support(&output_name, &hdr_support);
-        let hdr_requested_from_config =
-            configured_display_hdr_requested(&configured_displays, &output_name);
+        let edid_identity = edid.as_deref().and_then(parse_edid_identity);
+        let saved_display = configured_displays
+            .iter()
+            .find(|display| display.name == output_name);
+        // Connector names are not monitor identities. A monitor newly plugged
+        // into DP-3 must not inherit DP-3's old ICC profile or HDR calibration.
+        let saved_monitor = configured_displays
+            .iter()
+            .find(|display| display_matches_monitor(display, edid_identity.as_ref()));
+        let hdr_requested_from_config = saved_monitor
+            .map(|display| display.hdr_requested || display.hdr_enabled)
+            .unwrap_or(false);
         let hdr_requested_config = exclusive_hdr_output.as_deref() == Some(output_name.as_str())
             || hdr_requested_from_config;
         let hdr_safe_mode_requested = hdr_requested_config
             && hdr_support.can_signal_hdr10()
             && hdr_support.bpc_control_allows_ten_bit();
-        let requested_mode = configured_displays
-            .iter()
-            .find(|display| display.name == output_name)
+        let requested_mode = saved_monitor
             .map(|display| (display.mode_width, display.mode_height, display.refresh_mhz));
         let mode = select_connector_mode(info.modes(), requested_mode);
 
@@ -5079,7 +5183,6 @@ fn device_added(
                 .map(|(mm_w, mm_h)| (mm_w as i32, mm_h as i32))
                 .unwrap_or(fallback_mm);
 
-            let edid_identity = edid.as_deref().and_then(parse_edid_identity);
             let make = edid_identity
                 .as_ref()
                 .map(|identity| identity.make.clone())
@@ -5109,15 +5212,15 @@ fn device_added(
             // Logical layout in global compositor space (must match `register_output_entry` / `map_output`).
             // wl_output + xdg_output advertise this to clients; leaving (0,0) stacks every head at the origin
             // (e.g. OBS projector shows all DRM outputs on top of each other).
-            let output_scale = configured_display_scale(&configured_displays, &output_name);
+            let output_scale = saved_monitor
+                .map(|display| display.scale)
+                .filter(|scale| scale.is_finite() && (1.0..=4.0).contains(scale))
+                .unwrap_or(1.0);
             let output_scale_int = output_scale.round().max(1.0) as i32;
             let logical_size = Size::<i32, Logical>::from((
                 (w as f64 / output_scale).round() as i32,
                 (h as f64 / output_scale).round() as i32,
             ));
-            let saved_display = configured_displays
-                .iter()
-                .find(|display| display.name == output_name);
             let origin = saved_display
                 .map(|display| Point::<i32, Logical>::from((display.logical_x, display.logical_y)))
                 .unwrap_or_else(|| Point::<i32, Logical>::from((next_x, 0)));
@@ -5302,7 +5405,10 @@ fn device_added(
             );
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
                 sync_output_hdr_flags(out, &hdr_support, hdr_requested_config);
-                out.hdr_appearance = configured_hdr_appearance(&configured_displays, &output_name);
+                out.hdr_appearance = saved_monitor
+                    .map(|display| display.hdr_appearance)
+                    .and_then(|appearance| appearance.validate().ok())
+                    .unwrap_or_else(|| hdr_appearance_from_support(&hdr_support));
             }
 
             data.core.state.set_output_monitor_identity(
@@ -5313,12 +5419,11 @@ fn device_added(
                 edid.clone(),
             );
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
-                out.color_profile_override =
-                    configured_display_color_profile(&configured_displays, &output_name);
-                out.icc_profile_path = configured_displays
-                    .iter()
-                    .find(|display| display.name == output_name)
-                    .and_then(|display| display.icc_profile_path.clone());
+                out.color_profile_override = saved_monitor
+                    .map(|display| display.color_profile)
+                    .unwrap_or_default();
+                out.icc_profile_path =
+                    saved_monitor.and_then(|display| display.icc_profile_path.clone());
             }
             data.core.state.refresh_output_color(output_id);
 
@@ -5332,6 +5437,7 @@ fn device_added(
                 mode: wl_mode,
                 available_modes,
                 size: Size::<i32, Physical>::from((w as i32, h as i32)),
+                physical_size_mm: (mm_w, mm_h),
                 output_id,
                 origin,
                 present_render_id: Id::new(),

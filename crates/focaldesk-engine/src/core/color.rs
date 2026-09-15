@@ -189,23 +189,19 @@ pub fn hdr_reference_white_nits(max_luminance_nits: f32) -> f32 {
     HDR_REFERENCE_WHITE_NITS.min(max_luminance_nits.max(1.0))
 }
 
-/// DisplayHDR 400-class ceiling for authored HDR10 highlight energy.
-///
-/// ASUS VG32VQR-class VA panels advertise HDR10 and about 450 nits usable
-/// peak, but they have no local dimming. Inventing 800–1000 nit highlights
-/// only clips or trips the monitor's global tone map. Type-1 EDID often
-/// quantizes that peak to 409 nits; encode and KMS metadata use 450 so the
-/// panel's tone map matches the PQ we actually send.
+/// Conservative fallback when a display does not expose usable HDR metadata.
 pub const HDR_CONSERVATIVE_PEAK_NITS: f32 = 450.0;
 
-/// Usable HDR10 peak for encode, preferred client volume, and KMS metadata.
+/// Usable HDR10 peak for encode and preferred client volume.
 ///
-/// DisplayHDR 400 EDID commonly reports ~409 nits. These ASUS VA panels still
-/// reach about 450, so values at or below that ceiling are raised to 450.
-/// Brighter EDID peaks stay capped at [`HDR_CONSERVATIVE_PEAK_NITS`].
+/// Valid per-output EDID metadata is authoritative. The fallback remains for
+/// callers without EDID data; it must never cap a brighter monitor.
 pub fn hdr_conservative_peak_nits(max_luminance_nits: f32) -> f32 {
-    let _ = max_luminance_nits.max(1.0);
-    HDR_CONSERVATIVE_PEAK_NITS
+    if max_luminance_nits.is_finite() && max_luminance_nits > 0.0 {
+        max_luminance_nits.clamp(HDR_REFERENCE_WHITE_NITS, 10_000.0)
+    } else {
+        HDR_CONSERVATIVE_PEAK_NITS
+    }
 }
 
 /// CTA-861 Type-1 chromaticities for the BT.2020/D65 data sent to KMS.
@@ -1097,7 +1093,7 @@ mod tests {
         let hdr = kms_scanout_encode_description(sdr, true, Some(600.0), Some(400.0));
         assert_eq!(hdr.primaries, ColorPrimaries::Bt2020);
         assert_eq!(hdr.transfer, TransferFunction::St2084Pq);
-        assert_eq!(hdr.max_luminance_nits, HDR_CONSERVATIVE_PEAK_NITS);
+        assert_eq!(hdr.max_luminance_nits, 600.0);
         close(hdr.reference_white_nits, HDR_REFERENCE_WHITE_NITS, 0.0);
         assert_eq!(hdr.max_fall_nits, Some(HDR_REFERENCE_WHITE_NITS));
     }
@@ -1407,12 +1403,8 @@ mod tests {
             HDR_REFERENCE_WHITE_NITS,
             0.0,
         );
-        close(
-            preferred.max_luminance_nits,
-            HDR_CONSERVATIVE_PEAK_NITS,
-            0.0,
-        );
-        assert_eq!(preferred.max_cll_nits, Some(HDR_CONSERVATIVE_PEAK_NITS));
+        close(preferred.max_luminance_nits, 409.0, 0.0);
+        assert_eq!(preferred.max_cll_nits, Some(409.0));
         assert_eq!(preferred.max_fall_nits, Some(HDR_REFERENCE_WHITE_NITS));
         let rec2020_panel = ColorDescription {
             primaries: ColorPrimaries::Bt2020,
@@ -1422,11 +1414,7 @@ mod tests {
             ColorDescription::hdr_preferred_from_panel(rec2020_panel, 1_000.0, 400.0);
         assert_eq!(rec2020_preferred.primaries, ColorPrimaries::Bt2020);
         assert_eq!(rec2020_preferred.transfer, TransferFunction::St2084Pq);
-        close(
-            rec2020_preferred.max_luminance_nits,
-            HDR_CONSERVATIVE_PEAK_NITS,
-            0.0,
-        );
+        close(rec2020_preferred.max_luminance_nits, 1_000.0, 0.0);
         close(
             rec2020_preferred.reference_white_nits,
             HDR_REFERENCE_WHITE_NITS,
@@ -1507,21 +1495,14 @@ mod tests {
     }
 
     #[test]
-    fn hdr10_highlights_stay_inside_displayhdr_450_headroom() {
+    fn hdr10_highlights_follow_each_displays_edid_peak() {
+        assert_eq!(hdr_conservative_peak_nits(350.0), 350.0);
+        assert_eq!(hdr_conservative_peak_nits(409.0), 409.0);
+        assert_eq!(hdr_conservative_peak_nits(450.0), 450.0);
+        assert_eq!(hdr_conservative_peak_nits(1_000.0), 1_000.0);
+        assert_eq!(hdr_conservative_peak_nits(1_405.0), 1_405.0);
         assert_eq!(
-            hdr_conservative_peak_nits(350.0),
-            HDR_CONSERVATIVE_PEAK_NITS
-        );
-        assert_eq!(
-            hdr_conservative_peak_nits(409.0),
-            HDR_CONSERVATIVE_PEAK_NITS
-        );
-        assert_eq!(
-            hdr_conservative_peak_nits(450.0),
-            HDR_CONSERVATIVE_PEAK_NITS
-        );
-        assert_eq!(
-            hdr_conservative_peak_nits(1_000.0),
+            hdr_conservative_peak_nits(f32::NAN),
             HDR_CONSERVATIVE_PEAK_NITS
         );
         assert_eq!(hdr_reference_white_nits(409.0), HDR_REFERENCE_WHITE_NITS);

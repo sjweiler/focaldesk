@@ -362,7 +362,7 @@ install-focaldmd-fedora: release-focaldmd release-focaldm-greeter install-focald
     sudo systemctl daemon-reload
     @echo "focaldmd is installed but not enabled. Keep another display manager available until login testing succeeds."
 
-install-desktop: install-polkit
+install-desktop: install-polkit install-settings
     cargo build --release -p focaldesk-desktop
     sudo install -Dm644 assets/themes/default.toml /usr/share/focaldesk/default.toml
     sudo install -Dm644 assets/wallpaper/focaldesk_wallpaper.png /usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png

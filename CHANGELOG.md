@@ -16,6 +16,17 @@ version numbers where practical.
   HDR10/PQ output, hardware-cursor fallback, capture readback, and bounded GPU
   and KMS recovery. Hardware validation on Fedora 44/NVIDIA 595 confirmed mixed
   HDR/SDR output, sRGB and Display-P3 images, video, and compositor egui panels.
+- Raw Vulkan now verifies live HDR connector state periodically and atomically
+  re-arms BT.2020 signaling, link depth, and static metadata after a monitor
+  picture-mode change or DisplayPort link retrain silently drops them.
+- Raw Vulkan now completes live HDR-to-SDR connector transitions before
+  logout, suspend, restart, and shutdown. A bounded fallback executes the
+  requested session action even if the driver never reports a transition
+  vblank, preventing the dark shutdown screen from hanging indefinitely.
+- Changing the Focaldesk output gamut or ICC profile now updates the color
+  transform in place instead of rebuilding KMS scanout and disturbing HDR.
+- Raw Vulkan screenshots now support packed 10-bit HDR scanout formats and a
+  failed one-shot capture no longer retries GPU readback on every frame.
 - Added manifest-driven installation verification and a scoped uninstaller that
   preserves user data by default, plus a repeatable install-lifecycle test.
 - Added automatic, atomic migration from legacy `config.toml` desktop settings
@@ -89,6 +100,10 @@ version numbers where practical.
 
 ### Changed
 
+- Raw Vulkan now bridges implicit DMA-BUF synchronization into Vulkan: each
+  distinct client buffer's writer fence is imported as a temporary acquire
+  semaphore, and the completed Vulkan read fence is published back to the
+  reservation object. This prevents partially updated browser/video frames.
 - PolicyKit cancellation now reaches the matching in-flight authentication
   session, and dialog IPC waits no longer block the GLib authentication loop.
 - Settings can capture shortcuts directly from key presses and reports invalid

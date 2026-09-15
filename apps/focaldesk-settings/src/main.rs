@@ -269,6 +269,12 @@ struct DisplayModeConfig {
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct DisplayConfig {
     name: String,
+    #[serde(default)]
+    monitor_make: Option<String>,
+    #[serde(default)]
+    monitor_model: Option<String>,
+    #[serde(default)]
+    monitor_serial: Option<String>,
     enabled: bool,
 
     mode_width: i32,
@@ -290,6 +296,10 @@ struct DisplayConfig {
 
     #[serde(default)]
     hdr_supported: bool,
+    #[serde(default)]
+    hdr_max_luminance_nits: Option<f32>,
+    #[serde(default)]
+    hdr_max_fall_nits: Option<f32>,
     #[serde(default)]
     hdr_requested: bool,
     #[serde(default)]
@@ -610,14 +620,22 @@ fn display_summary(d: &DisplayConfig) -> String {
     } else {
         "sRGB advertised"
     };
+    let hdr = if d.hdr_supported {
+        d.hdr_max_luminance_nits
+            .map(|peak| format!("HDR10, {:.0} nit EDID peak", peak))
+            .unwrap_or_else(|| "HDR10".to_string())
+    } else {
+        "SDR".to_string()
+    };
     format!(
-        "{}x{} @ {} Hz  |  {}  |  {}  |  {}  |  Scale {:.2}{}{}{}",
+        "{}x{} @ {} Hz  |  {}  |  {}  |  {}  |  {}  |  Scale {:.2}{}{}{}",
         d.mode_width,
         d.mode_height,
         d.refresh_mhz / 1000,
         transform_label(&d.transform),
         profile,
         gamut,
+        hdr,
         d.scale,
         if d.primary { "  |  Primary" } else { "" },
         if d.enabled { "" } else { "  |  Disabled" },
@@ -1627,9 +1645,15 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
     section.set_subtitle("Final PQ shader only; does not change HDR signaling or display modes");
 
     let black_level = hdr_tuning_scale(0.0, 0.25, 0.005, initial.black_level_nits, 3);
-    let reference_white = hdr_tuning_scale(80.0, 450.0, 1.0, initial.reference_white_nits, 0);
-    let peak = hdr_tuning_scale(203.0, 450.0, 1.0, initial.peak_nits, 0);
-    let full_frame_peak = hdr_tuning_scale(80.0, 450.0, 1.0, initial.full_frame_peak_nits, 0);
+    let peak_limit = display
+        .hdr_max_luminance_nits
+        .unwrap_or(initial.peak_nits)
+        .max(initial.peak_nits)
+        .clamp(203.0, 10_000.0);
+    let peak_limit = f64::from(peak_limit);
+    let reference_white = hdr_tuning_scale(80.0, peak_limit, 1.0, initial.reference_white_nits, 0);
+    let peak = hdr_tuning_scale(203.0, peak_limit, 1.0, initial.peak_nits, 0);
+    let full_frame_peak = hdr_tuning_scale(80.0, peak_limit, 1.0, initial.full_frame_peak_nits, 0);
     let saturation = hdr_tuning_scale(0.75, 1.25, 0.01, initial.saturation, 2);
     let midtone_gamma = hdr_tuning_scale(0.70, 1.50, 0.01, initial.midtone_gamma, 2);
     let preset = gtk::DropDown::from_strings(HDR_APPEARANCE_PRESET_OPTIONS);
@@ -1811,7 +1835,12 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
         let midtone_gamma = midtone_gamma.clone();
         let preset = preset.clone();
         reset.connect_clicked(move |_| {
-            let defaults = HdrAppearance::default();
+            let defaults = display
+                .hdr_max_luminance_nits
+                .map(|peak| {
+                    HdrAppearance::from_edid(peak, display.hdr_max_fall_nits.unwrap_or(peak), 0.0)
+                })
+                .unwrap_or_default();
             suppress.set(true);
             *draft.borrow_mut() = defaults;
             preset.set_selected(0);
@@ -1880,7 +1909,11 @@ fn connected_display_row(
 ) -> adw::ExpanderRow {
     let display = displays.borrow()[index].clone();
     let row = adw::ExpanderRow::new();
-    row.set_title(&display.name);
+    let title = match (&display.monitor_make, &display.monitor_model) {
+        (Some(make), Some(model)) => format!("{make} {model} ({})", display.name),
+        _ => display.name.clone(),
+    };
+    row.set_title(&title);
     row.set_subtitle(&display_summary(&display));
     row.set_enable_expansion(true);
     row_registry
@@ -10067,6 +10100,9 @@ mod tests {
     fn display_output_config_keeps_hdr_request_and_runtime_state_separate() {
         let display = DisplayConfig {
             name: "DP-1".to_string(),
+            monitor_make: None,
+            monitor_model: None,
+            monitor_serial: None,
             enabled: true,
             mode_width: 3840,
             mode_height: 2160,
@@ -10082,6 +10118,8 @@ mod tests {
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
             hdr_supported: true,
+            hdr_max_luminance_nits: None,
+            hdr_max_fall_nits: None,
             hdr_requested: true,
             hdr_enabled: false,
             hdr_appearance: HdrAppearance::default(),
@@ -10101,6 +10139,9 @@ mod tests {
     fn test_display(name: &str, hdr_requested: bool) -> DisplayConfig {
         DisplayConfig {
             name: name.to_string(),
+            monitor_make: None,
+            monitor_model: None,
+            monitor_serial: None,
             enabled: true,
             mode_width: 2560,
             mode_height: 1440,
@@ -10116,6 +10157,8 @@ mod tests {
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
             hdr_supported: true,
+            hdr_max_luminance_nits: None,
+            hdr_max_fall_nits: None,
             hdr_requested,
             hdr_enabled: false,
             hdr_appearance: HdrAppearance::default(),

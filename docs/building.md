@@ -255,6 +255,7 @@ just install-desktop-session
 These recipes install:
 
 - `/usr/local/bin/focaldesk-desktop`
+- `/usr/local/bin/focaldesk-settings`
 - `/usr/libexec/focaldesk/focaldesk-polkitd`
 - `/usr/share/wayland-sessions/focaldesk.desktop`
 - `/usr/lib/systemd/user/focaldesk-session.target`

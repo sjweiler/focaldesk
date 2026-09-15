@@ -231,6 +231,7 @@ fn should_wait_for_lid_open_on_resume(last_lid_state: Option<bool>) -> bool {
 }
 
 const UNATTENDED_SUSPEND_PREPARE_TIMEOUT: Duration = Duration::from_secs(30);
+const HDR_SAFE_SESSION_ACTION_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug, Clone, Copy)]
 enum UnattendedSuspendState {
@@ -912,6 +913,7 @@ pub struct DesktopState {
     unattended_suspend_state: Option<UnattendedSuspendState>,
     deferred_power_action: Option<(PowerIpcRequest, &'static str)>,
     pending_hdr_safe_action: Option<HdrSafeSessionAction>,
+    pending_hdr_safe_action_started_at: Option<Instant>,
     hdr_outputs_to_restore_after_resume: Vec<OutputId>,
     low_battery_triggered: bool,
     lid_close_triggered: bool,
@@ -2825,6 +2827,9 @@ impl DesktopState {
         let single_output_id = (self.outputs.len() == 1 && outputs.len() == 1)
             .then(|| self.outputs.keys().copied().next())
             .flatten();
+        let mut backend_reconfigure_needed =
+            outputs.iter().filter(|output| output.enabled).count() != self.outputs.len();
+        let mut preferred_color_changed = false;
         let mut changed = false;
         let mut unmatched = Vec::new();
         for config in outputs {
@@ -2857,10 +2862,35 @@ impl DesktopState {
                 ));
             }
 
+            let requested_hdr = self.outputs.get(&output_id).is_some_and(|output| {
+                output.hdr_supported && (config.hdr_requested || config.hdr_enabled)
+            });
+            let (geometry_changed, color_changed, hdr_request_changed) = self
+                .outputs
+                .get(&output_id)
+                .map(|output| {
+                    let refresh_changed = output
+                        .handle
+                        .current_mode()
+                        .is_none_or(|mode| mode.refresh != config.refresh_mhz);
+                    (
+                        output.physical_size != physical_size
+                            || (output.scale_factor - scale_factor).abs() > f64::EPSILON
+                            || output.logical_origin != logical_origin
+                            || refresh_changed,
+                        output.color_profile_override != config.color_profile
+                            || output.icc_profile_path != config.icc_profile_path,
+                        output.hdr_requested != requested_hdr,
+                    )
+                })
+                .unwrap_or((true, true, true));
+            backend_reconfigure_needed |=
+                !config.enabled || geometry_changed || hdr_request_changed;
+            preferred_color_changed |= color_changed;
+
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
-                let requested = config.hdr_requested || config.hdr_enabled;
-                output.hdr_requested = output.hdr_supported && requested;
+                output.hdr_requested = requested_hdr;
                 output.hdr_enabled = !output.hdr_verification_pending
                     && crate::core::color::output_hdr_render_active(
                         output.hdr_requested,
@@ -2871,8 +2901,12 @@ impl DesktopState {
                 output.color_profile_override = config.color_profile;
                 output.icc_profile_path = config.icc_profile_path.clone();
             }
-            self.update_output_size(output_id, physical_size, scale_factor);
-            self.refresh_output_color(output_id);
+            if geometry_changed {
+                self.update_output_size(output_id, physical_size, scale_factor);
+            }
+            if color_changed {
+                self.refresh_output_color(output_id);
+            }
 
             if config.primary {
                 self.primary_output = output_id;
@@ -2893,8 +2927,12 @@ impl DesktopState {
         }
 
         if changed {
-            self.display_reconfigure_requested = true;
-            crate::core::wayland::color_management_protocol::notify_preferred_color_changed(self);
+            self.display_reconfigure_requested |= backend_reconfigure_needed;
+            if preferred_color_changed {
+                crate::core::wayland::color_management_protocol::notify_preferred_color_changed(
+                    self,
+                );
+            }
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
             self.cursor_manager.set_base_size_and_scale(
                 24,
@@ -5559,6 +5597,7 @@ impl DesktopState {
             return;
         }
         self.pending_hdr_safe_action = Some(HdrSafeSessionAction::Logout);
+        self.pending_hdr_safe_action_started_at = Some(Instant::now());
         self.begin_hdr_rollback();
         flog_warn!("HDR is active; deferring logout until SDR scanout is confirmed");
     }
@@ -5599,6 +5638,7 @@ impl DesktopState {
             interaction,
             restore_after_resume,
         });
+        self.pending_hdr_safe_action_started_at = Some(Instant::now());
         self.begin_hdr_rollback();
         flog_warn!("HDR is active; deferring {context} until SDR scanout is confirmed");
     }
@@ -5606,15 +5646,28 @@ impl DesktopState {
     /// Complete a session action only after the DRM vblank callback has
     /// confirmed that no connector remains in HDR or in a KMS transition.
     pub(crate) fn process_hdr_safe_session_action(&mut self) {
-        if self.pending_hdr_safe_action.is_none()
-            || self
-                .outputs
-                .values()
-                .any(|output| output.hdr_kms_applied || output.hdr_transition_target.is_some())
-        {
+        if self.pending_hdr_safe_action.is_none() {
             return;
         }
 
+        let transition_pending = self
+            .outputs
+            .values()
+            .any(|output| output.hdr_kms_applied || output.hdr_transition_target.is_some());
+        let timed_out = self
+            .pending_hdr_safe_action_started_at
+            .is_some_and(|started| started.elapsed() >= HDR_SAFE_SESSION_ACTION_TIMEOUT);
+        if transition_pending && !timed_out {
+            return;
+        }
+        if transition_pending {
+            flog_warn!(
+                "HDR-to-SDR session transition exceeded {:?}; executing the requested session action to avoid a frozen desktop",
+                HDR_SAFE_SESSION_ACTION_TIMEOUT
+            );
+        }
+
+        self.pending_hdr_safe_action_started_at = None;
         match self.pending_hdr_safe_action.take().unwrap() {
             HdrSafeSessionAction::Logout => self.running = false,
             HdrSafeSessionAction::Power {
@@ -7273,6 +7326,7 @@ impl DesktopState {
             unattended_suspend_state: None,
             deferred_power_action: None,
             pending_hdr_safe_action: None,
+            pending_hdr_safe_action_started_at: None,
             hdr_outputs_to_restore_after_resume: Vec::new(),
             low_battery_triggered: false,
             lid_close_triggered: false,

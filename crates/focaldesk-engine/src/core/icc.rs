@@ -434,6 +434,13 @@ mod tests {
             return;
         }
         let edid = std::fs::read(edid_path).expect("read edid");
+        let profile_name = format!("edid-{}.icc", edid_md5_hex(&edid));
+        if !icc_search_dirs()
+            .iter()
+            .any(|dir| dir.join(&profile_name).exists())
+        {
+            return;
+        }
         let parsed = load_display_profile_by_edid_hash(&edid).expect("load by hash");
         assert!(!parsed.bytes.is_empty());
     }

@@ -165,14 +165,30 @@ impl Default for HdrAppearance {
 }
 
 impl HdrAppearance {
-    // The current HDR10 path supports a conservative 450-nit mastering
-    // ceiling. KMS metadata follows the selected per-output peak.
-    pub const REFERENCE_WHITE_RANGE: std::ops::RangeInclusive<f32> = 80.0..=450.0;
-    pub const PEAK_RANGE: std::ops::RangeInclusive<f32> = 203.0..=450.0;
+    // PQ and CTA-861 metadata support values through 10,000 nits. Individual
+    // outputs start from their EDID values and can then be calibrated by the
+    // user; these bounds are format limits, not a panel-specific policy.
+    pub const REFERENCE_WHITE_RANGE: std::ops::RangeInclusive<f32> = 80.0..=10_000.0;
+    pub const PEAK_RANGE: std::ops::RangeInclusive<f32> = 203.0..=10_000.0;
     pub const BLACK_LEVEL_RANGE: std::ops::RangeInclusive<f32> = 0.0..=0.25;
-    pub const FULL_FRAME_PEAK_RANGE: std::ops::RangeInclusive<f32> = 80.0..=450.0;
+    pub const FULL_FRAME_PEAK_RANGE: std::ops::RangeInclusive<f32> = 80.0..=10_000.0;
     pub const SATURATION_RANGE: std::ops::RangeInclusive<f32> = 0.75..=1.25;
     pub const MIDTONE_GAMMA_RANGE: std::ops::RangeInclusive<f32> = 0.70..=1.50;
+
+    /// Neutral per-monitor starting point derived from CTA-861 HDR static
+    /// metadata. EDID values are capabilities, not a calibration, so the UI
+    /// still permits the user to tune and persist them for this monitor.
+    pub fn from_edid(max_luminance_nits: f32, max_fall_nits: f32, min_luminance_nits: f32) -> Self {
+        let peak_nits = max_luminance_nits.clamp(203.0, 10_000.0);
+        Self {
+            black_level_nits: min_luminance_nits.clamp(0.0, 0.25),
+            reference_white_nits: 203.0_f32.min(peak_nits),
+            peak_nits,
+            full_frame_peak_nits: max_fall_nits.clamp(80.0, peak_nits),
+            saturation: 1.0,
+            midtone_gamma: 1.0,
+        }
+    }
 
     pub fn validate(self) -> Result<Self, &'static str> {
         if !self.black_level_nits.is_finite()
@@ -818,6 +834,16 @@ mod tests {
         assert_eq!(appearance.saturation, 1.0);
         assert_eq!(appearance.midtone_gamma, 1.0);
         assert_eq!(appearance.validate(), Ok(appearance));
+    }
+
+    #[test]
+    fn hdr_appearance_uses_per_monitor_edid_luminance() {
+        let appearance = HdrAppearance::from_edid(1_405.0, 951.0, 0.0);
+        assert_eq!(appearance.reference_white_nits, 203.0);
+        assert_eq!(appearance.peak_nits, 1_405.0);
+        assert_eq!(appearance.full_frame_peak_nits, 951.0);
+        assert_eq!(appearance.black_level_nits, 0.0);
+        assert!(appearance.validate().is_ok());
     }
 
     #[test]
