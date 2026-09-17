@@ -56,7 +56,7 @@ use super::drm::{
     merge_disconnected_display_configs, parse_edid_identity, select_connector_mode,
     write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
 };
-use super::wgpu_nested::VulkanSceneBuilder;
+use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -160,7 +160,33 @@ struct VulkanOutput {
     hdr_rearm_pending: bool,
     hdr_rearm_attempts: u8,
     hdr_transition_retry_at: Option<Instant>,
+    hdr_source_peak_initialized: bool,
+    last_hdr_source_peak_bits: Option<u32>,
     cursor: Option<KmsCursor>,
+}
+
+fn hdr_source_peak_changed(initialized: bool, previous: Option<u32>, current: Option<u32>) -> bool {
+    initialized && previous != current
+}
+
+fn expand_dmabuf_damage(scene: &mut VulkanCompositorScene) {
+    // The raw renderer samples client DMA-BUFs directly into a retained linear
+    // scene image. Streaming clients can update a reused allocation without
+    // consistently advancing Wayland damage, so repaint every visible imported
+    // quad whenever a frame is already scheduled. This stays bounded to DMA-BUF
+    // surfaces rather than widening the update to the whole output.
+    let dmabufs = scene
+        .surfaces
+        .iter()
+        .filter(|surface| surface.dmabuf.is_some())
+        .map(|surface| surface.destination)
+        .filter(|[_, _, width, height]| *width > 0 && *height > 0)
+        .collect::<Vec<_>>();
+    for rect in dmabufs {
+        if !scene.damage.contains(&rect) {
+            scene.damage.push(rect);
+        }
+    }
 }
 
 struct KmsCursor {
@@ -236,18 +262,25 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
         return Err(anyhow!("libseat has not restored device ownership"));
     }
     data.drm.activate(true).context("reactivate DRM device")?;
-    for output in &mut data.outputs {
-        output.scanout.reset_buffers();
-        output.frame_pending = false;
-        output.present_started_at = None;
-    }
+    // A Vulkan device that survives suspend can still return apparently valid
+    // sync-file fences which NVIDIA can no longer import into KMS.  Reusing
+    // that device leaves the first post-resume frame pending forever and a
+    // retained pre-suspend frame on screen (most visibly: lock chrome without
+    // its text).  Recreate both the Vulkan device and scanout buffers while
+    // libseat ownership is active so all post-resume fences share the driver's
+    // new synchronization epoch.
+    recover_vulkan_renderer(
+        data,
+        &anyhow!("session resumed; GPU synchronization state is stale"),
+    )
+    .context("recreate raw Vulkan renderer after resume")?;
     data.libinput
         .resume()
         .map_err(|()| anyhow!("resume libinput"))?;
     data.session_active = true;
     data.resume_pending = false;
     data.resume_retry_at = None;
-    data.topology_refresh_pending = true;
+    data.topology_refresh_pending = false;
     data.desktop.state.handle_session_resume();
     data.desktop.state.mark_redraw();
     flog(format!("raw Vulkan DRM session resumed: {reason}"));
@@ -904,6 +937,8 @@ fn initialize_vulkan_outputs(
             hdr_rearm_pending: false,
             hdr_rearm_attempts: 0,
             hdr_transition_retry_at: None,
+            hdr_source_peak_initialized: false,
+            last_hdr_source_peak_bits: None,
             cursor,
         });
     }
@@ -1337,7 +1372,7 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
 }
 
 fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> Result<()> {
-    flog_warn!("raw Vulkan renderer failed; recreating device and scanout: {reason:#}");
+    flog_warn!("recreating raw Vulkan device and scanout: {reason:#}");
     // The replacement renderer starts with an empty texture cache. Make egui
     // resend its retained font/image atlases instead of referring to cache keys
     // that only existed on the abandoned Vulkan device.
@@ -1649,16 +1684,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .then(|| output.name.clone())
         }) {
             flog_warn!(
-                "Vulkan KMS present on {} exceeded {} ms; rebuilding scanout",
+                "Vulkan KMS present on {} exceeded {} ms; recreating renderer and scanout",
                 output_name,
                 KMS_PRESENT_TIMEOUT.as_millis()
             );
-            if !rebuild_vulkan_outputs(&mut data)? {
-                return Err(anyhow!(
-                    "cannot recover stalled Vulkan KMS present without a connected output"
-                )
-                .into());
-            }
+            let reason = anyhow!(
+                "KMS present on {output_name} exceeded {} ms",
+                KMS_PRESENT_TIMEOUT.as_millis()
+            );
+            recover_vulkan_renderer(&mut data, &reason)?;
             continue;
         }
         if let Some(error) = data.fatal_error.take() {
@@ -1717,13 +1751,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
 
             let software_cursor = data.desktop.state.cursor_manager.software_cursor_needed();
-            let scene = data.scene_builder.build_for_output_with_cursor_policy(
+            let mut scene = data.scene_builder.build_for_output_with_cursor_policy(
                 &mut data.desktop.state,
                 output_id,
                 software_cursor,
                 false,
                 true,
             );
+            expand_dmabuf_damage(&mut scene);
             let capture_requested = (data.desktop.state.screenshot_request() == Some(output_id)
                 || data.desktop.state.screenshot_all_requested
                 || data
@@ -1815,6 +1850,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         }
                     })
                 });
+            let hdr_source_peak_bits = hdr_output.map(|hdr| hdr.source_peak_nits.to_bits());
             let output_matrix = if hdr_output.is_some() {
                 [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
             } else {
@@ -1831,6 +1867,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 output_transfer
             };
             let output = &mut data.outputs[index];
+            if hdr_source_peak_changed(
+                output.hdr_source_peak_initialized,
+                output.last_hdr_source_peak_bits,
+                hdr_source_peak_bits,
+            ) {
+                // Source peak selects one output-wide tone curve, so a change invalidates
+                // retained pixels outside the surface that introduced the new peak.
+                scene.damage = vec![[0, 0, output.width as i32, output.height as i32]];
+            }
             let (dmabuf, _) = match output.scanout.next_buffer() {
                 Ok(next) => next,
                 Err(error) => {
@@ -1873,6 +1918,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let kms_damage = (!kms_damage.is_empty()).then_some(kms_damage);
             match output.scanout.queue_buffer(Some(sync), kms_damage, ()) {
                 Ok(()) => {
+                    output.hdr_source_peak_initialized = true;
+                    output.last_hdr_source_peak_bits = hdr_source_peak_bits;
                     output.frame_pending = true;
                     output.present_started_at = Some(Instant::now());
                     data.desktop.state.clear_output_repaint_request(output_id);
@@ -1901,7 +1948,84 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_cursor_rgba_to_argb;
+    use super::{copy_cursor_rgba_to_argb, expand_dmabuf_damage, hdr_source_peak_changed};
+    use crate::backend::wgpu_nested::VulkanCompositorScene;
+    use focaldesk_render::{
+        FramePixelFormat, FrameTransform, LinuxDmabuf, TextureColorTransform, TextureQuad,
+    };
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+
+    fn test_texture(dmabuf: bool, damage: Vec<[u32; 4]>, destination: [i32; 4]) -> TextureQuad {
+        TextureQuad {
+            cache_key: 1,
+            pixels: Vec::new(),
+            width: 100,
+            height: 50,
+            stride: 400,
+            format: FramePixelFormat::Bgra8Srgb,
+            color_transform: TextureColorTransform::default(),
+            dmabuf: dmabuf.then(|| LinuxDmabuf {
+                planes: vec![Arc::new(OwnedFd::from(
+                    std::fs::File::open("/dev/null").unwrap(),
+                ))],
+                fourcc: 0,
+                modifier: 0,
+                offsets: vec![0],
+                strides: vec![400],
+            }),
+            damage,
+            destination,
+            source_uv: [0.0, 0.0, 1.0, 1.0],
+            transform: FrameTransform::Normal,
+            tint: [1.0; 4],
+            retention: None,
+        }
+    }
+
+    fn test_scene(surfaces: Vec<TextureQuad>) -> VulkanCompositorScene {
+        VulkanCompositorScene {
+            background: Vec::new(),
+            surfaces,
+            overlay: Vec::new(),
+            overlay_after_surface: 0,
+            foreground: Vec::new(),
+            foreground_after_surface: 0,
+            egui_textures: Vec::new(),
+            egui_meshes: Vec::new(),
+            egui_before_surface: 0,
+            damage: vec![[1, 2, 3, 4]],
+            client_surface_count: 0,
+            cursor_present: false,
+        }
+    }
+
+    #[test]
+    fn every_visible_dmabuf_expands_damage_to_its_whole_destination() {
+        let mut scene = test_scene(vec![
+            test_texture(true, vec![[0, 0, 10, 10]], [20, 30, 100, 50]),
+            test_texture(false, vec![[0, 0, 10, 10]], [200, 30, 100, 50]),
+            test_texture(true, Vec::new(), [320, 30, 100, 50]),
+        ]);
+
+        expand_dmabuf_damage(&mut scene);
+
+        assert_eq!(
+            scene.damage,
+            vec![[1, 2, 3, 4], [20, 30, 100, 50], [320, 30, 100, 50]]
+        );
+    }
+
+    #[test]
+    fn hdr_source_peak_change_requires_full_damage_after_first_present() {
+        let peak_1000 = Some(1000.0_f32.to_bits());
+        let peak_4000 = Some(4000.0_f32.to_bits());
+
+        assert!(!hdr_source_peak_changed(false, None, peak_1000));
+        assert!(!hdr_source_peak_changed(true, peak_1000, peak_1000));
+        assert!(hdr_source_peak_changed(true, peak_1000, peak_4000));
+        assert!(hdr_source_peak_changed(true, peak_1000, None));
+    }
 
     #[test]
     fn cursor_upload_converts_rgba_to_little_endian_argb_and_keeps_pitch_padding_clear() {

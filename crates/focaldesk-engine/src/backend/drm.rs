@@ -2251,7 +2251,7 @@ mod hdr_tests {
             .iter()
             .find(|display| display.name == "HDMI-A-1")
             .expect("disconnected display should remain persisted");
-        assert!(!saved.enabled);
+        assert!(saved.enabled);
         assert!(saved.hdr_requested);
         assert!(!saved.hdr_enabled);
         assert_eq!(saved.logical_x, 2560);
@@ -2529,7 +2529,11 @@ pub(crate) fn merge_disconnected_display_configs(
     configured_displays: &[DisplayConfig],
 ) -> Vec<DisplayConfig> {
     // Keep disconnected monitors in the file so a later replug can recover their
-    // scale, position, primary choice, ICC profile, and HDR preference.
+    // requested enabled state as well as scale, position, primary choice, ICC
+    // profile, and HDR preference. A KMS link retrain can report a connector as
+    // disconnected for one probe. Persisting `enabled = false` here turns that
+    // transient into a user preference and makes the next topology rebuild leave
+    // the monitor off permanently.
     let connected_names: std::collections::HashSet<_> = displays
         .iter()
         .map(|display| display.name.clone())
@@ -2557,7 +2561,9 @@ pub(crate) fn merge_disconnected_display_configs(
             continue;
         }
         let mut disconnected = configured.clone();
-        disconnected.enabled = false;
+        // `enabled` is desired configuration, not live connector presence.
+        // Preserve it across a missing probe; `select_outputs` already requires
+        // the connector itself to be connected before creating an output.
         disconnected.hdr_enabled = false;
         displays.push(disconnected);
     }

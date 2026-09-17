@@ -575,7 +575,16 @@ struct SurfaceDamageState {
     commit: CommitCounter,
     geometry: Rectangle<i32, Logical>,
     view: SurfaceView,
+    // Color metadata changes pixels even when the client reuses an unchanged buffer.
+    color: Option<SurfaceColorRenderState>,
     root: Id,
+}
+
+fn surface_color_changed(
+    previous: Option<SurfaceColorRenderState>,
+    current: Option<SurfaceColorRenderState>,
+) -> bool {
+    previous != current
 }
 
 #[derive(Debug, Default)]
@@ -4516,6 +4525,7 @@ impl DesktopState {
 
         let previous = &mut self.surface_damage;
         let roots = &mut self.surface_damage_roots;
+        let surface_colors = &self.surface_colors;
         let mut handled = false;
         let mut frame_callback_pending = false;
 
@@ -4587,11 +4597,13 @@ impl DesktopState {
                 let surface_location = *location + view.offset;
                 let surface_geometry = Rectangle::from_loc_and_size(surface_location, view.dst);
                 let old = previous.get(&id).cloned();
+                let color = surface_colors.get(&id).copied();
 
-                if old
-                    .as_ref()
-                    .is_none_or(|old| old.geometry != surface_geometry || old.view != view)
-                {
+                if old.as_ref().is_none_or(|old| {
+                    old.geometry != surface_geometry
+                        || old.view != view
+                        || surface_color_changed(old.color, color)
+                }) {
                     if let Some(old) = old.as_ref() {
                         scratch.damage.push(old.geometry);
                     }
@@ -4627,6 +4639,7 @@ impl DesktopState {
                         commit: current_commit,
                         geometry: surface_geometry,
                         view,
+                        color,
                         root: root_id.clone(),
                     },
                 );
@@ -11057,10 +11070,11 @@ mod tests {
         is_browser_like, logical_damage_to_physical, power_action_interaction,
         remove_surface_root_membership, session_power_command, set_surface_root_membership,
         should_wait_for_lid_open_on_resume, surface_buffer_damage_to_logical,
-        topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding, DamageSource, Fourcc,
-        PowerActionInteraction, TopbarPulseTarget, UnattendedSuspendState,
+        surface_color_changed, topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding,
+        DamageSource, Fourcc, PowerActionInteraction, TopbarPulseTarget, UnattendedSuspendState,
         UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
+    use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_ai::AiDaemonStatus;
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
@@ -11073,6 +11087,22 @@ mod tests {
     use smithay::backend::renderer::utils::SurfaceView;
     use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
     use std::collections::HashMap;
+
+    #[test]
+    fn surface_color_metadata_change_is_visual_damage() {
+        let srgb = SurfaceColorRenderState::for_description(
+            ColorDescription::SRGB,
+            RenderingIntent::Perceptual,
+        );
+        let linear = SurfaceColorRenderState::for_description(
+            ColorDescription::LINEAR_SRGB,
+            RenderingIntent::Perceptual,
+        );
+
+        assert!(!surface_color_changed(Some(srgb), Some(srgb)));
+        assert!(surface_color_changed(Some(srgb), Some(linear)));
+        assert!(surface_color_changed(None, Some(srgb)));
+    }
 
     #[test]
     fn chromium_nv12_video_is_classified_as_eight_bit() {
