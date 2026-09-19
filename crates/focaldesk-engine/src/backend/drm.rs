@@ -1743,7 +1743,7 @@ fn nvidia_dual_head_hdr_allowed() -> bool {
     crate::core::color::hdr_nvidia_dual_enabled()
 }
 
-fn disable_explicit_kms_fences(gpu_vendor_id: Option<u32>) -> bool {
+pub(super) fn disable_explicit_kms_fences(gpu_vendor_id: Option<u32>) -> bool {
     // NVIDIA 595 can leave plane-fence semaphore creation broken for the rest
     // of the boot after S3. This must cover newly logged-in compositor
     // processes too, not only the renderer recreated by the session that
@@ -2305,7 +2305,7 @@ mod hdr_tests {
     }
 }
 
-fn drm_card_vendor_id(card_path: &Path) -> Option<u32> {
+pub(super) fn drm_card_vendor_id(card_path: &Path) -> Option<u32> {
     let card_name = card_path.file_name()?.to_string_lossy();
     let vendor_path = PathBuf::from("/sys/class/drm")
         .join(card_name.as_ref())

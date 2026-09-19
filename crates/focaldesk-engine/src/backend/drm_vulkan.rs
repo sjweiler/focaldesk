@@ -51,10 +51,10 @@ use super::common::{
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    connector_edid, dispatch_backend_input_event, display_matches_monitor,
-    hdr_appearance_from_support, hdr_detection, load_display_config,
-    merge_disconnected_display_configs, parse_edid_identity, select_connector_mode,
-    write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
+    connector_edid, disable_explicit_kms_fences, dispatch_backend_input_event,
+    display_matches_monitor, drm_card_vendor_id, hdr_appearance_from_support, hdr_detection,
+    load_display_config, merge_disconnected_display_configs, parse_edid_identity,
+    select_connector_mode, write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
 };
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
 
@@ -115,6 +115,31 @@ impl Fence for KmsFence {
     }
     fn export(&self) -> Option<OwnedFd> {
         self.0.try_clone().ok()
+    }
+}
+
+impl KmsFence {
+    fn wait_timeout(&self, timeout: Duration) -> std::io::Result<bool> {
+        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        loop {
+            let mut pollfd = libc::pollfd {
+                fd: self.0.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if result > 0 {
+                return Ok(true);
+            }
+            if result == 0 {
+                return Ok(false);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
     }
 }
 
@@ -222,6 +247,7 @@ struct VulkanDrmData {
     outputs: Vec<VulkanOutput>,
     libinput: Libinput,
     session_active: bool,
+    disable_explicit_kms_fences: bool,
     resume_pending: bool,
     resume_retry_at: Option<Instant>,
     topology_refresh_pending: bool,
@@ -1405,6 +1431,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     let primary_path: PathBuf = primary_gpu(session.seat())?
         .ok_or_else(|| anyhow!("no primary GPU found for seat {}", session.seat()))?;
     let node = DrmNode::from_path(&primary_path).context("identify primary DRM node")?;
+    let gpu_vendor_id = drm_card_vendor_id(&primary_path);
+    let disable_explicit_kms_fences = disable_explicit_kms_fences(gpu_vendor_id);
     let fd = session
         .open(&primary_path, OFlags::RDWR | OFlags::CLOEXEC)
         .with_context(|| format!("open primary DRM node {}", primary_path.display()))?;
@@ -1467,6 +1495,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         outputs,
         libinput,
         session_active: session.is_active(),
+        disable_explicit_kms_fences,
         resume_pending: false,
         resume_retry_at: None,
         topology_refresh_pending: false,
@@ -1476,6 +1505,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         fatal_error: None,
         surface_blocker_loop,
     };
+
+    if data.disable_explicit_kms_fences {
+        flog_warn!(
+            "Raw Vulkan disabled explicit KMS input fences for NVIDIA; submissions wait before implicit-sync atomic commits"
+        );
+    }
 
     #[cfg(feature = "xwayland")]
     {
@@ -1616,7 +1651,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         data.outputs.len(),
         data.renderer.info().adapter_name
     );
-    while data.desktop.state.running {
+    'main: while data.desktop.state.running {
         if let Some(rx) = sleep_notifications.as_ref() {
             while let Ok(event) = rx.try_recv() {
                 match event {
@@ -1866,25 +1901,27 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             } else {
                 output_transfer
             };
-            let output = &mut data.outputs[index];
-            if hdr_source_peak_changed(
-                output.hdr_source_peak_initialized,
-                output.last_hdr_source_peak_bits,
-                hdr_source_peak_bits,
-            ) {
-                // Source peak selects one output-wide tone curve, so a change invalidates
-                // retained pixels outside the surface that introduced the new peak.
-                scene.damage = vec![[0, 0, output.width as i32, output.height as i32]];
-            }
-            let (dmabuf, _) = match output.scanout.next_buffer() {
-                Ok(next) => next,
-                Err(error) => {
-                    flog_warn!("Vulkan GBM acquire skipped on {}: {error}", output.name);
-                    continue;
+            let target = {
+                let output = &mut data.outputs[index];
+                if hdr_source_peak_changed(
+                    output.hdr_source_peak_initialized,
+                    output.last_hdr_source_peak_bits,
+                    hdr_source_peak_bits,
+                ) {
+                    // Source peak selects one output-wide tone curve, so a change invalidates
+                    // retained pixels outside the surface that introduced the new peak.
+                    scene.damage = vec![[0, 0, output.width as i32, output.height as i32]];
                 }
+                let (dmabuf, _) = match output.scanout.next_buffer() {
+                    Ok(next) => next,
+                    Err(error) => {
+                        flog_warn!("Vulkan GBM acquire skipped on {}: {error}", output.name);
+                        continue;
+                    }
+                };
+                target_from_dmabuf(&dmabuf)?
             };
-            let target = target_from_dmabuf(&dmabuf)?;
-            let submission = data.renderer.render(
+            let submission = match data.renderer.render(
                 &target,
                 &scene.background,
                 &scene.surfaces,
@@ -1902,11 +1939,53 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 output_transfer,
                 output_lut,
                 hdr_output,
-            )?;
+            ) {
+                Ok(submission) => submission,
+                Err(error) => {
+                    data.desktop.state.mark_output_full_damage(
+                        output_id,
+                        crate::core::desktop::DamageSource::Unknown,
+                    );
+                    recover_vulkan_renderer(&mut data, &error)
+                        .context("recover from raw Vulkan frame-build failure")?;
+                    continue 'main;
+                }
+            };
             if capture_requested {
                 data.capture_pending.insert(output_id);
             }
-            let sync = SyncPoint::from(KmsFence(submission.fence_fd));
+            let sync = if data.disable_explicit_kms_fences {
+                let fence = KmsFence(submission.fence_fd);
+                match fence.wait_timeout(KMS_PRESENT_TIMEOUT) {
+                    Ok(true) => None,
+                    Ok(false) => {
+                        data.desktop.state.mark_output_full_damage(
+                            output_id,
+                            crate::core::desktop::DamageSource::Unknown,
+                        );
+                        let error = anyhow!(
+                            "Vulkan submission for {} did not complete within {} ms",
+                            data.outputs[index].name,
+                            KMS_PRESENT_TIMEOUT.as_millis()
+                        );
+                        recover_vulkan_renderer(&mut data, &error)
+                            .context("recover from NVIDIA implicit-sync wait timeout")?;
+                        continue 'main;
+                    }
+                    Err(error) => {
+                        data.desktop.state.mark_output_full_damage(
+                            output_id,
+                            crate::core::desktop::DamageSource::Unknown,
+                        );
+                        let error = anyhow!("wait for NVIDIA Vulkan submission: {error}");
+                        recover_vulkan_renderer(&mut data, &error)
+                            .context("recover from NVIDIA implicit-sync wait failure")?;
+                        continue 'main;
+                    }
+                }
+            } else {
+                Some(SyncPoint::from(KmsFence(submission.fence_fd)))
+            };
             let kms_damage = scene
                 .damage
                 .iter()
@@ -1916,7 +1995,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 })
                 .collect::<Vec<_>>();
             let kms_damage = (!kms_damage.is_empty()).then_some(kms_damage);
-            match output.scanout.queue_buffer(Some(sync), kms_damage, ()) {
+            let output = &mut data.outputs[index];
+            match output.scanout.queue_buffer(sync, kms_damage, ()) {
                 Ok(()) => {
                     output.hdr_source_peak_initialized = true;
                     output.last_hdr_source_peak_bits = hdr_source_peak_bits;
