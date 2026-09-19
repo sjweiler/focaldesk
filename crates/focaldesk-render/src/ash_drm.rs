@@ -427,6 +427,7 @@ fn encode_pq(scene_linear: vec3<f32>, pixel: vec2<f32>, uv: vec2<f32>) -> vec3<f
 struct TargetKey {
     device: u64,
     inode: u64,
+    layout: u64,
     modifier: u64,
     width: u32,
     height: u32,
@@ -478,6 +479,7 @@ struct ImportedTarget {
     image: ImageResource,
     initialized: bool,
     last_frame: u64,
+    last_used_frame: u64,
 }
 
 struct LinearScene {
@@ -485,6 +487,7 @@ struct LinearScene {
     width: u32,
     height: u32,
     initialized: bool,
+    color_fingerprint: u64,
 }
 
 struct OutputResources {
@@ -496,6 +499,7 @@ struct OutputResources {
 }
 
 struct PendingFrame {
+    serial: u64,
     submitted_at: Instant,
     fence: vk::Fence,
     command: vk::CommandBuffer,
@@ -504,6 +508,7 @@ struct PendingFrame {
     framebuffers: Vec<vk::Framebuffer>,
     retired_textures: Vec<TextureResource>,
     retired_outputs: Vec<OutputResources>,
+    retired_images: Vec<ImageResource>,
     staging: Vec<BufferResource>,
     capture: Option<PendingCapture>,
     _retentions: Vec<FrameRetention>,
@@ -653,6 +658,7 @@ pub struct AshDrmRenderer {
     completed_captures: VecDeque<AshDrmCapture>,
     damage_history: HashMap<u64, DamageHistory>,
     stream_frames: HashMap<u64, u64>,
+    output_fingerprints: HashMap<u64, u64>,
     /// Skip Vulkan destruction when the driver stopped making progress. A
     /// blocking `device_wait_idle` during unwinding would otherwise prevent
     /// the display manager from restarting the compositor.
@@ -730,6 +736,7 @@ impl AshDrmRenderer {
         let required = [
             ext::image_drm_format_modifier::NAME,
             ext::external_memory_dma_buf::NAME,
+            ext::queue_family_foreign::NAME,
             khr::external_memory_fd::NAME,
             khr::external_semaphore_fd::NAME,
         ];
@@ -740,6 +747,27 @@ impl AshDrmRenderer {
                 extension.to_string_lossy()
             );
         }
+        let semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD);
+        let mut semaphore_properties = vk::ExternalSemaphoreProperties::default();
+        unsafe {
+            instance.get_physical_device_external_semaphore_properties(
+                physical_device,
+                &semaphore_info,
+                &mut semaphore_properties,
+            )
+        };
+        let required_semaphore_features = vk::ExternalSemaphoreFeatureFlags::IMPORTABLE
+            | vk::ExternalSemaphoreFeatureFlags::EXPORTABLE;
+        ensure!(
+            semaphore_properties
+                .external_semaphore_features
+                .contains(required_semaphore_features)
+                && semaphore_properties
+                    .compatible_handle_types
+                    .contains(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
+            "Vulkan device cannot import and export Linux sync-file semaphores"
+        );
 
         let queue_family =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
@@ -901,6 +929,7 @@ impl AshDrmRenderer {
             completed_captures: VecDeque::new(),
             damage_history: HashMap::new(),
             stream_frames: HashMap::new(),
+            output_fingerprints: HashMap::new(),
             abandon_on_drop: false,
             info: RendererInfo {
                 api: crate::GraphicsApi::Vulkan,
@@ -1016,10 +1045,15 @@ impl AshDrmRenderer {
                 if usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) {
                     required_feature |= vk::FormatFeatureFlags::TRANSFER_SRC;
                 }
+                // The importer binds one DMA-BUF memory object. Do not
+                // advertise modifiers with auxiliary/disjoint memory planes
+                // until per-plane vkBindImageMemory2 support is implemented;
+                // Wayland feedback cannot require clients to alias those
+                // planes to one fd.
                 if !modifier
                     .drm_format_modifier_tiling_features
                     .contains(required_feature)
-                    || modifier.drm_format_modifier_plane_count == 0
+                    || modifier.drm_format_modifier_plane_count != 1
                 {
                     return None;
                 }
@@ -1099,6 +1133,47 @@ impl AshDrmRenderer {
         self.completed_captures.pop_front()
     }
 
+    /// Forget retained resources for an output stream which has been removed
+    /// or rebuilt. Resources referenced by queued work are attached to the
+    /// newest submission and released only after that fence completes.
+    pub fn remove_stream(&mut self, stream_id: u64) {
+        let scene = self
+            .linear_scenes
+            .remove(&stream_id)
+            .map(|scene| scene.resource);
+        let output = self.output_resources.remove(&stream_id);
+        self.damage_history.remove(&stream_id);
+        self.stream_frames.remove(&stream_id);
+        self.output_fingerprints.remove(&stream_id);
+        self.completed_captures
+            .retain(|capture| capture.id != stream_id);
+
+        if let Some(frame) = self.pending.iter_mut().max_by_key(|frame| frame.serial) {
+            if let Some(scene) = scene {
+                frame.retired_textures.push(scene);
+            }
+            if let Some(output) = output {
+                frame.retired_outputs.push(output);
+            }
+            return;
+        }
+
+        unsafe {
+            if let Some(scene) = scene {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[scene.descriptor_set])
+                    .ok();
+                self.destroy_image(scene.image);
+            }
+            if let Some(output) = output {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &[output.descriptor_set])
+                    .ok();
+                self.destroy_image(output.lut);
+            }
+        }
+    }
+
     /// Prevent potentially blocking driver teardown after a timeout or device
     /// loss. The backend replaces this renderer with a fresh Vulkan device.
     pub fn abandon_device(&mut self) {
@@ -1131,6 +1206,8 @@ impl AshDrmRenderer {
             target.width > 0 && target.height > 0,
             "zero-sized DRM render target"
         );
+        ensure!(!target.planes.is_empty(), "DMA-BUF target has no planes");
+        validate_meshes(meshes)?;
         let identity_lut;
         let output_lut = if let Some(lut) = output_lut {
             validate_output_lut(lut)?;
@@ -1143,6 +1220,9 @@ impl AshDrmRenderer {
             }
         };
         let lut_fingerprint = output_lut_fingerprint(output_lut);
+        let scene_fingerprint = matrix_fingerprint(output_matrix);
+        let output_fingerprint =
+            output_state_fingerprint(lut_fingerprint, output_transfer, hdr_output);
         let format = vk_format(target.fourcc)?;
         self.ensure_pipelines(format)?;
         let target_key = target_key(target)?;
@@ -1158,6 +1238,7 @@ impl AshDrmRenderer {
                     image,
                     initialized: false,
                     last_frame: 0,
+                    last_used_frame: self.frame_no,
                 },
             );
         }
@@ -1187,24 +1268,35 @@ impl AshDrmRenderer {
                         width: target.width,
                         height: target.height,
                         initialized: false,
+                        color_fingerprint: scene_fingerprint,
                     },
                 )
                 .map(|scene| scene.resource)
         };
         let linear_image = self.linear_scenes[&stream_id].resource.image.image;
         let linear_view = self.linear_scenes[&stream_id].resource.image.view;
-        let linear_initialized = self.linear_scenes[&stream_id].initialized;
+        let linear_initialized = self.linear_scenes[&stream_id].initialized
+            && self.linear_scenes[&stream_id].color_fingerprint == scene_fingerprint;
+        let output_state_matches = self
+            .output_fingerprints
+            .get(&stream_id)
+            .is_some_and(|fingerprint| *fingerprint == output_fingerprint);
 
         self.frame_no = self.frame_no.wrapping_add(1);
+        self.targets.get_mut(&target_key).unwrap().last_used_frame = self.frame_no;
         let stream_frame = self
             .stream_frames
-            .entry(stream_id)
-            .and_modify(|frame| *frame = frame.wrapping_add(1))
-            .or_insert(1);
-        let stream_frame = *stream_frame;
-        let history = self.damage_history.entry(stream_id).or_default();
+            .get(&stream_id)
+            .copied()
+            .unwrap_or(0)
+            .wrapping_add(1);
+        let empty_history = DamageHistory::new();
+        let history = self
+            .damage_history
+            .get(&stream_id)
+            .unwrap_or(&empty_history);
         let output_areas = effective_damage_regions(
-            initialized,
+            initialized && output_state_matches,
             last_target_frame,
             history,
             damage,
@@ -1219,10 +1311,6 @@ impl AshDrmRenderer {
             target.width,
             target.height,
         );
-        history.push_back((stream_frame, damage.to_vec()));
-        while history.len() > DAMAGE_HISTORY_LIMIT {
-            history.pop_front();
-        }
 
         let command = unsafe {
             self.device.allocate_command_buffers(
@@ -1299,6 +1387,7 @@ impl AshDrmRenderer {
             textures.push(draw);
         }
         for texture in mesh_textures {
+            let modifier = texture.dmabuf.as_ref().map(|dmabuf| dmabuf.modifier);
             let compatible = self
                 .texture_cache
                 .get(&texture.cache_key)
@@ -1306,16 +1395,17 @@ impl AshDrmRenderer {
                     cached.width == texture.width
                         && cached.height == texture.height
                         && cached.format == texture.format
-                        && cached.modifier.is_none()
+                        && cached.modifier == modifier
                 });
-            if !compatible || !texture.damage.is_empty() {
+            let external = texture.dmabuf.is_some();
+            if texture_needs_refresh(compatible, external, !texture.damage.is_empty()) {
                 if let Some(resource) = self.prepare_texture(command, texture, &mut staging)? {
                     let cached = CachedTexture {
                         resource,
                         width: texture.width,
                         height: texture.height,
                         format: texture.format,
-                        modifier: None,
+                        modifier,
                         last_used_frame: self.frame_no,
                     };
                     if let Some(old) = self.texture_cache.insert(texture.cache_key, cached) {
@@ -1360,6 +1450,7 @@ impl AshDrmRenderer {
         let active_keys = surfaces
             .iter()
             .map(|surface| surface.cache_key)
+            .chain(mesh_textures.iter().map(|texture| texture.cache_key))
             .chain(meshes.iter().map(|mesh| mesh.texture_key))
             .collect::<HashSet<_>>();
         self.texture_cache.retain(|key, cached| {
@@ -1377,6 +1468,7 @@ impl AshDrmRenderer {
         let foreign_acquires = textures
             .iter()
             .flatten()
+            .chain(mesh_draws.iter().flatten())
             .filter(|texture| texture.foreign)
             .map(|texture| texture.image)
             .collect::<HashSet<_>>()
@@ -1551,6 +1643,7 @@ impl AshDrmRenderer {
         let foreign_releases = textures
             .iter()
             .flatten()
+            .chain(mesh_draws.iter().flatten())
             .filter(|texture| texture.foreign)
             .map(|texture| texture.image)
             .collect::<HashSet<_>>()
@@ -1672,11 +1765,6 @@ impl AshDrmRenderer {
             );
             self.device.end_command_buffer(command)?;
         }
-        let rendered_target = self.targets.get_mut(&target_key).unwrap();
-        rendered_target.initialized = true;
-        rendered_target.last_frame = stream_frame;
-        self.linear_scenes.get_mut(&stream_id).unwrap().initialized = true;
-
         // Vulkan external-memory imports do not implicitly wait for writers in
         // the DMA-BUF reservation object. Snapshot each distinct client
         // buffer's writer fences and import them as temporary binary
@@ -1689,6 +1777,25 @@ impl AshDrmRenderer {
                 continue;
             };
             if !texture.is_some_and(|texture| texture.foreign) {
+                continue;
+            }
+            let Some(plane) = dmabuf.planes.first() else {
+                continue;
+            };
+            let identity = fd_identity(plane.as_raw_fd())?;
+            if implicit_dmabuf_ids.insert(identity) {
+                implicit_dmabufs.push(plane.clone());
+            }
+        }
+        for texture in mesh_textures {
+            let Some(dmabuf) = texture.dmabuf.as_ref() else {
+                continue;
+            };
+            if !self
+                .texture_cache
+                .get(&texture.cache_key)
+                .is_some_and(|cached| cached.resource.foreign)
+            {
                 continue;
             }
             let Some(plane) = dmabuf.planes.first() else {
@@ -1773,14 +1880,72 @@ impl AshDrmRenderer {
             }
             return Err(error).context("submit raw Vulkan composition");
         }
-        let raw_fd = unsafe {
+        let retentions = surfaces
+            .iter()
+            .chain(mesh_textures)
+            .filter_map(|surface| surface.retention.clone())
+            .collect::<Vec<_>>();
+        let raw_fd = match unsafe {
             self.external_semaphore_fd.get_semaphore_fd(
                 &vk::SemaphoreGetFdInfoKHR::default()
                     .semaphore(semaphore)
                     .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD),
             )
-        }?;
+        } {
+            Ok(raw_fd) => raw_fd,
+            Err(error) => {
+                // The queue owns all frame resources after a successful
+                // submit, even if exporting its KMS fence fails. Track the
+                // submission so poll/drop can release them after completion.
+                self.pending.push(PendingFrame {
+                    serial: self.frame_no,
+                    submitted_at: Instant::now(),
+                    fence,
+                    command,
+                    semaphore,
+                    wait_semaphores,
+                    framebuffers: vec![scene_framebuffer, output_framebuffer],
+                    retired_textures,
+                    retired_outputs: retired_output.into_iter().collect(),
+                    retired_images: Vec::new(),
+                    staging,
+                    capture,
+                    _retentions: retentions,
+                });
+                return Err(error).context("export Vulkan KMS sync file");
+            }
+        };
         let fence_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+
+        // Commit retained-rendering state only once submission and sync-file
+        // export have both succeeded. A retry after any earlier error must
+        // repaint rather than trusting work which may not have reached KMS.
+        let rendered_target = self.targets.get_mut(&target_key).unwrap();
+        rendered_target.initialized = true;
+        rendered_target.last_frame = stream_frame;
+        let linear_scene = self.linear_scenes.get_mut(&stream_id).unwrap();
+        linear_scene.initialized = true;
+        linear_scene.color_fingerprint = scene_fingerprint;
+        self.output_fingerprints
+            .insert(stream_id, output_fingerprint);
+        self.stream_frames.insert(stream_id, stream_frame);
+        let history = self.damage_history.entry(stream_id).or_default();
+        history.push_back((stream_frame, damage.to_vec()));
+        while history.len() > DAMAGE_HISTORY_LIMIT {
+            history.pop_front();
+        }
+        let stale_target_keys = self
+            .targets
+            .iter()
+            .filter_map(|(key, target)| {
+                (*key != target_key && self.frame_no.wrapping_sub(target.last_used_frame) > 120)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        let retired_images = stale_target_keys
+            .into_iter()
+            .filter_map(|key| self.targets.remove(&key).map(|target| target.image))
+            .collect();
         // Publish the Vulkan read completion back into the implicit-sync
         // reservation objects. Wayland buffer retention already prevents
         // normal reuse, while this also protects implicit consumers which use
@@ -1794,11 +1959,8 @@ impl AshDrmRenderer {
                 tracing::warn!(%error, "failed to publish Vulkan read fence to DMA-BUF");
             }
         }
-        let retentions = surfaces
-            .iter()
-            .filter_map(|surface| surface.retention.clone())
-            .collect();
         self.pending.push(PendingFrame {
+            serial: self.frame_no,
             submitted_at: Instant::now(),
             fence,
             command,
@@ -1807,6 +1969,7 @@ impl AshDrmRenderer {
             framebuffers: vec![scene_framebuffer, output_framebuffer],
             retired_textures,
             retired_outputs: retired_output.into_iter().collect(),
+            retired_images,
             staging,
             capture,
             _retentions: retentions,
@@ -2552,10 +2715,14 @@ impl AshDrmRenderer {
             )?;
             return Ok(Some(self.texture_resource(image, true)?));
         }
-        let required = usize::try_from(surface.stride)
-            .ok()
-            .and_then(|stride| stride.checked_mul(surface.height as usize));
-        if required.is_none_or(|required| surface.pixels.len() < required) {
+        if texture_upload_byte_len(
+            surface.width,
+            surface.height,
+            surface.stride,
+            surface.pixels.len(),
+        )
+        .is_none()
+        {
             return Ok(None);
         }
         let format = texture_vk_format(surface.format);
@@ -2623,13 +2790,19 @@ impl AshDrmRenderer {
 
     fn texture_resource(&self, image: ImageResource, foreign: bool) -> Result<TextureResource> {
         let layouts = [self.descriptor_layout];
-        let descriptor_set = unsafe {
+        let descriptor_set = match unsafe {
             self.device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(self.descriptor_pool)
                     .set_layouts(&layouts),
             )
-        }?[0];
+        } {
+            Ok(sets) => sets[0],
+            Err(error) => {
+                unsafe { self.destroy_image(image) };
+                return Err(error.into());
+            }
+        };
         let image_info = [vk::DescriptorImageInfo::default()
             .image_view(image.view)
             .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
@@ -2773,10 +2946,15 @@ impl AshDrmRenderer {
                 return Err(error).context("import DMA-BUF memory");
             }
         };
-        unsafe { self.device.bind_image_memory(image, memory, 0) }
-            .context("bind imported DMA-BUF image")?;
+        if let Err(error) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return Err(error).context("bind imported DMA-BUF image");
+        }
         let components = texture_components(target.fourcc);
-        let view = unsafe {
+        let view = match unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
@@ -2786,7 +2964,16 @@ impl AshDrmRenderer {
                     .subresource_range(color_range()),
                 None,
             )
-        }?;
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
         Ok(ImageResource {
             image,
             memory,
@@ -2821,20 +3008,38 @@ impl AshDrmRenderer {
             )
         }?;
         let requirements = unsafe { self.device.get_image_memory_requirements(image) };
-        let memory_type = self.memory_type(
+        let memory_type = match self.memory_type(
             requirements.memory_type_bits,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        )?;
-        let memory = unsafe {
+        ) {
+            Ok(memory_type) => memory_type,
+            Err(error) => {
+                unsafe { self.device.destroy_image(image, None) };
+                return Err(error);
+            }
+        };
+        let memory = match unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(requirements.size)
                     .memory_type_index(memory_type),
                 None,
             )
-        }?;
-        unsafe { self.device.bind_image_memory(image, memory, 0) }?;
-        let view = unsafe {
+        } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_image(image, None) };
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = unsafe { self.device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_image(image, None);
+            }
+            return Err(error.into());
+        }
+        let view = match unsafe {
             self.device.create_image_view(
                 &vk::ImageViewCreateInfo::default()
                     .image(image)
@@ -2843,7 +3048,16 @@ impl AshDrmRenderer {
                     .subresource_range(color_range()),
                 None,
             )
-        }?;
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_image(image, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
         Ok(ImageResource {
             image,
             memory,
@@ -2870,26 +3084,51 @@ impl AshDrmRenderer {
             )
         }?;
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = self.memory_type(
+        let memory_type = match self.memory_type(
             requirements.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let memory = unsafe {
+        ) {
+            Ok(memory_type) => memory_type,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
+        };
+        let memory = match unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(requirements.size)
                     .memory_type_index(memory_type),
                 None,
             )
-        }?;
+        } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+            }
+            return Err(error.into());
+        }
+        let ptr = match unsafe {
+            self.device
+                .map_memory(memory, 0, bytes.len() as u64, vk::MemoryMapFlags::empty())
+        } {
+            Ok(ptr) => ptr,
+            Err(error) => {
+                unsafe {
+                    self.device.destroy_buffer(buffer, None);
+                    self.device.free_memory(memory, None);
+                }
+                return Err(error.into());
+            }
+        };
         unsafe {
-            self.device.bind_buffer_memory(buffer, memory, 0)?;
-            let ptr = self.device.map_memory(
-                memory,
-                0,
-                bytes.len() as u64,
-                vk::MemoryMapFlags::empty(),
-            )?;
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
             self.device.unmap_memory(memory);
         }
@@ -2908,19 +3147,37 @@ impl AshDrmRenderer {
             )
         }?;
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
-        let memory_type = self.memory_type(
+        let memory_type = match self.memory_type(
             requirements.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-        let memory = unsafe {
+        ) {
+            Ok(memory_type) => memory_type,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(error);
+            }
+        };
+        let memory = match unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(requirements.size)
                     .memory_type_index(memory_type),
                 None,
             )
-        }?;
-        unsafe { self.device.bind_buffer_memory(buffer, memory, 0) }?;
+        } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { self.device.destroy_buffer(buffer, None) };
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = unsafe { self.device.bind_buffer_memory(buffer, memory, 0) } {
+            unsafe {
+                self.device.free_memory(memory, None);
+                self.device.destroy_buffer(buffer, None);
+            }
+            return Err(error.into());
+        }
         Ok(BufferResource { buffer, memory })
     }
 
@@ -2998,6 +3255,9 @@ impl AshDrmRenderer {
                     .ok();
                 self.destroy_image(output.lut);
             }
+            for image in frame.retired_images {
+                self.destroy_image(image);
+            }
             for texture in frame.retired_textures {
                 if texture.image.image == vk::Image::null() {
                     continue;
@@ -3068,6 +3328,11 @@ impl Drop for AshDrmRenderer {
                     self.device.destroy_image_view(output.lut.view, None);
                     self.device.destroy_image(output.lut.image, None);
                     self.device.free_memory(output.lut.memory, None);
+                }
+                for image in frame.retired_images {
+                    self.device.destroy_image_view(image.view, None);
+                    self.device.destroy_image(image.image, None);
+                    self.device.free_memory(image.memory, None);
                 }
                 for texture in frame.retired_textures {
                     if texture.image.image != vk::Image::null() {
@@ -3212,16 +3477,27 @@ fn texture_components(fourcc: u32) -> vk::ComponentMapping {
 }
 
 fn target_key(target: &DrmRenderTarget) -> Result<TargetKey> {
+    let plane = target
+        .planes
+        .first()
+        .context("DMA-BUF target has no planes")?;
     let stat = unsafe {
         let mut value = std::mem::MaybeUninit::<libc::stat>::zeroed();
-        if libc::fstat(target.planes[0].as_raw_fd(), value.as_mut_ptr()) != 0 {
+        if libc::fstat(plane.as_raw_fd(), value.as_mut_ptr()) != 0 {
             return Err(std::io::Error::last_os_error()).context("identify GBM DMA-BUF");
         }
         value.assume_init()
     };
+    let mut layout = DefaultHasher::new();
+    target.offsets.hash(&mut layout);
+    target.strides.hash(&mut layout);
+    for plane in &target.planes {
+        fd_identity(plane.as_raw_fd())?.hash(&mut layout);
+    }
     Ok(TargetKey {
         device: stat.st_dev,
         inode: stat.st_ino,
+        layout: layout.finish(),
         modifier: target.modifier,
         width: target.width,
         height: target.height,
@@ -3480,6 +3756,55 @@ fn output_lut_fingerprint(lut: AshDrmOutputLut<'_>) -> u64 {
     hasher.finish()
 }
 
+fn matrix_fingerprint(matrix: [[f32; 3]; 3]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for row in matrix {
+        for value in row {
+            value.to_bits().hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+fn output_state_fingerprint(
+    lut_fingerprint: u64,
+    transfer: AshDrmTransfer,
+    hdr: Option<AshDrmHdrOutput>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    lut_fingerprint.hash(&mut hasher);
+    let transfer = match transfer {
+        AshDrmTransfer::Srgb => 0_u8,
+        AshDrmTransfer::Gamma22 => 1,
+        AshDrmTransfer::SrgbUnorm => 2,
+        AshDrmTransfer::Gamma22Unorm => 3,
+        AshDrmTransfer::Pq => 4,
+    };
+    transfer.hash(&mut hasher);
+    if let Some(hdr) = hdr {
+        1_u8.hash(&mut hasher);
+        for value in [
+            hdr.peak_nits,
+            hdr.full_frame_peak_nits,
+            hdr.black_level_nits,
+            hdr.reference_white_nits,
+            hdr.source_peak_nits,
+            hdr.saturation,
+            hdr.midtone_gamma,
+            hdr.calibration_pattern,
+        ] {
+            value.to_bits().hash(&mut hasher);
+        }
+        matrix_fingerprint(hdr.scene_to_bt2020).hash(&mut hasher);
+        for value in hdr.bt2020_luma {
+            value.to_bits().hash(&mut hasher);
+        }
+    } else {
+        0_u8.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn identity_output_lut() -> Vec<u8> {
     let mut rgb = Vec::with_capacity(2 * 2 * 2 * 3);
     for blue in [0, 255] {
@@ -3517,17 +3842,53 @@ fn texture_needs_refresh(compatible: bool, external: bool, damaged: bool) -> boo
     !compatible || (!external && damaged)
 }
 
+fn texture_upload_byte_len(
+    width: u32,
+    height: u32,
+    stride: u32,
+    available: usize,
+) -> Option<usize> {
+    let minimum_stride = width.checked_mul(4)?;
+    if stride < minimum_stride || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let required = usize::try_from(stride)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)?;
+    (available >= required).then_some(required)
+}
+
+fn validate_meshes(meshes: &[TexturedMesh]) -> Result<()> {
+    for mesh in meshes {
+        ensure!(
+            u32::try_from(mesh.indices.len()).is_ok(),
+            "Vulkan mesh contains too many indices"
+        );
+        ensure!(
+            mesh.indices
+                .iter()
+                .all(|index| (*index as usize) < mesh.vertices.len()),
+            "Vulkan mesh index exceeds its vertex buffer"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         compile_shader, dmabuf_planes_share_object, effective_damage_regions,
         export_dmabuf_read_fence, identity_output_lut, import_dmabuf_read_fence,
-        mesh_clip_transform, multiply_3x3, ndc_rect, solid_push_constants, texture_components,
-        texture_needs_refresh, texture_vk_format, transformed_uv, validate_output_lut, vk_format,
-        AshDrmCapture, AshDrmOutputLut, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER,
-        SOLID_SHADER, TEXTURE_SHADER, XBGR2101010, XRGB2101010, XRGB8888,
+        matrix_fingerprint, mesh_clip_transform, multiply_3x3, ndc_rect, output_state_fingerprint,
+        solid_push_constants, target_key, texture_components, texture_needs_refresh,
+        texture_upload_byte_len, texture_vk_format, transformed_uv, validate_meshes,
+        validate_output_lut, vk_format, AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut,
+        AshDrmTransfer, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER,
+        TEXTURE_SHADER, XBGR2101010, XRGB2101010, XRGB8888,
     };
-    use crate::{FramePixelFormat, FrameTransform, SolidQuad};
+    use crate::{
+        DrmRenderTarget, FramePixelFormat, FrameTransform, MeshVertex, SolidQuad, TexturedMesh,
+    };
     use std::collections::VecDeque;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
@@ -3550,6 +3911,65 @@ mod tests {
         assert!(!texture_needs_refresh(true, true, true));
         assert!(texture_needs_refresh(true, false, true));
         assert!(!texture_needs_refresh(true, false, false));
+    }
+
+    #[test]
+    fn cpu_texture_upload_requires_complete_pixel_aligned_rows() {
+        assert_eq!(texture_upload_byte_len(2, 3, 8, 24), Some(24));
+        assert_eq!(texture_upload_byte_len(2, 3, 12, 36), Some(36));
+        assert_eq!(texture_upload_byte_len(2, 3, 7, 24), None);
+        assert_eq!(texture_upload_byte_len(2, 3, 6, 24), None);
+        assert_eq!(texture_upload_byte_len(2, 3, 8, 23), None);
+    }
+
+    #[test]
+    fn mesh_indices_must_reference_existing_vertices() {
+        let mut mesh = TexturedMesh {
+            vertices: vec![MeshVertex::default()],
+            indices: vec![0],
+            ..Default::default()
+        };
+        assert!(validate_meshes(&[mesh.clone()]).is_ok());
+        mesh.indices.push(1);
+        assert!(validate_meshes(&[mesh]).is_err());
+    }
+
+    #[test]
+    fn retained_color_state_changes_invalidate_its_fingerprint() {
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let changed = [[0.9, 0.1, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        assert_ne!(matrix_fingerprint(identity), matrix_fingerprint(changed));
+
+        let hdr = AshDrmHdrOutput {
+            peak_nits: 1000.0,
+            full_frame_peak_nits: 400.0,
+            black_level_nits: 0.01,
+            reference_white_nits: 203.0,
+            source_peak_nits: 1000.0,
+            saturation: 1.0,
+            midtone_gamma: 1.0,
+            calibration_pattern: 0.0,
+            scene_to_bt2020: identity,
+            bt2020_luma: [0.2627, 0.6780, 0.0593],
+        };
+        assert_ne!(
+            output_state_fingerprint(7, AshDrmTransfer::Srgb, None),
+            output_state_fingerprint(7, AshDrmTransfer::Pq, Some(hdr))
+        );
+    }
+
+    #[test]
+    fn empty_render_target_is_rejected_without_indexing_a_plane() {
+        let target = DrmRenderTarget {
+            planes: Vec::new(),
+            offsets: Vec::new(),
+            strides: Vec::new(),
+            fourcc: XRGB8888,
+            modifier: 0,
+            width: 1,
+            height: 1,
+        };
+        assert!(target_key(&target).is_err());
     }
 
     #[test]

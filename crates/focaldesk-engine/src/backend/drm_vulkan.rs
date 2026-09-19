@@ -45,8 +45,8 @@ use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
-    physical_size_mm_from_pixels, pump_desktop_services, spawn_session_sleep_watch,
-    stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
+    physical_size_mm_from_pixels, pump_desktop_services, restart_shell_surfaces_after_gpu_resume,
+    spawn_session_sleep_watch, stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
 };
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
@@ -250,6 +250,7 @@ struct VulkanDrmData {
     disable_explicit_kms_fences: bool,
     resume_pending: bool,
     resume_retry_at: Option<Instant>,
+    restart_shell_after_present: bool,
     topology_refresh_pending: bool,
     hdr_recovery_rebuild_attempted: bool,
     capture_pending: HashSet<OutputId>,
@@ -264,6 +265,7 @@ fn pause_vulkan_session(data: &mut VulkanDrmData, reason: &str) {
     }
     data.resume_pending = false;
     data.resume_retry_at = None;
+    data.restart_shell_after_present = false;
     data.session_active = false;
     for output in &mut data.outputs {
         if output.frame_pending {
@@ -306,6 +308,11 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
     data.session_active = true;
     data.resume_pending = false;
     data.resume_retry_at = None;
+    // GTK uses a separate GPU context. Recreate those clients only after a
+    // vblank proves the replacement Vulkan device and KMS scanout are live;
+    // otherwise a rail that retained invalid driver resources can remain
+    // visible but stop accepting input for the rest of the session.
+    data.restart_shell_after_present = true;
     data.topology_refresh_pending = false;
     data.desktop.state.handle_session_resume();
     data.desktop.state.mark_redraw();
@@ -1010,6 +1017,7 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
             .output_state
             .outputs
             .shift_remove(&output.output_id);
+        data.renderer.remove_stream(output.output_id.0);
     }
     data.outputs.clear();
     data.capture_pending.clear();
@@ -1498,6 +1506,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         disable_explicit_kms_fences,
         resume_pending: false,
         resume_retry_at: None,
+        restart_shell_after_present: false,
         topology_refresh_pending: false,
         hdr_recovery_rebuild_attempted: false,
         capture_pending: HashSet::new(),
@@ -1602,6 +1611,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     // primary-plane commit was pending.  Submit the newest
                     // coalesced position now that the CRTC is idle.
                     update_kms_cursor(data);
+                    if std::mem::take(&mut data.restart_shell_after_present) {
+                        flog("raw Vulkan first post-resume page flip completed");
+                        restart_shell_surfaces_after_gpu_resume();
+                    }
                 }
                 Err(error) => {
                     let output = &data.outputs[index];
