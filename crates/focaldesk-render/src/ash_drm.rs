@@ -589,13 +589,13 @@ impl AshDrmCapture {
     pub fn into_rgba8(mut self) -> Result<Vec<u8>> {
         match self.fourcc {
             XRGB8888 | ARGB8888 => {
-                for pixel in self.pixels.chunks_exact_mut(4) {
+                for pixel in self.pixels.as_chunks_mut::<4>().0 {
                     pixel.swap(0, 2);
                     pixel[3] = 255;
                 }
             }
             XBGR8888 | ABGR8888 => {
-                for pixel in self.pixels.chunks_exact_mut(4) {
+                for pixel in self.pixels.as_chunks_mut::<4>().0 {
                     pixel[3] = 255;
                 }
             }
@@ -604,7 +604,7 @@ impl AshDrmCapture {
                 // packed u32 per pixel. Normalize the RGB fields to eight bit
                 // for the existing screenshot/SHM capture contract. Captures
                 // are opaque regardless of the scanout format's alpha bits.
-                for pixel in self.pixels.chunks_exact_mut(4) {
+                for pixel in self.pixels.as_chunks_mut::<4>().0 {
                     let packed = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
                     let (r, g, b) = if matches!(self.fourcc, XRGB2101010 | ARGB2101010) {
                         (
@@ -2572,7 +2572,7 @@ impl AshDrmRenderer {
             .checked_mul(lut.grid_size)
             .context("ICC LUT atlas width overflow")?;
         let mut rgba = Vec::with_capacity(lut.rgb.len() / 3 * 4);
-        for rgb in lut.rgb.chunks_exact(3) {
+        for rgb in lut.rgb.as_chunks::<3>().0 {
             rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
         }
         let image = self.create_owned_image(

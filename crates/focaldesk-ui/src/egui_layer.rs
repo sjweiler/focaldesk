@@ -1736,14 +1736,16 @@ mod egui_vertex_layout_tests {
         assert!(paint.textures.iter().any(|texture| {
             texture
                 .pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[3] > 0 && pixel[3] < 255)
         }));
 
         let raster = rasterize_vulkan_paint(&paint).expect("power panel raster");
         assert!(raster.width >= 200);
         assert!(raster.height >= 300);
-        assert!(raster.pixels.chunks_exact(4).any(|pixel| {
+        assert!(raster.pixels.as_chunks::<4>().0.iter().any(|pixel| {
             pixel[3] >= 200 && pixel[..3].iter().copied().max().unwrap_or(0) >= 180
         }));
     }

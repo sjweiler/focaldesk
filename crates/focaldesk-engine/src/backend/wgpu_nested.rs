@@ -1404,7 +1404,7 @@ fn append_shell_icon_quads(
         if !assets.icons.contains_key(&icon) && !assets.unavailable_icons.contains(&icon) {
             match focaldesk_ui::atlas::rasterize_icon_rgba(icon, 48) {
                 Ok(mut pixels) => {
-                    for pixel in pixels.chunks_exact_mut(4) {
+                    for pixel in pixels.as_chunks_mut::<4>().0 {
                         let alpha = u16::from(pixel[3]);
                         pixel[0] = (u16::from(pixel[0]) * alpha / 255) as u8;
                         pixel[1] = (u16::from(pixel[1]) * alpha / 255) as u8;
@@ -1996,7 +1996,7 @@ fn dmabuf_surface_frame(
     #[cfg(target_endian = "little")]
     if matches!(format.code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888) {
         for row in pixels.chunks_exact_mut(stride as usize) {
-            for pixel in row[..size.w as usize * 4].chunks_exact_mut(4) {
+            for pixel in row[..size.w as usize * 4].as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }
@@ -2004,7 +2004,7 @@ fn dmabuf_surface_frame(
 
     #[cfg(target_endian = "big")]
     for row in pixels.chunks_exact_mut(stride as usize) {
-        for pixel in row[..size.w as usize * 4].chunks_exact_mut(4) {
+        for pixel in row[..size.w as usize * 4].as_chunks_mut::<4>().0 {
             let [a, r, g, b] = [pixel[0], pixel[1], pixel[2], pixel[3]];
             let alpha = if matches!(format.code, Fourcc::Xrgb8888 | Fourcc::Xbgr8888) {
                 255
@@ -2106,7 +2106,7 @@ fn shm_surface_frame(
         #[cfg(target_endian = "little")]
         if data.format == wl_shm::Format::Xrgb8888 {
             for row in pixels.chunks_exact_mut(stride) {
-                for pixel in row[..data.width as usize * 4].chunks_exact_mut(4) {
+                for pixel in row[..data.width as usize * 4].as_chunks_mut::<4>().0 {
                     pixel[3] = 255;
                 }
             }
@@ -2114,7 +2114,7 @@ fn shm_surface_frame(
 
         #[cfg(target_endian = "big")]
         for row in pixels.chunks_exact_mut(stride) {
-            for pixel in row[..data.width as usize * 4].chunks_exact_mut(4) {
+            for pixel in row[..data.width as usize * 4].as_chunks_mut::<4>().0 {
                 let [a, r, g, b] = [pixel[0], pixel[1], pixel[2], pixel[3]];
                 pixel.copy_from_slice(&[
                     b,

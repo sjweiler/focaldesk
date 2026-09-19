@@ -605,8 +605,10 @@ fn copy_cursor_rgba_to_argb(
         let source = &rgba[row * row_bytes..(row + 1) * row_bytes];
         let row_destination = &mut destination[row * pitch..row * pitch + row_bytes];
         for (src, dst) in source
-            .chunks_exact(4)
-            .zip(row_destination.chunks_exact_mut(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(row_destination.as_chunks_mut::<4>().0)
         {
             dst.copy_from_slice(&[src[2], src[1], src[0], src[3]]);
         }

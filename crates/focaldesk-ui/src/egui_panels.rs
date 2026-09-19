@@ -552,7 +552,7 @@ impl WorkspacesPanel {
                         rect,
                         7.0,
                         egui::Stroke::new(
-                            if entry.active { 2.0 } else { 1.0 },
+                            if entry.active { 2.0_f32 } else { 1.0_f32 },
                             if entry.active {
                                 egui::Color32::from_rgb(84, 188, 255)
                             } else {
@@ -1113,11 +1113,11 @@ fn panel_close_button(ui: &mut egui::Ui) -> egui::Response {
         rect,
         egui::CornerRadius::same(6),
         visuals.bg_fill,
-        egui::Stroke::new(1.0, visuals.bg_stroke.color),
+        egui::Stroke::new(1.0_f32, visuals.bg_stroke.color),
         egui::StrokeKind::Inside,
     );
     let inset = 7.0;
-    let stroke = egui::Stroke::new(2.0, visuals.fg_stroke.color);
+    let stroke = egui::Stroke::new(2.0_f32, visuals.fg_stroke.color);
     ui.painter().line_segment(
         [
             rect.left_top() + egui::vec2(inset, inset),
