@@ -51,9 +51,9 @@ use super::common::{
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    connector_edid, disable_explicit_kms_fences, dispatch_backend_input_event,
-    display_matches_monitor, drm_card_vendor_id, hdr_appearance_from_support, hdr_detection,
-    load_display_config, merge_disconnected_display_configs, parse_edid_identity,
+    connector_edid, disable_explicit_kms_fences, dispatch_backend_input_event, drm_card_vendor_id,
+    hdr_appearance_from_support, hdr_detection, load_display_config,
+    merge_disconnected_display_configs, parse_edid_identity, saved_monitor_config,
     select_connector_mode, write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
 };
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
@@ -338,19 +338,41 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
         let edid = connector_edid(drm, *handle);
         let hdr_support = hdr_detection::connector_hdr_support(drm, *handle, edid.as_deref());
         let identity = edid.as_deref().and_then(parse_edid_identity);
-        let saved_monitor = configured
-            .iter()
-            .find(|display| display_matches_monitor(display, identity.as_ref()));
+        let saved_monitor = saved_monitor_config(&configured, &name, identity.as_ref());
         if saved_monitor.is_some_and(|display| !display.enabled) {
             flog(format!(
                 "Raw Vulkan DRM leaving configured-disabled output {name} off"
             ));
             continue;
         }
+        // A connector fallback keeps an explicit Display Settings choice when
+        // EDID identity parsing is unavailable or changes. The shared selector
+        // still requires an exact currently advertised mode, so stale choices
+        // from a different monitor cannot be forced onto the connector.
         let requested_mode = saved_monitor
+            .or(saved)
             .map(|display| (display.mode_width, display.mode_height, display.refresh_mhz));
         let mode = select_connector_mode(info.modes(), requested_mode)
             .context("connected DRM output has no mode")?;
+        if let Some((requested_width, requested_height, requested_refresh_mhz)) = requested_mode {
+            let (selected_width, selected_height) = mode.size();
+            let selected_refresh_mhz = (mode.vrefresh() as i32).max(1) * 1_000;
+            let requested_mode_honored = i32::from(selected_width) == requested_width
+                && i32::from(selected_height) == requested_height
+                && (i64::from(selected_refresh_mhz) - i64::from(requested_refresh_mhz)).abs()
+                    <= 1_000;
+            if !requested_mode_honored {
+                flog_warn!(
+                    "Raw Vulkan requested display mode unavailable: output={name} requested={}x{}@{:.3}Hz selected={}x{}@{}Hz",
+                    requested_width,
+                    requested_height,
+                    f64::from(requested_refresh_mhz) / 1_000.0,
+                    selected_width,
+                    selected_height,
+                    mode.vrefresh(),
+                );
+            }
+        }
         let selected_crtc = info.encoders().iter().find_map(|encoder| {
             let encoder = drm.get_encoder(*encoder).ok()?;
             resources
@@ -1895,6 +1917,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                             saturation: appearance.saturation,
                             midtone_gamma: appearance.midtone_gamma,
                             calibration_pattern: output.hdr_calibration_pattern.shader_value(),
+                            tone_mapper: appearance.tone_mapper.shader_value(),
                             scene_to_bt2020,
                             bt2020_luma,
                         }

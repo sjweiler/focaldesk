@@ -116,6 +116,31 @@ pub struct HdrAppearance {
     pub full_frame_peak_nits: f32,
     pub saturation: f32,
     pub midtone_gamma: f32,
+    /// Highlight roll-off used by the final HDR output transform.
+    pub tone_mapper: HdrToneMapper,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HdrToneMapper {
+    /// A display-peak-aware, BT.2390-inspired shoulder. This preserves the
+    /// historical FocalDesk output and is the safest general-purpose default.
+    #[default]
+    Bt2390,
+    Reinhard,
+    Hable,
+    Aces,
+}
+
+impl HdrToneMapper {
+    pub const fn shader_value(self) -> f32 {
+        match self {
+            Self::Bt2390 => 0.0,
+            Self::Reinhard => 1.0,
+            Self::Hable => 2.0,
+            Self::Aces => 3.0,
+        }
+    }
 }
 
 fn legacy_hdr_full_frame_peak_nits() -> f32 {
@@ -160,6 +185,7 @@ impl Default for HdrAppearance {
             full_frame_peak_nits: 300.0,
             saturation: 1.0,
             midtone_gamma: 1.0,
+            tone_mapper: HdrToneMapper::Bt2390,
         }
     }
 }
@@ -187,6 +213,7 @@ impl HdrAppearance {
             full_frame_peak_nits: max_fall_nits.clamp(80.0, peak_nits),
             saturation: 1.0,
             midtone_gamma: 1.0,
+            tone_mapper: HdrToneMapper::Bt2390,
         }
     }
 
@@ -833,6 +860,7 @@ mod tests {
         assert_eq!(appearance.full_frame_peak_nits, 300.0);
         assert_eq!(appearance.saturation, 1.0);
         assert_eq!(appearance.midtone_gamma, 1.0);
+        assert_eq!(appearance.tone_mapper, HdrToneMapper::Bt2390);
         assert_eq!(appearance.validate(), Ok(appearance));
     }
 
@@ -858,6 +886,7 @@ mod tests {
         assert_eq!(appearance.black_level_nits, 0.05);
         assert_eq!(appearance.full_frame_peak_nits, 203.0);
         assert_eq!(appearance.peak_nits, 400.0);
+        assert_eq!(appearance.tone_mapper, HdrToneMapper::Bt2390);
         assert!(appearance.validate().is_ok());
     }
 

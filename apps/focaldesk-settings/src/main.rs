@@ -18,8 +18,8 @@ use focaldesk_permissions::{
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
     BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, ExclusiveHdrPhase, ExclusiveHdrState,
-    HdrAppearance, HdrCalibrationPattern, LidCloseAction, LowBatteryAction, OutputConfig,
-    PerformanceMode, PowerButtonAction, Settings,
+    HdrAppearance, HdrCalibrationPattern, HdrToneMapper, LidCloseAction, LowBatteryAction,
+    OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 use focaldesk_themes::{
@@ -88,6 +88,7 @@ const DISPLAY_COLOR_PROFILE_OPTIONS: &[&str] = &["Auto", "sRGB", "Display P3"];
 const HDR_APPEARANCE_PRESET_OPTIONS: &[&str] =
     &["Neutral (BT.2408)", "Bright room", "Punchy OLED", "Custom"];
 const HDR_APPEARANCE_CUSTOM_PRESET: u32 = 3;
+const HDR_TONE_MAPPER_OPTIONS: &[&str] = &["BT.2390", "Reinhard", "Hable", "ACES-inspired"];
 const HDR_CALIBRATION_PATTERN_OPTIONS: &[&str] = &[
     "Off",
     "Overview",
@@ -1449,6 +1450,7 @@ fn hdr_appearance_preset(selected: u32) -> Option<HdrAppearance> {
             full_frame_peak_nits: 300.0,
             saturation: 1.0,
             midtone_gamma: 0.90,
+            tone_mapper: HdrToneMapper::Bt2390,
         }),
         2 => Some(HdrAppearance {
             black_level_nits: 0.05,
@@ -1457,6 +1459,7 @@ fn hdr_appearance_preset(selected: u32) -> Option<HdrAppearance> {
             full_frame_peak_nits: 300.0,
             saturation: 1.10,
             midtone_gamma: 1.10,
+            tone_mapper: HdrToneMapper::Bt2390,
         }),
         _ => None,
     }
@@ -1476,6 +1479,24 @@ fn hdr_calibration_pattern(selected: u32) -> HdrCalibrationPattern {
         4 => HdrCalibrationPattern::PeakWindow,
         5 => HdrCalibrationPattern::PeakFullFrame,
         _ => HdrCalibrationPattern::Off,
+    }
+}
+
+fn hdr_tone_mapper(selected: u32) -> HdrToneMapper {
+    match selected {
+        1 => HdrToneMapper::Reinhard,
+        2 => HdrToneMapper::Hable,
+        3 => HdrToneMapper::Aces,
+        _ => HdrToneMapper::Bt2390,
+    }
+}
+
+fn hdr_tone_mapper_index(mapper: HdrToneMapper) -> u32 {
+    match mapper {
+        HdrToneMapper::Bt2390 => 0,
+        HdrToneMapper::Reinhard => 1,
+        HdrToneMapper::Hable => 2,
+        HdrToneMapper::Aces => 3,
     }
 }
 
@@ -1505,6 +1526,7 @@ fn start_hdr_appearance_preview(
     saturation: gtk::Scale,
     midtone_gamma: gtk::Scale,
     preset: gtk::DropDown,
+    tone_mapper: gtk::DropDown,
 ) {
     if let Err(message) = appearance.validate() {
         status.set_subtitle(&format!("Not previewed: {message}"));
@@ -1540,6 +1562,7 @@ fn start_hdr_appearance_preview(
         full_frame_peak.set_value(f64::from(rollback.full_frame_peak_nits));
         saturation.set_value(f64::from(rollback.saturation));
         midtone_gamma.set_value(f64::from(rollback.midtone_gamma));
+        tone_mapper.set_selected(hdr_tone_mapper_index(rollback.tone_mapper));
         suppress.set(false);
         generation.set(preview_generation.wrapping_add(1));
         status.set_subtitle("Preview expired; restored the saved values");
@@ -1563,6 +1586,7 @@ fn connect_hdr_appearance_scale(
     saturation: gtk::Scale,
     midtone_gamma: gtk::Scale,
     preset: gtk::DropDown,
+    tone_mapper: gtk::DropDown,
 ) {
     scale.connect_value_changed(move |scale| {
         if suppress.get() {
@@ -1627,6 +1651,7 @@ fn connect_hdr_appearance_scale(
             saturation.clone(),
             midtone_gamma.clone(),
             preset.clone(),
+            tone_mapper.clone(),
         );
     });
 }
@@ -1658,12 +1683,20 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
     let midtone_gamma = hdr_tuning_scale(0.70, 1.50, 0.01, initial.midtone_gamma, 2);
     let preset = gtk::DropDown::from_strings(HDR_APPEARANCE_PRESET_OPTIONS);
     preset.set_selected(hdr_appearance_preset_index(initial));
+    let tone_mapper = gtk::DropDown::from_strings(HDR_TONE_MAPPER_OPTIONS);
+    tone_mapper.set_selected(hdr_tone_mapper_index(initial.tone_mapper));
 
     let preset_row = adw::ActionRow::new();
     preset_row.set_title("Preset");
     preset_row.set_subtitle("Conservative starting points; selecting one starts a safe preview");
     preset_row.add_suffix(&preset);
     section.add_row(&preset_row);
+
+    let tone_mapper_row = adw::ActionRow::new();
+    tone_mapper_row.set_title("Tone mapping");
+    tone_mapper_row.set_subtitle("Highlight roll-off above reference white");
+    tone_mapper_row.add_suffix(&tone_mapper);
+    section.add_row(&tone_mapper_row);
 
     let calibration_pattern = gtk::DropDown::from_strings(HDR_CALIBRATION_PATTERN_OPTIONS);
     calibration_pattern.set_selected(0);
@@ -1769,6 +1802,7 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
             saturation.clone(),
             midtone_gamma.clone(),
             preset.clone(),
+            tone_mapper.clone(),
         );
     }
 
@@ -1785,6 +1819,7 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
         let full_frame_peak = full_frame_peak.clone();
         let saturation = saturation.clone();
         let midtone_gamma = midtone_gamma.clone();
+        let tone_mapper = tone_mapper.clone();
         preset.connect_selected_notify(move |preset| {
             if suppress.get() {
                 return;
@@ -1800,6 +1835,7 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
             full_frame_peak.set_value(f64::from(appearance.full_frame_peak_nits));
             saturation.set_value(f64::from(appearance.saturation));
             midtone_gamma.set_value(f64::from(appearance.midtone_gamma));
+            tone_mapper.set_selected(hdr_tone_mapper_index(appearance.tone_mapper));
             suppress.set(false);
             start_hdr_appearance_preview(
                 &connector,
@@ -1816,6 +1852,7 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
                 saturation.clone(),
                 midtone_gamma.clone(),
                 preset.clone(),
+                tone_mapper.clone(),
             );
         });
     }
@@ -1834,6 +1871,51 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
         let saturation = saturation.clone();
         let midtone_gamma = midtone_gamma.clone();
         let preset = preset.clone();
+        tone_mapper.connect_selected_notify(move |tone_mapper| {
+            if suppress.get() {
+                return;
+            }
+            let mut appearance = *draft.borrow();
+            appearance.tone_mapper = hdr_tone_mapper(tone_mapper.selected());
+            *draft.borrow_mut() = appearance;
+            suppress.set(true);
+            preset.set_selected(HDR_APPEARANCE_CUSTOM_PRESET);
+            suppress.set(false);
+            start_hdr_appearance_preview(
+                &connector,
+                appearance,
+                confirmed.clone(),
+                draft.clone(),
+                generation.clone(),
+                suppress.clone(),
+                status.clone(),
+                black_level.clone(),
+                reference_white.clone(),
+                peak.clone(),
+                full_frame_peak.clone(),
+                saturation.clone(),
+                midtone_gamma.clone(),
+                preset.clone(),
+                tone_mapper.clone(),
+            );
+        });
+    }
+
+    {
+        let connector = connector.clone();
+        let confirmed = confirmed.clone();
+        let draft = draft.clone();
+        let generation = generation.clone();
+        let suppress = suppress.clone();
+        let status = status.clone();
+        let black_level = black_level.clone();
+        let reference_white = reference_white.clone();
+        let peak = peak.clone();
+        let full_frame_peak = full_frame_peak.clone();
+        let saturation = saturation.clone();
+        let midtone_gamma = midtone_gamma.clone();
+        let preset = preset.clone();
+        let tone_mapper = tone_mapper.clone();
         reset.connect_clicked(move |_| {
             let defaults = display
                 .hdr_max_luminance_nits
@@ -1850,6 +1932,7 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
             full_frame_peak.set_value(f64::from(defaults.full_frame_peak_nits));
             saturation.set_value(f64::from(defaults.saturation));
             midtone_gamma.set_value(f64::from(defaults.midtone_gamma));
+            tone_mapper.set_selected(hdr_tone_mapper_index(defaults.tone_mapper));
             suppress.set(false);
             start_hdr_appearance_preview(
                 &connector,
@@ -1866,6 +1949,7 @@ fn hdr_appearance_row(index: usize, displays: Rc<RefCell<Vec<DisplayConfig>>>) -
                 saturation.clone(),
                 midtone_gamma.clone(),
                 preset.clone(),
+                tone_mapper.clone(),
             );
         });
     }
@@ -10176,6 +10260,11 @@ mod tests {
             DisplayModeConfig {
                 width: 2560,
                 height: 1440,
+                refresh_mhz: 165_000,
+            },
+            DisplayModeConfig {
+                width: 2560,
+                height: 1440,
                 refresh_mhz: 120_000,
             },
             DisplayModeConfig {
@@ -10189,7 +10278,10 @@ mod tests {
                 refresh_mhz: 60_000,
             },
         ];
-        assert_eq!(refresh_options(&display, 2560, 1440), vec![60_000, 120_000]);
+        assert_eq!(
+            refresh_options(&display, 2560, 1440),
+            vec![60_000, 120_000, 165_000]
+        );
     }
 
     #[test]

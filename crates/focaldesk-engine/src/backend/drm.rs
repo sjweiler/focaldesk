@@ -388,10 +388,10 @@ const HDR_MIN_STABLE_VBLANKS: u8 = 3;
 /// minimum supported refresh before exposing the output as verified-active.
 const HDR_VERIFY_VBLANKS: u16 = 300;
 const HDR_VERIFY_DURATION: Duration = Duration::from_secs(5);
-/// Keep SDR and HDR on the same conservative timing. High-refresh modes can fit
-/// at 8 bpc but exceed the same connector's payload budget once the driver
-/// switches to a 10-bpc link. Prefer the native-resolution mode at or below
-/// this limit so an HDR transition does not also require a refresh-rate change.
+/// Conservative ceiling for automatic mode selection. High-refresh modes can
+/// fit at 8 bpc but exceed the same connector's payload budget once the driver
+/// switches to a 10-bpc link. An exact mode selected in Display Settings is
+/// always tried before this fallback is used.
 const OUTPUT_MAX_REFRESH_HZ: u32 = 120;
 /// Bound any queued DRM frame, not only HDR property transitions. A connector
 /// disappearing between commit and vblank otherwise leaves the CRTC skipped forever.
@@ -821,6 +821,29 @@ pub(crate) fn display_matches_monitor(
     display.monitor_make.as_deref() == Some(identity.make.as_str())
         && display.monitor_model.as_deref() == Some(identity.model.as_str())
         && display.monitor_serial.as_deref() == Some(identity.serial_number.as_str())
+}
+
+/// Resolve saved settings for a physical monitor without conflating identical
+/// panels whose EDIDs do not contain unique serial numbers. A unique identity
+/// follows the monitor across connectors; an ambiguous identity stays tied to
+/// its current connector.
+pub(crate) fn saved_monitor_config<'a>(
+    displays: &'a [DisplayConfig],
+    connector_name: &str,
+    identity: Option<&EdidMonitorIdentity>,
+) -> Option<&'a DisplayConfig> {
+    let identity = identity?;
+    let mut matches = displays
+        .iter()
+        .filter(|display| display_matches_monitor(display, Some(identity)));
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        return Some(first);
+    }
+
+    displays.iter().find(|display| {
+        display.name == connector_name && display_matches_monitor(display, Some(identity))
+    })
 }
 
 pub(crate) fn hdr_appearance_from_support(support: &HdrSupport) -> HdrAppearance {
@@ -1862,13 +1885,13 @@ mod hdr_tests {
         hdr_driver_allows_output_with_override, hdr_failure_persist_action,
         hdr_verification_complete, merge_disconnected_display_configs,
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
-        reset_surface_timing_after_resume, select_drm_mode_index, select_exclusive_hdr_target,
-        select_requested_drm_mode_index, should_defer_drm_topology_change,
-        should_remove_drm_device, DisplayConfig, DisplayTransform, DrmLifecycle, DrmModeCandidate,
-        EdidHdrMetadata, EdidMonitorIdentity, ExclusiveHdrPrepareDecision, HdrBpcRange,
-        HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT, DRM_SCANOUT_FORMAT_PREFERENCE,
-        HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION, HDR_VERIFY_VBLANKS,
-        OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
+        reset_surface_timing_after_resume, saved_monitor_config, select_drm_mode_index,
+        select_exclusive_hdr_target, select_requested_drm_mode_index,
+        should_defer_drm_topology_change, should_remove_drm_device, DisplayConfig,
+        DisplayTransform, DrmLifecycle, DrmModeCandidate, EdidHdrMetadata, EdidMonitorIdentity,
+        ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT,
+        DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
+        HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
     use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance};
     use std::time::{Duration, Instant};
@@ -1935,6 +1958,29 @@ mod hdr_tests {
             ..identity
         };
         assert!(!display_matches_monitor(&display, Some(&other)));
+    }
+
+    #[test]
+    fn duplicate_monitor_identities_use_the_connector_specific_config() {
+        let identity = EdidMonitorIdentity {
+            make: "ACI".into(),
+            model: "ASUS VG32VQR".into(),
+            serial_number: "unknown".into(),
+        };
+        let mut first = display_config(false, false);
+        first.monitor_make = Some(identity.make.clone());
+        first.monitor_model = Some(identity.model.clone());
+        first.monitor_serial = Some(identity.serial_number.clone());
+        first.refresh_mhz = 120_000;
+
+        let mut second = first.clone();
+        second.name = "DP-2".into();
+        second.refresh_mhz = 165_000;
+
+        let displays = [first, second];
+        let saved = saved_monitor_config(&displays, "DP-2", Some(&identity)).unwrap();
+        assert_eq!(saved.name, "DP-2");
+        assert_eq!(saved.refresh_mhz, 165_000);
     }
 
     #[test]
@@ -2125,24 +2171,24 @@ mod hdr_tests {
     }
 
     #[test]
-    fn configured_refresh_selects_exact_advertised_mode() {
+    fn configured_refresh_selects_exact_advertised_mode_above_automatic_ceiling() {
         let candidates = [
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
-                refresh_hz: 120,
+                refresh_hz: 165,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
-                refresh_hz: 60,
+                refresh_hz: 120,
                 preferred: false,
             },
         ];
         assert_eq!(
-            select_requested_drm_mode_index(&candidates, (2560, 1440, 60_000)),
-            Some(1)
+            select_requested_drm_mode_index(&candidates, (2560, 1440, 165_000)),
+            Some(0)
         );
     }
 
@@ -5153,9 +5199,8 @@ fn device_added(
             .find(|display| display.name == output_name);
         // Connector names are not monitor identities. A monitor newly plugged
         // into DP-3 must not inherit DP-3's old ICC profile or HDR calibration.
-        let saved_monitor = configured_displays
-            .iter()
-            .find(|display| display_matches_monitor(display, edid_identity.as_ref()));
+        let saved_monitor =
+            saved_monitor_config(&configured_displays, &output_name, edid_identity.as_ref());
         let hdr_requested_from_config = saved_monitor
             .map(|display| display.hdr_requested || display.hdr_enabled)
             .unwrap_or(false);
@@ -5164,12 +5209,37 @@ fn device_added(
         let hdr_safe_mode_requested = hdr_requested_config
             && hdr_support.can_signal_hdr10()
             && hdr_support.bpc_control_allows_ten_bit();
+        // Prefer the monitor identity so a saved choice follows the panel to a
+        // different connector. Fall back to the connector entry when EDID is
+        // absent or changed: the requested mode is still validated against the
+        // connector's currently advertised modes before it can be selected.
         let requested_mode = saved_monitor
+            .or(saved_display)
             .map(|display| (display.mode_width, display.mode_height, display.refresh_mhz));
         let mode = select_connector_mode(info.modes(), requested_mode);
 
         if let Some(mode) = mode {
             let (w, h) = mode.size();
+
+            if let Some((requested_width, requested_height, requested_refresh_mhz)) = requested_mode
+            {
+                let selected_refresh_mhz = (mode.vrefresh() as i32) * 1_000;
+                let requested_mode_honored = i32::from(w) == requested_width
+                    && i32::from(h) == requested_height
+                    && (i64::from(selected_refresh_mhz) - i64::from(requested_refresh_mhz)).abs()
+                        <= 1_000;
+                if !requested_mode_honored {
+                    flog_warn!(
+                        "Requested display mode unavailable: output={output_name} requested={}x{}@{:.3}Hz selected={}x{}@{}Hz",
+                        requested_width,
+                        requested_height,
+                        f64::from(requested_refresh_mhz) / 1_000.0,
+                        w,
+                        h,
+                        mode.vrefresh(),
+                    );
+                }
+            }
 
             if hdr_safe_mode_requested {
                 flog_warn!(

@@ -423,6 +423,7 @@ pub fn apply_output_encode(
                     appearance.saturation,
                     appearance.midtone_gamma,
                     calibration_pattern,
+                    appearance.tone_mapper.shader_value(),
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {
@@ -591,6 +592,7 @@ fn hdr_pq_shader_uniforms(
     saturation: f32,
     midtone_gamma: f32,
     calibration_pattern: f32,
+    tone_mapper: f32,
 ) -> Vec<Uniform<'static>> {
     let (scene_to_panel, panel_to_bt2020, luma) = hdr10_pq_encode_transforms(panel);
     vec![
@@ -602,6 +604,7 @@ fn hdr_pq_shader_uniforms(
         Uniform::new("u_saturation", saturation),
         Uniform::new("u_midtone_gamma", midtone_gamma),
         Uniform::new("u_calibration_pattern", calibration_pattern),
+        Uniform::new("u_tone_mapper", tone_mapper),
         Uniform::new("u_m0", scene_to_panel[0]),
         Uniform::new("u_m1", scene_to_panel[1]),
         Uniform::new("u_m2", scene_to_panel[2]),
@@ -655,6 +658,7 @@ fn apply_hdr_pq_encode(
     saturation: f32,
     midtone_gamma: f32,
     calibration_pattern: f32,
+    tone_mapper: f32,
 ) -> Result<Option<SyncPoint>> {
     let damage = full_damage(buffer_size);
     let sdr_to_scrgb = state
@@ -725,6 +729,7 @@ fn apply_hdr_pq_encode(
             saturation,
             midtone_gamma,
             calibration_pattern,
+            tone_mapper,
         ),
         "linear-scRGB-to-PQ",
         &damage,
@@ -1040,6 +1045,7 @@ fn apply_linear_hdr_pq_encode(
     saturation: f32,
     midtone_gamma: f32,
     calibration_pattern: f32,
+    tone_mapper: f32,
 ) -> Result<SyncPoint> {
     let shader = state
         .render
@@ -1068,6 +1074,7 @@ fn apply_linear_hdr_pq_encode(
         saturation,
         midtone_gamma,
         calibration_pattern,
+        tone_mapper,
     );
     let destination = &mut targets
         .hdr_offscreen
@@ -1159,6 +1166,7 @@ fn apply_linear_output_encode(
                     appearance.saturation,
                     appearance.midtone_gamma,
                     calibration_pattern,
+                    appearance.tone_mapper.shader_value(),
                 ) {
                     Ok(sync) => return Ok(sync),
                     Err(err) => {

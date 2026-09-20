@@ -56,6 +56,10 @@ peak, and sustained full-frame peak separately. The final two values become
 MaxCLL/mastering peak and MaxFALL in the live KMS metadata. Saturation is
 applied in the resolved panel gamut while preserving luminance, and midtone
 gamma shapes only the SDR range while keeping black and reference white fixed.
+The tone-mapping selector affects only highlights above reference white.
+**BT.2390** is the conservative display-peak-aware default; **Reinhard**,
+**Hable**, and **ACES-inspired** provide alternative shoulders normalized to
+the configured panel peak.
 
 Moving a control or selecting the **Neutral (BT.2408)**, **Bright room**, or
 **Punchy OLED** preset starts a live 15-second preview. Choose **Keep** to save
@@ -338,11 +342,13 @@ scanout formats. If either preflight fails, all connected outputs remain active
 and the exclusive selector prevents HDR from being attempted on a different
 connector.
 
-All outputs use their preferred/native resolution at the fastest advertised
-refresh no greater than 120 Hz. Keeping the SDR and HDR timings identical avoids
-adding a refresh-rate modeset to HDR transitions, while the conservative ceiling
-also avoids selecting a timing that fits at 8 bpc but exceeds the connector's
-payload budget when HDR requires a 10-bpc link.
+Automatic mode selection uses the preferred/native resolution at the fastest
+advertised refresh no greater than 120 Hz. Keeping the SDR and HDR timings
+identical avoids adding a refresh-rate modeset to HDR transitions, while the
+conservative ceiling also avoids selecting a timing that fits at 8 bpc but
+exceeds the connector's payload budget when HDR requires a 10-bpc link. An exact
+mode explicitly selected in Display Settings takes precedence over this
+automatic ceiling, including 144 Hz and 165 Hz modes advertised by the display.
 
 Exclusive mode attaches BT.2020, HDR10 metadata, and any available 10-bpc link
 control to Smithay's pending connector state before the first real scanout

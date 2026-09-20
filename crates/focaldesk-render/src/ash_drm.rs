@@ -328,6 +328,32 @@ fn pq_oetf(nits: f32) -> f32 {
 }
 
 fn tone_map_nits(value: f32, source_peak: f32, display_peak: f32, white: f32) -> f32 {
+    let mapper = pc.params2.z;
+    if value <= white || source_peak <= display_peak || display_peak <= white {
+        return min(value, display_peak);
+    }
+    if mapper > 0.5 {
+        let x = clamp((value - white) / max(source_peak - white, 0.0001), 0.0, 1.0);
+        var shoulder: f32;
+        if mapper < 1.5 {
+            shoulder = 2.0 * x / (1.0 + x);
+        } else if mapper < 2.5 {
+            let a = 0.15;
+            let b = 0.50;
+            let c = 0.10;
+            let d = 0.20;
+            let e = 0.02;
+            let f = 0.30;
+            let hable_x = ((x * (a * x + c * b) + d * e) / (x * (a * x + b) + d * f)) - e / f;
+            let hable_white = ((a + c * b + d * e) / (a + b + d * f)) - e / f;
+            shoulder = hable_x / max(hable_white, 0.0001);
+        } else {
+            let aces_x = (x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14);
+            let aces_white = 2.54 / 3.16;
+            shoulder = aces_x / aces_white;
+        }
+        return min(white + clamp(shoulder, 0.0, 1.0) * (display_peak - white), display_peak);
+    }
     let knee = max(white, display_peak * 0.8);
     if value <= knee || display_peak <= knee || source_peak <= display_peak {
         return min(value, display_peak);
@@ -344,6 +370,23 @@ fn pq_dither(pixel: vec2<f32>) -> f32 {
     let a = fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
     let b = fract(52.9829189 * fract(dot(p, vec2(0.00583715, 0.06711056)) + 0.38196601));
     return (a - b) / 1023.0;
+}
+
+fn compress_to_output_gamut(rgb: vec3<f32>) -> vec3<f32> {
+    if min(rgb.r, min(rgb.g, rgb.b)) >= 0.0 { return rgb; }
+    let y = max(dot(rgb, pc.luma.xyz), 0.0);
+    let neutral = vec3(y);
+    var t = 0.0;
+    if rgb.r < 0.0 && abs(rgb.r - neutral.r) > 0.000001 {
+        t = max(t, rgb.r / (rgb.r - neutral.r));
+    }
+    if rgb.g < 0.0 && abs(rgb.g - neutral.g) > 0.000001 {
+        t = max(t, rgb.g / (rgb.g - neutral.g));
+    }
+    if rgb.b < 0.0 && abs(rgb.b - neutral.b) > 0.000001 {
+        t = max(t, rgb.b / (rgb.b - neutral.b));
+    }
+    return mix(rgb, neutral, clamp(t, 0.0, 1.0));
 }
 
 fn calibration_nits(uv: vec2<f32>, pattern: f32) -> vec3<f32> {
@@ -380,12 +423,13 @@ fn encode_pq(scene_linear: vec3<f32>, pixel: vec2<f32>, uv: vec2<f32>) -> vec3<f
     if calibration {
         nits = calibration_nits(uv, pc.params2.y);
     } else {
-        var bt2020 = max(vec3(
+        var bt2020 = compress_to_output_gamut(vec3(
             dot(pc.matrix0.xyz, scene_linear),
             dot(pc.matrix1.xyz, scene_linear),
-            dot(pc.matrix2.xyz, scene_linear)), vec3(0.0));
+            dot(pc.matrix2.xyz, scene_linear)));
         let scene_y = max(dot(bt2020, pc.luma.xyz), 0.0);
-        bt2020 = max(vec3(scene_y) + (bt2020 - vec3(scene_y)) * pc.params1.w, vec3(0.0));
+        bt2020 = compress_to_output_gamut(
+            vec3(scene_y) + (bt2020 - vec3(scene_y)) * pc.params1.w);
         nits = bt2020 * pc.params1.y;
     }
     var y = max(dot(nits, pc.luma.xyz), 0.0);
@@ -566,6 +610,7 @@ pub struct AshDrmHdrOutput {
     pub saturation: f32,
     pub midtone_gamma: f32,
     pub calibration_pattern: f32,
+    pub tone_mapper: f32,
     pub scene_to_bt2020: [[f32; 3]; 3],
     pub bt2020_luma: [f32; 3],
 }
@@ -2337,6 +2382,7 @@ impl AshDrmRenderer {
                 saturation: 1.0,
                 midtone_gamma: 1.0,
                 calibration_pattern: 0.0,
+                tone_mapper: 0.0,
                 scene_to_bt2020: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
                 bt2020_luma: [0.2627, 0.6780, 0.0593],
             });
@@ -2357,7 +2403,7 @@ impl AshDrmRenderer {
                 hdr.saturation,
                 hdr.midtone_gamma,
                 hdr.calibration_pattern,
-                0.0,
+                hdr.tone_mapper,
                 0.0,
                 hdr.scene_to_bt2020[0][0],
                 hdr.scene_to_bt2020[0][1],
@@ -3792,6 +3838,7 @@ fn output_state_fingerprint(
             hdr.saturation,
             hdr.midtone_gamma,
             hdr.calibration_pattern,
+            hdr.tone_mapper,
         ] {
             value.to_bits().hash(&mut hasher);
         }
@@ -3949,6 +3996,7 @@ mod tests {
             saturation: 1.0,
             midtone_gamma: 1.0,
             calibration_pattern: 0.0,
+            tone_mapper: 0.0,
             scene_to_bt2020: identity,
             bt2020_luma: [0.2627, 0.6780, 0.0593],
         };
@@ -4064,6 +4112,11 @@ mod tests {
         assert!(OUTPUT_SHADER.contains("fn tone_map_nits"));
         assert!(OUTPUT_SHADER.contains("/ 1023.0"));
         assert!(OUTPUT_SHADER.contains("dot(pc.matrix0.xyz, scene_linear)"));
+        assert!(OUTPUT_SHADER.contains("let mapper = pc.params2.z"));
+        assert!(OUTPUT_SHADER.contains("2.0 * x / (1.0 + x)"));
+        assert!(OUTPUT_SHADER.contains("hable_white"));
+        assert!(OUTPUT_SHADER.contains("aces_white"));
+        assert!(OUTPUT_SHADER.contains("fn compress_to_output_gamut"));
     }
 
     #[test]

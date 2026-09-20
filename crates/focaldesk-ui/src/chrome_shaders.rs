@@ -577,6 +577,7 @@ impl ChromeShaders {
                     UniformName::new("u_saturation", UniformType::_1f),
                     UniformName::new("u_midtone_gamma", UniformType::_1f),
                     UniformName::new("u_calibration_pattern", UniformType::_1f),
+                    UniformName::new("u_tone_mapper", UniformType::_1f),
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
@@ -2039,6 +2040,7 @@ uniform float u_source_peak_nits;
 uniform float u_saturation;
 uniform float u_midtone_gamma;
 uniform float u_calibration_pattern;
+uniform float u_tone_mapper;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
@@ -2159,6 +2161,33 @@ vec3 calibration_pattern_nits(vec2 coords, float pattern) {
 }
 
 float tone_map_nits(float value, float source_peak, float display_peak, float white) {
+    if (value <= white || source_peak <= display_peak || display_peak <= white) {
+        return min(value, display_peak);
+    }
+    if (u_tone_mapper > 0.5) {
+        float x = clamp((value - white) / max(source_peak - white, 0.0001), 0.0, 1.0);
+        float shoulder;
+        if (u_tone_mapper < 1.5) {
+            shoulder = 2.0 * x / (1.0 + x);
+        } else if (u_tone_mapper < 2.5) {
+            const float a = 0.15;
+            const float b = 0.50;
+            const float c = 0.10;
+            const float d = 0.20;
+            const float e = 0.02;
+            const float f = 0.30;
+            float hable_x = ((x * (a * x + c * b) + d * e)
+                / (x * (a * x + b) + d * f)) - e / f;
+            float hable_white = ((a + c * b + d * e) / (a + b + d * f)) - e / f;
+            shoulder = hable_x / max(hable_white, 0.0001);
+        } else {
+            float aces_x = (x * (2.51 * x + 0.03))
+                / (x * (2.43 * x + 0.59) + 0.14);
+            const float aces_white = 2.54 / 3.16;
+            shoulder = aces_x / aces_white;
+        }
+        return min(white + clamp(shoulder, 0.0, 1.0) * (display_peak - white), display_peak);
+    }
     float knee = max(white, display_peak * 0.8);
     if (value <= knee || display_peak <= knee || source_peak <= display_peak) {
         return min(value, display_peak);
@@ -3244,6 +3273,10 @@ mod tests {
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("max(white, display_peak * 0.8)"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mapped / y"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("min(nits, vec3(10000.0))"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_tone_mapper"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("2.0 * x / (1.0 + x)"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("hable_white"));
+        assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("aces_white"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("compress_to_panel_gamut"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("mul_panel_to_bt2020"));
         assert!(LINEAR_SCRGB_TO_PQ_FRAG.contains("uniform float u_saturation"));
