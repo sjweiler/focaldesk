@@ -625,11 +625,11 @@ pub(crate) fn stop_focaldesk_session_target() {
     }
 }
 
-/// Restart the two GPU-rendered shell surfaces after the compositor has
-/// recovered scanout from suspend. Their GTK renderers are separate processes
-/// and can retain partially invalid NVIDIA resources even after the compositor
-/// has replaced its own EGL context.
-pub(crate) fn restart_shell_surfaces_after_gpu_resume() {
+/// Restart the two GPU-rendered shell surfaces after the compositor has reset
+/// its scanout/output resources. Their GTK renderers are separate processes
+/// and can retain invalid output bindings or partial NVIDIA resources across
+/// both suspend recovery and a live mode/topology rebuild.
+pub(crate) fn restart_shell_surfaces_after_gpu_reset() {
     let status = std::process::Command::new("systemctl")
         .args([
             "--user",
@@ -641,7 +641,7 @@ pub(crate) fn restart_shell_surfaces_after_gpu_resume() {
         .status();
     match status {
         Ok(status) if status.success() => {
-            flog("restarted GPU-rendered shell surfaces after resume")
+            flog("restarted GPU-rendered shell surfaces after GPU/output reset")
         }
         Ok(status) => flog(format!(
             "failed to restart GPU-rendered shell surfaces: systemctl exited with {status}"

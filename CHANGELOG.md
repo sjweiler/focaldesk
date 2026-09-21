@@ -113,6 +113,9 @@ version numbers where practical.
 - Delayed compositor-native panel and dock fallbacks briefly during production
   session startup, preventing partially initialized chrome from flashing while
   the GTK system rail and task shelf start; crash fallback remains immediate.
+- Display mode and refresh-rate rebuilds now restart the standalone GPU-rendered
+  system rail and task shelf after recovered scanout, preventing stale output
+  bindings from leaving either client visible but unresponsive.
 - Restricted the root PAM session hook's native credential-broker access to a
   non-secret readiness ping; all secret operations remain limited to same-UID
   peers and their configured ACL grants.
@@ -148,6 +151,9 @@ version numbers where practical.
 - Locked sessions now remain locked across every suspend/resume path; PAM
   authentication runs outside the compositor loop and password buffers are
   scrubbed after use.
+- Suspend and resume now release compositor keyboard state that libinput can no
+  longer report, preventing a stale modifier from disabling lock-screen text
+  entry after repeated sleep cycles.
 - Clipboard capture is limited to one in-flight request, one MiB, and two
   seconds. Clipboard history and AI state use owner-only permissions and atomic
   replacement where applicable.

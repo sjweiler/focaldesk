@@ -45,7 +45,7 @@ use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
-    physical_size_mm_from_pixels, pump_desktop_services, restart_shell_surfaces_after_gpu_resume,
+    physical_size_mm_from_pixels, pump_desktop_services, restart_shell_surfaces_after_gpu_reset,
     spawn_session_sleep_watch, stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
 };
 #[cfg(feature = "xwayland")]
@@ -1636,8 +1636,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     // coalesced position now that the CRTC is idle.
                     update_kms_cursor(data);
                     if std::mem::take(&mut data.restart_shell_after_present) {
-                        flog("raw Vulkan first post-resume page flip completed");
-                        restart_shell_surfaces_after_gpu_resume();
+                        flog("raw Vulkan first post-reset page flip completed");
+                        restart_shell_surfaces_after_gpu_reset();
                     }
                 }
                 Err(error) => {
@@ -1727,7 +1727,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         if data.topology_refresh_pending && data.session_active && !data.resume_pending {
             data.topology_refresh_pending = false;
             match rebuild_vulkan_outputs(&mut data) {
-                Ok(true) => flog("raw Vulkan DRM topology rebuild complete"),
+                Ok(true) => {
+                    // The standalone GTK shell clients retain wl_output and
+                    // driver resources from the old mode. Restart them only
+                    // after the first successful presentation on the rebuilt
+                    // output, using the same fence as resume recovery.
+                    data.restart_shell_after_present = true;
+                    flog("raw Vulkan DRM topology rebuild complete");
+                }
                 Ok(false) => {}
                 Err(error) => {
                     data.fatal_error = Some(error.context(

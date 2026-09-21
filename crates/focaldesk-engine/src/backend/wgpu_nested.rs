@@ -68,6 +68,7 @@ struct WgpuShellAssets {
     unavailable_icons: HashSet<IconId>,
     font_atlas_initialized: bool,
     font_atlas_pending: Option<Vec<u8>>,
+    lock_screen_was_active: bool,
 }
 
 struct WgpuSceneDesktop<'a> {
@@ -844,6 +845,15 @@ fn clipped_text(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+fn font_atlas_needs_upload(
+    atlas_dirty: bool,
+    atlas_initialized: bool,
+    lock_screen_active: bool,
+    lock_screen_was_active: bool,
+) -> bool {
+    atlas_dirty || !atlas_initialized || (lock_screen_active && !lock_screen_was_active)
+}
+
 fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShellAssets) {
     let mut strings = vec![("FOCALDESK".to_string(), WGPU_LABEL_STYLE)];
     strings.extend(
@@ -900,7 +910,19 @@ fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShell
             warn!(%error, "failed to prepare wgpu shell text");
         }
     }
-    if desktop.state.fonts.atlas_dirty || !assets.font_atlas_initialized {
+    // The Vulkan renderers evict textures that have not been referenced for
+    // 120 frames. In fullscreen sessions the shell may emit no text quads for
+    // much longer than that, while this cache still considers the atlas
+    // initialized. Re-upload on every unlocked -> locked transition so the
+    // lock dialog never relies on an atlas the renderer may have evicted.
+    let upload_atlas = font_atlas_needs_upload(
+        desktop.state.fonts.atlas_dirty,
+        assets.font_atlas_initialized,
+        lock.active,
+        assets.lock_screen_was_active,
+    );
+    assets.lock_screen_was_active = lock.active;
+    if upload_atlas {
         let alpha = desktop.state.fonts.atlas_pixels();
         let mut rgba = Vec::with_capacity(alpha.len() * 4);
         for &value in alpha {
@@ -2176,7 +2198,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod color_transform_tests {
-    use super::texture_color_transform;
+    use super::{font_atlas_needs_upload, texture_color_transform};
     use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_render::FrameTransferFunction;
 
@@ -2207,5 +2229,12 @@ mod color_transform_tests {
             texture.reference_white_nits,
             color.description.reference_white_nits
         );
+    }
+
+    #[test]
+    fn lock_transition_reuploads_an_otherwise_clean_font_atlas() {
+        assert!(font_atlas_needs_upload(false, true, true, false));
+        assert!(!font_atlas_needs_upload(false, true, true, true));
+        assert!(!font_atlas_needs_upload(false, true, false, true));
     }
 }

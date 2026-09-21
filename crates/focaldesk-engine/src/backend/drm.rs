@@ -3,7 +3,7 @@
 
 use crate::backend::common::{
     bootstrap_compositor_core, is_nonfatal_wayland_io_error, physical_size_mm_from_pixels,
-    refresh_portal_services, restart_shell_surfaces_after_gpu_resume, spawn_session_sleep_watch,
+    refresh_portal_services, restart_shell_surfaces_after_gpu_reset, spawn_session_sleep_watch,
     stop_focaldesk_session_target, SessionSleepEvent,
 };
 use drm::control::{connector, crtc, property};
@@ -708,6 +708,9 @@ pub(crate) struct DrmLoopData {
     /// Connector events can arrive while libseat has revoked the DRM fd. Do
     /// not inspect or rebuild the device until ownership has been restored.
     pub drm_topology_refresh_pending: bool,
+    /// A live output rebuild also invalidates resources retained by the GTK
+    /// shell clients. Restart them only after KMS confirms a new frame.
+    pub restart_shell_after_present: bool,
     /// Device rebuilds requested from inside a DRM event callback after an
     /// exclusive HDR validation failure. Rebuilding with failed persistent
     /// state restores the ordinary all-output SDR topology.
@@ -1480,6 +1483,12 @@ fn reinitialize_drm_device(
         .state
         .mark_all_outputs_full_damage(DamageSource::Unknown);
     data.core.state.mark_redraw();
+    // Rebuilding outputs invalidates the wl_output bindings and GPU-side
+    // state retained by the standalone GTK rail and shelf just as thoroughly
+    // as a suspend/resume renderer replacement. Restart them after the new
+    // globals have been installed and the next frame has reached scanout, so
+    // refresh-rate changes cannot leave either client visible but unresponsive.
+    data.restart_shell_after_present = true;
 
     Ok(())
 }
@@ -3557,6 +3566,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         resume_pending: false,
         resume_retry_at: None,
         drm_topology_refresh_pending: false,
+        restart_shell_after_present: false,
         exclusive_hdr_recovery_nodes: Vec::new(),
         should_stop: false,
     };
@@ -5640,6 +5650,7 @@ fn device_added(
             DrmEvent::VBlank(crtc) => {
                 let mut recover_exclusive = false;
                 let mut first_resume_flip_completed = false;
+                let mut present_completed = false;
                 if let Some(device) = state.backend.devices.get_mut(&node) {
                     let exclusive_hdr_output = device.exclusive_hdr_output.clone();
                     let DrmDeviceState {
@@ -5649,8 +5660,9 @@ fn device_added(
                     } = device;
                     if let Some(surface) = surfaces.get_mut(&crtc) {
                         let submitted = surface.drm_output.frame_submitted();
+                        present_completed = submitted.is_ok();
                         first_resume_flip_completed =
-                            state.lifecycle == DrmLifecycle::Modesetting && submitted.is_ok();
+                            state.lifecycle == DrmLifecycle::Modesetting && present_completed;
                         if let Err(err) = &submitted {
                             surface.stable_vblank_count = 0;
                             flog(&format!(
@@ -5885,7 +5897,11 @@ fn device_added(
                         DrmLifecycle::Running,
                         "first post-resume page flip completed",
                     );
-                    restart_shell_surfaces_after_gpu_resume();
+                }
+                if first_resume_flip_completed
+                    || (present_completed && std::mem::take(&mut state.restart_shell_after_present))
+                {
+                    restart_shell_surfaces_after_gpu_reset();
                 }
                 if recover_exclusive
                     && !state.exclusive_hdr_recovery_nodes.contains(&node)

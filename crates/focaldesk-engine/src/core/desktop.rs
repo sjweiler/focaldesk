@@ -2052,6 +2052,7 @@ impl DesktopState {
 
     /// Reset compositor-side state after the session comes back from suspend.
     pub(crate) fn handle_session_resume(&mut self) {
+        self.release_stale_keys_after_session_transition();
         UnattendedSuspendState::clear_after_resume(&mut self.unattended_suspend_state);
         self.last_user_activity_at = Instant::now();
         self.idle_lock_triggered = false;
@@ -2085,12 +2086,39 @@ impl DesktopState {
     }
 
     pub(crate) fn handle_session_suspend(&mut self) {
+        // libinput is suspended immediately after this callback, so releases
+        // for keys held during the transition may never arrive. Leaving one
+        // modifier pressed in Smithay makes lock-screen text input reject all
+        // subsequent characters as shortcuts across later resume cycles.
+        self.release_stale_keys_after_session_transition();
         if !UnattendedSuspendState::prepare_for_sleep(
             &mut self.unattended_suspend_state,
             Instant::now(),
         ) {
             self.lock_session();
         }
+    }
+
+    fn release_stale_keys_after_session_transition(&mut self) {
+        use smithay::backend::input::KeyState;
+        use smithay::input::keyboard::FilterResult;
+
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            self.input.modifiers = FlowModifiers::default();
+            return;
+        };
+
+        for keycode in keyboard.pressed_keys() {
+            keyboard.input(
+                self,
+                keycode,
+                KeyState::Released,
+                SERIAL_COUNTER.next_serial(),
+                0,
+                |_, _, _| FilterResult::<()>::Forward,
+            );
+        }
+        self.input.modifiers = FlowModifiers::default();
     }
 
     pub(crate) fn on_resume(&mut self) {
