@@ -18,14 +18,20 @@ presentation.
 
 ## Known working configuration
 
-As of September 14, 2026, HDR10 has been observed working through both native
+As of September 20, 2026, HDR10 has been observed working through both native
 DRM renderers on Fedora 44, kernel 7.1.8, a GeForce RTX 4090, and the NVIDIA open
 kernel module/595.91.07 userspace driver. The raw-Ash Vulkan test used two active
 outputs with HDR requested on one output; sRGB and Display-P3 images, video, and
-the compositor egui overlay rendered correctly. Earlier GLES testing also
-included HDR content in Google Chrome. These are successful compatibility
-results, not a blanket support guarantee: the display, connector, mode, kernel,
-application version, and output topology can all affect the result.
+the compositor egui overlay rendered correctly. Raw Ash Vulkan is now the
+project owner's primary daily-tested renderer. Additional testing on a TCL
+display reached its 165 Hz mode; HDR images and video appeared visually correct,
+and SDR content retained visually correct color while HDR output was active.
+These observations have not been verified with a colorimeter, so they are
+visual compatibility results rather than calibration or measurement claims.
+Earlier GLES testing also included HDR content in Google Chrome. These are
+successful compatibility results, not a blanket support guarantee: the display,
+connector, mode, kernel, application version, and output topology can all affect
+the result.
 
 For a reproducible compatibility report, record those details together with the
 driver's complete version and whether Chrome was running as a native Wayland or

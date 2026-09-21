@@ -27,8 +27,8 @@ tracked in [Known Issues](docs/known-issues.md).
 - Keyboard-oriented workspaces and multi-monitor window management.
 - XWayland support for X11 applications, including tested Wine/DXVK workflows.
 - GLES and Vulkan rendering with damage tracking and experimental HDR and color
-  management; GLES remains the compatibility path while raw Vulkan parity is
-  completed.
+  management. Raw Ash Vulkan is the project owner's primary daily-tested path;
+  GLES remains the packaged compatibility and recovery default.
 - First-party launcher, Settings, file manager, login greeter, and AI Console.
 - Versioned theme editor with semantic surface tokens, wide-gamut/HDR paint
   intent, live compositor preview, wallpaper processing, and portable theme
@@ -63,7 +63,7 @@ release.
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
 | Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |
-| HDR and color management | Experimental and hardware-dependent; HDR10 verified through both GLES and raw Ash Vulkan on Fedora 44 with NVIDIA 595 ([details](docs/hdr.md#known-working-configuration)) |
+| HDR and color management | Experimental and hardware-dependent; HDR10 verified through both GLES and raw Ash Vulkan on Fedora 44 with NVIDIA 595. Raw Vulkan has also been visually validated with HDR images and video, visually correct SDR-in-HDR composition, and a TCL display at up to 165 Hz; this is not colorimeter-verified ([details](docs/hdr.md#known-working-configuration)) |
 | Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradients render compositor-side with up to eight stops |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |
