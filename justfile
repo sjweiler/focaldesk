@@ -1,5 +1,6 @@
 desktop_bin := "/usr/local/bin/focaldesk-desktop"
 focaldm_greeter_bin := "/usr/libexec/focaldm-greeter"
+focal_vector_rev := "15f48794a3193bafb090448853d32e37463630ea"
 
 build:
     cargo build
@@ -144,6 +145,12 @@ install-server-service:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
+install-vector-service:
+    cargo install --locked --force --root "$HOME/.local" --git https://github.com/sjweiler/focal-vector --rev {{focal_vector_rev}} --bin focal-server focal-vector
+    install -Dm644 packaging/systemd/user/focal-vector.service "$HOME/.config/systemd/user/focal-vector.service"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focal-vector.service || echo "Skipping Focal Vector enable: no user bus available"
+
 install-remoted-service:
     cargo build --release -p focaldesk-remoted
     install -Dm755 target/release/focaldesk-remoted "$HOME/.local/bin/focaldesk-remoted"
@@ -169,7 +176,7 @@ install-shell-services: install-session-target
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
 
-install-services: install-session-target install-shell-services install-server-service install-remoted-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
+install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -293,19 +300,19 @@ install-ai-console:
 # Install the AI IPC backend used at session boot and the console launched from
 # the desktop. The console is an application, so it is intentionally not a
 # long-running systemd service of its own.
-install-ai: install-dialog-service install-server-service install-ai-console
+install-ai: install-dialog-service install-vector-service install-server-service install-ai-console
 
 # Fedora system-installed variant: use the /usr/bin daemon and the Fedora
 # user-unit path. It is still managed by systemctl --user because it belongs
 # to the logged-in graphical desktop session.
-install-ai-fedora: migrate-ai-user-units install-dialog-service-fedora install-server-service-fedora install-ai-console
+install-ai-fedora: migrate-ai-user-units install-dialog-service-fedora install-vector-service-fedora install-server-service-fedora install-ai-console
 
 # Remove the older per-user development units before installing Fedora's
 # system-provided user units. A unit in ~/.config/systemd/user overrides the
 # matching unit in /usr/lib/systemd/user, even when the latter is newer.
 migrate-ai-user-units:
-    systemctl --user disable --now focaldesk-server.service focaldesk-dialogd.service 2>/dev/null || true
-    rm -f "$HOME/.config/systemd/user/focaldesk-server.service" "$HOME/.config/systemd/user/focaldesk-dialogd.service"
+    systemctl --user disable --now focaldesk-server.service focaldesk-dialogd.service focal-vector.service 2>/dev/null || true
+    rm -f "$HOME/.config/systemd/user/focaldesk-server.service" "$HOME/.config/systemd/user/focaldesk-dialogd.service" "$HOME/.config/systemd/user/focal-vector.service"
     systemctl --user daemon-reload || true
 
 install-focald-voice:
@@ -391,6 +398,13 @@ install-server-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-server.service || echo "Skipping systemd user enable: no user bus available"
 
+install-vector-service-fedora:
+    cargo install --locked --force --root target/focal-vector-install --git https://github.com/sjweiler/focal-vector --rev {{focal_vector_rev}} --bin focal-server focal-vector
+    sudo install -Dm755 target/focal-vector-install/bin/focal-server /usr/bin/focal-server
+    sudo install -Dm644 packaging/systemd/user/focal-vector-fedora.service /usr/lib/systemd/user/focal-vector.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focal-vector.service || echo "Skipping Focal Vector enable: no user bus available"
+
 install-remoted-service-fedora:
     cargo build --release -p focaldesk-remoted
     sudo install -Dm755 target/release/focaldesk-remoted /usr/bin/focaldesk-remoted
@@ -398,7 +412,7 @@ install-remoted-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     @echo "Installed focaldesk-remoted.service without enabling or starting it"
 
-install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-server-service-fedora install-remoted-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-vector-service-fedora install-server-service-fedora install-remoted-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
 
 # Both the system credential socket and user-session IPC use this directory.
 # Prepare it before starting user services so a directory created by PID 1
@@ -475,7 +489,10 @@ install-shell-services-fedora: install-session-target-fedora
     sudo install -Dm755 target/release/focaldesk-task-shelf /usr/bin/focaldesk-task-shelf
     sudo install -Dm644 packaging/systemd/user/focaldesk-system-rail-fedora.service /usr/lib/systemd/user/focaldesk-system-rail.service
     sudo install -Dm644 packaging/systemd/user/focaldesk-task-shelf-fedora.service /usr/lib/systemd/user/focaldesk-task-shelf.service
-    systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service || true
+    # User-unit precedence would otherwise keep launching old ~/.local binaries
+    # after a Fedora system install. Remove only the superseded FocalDesk units.
+    systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service focaldesk-system-rail.service focaldesk-task-shelf.service || true
+    rm -f "$HOME/.config/systemd/user/focaldesk-system-rail.service" "$HOME/.config/systemd/user/focaldesk-task-shelf.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
 

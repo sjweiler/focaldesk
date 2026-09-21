@@ -58,6 +58,7 @@ impl AiProvider for ScriptedProvider {
             model: Some("deterministic".into()),
             content,
             usage: None,
+            citations: Vec::new(),
         })
     }
 }

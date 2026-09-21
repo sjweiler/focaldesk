@@ -42,6 +42,11 @@ truth for what is usable today.
 - [x] Add bounded streaming responses and cancellation across Ollama, AI IPC, CLI, and Console.
 - [x] Add bounded provider retries and provider telemetry.
 - [x] Define and implement AI memory retention, bulk deletion, and migration policy.
+- [x] Run semantic retrieval through the private FocalVector sidecar and add
+  bounded text-document ingestion with source citations.
+- [x] Add PDF/DOCX extraction, indexed-source refresh/removal, hybrid FTS5 and
+  vector retrieval, deterministic reranking, retrieval evaluation, and an
+  Indexed Sources console page.
 - [x] Add deterministic provider-contract and agent-loop integration tests.
 
 ## Desktop experience

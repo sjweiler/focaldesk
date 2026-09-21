@@ -946,7 +946,9 @@ fn window_belongs_to_output(
 
 fn app_icon_name(identity: Option<&str>) -> &'static str {
     let identity = identity.unwrap_or_default().to_ascii_lowercase();
-    if identity.contains("terminal") || identity.contains("foot") {
+    if identity.contains("focaldesk-ai-console") || identity.contains("focaldesk.aiconsole") {
+        "focaldesk-ai-console"
+    } else if identity.contains("terminal") || identity.contains("foot") {
         "utilities-terminal-symbolic"
     } else if identity.contains("file") || identity.contains("nautilus") {
         "system-file-manager-symbolic"
@@ -960,6 +962,13 @@ fn app_icon_name(identity: Option<&str>) -> &'static str {
     } else {
         "application-x-executable-symbolic"
     }
+}
+
+fn ai_console_identity_matches(app_id: Option<&str>, class: Option<&str>, title: &str) -> bool {
+    app_id.into_iter().chain(class).any(|identity| {
+        let identity = identity.to_ascii_lowercase();
+        identity.contains("focaldesk-ai-console") || identity.contains("focaldesk.aiconsole")
+    }) || title.eq_ignore_ascii_case("FocalDesk AI Console")
 }
 
 #[cfg(any())]
@@ -1336,6 +1345,8 @@ struct RailWorkspaceWidgets {
 
 struct SystemRailWidgets {
     focus_notch: gtk::Box,
+    ai_console_button: gtk::Button,
+    ai_console_target: Rc<Cell<Option<u32>>>,
     network_button: gtk::Button,
     network_image: gtk::Image,
     microphone_button: gtk::Button,
@@ -1382,6 +1393,28 @@ fn build_panel(
     focus_notch.set_visible(false);
     rail_overlay.add_overlay(&focus_notch);
     window.set_child(Some(&rail_overlay));
+
+    let primary = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    primary.add_css_class("rail-group");
+    let ai_console_target = Rc::new(Cell::new(None::<u32>));
+    let click_ai_console_target = ai_console_target.clone();
+    let (ai_console_button, _) = glass_icon_button(
+        "focaldesk-ai-console",
+        "Open FocalDesk AI Console",
+        "rail-button",
+        move || {
+            if let Some(window_id) = click_ai_console_target.get() {
+                send_action(DesktopAction::FocusWindow { window_id });
+            } else {
+                send_action(DesktopAction::LaunchApp {
+                    app: "@ai-console".into(),
+                });
+            }
+        },
+    );
+    ai_console_button.add_css_class("rail-primary-action");
+    primary.append(&ai_console_button);
+    rail.append(&primary);
 
     let top = gtk::Box::new(gtk::Orientation::Vertical, 4);
     top.add_css_class("rail-group");
@@ -1542,6 +1575,8 @@ fn build_panel(
 
     let widgets = SystemRailWidgets {
         focus_notch,
+        ai_console_button,
+        ai_console_target,
         network_button,
         network_image,
         microphone_button,
@@ -1620,6 +1655,29 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
     widgets
         .focus_notch
         .set_visible(output.is_some_and(|output| output.focused));
+    let ai_window = snapshot.windows.iter().find(|window| {
+        window.mapped
+            && ai_console_identity_matches(
+                window.app_id.as_deref(),
+                window.class.as_deref(),
+                &window.title,
+            )
+    });
+    widgets.ai_console_target.set(
+        ai_window
+            .filter(|window| !window.minimized)
+            .map(|window| window.id),
+    );
+    set_button_active(&widgets.ai_console_button, ai_window.is_some());
+    widgets.ai_console_button.set_tooltip_text(Some(
+        if ai_window.is_some_and(|window| window.focused) {
+            "FocalDesk AI Console is active"
+        } else if ai_window.is_some() {
+            "Focus FocalDesk AI Console"
+        } else {
+            "Open FocalDesk AI Console"
+        },
+    ));
     let active_workspace = output
         .map(|output| output.active_workspace_id)
         .unwrap_or(snapshot.session.active_workspace_id)
@@ -1816,8 +1874,13 @@ pub fn glass_icon_button(
 ) -> (gtk::Button, gtk::Image) {
     let image = shell_icon_image(icon_name);
     if css_class == "rail-button" {
-        image.set_pixel_size(26);
-        set_shell_icon_at_size(&image, icon_name, 26);
+        let size = if icon_name == "focaldesk-ai-console" {
+            30
+        } else {
+            26
+        };
+        image.set_pixel_size(size as i32);
+        set_shell_icon_at_size(&image, icon_name, size);
     } else if css_class == "shelf-button" {
         image.set_pixel_size(32);
         set_shell_icon_at_size(&image, icon_name, 32);
@@ -1850,7 +1913,12 @@ fn set_shell_icon_at_size(image: &gtk::Image, icon_name: &str, icon_size: u32) {
     let Ok(svg) = std::str::from_utf8(svg) else {
         return;
     };
-    let styled = svg.replace("currentColor", "#8CA4C4");
+    let tint = if icon_name == "focaldesk-ai-console" {
+        "#D6E9FF"
+    } else {
+        "#8CA4C4"
+    };
+    let styled = svg.replace("currentColor", tint);
     let mut fontdb = resvg::usvg::fontdb::Database::new();
     fontdb.load_system_fonts();
     let Ok(tree) =
@@ -1881,7 +1949,7 @@ fn set_shell_icon_at_size(image: &gtk::Image, icon_name: &str, icon_size: u32) {
 
 fn focaldesk_icon_svg(icon_name: &str) -> Option<&'static [u8]> {
     Some(match icon_name {
-        "focaldesk-ai-console" => include_bytes!("../../../assets/icons/focal-ai-console.svg"),
+        "focaldesk-ai-console" => include_bytes!("../../../assets/icons/bot.svg"),
         "preferences-system-symbolic" => include_bytes!("../../../assets/svg/settings.svg"),
         "view-app-grid-symbolic" => include_bytes!("../../../assets/svg/launcher.svg"),
         "list-add-symbolic" => include_bytes!("../../../assets/svg/plus.svg"),
@@ -2193,9 +2261,10 @@ fn rgba(color: [f32; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        email_identity_matches, rail_clock_pattern, rail_display_status, running_app_capacity,
-        shelf_window_label, shell_css, shell_css_configured, window_belongs_to_output,
-        window_overlaps_shelf, ShelfOverflowEntry, ShellRole, ThemeSnapshot,
+        ai_console_identity_matches, app_icon_name, email_identity_matches, rail_clock_pattern,
+        rail_display_status, running_app_capacity, shelf_window_label, shell_css,
+        shell_css_configured, window_belongs_to_output, window_overlaps_shelf, ShelfOverflowEntry,
+        ShellRole, ThemeSnapshot,
     };
     use focaldesk_config::{
         ClockFormat, DockPosition, DockSize, FocalDeskConfig, PanelPosition, ShellStyle,
@@ -2359,6 +2428,29 @@ mod tests {
             "thunderbird",
             "org.mozilla.firefox"
         ));
+    }
+
+    #[test]
+    fn ai_console_window_uses_the_dedicated_icon_and_identity() {
+        assert!(ai_console_identity_matches(
+            Some("dev.focaldesk.AiConsole"),
+            None,
+            "Untitled"
+        ));
+        assert!(ai_console_identity_matches(
+            None,
+            Some("focaldesk-ai-console"),
+            "Untitled"
+        ));
+        assert!(!ai_console_identity_matches(
+            Some("org.gnome.Console"),
+            None,
+            "Console"
+        ));
+        assert_eq!(
+            app_icon_name(Some("dev.focaldesk.AiConsole")),
+            "focaldesk-ai-console"
+        );
     }
 
     #[test]

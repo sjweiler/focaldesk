@@ -124,6 +124,7 @@ impl AiProvider for OllamaProvider {
             model: Some(model),
             content: decoded.message.content,
             usage: ollama_usage(decoded.prompt_eval_count, decoded.eval_count),
+            citations: Vec::new(),
         })
     }
 
@@ -193,6 +194,7 @@ impl AiProvider for OllamaProvider {
             model: Some(model),
             content,
             usage: has_usage.then_some(usage),
+            citations: Vec::new(),
         })
     }
 }

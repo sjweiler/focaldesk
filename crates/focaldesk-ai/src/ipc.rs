@@ -14,6 +14,7 @@ use tracing::Instrument;
 use crate::service::AiService;
 use crate::types::{
     AiDaemonStatus, AiStreamEvent, ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo,
+    RetrievalEvalCase, RetrievalEvalReport,
 };
 use crate::{AgentActionResponse, AgentRequest, AgentResponse};
 use focaldesk_ipc::transport;
@@ -77,6 +78,18 @@ pub enum AiIpcRequest {
         #[serde(default)]
         metadata: serde_json::Value,
     },
+    IngestDocument {
+        path: PathBuf,
+    },
+    ListIndexedDocuments,
+    RemoveIndexedDocument {
+        source: String,
+    },
+    EvaluateRetrieval {
+        cases: Vec<RetrievalEvalCase>,
+        #[serde(default = "default_recall_top_k")]
+        top_k: usize,
+    },
     Recall {
         query: String,
         #[serde(default = "default_recall_top_k")]
@@ -122,6 +135,19 @@ pub enum AiIpcResponse {
     },
     Remembered {
         id: MemoryId,
+    },
+    DocumentIngested {
+        result: crate::types::DocumentIngestResult,
+    },
+    IndexedDocuments {
+        documents: Vec<focaldesk_memory::IndexedDocument>,
+    },
+    IndexedDocumentRemoved {
+        source: String,
+        removed: bool,
+    },
+    RetrievalEvaluated {
+        report: RetrievalEvalReport,
     },
     Recalled {
         hits: Vec<SearchHit>,
@@ -279,6 +305,36 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
             Ok(AiIpcRequest::Remember { text, metadata }) => {
                 match service.remember(text, metadata).await {
                     Ok(id) => AiIpcResponse::Remembered { id },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::IngestDocument { path }) => {
+                match service.ingest_document(path).await {
+                    Ok(result) => AiIpcResponse::DocumentIngested { result },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ListIndexedDocuments) => match service.indexed_documents().await {
+                Ok(documents) => AiIpcResponse::IndexedDocuments { documents },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::RemoveIndexedDocument { source }) => {
+                match service.remove_document(source.clone()).await {
+                    Ok(removed) => AiIpcResponse::IndexedDocumentRemoved { source, removed },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::EvaluateRetrieval { cases, top_k }) => {
+                match service.evaluate_retrieval(cases, top_k).await {
+                    Ok(report) => AiIpcResponse::RetrievalEvaluated { report },
                     Err(err) => AiIpcResponse::Error {
                         message: err.to_string(),
                     },
@@ -767,6 +823,7 @@ mod tests {
             model: Some("model".into()),
             content: "hello".into(),
             usage: None,
+            citations: Vec::new(),
         };
         let mut bytes = Vec::new();
         for event in [
@@ -867,6 +924,7 @@ mod tests {
                 model: Some("test-model".to_string()),
                 content: "delayed response received".to_string(),
                 usage: None,
+                citations: Vec::new(),
             },
         })
         .unwrap();

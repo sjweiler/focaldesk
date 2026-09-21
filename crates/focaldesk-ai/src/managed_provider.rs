@@ -485,6 +485,7 @@ mod tests {
                     input_tokens: 7,
                     output_tokens: 2,
                 }),
+                citations: Vec::new(),
             })
         }
     }

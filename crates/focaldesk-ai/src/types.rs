@@ -86,6 +86,40 @@ pub struct ChatResponse {
     pub content: String,
     #[serde(default)]
     pub usage: Option<TokenUsage>,
+    /// Evidence retrieved locally and supplied to the model for this answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<Citation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Citation {
+    pub memory_id: i64,
+    #[serde(default)]
+    pub source: Option<String>,
+    pub excerpt: String,
+    pub distance: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentIngestResult {
+    pub source: String,
+    pub chunks: usize,
+    pub memory_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalEvalCase {
+    pub query: String,
+    pub expected_source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetrievalEvalReport {
+    pub cases: usize,
+    pub hits: usize,
+    pub recall_at_k: f32,
+    pub mean_reciprocal_rank: f32,
+    pub top_k: usize,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]

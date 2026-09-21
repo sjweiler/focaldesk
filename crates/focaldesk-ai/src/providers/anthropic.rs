@@ -146,6 +146,7 @@ impl AiProvider for AnthropicProvider {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
             }),
+            citations: Vec::new(),
         })
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::{Context, bail};
 use focaldesk_ai::{
-    AgentRequest, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatRequest, send_ai_request,
-    stream_ai_chat,
+    AgentRequest, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatRequest, Citation,
+    RetrievalEvalCase, send_ai_request, stream_ai_chat,
 };
 use focaldesk_diagnostics::{DiagnosticsOptions, collect_diagnostics};
 use focaldesk_ipc::{
@@ -146,6 +146,7 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
             let mut provider = None;
             let mut model = None;
             let mut stream = false;
+            let mut use_memory = false;
             let mut prompt_parts = Vec::new();
 
             while let Some(arg) = args.next() {
@@ -157,6 +158,7 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
                         model = Some(args.next().context("--model requires a value")?);
                     }
                     "--stream" => stream = true,
+                    "--memory" => use_memory = true,
                     _ => prompt_parts.push(arg),
                 }
             }
@@ -168,6 +170,7 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
             let mut request = ChatRequest::from_prompt(prompt_parts.join(" "));
             request.provider = provider;
             request.model = model;
+            request.use_memory = use_memory;
 
             if stream {
                 return chat_stream_via_ipc(request);
@@ -188,7 +191,98 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
                     println!();
                 }
             }
+            print_citations(&execution.citations);
             Ok(())
+        }
+        "ingest" => {
+            let path = args.next().context("ai ingest requires a document path")?;
+            if args.next().is_some() {
+                bail!("ai ingest accepts exactly one document path");
+            }
+            match send_ai_request(&AiIpcRequest::IngestDocument {
+                path: PathBuf::from(path),
+            })? {
+                AiIpcResponse::DocumentIngested { result } => {
+                    println!("indexed {} chunk(s) from {}", result.chunks, result.source);
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "sources" => match send_ai_request(&AiIpcRequest::ListIndexedDocuments)? {
+            AiIpcResponse::IndexedDocuments { documents } => {
+                for document in documents {
+                    println!(
+                        "{}\tchunks={}\ttype={}\tindexed={}",
+                        document.source,
+                        document.chunk_count,
+                        document.media_type,
+                        document.indexed_at_unix
+                    );
+                }
+                Ok(())
+            }
+            AiIpcResponse::Error { message } => bail!(message),
+            other => bail!("unexpected AI response: {other:?}"),
+        },
+        "remove-source" => {
+            let source = args
+                .next()
+                .context("ai remove-source requires a canonical source path")?;
+            if args.next().is_some() {
+                bail!("ai remove-source accepts exactly one source path");
+            }
+            match send_ai_request(&AiIpcRequest::RemoveIndexedDocument {
+                source: source.clone(),
+            })? {
+                AiIpcResponse::IndexedDocumentRemoved { removed: true, .. } => {
+                    println!("removed {source}");
+                    Ok(())
+                }
+                AiIpcResponse::IndexedDocumentRemoved { removed: false, .. } => {
+                    bail!("indexed source not found: {source}")
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "eval" => {
+            let path = args
+                .next()
+                .context("ai eval requires a JSON evaluation file")?;
+            let mut top_k = 5usize;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--top-k" => {
+                        top_k = args
+                            .next()
+                            .context("--top-k requires a value")?
+                            .parse()
+                            .context("invalid --top-k value")?;
+                    }
+                    _ => bail!("unknown ai eval option: {arg}"),
+                }
+            }
+            let input = std::fs::read_to_string(&path)
+                .with_context(|| format!("failed to read retrieval evaluation file {path}"))?;
+            let cases: Vec<RetrievalEvalCase> = serde_json::from_str(&input)
+                .with_context(|| format!("invalid retrieval evaluation JSON in {path}"))?;
+            match send_ai_request(&AiIpcRequest::EvaluateRetrieval { cases, top_k })? {
+                AiIpcResponse::RetrievalEvaluated { report } => {
+                    println!(
+                        "cases={} hits={} recall@{}={:.3} mrr={:.3}",
+                        report.cases,
+                        report.hits,
+                        report.top_k,
+                        report.recall_at_k,
+                        report.mean_reciprocal_rank
+                    );
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
         }
         "agent" => {
             let mut provider = None;
@@ -274,7 +368,13 @@ fn print_usage() {
     eprintln!("  focaldesk-cli desktop-snapshot");
     eprintln!("  focaldesk-cli diagnostics [--output <archive.tar.gz>] [--no-logs]");
     eprintln!("  focaldesk-cli ai providers");
-    eprintln!("  focaldesk-cli ai chat [--stream] [--provider <id>] [--model <model>] <prompt...>");
+    eprintln!(
+        "  focaldesk-cli ai chat [--stream] [--memory] [--provider <id>] [--model <model>] <prompt...>"
+    );
+    eprintln!("  focaldesk-cli ai ingest <text-markdown-pdf-or-docx-path>");
+    eprintln!("  focaldesk-cli ai sources");
+    eprintln!("  focaldesk-cli ai remove-source <canonical-path>");
+    eprintln!("  focaldesk-cli ai eval <cases.json> [--top-k <n>]");
     eprintln!("  focaldesk-cli ai agent [--provider <id>] [--model <model>] <objective...>");
     eprintln!("  focaldesk-cli ai confirm <plan-id>");
     eprintln!("  focaldesk-cli ai deny <plan-id>");
@@ -333,6 +433,7 @@ struct AiExecution {
     provider: String,
     model: Option<String>,
     content: String,
+    citations: Vec<Citation>,
 }
 
 fn chat_via_ipc(request: ChatRequest) -> anyhow::Result<AiExecution> {
@@ -342,6 +443,7 @@ fn chat_via_ipc(request: ChatRequest) -> anyhow::Result<AiExecution> {
             provider: response.provider,
             model: response.model,
             content: response.content,
+            citations: response.citations,
         }),
         Ok(AiIpcResponse::Error { message }) => bail!(message),
         Ok(other) => bail!("unexpected AI response: {other:?}"),
@@ -374,10 +476,11 @@ fn chat_stream_via_ipc(request: ChatRequest) -> anyhow::Result<()> {
                     ends_with_newline = output.ends_with('\n');
                 }
             }
-            AiStreamEvent::Completed { .. } => {
+            AiStreamEvent::Completed { response, .. } => {
                 if printed && !ends_with_newline {
                     println!();
                 }
+                print_citations(&response.citations);
             }
             AiStreamEvent::Failed { message, .. } => bail!(message),
             AiStreamEvent::Cancelled { .. } => bail!("AI stream was cancelled"),
@@ -387,6 +490,22 @@ fn chat_stream_via_ipc(request: ChatRequest) -> anyhow::Result<()> {
     result
         .map(|_| ())
         .context("streaming AI chat requires a protocol-v2 focaldesk-server")
+}
+
+fn print_citations(citations: &[Citation]) {
+    if citations.is_empty() {
+        return;
+    }
+    eprintln!("[ai] retrieved sources:");
+    for (index, citation) in citations.iter().enumerate() {
+        eprintln!(
+            "  [{}] {} (memory {}, distance {:.4})",
+            index + 1,
+            citation.source.as_deref().unwrap_or("local memory"),
+            citation.memory_id,
+            citation.distance
+        );
+    }
 }
 
 fn strip_terminal_sequences(input: &str) -> String {

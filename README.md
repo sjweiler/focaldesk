@@ -364,19 +364,68 @@ Recalled entries can be permanently removed with the **Forget** action.
 The Memory page also shows the active lifecycle policy and provides a
 fresh-confirmation **Clear all AI memory** action.
 
-AI memory uses schema version 2, expires new records after 90 days by default,
+AI memory uses schema version 4, expires new records after 90 days by default,
 and retains at most 10,000 records. Expired and over-capacity records are
 pruned on startup and during normal memory operations. The configured
 retention window is reapplied from each record's original creation time when
-the store opens. Existing schema-v1 records are migrated transactionally. A
+the store opens. Existing schema-v1 through schema-v3 records are migrated
+transactionally. A
 database created by a newer unsupported schema is
 rejected rather than modified. Configure the limits with:
 
 - `FOCALDESK_MEMORY_RETENTION_DAYS`; set it to `0` to disable expiration.
 - `FOCALDESK_MEMORY_MAX_ENTRIES`; set it to `0` for no entry-count limit.
 
+Hybrid memory search combines semantic candidates from the private
+`focal-vector.service` sidecar with SQLite FTS5 keyword candidates, then uses
+reciprocal-rank fusion and a deterministic token-overlap reranker. SQLite
+remains authoritative for memory text and retains embedding
+bytes so a missing Focal Vector collection can be rebuilt. The service uses
+`$XDG_RUNTIME_DIR/focaldesk/focal-vector.sock` and stores its rebuildable index
+under `$XDG_DATA_HOME/focaldesk/vector` (or the corresponding default data
+directory). For development or rollback, set
+`FOCALDESK_MEMORY_BACKEND=sqlite-vec`. Override the collection name with
+`FOCALDESK_MEMORY_COLLECTION`; collections must use the configured embedding
+dimension and cosine metric.
+
 Individual and bulk deletion always require fresh native approval; saved AI
 chat permission does not authorize deleting stored memory.
+
+The CLI and AI Console **Indexed Sources** page can index bounded UTF-8 text,
+Markdown, source, PDF, and DOCX files into the same retrieval collection, then
+opt a chat into grounded retrieval:
+
+```sh
+focaldesk-cli ai ingest ./notes/project.md
+focaldesk-cli ai chat --memory "What did the project notes say about recovery?"
+```
+
+Documents are capped at 8 MiB, chunked with overlap, and stored with their
+canonical source path. Re-indexing a changed source replaces its catalog entry
+and retires its old chunks; unchanged content is skipped. Sources can be
+listed, refreshed, or removed without deleting the original file:
+
+```sh
+focaldesk-cli ai sources
+focaldesk-cli ai ingest ./notes/project.md
+focaldesk-cli ai remove-source /canonical/path/to/project.md
+```
+
+Retrieved chunks are marked as untrusted evidence in
+the model prompt and returned as structured citations; the CLI prints the
+sources and distances after the answer. File ingestion is explicit and passes
+through the normal AI permission gate.
+
+Retrieval quality can be measured against a JSON array of query/source pairs:
+
+```json
+[
+  {"query":"How is recovery handled?","expected_source":"/canonical/path/to/project.md"}
+]
+```
+
+Run `focaldesk-cli ai eval cases.json --top-k 5` to report recall@k and mean
+reciprocal rank using the same hybrid retrieval path as chat.
 
 The CLI can also run a bounded desktop agent:
 

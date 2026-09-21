@@ -1,5 +1,6 @@
 # mode path (relative to the user's home directory)
 755 .local/bin/focaldesk-server
+755 .local/bin/focal-server
 755 .local/bin/focaldesk-remoted
 755 .local/bin/focaldesk-system-rail
 755 .local/bin/focaldesk-task-shelf
@@ -22,6 +23,7 @@
 755 .local/bin/focald-mic
 644 .config/systemd/user/focaldesk-session.target
 644 .config/systemd/user/focaldesk-server.service
+644 .config/systemd/user/focal-vector.service
 644 .config/systemd/user/focaldesk-remoted.service
 644 .config/systemd/user/focaldesk-system-rail.service
 644 .config/systemd/user/focaldesk-task-shelf.service

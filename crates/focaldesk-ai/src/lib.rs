@@ -15,7 +15,7 @@ pub use agent::{
     Agent, AgentActionResponse, AgentConfirmation, AgentProposedAction, AgentRequest,
     AgentResponse, AgentStepResult, AgentToolExecutor, AgentToolSpec,
 };
-pub use focaldesk_memory::{MemoryId, MemoryStatus, SearchHit};
+pub use focaldesk_memory::{IndexedDocument, MemoryId, MemoryStatus, SearchHit};
 pub use ipc::{
     AI_LEGACY_PROTOCOL_VERSION, AI_MAX_REQUEST_BYTES, AI_MAX_RESPONSE_BYTES, AI_PROTOCOL_VERSION,
     AI_SOCKET_ENV, AI_SOCKET_NAME, AiIpcRequest, AiIpcResponse, ai_socket_path, cancel_ai_stream,
@@ -26,6 +26,7 @@ pub use planner::Planner;
 pub use provider::{AiProvider, ProviderError, ProviderErrorKind};
 pub use service::AiService;
 pub use types::{
-    AiDaemonStatus, AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, ProviderInfo,
-    ProviderModelInfo, ProviderTelemetry, TokenUsage,
+    AiDaemonStatus, AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, Citation,
+    DocumentIngestResult, ProviderInfo, ProviderModelInfo, ProviderTelemetry, RetrievalEvalCase,
+    RetrievalEvalReport, TokenUsage,
 };

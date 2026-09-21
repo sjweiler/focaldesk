@@ -1,8 +1,8 @@
 use anyhow::Context;
 use focaldesk_ai::{
-    AiDaemonStatus, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatMessage, ChatRequest, MemoryId,
-    MemoryStatus, ProviderInfo, ProviderModelInfo, ProviderTelemetry, SearchHit, cancel_ai_stream,
-    send_ai_request, stream_ai_chat,
+    AiDaemonStatus, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatMessage, ChatRequest,
+    IndexedDocument, MemoryId, MemoryStatus, ProviderInfo, ProviderModelInfo, ProviderTelemetry,
+    SearchHit, cancel_ai_stream, send_ai_request, stream_ai_chat,
 };
 use focaldesk_config::load_config;
 use focaldesk_gtk::{StateKind, StateView, StatusBanner};
@@ -466,6 +466,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         "Providers",
         "Quick Prompts",
         "Memory",
+        "Indexed Sources",
         "Settings",
         "Log/Debug",
     ];
@@ -683,6 +684,11 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
         "Memory",
     );
     stack.add_titled(
+        &indexed_sources_page(log_buffer.clone()),
+        Some("indexed-sources"),
+        "Indexed Sources",
+    );
+    stack.add_titled(
         &settings_page(state.clone(), log_buffer.clone()),
         Some("settings"),
         "Settings",
@@ -897,6 +903,7 @@ fn build_ui(app: &Application, main_window: Rc<RefCell<Option<ApplicationWindow>
                 "Providers" => "providers",
                 "Quick Prompts" => "prompts",
                 "Memory" => "memory",
+                "Indexed Sources" => "indexed-sources",
                 "Settings" => "settings",
                 "Log/Debug" => "debug",
                 _ => "new-chat",
@@ -1876,6 +1883,30 @@ fn send_clear_memory_request() -> anyhow::Result<usize> {
     }
 }
 
+fn send_indexed_documents_request() -> anyhow::Result<Vec<IndexedDocument>> {
+    match send_ai_request(&AiIpcRequest::ListIndexedDocuments)? {
+        AiIpcResponse::IndexedDocuments { documents } => Ok(documents),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
+fn send_ingest_document_request(path: PathBuf) -> anyhow::Result<usize> {
+    match send_ai_request(&AiIpcRequest::IngestDocument { path })? {
+        AiIpcResponse::DocumentIngested { result } => Ok(result.chunks),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
+fn send_remove_document_request(source: String) -> anyhow::Result<bool> {
+    match send_ai_request(&AiIpcRequest::RemoveIndexedDocument { source })? {
+        AiIpcResponse::IndexedDocumentRemoved { removed, .. } => Ok(removed),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
 fn launch_configured_app(
     selector: impl FnOnce(&focaldesk_settings_core::Settings) -> String,
 ) -> anyhow::Result<String> {
@@ -2120,7 +2151,17 @@ fn dispatch_chat_request_async(
             ControlFlow::Continue
         }
         Ok(Ok(AiStreamEvent::Completed { response, .. })) => {
-            let reply = response.content;
+            let mut reply = response.content;
+            if !response.citations.is_empty() {
+                reply.push_str("\n\nSources:\n");
+                for (index, citation) in response.citations.iter().enumerate() {
+                    reply.push_str(&format!(
+                        "[{}] {}\n",
+                        index + 1,
+                        citation.source.as_deref().unwrap_or("Local memory")
+                    ));
+                }
+            }
             let mut store = state_for_result.borrow_mut();
             set_latest_ai_reply(&mut store, active_idx, &reply, "Recently updated");
             persist_state(&store);
@@ -2566,6 +2607,7 @@ fn conversations_page(
 fn memory_status_lines(status: &MemoryStatus) -> Vec<String> {
     vec![
         format!("AI memory records: {}", status.entry_count),
+        format!("Vector backend: {}", status.vector_backend),
         format!("Storage schema: v{}", status.schema_version),
         format!(
             "Retention: {}",
@@ -2839,6 +2881,211 @@ fn memory_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Bo
     page.append(&recall_results);
 
     page
+}
+
+fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
+    let page = section_shell(
+        "Indexed Sources",
+        "Documents available to grounded chat through hybrid semantic and full-text retrieval",
+    );
+    page.append(&info_card(&[
+        "Index UTF-8 text, Markdown, source code, PDF, or DOCX files.".to_string(),
+        "Reindex replaces prior chunks when the file changes; removal never deletes the original file."
+            .to_string(),
+    ]));
+
+    let source_entry = Entry::builder()
+        .placeholder_text("/absolute/path/to/document.pdf")
+        .hexpand(true)
+        .build();
+    let index_button = action_button("Index / Refresh");
+    let refresh_button = action_button("Refresh List");
+    let controls = Box::new(Orientation::Horizontal, 8);
+    controls.append(&source_entry);
+    controls.append(&index_button);
+    controls.append(&refresh_button);
+    page.append(&controls);
+
+    let list = Box::new(Orientation::Vertical, 8);
+    list.append(&note_card("Loading indexed sources..."));
+    let scroll = ScrolledWindow::builder()
+        .min_content_height(360)
+        .vexpand(true)
+        .child(&list)
+        .build();
+    page.append(&scroll);
+
+    refresh_indexed_sources(list.clone(), log_buffer.clone());
+    {
+        let list = list.clone();
+        let log_buffer = log_buffer.clone();
+        refresh_button.connect_clicked(move |_| {
+            refresh_indexed_sources(list.clone(), log_buffer.clone());
+        });
+    }
+    {
+        let list = list.clone();
+        let log_buffer = log_buffer.clone();
+        let entry = source_entry.clone();
+        let button = index_button.clone();
+        index_button.connect_clicked(move |_| {
+            let path = entry.text().trim().to_string();
+            if path.is_empty() {
+                return;
+            }
+            button.set_sensitive(false);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(send_ingest_document_request(PathBuf::from(path)));
+            });
+            let list = list.clone();
+            let log_buffer = log_buffer.clone();
+            let button = button.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(chunks)) => {
+                    button.set_sensitive(true);
+                    append_log(
+                        &log_buffer,
+                        &format!("[sources] indexed {chunks} document chunk(s)"),
+                    );
+                    refresh_indexed_sources(list.clone(), log_buffer.clone());
+                    ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    button.set_sensitive(true);
+                    append_log(&log_buffer, &format!("[sources] indexing failed: {error}"));
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => ControlFlow::Break,
+            });
+        });
+    }
+    page
+}
+
+fn refresh_indexed_sources(list: Box, log_buffer: TextBuffer) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    list.append(&note_card("Loading indexed sources..."));
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_indexed_documents_request());
+    });
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(documents)) => {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            if documents.is_empty() {
+                list.append(&note_card("No documents are indexed yet."));
+            } else {
+                for document in documents {
+                    list.append(&indexed_document_card(
+                        document,
+                        list.clone(),
+                        log_buffer.clone(),
+                    ));
+                }
+            }
+            ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            list.append(&note_card(&format!(
+                "Could not load indexed sources: {error}"
+            )));
+            ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => ControlFlow::Break,
+    });
+}
+
+fn indexed_document_card(document: IndexedDocument, list: Box, log_buffer: TextBuffer) -> Box {
+    let card = Box::new(Orientation::Vertical, 6);
+    card.add_css_class("item-card");
+    let title = Label::new(Some(&document.title));
+    title.set_xalign(0.0);
+    title.add_css_class("item-title");
+    card.append(&title);
+    let details = Label::new(Some(&format!(
+        "{}\n{} · {} chunks · indexed {}",
+        document.source, document.media_type, document.chunk_count, document.indexed_at_unix
+    )));
+    details.set_xalign(0.0);
+    details.set_wrap(true);
+    details.add_css_class("item-meta");
+    card.append(&details);
+    let actions = Box::new(Orientation::Horizontal, 8);
+    let reindex = action_button("Reindex");
+    let remove = action_button("Remove");
+    actions.append(&reindex);
+    actions.append(&remove);
+    card.append(&actions);
+
+    {
+        let source = document.source.clone();
+        let list = list.clone();
+        let log_buffer = log_buffer.clone();
+        reindex.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let source = source.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(send_ingest_document_request(PathBuf::from(source)));
+            });
+            let button = button.clone();
+            let list = list.clone();
+            let log_buffer = log_buffer.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(_)) => {
+                    button.set_sensitive(true);
+                    refresh_indexed_sources(list.clone(), log_buffer.clone());
+                    ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    button.set_sensitive(true);
+                    append_log(&log_buffer, &format!("[sources] reindex failed: {error}"));
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => ControlFlow::Break,
+            });
+        });
+    }
+    {
+        let source = document.source;
+        let list = list.clone();
+        remove.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let source = source.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(send_remove_document_request(source));
+            });
+            let button = button.clone();
+            let list = list.clone();
+            let log_buffer = log_buffer.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(_)) => {
+                    refresh_indexed_sources(list.clone(), log_buffer.clone());
+                    ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    button.set_sensitive(true);
+                    append_log(&log_buffer, &format!("[sources] removal failed: {error}"));
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => ControlFlow::Break,
+            });
+        });
+    }
+    card
 }
 
 fn settings_page(store: Rc<RefCell<PersistedState>>, log_buffer: TextBuffer) -> Box {

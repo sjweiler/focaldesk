@@ -10,6 +10,9 @@ version numbers where practical.
 
 ### Added
 
+- Added a permanent AI Console button to the GTK system rail. It opens the
+  console, focuses its existing window when already running, reflects its
+  running/active state, and keeps the task shelf representation unpinned.
 - Added a selectable raw-Ash Vulkan DRM renderer with GBM DMA-BUF scanout,
   explicit synchronization, multi-output layout and scaling, XWayland,
   damage-aware retained FP16 composition, SDR/ICC color management, guarded
@@ -69,6 +72,13 @@ version numbers where practical.
 - Added transactional AI-memory schema migration, default 90-day/10,000-record
   lifecycle limits, automatic pruning, lifecycle status, and fresh-confirmed
   individual or bulk deletion from the AI Console.
+- Added a private FocalVector user-service backend for semantic memory, durable
+  index rebuilding from SQLite embedding records, explicit text-document
+  ingestion, grounded context formatting, and structured source citations.
+- Added full local RAG source management with PDF and DOCX extraction,
+  content-hash refresh, removal, an AI Console Indexed Sources page, SQLite
+  FTS5/FocalVector hybrid retrieval with deterministic reranking, and
+  recall@k/MRR evaluation through the CLI.
 - Added deterministic, network-independent wire-contract tests for OpenAI,
   Anthropic, Ollama, and vLLM providers plus bounded agent-loop integration
   coverage for synthesis, failures, mutation proposals, expiry, and replay.

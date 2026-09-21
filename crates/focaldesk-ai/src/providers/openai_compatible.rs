@@ -172,6 +172,7 @@ impl AiProvider for OpenAICompatibleProvider {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
             }),
+            citations: Vec::new(),
         })
     }
 }

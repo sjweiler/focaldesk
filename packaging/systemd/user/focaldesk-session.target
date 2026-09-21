@@ -5,6 +5,7 @@ Requires=graphical-session.target
 After=graphical-session.target
 PartOf=graphical-session.target
 Wants=focaldesk-server.service
+Wants=focal-vector.service
 Wants=focaldesk-powerd.service
 Wants=focaldesk-notificationsd.service
 Wants=focaldesk-updatesd.service

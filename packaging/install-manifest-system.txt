@@ -8,6 +8,7 @@
 755 usr/libexec/focaldm-greeter
 755 usr/sbin/focaldmd
 755 usr/bin/focaldesk-server
+755 usr/bin/focal-server
 755 usr/bin/focaldesk-remoted
 755 usr/bin/focaldesk-system-rail
 755 usr/bin/focaldesk-task-shelf
@@ -33,6 +34,7 @@
 644 usr/share/wayland-sessions/focaldesk.desktop
 644 usr/lib/systemd/user/focaldesk-session.target
 644 usr/lib/systemd/user/focaldesk-server.service
+644 usr/lib/systemd/user/focal-vector.service
 644 usr/lib/systemd/user/focaldesk-remoted.service
 644 usr/lib/systemd/user/focaldesk-system-rail.service
 644 usr/lib/systemd/user/focaldesk-task-shelf.service

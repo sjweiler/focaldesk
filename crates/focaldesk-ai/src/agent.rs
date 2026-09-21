@@ -236,6 +236,7 @@ mod tests {
                 model: Some("test-model".into()),
                 content: self.responses.lock().unwrap().pop_front().unwrap(),
                 usage: None,
+                citations: Vec::new(),
             })
         }
     }

@@ -1,0 +1,21 @@
+[Unit]
+Description=FocalDesk vector search sidecar
+PartOf=focaldesk-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focal-server
+Restart=on-failure
+RestartSec=2
+Environment=FOCAL_VECTOR_SOCKET=%t/focaldesk/focal-vector.sock
+Environment=FOCAL_DATA_DIR=%h/.local/share/focaldesk/vector
+Environment=RAYON_NUM_THREADS=4
+Environment=FOCAL_MAX_CONCURRENT_OPERATIONS=4
+UMask=0077
+Nice=10
+NoNewPrivileges=yes
+LimitCORE=0
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=focaldesk-session.target
