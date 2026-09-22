@@ -434,7 +434,7 @@ async fn handle_stream_connection(
                 let _ = event_tx_for_error
                     .send(crate::types::AiStreamEvent::Failed {
                         request_id: request_id_for_task,
-                        message: err.to_string(),
+                        message: format!("{err:#}"),
                     })
                     .await;
             }

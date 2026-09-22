@@ -75,6 +75,7 @@ impl AiProvider for OllamaProvider {
         Ok(decoded
             .models
             .into_iter()
+            .filter(OllamaModelInfo::supports_chat)
             .map(|model| ProviderModelInfo { id: model.name })
             .filter(|model| !model.id.trim().is_empty())
             .collect())
@@ -316,12 +317,48 @@ struct OllamaTagsResponse {
 #[derive(Debug, Deserialize)]
 struct OllamaModelInfo {
     name: String,
+    #[serde(default)]
+    capabilities: Option<Vec<String>>,
+}
+
+impl OllamaModelInfo {
+    fn supports_chat(&self) -> bool {
+        self.capabilities.as_ref().is_none_or(|capabilities| {
+            capabilities
+                .iter()
+                .any(|capability| capability == "completion")
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_support::serve_once;
+
+    #[tokio::test]
+    async fn ollama_model_list_excludes_embedding_only_models() {
+        let (base_url, request) = serve_once(
+            "200 OK",
+            &[("Content-Type", "application/json")],
+            concat!(
+                "{\"models\":[",
+                "{\"name\":\"nomic-embed-text:latest\",\"capabilities\":[\"embedding\"]},",
+                "{\"name\":\"llama3.1:latest\",\"capabilities\":[\"completion\",\"tools\"]},",
+                "{\"name\":\"legacy-chat-model\"}",
+                "]}"
+            ),
+        )
+        .await;
+        let provider = OllamaProvider::new(base_url, None).unwrap();
+
+        let models = provider.list_models().await.unwrap();
+        assert_eq!(
+            models.into_iter().map(|model| model.id).collect::<Vec<_>>(),
+            vec!["llama3.1:latest", "legacy-chat-model"]
+        );
+        assert_eq!(request.await.unwrap().path, "/api/tags");
+    }
 
     #[tokio::test]
     async fn ollama_chat_contract_preserves_options_roles_and_usage() {
