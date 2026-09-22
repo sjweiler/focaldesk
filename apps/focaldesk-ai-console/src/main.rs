@@ -1,8 +1,8 @@
 use anyhow::Context;
 use focaldesk_ai::{
     AiDaemonStatus, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatMessage, ChatRequest,
-    IndexedDocument, MemoryId, MemoryStatus, ProviderInfo, ProviderModelInfo, ProviderTelemetry,
-    SearchHit, cancel_ai_stream, send_ai_request, stream_ai_chat,
+    DocumentIngestResult, IndexedDocument, MemoryId, MemoryStatus, ProviderInfo, ProviderModelInfo,
+    ProviderTelemetry, SearchHit, cancel_ai_stream, send_ai_request, stream_ai_chat,
 };
 use focaldesk_config::load_config;
 use focaldesk_gtk::{StateKind, StateView, StatusBanner};
@@ -1891,9 +1891,9 @@ fn send_indexed_documents_request() -> anyhow::Result<Vec<IndexedDocument>> {
     }
 }
 
-fn send_ingest_document_request(path: PathBuf) -> anyhow::Result<usize> {
+fn send_ingest_document_request(path: PathBuf) -> anyhow::Result<DocumentIngestResult> {
     match send_ai_request(&AiIpcRequest::IngestDocument { path })? {
-        AiIpcResponse::DocumentIngested { result } => Ok(result.chunks),
+        AiIpcResponse::DocumentIngested { result } => Ok(result),
         AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
     }
@@ -2906,6 +2906,12 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
     controls.append(&refresh_button);
     page.append(&controls);
 
+    let operation_status = Label::new(Some("Choose a file to index."));
+    operation_status.set_xalign(0.0);
+    operation_status.set_wrap(true);
+    operation_status.add_css_class("source-status");
+    page.append(&operation_status);
+
     let list = Box::new(Orientation::Vertical, 8);
     list.append(&note_card("Loading indexed sources..."));
     let scroll = ScrolledWindow::builder()
@@ -2928,12 +2934,16 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
         let log_buffer = log_buffer.clone();
         let entry = source_entry.clone();
         let button = index_button.clone();
+        let status = operation_status.clone();
         index_button.connect_clicked(move |_| {
             let path = entry.text().trim().to_string();
             if path.is_empty() {
+                set_source_status(&status, "Enter an absolute file path first.", true);
                 return;
             }
+            set_source_status(&status, &format!("Indexing {path}…"), false);
             button.set_sensitive(false);
+            entry.set_sensitive(false);
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
                 let _ = tx.send(send_ingest_document_request(PathBuf::from(path)));
@@ -2941,23 +2951,43 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
             let list = list.clone();
             let log_buffer = log_buffer.clone();
             let button = button.clone();
+            let entry = entry.clone();
+            let status = status.clone();
             glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
-                Ok(Ok(chunks)) => {
+                Ok(Ok(result)) => {
                     button.set_sensitive(true);
+                    entry.set_sensitive(true);
+                    entry.set_text("");
+                    set_source_status(
+                        &status,
+                        &format!("Indexed {} chunk(s) from {}.", result.chunks, result.source),
+                        false,
+                    );
                     append_log(
                         &log_buffer,
-                        &format!("[sources] indexed {chunks} document chunk(s)"),
+                        &format!("[sources] indexed {} document chunk(s)", result.chunks),
                     );
                     refresh_indexed_sources(list.clone(), log_buffer.clone());
                     ControlFlow::Break
                 }
                 Ok(Err(error)) => {
                     button.set_sensitive(true);
+                    entry.set_sensitive(true);
+                    set_source_status(&status, &format!("Indexing failed: {error}"), true);
                     append_log(&log_buffer, &format!("[sources] indexing failed: {error}"));
                     ControlFlow::Break
                 }
                 Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
-                Err(mpsc::TryRecvError::Disconnected) => ControlFlow::Break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    button.set_sensitive(true);
+                    entry.set_sensitive(true);
+                    set_source_status(
+                        &status,
+                        "Indexing failed: the background request stopped unexpectedly.",
+                        true,
+                    );
+                    ControlFlow::Break
+                }
             });
         });
     }
@@ -3152,6 +3182,15 @@ fn note_card(text: &str) -> Box {
 
     card.append(&label);
     card
+}
+
+fn set_source_status(label: &Label, message: &str, is_error: bool) {
+    label.set_text(message);
+    if is_error {
+        label.add_css_class("source-status-error");
+    } else {
+        label.remove_css_class("source-status-error");
+    }
 }
 
 fn recall_hit_card(hit: &SearchHit, log_buffer: TextBuffer) -> Box {
@@ -3426,6 +3465,15 @@ const AI_CONSOLE_CSS: &str = r#"
         .item-meta {
             color: @fd_app_text_dim;
             font-size: 0.78em;
+        }
+
+        .source-status {
+            color: @fd_app_text_dim;
+            font-size: 0.88em;
+        }
+
+        .source-status-error {
+            color: @fd_app_red;
         }
 
         .info-card {

@@ -239,6 +239,16 @@ impl MemoryStore {
             );",
         )?;
 
+        // Older SQLite-backed sessions could leave recoverable embedding rows
+        // behind when memory was cleared before Focal Vector became the active
+        // backend. Those orphan rows can collide with SQLite's reused integer
+        // ids and make every subsequent document ingest fail.
+        tx.execute(
+            "DELETE FROM memory_embeddings
+             WHERE memory_id NOT IN (SELECT id FROM memories)",
+            [],
+        )?;
+
         tx.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                 text,
@@ -301,6 +311,21 @@ impl MemoryStore {
                 &format!(
                     "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(embedding float[{dimension}])"
                 ),
+                [],
+            )?;
+        }
+        let has_legacy_vectors: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'memory_vectors'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if has_legacy_vectors {
+            tx.execute(
+                "DELETE FROM memory_vectors
+                 WHERE rowid NOT IN (SELECT id FROM memories)",
                 [],
             )?;
         }
@@ -1296,6 +1321,41 @@ mod tests {
         assert_eq!(sentinel, "untouched");
         assert!(!memories_table_exists);
         drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn orphaned_embeddings_are_removed_when_the_store_opens() {
+        let path = test_path("orphaned-embedding");
+        {
+            let store = MemoryStore::open(&path, 4).unwrap();
+            let id = test_runtime()
+                .block_on(store.remember(
+                    "stale memory".into(),
+                    vec![1.0, 0.0, 0.0, 0.0],
+                    Value::Null,
+                ))
+                .unwrap();
+            assert_eq!(id, 1);
+            drop(store);
+
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "INSERT INTO memory_embeddings (memory_id, embedding, indexed)
+                 VALUES (1, ?1, 0)",
+                params![vec![0_u8; 16]],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM memories WHERE id = 1", [])
+                .unwrap();
+        }
+
+        let store = MemoryStore::open(&path, 4).unwrap();
+        let id = test_runtime()
+            .block_on(store.remember("new memory".into(), vec![1.0, 0.0, 0.0, 0.0], Value::Null))
+            .unwrap();
+        assert_eq!(id, 1);
+        drop(store);
         let _ = fs::remove_file(path);
     }
 

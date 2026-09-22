@@ -715,7 +715,9 @@ pub(crate) fn confirm_ai_action(tool: &str, title: &str, message: &str) -> anyho
     let resource = match tool {
         "focus_window" | "move_window_to_workspace" => PermissionResource::RemoteInput,
         "show_notification" => PermissionResource::Notifications,
-        "open_settings_panel" | "forget_memory" | "clear_memory" => PermissionResource::AiChat,
+        "open_settings_panel" | "forget_memory" | "clear_memory" | "remove_indexed_document" => {
+            PermissionResource::AiChat
+        }
         _ => {
             return Err(anyhow::anyhow!(
                 "AI action is not eligible for confirmation: {tool}"

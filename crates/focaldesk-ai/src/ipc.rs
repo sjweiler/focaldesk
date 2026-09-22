@@ -311,11 +311,28 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
                 }
             }
             Ok(AiIpcRequest::IngestDocument { path }) => {
+                let source = path.display().to_string();
                 match service.ingest_document(path).await {
-                    Ok(result) => AiIpcResponse::DocumentIngested { result },
-                    Err(err) => AiIpcResponse::Error {
-                        message: err.to_string(),
-                    },
+                    Ok(result) => {
+                        tracing::info!(
+                            target: "focaldesk.ai",
+                            source = %result.source,
+                            chunks = result.chunks,
+                            "document indexed"
+                        );
+                        AiIpcResponse::DocumentIngested { result }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "focaldesk.ai",
+                            %source,
+                            error = %err,
+                            "document indexing failed"
+                        );
+                        AiIpcResponse::Error {
+                            message: err.to_string(),
+                        }
+                    }
                 }
             }
             Ok(AiIpcRequest::ListIndexedDocuments) => match service.indexed_documents().await {
