@@ -565,6 +565,8 @@ struct PendingCapture {
     width: u32,
     height: u32,
     fourcc: u32,
+    output_transfer: AshDrmTransfer,
+    reference_white_nits: f32,
 }
 
 struct Pipelines {
@@ -582,7 +584,7 @@ pub struct AshDrmSubmission {
     pub fence_fd: OwnedFd,
 }
 
-/// CPU-visible encoded-SDR pixels copied from a completed Vulkan output frame.
+/// CPU-visible pixels copied from a completed Vulkan output frame.
 #[derive(Debug)]
 pub struct AshDrmCapture {
     pub id: u64,
@@ -590,6 +592,8 @@ pub struct AshDrmCapture {
     pub height: u32,
     pub fourcc: u32,
     pub pixels: Vec<u8>,
+    pub output_transfer: AshDrmTransfer,
+    pub reference_white_nits: f32,
 }
 
 /// Encoded output-space RGB cube used for a post-composition ICC correction.
@@ -635,20 +639,29 @@ impl AshDrmCapture {
         match self.fourcc {
             XRGB8888 | ARGB8888 => {
                 for pixel in self.pixels.as_chunks_mut::<4>().0 {
-                    pixel.swap(0, 2);
-                    pixel[3] = 255;
+                    let rgb = [pixel[2], pixel[1], pixel[0]].map(|value| value as f32 / 255.0);
+                    pixel.copy_from_slice(&capture_rgb_to_srgb8(
+                        rgb,
+                        self.output_transfer,
+                        self.reference_white_nits,
+                    ));
                 }
             }
             XBGR8888 | ABGR8888 => {
                 for pixel in self.pixels.as_chunks_mut::<4>().0 {
-                    pixel[3] = 255;
+                    let rgb = [pixel[0], pixel[1], pixel[2]].map(|value| value as f32 / 255.0);
+                    pixel.copy_from_slice(&capture_rgb_to_srgb8(
+                        rgb,
+                        self.output_transfer,
+                        self.reference_white_nits,
+                    ));
                 }
             }
             XRGB2101010 | ARGB2101010 | XBGR2101010 | ABGR2101010 => {
                 // All supported ten-bit DRM formats are one little-endian
-                // packed u32 per pixel. Normalize the RGB fields to eight bit
-                // for the existing screenshot/SHM capture contract. Captures
-                // are opaque regardless of the scanout format's alpha bits.
+                // packed u32 per pixel. Decode the output transfer before
+                // reducing them to the screenshot/SHM capture contract.
+                // Captures are opaque regardless of the format's alpha bits.
                 for pixel in self.pixels.as_chunks_mut::<4>().0 {
                     let packed = u32::from_le_bytes([pixel[0], pixel[1], pixel[2], pixel[3]]);
                     let (r, g, b) = if matches!(self.fourcc, XRGB2101010 | ARGB2101010) {
@@ -664,13 +677,61 @@ impl AshDrmCapture {
                             (packed >> 20) & 0x3ff,
                         )
                     };
-                    let to_u8 = |value: u32| ((value * 255 + 511) / 1023) as u8;
-                    pixel.copy_from_slice(&[to_u8(r), to_u8(g), to_u8(b), 255]);
+                    let rgb = [r, g, b].map(|value| value as f32 / 1023.0);
+                    pixel.copy_from_slice(&capture_rgb_to_srgb8(
+                        rgb,
+                        self.output_transfer,
+                        self.reference_white_nits,
+                    ));
                 }
             }
             fourcc => bail!("unsupported Vulkan capture fourcc 0x{fourcc:08x}"),
         }
         Ok(self.pixels)
+    }
+}
+
+fn capture_rgb_to_srgb8(
+    encoded: [f32; 3],
+    transfer: AshDrmTransfer,
+    reference_white_nits: f32,
+) -> [u8; 4] {
+    let srgb = match transfer {
+        AshDrmTransfer::Srgb | AshDrmTransfer::SrgbUnorm => encoded,
+        AshDrmTransfer::Gamma22 | AshDrmTransfer::Gamma22Unorm => {
+            encoded.map(|value| linear_to_srgb(value.max(0.0).powf(2.2)))
+        }
+        AshDrmTransfer::Pq => {
+            let bt2020 = encoded.map(pq_to_nits);
+            let linear_srgb_nits = [
+                1.660_491 * bt2020[0] - 0.587_641 * bt2020[1] - 0.072_850 * bt2020[2],
+                -0.124_550 * bt2020[0] + 1.132_900 * bt2020[1] - 0.008_349 * bt2020[2],
+                -0.018_151 * bt2020[0] - 0.100_579 * bt2020[1] + 1.118_730 * bt2020[2],
+            ];
+            let white = reference_white_nits.max(1.0);
+            linear_srgb_nits.map(|value| linear_to_srgb((value / white).clamp(0.0, 1.0)))
+        }
+    };
+    let to_u8 = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [to_u8(srgb[0]), to_u8(srgb[1]), to_u8(srgb[2]), 255]
+}
+
+fn pq_to_nits(encoded: f32) -> f32 {
+    const M1: f32 = 2610.0 / 16384.0;
+    const M2: f32 = 2523.0 / 32.0;
+    const C1: f32 = 3424.0 / 4096.0;
+    const C2: f32 = 2413.0 / 128.0;
+    const C3: f32 = 2392.0 / 128.0;
+    let power = encoded.clamp(0.0, 1.0).powf(1.0 / M2);
+    let linear = ((power - C1).max(0.0) / (C2 - C3 * power).max(f32::EPSILON)).powf(1.0 / M1);
+    linear * 10_000.0
+}
+
+fn linear_to_srgb(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        12.92 * linear
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
     }
 }
 
@@ -1772,6 +1833,10 @@ impl AshDrmRenderer {
                 width: target.width,
                 height: target.height,
                 fourcc: target.fourcc,
+                output_transfer,
+                reference_white_nits: hdr_output
+                    .map(|output| output.reference_white_nits)
+                    .unwrap_or(203.0),
             })
         } else {
             None
@@ -3268,6 +3333,8 @@ impl AshDrmRenderer {
             height: capture.height,
             fourcc: capture.fourcc,
             pixels,
+            output_transfer: capture.output_transfer,
+            reference_white_nits: capture.reference_white_nits,
         })
     }
 
@@ -4166,6 +4233,8 @@ mod tests {
             height: 1,
             fourcc: ARGB8888,
             pixels: vec![10, 20, 30, 99],
+            output_transfer: AshDrmTransfer::Srgb,
+            reference_white_nits: 203.0,
         };
         assert_eq!(capture.into_rgba8().unwrap(), vec![30, 20, 10, 255]);
     }
@@ -4179,6 +4248,8 @@ mod tests {
             height: 1,
             fourcc: XRGB2101010,
             pixels: packed.to_le_bytes().to_vec(),
+            output_transfer: AshDrmTransfer::Srgb,
+            reference_white_nits: 203.0,
         };
         assert_eq!(capture.into_rgba8().unwrap(), vec![255, 128, 0, 255]);
 
@@ -4189,8 +4260,41 @@ mod tests {
             height: 1,
             fourcc: XBGR2101010,
             pixels: packed.to_le_bytes().to_vec(),
+            output_transfer: AshDrmTransfer::Srgb,
+            reference_white_nits: 203.0,
         };
         assert_eq!(capture.into_rgba8().unwrap(), vec![255, 128, 0, 255]);
+    }
+
+    #[test]
+    fn pq_capture_maps_hdr_reference_white_to_srgb_white() {
+        let encoded = pq_from_nits(203.0);
+        let channel = (encoded * 1023.0).round() as u32;
+        let packed = (channel << 20) | (channel << 10) | channel;
+        let capture = AshDrmCapture {
+            id: 10,
+            width: 1,
+            height: 1,
+            fourcc: XRGB2101010,
+            pixels: packed.to_le_bytes().to_vec(),
+            output_transfer: AshDrmTransfer::Pq,
+            reference_white_nits: 203.0,
+        };
+        let rgba = capture.into_rgba8().unwrap();
+        assert!(rgba[0] >= 254, "red was {}", rgba[0]);
+        assert!(rgba[1] >= 254, "green was {}", rgba[1]);
+        assert!(rgba[2] >= 254, "blue was {}", rgba[2]);
+        assert_eq!(rgba[3], 255);
+    }
+
+    fn pq_from_nits(nits: f32) -> f32 {
+        const M1: f32 = 2610.0 / 16384.0;
+        const M2: f32 = 2523.0 / 32.0;
+        const C1: f32 = 3424.0 / 4096.0;
+        const C2: f32 = 2413.0 / 128.0;
+        const C3: f32 = 2392.0 / 128.0;
+        let linear = (nits / 10_000.0).clamp(0.0, 1.0).powf(M1);
+        ((C1 + C2 * linear) / (1.0 + C3 * linear)).powf(M2)
     }
 
     #[test]
