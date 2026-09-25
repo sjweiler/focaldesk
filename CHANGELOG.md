@@ -19,6 +19,10 @@ version numbers where practical.
   HDR10/PQ output, hardware-cursor fallback, capture readback, and bounded GPU
   and KMS recovery. Hardware validation on Fedora 44/NVIDIA 595 confirmed mixed
   HDR/SDR output, sRGB and Display-P3 images, video, and compositor egui panels.
+  Raw Vulkan HDR video was also visually validated on a TCL HDR 1400 display,
+  stable at 165 Hz, and an ASUS VG32VQR DisplayHDR 400 display, stable at up to
+  120 Hz. The current dual-monitor configuration runs both at 120 Hz. These are
+  visual compatibility results rather than colorimeter measurements.
 - Raw Vulkan now verifies live HDR connector state periodically and atomically
   re-arms BT.2020 signaling, link depth, and static metadata after a monitor
   picture-mode change or DisplayPort link retrain silently drops them.

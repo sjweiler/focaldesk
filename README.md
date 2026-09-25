@@ -63,7 +63,7 @@ release.
 | XWayland application support | Working, alpha |
 | PipeWire/portal screen capture | Experimental |
 | Remote desktop | Experimental Phase 3: one output, one view-only RDP client, loopback/SSH-tunnel access only |
-| HDR and color management | Experimental and hardware-dependent; HDR10 verified through both GLES and raw Ash Vulkan on Fedora 44 with NVIDIA 595. Raw Vulkan has also been visually validated with HDR images and video, visually correct SDR-in-HDR composition, and a TCL display at up to 165 Hz; this is not colorimeter-verified ([details](docs/hdr.md#known-working-configuration)) |
+| HDR and color management | Experimental and hardware-dependent; HDR10 verified through both GLES and raw Ash Vulkan on Fedora 44 with NVIDIA 595. Raw Vulkan has also been visually validated with HDR images and video, visually correct SDR-in-HDR composition, a TCL HDR 1400 display stable at 165 Hz, and an ASUS VG32VQR DisplayHDR 400 display stable at up to 120 Hz; this is not colorimeter-verified ([details](docs/hdr.md#known-working-configuration)) |
 | Settings, theme editor, file manager, launcher, and AI console | Usable prototypes; theme editor gradients render compositor-side with up to eight stops |
 | Local AI and automation services | Experimental and permission-gated |
 | Precise Wayland subsurface damage tracking | Implemented, with safe fallbacks |

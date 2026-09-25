@@ -18,16 +18,20 @@ presentation.
 
 ## Known working configuration
 
-As of September 20, 2026, HDR10 has been observed working through both native
+As of September 25, 2026, HDR10 has been observed working through both native
 DRM renderers on Fedora 44, kernel 7.1.8, a GeForce RTX 4090, and the NVIDIA open
 kernel module/595.91.07 userspace driver. The raw-Ash Vulkan test used two active
 outputs with HDR requested on one output; sRGB and Display-P3 images, video, and
 the compositor egui overlay rendered correctly. Raw Ash Vulkan is now the
-project owner's primary daily-tested renderer. Additional testing on a TCL
-display reached its 165 Hz mode; HDR images and video appeared visually correct,
-and SDR content retained visually correct color while HDR output was active.
-These observations have not been verified with a colorimeter, so they are
-visual compatibility results rather than calibration or measurement claims.
+project owner's primary daily-tested renderer. A TCL HDR 1400 display remained
+stable in HDR at 165 Hz; HDR images and video appeared visually correct, and SDR
+content retained visually correct color while HDR output was active. HDR video
+also appeared visually correct on an ASUS TUF Gaming VG32VQR (VESA DisplayHDR
+400, HDR10, 2560x1440), with natural color, smooth playback, and no visible
+banding. The ASUS is not stable in HDR above 120 Hz, even with the raw Vulkan
+renderer. The current two-monitor configuration runs both displays at 120 Hz.
+These observations have not been verified with a colorimeter, so they are visual
+compatibility results rather than calibration or measurement claims.
 Earlier GLES testing also included HDR content in Google Chrome. These are
 successful compatibility results, not a blanket support guarantee: the display,
 connector, mode, kernel, application version, and output topology can all affect
