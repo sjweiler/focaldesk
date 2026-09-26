@@ -6939,11 +6939,15 @@ impl DesktopState {
                 .windows
                 .iter()
                 .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
-            if !managed.mapped
-                || managed.fullscreen
-                || managed.minimized
-                || window.x11_surface().is_none()
-            {
+            if !managed.mapped || managed.fullscreen || managed.minimized {
+                return None;
+            }
+
+            // Client-side-decorated X11 applications (notably Electron/Chromium)
+            // own their top strip. Treating it as a compositor titlebar steals
+            // presses from their menus, tabs, and close button.
+            let x11 = window.x11_surface()?;
+            if x11.is_decorated() {
                 return None;
             }
 
