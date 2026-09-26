@@ -1706,6 +1706,24 @@ fn collect_shm_surfaces(
     let scale = output_state
         .map(|output| output.scale_factor)
         .unwrap_or(1.0);
+    let visible_windows: HashSet<_> = output_state
+        .map(|output| {
+            desktop
+                .state
+                .windows
+                .iter()
+                .filter(|window| {
+                    crate::core::render::managed_window_is_visible_on_output(
+                        &desktop.state.space,
+                        window,
+                        output.active_workspace,
+                        &output.handle,
+                    )
+                })
+                .map(|window| &window.window)
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut output = Vec::new();
     if let Some(output_state) = output_state {
@@ -1721,6 +1739,9 @@ fn collect_shm_surfaces(
         );
     }
     for window in desktop.state.space.elements() {
+        if !visible_windows.contains(window) {
+            continue;
+        }
         let Some(window_location) = desktop.state.space.element_location(window) else {
             continue;
         };

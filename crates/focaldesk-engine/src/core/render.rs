@@ -450,6 +450,21 @@ fn window_prefers_output(space: &Space<Window>, window: &Window, output: &Output
         .is_some_and(|(preferred, _)| preferred == output)
 }
 
+/// Keep every renderer on the same definition of a visible application window.
+///
+/// `Space` retains windows from inactive workspaces, so walking its elements
+/// directly is not sufficient when constructing an output scene.
+pub(crate) fn managed_window_is_visible_on_output(
+    space: &Space<Window>,
+    window: &ManagedWindow,
+    active_workspace: WorkspaceId,
+    output: &Output,
+) -> bool {
+    window.mapped
+        && window.workspace == active_workspace
+        && window_prefers_output(space, &window.window, output)
+}
+
 #[cfg(test)]
 mod color_run_tests {
     use super::{
@@ -3781,11 +3796,7 @@ impl RenderState {
 
         let on_workspace: std::collections::HashSet<_> = windows
             .iter()
-            .filter(|mw| {
-                mw.mapped
-                    && mw.workspace == active_workspace
-                    && window_prefers_output(space, &mw.window, output)
-            })
+            .filter(|mw| managed_window_is_visible_on_output(space, mw, active_workspace, output))
             .map(|mw| &mw.window)
             .collect();
 
@@ -3898,11 +3909,7 @@ impl RenderState {
 
         let on_workspace: std::collections::HashSet<_> = windows
             .iter()
-            .filter(|mw| {
-                mw.mapped
-                    && mw.workspace == active_workspace
-                    && window_prefers_output(space, &mw.window, output)
-            })
+            .filter(|mw| managed_window_is_visible_on_output(space, mw, active_workspace, output))
             .map(|mw| &mw.window)
             .collect();
 
