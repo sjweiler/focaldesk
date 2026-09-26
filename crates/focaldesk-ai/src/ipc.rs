@@ -24,13 +24,21 @@ pub const AI_SOCKET_ENV: &str = "FOCALDESK_AI_SOCKET";
 pub const AI_PROTOCOL_VERSION: u16 = 2;
 pub const AI_LEGACY_PROTOCOL_VERSION: u16 = 1;
 pub const AI_MAX_REQUEST_BYTES: u64 = 256 * 1024;
-pub const AI_MAX_RESPONSE_BYTES: usize = 512 * 1024;
+// Source listings for large repositories can contain thousands of paths and
+// hashes. Keep responses bounded, but leave enough room for the documented
+// 10,000-file directory-ingestion ceiling.
+pub const AI_MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 static NEXT_AI_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 // The provider layer permits a chat request to run for 120 seconds. Keep the
 // client alive slightly longer so the daemon can return its timeout error (or
 // a response completed near the deadline) instead of failing after the shared
 // five-second IPC timeout.
 const AI_RESPONSE_TIMEOUT: Duration = Duration::from_secs(130);
+// Directory ingestion can legitimately take many minutes for a large source
+// tree because each changed document must be extracted, chunked, and embedded.
+// Keep a finite upper bound so a wedged daemon is still eventually reported,
+// but do not apply the provider/chat deadline to local indexing work.
+const AI_INGEST_RESPONSE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug, Serialize, Deserialize)]
 struct AiRequestEnvelope<T> {
@@ -80,6 +88,11 @@ pub enum AiIpcRequest {
     },
     IngestDocument {
         path: PathBuf,
+    },
+    IngestDirectory {
+        path: PathBuf,
+        #[serde(default)]
+        recursive: bool,
     },
     ListIndexedDocuments,
     RemoveIndexedDocument {
@@ -138,6 +151,9 @@ pub enum AiIpcResponse {
     },
     DocumentIngested {
         result: crate::types::DocumentIngestResult,
+    },
+    DirectoryIngested {
+        result: crate::types::DirectoryIngestResult,
     },
     IndexedDocuments {
         documents: Vec<focaldesk_memory::IndexedDocument>,
@@ -335,8 +351,37 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
                     }
                 }
             }
+            Ok(AiIpcRequest::IngestDirectory { path, recursive }) => {
+                let source = path.display().to_string();
+                match service.ingest_directory(path, recursive).await {
+                    Ok(result) => {
+                        tracing::info!(
+                            target: "focaldesk.ai",
+                            source = %result.source,
+                            indexed = result.indexed,
+                            unchanged = result.unchanged,
+                            failed = result.failed,
+                            "directory indexed"
+                        );
+                        AiIpcResponse::DirectoryIngested { result }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "focaldesk.ai",
+                            %source,
+                            error = %err,
+                            "directory indexing failed"
+                        );
+                        AiIpcResponse::Error {
+                            message: err.to_string(),
+                        }
+                    }
+                }
+            }
             Ok(AiIpcRequest::ListIndexedDocuments) => match service.indexed_documents().await {
-                Ok(documents) => AiIpcResponse::IndexedDocuments { documents },
+                Ok(documents) => AiIpcResponse::IndexedDocuments {
+                    documents: indexed_document_summaries(documents),
+                },
                 Err(err) => AiIpcResponse::Error {
                     message: err.to_string(),
                 },
@@ -491,7 +536,7 @@ pub fn stream_ai_chat_at(
     let request_id = next_request_id();
     let mut stream = StdUnixStream::connect(path)
         .with_context(|| format!("could not connect to AI IPC socket {}", path.display()))?;
-    configure_ai_stream(&stream)?;
+    configure_ai_stream(&stream, AI_RESPONSE_TIMEOUT)?;
     let encoded = encode_ai_request(&AiIpcRequest::ChatStream { request }, &request_id)
         .map_err(anyhow::Error::msg)?;
     stream
@@ -720,11 +765,32 @@ fn decode_ai_response(
     Ok((envelope.payload, mode))
 }
 
-fn configure_ai_stream(stream: &StdUnixStream) -> Result<()> {
+fn configure_ai_stream(stream: &StdUnixStream, response_timeout: Duration) -> Result<()> {
     transport::configure_stream(stream).context("configure AI IPC connection")?;
     stream
-        .set_read_timeout(Some(AI_RESPONSE_TIMEOUT))
+        .set_read_timeout(Some(response_timeout))
         .context("configure AI IPC response timeout")
+}
+
+fn response_timeout_for(request: &AiIpcRequest) -> Duration {
+    match request {
+        AiIpcRequest::IngestDocument { .. } | AiIpcRequest::IngestDirectory { .. } => {
+            AI_INGEST_RESPONSE_TIMEOUT
+        }
+        _ => AI_RESPONSE_TIMEOUT,
+    }
+}
+
+fn indexed_document_summaries(
+    mut documents: Vec<focaldesk_memory::IndexedDocument>,
+) -> Vec<focaldesk_memory::IndexedDocument> {
+    // Chunk ids are an internal deletion detail and can dominate the source
+    // list payload for heavily chunked repositories. Callers only need the
+    // document metadata and chunk count.
+    for document in &mut documents {
+        document.memory_ids.clear();
+    }
+    documents
 }
 
 pub fn send_ai_request_at(path: impl AsRef<Path>, request: &AiIpcRequest) -> Result<AiIpcResponse> {
@@ -746,7 +812,8 @@ fn send_ai_request_at_mode(
 ) -> Result<(AiIpcResponse, AiWireMode)> {
     let mut stream = StdUnixStream::connect(path)
         .with_context(|| format!("could not connect to AI IPC socket {}", path.display()))?;
-    configure_ai_stream(&stream)?;
+    let response_timeout = response_timeout_for(request);
+    configure_ai_stream(&stream, response_timeout)?;
     let json = match request_id {
         Some(request_id) => encode_ai_request(request, request_id),
         None => transport::encode_message(request),
@@ -763,7 +830,7 @@ fn send_ai_request_at_mode(
         .shutdown(std::net::Shutdown::Write)
         .context("failed to finish AI IPC request")?;
 
-    read_ai_response(&mut stream, AI_RESPONSE_TIMEOUT, request_id)
+    read_ai_response(&mut stream, response_timeout, request_id)
 }
 
 fn read_ai_response(
@@ -813,7 +880,7 @@ mod tests {
         assert!(AI_RESPONSE_TIMEOUT > Duration::from_secs(120));
 
         let (client, _server) = StdUnixStream::pair().unwrap();
-        if let Err(err) = configure_ai_stream(&client) {
+        if let Err(err) = configure_ai_stream(&client, AI_RESPONSE_TIMEOUT) {
             if err.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
@@ -827,6 +894,40 @@ mod tests {
             panic!("configure AI stream: {err:#}");
         }
         assert_eq!(client.read_timeout().unwrap(), Some(AI_RESPONSE_TIMEOUT));
+    }
+
+    #[test]
+    fn ingestion_uses_a_long_running_response_timeout() {
+        assert_eq!(
+            response_timeout_for(&AiIpcRequest::IngestDirectory {
+                path: PathBuf::from("project"),
+                recursive: true,
+            }),
+            AI_INGEST_RESPONSE_TIMEOUT
+        );
+        assert_eq!(
+            response_timeout_for(&AiIpcRequest::IngestDocument {
+                path: PathBuf::from("large.pdf"),
+            }),
+            AI_INGEST_RESPONSE_TIMEOUT
+        );
+        assert!(AI_INGEST_RESPONSE_TIMEOUT > AI_RESPONSE_TIMEOUT);
+    }
+
+    #[test]
+    fn indexed_document_list_omits_internal_chunk_ids() {
+        let documents = indexed_document_summaries(vec![focaldesk_memory::IndexedDocument {
+            source: "/project/src/main.rs".into(),
+            title: "main.rs".into(),
+            media_type: "text/rust".into(),
+            content_hash: "abc".into(),
+            modified_at_unix: 1,
+            indexed_at_unix: 2,
+            chunk_count: 3,
+            memory_ids: vec![10, 11, 12],
+        }]);
+        assert_eq!(documents[0].chunk_count, 3);
+        assert!(documents[0].memory_ids.is_empty());
     }
 
     #[test]

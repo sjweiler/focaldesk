@@ -105,6 +105,20 @@ pub struct DocumentIngestResult {
     pub source: String,
     pub chunks: usize,
     pub memory_ids: Vec<i64>,
+    #[serde(default)]
+    pub unchanged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectoryIngestResult {
+    pub source: String,
+    pub indexed: usize,
+    pub unchanged: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub chunks: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

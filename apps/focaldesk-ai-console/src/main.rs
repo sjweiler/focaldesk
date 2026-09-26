@@ -1,8 +1,9 @@
 use anyhow::Context;
 use focaldesk_ai::{
     AiDaemonStatus, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatMessage, ChatRequest,
-    DocumentIngestResult, IndexedDocument, MemoryId, MemoryStatus, ProviderInfo, ProviderModelInfo,
-    ProviderTelemetry, SearchHit, cancel_ai_stream, send_ai_request, stream_ai_chat,
+    DirectoryIngestResult, DocumentIngestResult, IndexedDocument, MemoryId, MemoryStatus,
+    ProviderInfo, ProviderModelInfo, ProviderTelemetry, SearchHit, cancel_ai_stream,
+    send_ai_request, stream_ai_chat,
 };
 use focaldesk_config::load_config;
 use focaldesk_gtk::{StateKind, StateView, StatusBanner};
@@ -1899,6 +1900,17 @@ fn send_ingest_document_request(path: PathBuf) -> anyhow::Result<DocumentIngestR
     }
 }
 
+fn send_ingest_directory_request(
+    path: PathBuf,
+    recursive: bool,
+) -> anyhow::Result<DirectoryIngestResult> {
+    match send_ai_request(&AiIpcRequest::IngestDirectory { path, recursive })? {
+        AiIpcResponse::DirectoryIngested { result } => Ok(result),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
 fn send_remove_document_request(source: String) -> anyhow::Result<bool> {
     match send_ai_request(&AiIpcRequest::RemoveIndexedDocument { source })? {
         AiIpcResponse::IndexedDocumentRemoved { removed, .. } => Ok(removed),
@@ -2899,14 +2911,16 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
         .hexpand(true)
         .build();
     let index_button = action_button("Index / Refresh");
+    let folder_button = action_button("Add Folder");
     let refresh_button = action_button("Refresh List");
     let controls = Box::new(Orientation::Horizontal, 8);
     controls.append(&source_entry);
     controls.append(&index_button);
+    controls.append(&folder_button);
     controls.append(&refresh_button);
     page.append(&controls);
 
-    let operation_status = Label::new(Some("Choose a file to index."));
+    let operation_status = Label::new(Some("Choose a file or folder to index."));
     operation_status.set_xalign(0.0);
     operation_status.set_wrap(true);
     operation_status.add_css_class("source-status");
@@ -2922,6 +2936,133 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
     page.append(&scroll);
 
     refresh_indexed_sources(list.clone(), log_buffer.clone());
+    {
+        let list = list.clone();
+        let log_buffer = log_buffer.clone();
+        let button = folder_button.clone();
+        let status = operation_status.clone();
+        folder_button.connect_clicked(move |_| {
+            let dialog = gtk4::FileDialog::builder()
+                .title("Choose a folder to index")
+                .accept_label("Index Folder")
+                .modal(true)
+                .build();
+            let list = list.clone();
+            let log_buffer = log_buffer.clone();
+            let button = button.clone();
+            let status = status.clone();
+            dialog.select_folder(
+                None::<&gtk4::Window>,
+                gtk4::gio::Cancellable::NONE,
+                move |selection| match selection {
+                    Ok(folder) => {
+                        let Some(path) = folder.path() else {
+                            set_source_status(
+                                &status,
+                                "The selected folder is not a local directory.",
+                                true,
+                            );
+                            return;
+                        };
+                        set_source_status(
+                            &status,
+                            &format!("Indexing {} recursively…", path.display()),
+                            false,
+                        );
+                        let indexing_path = path.display().to_string();
+                        let started_at = Instant::now();
+                        button.set_sensitive(false);
+                        let (tx, rx) = mpsc::channel();
+                        thread::spawn(move || {
+                            let _ = tx.send(send_ingest_directory_request(path, true));
+                        });
+                        let list = list.clone();
+                        let log_buffer = log_buffer.clone();
+                        let button = button.clone();
+                        let status = status.clone();
+                        let mut last_elapsed_second = 0;
+                        glib::timeout_add_local(Duration::from_millis(50), move || {
+                            match rx.try_recv() {
+                                Ok(Ok(result)) => {
+                                    button.set_sensitive(true);
+                                    set_source_status(
+                                        &status,
+                                        &format!(
+                                            "Folder complete: {} indexed, {} unchanged, {} skipped, {} failed ({} chunks).",
+                                            result.indexed,
+                                            result.unchanged,
+                                            result.skipped,
+                                            result.failed,
+                                            result.chunks
+                                        ),
+                                        result.failed > 0,
+                                    );
+                                    append_log(
+                                        &log_buffer,
+                                        &format!(
+                                            "[sources] folder indexed={} unchanged={} skipped={} failed={}",
+                                            result.indexed,
+                                            result.unchanged,
+                                            result.skipped,
+                                            result.failed
+                                        ),
+                                    );
+                                    for error in &result.errors {
+                                        append_log(&log_buffer, &format!("[sources] {error}"));
+                                    }
+                                    refresh_indexed_sources(list.clone(), log_buffer.clone());
+                                    ControlFlow::Break
+                                }
+                                Ok(Err(error)) => {
+                                    button.set_sensitive(true);
+                                    set_source_status(
+                                        &status,
+                                        &format!("Folder indexing failed: {error}"),
+                                        true,
+                                    );
+                                    append_log(
+                                        &log_buffer,
+                                        &format!("[sources] folder indexing failed: {error}"),
+                                    );
+                                    ControlFlow::Break
+                                }
+                                Err(mpsc::TryRecvError::Empty) => {
+                                    let elapsed = started_at.elapsed().as_secs();
+                                    if elapsed != last_elapsed_second {
+                                        last_elapsed_second = elapsed;
+                                        set_source_status(
+                                            &status,
+                                            &format!(
+                                                "Indexing {indexing_path} recursively… {elapsed}s elapsed. Large projects can take several minutes."
+                                            ),
+                                            false,
+                                        );
+                                    }
+                                    ControlFlow::Continue
+                                }
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    button.set_sensitive(true);
+                                    set_source_status(
+                                        &status,
+                                        "Folder indexing failed: the background request stopped unexpectedly.",
+                                        true,
+                                    );
+                                    ControlFlow::Break
+                                }
+                            }
+                        });
+                    }
+                    Err(error)
+                        if error.matches(gtk4::gio::IOErrorEnum::Cancelled) => {}
+                    Err(error) => set_source_status(
+                        &status,
+                        &format!("Could not choose folder: {error}"),
+                        true,
+                    ),
+                },
+            );
+        });
+    }
     {
         let list = list.clone();
         let log_buffer = log_buffer.clone();
@@ -2960,7 +3101,14 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
                     entry.set_text("");
                     set_source_status(
                         &status,
-                        &format!("Indexed {} chunk(s) from {}.", result.chunks, result.source),
+                        &if result.unchanged {
+                            format!(
+                                "Already current: {} chunk(s) from {}.",
+                                result.chunks, result.source
+                            )
+                        } else {
+                            format!("Indexed {} chunk(s) from {}.", result.chunks, result.source)
+                        },
                         false,
                     );
                     append_log(

@@ -486,37 +486,48 @@ impl MemoryStore {
         .context("memory lexical search task panicked")??;
 
         let query_terms = terms(&query);
-        let mut fused: HashMap<MemoryId, (MemoryRecord, f32)> = HashMap::new();
+        let sqlite_distances_are_l2 = matches!(self.vector_backend, VectorBackend::SqliteVec);
+        let mut fused: HashMap<MemoryId, (MemoryRecord, f32, Option<f32>)> = HashMap::new();
         for (rank, hit) in dense.into_iter().enumerate() {
+            // Expose a backend-independent cosine distance to callers. The
+            // sqlite-vec backend returns Euclidean distance; embeddings are
+            // normalized, so cosine distance is L2^2 / 2. Focal Vector
+            // already returns 1 - cosine similarity.
+            let semantic_distance = if sqlite_distances_are_l2 {
+                hit.distance * hit.distance / 2.0
+            } else {
+                hit.distance
+            };
             let entry = fused
                 .entry(hit.record.id)
-                .or_insert_with(|| (hit.record, 0.0));
+                .or_insert_with(|| (hit.record, 0.0, None));
             entry.1 += 1.0 / (60.0 + rank as f32 + 1.0);
+            entry.2 = Some(semantic_distance);
         }
         for (rank, hit) in lexical.into_iter().enumerate() {
             let entry = fused
                 .entry(hit.record.id)
-                .or_insert_with(|| (hit.record, 0.0));
+                .or_insert_with(|| (hit.record, 0.0, None));
             entry.1 += 1.0 / (60.0 + rank as f32 + 1.0);
         }
         let mut hits = fused
             .into_values()
-            .map(|(record, mut score)| {
+            .map(|(record, mut score, semantic_distance)| {
                 let record_terms = terms(&record.text);
                 if !query_terms.is_empty() {
                     let overlap = query_terms.intersection(&record_terms).count() as f32
                         / query_terms.len() as f32;
                     score += overlap * 0.02;
                 }
-                SearchHit {
-                    record,
-                    distance: -score,
-                }
+                (record, score, semantic_distance.unwrap_or(f32::INFINITY))
             })
             .collect::<Vec<_>>();
-        hits.sort_by(|left, right| left.distance.total_cmp(&right.distance));
+        hits.sort_by(|left, right| right.1.total_cmp(&left.1));
         hits.truncate(top_k);
-        Ok(hits)
+        Ok(hits
+            .into_iter()
+            .map(|(record, _, distance)| SearchHit { record, distance })
+            .collect())
     }
 
     pub async fn forget(&self, id: MemoryId) -> Result<()> {

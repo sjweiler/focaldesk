@@ -397,6 +397,7 @@ opt a chat into grounded retrieval:
 
 ```sh
 focaldesk-cli ai ingest ./notes/project.md
+focaldesk-cli ai ingest ./notes --recursive
 focaldesk-cli ai chat --memory "What did the project notes say about recovery?"
 ```
 
@@ -404,6 +405,12 @@ Documents are capped at 8 MiB, chunked with overlap, and stored with their
 canonical source path. Re-indexing a changed source replaces its catalog entry
 and retires its old chunks; unchanged content is skipped. Sources can be
 listed, refreshed, or removed without deleting the original file:
+
+Directory ingestion accepts supported document and source-code files, skips
+hidden entries and symbolic links, and only descends into subdirectories when
+`--recursive` is supplied. The AI Console provides an **Add Folder** picker
+that performs a recursive import and reports indexed, unchanged, skipped, and
+failed file counts.
 
 ```sh
 focaldesk-cli ai sources

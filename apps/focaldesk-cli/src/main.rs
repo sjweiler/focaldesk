@@ -195,19 +195,57 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
             Ok(())
         }
         "ingest" => {
-            let path = args.next().context("ai ingest requires a document path")?;
-            if args.next().is_some() {
-                bail!("ai ingest accepts exactly one document path");
-            }
-            match send_ai_request(&AiIpcRequest::IngestDocument {
-                path: PathBuf::from(path),
-            })? {
-                AiIpcResponse::DocumentIngested { result } => {
-                    println!("indexed {} chunk(s) from {}", result.chunks, result.source);
-                    Ok(())
+            let mut path = None;
+            let mut recursive = false;
+            for argument in args {
+                if argument == "--recursive" {
+                    recursive = true;
+                } else if argument.starts_with('-') {
+                    bail!("unknown ai ingest option: {argument}");
+                } else if path.replace(PathBuf::from(argument)).is_some() {
+                    bail!("ai ingest accepts exactly one file or directory path");
                 }
-                AiIpcResponse::Error { message } => bail!(message),
-                other => bail!("unexpected AI response: {other:?}"),
+            }
+            let path = path.context("ai ingest requires a file or directory path")?;
+            if path.is_dir() {
+                match send_ai_request(&AiIpcRequest::IngestDirectory { path, recursive })? {
+                    AiIpcResponse::DirectoryIngested { result } => {
+                        println!(
+                            "indexed={} unchanged={} skipped={} failed={} chunks={} from {}",
+                            result.indexed,
+                            result.unchanged,
+                            result.skipped,
+                            result.failed,
+                            result.chunks,
+                            result.source
+                        );
+                        for error in result.errors {
+                            eprintln!("warning: {error}");
+                        }
+                        Ok(())
+                    }
+                    AiIpcResponse::Error { message } => bail!(message),
+                    other => bail!("unexpected AI response: {other:?}"),
+                }
+            } else {
+                if recursive {
+                    bail!("--recursive requires a directory path");
+                }
+                match send_ai_request(&AiIpcRequest::IngestDocument { path })? {
+                    AiIpcResponse::DocumentIngested { result } => {
+                        if result.unchanged {
+                            println!(
+                                "unchanged {} chunk(s) from {}",
+                                result.chunks, result.source
+                            );
+                        } else {
+                            println!("indexed {} chunk(s) from {}", result.chunks, result.source);
+                        }
+                        Ok(())
+                    }
+                    AiIpcResponse::Error { message } => bail!(message),
+                    other => bail!("unexpected AI response: {other:?}"),
+                }
             }
         }
         "sources" => match send_ai_request(&AiIpcRequest::ListIndexedDocuments)? {
@@ -371,7 +409,7 @@ fn print_usage() {
     eprintln!(
         "  focaldesk-cli ai chat [--stream] [--memory] [--provider <id>] [--model <model>] <prompt...>"
     );
-    eprintln!("  focaldesk-cli ai ingest <text-markdown-pdf-or-docx-path>");
+    eprintln!("  focaldesk-cli ai ingest <file-or-directory-path> [--recursive]");
     eprintln!("  focaldesk-cli ai sources");
     eprintln!("  focaldesk-cli ai remove-source <canonical-path>");
     eprintln!("  focaldesk-cli ai eval <cases.json> [--top-k <n>]");

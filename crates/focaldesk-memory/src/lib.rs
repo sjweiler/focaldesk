@@ -54,18 +54,31 @@ impl MemoryService {
         chunks: Vec<String>,
     ) -> Result<IndexedDocument> {
         let previous = self.store.document(&document.source).await?;
+        // Complete and validate the whole batch before mutating storage. An
+        // Ollama or dimension failure therefore leaves the prior document
+        // fully intact and cannot create partial replacement chunks.
+        let embeddings = self.embedder.embed_batch(&chunks).await?;
+        if embeddings.len() != chunks.len() {
+            anyhow::bail!(
+                "embedding provider returned {} embeddings for {} document chunks",
+                embeddings.len(),
+                chunks.len()
+            );
+        }
         let mut ids = Vec::with_capacity(chunks.len());
-        for (index, chunk) in chunks.into_iter().enumerate() {
+        for (index, (chunk, embedding)) in chunks.into_iter().zip(embeddings).enumerate() {
             let metadata = serde_json::json!({
                 "kind": "document_chunk",
                 "source_uri": document.source,
                 "title": document.title,
                 "media_type": document.media_type,
                 "content_hash": document.content_hash,
+                "modified_at_unix": document.modified_at_unix,
+                "indexed_at_unix": document.indexed_at_unix,
                 "chunk_index": index,
                 "chunk_count": document.chunk_count,
             });
-            match self.remember_text(chunk, metadata).await {
+            match self.store.remember(chunk, embedding, metadata).await {
                 Ok(id) => ids.push(id),
                 Err(error) => {
                     for id in ids {
@@ -123,5 +136,156 @@ impl MemoryService {
 
     pub async fn status(&self) -> Result<MemoryStatus> {
         self.store.status().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::bail;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct BatchEmbedder {
+        batch_calls: AtomicUsize,
+        fail: AtomicBool,
+        invalid_second_dimension: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for BatchEmbedder {
+        fn dimension(&self) -> usize {
+            3
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>> {
+            panic!("document replacement should use the batch API")
+        }
+
+        async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            self.batch_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                bail!("batch embedding failed");
+            }
+            let mut embeddings = texts
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let mut embedding = vec![0.0; 3];
+                    embedding[index % 3] = 1.0;
+                    embedding
+                })
+                .collect::<Vec<_>>();
+            if self.invalid_second_dimension.load(Ordering::SeqCst) && embeddings.len() > 1 {
+                embeddings[1].pop();
+            }
+            Ok(embeddings)
+        }
+    }
+
+    fn test_path(name: &str) -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "focaldesk-memory-{name}-{}-{stamp}.db",
+            std::process::id()
+        ))
+    }
+
+    fn document(hash: &str) -> IndexedDocument {
+        IndexedDocument {
+            source: "/tmp/batched-document.md".into(),
+            title: "batched-document.md".into(),
+            media_type: "text/markdown".into(),
+            content_hash: hash.into(),
+            modified_at_unix: 1,
+            indexed_at_unix: 2,
+            chunk_count: 2,
+            memory_ids: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn document_replacement_embeds_all_chunks_in_one_batch() {
+        let path = test_path("batch");
+        let store = MemoryStore::open(&path, 3).unwrap();
+        let embedder = Arc::new(BatchEmbedder {
+            batch_calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            invalid_second_dimension: AtomicBool::new(false),
+        });
+        let memory = MemoryService::new(store, embedder.clone());
+
+        let indexed = memory
+            .replace_document(document("new"), vec!["one".into(), "two".into()])
+            .await
+            .unwrap();
+
+        assert_eq!(embedder.batch_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(indexed.memory_ids.len(), 2);
+        assert_eq!(memory.status().await.unwrap().entry_count, 2);
+        drop(memory);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn failed_batch_preserves_previous_document_and_chunks() {
+        let path = test_path("batch-rollback");
+        let store = MemoryStore::open(&path, 3).unwrap();
+        let embedder = Arc::new(BatchEmbedder {
+            batch_calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            invalid_second_dimension: AtomicBool::new(false),
+        });
+        let memory = MemoryService::new(store, embedder.clone());
+        let previous = memory
+            .replace_document(document("old"), vec!["old one".into(), "old two".into()])
+            .await
+            .unwrap();
+        embedder.fail.store(true, Ordering::SeqCst);
+
+        let error = memory
+            .replace_document(document("new"), vec!["new one".into(), "new two".into()])
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("batch embedding failed"));
+        assert_eq!(memory.documents().await.unwrap(), vec![previous]);
+        assert_eq!(memory.status().await.unwrap().entry_count, 2);
+        drop(memory);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn partial_storage_failure_rolls_back_new_chunks() {
+        let path = test_path("storage-rollback");
+        let store = MemoryStore::open(&path, 3).unwrap();
+        let embedder = Arc::new(BatchEmbedder {
+            batch_calls: AtomicUsize::new(0),
+            fail: AtomicBool::new(false),
+            invalid_second_dimension: AtomicBool::new(false),
+        });
+        let memory = MemoryService::new(store, embedder.clone());
+        let previous = memory
+            .replace_document(document("old"), vec!["old one".into(), "old two".into()])
+            .await
+            .unwrap();
+        embedder
+            .invalid_second_dimension
+            .store(true, Ordering::SeqCst);
+
+        let error = memory
+            .replace_document(document("new"), vec!["new one".into(), "new two".into()])
+            .await
+            .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("embedding has 2 dims, store expects 3"));
+        assert_eq!(memory.documents().await.unwrap(), vec![previous]);
+        assert_eq!(memory.status().await.unwrap().entry_count, 2);
+        drop(memory);
+        let _ = std::fs::remove_file(path);
     }
 }

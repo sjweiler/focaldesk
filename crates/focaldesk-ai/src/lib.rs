@@ -27,6 +27,6 @@ pub use provider::{AiProvider, ProviderError, ProviderErrorKind};
 pub use service::AiService;
 pub use types::{
     AiDaemonStatus, AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, Citation,
-    DocumentIngestResult, ProviderInfo, ProviderModelInfo, ProviderTelemetry, RetrievalEvalCase,
-    RetrievalEvalReport, TokenUsage,
+    DirectoryIngestResult, DocumentIngestResult, ProviderInfo, ProviderModelInfo,
+    ProviderTelemetry, RetrievalEvalCase, RetrievalEvalReport, TokenUsage,
 };
