@@ -6,10 +6,11 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -59,11 +60,20 @@ const TASK_SHELF_BUTTON_WIDTH: i32 = 48;
 const TASK_SHELF_GROUP_GAP: i32 = 4;
 // Outer padding/border and spacing, the separator, and the two utility buttons.
 const TASK_SHELF_FIXED_WIDTH: i32 = 151;
-// Focus follows the pointer across outputs, so the rail's active-output accent
-// must not wait on the slower background-status refresh cadence.
-const RAIL_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+// Desktop IPC does not yet expose a snapshot-change subscription. Keep this
+// bounded fallback responsive without waking the shell at frame-like cadence;
+// unchanged snapshots are filtered before any GTK updates occur.
+const RAIL_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const BACKGROUND_SNAPSHOT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SHELL_CSS_BASE: &str = include_str!("shell.css");
+
+thread_local! {
+    /// SVG parsing, font discovery, and rasterization are intentionally shared
+    /// by every shell window on the GTK thread. Dynamic rail updates can select
+    /// an icon frequently, but a given icon/size pair only needs rendering once.
+    static SHELL_ICON_CACHE: RefCell<HashMap<(String, u32), gdk::Texture>> =
+        RefCell::new(HashMap::new());
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShellRole {
@@ -1362,6 +1372,46 @@ struct SystemRailWidgets {
     workspace_box: gtk::Box,
     add_workspace_button: gtk::Button,
     remove_workspace_button: gtk::Button,
+    last_state: RefCell<Option<SystemRailState>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemRailOutputState {
+    connector: String,
+    focused: bool,
+    hdr_supported: bool,
+    hdr_requested: bool,
+    hdr_active: bool,
+    wide_gamut_active: bool,
+    icc_lut_fallback_active: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SystemRailAiState {
+    id: u32,
+    minimized: bool,
+    focused: bool,
+}
+
+/// The subset of a desktop snapshot that can affect the system rail.
+///
+/// Desktop snapshots currently arrive through request/response IPC. Keeping a
+/// compact signature here makes that fallback polling edge-triggered from the
+/// GTK UI's perspective: unchanged snapshots perform no widget or paint work.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SystemRailState {
+    output: Option<SystemRailOutputState>,
+    ai: Option<SystemRailAiState>,
+    active_workspace: u32,
+    workspace_count: usize,
+    max_workspace_slots: usize,
+    network_carrier: bool,
+    microphone_active: bool,
+    camera_active: bool,
+    battery_percent: Option<u8>,
+    externally_powered: bool,
+    battery_charging: bool,
+    notification_unread_count: usize,
 }
 
 fn build_panel(
@@ -1592,6 +1642,7 @@ fn build_panel(
         workspace_box,
         add_workspace_button,
         remove_workspace_button,
+        last_state: RefCell::new(None),
     };
     let clock_format = config.panel.clock_format;
     update_clock(&widgets.clock, clock_format);
@@ -1651,6 +1702,15 @@ fn rebuild_rail_workspaces(
 }
 
 fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, connector: &str) {
+    let state = system_rail_state(snapshot, connector);
+    {
+        let mut last_state = widgets.last_state.borrow_mut();
+        if last_state.as_ref() == Some(&state) {
+            return;
+        }
+        *last_state = Some(state);
+    }
+
     let output = output_for_connector(snapshot, connector);
     widgets
         .focus_notch
@@ -1774,6 +1834,54 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
     widgets
         .notifications_button
         .set_tooltip_text(Some(&notification_tooltip));
+}
+
+fn system_rail_state(snapshot: &DesktopSnapshot, connector: &str) -> SystemRailState {
+    let output = output_for_connector(snapshot, connector);
+    let ai = snapshot
+        .windows
+        .iter()
+        .find(|window| {
+            window.mapped
+                && ai_console_identity_matches(
+                    window.app_id.as_deref(),
+                    window.class.as_deref(),
+                    &window.title,
+                )
+        })
+        .map(|window| SystemRailAiState {
+            id: window.id,
+            minimized: window.minimized,
+            focused: window.focused,
+        });
+    let externally_powered =
+        snapshot.shell.line_power_online == Some(true) || snapshot.shell.battery_percent.is_none();
+
+    SystemRailState {
+        output: output.map(|output| SystemRailOutputState {
+            connector: output.connector.clone(),
+            focused: output.focused,
+            hdr_supported: output.hdr_supported,
+            hdr_requested: output.hdr_requested,
+            hdr_active: output.hdr_active,
+            wide_gamut_active: output.wide_gamut_active,
+            icc_lut_fallback_active: output.icc_lut_fallback_active,
+        }),
+        ai,
+        active_workspace: output
+            .map(|output| output.active_workspace_id)
+            .unwrap_or(snapshot.session.active_workspace_id)
+            .max(1),
+        workspace_count: snapshot.shell.workspace_count.max(1),
+        max_workspace_slots: snapshot.shell.max_workspace_slots.max(1),
+        network_carrier: snapshot.shell.network_carrier,
+        microphone_active: snapshot.shell.microphone_active,
+        camera_active: snapshot.shell.camera_active,
+        battery_percent: snapshot.shell.battery_percent,
+        externally_powered,
+        battery_charging: snapshot.shell.battery_charging,
+        notification_unread_count: snapshot.shell.notification_unread_count,
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1910,6 +2018,11 @@ fn set_shell_icon_at_size(image: &gtk::Image, icon_name: &str, icon_size: u32) {
         image.set_icon_name(Some(icon_name));
         return;
     };
+    let cache_key = (icon_name.to_string(), icon_size);
+    if let Some(texture) = SHELL_ICON_CACHE.with(|cache| cache.borrow().get(&cache_key).cloned()) {
+        image.set_paintable(Some(&texture));
+        return;
+    }
     let Ok(svg) = std::str::from_utf8(svg) else {
         return;
     };
@@ -1937,14 +2050,18 @@ fn set_shell_icon_at_size(image: &gtk::Image, icon_name: &str, icon_size: u32) {
     );
     resvg::render(&tree, transform, &mut pixmap.as_mut());
     let bytes = glib::Bytes::from_owned(pixmap.data().to_vec());
-    let texture = gdk::MemoryTexture::new(
+    let texture: gdk::Texture = gdk::MemoryTexture::new(
         icon_size as i32,
         icon_size as i32,
         gdk::MemoryFormat::R8g8b8a8Premultiplied,
         &bytes,
         (icon_size * 4) as usize,
-    );
+    )
+    .upcast();
     image.set_paintable(Some(&texture));
+    SHELL_ICON_CACHE.with(|cache| {
+        cache.borrow_mut().insert(cache_key, texture);
+    });
 }
 
 fn focaldesk_icon_svg(icon_name: &str) -> Option<&'static [u8]> {
