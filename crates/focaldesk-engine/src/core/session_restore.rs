@@ -24,6 +24,30 @@ pub struct SavedRect {
     pub height: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedSplitDirection {
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedSplitPlacement {
+    pub direction: SavedSplitDirection,
+    /// Divider locations normalized to the saved work area in thousandths.
+    pub x_ratio_per_mille: Option<u16>,
+    #[serde(default)]
+    pub x_end_ratio_per_mille: Option<u16>,
+    pub y_ratio_per_mille: Option<u16>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SavedWindow {
     pub protocol: SavedProtocol,
@@ -37,6 +61,8 @@ pub struct SavedWindow {
     /// monitor rearrangement and scale changes better than global coordinates.
     pub geometry: SavedRect,
     pub restore_geometry: Option<SavedRect>,
+    #[serde(default)]
+    pub split_placement: Option<SavedSplitPlacement>,
     pub floating: bool,
     pub maximized: bool,
     pub fullscreen: bool,
@@ -320,6 +346,7 @@ mod tests {
                 height: 600,
             },
             restore_geometry: None,
+            split_placement: None,
             floating: true,
             maximized: false,
             fullscreen: false,
@@ -348,6 +375,14 @@ mod tests {
         atomic_write(&path, &serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
         assert_eq!(load_snapshot(&path), Some(snapshot));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_window_records_default_to_no_split_placement() {
+        let mut value = serde_json::to_value(saved("org.test.App", 0)).unwrap();
+        value.as_object_mut().unwrap().remove("split_placement");
+        let restored: SavedWindow = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.split_placement, None);
     }
 
     #[test]

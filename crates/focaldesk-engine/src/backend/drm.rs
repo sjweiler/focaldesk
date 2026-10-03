@@ -422,6 +422,10 @@ fn reset_surface_timing_after_resume(
     *hdr_commit_deadline = hdr_transition_pending.then_some(now + HDR_FRAME_TIMEOUT);
 }
 
+fn take_shell_restart_after_present(present_completed: bool, pending: &mut bool) -> bool {
+    present_completed && std::mem::take(pending)
+}
+
 fn hdr_commit_stalled(deadline: Option<Instant>, now: Instant) -> bool {
     deadline.is_some_and(|deadline| now >= deadline)
 }
@@ -1667,6 +1671,10 @@ fn resume_drm_session(
 
     data.resume_pending = false;
     data.resume_retry_at = None;
+    // Recreating the compositor's EGL context can leave the independently
+    // rendered GTK shell clients holding stale GPU resources. Arm exactly one
+    // restart; the first successfully presented frame consumes this flag.
+    data.restart_shell_after_present = true;
     data.core.state.handle_session_resume();
     // RenderState::invalidate_gpu_state() (called above via
     // handle_session_resume) only covers caches owned by DesktopState.
@@ -1896,9 +1904,10 @@ mod hdr_tests {
         nvidia_kms_hdr_blocked_with_override, queued_frame_stalled,
         reset_surface_timing_after_resume, saved_monitor_config, select_drm_mode_index,
         select_exclusive_hdr_target, select_requested_drm_mode_index,
-        should_defer_drm_topology_change, should_remove_drm_device, DisplayConfig,
-        DisplayTransform, DrmLifecycle, DrmModeCandidate, EdidHdrMetadata, EdidMonitorIdentity,
-        ExclusiveHdrPrepareDecision, HdrBpcRange, HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT,
+        should_defer_drm_topology_change, should_remove_drm_device,
+        take_shell_restart_after_present, DisplayConfig, DisplayTransform, DrmLifecycle,
+        DrmModeCandidate, EdidHdrMetadata, EdidMonitorIdentity, ExclusiveHdrPrepareDecision,
+        HdrBpcRange, HdrFailurePersist, HdrSupport, DRM_FRAME_TIMEOUT,
         DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
         HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
@@ -2073,6 +2082,17 @@ mod hdr_tests {
 
         reset_surface_timing_after_resume(&mut queued_at, &mut hdr_deadline, false, resumed_at);
         assert_eq!(hdr_deadline, None);
+    }
+
+    #[test]
+    fn shell_restart_is_consumed_by_only_one_successful_present() {
+        let mut pending = true;
+
+        assert!(!take_shell_restart_after_present(false, &mut pending));
+        assert!(pending, "a failed present must leave the restart armed");
+        assert!(take_shell_restart_after_present(true, &mut pending));
+        assert!(!pending);
+        assert!(!take_shell_restart_after_present(true, &mut pending));
     }
 
     #[test]
@@ -5898,9 +5918,10 @@ fn device_added(
                         "first post-resume page flip completed",
                     );
                 }
-                if first_resume_flip_completed
-                    || (present_completed && std::mem::take(&mut state.restart_shell_after_present))
-                {
+                if take_shell_restart_after_present(
+                    present_completed,
+                    &mut state.restart_shell_after_present,
+                ) {
                     restart_shell_surfaces_after_gpu_reset();
                 }
                 if recover_exclusive

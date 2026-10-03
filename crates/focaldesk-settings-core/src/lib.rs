@@ -416,8 +416,21 @@ pub enum BrowserLaunchBackend {
 pub struct WorkspaceSettings {
     #[serde(default = "default_restore_session")]
     pub restore_session: bool,
+    /// Restore saved split pane assignments as part of session restoration.
+    /// Kept separate because recreating application tiling is more intrusive
+    /// than reopening applications on their previous workspaces.
+    #[serde(default)]
+    pub restore_split_layouts: bool,
     #[serde(default = "default_maximize_on_launch")]
     pub maximize_on_launch: bool,
+    /// Enables optional split-screen window placement controls. Consumers must
+    /// keep those controls hidden or inactive while this is false.
+    #[serde(default)]
+    pub split_screen_enabled: bool,
+    /// Last draggable split boundaries, keyed by display connector. Values are
+    /// normalized so they remain useful when a display mode changes.
+    #[serde(default)]
+    pub split_ratios: BTreeMap<String, SplitRatioSettings>,
     /// Max number of workspace buttons shown individually in the sidebar before
     /// they collapse into an overflow button. Does not limit how many workspaces
     /// can actually be created.
@@ -429,8 +442,27 @@ impl Default for WorkspaceSettings {
     fn default() -> Self {
         Self {
             restore_session: default_restore_session(),
+            restore_split_layouts: false,
             maximize_on_launch: default_maximize_on_launch(),
+            split_screen_enabled: false,
+            split_ratios: BTreeMap::new(),
             max_workspace_slots: default_max_workspace_slots(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SplitRatioSettings {
+    pub side_by_side: f64,
+    pub stacked: f64,
+}
+
+impl Default for SplitRatioSettings {
+    fn default() -> Self {
+        Self {
+            side_by_side: 0.5,
+            stacked: 0.5,
         }
     }
 }
@@ -720,6 +752,22 @@ mod tests {
     }
 
     #[test]
+    fn split_layout_restore_defaults_disabled_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["workspaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("restore_split_layouts");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(!settings.workspaces.restore_split_layouts);
+
+        settings.workspaces.restore_split_layouts = true;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(restored.workspaces.restore_split_layouts);
+    }
+
+    #[test]
     fn keybindings_default_empty_and_round_trip() {
         let mut value = serde_json::to_value(default_settings()).unwrap();
         value["input"]
@@ -812,6 +860,48 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.maximize_on_launch);
+    }
+
+    #[test]
+    fn split_screen_defaults_disabled_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["workspaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("split_screen_enabled");
+
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(!settings.workspaces.split_screen_enabled);
+
+        let mut settings = settings;
+        settings.workspaces.split_screen_enabled = true;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(restored.workspaces.split_screen_enabled);
+    }
+
+    #[test]
+    fn split_ratios_default_empty_and_round_trip_by_connector() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["workspaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("split_ratios");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.workspaces.split_ratios.is_empty());
+
+        settings.workspaces.split_ratios.insert(
+            "DP-1".into(),
+            SplitRatioSettings {
+                side_by_side: 2.0 / 3.0,
+                stacked: 0.4,
+            },
+        );
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        let ratio = restored.workspaces.split_ratios.get("DP-1").unwrap();
+        assert!((ratio.side_by_side - 2.0 / 3.0).abs() < f64::EPSILON);
+        assert!((ratio.stacked - 0.4).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -115,6 +115,41 @@ pub enum DesktopDirection {
     Down,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSplitLayout {
+    LeftHalf,
+    RightHalf,
+    LeftTwoThirds,
+    RightThird,
+    LeftThird,
+    RightTwoThirds,
+    TopHalf,
+    BottomHalf,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+/// Split commands exposed to trusted diagnostics so nested compositor tests can
+/// exercise the same action path as keyboard shortcuts against real clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopSplitKeyboardAction {
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    ResizeLeftFine,
+    ResizeRightFine,
+    ResizeUpFine,
+    ResizeDownFine,
+    FocusNext,
+    FocusPrevious,
+    Undo,
+}
+
 /// Compositor-owned shell panels that trusted clients may open on an output.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -157,6 +192,45 @@ pub enum DesktopAction {
     FocusWindow {
         window_id: u32,
     },
+    SplitWindow {
+        window_id: u32,
+        direction: DesktopDirection,
+    },
+    SetSplitRatio {
+        window_id: u32,
+        ratio_per_mille: u16,
+    },
+    SetSplitDivider {
+        window_id: u32,
+        direction: DesktopDirection,
+        ratio_per_mille: u16,
+    },
+    ApplySplitLayout {
+        window_id: u32,
+        layout: DesktopSplitLayout,
+    },
+    SelectSplitAssistWindow {
+        window_id: u32,
+    },
+    SwapSplitWindow {
+        window_id: u32,
+        direction: DesktopDirection,
+    },
+    InvokeSplitKeyboardAction {
+        window_id: u32,
+        command: DesktopSplitKeyboardAction,
+    },
+    ReplaceSplitWindow {
+        window_id: u32,
+    },
+    ExitSplitGroup {
+        window_id: u32,
+    },
+    AssignSplitGroupToWorkspace {
+        window_id: u32,
+        workspace: u32,
+    },
+    CheckpointSession,
     MoveWindowToWorkspace {
         window_id: u32,
         workspace: u32,
@@ -362,6 +436,8 @@ pub struct RenderingStatus {
     pub compositor_ready: bool,
     pub output_count: usize,
     pub damage_debug_enabled: bool,
+    #[serde(default)]
+    pub split_resize_percent: Option<u8>,
 }
 
 pub fn send_desktop_request(request: &IpcRequest) -> Result<IpcResponse, String> {

@@ -2,12 +2,15 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::backend::{UpdateBackendKind, detect_backend, install_updates, list_updates};
+use crate::backend::{
+    UpdateBackendKind, detect_backend, install_all_updates, install_updates, list_updates,
+};
 use crate::model::UpdateSnapshot;
 
 enum Job {
     Refresh { refresh_metadata: bool },
     Install { ids: Vec<String> },
+    InstallAll,
 }
 
 /// In-process update cache plus a worker thread for PackageKit/DNF.
@@ -67,13 +70,12 @@ impl UpdateManager {
     }
 
     pub fn request_install_all(&self) -> Result<(), String> {
-        let ids = self
-            .snapshot()
-            .packages
-            .into_iter()
-            .map(|package| package.id)
-            .collect::<Vec<_>>();
-        self.request_install(ids)
+        if self.snapshot().packages.is_empty() {
+            return Err("no packages selected".into());
+        }
+        self.jobs
+            .send(Job::InstallAll)
+            .map_err(|_| "update worker is not running".to_string())
     }
 }
 
@@ -81,7 +83,8 @@ fn worker_loop(state: Arc<Mutex<UpdateSnapshot>>, jobs: std::sync::mpsc::Receive
     while let Ok(job) = jobs.recv() {
         match job {
             Job::Refresh { refresh_metadata } => run_refresh(&state, refresh_metadata),
-            Job::Install { ids } => run_install(&state, ids),
+            Job::Install { ids } => run_install(&state, ids, false),
+            Job::InstallAll => run_install(&state, Vec::new(), true),
         }
     }
 }
@@ -125,14 +128,19 @@ fn run_refresh(state: &Arc<Mutex<UpdateSnapshot>>, refresh_metadata: bool) {
     }
 }
 
-fn run_install(state: &Arc<Mutex<UpdateSnapshot>>, ids: Vec<String>) {
+fn run_install(state: &Arc<Mutex<UpdateSnapshot>>, ids: Vec<String>, install_all: bool) {
     let backend = {
         let mut snapshot = state.lock().unwrap();
         if snapshot.checking || snapshot.installing {
             return;
         }
         snapshot.installing = true;
-        snapshot.progress = Some(format!("Installing {} update(s)…", ids.len()));
+        let count = if install_all {
+            snapshot.available_count()
+        } else {
+            ids.len()
+        };
+        snapshot.progress = Some(format!("Installing {count} update(s)…"));
         snapshot.last_error = None;
         snapshot.backend.clone()
     };
@@ -145,7 +153,11 @@ fn run_install(state: &Arc<Mutex<UpdateSnapshot>>, ids: Vec<String>) {
         return;
     };
 
-    let result = install_updates(kind, &ids);
+    let result = if install_all {
+        install_all_updates(kind)
+    } else {
+        install_updates(kind, &ids)
+    };
     {
         let mut snapshot = state.lock().unwrap();
         snapshot.installing = false;

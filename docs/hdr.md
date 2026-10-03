@@ -16,6 +16,35 @@ link depth, connector colorspace, and HDR static metadata. Vulkan WSI colorspace
 extensions are not involved because KMS, rather than a Vulkan swapchain, owns
 presentation.
 
+## Game Auto HDR
+
+The raw-Ash Vulkan renderer has an opt-in inverse tone-mapping path for SDR
+game windows. It runs after the client transfer function is decoded and before
+the client gamut is transformed into the FP16 scene. Native PQ, HLG, scRGB, and
+extended-sRGB surfaces always bypass inverse tone mapping.
+
+Auto HDR is disabled unless a window matches `FOCALDESK_AUTO_HDR_APPS`. Entries
+are comma or semicolon separated and match an executable name, Wayland app-id,
+or X11 `WM_CLASS` case-insensitively. For Wine games, list both the launched
+executable and its observed `WM_CLASS` when those names differ. A diagnostic
+`*` entry enables every eligible client window but is not recommended for a
+normal session. For example:
+
+```toml
+[session_environment]
+FOCALDESK_AUTO_HDR_APPS = "game.exe,steam_app_123456"
+FOCALDESK_AUTO_HDR_SDR_NITS = "100"
+FOCALDESK_AUTO_HDR_TARGET_NITS = "600"
+FOCALDESK_AUTO_HDR_GAMUT_WIDENESS = "0.05"
+```
+
+The launch service supplies `DXVK_HDR=1` and `ENABLE_HDR_WSI=1` to matching
+applications. If a game then submits a native HDR surface, its declared transfer
+function wins and Auto HDR stays off. If it continues to submit ordinary SDR,
+the compositor raises highlights toward the target. The target is always capped
+to the active output's configured peak, and the feature activates only after
+KMS HDR has been verified on that output.
+
 ## Known working configuration
 
 As of September 25, 2026, HDR10 has been observed working through both native

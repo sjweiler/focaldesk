@@ -257,6 +257,12 @@ pub struct RenderInputs<'a> {
     pub sidebar_pulse: Option<SidebarPulseFrame>,
     pub topbar_pulse: Option<TopbarPulseFrame>,
     pub clock_pulse: Option<ClockPulseFrame>,
+    /// Output-local logical rectangles for split-screen grid dividers.
+    pub split_dividers: &'a [(Rectangle<i32, Logical>, bool)],
+    /// Temporary keyboard-resize indicator for this output.
+    pub split_resize_percent: Option<u8>,
+    /// Output-local target shown while a moved window is inside a snap zone.
+    pub snap_preview: Option<Rectangle<i32, Logical>>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     /// Focus is retained by the accessibility model, while chrome rendering
@@ -2505,6 +2511,72 @@ impl RenderState {
                 theme,
                 inputs.client_compositing.ui_textures_linear(),
             );
+        }
+
+        if matches!(
+            stage,
+            OutputRenderStage::All | OutputRenderStage::ChromeOverlay
+        ) && !inputs.fullscreen_client
+        {
+            if let Some(preview) = inputs.snap_preview {
+                let mut fill = theme.chrome.accent_color;
+                fill[3] = 0.22;
+                let mut border = theme.chrome.accent_color;
+                border[3] = 0.9;
+                if inputs.client_compositing.ui_textures_linear() {
+                    fill = scene_linear_to_display_p3(fill);
+                    border = scene_linear_to_display_p3(border);
+                }
+                self.draw_rounded_rect(frame, preview, inputs.ctx.output_scale, 10.0, fill)?;
+                let thickness = 3;
+                for edge in [
+                    Rectangle::from_loc_and_size(preview.loc, (preview.size.w, thickness)),
+                    Rectangle::from_loc_and_size(
+                        (preview.loc.x, preview.loc.y + preview.size.h - thickness),
+                        (preview.size.w, thickness),
+                    ),
+                    Rectangle::from_loc_and_size(preview.loc, (thickness, preview.size.h)),
+                    Rectangle::from_loc_and_size(
+                        (preview.loc.x + preview.size.w - thickness, preview.loc.y),
+                        (thickness, preview.size.h),
+                    ),
+                ] {
+                    self.draw_rounded_rect(frame, edge, inputs.ctx.output_scale, 2.0, border)?;
+                }
+            }
+            for &(divider, active) in inputs.split_dividers {
+                let mut color = theme.chrome.accent_color;
+                color[3] = if active { 0.95 } else { 0.65 };
+                if inputs.client_compositing.ui_textures_linear() {
+                    color = scene_linear_to_display_p3(color);
+                }
+                self.draw_rounded_rect(frame, divider, inputs.ctx.output_scale, 2.0, color)?;
+            }
+            if let Some(percent) = inputs.split_resize_percent {
+                let work = inputs.layout.work_area.recess;
+                let hud = Rectangle::from_loc_and_size(
+                    (
+                        work.loc.x + work.size.w / 2 - 48,
+                        work.loc.y + work.size.h / 2 - 28,
+                    ),
+                    (96, 56),
+                );
+                let mut background = theme.chrome.panel_color;
+                background[3] = 0.94;
+                self.draw_rounded_rect(frame, hud, inputs.ctx.output_scale, 10.0, background)?;
+                let label = format!("{percent}%");
+                let theme_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+                self.draw_text_cached(
+                    frame,
+                    inputs.fonts,
+                    &label,
+                    hud.loc.x + 26,
+                    hud.loc.y + 37,
+                    style_for(FontRole::Title, 22, theme_id),
+                    theme.dialog.title_color,
+                    inputs.ctx.output_scale,
+                )?;
+            }
         }
 
         if matches!(stage, OutputRenderStage::ChromeOverlay) {

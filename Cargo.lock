@@ -2596,6 +2596,7 @@ dependencies = [
  "focaldesk-ai",
  "focaldesk-diagnostics",
  "focaldesk-ipc",
+ "focaldesk-settings-core",
  "serde_json",
  "tracing",
  "tracing-subscriber",

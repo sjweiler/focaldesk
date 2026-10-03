@@ -19,6 +19,14 @@ saves them. Invalid or conflicting overrides are ignored individually.
 | `Super+Shift+V` | Toggle voice capture | Experimental |
 | `Super+F7` | Focus the previous window | Working |
 | `Super+F8` | Focus the next window | Working |
+| `Super+Left` / `Super+Right` | Place or restore the focused window in a side-by-side split | Requires **Enable split screen** |
+| `Super+Up` / `Super+Down` | Place or restore the focused window in a top/bottom split | Requires **Enable split screen** |
+| `Super+Z` | Open the split-layout chooser for the focused window | Requires **Enable split screen** |
+| `Super+Shift+Arrow` | Swap the focused window with its neighboring split pane | Requires **Enable split screen** |
+| `Super+Alt+Arrow` | Move the nearest split divider by 5% | Requires **Enable split screen** |
+| `Super+Alt+Shift+Arrow` | Move the nearest split divider by 1% | Requires **Enable split screen** |
+| `Super+Alt+Tab` / `Super+Alt+Shift+Tab` | Focus the next or previous pane in the split group | Requires **Enable split screen** |
+| `Super+Alt+Backspace` | Undo the last split placement, swap, resize, or group exit | Requires **Enable split screen** |
 | `Ctrl+Alt+Tab` | Enter or advance shell accessibility focus | Working |
 | `Ctrl+Alt+Shift+Tab` | Enter or reverse shell accessibility focus | Working |
 | `Ctrl+Alt+D` | Toggle the application launcher | Working |
@@ -84,7 +92,14 @@ Key names use XKB names such as `Return`, `Escape`, `Tab`, `Print`, `Space`,
 Supported action names are `launch_terminal`, `launch_browser`, `launch_files`,
 `toggle_launcher`, `close_focused`, `lock_screen`, `focus_next`,
 `focus_previous`, `focus_shell_next`, `focus_shell_previous`,
-`toggle_clipboard_history`, `toggle_voice_capture`, `show_workspaces`,
-`take_screenshot`, `take_screenshot_all`, and `quit_compositor`. Workspace
-actions use `activate_workspace_1` through `activate_workspace_9` and
+`toggle_clipboard_history`, `toggle_voice_capture`, `split_left`,
+`split_right`, `split_top`, `split_bottom`, `toggle_split_layout`,
+`swap_split_left`, `swap_split_right`, `swap_split_top`, `swap_split_bottom`,
+`resize_split_left`, `resize_split_right`, `resize_split_top`,
+`resize_split_bottom`, `resize_split_left_fine`, `resize_split_right_fine`,
+`resize_split_top_fine`, `resize_split_bottom_fine`, `focus_split_next`,
+`focus_split_previous`, `undo_split_action`,
+`show_workspaces`, `take_screenshot`,
+`take_screenshot_all`, and `quit_compositor`. Workspace actions use
+`activate_workspace_1` through `activate_workspace_9` and
 `move_to_workspace_1` through `move_to_workspace_9`.

@@ -28,7 +28,7 @@ use crate::core::workspace_store::WorkspaceStore;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
 use focaldesk_ui::element::UiElement;
-use focaldesk_ui::types::{ElementId, PanelKind, UiAction, UiElementKind};
+use focaldesk_ui::types::{ElementId, PanelKind, SplitLayoutPreset, UiAction, UiElementKind};
 use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonState};
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::element::Id;
@@ -40,10 +40,12 @@ use smithay::input::pointer::{
 use smithay::reexports::wayland_server::Resource;
 
 use crate::core::session_restore::{
-    desktop_entry_for_identity, SavedOutput, SavedProtocol, SavedRect, SavedWindow,
-    SessionRestoreState, SessionSnapshot,
+    desktop_entry_for_identity, SavedOutput, SavedProtocol, SavedRect, SavedSplitDirection,
+    SavedSplitPlacement, SavedWindow, SessionRestoreState, SessionSnapshot,
 };
-use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
+use crate::core::shell::xwayland::{
+    is_noninteractive_fixed_size_helper, XwaylandSurfaceRole, XwaylandWindowMeta,
+};
 use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
@@ -77,8 +79,9 @@ use focaldesk_flow::ModMask;
 use focaldesk_ipc::{
     desktop_socket_path, send_control_request, send_notification_request, send_power_request,
     send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
-    DesktopAction, DesktopDirection, DesktopSnapshot, DisplayRuntimeOutputStatus, IpcRequest,
-    IpcResponse, NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
+    DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
+    DesktopSplitLayout, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
     PowerIpcResponse, RenderingStatus, SessionStatus, ThemeEditorCommand, UpdateIpcRequest,
     UpdateIpcResponse, WindowSnapshot, WorkspaceSnapshot, THEME_EDITOR_PROTOCOL_VERSION,
 };
@@ -90,10 +93,11 @@ use focaldesk_power::{
     PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
 };
 use focaldesk_settings_core::{
-    load_settings, rearm_exclusive_hdr_for_next_session, AppSettings, BrowserLaunchBackend,
-    ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings, DisplayColorProfile,
-    HdrAppearance, HdrCalibrationPattern, LidCloseAction, LowBatteryAction, OutputConfig,
-    PerformanceMode, PowerButtonAction, PowerSettings, PrivacySettings, WorkspaceSettings,
+    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AppSettings,
+    BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings,
+    DisplayColorProfile, HdrAppearance, HdrCalibrationPattern, LidCloseAction, LowBatteryAction,
+    OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings, PrivacySettings,
+    WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::atlas::IconId;
@@ -204,6 +208,27 @@ fn rect_center_distance_sq(a: Rectangle<i32, Logical>, b: Rectangle<i32, Logical
 
 fn rect_area(rect: Rectangle<i32, Logical>) -> i64 {
     i64::from(rect.size.w.max(0)) * i64::from(rect.size.h.max(0))
+}
+
+fn output_with_largest_overlap(
+    window_geo: Rectangle<i32, Logical>,
+    outputs: impl IntoIterator<Item = (OutputId, Rectangle<i32, Logical>)>,
+    fallback: OutputId,
+) -> OutputId {
+    outputs
+        .into_iter()
+        .fold((fallback, 0i64), |(best, best_area), (id, geometry)| {
+            let area = window_geo
+                .intersection(geometry)
+                .map(rect_area)
+                .unwrap_or(0);
+            if area > best_area {
+                (id, area)
+            } else {
+                (best, best_area)
+            }
+        })
+        .0
 }
 
 fn clamp_rect_to_any_bounds(
@@ -691,7 +716,22 @@ pub(crate) struct OutputTopologySnapshot {
     output_workspaces: HashMap<String, WorkspaceId>,
     primary_output: Option<String>,
     focused_output: Option<String>,
-    window_outputs: Vec<(WindowId, Option<String>)>,
+    windows: Vec<OutputWindowSnapshot>,
+}
+
+#[derive(Clone, Debug)]
+struct OutputWindowSnapshot {
+    id: WindowId,
+    output_name: Option<String>,
+    workspace: WorkspaceId,
+    split: Option<SavedSplitPlacement>,
+}
+
+#[derive(Clone, Debug)]
+struct DisplacedSplitWindow {
+    connector: String,
+    workspace: WorkspaceId,
+    placement: SavedSplitPlacement,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -705,6 +745,728 @@ pub enum DamageSource {
     CommitBbox,
     FullRedrawFallback,
     Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitDirection {
+    Left,
+    Center,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+fn split_direction_label(direction: SplitDirection) -> &'static str {
+    match direction {
+        SplitDirection::Left => "left",
+        SplitDirection::Center => "center",
+        SplitDirection::Right => "right",
+        SplitDirection::Top => "top",
+        SplitDirection::Bottom => "bottom",
+        SplitDirection::TopLeft => "top-left",
+        SplitDirection::TopRight => "top-right",
+        SplitDirection::BottomLeft => "bottom-left",
+        SplitDirection::BottomRight => "bottom-right",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitPair {
+    first: WindowId,
+    second: WindowId,
+    output: OutputId,
+    workspace: WorkspaceId,
+    work: Rectangle<i32, Logical>,
+    axis: SplitAxis,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitDividerDrag {
+    divider: SplitGridDivider,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitResizeHud {
+    output: OutputId,
+    percent: u8,
+    started_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitUndoWindow {
+    id: WindowId,
+    output: Option<OutputId>,
+    workspace: WorkspaceId,
+    tile_rect: Option<Rectangle<i32, Logical>>,
+    float_rect: Option<Rectangle<i32, Logical>>,
+    split_restore_rect: Option<Rectangle<i32, Logical>>,
+    suspended_tile_rect: Option<Rectangle<i32, Logical>>,
+}
+
+#[derive(Clone, Debug)]
+struct SplitUndoState {
+    windows: Vec<SplitUndoWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SplitGridDivider {
+    before: [Option<WindowId>; 4],
+    after: [Option<WindowId>; 4],
+    output: OutputId,
+    workspace: WorkspaceId,
+    work: Rectangle<i32, Logical>,
+    axis: SplitAxis,
+    boundary: i32,
+    span_start: i32,
+    span_end: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitAssistState {
+    source: WindowId,
+    used: [Option<WindowId>; 4],
+    output: OutputId,
+    workspace: WorkspaceId,
+    target: Rectangle<i32, Logical>,
+    direction: SplitDirection,
+    remaining: [Option<SplitAssistTarget>; 2],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitAssistTarget {
+    rect: Rectangle<i32, Logical>,
+    direction: SplitDirection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapPreview {
+    window: WindowId,
+    output: OutputId,
+    target: Rectangle<i32, Logical>,
+    direction: SplitDirection,
+}
+
+const MIN_SPLIT_PANE_WIDTH: i32 = 800;
+const MIN_SPLIT_PANE_HEIGHT: i32 = 500;
+const SNAP_EDGE_ZONE: i32 = 40;
+
+fn split_swap_allowed(axis: SplitAxis, focused_is_first: bool, requested: SplitDirection) -> bool {
+    matches!(
+        (axis, focused_is_first, requested),
+        (SplitAxis::Vertical, true, SplitDirection::Right)
+            | (SplitAxis::Vertical, false, SplitDirection::Left)
+            | (SplitAxis::Horizontal, true, SplitDirection::Bottom)
+            | (SplitAxis::Horizontal, false, SplitDirection::Top)
+    )
+}
+
+fn split_rect(
+    work: Rectangle<i32, Logical>,
+    direction: SplitDirection,
+) -> Option<Rectangle<i32, Logical>> {
+    match direction {
+        SplitDirection::Left | SplitDirection::Right if work.size.w < MIN_SPLIT_PANE_WIDTH * 2 => {
+            None
+        }
+        SplitDirection::Top | SplitDirection::Bottom if work.size.h < MIN_SPLIT_PANE_HEIGHT * 2 => {
+            None
+        }
+        SplitDirection::Left => Some(Rectangle::from_loc_and_size(
+            work.loc,
+            (work.size.w / 2, work.size.h),
+        )),
+        SplitDirection::Right => {
+            let left_width = work.size.w / 2;
+            Some(Rectangle::from_loc_and_size(
+                (work.loc.x + left_width, work.loc.y),
+                (work.size.w - left_width, work.size.h),
+            ))
+        }
+        SplitDirection::Top => Some(Rectangle::from_loc_and_size(
+            work.loc,
+            (work.size.w, work.size.h / 2),
+        )),
+        SplitDirection::Bottom => {
+            let top_height = work.size.h / 2;
+            Some(Rectangle::from_loc_and_size(
+                (work.loc.x, work.loc.y + top_height),
+                (work.size.w, work.size.h - top_height),
+            ))
+        }
+        SplitDirection::TopLeft
+        | SplitDirection::TopRight
+        | SplitDirection::BottomLeft
+        | SplitDirection::BottomRight => None,
+        SplitDirection::Center => None,
+    }
+}
+
+fn split_preset_rect(
+    work: Rectangle<i32, Logical>,
+    preset: SplitLayoutPreset,
+) -> Option<(Rectangle<i32, Logical>, SplitDirection)> {
+    let third = work.size.w / 3;
+    let left_half = work.size.w / 2;
+    let top_half = work.size.h / 2;
+    let result = match preset {
+        SplitLayoutPreset::LeftHalf => (
+            split_rect(work, SplitDirection::Left)?,
+            SplitDirection::Left,
+        ),
+        SplitLayoutPreset::RightHalf => (
+            split_rect(work, SplitDirection::Right)?,
+            SplitDirection::Right,
+        ),
+        SplitLayoutPreset::TopHalf => (split_rect(work, SplitDirection::Top)?, SplitDirection::Top),
+        SplitLayoutPreset::BottomHalf => (
+            split_rect(work, SplitDirection::Bottom)?,
+            SplitDirection::Bottom,
+        ),
+        SplitLayoutPreset::LeftTwoThirds if work.size.w >= MIN_SPLIT_PANE_WIDTH * 3 => (
+            Rectangle::from_loc_and_size(work.loc, (third * 2, work.size.h)),
+            SplitDirection::Left,
+        ),
+        SplitLayoutPreset::RightThird if work.size.w >= MIN_SPLIT_PANE_WIDTH * 3 => (
+            Rectangle::from_loc_and_size(
+                (work.loc.x + third * 2, work.loc.y),
+                (work.size.w - third * 2, work.size.h),
+            ),
+            SplitDirection::Right,
+        ),
+        SplitLayoutPreset::LeftThird if work.size.w >= MIN_SPLIT_PANE_WIDTH * 3 => (
+            Rectangle::from_loc_and_size(work.loc, (third, work.size.h)),
+            SplitDirection::Left,
+        ),
+        SplitLayoutPreset::RightTwoThirds if work.size.w >= MIN_SPLIT_PANE_WIDTH * 3 => (
+            Rectangle::from_loc_and_size(
+                (work.loc.x + third, work.loc.y),
+                (work.size.w - third, work.size.h),
+            ),
+            SplitDirection::Right,
+        ),
+        SplitLayoutPreset::TopLeft
+            if work.size.w >= MIN_SPLIT_PANE_WIDTH * 2
+                && work.size.h >= MIN_SPLIT_PANE_HEIGHT * 2 =>
+        {
+            (
+                Rectangle::from_loc_and_size(work.loc, (left_half, top_half)),
+                SplitDirection::TopLeft,
+            )
+        }
+        SplitLayoutPreset::TopRight
+            if work.size.w >= MIN_SPLIT_PANE_WIDTH * 2
+                && work.size.h >= MIN_SPLIT_PANE_HEIGHT * 2 =>
+        {
+            (
+                Rectangle::from_loc_and_size(
+                    (work.loc.x + left_half, work.loc.y),
+                    (work.size.w - left_half, top_half),
+                ),
+                SplitDirection::TopRight,
+            )
+        }
+        SplitLayoutPreset::BottomLeft
+            if work.size.w >= MIN_SPLIT_PANE_WIDTH * 2
+                && work.size.h >= MIN_SPLIT_PANE_HEIGHT * 2 =>
+        {
+            (
+                Rectangle::from_loc_and_size(
+                    (work.loc.x, work.loc.y + top_half),
+                    (left_half, work.size.h - top_half),
+                ),
+                SplitDirection::BottomLeft,
+            )
+        }
+        SplitLayoutPreset::BottomRight
+            if work.size.w >= MIN_SPLIT_PANE_WIDTH * 2
+                && work.size.h >= MIN_SPLIT_PANE_HEIGHT * 2 =>
+        {
+            (
+                Rectangle::from_loc_and_size(
+                    (work.loc.x + left_half, work.loc.y + top_half),
+                    (work.size.w - left_half, work.size.h - top_half),
+                ),
+                SplitDirection::BottomRight,
+            )
+        }
+        _ => return None,
+    };
+    Some(result)
+}
+
+fn complementary_split_rect(
+    work: Rectangle<i32, Logical>,
+    occupied: Rectangle<i32, Logical>,
+    direction: SplitDirection,
+) -> Option<(Rectangle<i32, Logical>, SplitDirection)> {
+    let (target, complementary_direction) = match direction {
+        SplitDirection::Center => return None,
+        SplitDirection::Left => (
+            Rectangle::from_loc_and_size(
+                (occupied.loc.x + occupied.size.w, work.loc.y),
+                (
+                    work.loc.x + work.size.w - occupied.loc.x - occupied.size.w,
+                    work.size.h,
+                ),
+            ),
+            SplitDirection::Right,
+        ),
+        SplitDirection::Right => (
+            Rectangle::from_loc_and_size(work.loc, (occupied.loc.x - work.loc.x, work.size.h)),
+            SplitDirection::Left,
+        ),
+        SplitDirection::Top => (
+            Rectangle::from_loc_and_size(
+                (work.loc.x, occupied.loc.y + occupied.size.h),
+                (
+                    work.size.w,
+                    work.loc.y + work.size.h - occupied.loc.y - occupied.size.h,
+                ),
+            ),
+            SplitDirection::Bottom,
+        ),
+        SplitDirection::Bottom => (
+            Rectangle::from_loc_and_size(work.loc, (work.size.w, occupied.loc.y - work.loc.y)),
+            SplitDirection::Top,
+        ),
+        SplitDirection::TopLeft => (
+            Rectangle::from_loc_and_size(
+                (occupied.loc.x + occupied.size.w, occupied.loc.y),
+                (
+                    work.loc.x + work.size.w - occupied.loc.x - occupied.size.w,
+                    occupied.size.h,
+                ),
+            ),
+            SplitDirection::TopRight,
+        ),
+        SplitDirection::TopRight => (
+            Rectangle::from_loc_and_size(
+                (work.loc.x, occupied.loc.y),
+                (occupied.loc.x - work.loc.x, occupied.size.h),
+            ),
+            SplitDirection::TopLeft,
+        ),
+        SplitDirection::BottomLeft => (
+            Rectangle::from_loc_and_size(
+                (occupied.loc.x + occupied.size.w, occupied.loc.y),
+                (
+                    work.loc.x + work.size.w - occupied.loc.x - occupied.size.w,
+                    occupied.size.h,
+                ),
+            ),
+            SplitDirection::BottomRight,
+        ),
+        SplitDirection::BottomRight => (
+            Rectangle::from_loc_and_size(
+                (work.loc.x, occupied.loc.y),
+                (occupied.loc.x - work.loc.x, occupied.size.h),
+            ),
+            SplitDirection::BottomLeft,
+        ),
+    };
+    (target.size.w > 0 && target.size.h > 0).then_some((target, complementary_direction))
+}
+
+fn split_assist_targets(
+    work: Rectangle<i32, Logical>,
+    occupied: Rectangle<i32, Logical>,
+    direction: SplitDirection,
+) -> Vec<SplitAssistTarget> {
+    let third = work.size.w / 3;
+    let is_left_third = direction == SplitDirection::Left
+        && occupied.loc.x == work.loc.x
+        && occupied.size.w == third;
+    let is_right_third = direction == SplitDirection::Right
+        && occupied.loc.x == work.loc.x + third * 2
+        && occupied.loc.x + occupied.size.w == work.loc.x + work.size.w;
+    if work.size.w >= MIN_SPLIT_PANE_WIDTH * 3
+        && occupied.loc.y == work.loc.y
+        && occupied.size.h == work.size.h
+        && (is_left_third || is_right_third)
+    {
+        let middle = SplitAssistTarget {
+            rect: Rectangle::from_loc_and_size(
+                (work.loc.x + third, work.loc.y),
+                (third, work.size.h),
+            ),
+            direction: SplitDirection::Center,
+        };
+        let left = SplitAssistTarget {
+            rect: Rectangle::from_loc_and_size(work.loc, (third, work.size.h)),
+            direction: SplitDirection::Left,
+        };
+        let right = SplitAssistTarget {
+            rect: Rectangle::from_loc_and_size(
+                (work.loc.x + third * 2, work.loc.y),
+                (work.size.w - third * 2, work.size.h),
+            ),
+            direction: SplitDirection::Right,
+        };
+        return if is_left_third {
+            vec![middle, right]
+        } else {
+            vec![middle, left]
+        };
+    }
+
+    if matches!(
+        direction,
+        SplitDirection::TopLeft
+            | SplitDirection::TopRight
+            | SplitDirection::BottomLeft
+            | SplitDirection::BottomRight
+    ) {
+        let presets = match direction {
+            SplitDirection::TopLeft => [
+                SplitLayoutPreset::TopRight,
+                SplitLayoutPreset::BottomLeft,
+                SplitLayoutPreset::BottomRight,
+            ],
+            SplitDirection::TopRight => [
+                SplitLayoutPreset::TopLeft,
+                SplitLayoutPreset::BottomRight,
+                SplitLayoutPreset::BottomLeft,
+            ],
+            SplitDirection::BottomLeft => [
+                SplitLayoutPreset::BottomRight,
+                SplitLayoutPreset::TopLeft,
+                SplitLayoutPreset::TopRight,
+            ],
+            SplitDirection::BottomRight => [
+                SplitLayoutPreset::BottomLeft,
+                SplitLayoutPreset::TopRight,
+                SplitLayoutPreset::TopLeft,
+            ],
+            _ => unreachable!(),
+        };
+        return presets
+            .into_iter()
+            .filter_map(|preset| split_preset_rect(work, preset))
+            .map(|(rect, direction)| SplitAssistTarget { rect, direction })
+            .collect();
+    }
+
+    complementary_split_rect(work, occupied, direction)
+        .map(|(rect, direction)| vec![SplitAssistTarget { rect, direction }])
+        .unwrap_or_default()
+}
+
+fn snap_target_for_pointer(
+    work: Rectangle<i32, Logical>,
+    pointer: Point<f64, Logical>,
+) -> Option<(Rectangle<i32, Logical>, SplitDirection)> {
+    let x = pointer.x.round() as i32;
+    let y = pointer.y.round() as i32;
+    if x < work.loc.x
+        || x > work.loc.x + work.size.w
+        || y < work.loc.y
+        || y > work.loc.y + work.size.h
+    {
+        return None;
+    }
+    let left = x <= work.loc.x + SNAP_EDGE_ZONE;
+    let right = x >= work.loc.x + work.size.w - SNAP_EDGE_ZONE;
+    let top = y <= work.loc.y + SNAP_EDGE_ZONE;
+    let bottom = y >= work.loc.y + work.size.h - SNAP_EDGE_ZONE;
+    let preset = match (left, right, top, bottom) {
+        (true, false, true, false) => SplitLayoutPreset::TopLeft,
+        (false, true, true, false) => SplitLayoutPreset::TopRight,
+        (true, false, false, true) => SplitLayoutPreset::BottomLeft,
+        (false, true, false, true) => SplitLayoutPreset::BottomRight,
+        (true, false, false, false) => SplitLayoutPreset::LeftHalf,
+        (false, true, false, false) => SplitLayoutPreset::RightHalf,
+        (false, false, true, false) => SplitLayoutPreset::TopHalf,
+        (false, false, false, true) => SplitLayoutPreset::BottomHalf,
+        _ => return None,
+    };
+    split_preset_rect(work, preset)
+}
+
+fn split_direction_for_rect(
+    work: Rectangle<i32, Logical>,
+    rect: Rectangle<i32, Logical>,
+) -> Option<SplitDirection> {
+    if rect.loc.y == work.loc.y && rect.size.h == work.size.h {
+        if rect.loc.x == work.loc.x && rect.size.w < work.size.w {
+            return Some(SplitDirection::Left);
+        }
+        if rect.loc.x > work.loc.x && rect.loc.x + rect.size.w == work.loc.x + work.size.w {
+            return Some(SplitDirection::Right);
+        }
+        if rect.loc.x > work.loc.x && rect.loc.x + rect.size.w < work.loc.x + work.size.w {
+            return Some(SplitDirection::Center);
+        }
+    }
+    if rect.loc.x == work.loc.x && rect.size.w == work.size.w {
+        if rect.loc.y == work.loc.y && rect.size.h < work.size.h {
+            return Some(SplitDirection::Top);
+        }
+        if rect.loc.y > work.loc.y && rect.loc.y + rect.size.h == work.loc.y + work.size.h {
+            return Some(SplitDirection::Bottom);
+        }
+    }
+    let left = rect.loc.x == work.loc.x;
+    let right = rect.loc.x + rect.size.w == work.loc.x + work.size.w;
+    let top = rect.loc.y == work.loc.y;
+    let bottom = rect.loc.y + rect.size.h == work.loc.y + work.size.h;
+    if rect.size.w < work.size.w && rect.size.h < work.size.h {
+        return match (left, right, top, bottom) {
+            (true, false, true, false) => Some(SplitDirection::TopLeft),
+            (false, true, true, false) => Some(SplitDirection::TopRight),
+            (true, false, false, true) => Some(SplitDirection::BottomLeft),
+            (false, true, false, true) => Some(SplitDirection::BottomRight),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn saved_split_placement(
+    work: Rectangle<i32, Logical>,
+    tile: Rectangle<i32, Logical>,
+) -> Option<SavedSplitPlacement> {
+    let direction = split_direction_for_rect(work, tile)?;
+    let ratio = |boundary: i32, start: i32, extent: i32| {
+        (((boundary - start) as i64 * 1000) / i64::from(extent.max(1))).clamp(0, 1000) as u16
+    };
+    let x_boundary = match direction {
+        SplitDirection::Center => Some(tile.loc.x),
+        SplitDirection::Left | SplitDirection::TopLeft | SplitDirection::BottomLeft => {
+            Some(tile.loc.x + tile.size.w)
+        }
+        SplitDirection::Right | SplitDirection::TopRight | SplitDirection::BottomRight => {
+            Some(tile.loc.x)
+        }
+        _ => None,
+    };
+    let x_end_boundary = (direction == SplitDirection::Center).then_some(tile.loc.x + tile.size.w);
+    let y_boundary = match direction {
+        SplitDirection::Top | SplitDirection::TopLeft | SplitDirection::TopRight => {
+            Some(tile.loc.y + tile.size.h)
+        }
+        SplitDirection::Bottom | SplitDirection::BottomLeft | SplitDirection::BottomRight => {
+            Some(tile.loc.y)
+        }
+        _ => None,
+    };
+    Some(SavedSplitPlacement {
+        direction: match direction {
+            SplitDirection::Left => SavedSplitDirection::Left,
+            SplitDirection::Center => SavedSplitDirection::Center,
+            SplitDirection::Right => SavedSplitDirection::Right,
+            SplitDirection::Top => SavedSplitDirection::Top,
+            SplitDirection::Bottom => SavedSplitDirection::Bottom,
+            SplitDirection::TopLeft => SavedSplitDirection::TopLeft,
+            SplitDirection::TopRight => SavedSplitDirection::TopRight,
+            SplitDirection::BottomLeft => SavedSplitDirection::BottomLeft,
+            SplitDirection::BottomRight => SavedSplitDirection::BottomRight,
+        },
+        x_ratio_per_mille: x_boundary.map(|boundary| ratio(boundary, work.loc.x, work.size.w)),
+        x_end_ratio_per_mille: x_end_boundary
+            .map(|boundary| ratio(boundary, work.loc.x, work.size.w)),
+        y_ratio_per_mille: y_boundary.map(|boundary| ratio(boundary, work.loc.y, work.size.h)),
+    })
+}
+
+fn restored_split_rect(
+    work: Rectangle<i32, Logical>,
+    saved: SavedSplitPlacement,
+) -> Option<(Rectangle<i32, Logical>, SplitDirection)> {
+    let x_boundary = saved.x_ratio_per_mille.map(|ratio| {
+        work.loc.x + (i64::from(work.size.w) * i64::from(ratio.min(1000)) / 1000) as i32
+    });
+    let y_boundary = saved.y_ratio_per_mille.map(|ratio| {
+        work.loc.y + (i64::from(work.size.h) * i64::from(ratio.min(1000)) / 1000) as i32
+    });
+    let x_end_boundary = saved.x_end_ratio_per_mille.map(|ratio| {
+        work.loc.x + (i64::from(work.size.w) * i64::from(ratio.min(1000)) / 1000) as i32
+    });
+    let (target, direction) = match saved.direction {
+        SavedSplitDirection::Center => {
+            let start = x_boundary?.clamp(work.loc.x, work.loc.x + work.size.w);
+            let end = x_end_boundary?.clamp(start, work.loc.x + work.size.w);
+            if end - start < MIN_SPLIT_PANE_WIDTH {
+                return None;
+            }
+            (
+                Rectangle::from_loc_and_size((start, work.loc.y), (end - start, work.size.h)),
+                SplitDirection::Center,
+            )
+        }
+        SavedSplitDirection::Left | SavedSplitDirection::Right => {
+            let (left, right) = resized_split_rects(
+                work,
+                SplitAxis::Vertical,
+                x_boundary?,
+                MIN_SPLIT_PANE_WIDTH,
+                MIN_SPLIT_PANE_WIDTH,
+            )?;
+            if saved.direction == SavedSplitDirection::Left {
+                (left, SplitDirection::Left)
+            } else {
+                (right, SplitDirection::Right)
+            }
+        }
+        SavedSplitDirection::Top | SavedSplitDirection::Bottom => {
+            let (top, bottom) = resized_split_rects(
+                work,
+                SplitAxis::Horizontal,
+                y_boundary?,
+                MIN_SPLIT_PANE_HEIGHT,
+                MIN_SPLIT_PANE_HEIGHT,
+            )?;
+            if saved.direction == SavedSplitDirection::Top {
+                (top, SplitDirection::Top)
+            } else {
+                (bottom, SplitDirection::Bottom)
+            }
+        }
+        quadrant => {
+            if work.size.w < MIN_SPLIT_PANE_WIDTH * 2 || work.size.h < MIN_SPLIT_PANE_HEIGHT * 2 {
+                return None;
+            }
+            let x = x_boundary?.clamp(
+                work.loc.x + MIN_SPLIT_PANE_WIDTH,
+                work.loc.x + work.size.w - MIN_SPLIT_PANE_WIDTH,
+            );
+            let y = y_boundary?.clamp(
+                work.loc.y + MIN_SPLIT_PANE_HEIGHT,
+                work.loc.y + work.size.h - MIN_SPLIT_PANE_HEIGHT,
+            );
+            match quadrant {
+                SavedSplitDirection::TopLeft => (
+                    Rectangle::from_loc_and_size(work.loc, (x - work.loc.x, y - work.loc.y)),
+                    SplitDirection::TopLeft,
+                ),
+                SavedSplitDirection::TopRight => (
+                    Rectangle::from_loc_and_size(
+                        (x, work.loc.y),
+                        (work.loc.x + work.size.w - x, y - work.loc.y),
+                    ),
+                    SplitDirection::TopRight,
+                ),
+                SavedSplitDirection::BottomLeft => (
+                    Rectangle::from_loc_and_size(
+                        (work.loc.x, y),
+                        (x - work.loc.x, work.loc.y + work.size.h - y),
+                    ),
+                    SplitDirection::BottomLeft,
+                ),
+                SavedSplitDirection::BottomRight => (
+                    Rectangle::from_loc_and_size(
+                        (x, y),
+                        (work.loc.x + work.size.w - x, work.loc.y + work.size.h - y),
+                    ),
+                    SplitDirection::BottomRight,
+                ),
+                _ => unreachable!(),
+            }
+        }
+    };
+    Some((target, direction))
+}
+
+fn restored_split_rect_for_minimum(
+    work: Rectangle<i32, Logical>,
+    saved: SavedSplitPlacement,
+    minimum: Size<i32, Logical>,
+) -> Option<(Rectangle<i32, Logical>, SplitDirection)> {
+    let restored = restored_split_rect(work, saved)?;
+    (minimum.w <= restored.0.size.w && minimum.h <= restored.0.size.h).then_some(restored)
+}
+
+fn resized_split_rects(
+    work: Rectangle<i32, Logical>,
+    axis: SplitAxis,
+    requested_boundary: i32,
+    first_min: i32,
+    second_min: i32,
+) -> Option<(Rectangle<i32, Logical>, Rectangle<i32, Logical>)> {
+    let (start, extent) = match axis {
+        SplitAxis::Vertical => (work.loc.x, work.size.w),
+        SplitAxis::Horizontal => (work.loc.y, work.size.h),
+    };
+    let min_boundary = start + first_min.max(1);
+    let max_boundary = start + extent - second_min.max(1);
+    if min_boundary > max_boundary {
+        return None;
+    }
+    let boundary = requested_boundary.clamp(min_boundary, max_boundary);
+    Some(match axis {
+        SplitAxis::Vertical => (
+            Rectangle::from_loc_and_size(work.loc, (boundary - work.loc.x, work.size.h)),
+            Rectangle::from_loc_and_size(
+                (boundary, work.loc.y),
+                (work.loc.x + work.size.w - boundary, work.size.h),
+            ),
+        ),
+        SplitAxis::Horizontal => (
+            Rectangle::from_loc_and_size(work.loc, (work.size.w, boundary - work.loc.y)),
+            Rectangle::from_loc_and_size(
+                (work.loc.x, boundary),
+                (work.size.w, work.loc.y + work.size.h - boundary),
+            ),
+        ),
+    })
+}
+
+fn set_split_states(
+    states: &mut smithay::wayland::shell::xdg::ToplevelStateSet,
+    direction: Option<SplitDirection>,
+) {
+    for state in [
+        xdg_toplevel::State::TiledLeft,
+        xdg_toplevel::State::TiledRight,
+        xdg_toplevel::State::TiledTop,
+        xdg_toplevel::State::TiledBottom,
+    ] {
+        states.unset(state);
+    }
+    match direction {
+        Some(SplitDirection::Left) => {
+            states.set(xdg_toplevel::State::TiledLeft);
+        }
+        Some(SplitDirection::Center) => {
+            states.set(xdg_toplevel::State::TiledTop);
+            states.set(xdg_toplevel::State::TiledBottom);
+        }
+        Some(SplitDirection::Right) => {
+            states.set(xdg_toplevel::State::TiledRight);
+        }
+        Some(SplitDirection::Top) => {
+            states.set(xdg_toplevel::State::TiledTop);
+        }
+        Some(SplitDirection::Bottom) => {
+            states.set(xdg_toplevel::State::TiledBottom);
+        }
+        Some(SplitDirection::TopLeft) => {
+            states.set(xdg_toplevel::State::TiledTop);
+            states.set(xdg_toplevel::State::TiledLeft);
+        }
+        Some(SplitDirection::TopRight) => {
+            states.set(xdg_toplevel::State::TiledTop);
+            states.set(xdg_toplevel::State::TiledRight);
+        }
+        Some(SplitDirection::BottomLeft) => {
+            states.set(xdg_toplevel::State::TiledBottom);
+            states.set(xdg_toplevel::State::TiledLeft);
+        }
+        Some(SplitDirection::BottomRight) => {
+            states.set(xdg_toplevel::State::TiledBottom);
+            states.set(xdg_toplevel::State::TiledRight);
+        }
+        None => {}
+    }
 }
 
 impl DamageSource {
@@ -915,6 +1677,13 @@ pub struct DesktopState {
     pub seat_name: String,
     pub focused_window: Option<WindowId>,
     workspace_focus: HashMap<(OutputId, WorkspaceId), WindowId>,
+    split_divider_drag: Option<SplitDividerDrag>,
+    split_resize_hud: Option<SplitResizeHud>,
+    split_undo: Option<SplitUndoState>,
+    pending_split_assist: Option<SplitAssistState>,
+    snap_preview: Option<SnapPreview>,
+    split_work_areas: HashMap<OutputId, Rectangle<i32, Logical>>,
+    displaced_split_windows: HashMap<WindowId, DisplacedSplitWindow>,
     pub pointer_pos: smithay::utils::Point<f64, smithay::utils::Logical>,
     last_user_activity_at: Instant,
     idle_lock_triggered: bool,
@@ -1029,6 +1798,16 @@ pub struct DesktopState {
     surface_damage: HashMap<Id, SurfaceDamageState>,
     /// Surfaces grouped by tree root, avoiding a full state-map scan on every commit.
     surface_damage_roots: HashMap<Id, HashSet<Id>>,
+    /// Last wl_surface associated with each managed X11 window. Smithay may
+    /// clear X11Surface::wl_surface before destruction reaches this handler.
+    #[cfg(feature = "xwayland")]
+    xwayland_surface_windows: HashMap<Id, WindowId>,
+    /// X11 windows whose map request has been accepted (or whose
+    /// override-redirect MapNotify has arrived). This is deliberately kept
+    /// separate from `X11Surface::is_mapped()`: Smithay defines that accessor
+    /// as "currently has a wl_surface", which is not the X11 map state.
+    #[cfg(feature = "xwayland")]
+    xwayland_mapped_windows: HashSet<WindowId>,
     surface_damage_scratch: SurfaceDamageScratch,
     pub surface_damage_metrics: SurfaceDamageMetrics,
     /// Last output used for `wp_color` surface feedback (detect cross-monitor moves).
@@ -1090,6 +1869,7 @@ struct LaunchContext {
 pub(crate) const SIDEBAR_PULSE_DURATION: Duration = Duration::from_millis(700);
 pub(crate) const TOPBAR_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
 pub(crate) const CLOCK_PULSE_DURATION: Duration = SIDEBAR_PULSE_DURATION;
+const SPLIT_RESIZE_HUD_DURATION: Duration = Duration::from_millis(1200);
 
 #[derive(Debug)]
 enum PendingEguiOp {
@@ -1557,8 +2337,14 @@ impl DesktopState {
                 let saved_instance = *instance;
                 *instance = instance.saturating_add(1);
 
-                let geometry = self
-                    .global_window_bbox(&window.window)
+                // Always retain the pre-split geometry as the safe fallback.
+                // Optional split metadata below carries tiled protocol state
+                // separately, so old snapshots and unavailable displays still
+                // reopen at a useful floating rectangle.
+                let geometry = window
+                    .tile_rect
+                    .and(window.split_restore_rect)
+                    .or_else(|| self.global_window_bbox(&window.window))
                     .unwrap_or_else(|| window.current_rect());
                 let output_id = window
                     .output
@@ -1583,6 +2369,13 @@ impl DesktopState {
                     .get(window.workspace.0.saturating_sub(1) as usize)
                     .cloned()
                     .unwrap_or_else(|| format!("Workspace {}", window.workspace.0));
+                let split_placement = (self.workspaces.restore_split_layouts
+                    && self.workspaces.split_screen_enabled)
+                    .then(|| {
+                        let work = self.work_recess_for_output(output_id)?;
+                        saved_split_placement(work, window.tile_rect?)
+                    })
+                    .flatten();
 
                 Some(SavedWindow {
                     protocol,
@@ -1591,7 +2384,14 @@ impl DesktopState {
                     workspace,
                     output_connector,
                     geometry: saved_rect(geometry),
-                    restore_geometry: window.restore_rect.map(saved_rect),
+                    restore_geometry: if split_placement.is_some() {
+                        window.split_restore_rect.map(saved_rect)
+                    } else if window.tile_rect.is_some() {
+                        None
+                    } else {
+                        window.restore_rect.map(saved_rect)
+                    },
+                    split_placement,
                     floating: window.floating,
                     maximized: window.maximized,
                     fullscreen: window.fullscreen,
@@ -1722,6 +2522,12 @@ impl DesktopState {
         let Some(saved) = self.session_restore.take_match(protocol, identity) else {
             return false;
         };
+        let original_output_available =
+            saved.output_connector.as_deref().is_some_and(|connector| {
+                self.outputs
+                    .values()
+                    .any(|output| output.handle.name().as_str() == connector)
+            });
         let output_id = self.restored_output_id(saved.output_connector.as_deref());
         let workspace = self
             .workspace_names
@@ -1734,6 +2540,18 @@ impl DesktopState {
             .restore_geometry
             .map(|rect| self.clamp_restored_rect(output_id, rect))
             .unwrap_or(rect);
+        let split = (self.workspaces.restore_session
+            && self.workspaces.restore_split_layouts
+            && self.workspaces.split_screen_enabled
+            && original_output_available)
+            .then(|| {
+                let work = self.work_recess_for_output(output_id)?;
+                let (target, direction) = restored_split_rect(work, saved.split_placement?)?;
+                let min_size = self.split_window_min_size(window_id);
+                (min_size.w <= target.size.w && min_size.h <= target.size.h)
+                    .then_some((target, direction))
+            })
+            .flatten();
         let Some(window) = self.window_mut(window_id) else {
             return false;
         };
@@ -1741,9 +2559,15 @@ impl DesktopState {
         window.output = Some(output_id);
         window.float_rect = Some(rect);
         window.restore_rect = Some(restore_rect);
-        window.floating = saved.floating;
-        window.maximized = saved.maximized;
-        window.fullscreen = saved.fullscreen;
+        window.tile_rect = split.map(|(target, _)| target);
+        window.split_restore_rect = split.map(|_| restore_rect);
+        window.floating = if saved.split_placement.is_some() {
+            split.is_none()
+        } else {
+            saved.floating
+        };
+        window.maximized = split.is_none() && saved.maximized;
+        window.fullscreen = split.is_none() && saved.fullscreen;
         window.minimized = saved.minimized;
         window.session_restore_focus = Some(saved.focused);
         flog_info!(
@@ -1753,6 +2577,30 @@ impl DesktopState {
             workspace.0
         );
         true
+    }
+
+    pub(crate) fn apply_restored_xdg_split_state(
+        &self,
+        window_id: WindowId,
+        surface: &ToplevelSurface,
+    ) {
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        let (Some(tile), Some(output)) = (window.tile_rect, window.output) else {
+            return;
+        };
+        let Some(work) = self.work_recess_for_output(output) else {
+            return;
+        };
+        let Some(direction) = split_direction_for_rect(work, tile) else {
+            return;
+        };
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Maximized);
+            set_split_states(&mut state.states, Some(direction));
+            state.size = Some(tile.size);
+        });
     }
 
     pub fn process_chrome_timers(&mut self) {
@@ -2247,6 +3095,10 @@ impl DesktopState {
         }
         self.keybinds = keybinds;
         self.apps = settings.apps;
+        if self.workspaces.split_screen_enabled && !settings.workspaces.split_screen_enabled {
+            self.clear_snap_preview();
+            self.restore_all_split_windows();
+        }
         self.workspaces = settings.workspaces;
         self.session_restore
             .set_enabled(self.workspaces.restore_session);
@@ -2613,6 +3465,8 @@ impl DesktopState {
                 compositor_ready: self.compositor_ready,
                 output_count: self.outputs.len(),
                 damage_debug_enabled: self.damage_debug_enabled,
+                split_resize_percent: self
+                    .split_resize_percent_for_output(self.focused_output, Instant::now()),
             },
         }
     }
@@ -2657,7 +3511,8 @@ impl DesktopState {
                     .map(|managed| managed.window.clone())
                     .ok_or("focused window no longer exists")?;
                 let location = self.default_toplevel_map_location(target);
-                self.space.map_element(window, location, true);
+                self.space.map_element(window.clone(), location, true);
+                self.refresh_window_fractional_scale(&window);
                 if let Some(managed) = self.window_mut(focused) {
                     managed.output = Some(target);
                 }
@@ -2683,7 +3538,8 @@ impl DesktopState {
                 }
                 let location =
                     self.clamp_window_location_to_work_recess(&window, location, self.pointer_pos);
-                self.space.map_element(window, location, true);
+                self.space.map_element(window.clone(), location, true);
+                self.refresh_window_fractional_scale(&window);
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
             DesktopAction::CloseFocused => self.close_focused(),
@@ -2712,6 +3568,256 @@ impl DesktopState {
                 self.set_focused_output(output);
                 self.set_focused_workspace(workspace);
                 self.focus_window_id(id);
+            }
+            DesktopAction::SplitWindow {
+                window_id,
+                direction,
+            } => {
+                if !self.workspaces.split_screen_enabled {
+                    return Err("split screen is disabled".to_string());
+                }
+                let id = WindowId(window_id);
+                if self.window(id).is_none() {
+                    return Err(format!("window {window_id} does not exist"));
+                }
+                let direction = match direction {
+                    DesktopDirection::Left => SplitDirection::Left,
+                    DesktopDirection::Right => SplitDirection::Right,
+                    DesktopDirection::Up => SplitDirection::Top,
+                    DesktopDirection::Down => SplitDirection::Bottom,
+                };
+                self.split_window(id, direction);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!(
+                        "window {window_id} could not be placed in the split"
+                    ));
+                }
+            }
+            DesktopAction::SetSplitRatio {
+                window_id,
+                ratio_per_mille,
+            } => {
+                if !(1..1000).contains(&ratio_per_mille) {
+                    return Err("split ratio must be between 1 and 999 per mille".to_string());
+                }
+                let id = WindowId(window_id);
+                let output = self
+                    .window(id)
+                    .and_then(|window| window.output)
+                    .ok_or_else(|| format!("window {window_id} is not on an output"))?;
+                let pair = self
+                    .split_pair_for_output(output)
+                    .filter(|pair| pair.first == id || pair.second == id)
+                    .ok_or_else(|| format!("window {window_id} is not in a split group"))?;
+                let ratio = f64::from(ratio_per_mille) / 1000.0;
+                let position = match pair.axis {
+                    SplitAxis::Vertical => Point::from((
+                        f64::from(pair.work.loc.x) + f64::from(pair.work.size.w) * ratio,
+                        f64::from(pair.work.loc.y),
+                    )),
+                    SplitAxis::Horizontal => Point::from((
+                        f64::from(pair.work.loc.x),
+                        f64::from(pair.work.size.h) * ratio + f64::from(pair.work.loc.y),
+                    )),
+                };
+                self.resize_split_pair(pair, position);
+                self.remember_split_ratio(pair);
+            }
+            DesktopAction::SetSplitDivider {
+                window_id,
+                direction,
+                ratio_per_mille,
+            } => {
+                if !(1..1000).contains(&ratio_per_mille) {
+                    return Err(
+                        "split divider ratio must be between 1 and 999 per mille".to_string()
+                    );
+                }
+                let id = WindowId(window_id);
+                let output = self
+                    .window(id)
+                    .and_then(|window| window.output)
+                    .ok_or_else(|| format!("window {window_id} is not on an output"))?;
+                let divider = self
+                    .split_grid_dividers_for_output(output)
+                    .into_iter()
+                    .find(|divider| match direction {
+                        DesktopDirection::Left => {
+                            divider.axis == SplitAxis::Vertical && divider.after.contains(&Some(id))
+                        }
+                        DesktopDirection::Right => {
+                            divider.axis == SplitAxis::Vertical
+                                && divider.before.contains(&Some(id))
+                        }
+                        DesktopDirection::Up => {
+                            divider.axis == SplitAxis::Horizontal
+                                && divider.after.contains(&Some(id))
+                        }
+                        DesktopDirection::Down => {
+                            divider.axis == SplitAxis::Horizontal
+                                && divider.before.contains(&Some(id))
+                        }
+                    })
+                    .ok_or_else(|| {
+                        format!("window {window_id} has no split divider in that direction")
+                    })?;
+                let ratio = f64::from(ratio_per_mille) / 1000.0;
+                let position = match divider.axis {
+                    SplitAxis::Vertical => Point::from((
+                        f64::from(divider.work.loc.x) + f64::from(divider.work.size.w) * ratio,
+                        f64::from(divider.work.loc.y),
+                    )),
+                    SplitAxis::Horizontal => Point::from((
+                        f64::from(divider.work.loc.x),
+                        f64::from(divider.work.loc.y) + f64::from(divider.work.size.h) * ratio,
+                    )),
+                };
+                self.resize_split_grid_divider(divider, position);
+                if let Some(pair) = self.split_pair_for_output(output) {
+                    self.remember_split_ratio(pair);
+                }
+            }
+            DesktopAction::ApplySplitLayout { window_id, layout } => {
+                if !self.workspaces.split_screen_enabled {
+                    return Err("split screen is disabled".to_string());
+                }
+                let id = WindowId(window_id);
+                if self.window(id).is_none() {
+                    return Err(format!("window {window_id} does not exist"));
+                }
+                self.focus_window_id(id);
+                let preset = match layout {
+                    DesktopSplitLayout::LeftHalf => SplitLayoutPreset::LeftHalf,
+                    DesktopSplitLayout::RightHalf => SplitLayoutPreset::RightHalf,
+                    DesktopSplitLayout::LeftTwoThirds => SplitLayoutPreset::LeftTwoThirds,
+                    DesktopSplitLayout::RightThird => SplitLayoutPreset::RightThird,
+                    DesktopSplitLayout::LeftThird => SplitLayoutPreset::LeftThird,
+                    DesktopSplitLayout::RightTwoThirds => SplitLayoutPreset::RightTwoThirds,
+                    DesktopSplitLayout::TopHalf => SplitLayoutPreset::TopHalf,
+                    DesktopSplitLayout::BottomHalf => SplitLayoutPreset::BottomHalf,
+                    DesktopSplitLayout::TopLeft => SplitLayoutPreset::TopLeft,
+                    DesktopSplitLayout::TopRight => SplitLayoutPreset::TopRight,
+                    DesktopSplitLayout::BottomLeft => SplitLayoutPreset::BottomLeft,
+                    DesktopSplitLayout::BottomRight => SplitLayoutPreset::BottomRight,
+                };
+                self.apply_split_layout_preset(preset);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!(
+                        "window {window_id} could not be placed in the split"
+                    ));
+                }
+            }
+            DesktopAction::SelectSplitAssistWindow { window_id } => {
+                let id = WindowId(window_id);
+                if self.pending_split_assist.is_none() {
+                    return Err("split assist is not active".to_string());
+                }
+                self.select_split_assist_window(id);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!("window {window_id} could not fill the split slot"));
+                }
+            }
+            DesktopAction::SwapSplitWindow {
+                window_id,
+                direction,
+            } => {
+                let id = WindowId(window_id);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!("window {window_id} is not in a split group"));
+                }
+                self.focus_window_id(id);
+                let direction = match direction {
+                    DesktopDirection::Left => SplitDirection::Left,
+                    DesktopDirection::Right => SplitDirection::Right,
+                    DesktopDirection::Up => SplitDirection::Top,
+                    DesktopDirection::Down => SplitDirection::Bottom,
+                };
+                if !self.swap_focused_split_neighbor(direction) {
+                    return Err(format!(
+                        "window {window_id} has no split neighbor in that direction"
+                    ));
+                }
+            }
+            DesktopAction::InvokeSplitKeyboardAction { window_id, command } => {
+                let id = WindowId(window_id);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!("window {window_id} is not in a split group"));
+                }
+                self.focus_window_id(id);
+                let action = match command {
+                    DesktopSplitKeyboardAction::ResizeLeft => KeyAction::ResizeSplitLeft,
+                    DesktopSplitKeyboardAction::ResizeRight => KeyAction::ResizeSplitRight,
+                    DesktopSplitKeyboardAction::ResizeUp => KeyAction::ResizeSplitTop,
+                    DesktopSplitKeyboardAction::ResizeDown => KeyAction::ResizeSplitBottom,
+                    DesktopSplitKeyboardAction::ResizeLeftFine => KeyAction::ResizeSplitLeftFine,
+                    DesktopSplitKeyboardAction::ResizeRightFine => KeyAction::ResizeSplitRightFine,
+                    DesktopSplitKeyboardAction::ResizeUpFine => KeyAction::ResizeSplitTopFine,
+                    DesktopSplitKeyboardAction::ResizeDownFine => KeyAction::ResizeSplitBottomFine,
+                    DesktopSplitKeyboardAction::FocusNext => KeyAction::FocusSplitNext,
+                    DesktopSplitKeyboardAction::FocusPrevious => KeyAction::FocusSplitPrevious,
+                    DesktopSplitKeyboardAction::Undo => KeyAction::UndoSplitAction,
+                };
+                self.handle_action(action);
+            }
+            DesktopAction::ReplaceSplitWindow { window_id } => {
+                let id = WindowId(window_id);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!("window {window_id} is not in a split group"));
+                }
+                self.focus_window_id(id);
+                self.replace_focused_split_window();
+                if self.pending_split_assist.is_none() {
+                    return Err(format!("window {window_id} has no replacement candidate"));
+                }
+            }
+            DesktopAction::ExitSplitGroup { window_id } => {
+                let id = WindowId(window_id);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!("window {window_id} is not in a split group"));
+                }
+                self.focus_window_id(id);
+                self.exit_focused_split_group();
+            }
+            DesktopAction::AssignSplitGroupToWorkspace {
+                window_id,
+                workspace,
+            } => {
+                if workspace == 0 || workspace as usize > self.workspace_names.len() {
+                    return Err(format!("workspace {workspace} does not exist"));
+                }
+                let id = WindowId(window_id);
+                if self
+                    .window(id)
+                    .is_none_or(|window| window.tile_rect.is_none())
+                {
+                    return Err(format!("window {window_id} is not in a split group"));
+                }
+                self.focus_window_id(id);
+                self.assign_slot(workspace as usize - 1);
+            }
+            DesktopAction::CheckpointSession => {
+                self.checkpoint_session(true);
             }
             DesktopAction::MoveWindowToWorkspace {
                 window_id,
@@ -2924,6 +4030,9 @@ impl DesktopState {
             backend_reconfigure_needed |=
                 !config.enabled || geometry_changed || hdr_request_changed;
             preferred_color_changed |= color_changed;
+            let old_work = geometry_changed
+                .then(|| self.work_recess_for_output(output_id))
+                .flatten();
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
@@ -2939,7 +4048,7 @@ impl DesktopState {
                 output.icc_profile_path = config.icc_profile_path.clone();
             }
             if geometry_changed {
-                self.update_output_size(output_id, physical_size, scale_factor);
+                self.update_output_size_from_work(output_id, physical_size, scale_factor, old_work);
             }
             if color_changed {
                 self.refresh_output_color(output_id);
@@ -3713,6 +4822,14 @@ impl DesktopState {
 
     pub fn sync_egui(&mut self, frame_ctx: &DesktopFrameCtx) {
         let output_id = frame_ctx.rendering_output;
+        if !self.workspaces.split_screen_enabled {
+            self.pending_split_assist = None;
+            if let Some(output) = self.desktop_outputs.get_mut(&output_id) {
+                output.egui.close_split_layout();
+                output.egui.close_split_assist();
+                output.egui.close_split_group();
+            }
+        }
         let Some(desktop_output) = self.desktop_outputs.get(&output_id) else {
             return;
         };
@@ -3778,6 +4895,30 @@ impl DesktopState {
             })
             .collect();
 
+        let split_assist_state_valid = self
+            .pending_split_assist
+            .is_some_and(|state| self.split_assist_state_valid(state));
+        let split_assist_entries = self
+            .pending_split_assist
+            .filter(|state| split_assist_state_valid && state.output == output_id)
+            .map(|state| {
+                self.windows
+                    .iter()
+                    .filter(|window| self.split_assist_candidate(window.id, state))
+                    .map(|window| focaldesk_ui::egui_panels::SplitAssistEntryView {
+                        id: window.id,
+                        title: window.title(),
+                        app_name: window.display_name(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let close_split_assist = self.pending_split_assist.is_some()
+            && (!split_assist_state_valid || split_assist_entries.is_empty());
+        if close_split_assist {
+            self.pending_split_assist = None;
+        }
+
         let actions = {
             let egui = &mut self
                 .desktop_outputs
@@ -3786,6 +4927,20 @@ impl DesktopState {
                 .egui;
             egui.set_clipboard_entries(clipboard_entries);
             egui.set_workspace_entries(workspace_entries);
+            egui.set_split_assist_entries(split_assist_entries);
+            if close_split_assist {
+                egui.close_split_assist();
+            }
+            egui.set_split_layout_availability(
+                focaldesk_ui::egui_panels::SplitLayoutAvailability {
+                    focused_window: self.focused_window.is_some(),
+                    side_by_side: frame_ctx.work.size.w >= MIN_SPLIT_PANE_WIDTH * 2,
+                    thirds: frame_ctx.work.size.w >= MIN_SPLIT_PANE_WIDTH * 3,
+                    stacked: frame_ctx.work.size.h >= MIN_SPLIT_PANE_HEIGHT * 2,
+                    quadrants: frame_ctx.work.size.w >= MIN_SPLIT_PANE_WIDTH * 2
+                        && frame_ctx.work.size.h >= MIN_SPLIT_PANE_HEIGHT * 2,
+                },
+            );
             egui.update_panels(frame_ctx);
             let actions = egui.take_actions();
             if !egui.has_open_panels() {
@@ -4454,26 +5609,50 @@ impl DesktopState {
             self.mark_global_logical_damage_with_margin(old.geometry, 1, DamageSource::CommitBbox);
         }
 
-        // XDG shell has no separate toplevel-destroy callback in this handler path.
-        // Remove a native managed window when its root wl_surface dies; otherwise it
-        // remains mapped in desktop snapshots and shell clients can mistake the dead
-        // fullscreen window for a live obstruction indefinitely.
-        let destroyed_window = self.windows.iter().position(|managed| {
-            matches!(
-                managed.kind,
-                crate::core::shell::managed_window::ManagedWindowKind::Wayland(_)
-            ) && managed
-                .wl_surface()
-                .is_some_and(|surface| Id::from_wayland_resource(&*surface) == *id)
-        });
+        // XDG shell has no separate toplevel-destroy callback in this handler path,
+        // so native windows must be removed here. An X11 window, however, can outlive
+        // its paired wl_surface and later associate a replacement (Wine/CEF does this
+        // while rebuilding Battle.net's launcher). Keep that managed identity around
+        // but unmap it until surface_associated calls map_xwayland_window again.
+        #[cfg(feature = "xwayland")]
+        let associated_xwayland_window = self.xwayland_surface_windows.remove(id);
+        #[cfg(not(feature = "xwayland"))]
+        let associated_xwayland_window: Option<WindowId> = None;
+
+        let destroyed_window = associated_xwayland_window
+            .and_then(|window_id| {
+                self.windows
+                    .iter()
+                    .position(|managed| managed.id == window_id)
+            })
+            .or_else(|| {
+                self.windows.iter().position(|managed| {
+                    managed
+                        .wl_surface()
+                        .is_some_and(|surface| Id::from_wayland_resource(&*surface) == *id)
+                })
+            });
         if let Some(index) = destroyed_window {
-            let managed = self.windows.remove(index);
-            self.space.unmap_elem(&managed.window);
-            if self.focused_window == Some(managed.id) {
+            let window_id = self.windows[index].id;
+            let window = self.windows[index].window.clone();
+            self.space.unmap_elem(&window);
+
+            let is_xwayland = matches!(
+                &self.windows[index].kind,
+                crate::core::shell::managed_window::ManagedWindowKind::Xwayland(_)
+            );
+            if is_xwayland {
+                self.windows[index].mapped = false;
+            } else {
+                self.windows.remove(index);
+                self.displaced_split_windows.remove(&window_id);
+            }
+
+            if self.focused_window == Some(window_id) {
                 self.focused_window = None;
             }
             self.workspace_focus
-                .retain(|_, window_id| *window_id != managed.id);
+                .retain(|_, focused_id| *focused_id != window_id);
             self.mark_all_outputs_full_damage(DamageSource::CommitBbox);
         }
     }
@@ -4836,7 +6015,8 @@ impl DesktopState {
             activate,
             "map window bbox"
         );
-        self.space.map_element(window, space_loc, activate);
+        self.space.map_element(window.clone(), space_loc, activate);
+        self.refresh_window_fractional_scale(&window);
     }
 
     fn pointer_layer_surface_under(
@@ -5313,6 +6493,43 @@ impl DesktopState {
                     .push(PendingEguiOp::OpenPanel(panel, self.focused_output));
             }
 
+            UiAction::ApplySplitLayout(preset) => {
+                self.apply_split_layout_preset(preset);
+            }
+
+            UiAction::SelectSplitAssistWindow(id) => {
+                self.select_split_assist_window(id);
+            }
+
+            UiAction::CancelSplitAssist => {
+                self.pending_split_assist = None;
+            }
+
+            UiAction::SwapSplitPanes => {
+                if let Some(pair) = self.focused_split_pair() {
+                    self.swap_split_pair(pair);
+                } else {
+                    for direction in [
+                        SplitDirection::Right,
+                        SplitDirection::Bottom,
+                        SplitDirection::Left,
+                        SplitDirection::Top,
+                    ] {
+                        if self.swap_focused_split_neighbor(direction) {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            UiAction::ReplaceSplitWindow => {
+                self.replace_focused_split_window();
+            }
+
+            UiAction::ExitSplitGroup => {
+                self.exit_focused_split_group();
+            }
+
             UiAction::ReloadSettings => {
                 self.reload_settings_from_disk();
             }
@@ -5535,6 +6752,7 @@ impl DesktopState {
     }
 
     fn lock_session(&mut self) {
+        self.clear_snap_preview();
         for output in self.desktop_outputs.values_mut() {
             output.egui.close_all_panels();
         }
@@ -6136,6 +7354,7 @@ impl DesktopState {
             self.primary_output = output_id;
         }
         self.restore_registered_output(output_id);
+        self.refresh_all_fractional_scales();
     }
 
     /// Preserve user-visible state while the DRM backend tears down and rebuilds its
@@ -6156,17 +7375,195 @@ impl DesktopState {
                 .collect(),
             primary_output: output_name(self.primary_output),
             focused_output: output_name(self.focused_output),
-            window_outputs: self
+            windows: self
                 .windows
                 .iter()
                 .map(|window| {
                     let output_id = window
                         .output
                         .unwrap_or_else(|| self.preferred_output_id_for_window(&window.window));
-                    (window.id, output_name(output_id))
+                    let split = self
+                        .work_recess_for_output(output_id)
+                        .zip(window.tile_rect)
+                        .and_then(|(work, tile)| saved_split_placement(work, tile));
+                    OutputWindowSnapshot {
+                        id: window.id,
+                        output_name: output_name(output_id),
+                        workspace: window.workspace,
+                        split,
+                    }
                 })
                 .collect(),
         }
+    }
+
+    fn clamp_floating_window_to_work(
+        &mut self,
+        window_id: WindowId,
+        output_id: OutputId,
+        work: Rectangle<i32, Logical>,
+    ) {
+        if self
+            .window(window_id)
+            .is_some_and(|window| window.tile_rect.is_some())
+        {
+            self.restore_split_window(window_id);
+        }
+        let Some(index) = self
+            .windows
+            .iter()
+            .position(|window| window.id == window_id)
+        else {
+            return;
+        };
+        let window = self.windows[index].window.clone();
+        let geometry = self.windows[index]
+            .float_rect
+            .or_else(|| self.space.element_bbox(&window))
+            .unwrap_or_else(|| Rectangle::from_loc_and_size(work.loc, window.geometry().size));
+        let geometry = clamp_rect_to_bounds(geometry, work);
+        self.windows[index].output = Some(output_id);
+        self.windows[index].float_rect = Some(geometry);
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| state.size = Some(geometry.size));
+            toplevel.send_pending_configure();
+        }
+        if let Some(x11) = window.x11_surface() {
+            let _ = x11.configure(geometry);
+        }
+        self.map_window_bbox_location(window, geometry.loc, true);
+    }
+
+    fn restore_live_split_placement(
+        &mut self,
+        window_id: WindowId,
+        output_id: OutputId,
+        placement: SavedSplitPlacement,
+    ) -> bool {
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return false;
+        };
+        let minimum = self.split_window_min_size(window_id);
+        let Some((target, direction)) = restored_split_rect_for_minimum(work, placement, minimum)
+        else {
+            return false;
+        };
+        let Some(window) = self.window_mut(window_id) else {
+            return false;
+        };
+        window.output = Some(output_id);
+        self.configure_split_member(window_id, target, direction);
+        true
+    }
+
+    fn remember_displaced_split(
+        &mut self,
+        window_id: WindowId,
+        output_id: OutputId,
+        placement: SavedSplitPlacement,
+    ) {
+        let Some((connector, workspace)) = self.outputs.get(&output_id).and_then(|output| {
+            self.window(window_id)
+                .map(|window| (output.handle.name().to_string(), window.workspace))
+        }) else {
+            return;
+        };
+        self.displaced_split_windows.insert(
+            window_id,
+            DisplacedSplitWindow {
+                connector,
+                workspace,
+                placement,
+            },
+        );
+    }
+
+    fn reflow_split_windows_for_output(
+        &mut self,
+        output_id: OutputId,
+        old_work: Rectangle<i32, Logical>,
+    ) {
+        let placements: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|window| window.output == Some(output_id))
+            .filter_map(|window| {
+                window
+                    .tile_rect
+                    .and_then(|tile| saved_split_placement(old_work, tile))
+                    .map(|placement| (window.id, placement))
+            })
+            .collect();
+        let Some(new_work) = self.work_recess_for_output(output_id) else {
+            return;
+        };
+        for (window_id, placement) in placements {
+            if self.restore_live_split_placement(window_id, output_id, placement) {
+                self.displaced_split_windows.remove(&window_id);
+            } else {
+                self.remember_displaced_split(window_id, output_id, placement);
+                self.clamp_floating_window_to_work(window_id, output_id, new_work);
+            }
+        }
+    }
+
+    fn restore_displaced_split_windows(&mut self, outputs_by_name: &HashMap<String, OutputId>) {
+        let candidates: Vec<_> = self
+            .displaced_split_windows
+            .iter()
+            .filter_map(|(window_id, displaced)| {
+                outputs_by_name
+                    .get(&displaced.connector)
+                    .copied()
+                    .map(|output_id| (*window_id, output_id, displaced.clone()))
+            })
+            .collect();
+        for (window_id, output_id, displaced) in candidates {
+            if self.restore_live_split_placement(window_id, output_id, displaced.placement) {
+                if let Some(window) = self.window_mut(window_id) {
+                    window.workspace = displaced.workspace;
+                }
+                self.displaced_split_windows.remove(&window_id);
+            }
+        }
+    }
+
+    fn reconcile_split_work_areas(&mut self) {
+        let current: Vec<_> = self
+            .outputs
+            .keys()
+            .copied()
+            .filter_map(|output_id| {
+                self.work_recess_for_output(output_id)
+                    .map(|work| (output_id, work))
+            })
+            .collect();
+        let live_outputs: HashSet<_> = current.iter().map(|(output_id, _)| *output_id).collect();
+        self.split_work_areas
+            .retain(|output_id, _| live_outputs.contains(output_id));
+        let changes: Vec<_> = current
+            .iter()
+            .filter_map(|(output_id, work)| {
+                self.split_work_areas
+                    .get(output_id)
+                    .copied()
+                    .filter(|old_work| old_work != work)
+                    .map(|old_work| (*output_id, old_work))
+            })
+            .collect();
+        for (output_id, work) in &current {
+            self.split_work_areas.insert(*output_id, *work);
+        }
+        for (output_id, old_work) in changes {
+            self.reflow_split_windows_for_output(output_id, old_work);
+        }
+
+        let outputs_by_name = self
+            .outputs
+            .iter()
+            .map(|(id, output)| (output.handle.name().to_string(), *id))
+            .collect();
+        self.restore_displaced_split_windows(&outputs_by_name);
     }
 
     /// Restore per-output state after a DRM rebuild and rescue windows whose connector
@@ -6240,30 +7637,70 @@ impl DesktopState {
         let fallback_work = self.work_recess_for_output(focused);
         let mut rehome = Vec::new();
 
-        for (window_id, old_output_name) in snapshot.window_outputs {
-            let target = old_output_name
-                .as_ref()
-                .and_then(|name| outputs_by_name.get(name).copied())
-                .or_else(|| {
-                    let window = self.window(window_id)?;
+        let mut split_restores = Vec::new();
+        for saved_window in snapshot.windows {
+            let window_id = saved_window.id;
+            let target = match saved_window.output_name.as_ref() {
+                Some(name) => outputs_by_name.get(name).copied(),
+                None => self.window(window_id).and_then(|window| {
                     self.space
                         .outputs_for_element(&window.window)
                         .first()
                         .and_then(|output| self.output_id_for_space_output(output))
-                });
-            let Some(window) = self.window_mut(window_id) else {
+                }),
+            };
+            let Some(index) = self
+                .windows
+                .iter()
+                .position(|window| window.id == window_id)
+            else {
                 continue;
             };
             if let Some(target) = target {
-                window.output = Some(target);
+                self.windows[index].output = Some(target);
+                if let Some(split) = saved_window.split {
+                    self.windows[index].workspace = saved_window.workspace;
+                    split_restores.push((window_id, target, split));
+                }
             } else {
-                window.output = Some(focused);
-                window.workspace = fallback_workspace;
-                rehome.push((window_id, window.fullscreen, window.maximized));
+                self.windows[index].output = Some(focused);
+                self.windows[index].workspace = fallback_workspace;
+                let fullscreen = self.windows[index].fullscreen;
+                let maximized = self.windows[index].maximized;
+                if let (Some(connector), Some(placement)) =
+                    (saved_window.output_name, saved_window.split)
+                {
+                    self.displaced_split_windows.insert(
+                        window_id,
+                        DisplacedSplitWindow {
+                            connector,
+                            workspace: saved_window.workspace,
+                            placement,
+                        },
+                    );
+                }
+                rehome.push((window_id, fullscreen, maximized));
             }
         }
 
-        for (index, (window_id, fullscreen, maximized)) in rehome.into_iter().enumerate() {
+        for (window_id, output_id, placement) in split_restores {
+            if !self.restore_live_split_placement(window_id, output_id, placement) {
+                self.remember_displaced_split(window_id, output_id, placement);
+                if let Some(work) = self.work_recess_for_output(output_id) {
+                    self.clamp_floating_window_to_work(window_id, output_id, work);
+                }
+            } else {
+                self.displaced_split_windows.remove(&window_id);
+            }
+        }
+
+        for (window_id, fullscreen, maximized) in rehome {
+            if self
+                .window(window_id)
+                .is_some_and(|window| window.tile_rect.is_some())
+            {
+                self.restore_split_window(window_id);
+            }
             if fullscreen {
                 if let Some(window) = self.window_mut(window_id) {
                     window.fullscreen = false;
@@ -6274,23 +7711,12 @@ impl DesktopState {
                     window.maximized = false;
                 }
                 self.set_window_maximized(window_id, true);
-            } else if let (Some(work), Some(window)) = (
-                fallback_work,
-                self.window(window_id).map(|managed| managed.window.clone()),
-            ) {
-                let offset = 24 * (index as i32 % 8);
-                let bbox = self.space.element_bbox(&window).unwrap_or_else(|| {
-                    Rectangle::from_loc_and_size(work.loc, window.geometry().size)
-                });
-                let max_x = work.loc.x + (work.size.w - bbox.size.w).max(0);
-                let max_y = work.loc.y + (work.size.h - bbox.size.h).max(0);
-                let loc = Point::from((
-                    (work.loc.x + offset).min(max_x),
-                    (work.loc.y + offset).min(max_y),
-                ));
-                self.map_window_bbox_location(window, loc, false);
+            } else if let Some(work) = fallback_work {
+                self.clamp_floating_window_to_work(window_id, focused, work);
             }
         }
+
+        self.restore_displaced_split_windows(&outputs_by_name);
 
         crate::core::portal::invalidate_portal_output_state(self);
         self.screenshot_requested = None;
@@ -6425,7 +7851,10 @@ impl DesktopState {
     }
 
     #[cfg(feature = "xwayland")]
-    fn output_logical_rect(&self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+    pub(crate) fn output_logical_rect(
+        &self,
+        output_id: OutputId,
+    ) -> Option<Rectangle<i32, Logical>> {
         let output = self.outputs.get(&output_id)?;
         Some(Rectangle::from_loc_and_size(
             output.logical_origin,
@@ -6561,40 +7990,22 @@ impl DesktopState {
         self.focused_output
     }
 
-    fn preferred_output_id_for_window(&self, window: &Window) -> OutputId {
-        let outputs = self.space.outputs_for_element(window);
-        if outputs.is_empty() {
-            return self.focused_output;
-        }
-        if outputs.len() == 1 {
-            return self
-                .output_id_for_space_output(&outputs[0])
-                .unwrap_or(self.focused_output);
-        }
-
+    pub(crate) fn preferred_output_id_for_window(&self, window: &Window) -> OutputId {
+        let fallback = self
+            .windows
+            .iter()
+            .find(|managed| &managed.window == window)
+            .and_then(|managed| managed.output)
+            .unwrap_or(self.focused_output);
         let Some(window_geo) = self.space.element_geometry(window) else {
-            return self.focused_output;
+            return fallback;
         };
-
-        let mut best = self.focused_output;
-        let mut best_area = 0i64;
-        for output in &outputs {
-            let Some(output_id) = self.output_id_for_space_output(output) else {
-                continue;
-            };
-            let Some(output_geo) = self.space.output_geometry(output) else {
-                continue;
-            };
-            let overlap = window_geo
-                .intersection(output_geo)
-                .map(|rect| i64::from(rect.size.w) * i64::from(rect.size.h))
-                .unwrap_or(0);
-            if overlap > best_area {
-                best_area = overlap;
-                best = output_id;
-            }
-        }
-        best
+        let outputs = self.outputs.iter().filter_map(|(output_id, output)| {
+            self.space
+                .output_geometry(&output.handle)
+                .map(|geometry| (*output_id, geometry))
+        });
+        output_with_largest_overlap(window_geo, outputs, fallback)
     }
 
     /// Update `wp_color` feedback as soon as compositor-driven movement changes the output that
@@ -7083,6 +8494,15 @@ impl DesktopState {
             return;
         }
 
+        if let Some(drag) = self.split_divider_drag {
+            let icon = match drag.divider.axis {
+                SplitAxis::Vertical => CursorIcon::EwResize,
+                SplitAxis::Horizontal => CursorIcon::NsResize,
+            };
+            self.set_compositor_cursor_icon(icon);
+            return;
+        }
+
         if self
             .output_under_pointer(position)
             .is_some_and(|output_id| self.egui_open_on_output(output_id))
@@ -7091,7 +8511,13 @@ impl DesktopState {
             return;
         }
 
-        if let Some((_, edges)) = self.top_window_resize_edge_at(position) {
+        if let Some(divider) = self.split_divider_at(position) {
+            let icon = match divider.axis {
+                SplitAxis::Vertical => CursorIcon::EwResize,
+                SplitAxis::Horizontal => CursorIcon::NsResize,
+            };
+            self.set_compositor_cursor_icon(icon);
+        } else if let Some((_, edges)) = self.top_window_resize_edge_at(position) {
             self.set_compositor_cursor_icon(cursor_for_resize_edges(edges));
         } else if self.pending_compositor_move.is_some() {
             self.set_compositor_cursor_icon(CursorIcon::Move);
@@ -7157,6 +8583,24 @@ impl DesktopState {
             .unwrap_or_else(|| self.preferred_output_id_for_window(&window));
         self.workspace_focus.insert((output, workspace), window_id);
         self.space.raise_element(&window, true);
+        // Keep XWayland's X11 stack in lockstep with the compositor scene.
+        // Wine/CEF uses a separate GPU surface for Battle.net; if only the
+        // Wayland element is raised, X11 and Wayland disagree about which of
+        // the rendered surface and its blank host is on top. The next click
+        // then exposes the host and makes the UI appear to vanish.
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = window.x11_surface().cloned() {
+            if let Some(xwm) = self.xwm.as_mut() {
+                if let Err(error) = xwm.raise_window(&x11) {
+                    tracing::warn!(
+                        target: "focaldesk",
+                        window_id = ?window_id,
+                        ?error,
+                        "failed to synchronize XWayland stacking order"
+                    );
+                }
+            }
+        }
         let new_focus_bbox = self.global_window_bbox(&window);
 
         // `raise_element(..., true)` updates xdg `Activated` in pending state only; clients are not
@@ -7181,19 +8625,97 @@ impl DesktopState {
         }
     }
 
-    fn focus_window_at(&mut self, position: Point<f64, Logical>) {
-        let px = position.x.round() as i32;
-        let py = position.y.round() as i32;
-        let ws = self.focused_workspace();
-        let target_id = self.space.elements().rev().find_map(|window| {
-            let managed = self
-                .windows
-                .iter()
-                .find(|mw| mw.mapped && mw.workspace == ws && &mw.window == window)?;
-            self.global_window_bbox(window)
-                .is_some_and(|bbox| bbox.contains((px, py)))
-                .then_some(managed.id)
+    /// Honor an X11 `_NET_ACTIVE_WINDOW` request without letting a normal
+    /// Wine host cover the override-redirect surface that was actually
+    /// clicked. Battle.net's CEF GPU process uses exactly this arrangement:
+    /// pointer input lands on the rendered overlay, then the white host asks
+    /// to become active.
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn focus_xwayland_active_window(&mut self, window_id: WindowId) {
+        let pointer = self.pointer_pos;
+        let pointer_i32 = (pointer.x.round() as i32, pointer.y.round() as i32);
+        let requested_context = self.window(window_id).and_then(|requested| {
+            self.global_window_bbox(&requested.window)
+                .map(|bbox| (requested.workspace, bbox))
         });
+        let pointer_is_over_requested =
+            requested_context.is_some_and(|(_, bbox)| bbox.contains(pointer_i32));
+        let requested_workspace = requested_context.map(|(workspace, _)| workspace);
+
+        // Override-redirect CEF surfaces receive pointer input without taking
+        // keyboard focus. Looking only at `focused_window` therefore misses the
+        // rendered Battle.net menu and lets its opaque host get raised over it.
+        // Consult the compositor stack first, using the same topmost ordering as
+        // pointer hit testing, then retain the focused-surface fallback for
+        // clients whose input region has not caught up with their geometry yet.
+        let stacked_overlay = pointer_is_over_requested.then(|| {
+            self.space.elements().rev().find_map(|window| {
+                let managed = self.windows.iter().find(|managed| {
+                    managed.id != window_id
+                        && managed.mapped
+                        && managed.is_override_redirect()
+                        && Some(managed.workspace) == requested_workspace
+                        && &managed.window == window
+                })?;
+                self.global_window_bbox(window)
+                    .is_some_and(|bbox| bbox.contains(pointer_i32))
+                    .then(|| (managed.id, window.clone()))
+            })
+        });
+        let clicked_overlay = stacked_overlay.flatten().or_else(|| {
+            self.focused_window.and_then(|focused_id| {
+                if focused_id == window_id || !pointer_is_over_requested {
+                    return None;
+                }
+                let focused = self.window(focused_id)?;
+                (focused.mapped && focused.is_override_redirect())
+                    .then(|| (focused_id, focused.window.clone()))
+            })
+        });
+
+        self.focus_window_id(window_id);
+
+        let Some((overlay_id, overlay)) = clicked_overlay else {
+            return;
+        };
+        self.space.raise_element(&overlay, true);
+        if let Some(x11) = overlay.x11_surface().cloned() {
+            if let Some(xwm) = self.xwm.as_mut() {
+                if let Err(error) = xwm.raise_window(&x11) {
+                    tracing::warn!(
+                        target: "focaldesk",
+                        window_id = ?overlay_id,
+                        ?error,
+                        "failed to preserve XWayland rendered overlay stacking"
+                    );
+                }
+            }
+        }
+        if let Some(rect) = self.global_window_bbox(&overlay) {
+            self.mark_window_bbox_damage_source(rect, DamageSource::Unknown);
+        }
+    }
+
+    fn focus_window_at(&mut self, position: Point<f64, Logical>) {
+        // Use the same surface/input-region hit test that will receive the
+        // button below. A bbox-only lookup can select an overlapping X11
+        // window whose surface has an empty or transparent input region. That
+        // made clicks visibly aimed at Wine games raise Battle.net instead.
+        let target_id = self
+            .pointer_surface_under(position)
+            .and_then(|(target, _)| match target {
+                #[cfg(feature = "xwayland")]
+                PointerFocusTarget::Xwayland(surface) => self.window_id_for_x11_surface(&surface),
+                PointerFocusTarget::Wayland(mut surface) => loop {
+                    if let Some(id) = self.window_id_for_wl_surface(&surface) {
+                        break Some(id);
+                    }
+                    let Some(parent) = get_parent(&surface) else {
+                        break None;
+                    };
+                    surface = parent;
+                },
+            });
 
         if let Some(id) = target_id {
             self.focus_window_id(id);
@@ -7292,6 +8814,13 @@ impl DesktopState {
             primary_output: init.primary_output,
             focused_output: init.primary_output,
             focus_changed_at: Instant::now(),
+            split_divider_drag: None,
+            split_resize_hud: None,
+            split_undo: None,
+            pending_split_assist: None,
+            snap_preview: None,
+            split_work_areas: HashMap::new(),
+            displaced_split_windows: HashMap::new(),
             input: InputState::default(),
             compositor_state: init.compositor_state,
             fractional_scale_manager_state: init.fractional_scale_manager_state,
@@ -7435,6 +8964,10 @@ impl DesktopState {
             surface_colors: HashMap::new(),
             surface_damage: HashMap::new(),
             surface_damage_roots: HashMap::new(),
+            #[cfg(feature = "xwayland")]
+            xwayland_surface_windows: HashMap::new(),
+            #[cfg(feature = "xwayland")]
+            xwayland_mapped_windows: HashSet::new(),
             surface_damage_scratch: SurfaceDamageScratch::default(),
             surface_damage_metrics: SurfaceDamageMetrics::default(),
             wp_color_surface_outputs: HashMap::new(),
@@ -7512,6 +9045,38 @@ impl DesktopState {
     }
 
     #[cfg(feature = "xwayland")]
+    pub(crate) fn remember_xwayland_surface_association(
+        &mut self,
+        surface: &WlSurface,
+        window_id: WindowId,
+    ) {
+        self.xwayland_surface_windows
+            .retain(|_, associated_id| *associated_id != window_id);
+        self.xwayland_surface_windows
+            .insert(Id::from_wayland_resource(surface), window_id);
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn forget_xwayland_surface_associations(&mut self, window_id: WindowId) {
+        self.xwayland_surface_windows
+            .retain(|_, associated_id| *associated_id != window_id);
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn set_xwayland_window_mapped(&mut self, window_id: WindowId, mapped: bool) {
+        if mapped {
+            self.xwayland_mapped_windows.insert(window_id);
+        } else {
+            self.xwayland_mapped_windows.remove(&window_id);
+        }
+    }
+
+    #[cfg(feature = "xwayland")]
+    pub(crate) fn xwayland_window_is_mapped(&self, window_id: WindowId) -> bool {
+        self.xwayland_mapped_windows.contains(&window_id)
+    }
+
+    #[cfg(feature = "xwayland")]
     pub fn add_xwayland_window(
         &mut self,
         surface: smithay::xwayland::X11Surface,
@@ -7585,6 +9150,9 @@ impl DesktopState {
         let id = self.window_id_for_x11_surface(&surface).unwrap_or_else(|| {
             self.add_xwayland_window(surface.clone(), surface.is_override_redirect())
         });
+        if let Some(wl_surface) = surface.wl_surface() {
+            self.remember_xwayland_surface_association(&wl_surface, id);
+        }
         let _span = info_span!(
             "map_xwayland_window",
             session_id = session_id(),
@@ -7596,6 +9164,34 @@ impl DesktopState {
         .entered();
 
         self.sync_xwayland_window_meta(&surface);
+        let role = XwaylandSurfaceRole::from_surface(&surface);
+        let min_size = surface.min_size().map(|size| (size.w, size.h));
+        let max_size = surface.max_size().map(|size| (size.w, size.h));
+        let expects_input = surface.input_model() != smithay::xwayland::xwm::WmInputModel::None;
+        if is_noninteractive_fixed_size_helper(role, expects_input, min_size, max_size) {
+            if !surface.is_override_redirect() {
+                let _ = surface.set_mapped(true);
+            }
+            if let Some(index) = self.windows.iter().position(|window| window.id == id) {
+                let window = self.windows[index].window.clone();
+                self.space.unmap_elem(&window);
+                self.windows[index].mapped = false;
+            }
+            if self.focused_window == Some(id) {
+                self.focused_window = None;
+            }
+            self.workspace_focus.retain(|_, window_id| *window_id != id);
+            debug!(
+                target: "focaldesk",
+                window_id = ?id,
+                title = ?surface.title(),
+                class = ?surface.class(),
+                ?min_size,
+                ?max_size,
+                "xwayland implementation helper excluded from desktop"
+            );
+            return;
+        }
         let x11_class = surface.class();
         let restore_unresolved = self
             .window(id)
@@ -7638,7 +9234,11 @@ impl DesktopState {
         let should_float = self.windows[idx].floating;
         let restored_maximized = restored && self.windows[idx].maximized;
         let restored_fullscreen = restored && self.windows[idx].fullscreen;
-        let restored_rect = restored.then(|| self.windows[idx].float_rect).flatten();
+        let restored_rect = restored
+            .then(|| self.windows[idx].tile_rect.or(self.windows[idx].float_rect))
+            .flatten();
+        let requested_fills_output =
+            self.xwayland_request_fills_output(output_id, requested_geometry.size);
         let (bbox_location, configure_size, maximize_on_map) = if restored_fullscreen {
             let geometry = self
                 .outputs
@@ -7651,8 +9251,6 @@ impl DesktopState {
                 .work_recess_for_output(output_id)
                 .unwrap_or(requested_geometry);
             (geometry.loc, geometry.size, true)
-        } else if let Some(geometry) = restored_rect {
-            (geometry.loc, geometry.size, false)
         } else if surface.is_override_redirect() {
             let geometry = Rectangle::from_loc_and_size(
                 self.xwayland_or_compositor_loc(&surface, requested_geometry.loc),
@@ -7668,13 +9266,28 @@ impl DesktopState {
             let geometry = Rectangle::from_loc_and_size(location, requested_geometry.size);
             let geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
             (geometry.loc, geometry.size, false)
+        } else if requested_fills_output {
+            // Wine implements borderless "Fullscreen (Windowed)" with a normal
+            // X11 toplevel whose initial geometry fills the monitor. Honor that
+            // current request ahead of stale session geometry; otherwise every
+            // such game is forced into the generic 1280x800 launch rectangle.
+            let geometry = self
+                .work_recess_for_output(output_id)
+                .or_else(|| self.output_logical_rect(output_id))
+                .unwrap_or(requested_geometry);
+            (geometry.loc, geometry.size, true)
+        } else if let Some(geometry) = restored_rect {
+            (geometry.loc, geometry.size, false)
         } else if self.workspaces.maximize_on_launch {
             let work = self
                 .work_recess_for_output(output_id)
                 .unwrap_or(requested_geometry);
             (work.loc, work.size, true)
         } else {
-            let geometry = self.default_unmaximized_toplevel_geometry(output_id);
+            // X11 clients choose an initial window size. Preserve it instead of
+            // applying the compositor's generic Wayland-toplevel default.
+            let geometry =
+                self.xwayland_clamp_toplevel_geometry(output_id, requested_geometry, None);
             (geometry.loc, geometry.size, false)
         };
 
@@ -7682,8 +9295,10 @@ impl DesktopState {
             self.windows[idx].set_maximized(true);
         }
 
-        self.windows[idx].float_rect =
-            Some(Rectangle::from_loc_and_size(bbox_location, configure_size));
+        if self.windows[idx].tile_rect.is_none() {
+            self.windows[idx].float_rect =
+                Some(Rectangle::from_loc_and_size(bbox_location, configure_size));
+        }
 
         window.on_commit();
         self.map_window_bbox_location(window.clone(), bbox_location, true);
@@ -7895,6 +9510,19 @@ impl DesktopState {
                         }
                     }
                 }
+
+                // XWayland/DRI3 clients such as Wine games can reuse a DMA-BUF
+                // while reporting only the region they expect an X11 compositor
+                // to copy. The raw Vulkan backend retains its composed scene, so
+                // trusting that partial region can leave a horizontal strip from
+                // an older frame. Repaint the complete XWayland toplevel on each
+                // root commit; native Wayland clients retain precise damage.
+                if !commit_damage_queued {
+                    if let Some(bbox) = self.global_window_bbox(&window) {
+                        self.mark_window_bbox_damage_source(bbox, DamageSource::CommitBbox);
+                        commit_damage_queued = true;
+                    }
+                }
             }
 
             if let Some(idx) = self
@@ -7965,7 +9593,8 @@ impl DesktopState {
                 .unwrap_or(self.primary_output);
 
             let map_loc = self.windows[idx]
-                .float_rect
+                .tile_rect
+                .or(self.windows[idx].float_rect)
                 .map(|rect| rect.loc)
                 .unwrap_or_else(|| self.default_toplevel_map_location(output_id));
 
@@ -8022,6 +9651,7 @@ impl DesktopState {
         }
 
         if let Some(window) = committed_window {
+            self.refresh_window_fractional_scale(&window);
             self.refresh_window_preferred_color_output(&window);
         }
 
@@ -8263,6 +9893,60 @@ impl DesktopState {
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 toggle_voice_capture(self.voice_capture_status_tx.clone());
             }
+            KeyAction::SplitLeft => self.split_focused_window(SplitDirection::Left),
+            KeyAction::SplitRight => self.split_focused_window(SplitDirection::Right),
+            KeyAction::SplitTop => self.split_focused_window(SplitDirection::Top),
+            KeyAction::SplitBottom => self.split_focused_window(SplitDirection::Bottom),
+            KeyAction::ToggleSplitLayout => {
+                if self.workspaces.split_screen_enabled && self.focused_window.is_some() {
+                    self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::SplitLayout));
+                }
+            }
+            KeyAction::SwapSplitLeft => {
+                self.swap_focused_split_neighbor(SplitDirection::Left);
+            }
+            KeyAction::SwapSplitRight => {
+                self.swap_focused_split_neighbor(SplitDirection::Right);
+            }
+            KeyAction::SwapSplitTop => {
+                self.swap_focused_split_neighbor(SplitDirection::Top);
+            }
+            KeyAction::SwapSplitBottom => {
+                self.swap_focused_split_neighbor(SplitDirection::Bottom);
+            }
+            KeyAction::ResizeSplitLeft => {
+                self.resize_focused_split_divider(SplitDirection::Left, false);
+            }
+            KeyAction::ResizeSplitRight => {
+                self.resize_focused_split_divider(SplitDirection::Right, false);
+            }
+            KeyAction::ResizeSplitTop => {
+                self.resize_focused_split_divider(SplitDirection::Top, false);
+            }
+            KeyAction::ResizeSplitBottom => {
+                self.resize_focused_split_divider(SplitDirection::Bottom, false);
+            }
+            KeyAction::ResizeSplitLeftFine => {
+                self.resize_focused_split_divider(SplitDirection::Left, true);
+            }
+            KeyAction::ResizeSplitRightFine => {
+                self.resize_focused_split_divider(SplitDirection::Right, true);
+            }
+            KeyAction::ResizeSplitTopFine => {
+                self.resize_focused_split_divider(SplitDirection::Top, true);
+            }
+            KeyAction::ResizeSplitBottomFine => {
+                self.resize_focused_split_divider(SplitDirection::Bottom, true);
+            }
+            KeyAction::FocusSplitNext => {
+                self.focus_split_group_member(true);
+            }
+            KeyAction::FocusSplitPrevious => {
+                self.focus_split_group_member(false);
+            }
+            KeyAction::UndoSplitAction => {
+                self.undo_last_split_action();
+            }
         }
     }
 
@@ -8309,16 +9993,28 @@ impl DesktopState {
         let Some(window_id) = self.focused_window else {
             return;
         };
-        let focused_output = self.focused_output;
-        let Some(managed) = self.window_mut(window_id) else {
+        let focused_output = self
+            .window(window_id)
+            .and_then(|window| window.output)
+            .unwrap_or(self.focused_output);
+        let Some(managed) = self.window(window_id) else {
             self.focused_window = None;
             return;
         };
         if !managed.mapped {
             return;
         }
-        managed.set_workspace(workspace);
-        managed.set_output(Some(focused_output));
+        let window_ids = if managed.tile_rect.is_some() {
+            self.split_group_window_ids(focused_output, managed.workspace)
+        } else {
+            vec![window_id]
+        };
+        for id in window_ids {
+            if let Some(managed) = self.window_mut(id) {
+                managed.set_workspace(workspace);
+                managed.set_output(Some(focused_output));
+            }
+        }
         self.set_focused_workspace(workspace);
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
@@ -8671,7 +10367,8 @@ impl DesktopState {
                     if changed_output {
                         self.mark_all_outputs_full_damage(DamageSource::WindowMove);
                     }
-                    return old_bbox.is_some() || new_bbox.is_some();
+                    let snap_changed = self.update_snap_preview(window_id, pos);
+                    return old_bbox.is_some() || new_bbox.is_some() || snap_changed;
                 }
             }
             Some(ToplevelPointerInteraction::Resize {
@@ -8681,6 +10378,7 @@ impl DesktopState {
                 initial_rect,
                 ..
             }) => {
+                self.clear_snap_preview();
                 let mut delta = pos - pointer_start;
 
                 let mut new_window_width = initial_rect.size.w;
@@ -8749,7 +10447,9 @@ impl DesktopState {
                 }
                 return true;
             }
-            None => {}
+            None => {
+                self.clear_snap_preview();
+            }
         }
         false
     }
@@ -8760,6 +10460,10 @@ impl DesktopState {
         }
         if !matches!(state, FlowKeyState::Released) {
             return;
+        }
+        let snap_preview = self.snap_preview.take();
+        if let Some(preview) = snap_preview {
+            self.mark_output_full_damage(preview.output, DamageSource::WindowMove);
         }
         let Some(active) = self.toplevel_pointer.take() else {
             return;
@@ -8812,6 +10516,21 @@ impl DesktopState {
                         managed.set_output(target_output);
                         managed.set_workspace(target_workspace);
                         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    }
+                }
+                if let Some(preview) = snap_preview.filter(|preview| preview.window == window_id) {
+                    if self.place_window_in_split_rect(
+                        window_id,
+                        preview.output,
+                        preview.target,
+                        preview.direction,
+                    ) {
+                        self.start_split_assist(
+                            window_id,
+                            preview.output,
+                            preview.target,
+                            preview.direction,
+                        );
                     }
                 }
             }
@@ -8895,6 +10614,7 @@ impl DesktopState {
             self.pending_compositor_move = None;
             self.pending_xdg_move = None;
             self.toplevel_pointer = None;
+            self.split_divider_drag = None;
             self.input.pointer_left_down = false;
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
             return;
@@ -8909,6 +10629,7 @@ impl DesktopState {
                     if let Some(output) = self.desktop_outputs.get_mut(&self.focused_output) {
                         output.egui.close_all_panels();
                     }
+                    self.pending_split_assist = None;
                     self.mark_egui_damage(self.focused_output);
                     return;
                 }
@@ -8959,6 +10680,18 @@ impl DesktopState {
                     self.clear_client_pointer_focus(self.pointer_pos);
                     self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
+                }
+                if self.input.pointer_left_down {
+                    if let Some(drag) = self.split_divider_drag {
+                        self.resize_split_grid_divider(drag.divider, position);
+                        self.clear_client_pointer_focus(position);
+                        self.update_pointer_cursor(position);
+                        self.mark_output_full_damage(
+                            drag.divider.output,
+                            DamageSource::WindowResize,
+                        );
+                        return;
+                    }
                 }
                 const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
                 if self.input.pointer_left_down {
@@ -9060,6 +10793,69 @@ impl DesktopState {
                     self.clear_client_pointer_focus(self.pointer_pos);
                     self.mark_focused_output_full_damage(DamageSource::Unknown);
                     return;
+                }
+
+                if matches!(button, FlowMouseButton::Right)
+                    && matches!(state, FlowKeyState::Pressed)
+                {
+                    if let Some(divider) = self.split_divider_at(position) {
+                        if !self.focused_window.is_some_and(|id| {
+                            divider.before.contains(&Some(id)) || divider.after.contains(&Some(id))
+                        }) {
+                            if let Some(id) = divider
+                                .before
+                                .into_iter()
+                                .chain(divider.after)
+                                .flatten()
+                                .next()
+                            {
+                                self.focus_window_id(id);
+                            }
+                        }
+                        self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::SplitGroup));
+                        self.clear_client_pointer_focus(position);
+                        self.mark_output_full_damage(divider.output, DamageSource::Egui);
+                        return;
+                    }
+                }
+
+                if matches!(button, FlowMouseButton::Left) {
+                    match state {
+                        FlowKeyState::Pressed => {
+                            if let Some(divider) = self.split_divider_at(position) {
+                                self.input.pointer_left_down = true;
+                                self.record_split_undo(
+                                    divider.before.into_iter().chain(divider.after).flatten(),
+                                );
+                                self.split_divider_drag = Some(SplitDividerDrag { divider });
+                                self.pending_compositor_move = None;
+                                self.pending_xdg_move = None;
+                                self.clear_client_pointer_focus(position);
+                                self.update_pointer_cursor(position);
+                                self.mark_output_full_damage(
+                                    divider.output,
+                                    DamageSource::WindowResize,
+                                );
+                                return;
+                            }
+                        }
+                        FlowKeyState::Released => {
+                            if let Some(drag) = self.split_divider_drag.take() {
+                                if let Some(pair) = self.split_pair_for_output(drag.divider.output)
+                                {
+                                    self.remember_split_ratio(pair);
+                                }
+                                self.input.pointer_left_down = false;
+                                self.clear_client_pointer_focus(position);
+                                self.update_pointer_cursor(position);
+                                self.mark_output_full_damage(
+                                    drag.divider.output,
+                                    DamageSource::WindowResize,
+                                );
+                                return;
+                            }
+                        }
+                    }
                 }
 
                 if matches!(button, FlowMouseButton::Left)
@@ -9274,6 +11070,7 @@ impl DesktopState {
                 self.input.pointer_left_down = false;
                 self.pending_compositor_move = None;
                 self.pending_xdg_move = None;
+                self.split_divider_drag = None;
                 self.cursor_manager.set_visible(false);
                 self.update_cursor_owner_damage();
                 self.clear_all_software_cursor_damage();
@@ -9385,6 +11182,17 @@ impl DesktopState {
         physical_size: Size<i32, Physical>,
         scale_factor: f64,
     ) {
+        let old_work = self.work_recess_for_output(output_id);
+        self.update_output_size_from_work(output_id, physical_size, scale_factor, old_work);
+    }
+
+    fn update_output_size_from_work(
+        &mut self,
+        output_id: OutputId,
+        physical_size: Size<i32, Physical>,
+        scale_factor: f64,
+        old_work: Option<Rectangle<i32, Logical>>,
+    ) {
         let mode = Mode {
             size: (physical_size.w, physical_size.h).into(),
             refresh: 60_000,
@@ -9415,6 +11223,13 @@ impl DesktopState {
             output.handle.set_preferred(mode);
             self.space.map_output(&output.handle, output.logical_origin);
         }
+        if let Some(old_work) = old_work {
+            self.reflow_split_windows_for_output(output_id, old_work);
+        }
+        if let Some(work) = self.work_recess_for_output(output_id) {
+            self.split_work_areas.insert(output_id, work);
+        }
+        self.refresh_all_fractional_scales();
     }
 
     pub fn needs_redraw(&self) -> bool {
@@ -9433,6 +11248,9 @@ impl DesktopState {
             || self.clock_pulse.is_some_and(|pulse| {
                 now.saturating_duration_since(pulse.started_at) < CLOCK_PULSE_DURATION
             })
+            || self.split_resize_hud.is_some_and(|hud| {
+                now.saturating_duration_since(hud.started_at) < SPLIT_RESIZE_HUD_DURATION
+            })
             || self.lock_screen.active
     }
 
@@ -9445,6 +11263,9 @@ impl DesktopState {
             || self.output_has_active_sidebar_pulse(output_id, now)
             || self.output_has_active_topbar_pulse(output_id, now)
             || self.output_has_active_clock_pulse(output_id, now)
+            || self
+                .split_resize_percent_for_output(output_id, now)
+                .is_some()
             || self.lock_screen.active
     }
 
@@ -9755,6 +11576,7 @@ impl DesktopState {
 
         self.cursor_manager
             .set_base_size_and_scale(24, scale as f32);
+        self.refresh_all_fractional_scales();
     }
 
     pub fn insert_nested_output(
@@ -9768,6 +11590,7 @@ impl DesktopState {
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();
         self.refresh_ai_flow_mode();
+        self.reconcile_split_work_areas();
     }
 
     /// Update output enter/leave and refresh mapped client surfaces. Call before flushing Wayland clients.
@@ -10166,6 +11989,13 @@ impl DesktopState {
         if self.toplevel_pointer.is_some() {
             return;
         }
+        self.displaced_split_windows.remove(&id);
+        if self
+            .window(id)
+            .is_some_and(|window| window.tile_rect.is_some())
+        {
+            self.restore_split_window(id);
+        }
         let Some(w) = self.window(id) else {
             return;
         };
@@ -10173,6 +12003,7 @@ impl DesktopState {
             return;
         };
         self.clear_client_pointer_focus(self.pointer_pos);
+        self.clear_snap_preview();
         self.toplevel_pointer = Some(ToplevelPointerInteraction::Move {
             window_id: id,
             pointer_start: self.pointer_pos,
@@ -10189,6 +12020,12 @@ impl DesktopState {
             Some(ToplevelPointerInteraction::Move { .. })
         ) {
             return;
+        }
+        if self
+            .window(id)
+            .is_some_and(|window| window.tile_rect.is_some())
+        {
+            self.restore_split_window(id);
         }
         let edges_m = ResizeEdgeMask::from(edges);
         let pointer_pos = self.pointer_pos;
@@ -10219,6 +12056,1454 @@ impl DesktopState {
         }
     }
 
+    fn split_focused_window(&mut self, direction: SplitDirection) {
+        let Some(id) = self.focused_window else {
+            return;
+        };
+        self.record_split_undo([id]);
+        self.split_window(id, direction);
+        if self
+            .window(id)
+            .is_some_and(|window| window.tile_rect.is_some())
+        {
+            self.announce_split(format!(
+                "Window placed in {} split",
+                split_direction_label(direction)
+            ));
+        }
+    }
+
+    fn split_pair_for_output(&self, output_id: OutputId) -> Option<SplitPair> {
+        if !self.workspaces.split_screen_enabled {
+            return None;
+        }
+        let output = self.outputs.get(&output_id)?;
+        let workspace = output.active_workspace;
+        let work = self.work_recess_for_output(output_id)?;
+        let candidates = self.windows.iter().filter(|window| {
+            window.mapped
+                && !window.minimized
+                && window.output == Some(output_id)
+                && window.workspace == workspace
+                && window.tile_rect.is_some()
+        });
+
+        let mut left = None;
+        let mut right = None;
+        let mut top = None;
+        let mut bottom = None;
+        for window in candidates {
+            let rect = window
+                .tile_rect
+                .expect("split candidate has a tile rectangle");
+            if rect.loc == work.loc && rect.size.h == work.size.h {
+                left = Some((window.id, rect));
+            }
+            if rect.loc.y == work.loc.y
+                && rect.size.h == work.size.h
+                && rect.loc.x + rect.size.w == work.loc.x + work.size.w
+            {
+                right = Some((window.id, rect));
+            }
+            if rect.loc == work.loc && rect.size.w == work.size.w {
+                top = Some((window.id, rect));
+            }
+            if rect.loc.x == work.loc.x
+                && rect.size.w == work.size.w
+                && rect.loc.y + rect.size.h == work.loc.y + work.size.h
+            {
+                bottom = Some((window.id, rect));
+            }
+        }
+
+        if let (Some((first, first_rect)), Some((second, second_rect))) = (left, right) {
+            if first != second && first_rect.loc.x + first_rect.size.w == second_rect.loc.x {
+                return Some(SplitPair {
+                    first,
+                    second,
+                    output: output_id,
+                    workspace,
+                    work,
+                    axis: SplitAxis::Vertical,
+                });
+            }
+        }
+        if let (Some((first, first_rect)), Some((second, second_rect))) = (top, bottom) {
+            if first != second && first_rect.loc.y + first_rect.size.h == second_rect.loc.y {
+                return Some(SplitPair {
+                    first,
+                    second,
+                    output: output_id,
+                    workspace,
+                    work,
+                    axis: SplitAxis::Horizontal,
+                });
+            }
+        }
+        None
+    }
+
+    fn split_group_window_ids(&self, output_id: OutputId, workspace: WorkspaceId) -> Vec<WindowId> {
+        self.windows
+            .iter()
+            .filter(|window| {
+                window.mapped
+                    && !window.minimized
+                    && window.output == Some(output_id)
+                    && window.workspace == workspace
+                    && window.tile_rect.is_some()
+            })
+            .map(|window| window.id)
+            .collect()
+    }
+
+    fn announce_split(&mut self, message: impl Into<String>) {
+        self.accessibility.set_announcement(message);
+        self.publish_accessibility_tree();
+    }
+
+    fn record_split_undo<I>(&mut self, ids: I)
+    where
+        I: IntoIterator<Item = WindowId>,
+    {
+        let mut seen = HashSet::new();
+        let windows = ids
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .filter_map(|id| {
+                let window = self.window(id)?;
+                Some(SplitUndoWindow {
+                    id,
+                    output: window.output,
+                    workspace: window.workspace,
+                    tile_rect: window.tile_rect,
+                    float_rect: window.float_rect,
+                    split_restore_rect: window.split_restore_rect,
+                    suspended_tile_rect: window.suspended_tile_rect,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !windows.is_empty() {
+            self.split_undo = Some(SplitUndoState { windows });
+        }
+    }
+
+    fn undo_last_split_action(&mut self) -> bool {
+        let Some(undo) = self.split_undo.take() else {
+            self.announce_split("Nothing to undo");
+            return false;
+        };
+        for saved in undo.windows {
+            let Some(index) = self.windows.iter().position(|window| window.id == saved.id) else {
+                continue;
+            };
+            let window = self.windows[index].window.clone();
+            let old_bbox = self.global_window_bbox(&window);
+            self.windows[index].output = saved.output;
+            self.windows[index].workspace = saved.workspace;
+            self.windows[index].float_rect = saved.float_rect;
+            self.windows[index].split_restore_rect = saved.split_restore_rect;
+            self.windows[index].suspended_tile_rect = saved.suspended_tile_rect;
+            self.windows[index].tile_rect = saved.tile_rect;
+
+            let target = saved
+                .tile_rect
+                .or(saved.float_rect)
+                .or(saved.split_restore_rect);
+            if let Some(target) = target {
+                let direction = saved.tile_rect.and_then(|_| {
+                    saved
+                        .output
+                        .and_then(|output| self.work_recess_for_output(output))
+                        .and_then(|work| split_direction_for_rect(work, target))
+                });
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|state| {
+                        set_split_states(&mut state.states, direction);
+                        state.size = Some(target.size);
+                    });
+                    toplevel.send_pending_configure();
+                }
+                if let Some(x11) = window.x11_surface() {
+                    let _ = x11.configure(target);
+                }
+                self.map_window_bbox_location(window, target.loc, true);
+                if let Some(rect) = old_bbox {
+                    self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+                }
+                self.mark_window_bbox_damage_source(target, DamageSource::WindowResize);
+            }
+        }
+        self.space.refresh();
+        self.announce_split("Undid last split action");
+        true
+    }
+
+    fn focus_split_group_member(&mut self, forward: bool) -> bool {
+        let Some(focused) = self.focused_window else {
+            return false;
+        };
+        let Some(window) = self.window(focused) else {
+            return false;
+        };
+        let Some(output) = window.output else {
+            return false;
+        };
+        if window.tile_rect.is_none() {
+            return false;
+        }
+        let mut members = self
+            .split_group_window_ids(output, window.workspace)
+            .into_iter()
+            .filter_map(|id| self.window(id)?.tile_rect.map(|rect| (id, rect)))
+            .collect::<Vec<_>>();
+        members.sort_by_key(|(id, rect)| (rect.loc.y, rect.loc.x, id.0));
+        if members.len() < 2 {
+            return false;
+        }
+        let Some(index) = members.iter().position(|(id, _)| *id == focused) else {
+            return false;
+        };
+        let next = if forward {
+            (index + 1) % members.len()
+        } else {
+            (index + members.len() - 1) % members.len()
+        };
+        let id = members[next].0;
+        let title = self
+            .window(id)
+            .map(ManagedWindow::title)
+            .unwrap_or_else(|| "Window".to_string());
+        self.focus_window_id(id);
+        self.announce_split(format!(
+            "Focused split pane {} of {}: {title}",
+            next + 1,
+            members.len()
+        ));
+        true
+    }
+
+    fn focused_split_divider(&self, requested: SplitDirection) -> Option<SplitGridDivider> {
+        let focused = self.focused_window?;
+        let output = self.window(focused)?.output?;
+        self.split_grid_dividers_for_output(output)
+            .into_iter()
+            .find(|divider| match requested {
+                SplitDirection::Left => {
+                    divider.axis == SplitAxis::Vertical && divider.after.contains(&Some(focused))
+                }
+                SplitDirection::Right => {
+                    divider.axis == SplitAxis::Vertical && divider.before.contains(&Some(focused))
+                }
+                SplitDirection::Top => {
+                    divider.axis == SplitAxis::Horizontal && divider.after.contains(&Some(focused))
+                }
+                SplitDirection::Bottom => {
+                    divider.axis == SplitAxis::Horizontal && divider.before.contains(&Some(focused))
+                }
+                _ => false,
+            })
+    }
+
+    fn resize_focused_split_divider(&mut self, requested: SplitDirection, fine: bool) -> bool {
+        let Some(divider) = self.focused_split_divider(requested) else {
+            return false;
+        };
+        let ids = divider
+            .before
+            .into_iter()
+            .chain(divider.after)
+            .flatten()
+            .collect::<Vec<_>>();
+        self.record_split_undo(ids);
+        let extent = match divider.axis {
+            SplitAxis::Vertical => divider.work.size.w,
+            SplitAxis::Horizontal => divider.work.size.h,
+        };
+        let delta = ((extent as f64 * if fine { 0.01 } else { 0.05 }).round() as i32).max(1);
+        let sign = match requested {
+            SplitDirection::Left | SplitDirection::Top => -1,
+            _ => 1,
+        };
+        let boundary = divider.boundary + sign * delta;
+        let position = match divider.axis {
+            SplitAxis::Vertical => Point::from((boundary as f64, divider.span_start as f64)),
+            SplitAxis::Horizontal => Point::from((divider.span_start as f64, boundary as f64)),
+        };
+        self.resize_split_grid_divider(divider, position);
+        let actual = self
+            .split_grid_dividers_for_output(divider.output)
+            .into_iter()
+            .find(|candidate| {
+                candidate.axis == divider.axis
+                    && candidate.before == divider.before
+                    && candidate.after == divider.after
+            })
+            .map(|candidate| candidate.boundary)
+            .unwrap_or(boundary);
+        let origin = match divider.axis {
+            SplitAxis::Vertical => divider.work.loc.x,
+            SplitAxis::Horizontal => divider.work.loc.y,
+        };
+        let percent = (((actual - origin) as f64 / extent.max(1) as f64) * 100.0)
+            .round()
+            .clamp(0.0, 100.0) as u8;
+        self.split_resize_hud = Some(SplitResizeHud {
+            output: divider.output,
+            percent,
+            started_at: Instant::now(),
+        });
+        self.mark_output_full_damage(divider.output, DamageSource::WindowResize);
+        self.announce_split(format!("Split divider {percent} percent"));
+        true
+    }
+
+    fn split_grid_dividers_for_output(&self, output_id: OutputId) -> Vec<SplitGridDivider> {
+        if !self.workspaces.split_screen_enabled {
+            return Vec::new();
+        }
+        let Some(output) = self.outputs.get(&output_id) else {
+            return Vec::new();
+        };
+        let workspace = output.active_workspace;
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return Vec::new();
+        };
+        let tiles: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.mapped
+                    && !window.minimized
+                    && window.output == Some(output_id)
+                    && window.workspace == workspace
+            })
+            .filter_map(|window| window.tile_rect.map(|rect| (window.id, rect)))
+            .collect();
+        let mut dividers = Vec::new();
+        for axis in [SplitAxis::Vertical, SplitAxis::Horizontal] {
+            let mut boundaries: Vec<i32> = tiles
+                .iter()
+                .flat_map(|(_, rect)| match axis {
+                    SplitAxis::Vertical => [rect.loc.x, rect.loc.x + rect.size.w],
+                    SplitAxis::Horizontal => [rect.loc.y, rect.loc.y + rect.size.h],
+                })
+                .filter(|boundary| match axis {
+                    SplitAxis::Vertical => {
+                        *boundary > work.loc.x && *boundary < work.loc.x + work.size.w
+                    }
+                    SplitAxis::Horizontal => {
+                        *boundary > work.loc.y && *boundary < work.loc.y + work.size.h
+                    }
+                })
+                .collect();
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            for boundary in boundaries {
+                let before: Vec<_> = tiles
+                    .iter()
+                    .filter(|(_, rect)| match axis {
+                        SplitAxis::Vertical => rect.loc.x + rect.size.w == boundary,
+                        SplitAxis::Horizontal => rect.loc.y + rect.size.h == boundary,
+                    })
+                    .copied()
+                    .collect();
+                let after: Vec<_> = tiles
+                    .iter()
+                    .filter(|(_, rect)| match axis {
+                        SplitAxis::Vertical => rect.loc.x == boundary,
+                        SplitAxis::Horizontal => rect.loc.y == boundary,
+                    })
+                    .copied()
+                    .collect();
+                let overlaps = |a: Rectangle<i32, Logical>, b: Rectangle<i32, Logical>| match axis {
+                    SplitAxis::Vertical => {
+                        a.loc.y < b.loc.y + b.size.h && b.loc.y < a.loc.y + a.size.h
+                    }
+                    SplitAxis::Horizontal => {
+                        a.loc.x < b.loc.x + b.size.w && b.loc.x < a.loc.x + a.size.w
+                    }
+                };
+                let before: Vec<_> = before
+                    .into_iter()
+                    .filter(|(_, rect)| after.iter().any(|(_, other)| overlaps(*rect, *other)))
+                    .collect();
+                let after: Vec<_> = after
+                    .into_iter()
+                    .filter(|(_, rect)| before.iter().any(|(_, other)| overlaps(*rect, *other)))
+                    .collect();
+                if before.is_empty() || after.is_empty() {
+                    continue;
+                }
+                let spans = before.iter().chain(&after).map(|(_, rect)| match axis {
+                    SplitAxis::Vertical => (rect.loc.y, rect.loc.y + rect.size.h),
+                    SplitAxis::Horizontal => (rect.loc.x, rect.loc.x + rect.size.w),
+                });
+                let (span_start, span_end) = spans.fold(
+                    (i32::MAX, i32::MIN),
+                    |(start, end), (next_start, next_end)| {
+                        (start.min(next_start), end.max(next_end))
+                    },
+                );
+                let mut before_ids = [None; 4];
+                let mut after_ids = [None; 4];
+                for (slot, (id, _)) in before_ids.iter_mut().zip(before.iter()) {
+                    *slot = Some(*id);
+                }
+                for (slot, (id, _)) in after_ids.iter_mut().zip(after.iter()) {
+                    *slot = Some(*id);
+                }
+                dividers.push(SplitGridDivider {
+                    before: before_ids,
+                    after: after_ids,
+                    output: output_id,
+                    workspace,
+                    work,
+                    axis,
+                    boundary,
+                    span_start,
+                    span_end,
+                });
+            }
+        }
+        dividers
+    }
+
+    fn split_grid_divider_rect(divider: SplitGridDivider) -> Rectangle<i32, Logical> {
+        const DIVIDER_VISUAL_SIZE: i32 = 4;
+        match divider.axis {
+            SplitAxis::Vertical => Rectangle::from_loc_and_size(
+                (
+                    divider.boundary - DIVIDER_VISUAL_SIZE / 2,
+                    divider.span_start,
+                ),
+                (DIVIDER_VISUAL_SIZE, divider.span_end - divider.span_start),
+            ),
+            SplitAxis::Horizontal => Rectangle::from_loc_and_size(
+                (
+                    divider.span_start,
+                    divider.boundary - DIVIDER_VISUAL_SIZE / 2,
+                ),
+                (divider.span_end - divider.span_start, DIVIDER_VISUAL_SIZE),
+            ),
+        }
+    }
+
+    fn split_pair_divider_rect(pair: SplitPair, boundary: i32) -> Rectangle<i32, Logical> {
+        const DIVIDER_VISUAL_SIZE: i32 = 4;
+        match pair.axis {
+            SplitAxis::Vertical => Rectangle::from_loc_and_size(
+                (boundary - DIVIDER_VISUAL_SIZE / 2, pair.work.loc.y),
+                (DIVIDER_VISUAL_SIZE, pair.work.size.h),
+            ),
+            SplitAxis::Horizontal => Rectangle::from_loc_and_size(
+                (pair.work.loc.x, boundary - DIVIDER_VISUAL_SIZE / 2),
+                (pair.work.size.w, DIVIDER_VISUAL_SIZE),
+            ),
+        }
+    }
+
+    fn split_pair_boundary(&self, pair: SplitPair) -> Option<i32> {
+        let first_rect = self.window(pair.first)?.tile_rect?;
+        Some(match pair.axis {
+            SplitAxis::Vertical => first_rect.loc.x + first_rect.size.w,
+            SplitAxis::Horizontal => first_rect.loc.y + first_rect.size.h,
+        })
+    }
+
+    fn swap_split_pair(&mut self, pair: SplitPair) {
+        let Some(first_rect) = self.window(pair.first).and_then(|window| window.tile_rect) else {
+            return;
+        };
+        let Some(second_rect) = self.window(pair.second).and_then(|window| window.tile_rect) else {
+            return;
+        };
+        let (first_direction, second_direction) = match pair.axis {
+            SplitAxis::Vertical => (SplitDirection::Right, SplitDirection::Left),
+            SplitAxis::Horizontal => (SplitDirection::Bottom, SplitDirection::Top),
+        };
+        self.record_split_undo([pair.first, pair.second]);
+        self.configure_split_member(pair.first, second_rect, first_direction);
+        self.configure_split_member(pair.second, first_rect, second_direction);
+        self.space.refresh();
+        self.announce_split("Swapped split panes");
+    }
+
+    fn swap_focused_split_neighbor(&mut self, requested: SplitDirection) -> bool {
+        if !self.workspaces.split_screen_enabled {
+            return false;
+        }
+        let Some(focused) = self.focused_window else {
+            return false;
+        };
+        let output = self
+            .window(focused)
+            .and_then(|window| window.output)
+            .unwrap_or(self.focused_output);
+        let Some(focused_state) = self.window(focused) else {
+            return false;
+        };
+        let workspace = focused_state.workspace;
+        let Some(focused_rect) = focused_state.tile_rect else {
+            return false;
+        };
+        let overlap = |candidate: Rectangle<i32, Logical>| match requested {
+            SplitDirection::Left if candidate.loc.x + candidate.size.w == focused_rect.loc.x => {
+                (candidate.loc.y + candidate.size.h).min(focused_rect.loc.y + focused_rect.size.h)
+                    - candidate.loc.y.max(focused_rect.loc.y)
+            }
+            SplitDirection::Right
+                if focused_rect.loc.x + focused_rect.size.w == candidate.loc.x =>
+            {
+                (candidate.loc.y + candidate.size.h).min(focused_rect.loc.y + focused_rect.size.h)
+                    - candidate.loc.y.max(focused_rect.loc.y)
+            }
+            SplitDirection::Top if candidate.loc.y + candidate.size.h == focused_rect.loc.y => {
+                (candidate.loc.x + candidate.size.w).min(focused_rect.loc.x + focused_rect.size.w)
+                    - candidate.loc.x.max(focused_rect.loc.x)
+            }
+            SplitDirection::Bottom
+                if focused_rect.loc.y + focused_rect.size.h == candidate.loc.y =>
+            {
+                (candidate.loc.x + candidate.size.w).min(focused_rect.loc.x + focused_rect.size.w)
+                    - candidate.loc.x.max(focused_rect.loc.x)
+            }
+            _ => 0,
+        };
+        let neighbor = self
+            .split_group_window_ids(output, workspace)
+            .into_iter()
+            .filter(|id| *id != focused)
+            .filter_map(|id| {
+                let rect = self.window(id)?.tile_rect?;
+                let shared_edge = overlap(rect);
+                (shared_edge > 0).then_some((id, rect, shared_edge))
+            })
+            .max_by_key(|(_, _, shared_edge)| *shared_edge);
+        let Some((neighbor, neighbor_rect, _)) = neighbor else {
+            return false;
+        };
+        let Some(work) = self.work_recess_for_output(output) else {
+            return false;
+        };
+        let Some(focused_direction) = split_direction_for_rect(work, neighbor_rect) else {
+            return false;
+        };
+        let Some(neighbor_direction) = split_direction_for_rect(work, focused_rect) else {
+            return false;
+        };
+        self.record_split_undo([focused, neighbor]);
+        self.configure_split_member(focused, neighbor_rect, focused_direction);
+        self.configure_split_member(neighbor, focused_rect, neighbor_direction);
+        self.space.refresh();
+        self.announce_split("Swapped split panes");
+        true
+    }
+
+    fn focused_split_pair(&self) -> Option<SplitPair> {
+        let focused = self.focused_window?;
+        let output = self.window(focused)?.output.unwrap_or(self.focused_output);
+        self.split_pair_for_output(output)
+            .filter(|pair| pair.first == focused || pair.second == focused)
+    }
+
+    fn exit_focused_split_group(&mut self) {
+        let Some(focused) = self.focused_window else {
+            return;
+        };
+        let Some(window) = self.window(focused) else {
+            return;
+        };
+        let Some(output) = window.output else {
+            return;
+        };
+        if window.tile_rect.is_none() {
+            return;
+        }
+        let ids = self.split_group_window_ids(output, window.workspace);
+        self.record_split_undo(ids.iter().copied());
+        for id in ids {
+            self.restore_split_window(id);
+        }
+        self.announce_split("Exited split group");
+    }
+
+    fn replace_focused_split_window(&mut self) {
+        let Some(focused) = self.focused_window else {
+            return;
+        };
+        let Some(window) = self.window(focused) else {
+            return;
+        };
+        let Some(output) = window.output else {
+            return;
+        };
+        let workspace = window.workspace;
+        let Some(focused_rect) = window.tile_rect else {
+            return;
+        };
+        let Some(work) = self.work_recess_for_output(output) else {
+            return;
+        };
+        let Some(focused_direction) = split_direction_for_rect(work, focused_rect) else {
+            return;
+        };
+        let ids = self.split_group_window_ids(output, workspace);
+        let Some(source) = ids.iter().copied().find(|id| *id != focused) else {
+            return;
+        };
+        let mut used = [None; 4];
+        for (slot, id) in used.iter_mut().zip(ids) {
+            *slot = Some(id);
+        }
+        let candidate_state = SplitAssistState {
+            source,
+            used,
+            output,
+            workspace,
+            target: focused_rect,
+            direction: focused_direction,
+            remaining: [None, None],
+        };
+        if !self
+            .windows
+            .iter()
+            .any(|window| self.split_assist_candidate(window.id, candidate_state))
+        {
+            return;
+        }
+        self.restore_split_window(focused);
+        self.start_split_assist_targets(
+            source,
+            output,
+            vec![SplitAssistTarget {
+                rect: focused_rect,
+                direction: focused_direction,
+            }],
+            used,
+        );
+    }
+
+    pub(crate) fn split_divider_rects_for_output(
+        &self,
+        output_id: OutputId,
+    ) -> Vec<(Rectangle<i32, Logical>, bool)> {
+        let Some(output_origin) = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.logical_origin)
+        else {
+            return Vec::new();
+        };
+        self.split_grid_dividers_for_output(output_id)
+            .into_iter()
+            .map(|divider| {
+                let active = self.split_divider_drag.is_some_and(|drag| {
+                    drag.divider.axis == divider.axis
+                        && drag.divider.before == divider.before
+                        && drag.divider.after == divider.after
+                });
+                let mut rect = Self::split_grid_divider_rect(divider);
+                rect.loc -= output_origin;
+                (rect, active)
+            })
+            .collect()
+    }
+
+    pub(crate) fn split_resize_percent_for_output(
+        &self,
+        output_id: OutputId,
+        now: Instant,
+    ) -> Option<u8> {
+        self.split_resize_hud
+            .filter(|hud| {
+                hud.output == output_id
+                    && now.saturating_duration_since(hud.started_at) < SPLIT_RESIZE_HUD_DURATION
+            })
+            .map(|hud| hud.percent)
+    }
+
+    pub(crate) fn snap_preview_rect_for_output(
+        &self,
+        output_id: OutputId,
+    ) -> Option<Rectangle<i32, Logical>> {
+        let preview = self
+            .snap_preview
+            .filter(|preview| preview.output == output_id)?;
+        let output_origin = self.outputs.get(&output_id)?.logical_origin;
+        let mut rect = preview.target;
+        rect.loc -= output_origin;
+        Some(rect)
+    }
+
+    fn clear_snap_preview(&mut self) {
+        if let Some(preview) = self.snap_preview.take() {
+            self.mark_output_full_damage(preview.output, DamageSource::WindowMove);
+        }
+    }
+
+    fn update_snap_preview(&mut self, window: WindowId, position: Point<f64, Logical>) -> bool {
+        let next = if self.workspaces.split_screen_enabled {
+            self.output_under_pointer(position).and_then(|output| {
+                let work = self.work_recess_for_output(output)?;
+                let (target, direction) = snap_target_for_pointer(work, position)?;
+                let min_size = self.split_window_min_size(window);
+                (min_size.w <= target.size.w && min_size.h <= target.size.h).then_some(
+                    SnapPreview {
+                        window,
+                        output,
+                        target,
+                        direction,
+                    },
+                )
+            })
+        } else {
+            None
+        };
+        if self.snap_preview == next {
+            return false;
+        }
+        let previous = std::mem::replace(&mut self.snap_preview, next);
+        if let Some(preview) = previous {
+            self.mark_output_full_damage(preview.output, DamageSource::WindowMove);
+        }
+        if let Some(preview) = next {
+            self.mark_output_full_damage(preview.output, DamageSource::WindowMove);
+        }
+        true
+    }
+
+    fn split_divider_at(&self, position: Point<f64, Logical>) -> Option<SplitGridDivider> {
+        const DIVIDER_HIT_SIZE: i32 = 12;
+        let output_id = self.output_under_pointer(position)?;
+        self.split_grid_dividers_for_output(output_id)
+            .into_iter()
+            .find(|divider| {
+                let visual = Self::split_grid_divider_rect(*divider);
+                let hit: Rectangle<i32, Logical> = match divider.axis {
+                    SplitAxis::Vertical => Rectangle::from_loc_and_size(
+                        (
+                            visual.loc.x - (DIVIDER_HIT_SIZE - visual.size.w) / 2,
+                            visual.loc.y,
+                        ),
+                        (DIVIDER_HIT_SIZE, visual.size.h),
+                    ),
+                    SplitAxis::Horizontal => Rectangle::from_loc_and_size(
+                        (
+                            visual.loc.x,
+                            visual.loc.y - (DIVIDER_HIT_SIZE - visual.size.h) / 2,
+                        ),
+                        (visual.size.w, DIVIDER_HIT_SIZE),
+                    ),
+                };
+                hit.contains((position.x.round() as i32, position.y.round() as i32))
+            })
+    }
+
+    fn split_window_min_size(&self, id: WindowId) -> Size<i32, Logical> {
+        let Some(window) = self.window(id).map(|managed| &managed.window) else {
+            return Size::from((1, 1));
+        };
+        if let Some(toplevel) = window.toplevel() {
+            return compositor::with_states(toplevel.wl_surface(), |states| {
+                let mut guard = states.cached_state.get::<SurfaceCachedState>();
+                let size = guard.current().min_size;
+                Size::from((size.w.max(1), size.h.max(1)))
+            });
+        }
+        #[cfg(feature = "xwayland")]
+        if let Some(size) = window.x11_surface().and_then(|surface| surface.min_size()) {
+            return Size::from((size.w.max(1), size.h.max(1)));
+        }
+        Size::from((1, 1))
+    }
+
+    fn configure_split_member(
+        &mut self,
+        id: WindowId,
+        target: Rectangle<i32, Logical>,
+        direction: SplitDirection,
+    ) {
+        let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
+            return;
+        };
+        let window = self.windows[idx].window.clone();
+        let old_bbox = self.global_window_bbox(&window);
+        self.windows[idx].tile_rect = Some(target);
+
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                set_split_states(&mut state.states, Some(direction));
+                state.size = Some(target.size);
+            });
+            toplevel.send_pending_configure();
+        }
+        if let Some(x11) = window.x11_surface() {
+            let _ = x11.configure(target);
+        }
+        self.map_window_bbox_location(window, target.loc, false);
+        if let Some(rect) = old_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
+        self.mark_window_bbox_damage_source(target, DamageSource::WindowResize);
+    }
+
+    fn resize_split_pair(&mut self, pair: SplitPair, position: Point<f64, Logical>) {
+        let Some(current) = self.split_pair_for_output(pair.output) else {
+            self.split_divider_drag = None;
+            return;
+        };
+        if current.first != pair.first
+            || current.second != pair.second
+            || current.workspace != pair.workspace
+            || current.axis != pair.axis
+        {
+            self.split_divider_drag = None;
+            return;
+        }
+
+        let first_min = self.split_window_min_size(pair.first);
+        let second_min = self.split_window_min_size(pair.second);
+        let work = current.work;
+        match pair.axis {
+            SplitAxis::Vertical => {
+                let first_min_width = first_min.w.max(MIN_SPLIT_PANE_WIDTH);
+                let second_min_width = second_min.w.max(MIN_SPLIT_PANE_WIDTH);
+                let Some((first, second)) = resized_split_rects(
+                    work,
+                    SplitAxis::Vertical,
+                    position.x.round() as i32,
+                    first_min_width,
+                    second_min_width,
+                ) else {
+                    return;
+                };
+                self.configure_split_member(pair.first, first, SplitDirection::Left);
+                self.configure_split_member(pair.second, second, SplitDirection::Right);
+            }
+            SplitAxis::Horizontal => {
+                let first_min_height = first_min.h.max(MIN_SPLIT_PANE_HEIGHT);
+                let second_min_height = second_min.h.max(MIN_SPLIT_PANE_HEIGHT);
+                let Some((first, second)) = resized_split_rects(
+                    work,
+                    SplitAxis::Horizontal,
+                    position.y.round() as i32,
+                    first_min_height,
+                    second_min_height,
+                ) else {
+                    return;
+                };
+                self.configure_split_member(pair.first, first, SplitDirection::Top);
+                self.configure_split_member(pair.second, second, SplitDirection::Bottom);
+            }
+        }
+        self.space.refresh();
+    }
+
+    fn resize_split_grid_divider(
+        &mut self,
+        divider: SplitGridDivider,
+        position: Point<f64, Logical>,
+    ) {
+        let Some(current) = self
+            .split_grid_dividers_for_output(divider.output)
+            .into_iter()
+            .find(|candidate| {
+                candidate.axis == divider.axis
+                    && candidate.workspace == divider.workspace
+                    && candidate.before == divider.before
+                    && candidate.after == divider.after
+            })
+        else {
+            self.split_divider_drag = None;
+            return;
+        };
+
+        let requested = match current.axis {
+            SplitAxis::Vertical => position.x.round() as i32,
+            SplitAxis::Horizontal => position.y.round() as i32,
+        };
+        let mut minimum = match current.axis {
+            SplitAxis::Vertical => current.work.loc.x,
+            SplitAxis::Horizontal => current.work.loc.y,
+        };
+        let mut maximum = match current.axis {
+            SplitAxis::Vertical => current.work.loc.x + current.work.size.w,
+            SplitAxis::Horizontal => current.work.loc.y + current.work.size.h,
+        };
+
+        for id in current.before.into_iter().flatten() {
+            let Some(rect) = self.window(id).and_then(|window| window.tile_rect) else {
+                self.split_divider_drag = None;
+                return;
+            };
+            let min_size = self.split_window_min_size(id);
+            minimum = minimum.max(match current.axis {
+                SplitAxis::Vertical => rect.loc.x + min_size.w.max(MIN_SPLIT_PANE_WIDTH),
+                SplitAxis::Horizontal => rect.loc.y + min_size.h.max(MIN_SPLIT_PANE_HEIGHT),
+            });
+        }
+        for id in current.after.into_iter().flatten() {
+            let Some(rect) = self.window(id).and_then(|window| window.tile_rect) else {
+                self.split_divider_drag = None;
+                return;
+            };
+            let min_size = self.split_window_min_size(id);
+            maximum = maximum.min(match current.axis {
+                SplitAxis::Vertical => {
+                    rect.loc.x + rect.size.w - min_size.w.max(MIN_SPLIT_PANE_WIDTH)
+                }
+                SplitAxis::Horizontal => {
+                    rect.loc.y + rect.size.h - min_size.h.max(MIN_SPLIT_PANE_HEIGHT)
+                }
+            });
+        }
+        if minimum > maximum {
+            return;
+        }
+        let boundary = requested.clamp(minimum, maximum);
+
+        let before: Vec<_> = current.before.into_iter().flatten().collect();
+        let after: Vec<_> = current.after.into_iter().flatten().collect();
+        for id in before {
+            let Some(mut rect) = self.window(id).and_then(|window| window.tile_rect) else {
+                continue;
+            };
+            match current.axis {
+                SplitAxis::Vertical => rect.size.w = boundary - rect.loc.x,
+                SplitAxis::Horizontal => rect.size.h = boundary - rect.loc.y,
+            }
+            if let Some(direction) = split_direction_for_rect(current.work, rect) {
+                self.configure_split_member(id, rect, direction);
+            }
+        }
+        for id in after {
+            let Some(mut rect) = self.window(id).and_then(|window| window.tile_rect) else {
+                continue;
+            };
+            match current.axis {
+                SplitAxis::Vertical => {
+                    let far_edge = rect.loc.x + rect.size.w;
+                    rect.loc.x = boundary;
+                    rect.size.w = far_edge - boundary;
+                }
+                SplitAxis::Horizontal => {
+                    let far_edge = rect.loc.y + rect.size.h;
+                    rect.loc.y = boundary;
+                    rect.size.h = far_edge - boundary;
+                }
+            }
+            if let Some(direction) = split_direction_for_rect(current.work, rect) {
+                self.configure_split_member(id, rect, direction);
+            }
+        }
+        self.space.refresh();
+    }
+
+    fn split_window(&mut self, id: WindowId, direction: SplitDirection) {
+        let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
+            return;
+        };
+        let output_id = self.windows[idx]
+            .output
+            .or_else(|| self.output_under_pointer(self.pointer_pos))
+            .unwrap_or(self.focused_output);
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return;
+        };
+        let Some(mut target) = split_rect(work, direction) else {
+            flog_warn!(
+                "Split screen {:?} unavailable: work area {}x{} is below the minimum pane size",
+                direction,
+                work.size.w,
+                work.size.h
+            );
+            return;
+        };
+        let ratio = self.split_ratio_for_output(output_id, direction);
+        let boundary = match direction {
+            SplitDirection::Left | SplitDirection::Right => {
+                work.loc.x + (work.size.w as f64 * ratio).round() as i32
+            }
+            SplitDirection::Top | SplitDirection::Bottom => {
+                work.loc.y + (work.size.h as f64 * ratio).round() as i32
+            }
+            _ => 0,
+        };
+        let resized = match direction {
+            SplitDirection::Left | SplitDirection::Right => resized_split_rects(
+                work,
+                SplitAxis::Vertical,
+                boundary,
+                MIN_SPLIT_PANE_WIDTH,
+                MIN_SPLIT_PANE_WIDTH,
+            ),
+            SplitDirection::Top | SplitDirection::Bottom => resized_split_rects(
+                work,
+                SplitAxis::Horizontal,
+                boundary,
+                MIN_SPLIT_PANE_HEIGHT,
+                MIN_SPLIT_PANE_HEIGHT,
+            ),
+            _ => None,
+        };
+        if let Some((first, second)) = resized {
+            target = match direction {
+                SplitDirection::Left | SplitDirection::Top => first,
+                SplitDirection::Right | SplitDirection::Bottom => second,
+                _ => target,
+            };
+        }
+        if self.place_window_in_split_rect(id, output_id, target, direction) {
+            self.start_split_assist(id, output_id, target, direction);
+        }
+    }
+
+    fn split_ratio_for_output(&self, output_id: OutputId, direction: SplitDirection) -> f64 {
+        let Some(connector) = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.handle.name())
+        else {
+            return 0.5;
+        };
+        let stored = self.workspaces.split_ratios.get(connector.as_str());
+        match direction {
+            SplitDirection::Left | SplitDirection::Right => {
+                stored.map_or(0.5, |ratio| ratio.side_by_side.clamp(0.0, 1.0))
+            }
+            SplitDirection::Top | SplitDirection::Bottom => {
+                stored.map_or(0.5, |ratio| ratio.stacked.clamp(0.0, 1.0))
+            }
+            _ => 0.5,
+        }
+    }
+
+    fn persist_split_ratio(&mut self, output_id: OutputId, axis: SplitAxis, ratio: f64) {
+        let Some(connector) = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.handle.name().to_string())
+        else {
+            return;
+        };
+        let ratio = ratio.clamp(0.0, 1.0);
+        let entry = self
+            .workspaces
+            .split_ratios
+            .entry(connector.clone())
+            .or_default();
+        match axis {
+            SplitAxis::Vertical => entry.side_by_side = ratio,
+            SplitAxis::Horizontal => entry.stacked = ratio,
+        }
+
+        let mut settings = load_settings();
+        settings.workspaces.split_ratios = self.workspaces.split_ratios.clone();
+        if let Err(error) = save_settings(&settings) {
+            flog_warn!("Could not save split ratio for {connector}: {error}");
+        }
+    }
+
+    fn remember_split_ratio(&mut self, pair: SplitPair) {
+        let Some(current) = self.split_pair_for_output(pair.output) else {
+            return;
+        };
+        let Some(boundary) = self.split_pair_boundary(current) else {
+            return;
+        };
+        let ratio = match current.axis {
+            SplitAxis::Vertical => {
+                (boundary - current.work.loc.x) as f64 / current.work.size.w.max(1) as f64
+            }
+            SplitAxis::Horizontal => {
+                (boundary - current.work.loc.y) as f64 / current.work.size.h.max(1) as f64
+            }
+        };
+        self.persist_split_ratio(pair.output, current.axis, ratio);
+    }
+
+    fn place_window_in_split_rect(
+        &mut self,
+        id: WindowId,
+        output_id: OutputId,
+        target: Rectangle<i32, Logical>,
+        direction: SplitDirection,
+    ) -> bool {
+        if !self.workspaces.split_screen_enabled {
+            return false;
+        }
+        self.displaced_split_windows.remove(&id);
+
+        let Some(window_state) = self.window(id) else {
+            return false;
+        };
+        if !window_state.mapped
+            || window_state.fullscreen
+            || window_state.minimized
+            || window_state.is_dialog_like()
+        {
+            return false;
+        }
+
+        if window_state.maximized {
+            self.set_window_maximized(id, false);
+        }
+
+        let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
+            return false;
+        };
+        if self.windows[idx].tile_rect == Some(target) {
+            self.restore_split_window(id);
+            return false;
+        }
+
+        let window = self.windows[idx].window.clone();
+        if let Some(toplevel) = window.toplevel() {
+            let min_size = compositor::with_states(toplevel.wl_surface(), |states| {
+                let mut guard = states.cached_state.get::<SurfaceCachedState>();
+                guard.current().min_size
+            });
+            if min_size.w > target.size.w || min_size.h > target.size.h {
+                flog_warn!(
+                    "Split screen {:?} unavailable: client minimum {}x{} exceeds pane {}x{}",
+                    direction,
+                    min_size.w,
+                    min_size.h,
+                    target.size.w,
+                    target.size.h
+                );
+                return false;
+            }
+        }
+        #[cfg(feature = "xwayland")]
+        if let Some(x11) = window.x11_surface() {
+            if let Some(min_size) = x11.min_size() {
+                if min_size.w > target.size.w || min_size.h > target.size.h {
+                    flog_warn!(
+                        "Split screen {:?} unavailable: X11 client minimum {}x{} exceeds pane {}x{}",
+                        direction,
+                        min_size.w,
+                        min_size.h,
+                        target.size.w,
+                        target.size.h
+                    );
+                    return false;
+                }
+            }
+        }
+
+        let old_bbox = self.global_window_bbox(&window);
+        let restore_rect = self
+            .space
+            .element_bbox(&window)
+            .or(self.windows[idx].float_rect)
+            .unwrap_or_else(|| Rectangle::from_loc_and_size(target.loc, window.geometry().size));
+        {
+            let managed = &mut self.windows[idx];
+            if managed.tile_rect.is_none() {
+                managed.split_restore_rect = Some(restore_rect);
+            }
+            managed.suspended_tile_rect = None;
+            managed.tile_rect = Some(target);
+            managed.set_output(Some(output_id));
+        }
+
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                state.states.unset(xdg_toplevel::State::Maximized);
+                set_split_states(&mut state.states, Some(direction));
+                state.size = Some(target.size);
+            });
+            toplevel.send_pending_configure();
+        }
+        if let Some(x11) = window.x11_surface() {
+            let _ = x11.set_maximized(false);
+            let _ = x11.configure(target);
+        }
+
+        self.map_window_bbox_location(window.clone(), target.loc, true);
+        self.space.refresh();
+        if let Some(rect) = old_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
+        self.mark_window_bbox_damage_source(target, DamageSource::WindowResize);
+        true
+    }
+
+    fn apply_split_layout_preset(&mut self, preset: SplitLayoutPreset) {
+        if !self.workspaces.split_screen_enabled {
+            return;
+        }
+        let Some(id) = self.focused_window else {
+            return;
+        };
+        let output_id = self
+            .window(id)
+            .and_then(|window| window.output)
+            .unwrap_or(self.focused_output);
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return;
+        };
+        let Some((target, direction)) = split_preset_rect(work, preset) else {
+            return;
+        };
+        self.record_split_undo([id]);
+        if !self.place_window_in_split_rect(id, output_id, target, direction) {
+            return;
+        }
+        self.announce_split(format!(
+            "Window placed in {} split",
+            split_direction_label(direction)
+        ));
+        self.start_split_assist(id, output_id, target, direction);
+        if target.size.h == work.size.h {
+            let boundary = match direction {
+                SplitDirection::Left => target.loc.x + target.size.w,
+                SplitDirection::Right => target.loc.x,
+                _ => return,
+            };
+            self.persist_split_ratio(
+                output_id,
+                SplitAxis::Vertical,
+                (boundary - work.loc.x) as f64 / work.size.w.max(1) as f64,
+            );
+        } else if target.size.w == work.size.w {
+            let boundary = match direction {
+                SplitDirection::Top => target.loc.y + target.size.h,
+                SplitDirection::Bottom => target.loc.y,
+                _ => return,
+            };
+            self.persist_split_ratio(
+                output_id,
+                SplitAxis::Horizontal,
+                (boundary - work.loc.y) as f64 / work.size.h.max(1) as f64,
+            );
+        }
+    }
+
+    fn split_assist_candidate(&self, id: WindowId, state: SplitAssistState) -> bool {
+        let Some(window) = self.window(id) else {
+            return false;
+        };
+        if state.used.contains(&Some(id))
+            || !window.mapped
+            || window.minimized
+            || window.fullscreen
+            || window.is_dialog_like()
+            || window.workspace != state.workspace
+            || window.tile_rect == Some(state.target)
+        {
+            return false;
+        }
+        let output = window
+            .output
+            .unwrap_or_else(|| self.preferred_output_id_for_window(&window.window));
+        output == state.output
+            && self.split_window_min_size(id).w <= state.target.size.w
+            && self.split_window_min_size(id).h <= state.target.size.h
+    }
+
+    fn split_assist_state_valid(&self, state: SplitAssistState) -> bool {
+        self.workspaces.split_screen_enabled
+            && self.window(state.source).is_some_and(|window| {
+                window.mapped
+                    && !window.minimized
+                    && window.workspace == state.workspace
+                    && window.tile_rect.is_some()
+            })
+    }
+
+    fn start_split_assist(
+        &mut self,
+        source: WindowId,
+        output: OutputId,
+        occupied: Rectangle<i32, Logical>,
+        direction: SplitDirection,
+    ) {
+        let Some(work) = self.work_recess_for_output(output) else {
+            return;
+        };
+        let targets = split_assist_targets(work, occupied, direction);
+        self.start_split_assist_targets(source, output, targets, [Some(source), None, None, None]);
+    }
+
+    fn start_split_assist_excluding(
+        &mut self,
+        source: WindowId,
+        output: OutputId,
+        occupied: Rectangle<i32, Logical>,
+        direction: SplitDirection,
+        excluded: Option<WindowId>,
+    ) {
+        let Some(work) = self.work_recess_for_output(output) else {
+            return;
+        };
+        let Some((target, direction)) = complementary_split_rect(work, occupied, direction) else {
+            return;
+        };
+        self.start_split_assist_targets(
+            source,
+            output,
+            vec![SplitAssistTarget {
+                rect: target,
+                direction,
+            }],
+            [Some(source), excluded, None, None],
+        );
+    }
+
+    fn start_split_assist_targets(
+        &mut self,
+        source: WindowId,
+        output: OutputId,
+        targets: Vec<SplitAssistTarget>,
+        used: [Option<WindowId>; 4],
+    ) {
+        let Some(target) = targets.first().copied() else {
+            self.pending_split_assist = None;
+            return;
+        };
+        let workspace = self
+            .window(source)
+            .map(|window| window.workspace)
+            .unwrap_or(self.active_workspace);
+        let state = SplitAssistState {
+            source,
+            used,
+            output,
+            workspace,
+            target: target.rect,
+            direction: target.direction,
+            remaining: [targets.get(1).copied(), targets.get(2).copied()],
+        };
+        if self.windows.iter().any(|window| {
+            window.id != source
+                && window.mapped
+                && !window.minimized
+                && window.workspace == workspace
+                && window.tile_rect == Some(target.rect)
+        }) {
+            self.pending_split_assist = None;
+            return;
+        }
+        if !self
+            .windows
+            .iter()
+            .any(|window| self.split_assist_candidate(window.id, state))
+        {
+            self.pending_split_assist = None;
+            return;
+        }
+
+        for desktop_output in self.desktop_outputs.values_mut() {
+            desktop_output.egui.close_split_assist();
+        }
+        self.pending_split_assist = Some(state);
+        self.pending_egui_ops
+            .push(PendingEguiOp::OpenPanel(PanelKind::SplitAssist, output));
+    }
+
+    fn select_split_assist_window(&mut self, id: WindowId) {
+        let Some(state) = self.pending_split_assist.take() else {
+            return;
+        };
+        if !self.split_assist_state_valid(state) || !self.split_assist_candidate(id, state) {
+            return;
+        }
+        self.record_split_undo([id]);
+        if self.place_window_in_split_rect(id, state.output, state.target, state.direction) {
+            self.focus_window_id(id);
+            self.announce_split(format!(
+                "Window placed in {} split",
+                split_direction_label(state.direction)
+            ));
+            if let Some(next) = state.remaining[0] {
+                let mut used = state.used;
+                if let Some(slot) = used.iter_mut().find(|slot| slot.is_none()) {
+                    *slot = Some(id);
+                }
+                let targets = [Some(next), state.remaining[1]]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                self.start_split_assist_targets(state.source, state.output, targets, used);
+            }
+        }
+    }
+
+    fn restore_split_window(&mut self, id: WindowId) {
+        let Some(idx) = self
+            .windows
+            .iter()
+            .position(|window| window.id == id && window.tile_rect.is_some())
+        else {
+            return;
+        };
+        let window = self.windows[idx].window.clone();
+        if self.split_divider_drag.is_some_and(|drag| {
+            drag.divider.before.contains(&Some(id)) || drag.divider.after.contains(&Some(id))
+        }) {
+            self.split_divider_drag = None;
+        }
+        let old_bbox = self.global_window_bbox(&window);
+        let restore_rect = self.windows[idx]
+            .split_restore_rect
+            .take()
+            .or(self.windows[idx].float_rect)
+            .unwrap_or_else(|| {
+                self.default_unmaximized_toplevel_geometry(
+                    self.windows[idx].output.unwrap_or(self.focused_output),
+                )
+            });
+        self.windows[idx].tile_rect = None;
+        self.windows[idx].suspended_tile_rect = None;
+        self.windows[idx].float_rect = Some(restore_rect);
+
+        if let Some(toplevel) = window.toplevel() {
+            toplevel.with_pending_state(|state| {
+                set_split_states(&mut state.states, None);
+                state.size = Some(restore_rect.size);
+            });
+            toplevel.send_pending_configure();
+        }
+        if let Some(x11) = window.x11_surface() {
+            let _ = x11.configure(restore_rect);
+        }
+
+        self.map_window_bbox_location(window.clone(), restore_rect.loc, true);
+        self.space.refresh();
+        if let Some(rect) = old_bbox {
+            self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+        }
+        self.mark_window_bbox_damage_source(restore_rect, DamageSource::WindowResize);
+    }
+
+    fn restore_all_split_windows(&mut self) {
+        self.split_divider_drag = None;
+        let ids: Vec<WindowId> = self
+            .windows
+            .iter()
+            .filter(|window| window.tile_rect.is_some() || window.suspended_tile_rect.is_some())
+            .map(|window| window.id)
+            .collect();
+        for id in ids {
+            if self
+                .window(id)
+                .is_some_and(|window| window.tile_rect.is_some())
+            {
+                self.restore_split_window(id);
+                continue;
+            }
+            if let Some(window) = self.window_mut(id) {
+                window.suspended_tile_rect = None;
+                if let Some(floating) = window.split_restore_rect.take() {
+                    window.restore_rect = Some(floating);
+                }
+            }
+        }
+    }
+
     pub(crate) fn set_window_maximized(&mut self, id: WindowId, maximized: bool) {
         let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
             return;
@@ -10236,6 +13521,16 @@ impl DesktopState {
         let old_bbox = self.global_window_bbox(&window);
 
         if maximized {
+            let suspended_tile = self.windows[idx].tile_rect.take();
+            if let Some(tile_rect) = suspended_tile {
+                self.windows[idx].suspended_tile_rect = Some(tile_rect);
+                if self.split_divider_drag.is_some_and(|drag| {
+                    drag.divider.before.contains(&Some(id))
+                        || drag.divider.after.contains(&Some(id))
+                }) {
+                    self.split_divider_drag = None;
+                }
+            }
             let Some(work) = self.work_recess_for_output(output_id) else {
                 self.windows[idx].set_maximized(true);
                 if let Some(rect) = old_bbox {
@@ -10244,9 +13539,8 @@ impl DesktopState {
                 return;
             };
 
-            let restore_rect = self
-                .space
-                .element_bbox(&window)
+            let restore_rect = suspended_tile
+                .or_else(|| self.space.element_bbox(&window))
                 .or(self.windows[idx].float_rect)
                 .unwrap_or_else(|| Rectangle::from_loc_and_size(work.loc, window.geometry().size));
 
@@ -10258,6 +13552,7 @@ impl DesktopState {
 
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|state| {
+                    set_split_states(&mut state.states, None);
                     state.states.set(xdg_toplevel::State::Maximized);
                     state.size = Some(work.size);
                 });
@@ -10271,6 +13566,14 @@ impl DesktopState {
 
             self.map_window_bbox_location(window.clone(), work.loc, true);
         } else {
+            let suspended_tile = self.windows[idx].suspended_tile_rect.take();
+            let suspended_direction = suspended_tile.and_then(|tile| {
+                self.windows[idx]
+                    .output
+                    .and_then(|output| self.work_recess_for_output(output))
+                    .and_then(|work| split_direction_for_rect(work, tile))
+                    .map(|direction| (tile, direction))
+            });
             let restore_rect = self.windows[idx].restore_rect.take().unwrap_or_else(|| {
                 self.windows[idx].float_rect.unwrap_or_else(|| {
                     Rectangle::from_loc_and_size((100, 100), window.geometry().size)
@@ -10278,11 +13581,19 @@ impl DesktopState {
             });
 
             self.windows[idx].set_maximized(false);
-            self.windows[idx].float_rect = Some(restore_rect);
+            if let Some((tile, _)) = suspended_direction {
+                self.windows[idx].tile_rect = Some(tile);
+            } else {
+                self.windows[idx].float_rect = Some(restore_rect);
+            }
 
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|state| {
                     state.states.unset(xdg_toplevel::State::Maximized);
+                    set_split_states(
+                        &mut state.states,
+                        suspended_direction.map(|(_, direction)| direction),
+                    );
                     state.size = Some(restore_rect.size);
                 });
                 toplevel.send_pending_configure();
@@ -10322,6 +13633,21 @@ impl DesktopState {
         fullscreen: bool,
         requested_output: Option<wayland_server::protocol::wl_output::WlOutput>,
     ) {
+        if fullscreen
+            && self
+                .window(id)
+                .is_some_and(|window| window.tile_rect.is_some())
+        {
+            self.restore_split_window(id);
+        }
+        if fullscreen {
+            if let Some(window) = self.window_mut(id) {
+                // Fullscreen is an explicit departure from the pane layout;
+                // do not leave a stale temporary-maximize pane behind.
+                window.suspended_tile_rect = None;
+                window.split_restore_rect = None;
+            }
+        }
         let Some(idx) = self.windows.iter().position(|window| window.id == id) else {
             return;
         };
@@ -10339,8 +13665,8 @@ impl DesktopState {
                     .iter()
                     .find_map(|(id, output)| output.handle.owns(requested).then_some(*id))
             })
-            .or_else(|| self.output_under_pointer(self.pointer_pos))
             .or(self.windows[idx].output)
+            .or_else(|| self.output_under_pointer(self.pointer_pos))
             .unwrap_or(self.focused_output);
 
         if fullscreen {
@@ -10958,6 +14284,7 @@ fn spawn_app_detached(
             xwayland_display: xwayland_display.map(|display| display.to_string()),
             browser_backend: browser_backend_for_launch(browser_backend),
             hdr_output_active,
+            auto_hdr: focal_launch_shared::auto_hdr_app_enabled(&candidate),
             source,
         };
 
@@ -11098,27 +14425,448 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds, encoding_from_fourcc,
-        is_browser_like, logical_damage_to_physical, power_action_interaction,
-        remove_surface_root_membership, session_power_command, set_surface_root_membership,
-        should_wait_for_lid_open_on_resume, surface_buffer_damage_to_logical,
-        surface_color_changed, topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding,
-        DamageSource, Fourcc, PowerActionInteraction, TopbarPulseTarget, UnattendedSuspendState,
-        UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds,
+        complementary_split_rect, encoding_from_fourcc, is_browser_like,
+        logical_damage_to_physical, output_with_largest_overlap, power_action_interaction,
+        remove_surface_root_membership, resized_split_rects, restored_split_rect,
+        restored_split_rect_for_minimum, saved_split_placement, session_power_command,
+        set_surface_root_membership, should_wait_for_lid_open_on_resume, snap_target_for_pointer,
+        split_assist_targets, split_direction_for_rect, split_preset_rect, split_rect,
+        split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
+        topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding, DamageSource, Fourcc,
+        OutputId, PowerActionInteraction, SplitAxis, SplitDirection, TopbarPulseTarget,
+        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_ai::AiDaemonStatus;
     use focaldesk_ipc::PowerIpcRequest;
     use focaldesk_power::PowerCommand;
     use focaldesk_settings_core::{ChromeLaunchItemSettings, ChromeRegionSettings};
+    use focaldesk_types::types::WorkspaceId;
     use focaldesk_ui::atlas::IconId;
     use focaldesk_ui::element::ChromeItem;
-    use focaldesk_ui::types::UiAction;
+    use focaldesk_ui::types::{SplitLayoutPreset, UiAction};
     use focaldesk_ui::ui_builder::AiFlowMode;
     use smithay::backend::renderer::element::Id;
     use smithay::backend::renderer::utils::SurfaceView;
-    use smithay::utils::{Buffer, Logical, Rectangle, Scale, Size, Transform};
+    use smithay::utils::{Buffer, Logical, Point, Rectangle, Scale, Size, Transform};
     use std::collections::HashMap;
+
+    struct VirtualSplitMonitor {
+        connector: String,
+        workspace: WorkspaceId,
+        placement: crate::core::session_restore::SavedSplitPlacement,
+        geometry: Rectangle<i32, Logical>,
+        tiled: bool,
+        awaiting_connector: bool,
+    }
+
+    impl VirtualSplitMonitor {
+        fn new(
+            connector: &str,
+            workspace: WorkspaceId,
+            work: Rectangle<i32, Logical>,
+            tile: Rectangle<i32, Logical>,
+        ) -> Self {
+            Self {
+                connector: connector.to_string(),
+                workspace,
+                placement: saved_split_placement(work, tile).unwrap(),
+                geometry: tile,
+                tiled: true,
+                awaiting_connector: false,
+            }
+        }
+
+        fn apply_work_area(
+            &mut self,
+            work: Rectangle<i32, Logical>,
+            minimum: Size<i32, Logical>,
+        ) -> bool {
+            if let Some((geometry, _)) =
+                restored_split_rect_for_minimum(work, self.placement, minimum)
+            {
+                self.geometry = geometry;
+                self.tiled = true;
+                self.awaiting_connector = false;
+                true
+            } else {
+                self.geometry = clamp_rect_to_bounds(self.geometry, work);
+                self.tiled = false;
+                self.awaiting_connector = true;
+                false
+            }
+        }
+
+        fn disconnect(&mut self, fallback_work: Rectangle<i32, Logical>) {
+            self.geometry = clamp_rect_to_bounds(self.geometry, fallback_work);
+            self.tiled = false;
+            self.awaiting_connector = true;
+        }
+
+        fn reconnect(
+            &mut self,
+            connector: &str,
+            work: Rectangle<i32, Logical>,
+            minimum: Size<i32, Logical>,
+        ) -> bool {
+            connector == self.connector
+                && self.awaiting_connector
+                && self.apply_work_area(work, minimum)
+        }
+    }
+
+    #[test]
+    fn split_layouts_enforce_logical_minimums_and_cover_odd_work_areas() {
+        let too_narrow = Rectangle::from_loc_and_size((64, 56), (1599, 1200));
+        assert_eq!(split_rect(too_narrow, SplitDirection::Left), None);
+
+        let too_short = Rectangle::from_loc_and_size((64, 56), (2000, 999));
+        assert_eq!(split_rect(too_short, SplitDirection::Top), None);
+
+        let work = Rectangle::from_loc_and_size((64, 56), (2561, 1401));
+        let left = split_rect(work, SplitDirection::Left).unwrap();
+        let right = split_rect(work, SplitDirection::Right).unwrap();
+        assert_eq!(left.size.w + right.size.w, work.size.w);
+        assert_eq!(right.loc.x, left.loc.x + left.size.w);
+
+        let top = split_rect(work, SplitDirection::Top).unwrap();
+        let bottom = split_rect(work, SplitDirection::Bottom).unwrap();
+        assert_eq!(top.size.h + bottom.size.h, work.size.h);
+        assert_eq!(bottom.loc.y, top.loc.y + top.size.h);
+    }
+
+    #[test]
+    fn split_chooser_presets_enforce_minimums_and_cover_corners() {
+        let work = Rectangle::from_loc_and_size((64, 56), (2561, 1401));
+        let (left_two_thirds, _) =
+            split_preset_rect(work, SplitLayoutPreset::LeftTwoThirds).unwrap();
+        let (right_third, _) = split_preset_rect(work, SplitLayoutPreset::RightThird).unwrap();
+        assert_eq!(
+            left_two_thirds.loc.x + left_two_thirds.size.w,
+            right_third.loc.x
+        );
+        assert_eq!(left_two_thirds.size.w + right_third.size.w, work.size.w);
+
+        let (bottom_right, direction) =
+            split_preset_rect(work, SplitLayoutPreset::BottomRight).unwrap();
+        assert_eq!(direction, SplitDirection::BottomRight);
+        assert_eq!(
+            bottom_right.loc.x + bottom_right.size.w,
+            work.loc.x + work.size.w
+        );
+        assert_eq!(
+            bottom_right.loc.y + bottom_right.size.h,
+            work.loc.y + work.size.h
+        );
+        assert_eq!(
+            split_direction_for_rect(work, bottom_right),
+            Some(SplitDirection::BottomRight)
+        );
+
+        let too_narrow_for_thirds = Rectangle::from_loc_and_size((0, 0), (2399, 1400));
+        assert!(split_preset_rect(too_narrow_for_thirds, SplitLayoutPreset::LeftThird).is_none());
+        let too_short_for_quadrants = Rectangle::from_loc_and_size((0, 0), (2560, 999));
+        assert!(split_preset_rect(too_short_for_quadrants, SplitLayoutPreset::TopLeft).is_none());
+    }
+
+    #[test]
+    fn saved_split_ratios_reflow_to_a_changed_work_area() {
+        let old_work = Rectangle::from_loc_and_size((64, 56), (2400, 1400));
+        let (left, _) = resized_split_rects(
+            old_work,
+            SplitAxis::Vertical,
+            old_work.loc.x + 1600,
+            800,
+            800,
+        )
+        .unwrap();
+        let saved = saved_split_placement(old_work, left).unwrap();
+
+        let new_work = Rectangle::from_loc_and_size((100, 80), (3000, 1800));
+        let (restored, direction) = restored_split_rect(new_work, saved).unwrap();
+        assert_eq!(direction, SplitDirection::Left);
+        assert!((restored.size.w - 2000).abs() <= 3);
+        assert_eq!(restored.size.h, new_work.size.h);
+
+        let too_small = Rectangle::from_loc_and_size((0, 0), (1500, 900));
+        assert!(restored_split_rect(too_small, saved).is_none());
+    }
+
+    #[test]
+    fn saved_center_third_reflows_between_work_areas() {
+        let old_work = Rectangle::from_loc_and_size((60, 40), (3000, 1800));
+        let center = Rectangle::from_loc_and_size((1060, 40), (1000, 1800));
+        let saved = saved_split_placement(old_work, center).unwrap();
+
+        let new_work = Rectangle::from_loc_and_size((100, 80), (3600, 2100));
+        let (restored, direction) = restored_split_rect(new_work, saved).unwrap();
+
+        assert_eq!(direction, SplitDirection::Center);
+        assert!((restored.loc.x - 1300).abs() <= 3);
+        assert!((restored.size.w - 1200).abs() <= 3);
+        assert_eq!(restored.loc.y, new_work.loc.y);
+        assert_eq!(restored.size.h, new_work.size.h);
+    }
+
+    #[test]
+    fn virtual_monitor_reflows_across_resolution_and_scale_changes() {
+        let logical_1440p = Rectangle::from_loc_and_size((64, 40), (2496, 1400));
+        let (left, _) = resized_split_rects(
+            logical_1440p,
+            SplitAxis::Vertical,
+            logical_1440p.loc.x + 1498,
+            800,
+            800,
+        )
+        .unwrap();
+        let mut session = VirtualSplitMonitor::new("DP-1", WorkspaceId(2), logical_1440p, left);
+
+        // 3840x2160 at 150% has the same 2560x1440 logical canvas. Chrome recesses
+        // are therefore identical and the divider must not drift.
+        assert!(session.apply_work_area(logical_1440p, Size::from((1, 1))));
+        assert_eq!(session.geometry.loc, left.loc);
+        assert!((session.geometry.size.w - left.size.w).abs() <= 1);
+        assert_eq!(session.geometry.size.h, left.size.h);
+
+        let logical_4k_100 = Rectangle::from_loc_and_size((80, 48), (3760, 2112));
+        assert!(session.apply_work_area(logical_4k_100, Size::from((1, 1))));
+        let ratio = session.geometry.size.w as f64 / logical_4k_100.size.w as f64;
+        assert!((ratio - 0.6).abs() < 0.002);
+        assert_eq!(session.geometry.loc, logical_4k_100.loc);
+    }
+
+    #[test]
+    fn virtual_monitor_rotation_falls_back_and_returns_when_space_recovers() {
+        let landscape = Rectangle::from_loc_and_size((64, 40), (2496, 1400));
+        let left = split_rect(landscape, SplitDirection::Left).unwrap();
+        let mut session = VirtualSplitMonitor::new("DP-1", WorkspaceId(1), landscape, left);
+        let portrait_at_150_percent = Rectangle::from_loc_and_size((40, 64), (1360, 2496));
+
+        assert!(!session.apply_work_area(portrait_at_150_percent, Size::from((1, 1))));
+        assert!(!session.tiled);
+        assert!(portrait_at_150_percent.contains(session.geometry.loc));
+
+        assert!(session.apply_work_area(landscape, Size::from((1, 1))));
+        assert!(session.tiled);
+        assert_eq!(session.geometry, left);
+    }
+
+    #[test]
+    fn virtual_monitor_honors_client_minimums_before_retiling() {
+        let work = Rectangle::from_loc_and_size((0, 0), (2560, 1400));
+        let left = split_rect(work, SplitDirection::Left).unwrap();
+        let mut session = VirtualSplitMonitor::new("DP-1", WorkspaceId(1), work, left);
+
+        assert!(!session.apply_work_area(work, Size::from((1400, 600))));
+        assert!(!session.tiled);
+
+        let wider = Rectangle::from_loc_and_size((0, 0), (3200, 1400));
+        assert!(session.apply_work_area(wider, Size::from((1400, 600))));
+        assert_eq!(session.geometry.size.w, 1600);
+    }
+
+    #[test]
+    fn virtual_monitor_disconnect_reconnect_preserves_connector_ratio_and_workspace() {
+        let original = Rectangle::from_loc_and_size((2560, 40), (2496, 1400));
+        let (_, right) = resized_split_rects(
+            original,
+            SplitAxis::Vertical,
+            original.loc.x + 1498,
+            800,
+            800,
+        )
+        .unwrap();
+        let mut session = VirtualSplitMonitor::new("DP-1", WorkspaceId(3), original, right);
+        let fallback = Rectangle::from_loc_and_size((0, 40), (1920, 1040));
+
+        session.disconnect(fallback);
+        assert!(!session.tiled);
+        assert!(fallback.contains(session.geometry.loc));
+        assert!(!session.reconnect("HDMI-A-1", fallback, Size::from((1, 1))));
+
+        let returned = Rectangle::from_loc_and_size((1920, 40), (3000, 1800));
+        assert!(session.reconnect("DP-1", returned, Size::from((1, 1))));
+        assert!(session.tiled);
+        assert_eq!(session.workspace, WorkspaceId(3));
+        assert_eq!(session.geometry.loc.x, returned.loc.x + 1800);
+        assert_eq!(session.geometry.loc.y, returned.loc.y);
+    }
+
+    #[test]
+    fn split_assist_targets_the_exact_remaining_pane() {
+        let work = Rectangle::from_loc_and_size((64, 56), (2561, 1401));
+        for preset in [
+            SplitLayoutPreset::LeftTwoThirds,
+            SplitLayoutPreset::RightThird,
+            SplitLayoutPreset::TopHalf,
+            SplitLayoutPreset::BottomHalf,
+            SplitLayoutPreset::TopLeft,
+            SplitLayoutPreset::BottomRight,
+        ] {
+            let (occupied, direction) = split_preset_rect(work, preset).unwrap();
+            let (remaining, remaining_direction) =
+                complementary_split_rect(work, occupied, direction).unwrap();
+            assert!(remaining.size.w > 0 && remaining.size.h > 0);
+            assert_ne!(direction, remaining_direction);
+
+            match direction {
+                SplitDirection::Left | SplitDirection::Right => {
+                    assert_eq!(occupied.size.w + remaining.size.w, work.size.w);
+                    assert_eq!(remaining.size.h, work.size.h);
+                }
+                SplitDirection::Top | SplitDirection::Bottom => {
+                    assert_eq!(occupied.size.h + remaining.size.h, work.size.h);
+                    assert_eq!(remaining.size.w, work.size.w);
+                }
+                _ => {
+                    assert_eq!(occupied.size.w + remaining.size.w, work.size.w);
+                    assert_eq!(occupied.size.h, remaining.size.h);
+                    assert_eq!(occupied.loc.y, remaining.loc.y);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_assist_builds_three_column_groups_in_sequence() {
+        let work = Rectangle::from_loc_and_size((64, 56), (3000, 1600));
+        let (left, direction) = split_preset_rect(work, SplitLayoutPreset::LeftThird).unwrap();
+        let targets = split_assist_targets(work, left, direction);
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].direction, SplitDirection::Center);
+        assert_eq!(targets[0].rect.loc.x, left.loc.x + left.size.w);
+        assert_eq!(targets[1].direction, SplitDirection::Right);
+        assert_eq!(
+            targets[1].rect.loc.x,
+            targets[0].rect.loc.x + targets[0].rect.size.w
+        );
+        assert_eq!(
+            left.size.w + targets.iter().map(|target| target.rect.size.w).sum::<i32>(),
+            work.size.w
+        );
+
+        let odd_work = Rectangle::from_loc_and_size((64, 56), (3001, 1600));
+        let (right, direction) =
+            split_preset_rect(odd_work, SplitLayoutPreset::RightThird).unwrap();
+        let targets = split_assist_targets(odd_work, right, direction);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].direction, SplitDirection::Center);
+        assert_eq!(targets[1].direction, SplitDirection::Left);
+        assert_eq!(
+            right.size.w + targets.iter().map(|target| target.rect.size.w).sum::<i32>(),
+            odd_work.size.w
+        );
+    }
+
+    #[test]
+    fn split_assist_builds_all_three_remaining_quadrants() {
+        let work = Rectangle::from_loc_and_size((64, 56), (2560, 1400));
+        let (occupied, direction) = split_preset_rect(work, SplitLayoutPreset::TopLeft).unwrap();
+        let targets = split_assist_targets(work, occupied, direction);
+
+        assert_eq!(targets.len(), 3);
+        assert_eq!(targets[0].direction, SplitDirection::TopRight);
+        assert_eq!(targets[1].direction, SplitDirection::BottomLeft);
+        assert_eq!(targets[2].direction, SplitDirection::BottomRight);
+        let covered = occupied.size.w * occupied.size.h
+            + targets
+                .iter()
+                .map(|target| target.rect.size.w * target.rect.size.h)
+                .sum::<i32>();
+        assert_eq!(covered, work.size.w * work.size.h);
+    }
+
+    #[test]
+    fn drag_snap_zones_choose_edges_and_corners_only_when_they_fit() {
+        let work = Rectangle::from_loc_and_size((64, 56), (2560, 1400));
+        assert_eq!(
+            snap_target_for_pointer(work, Point::from((65.0, 700.0)))
+                .map(|(_, direction)| direction),
+            Some(SplitDirection::Left)
+        );
+        assert_eq!(
+            snap_target_for_pointer(work, Point::from((2623.0, 57.0)))
+                .map(|(_, direction)| direction),
+            Some(SplitDirection::TopRight)
+        );
+        assert_eq!(
+            snap_target_for_pointer(work, Point::from((1300.0, 1455.0)))
+                .map(|(_, direction)| direction),
+            Some(SplitDirection::Bottom)
+        );
+        assert!(snap_target_for_pointer(work, Point::from((1300.0, 700.0))).is_none());
+
+        let too_narrow = Rectangle::from_loc_and_size((0, 0), (1599, 1200));
+        assert!(snap_target_for_pointer(too_narrow, Point::from((1.0, 600.0))).is_none());
+        let too_short = Rectangle::from_loc_and_size((0, 0), (1920, 999));
+        assert!(snap_target_for_pointer(too_short, Point::from((1.0, 1.0))).is_none());
+    }
+
+    #[test]
+    fn split_swap_requires_a_neighbor_in_the_requested_direction() {
+        assert!(split_swap_allowed(
+            SplitAxis::Vertical,
+            true,
+            SplitDirection::Right
+        ));
+        assert!(split_swap_allowed(
+            SplitAxis::Vertical,
+            false,
+            SplitDirection::Left
+        ));
+        assert!(split_swap_allowed(
+            SplitAxis::Horizontal,
+            true,
+            SplitDirection::Bottom
+        ));
+        assert!(!split_swap_allowed(
+            SplitAxis::Horizontal,
+            true,
+            SplitDirection::Left
+        ));
+    }
+
+    #[test]
+    fn split_divider_clamps_to_both_pane_minimums() {
+        let work = Rectangle::from_loc_and_size((64, 56), (2000, 1200));
+        let (left, right) = resized_split_rects(work, SplitAxis::Vertical, 100, 800, 900).unwrap();
+        assert_eq!(left.size.w, 800);
+        assert_eq!(right.size.w, 1200);
+
+        let (top, bottom) =
+            resized_split_rects(work, SplitAxis::Horizontal, 5000, 500, 600).unwrap();
+        assert_eq!(top.size.h, 600);
+        assert_eq!(bottom.size.h, 600);
+
+        assert!(resized_split_rects(work, SplitAxis::Vertical, 1000, 1200, 900).is_none());
+    }
+
+    #[test]
+    fn arbitrary_split_ratios_retain_their_pane_direction() {
+        let work = Rectangle::from_loc_and_size((64, 56), (2400, 1400));
+        let (left, right) = resized_split_rects(work, SplitAxis::Vertical, 1664, 800, 800).unwrap();
+        assert_eq!(
+            split_direction_for_rect(work, left),
+            Some(SplitDirection::Left)
+        );
+        assert_eq!(
+            split_direction_for_rect(work, right),
+            Some(SplitDirection::Right)
+        );
+
+        let (top, bottom) =
+            resized_split_rects(work, SplitAxis::Horizontal, 856, 500, 500).unwrap();
+        assert_eq!(
+            split_direction_for_rect(work, top),
+            Some(SplitDirection::Top)
+        );
+        assert_eq!(
+            split_direction_for_rect(work, bottom),
+            Some(SplitDirection::Bottom)
+        );
+    }
 
     #[test]
     fn surface_color_metadata_change_is_visual_damage() {
@@ -11321,6 +15069,25 @@ mod tests {
             physical,
             Rectangle::<i32, smithay::utils::Physical>::from_loc_and_size((1, 1), (2, 2))
         );
+    }
+
+    #[test]
+    fn preferred_output_tracks_the_largest_current_overlap() {
+        let left = OutputId(1);
+        let right = OutputId(2);
+        let outputs = [
+            (left, Rectangle::from_loc_and_size((0, 0), (1000, 800))),
+            (right, Rectangle::from_loc_and_size((1000, 0), (1000, 800))),
+        ];
+
+        let mostly_right = Rectangle::from_loc_and_size((800, 100), (800, 600));
+        assert_eq!(
+            output_with_largest_overlap(mostly_right, outputs, left),
+            right
+        );
+
+        let offscreen = Rectangle::from_loc_and_size((2500, 100), (400, 300));
+        assert_eq!(output_with_largest_overlap(offscreen, outputs, left), left);
     }
 
     #[test]

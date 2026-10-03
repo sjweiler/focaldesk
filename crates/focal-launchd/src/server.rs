@@ -6,8 +6,8 @@ use std::process::Command;
 use std::thread;
 
 use focal_launch_shared::{
-    BrowserBackend, LaunchRequest, LaunchResponse, chrome_command_args, chrome_hdr_mode_active,
-    is_browser_like, is_chrome_like, socket_path,
+    BrowserBackend, LaunchRequest, LaunchResponse, auto_hdr_app_enabled, chrome_command_args,
+    chrome_hdr_mode_active, is_browser_like, is_chrome_like, socket_path,
 };
 use focaldesk_ipc::transport;
 use focaldesk_logging::log_file_path_candidates;
@@ -67,6 +67,13 @@ fn launch(req: LaunchRequest) -> anyhow::Result<()> {
     let prefer_x11 = matches!(req.browser_backend, BrowserBackend::Xwayland);
 
     let mut cmd = Command::new(&req.app);
+
+    if req.auto_hdr || auto_hdr_app_enabled(&req.app) {
+        // These only expose native HDR when the game supports it. The compositor
+        // separately detects SDR surfaces and applies ITM to those instead.
+        cmd.env("DXVK_HDR", "1");
+        cmd.env("ENABLE_HDR_WSI", "1");
+    }
 
     if browser_like {
         if prefer_x11 {

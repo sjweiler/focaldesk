@@ -83,7 +83,7 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-mcp",
         "focaldesk-updatesd",
     ],
-    allowed_units: &["focaldesk-automation.service"],
+    allowed_units: &["focaldesk-automation.service", "focaldesk-updatesd.service"],
 };
 
 pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -438,6 +438,19 @@ mod tests {
                 .allowed_units
                 .contains(&"focaldesk-system-rail.service")
         );
+    }
+
+    #[test]
+    fn notifications_policy_allows_user_installed_update_daemon_unit() {
+        let identity = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/home/user/.local/bin/focaldesk-updatesd"),
+            unit: Some("focaldesk-updatesd.service".to_string()),
+            executable_trusted: false,
+        };
+
+        assert!(policy_allows(&identity, NOTIFICATIONS_POLICY));
     }
 
     #[test]

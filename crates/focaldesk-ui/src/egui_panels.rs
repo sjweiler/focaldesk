@@ -1,10 +1,11 @@
 use crate::desktop_frame::DesktopFrameCtx;
-use crate::types::{SettingKey, SystemCommand, UiAction};
+use crate::types::{SettingKey, SplitLayoutPreset, SystemCommand, UiAction};
 use chrono::{Datelike, Local, NaiveDate};
 use focaldesk_ipc::{
     NotificationIpcRequest, NotificationIpcResponse, UpdateIpcRequest, UpdateIpcResponse,
     send_notification_request, send_update_request,
 };
+use focaldesk_types::WindowId;
 use focaldesk_updates::UpdateSnapshot;
 use std::collections::HashSet;
 pub mod settings;
@@ -401,6 +402,536 @@ pub struct WorkspaceWindowPreview {
 pub struct WorkspacesPanel {
     pub open: bool,
     pub entries: Vec<WorkspaceEntryView>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SplitLayoutAvailability {
+    pub focused_window: bool,
+    pub side_by_side: bool,
+    pub thirds: bool,
+    pub stacked: bool,
+    pub quadrants: bool,
+}
+
+#[derive(Default)]
+pub struct SplitLayoutPanel {
+    pub open: bool,
+    pub availability: SplitLayoutAvailability,
+    keyboard_preset: Option<SplitLayoutPreset>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SplitAssistEntryView {
+    pub id: WindowId,
+    pub title: String,
+    pub app_name: String,
+}
+
+#[derive(Default)]
+pub struct SplitAssistPanel {
+    pub open: bool,
+    pub entries: Vec<SplitAssistEntryView>,
+    pub(crate) keyboard_index: usize,
+}
+
+#[derive(Default)]
+pub struct SplitGroupPanel {
+    pub open: bool,
+    pub anchor: Option<egui::Pos2>,
+}
+
+impl EguiPanelView for SplitGroupPanel {
+    fn title(&self) -> &'static str {
+        "Split Group"
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            return;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.open = false;
+            return;
+        }
+        let mut open = self.open;
+        let mut action = None;
+        egui::Window::new(self.title())
+            .fade_in(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(self.anchor.unwrap_or_else(|| {
+                egui::pos2(
+                    (frame_ctx.work.loc.x + frame_ctx.work.size.w / 2 - 110) as f32,
+                    (frame_ctx.work.loc.y + frame_ctx.work.size.h / 2 - 80) as f32,
+                )
+            }))
+            .default_width(220.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if ui.button("Swap panes").clicked() {
+                    action = Some(UiAction::SwapSplitPanes);
+                }
+                if ui.button("Replace focused pane").clicked() {
+                    action = Some(UiAction::ReplaceSplitWindow);
+                }
+                if ui.button("Exit split").clicked() {
+                    action = Some(UiAction::ExitSplitGroup);
+                }
+            });
+        if let Some(action) = action {
+            actions.push(action);
+            open = false;
+        }
+        self.open = open;
+    }
+}
+
+impl EguiPanelView for SplitAssistPanel {
+    fn title(&self) -> &'static str {
+        "Split Assist"
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            return;
+        }
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.open = false;
+            actions.push(UiAction::CancelSplitAssist);
+            return;
+        }
+
+        if self.entries.is_empty() {
+            self.keyboard_index = 0;
+        } else {
+            self.keyboard_index = self.keyboard_index.min(self.entries.len() - 1);
+            let forward = ctx.input(|input| {
+                input.key_pressed(egui::Key::ArrowDown) || input.key_pressed(egui::Key::ArrowRight)
+            });
+            let backward = ctx.input(|input| {
+                input.key_pressed(egui::Key::ArrowUp) || input.key_pressed(egui::Key::ArrowLeft)
+            });
+            if forward {
+                self.keyboard_index = move_selection(self.keyboard_index, self.entries.len(), true);
+            } else if backward {
+                self.keyboard_index =
+                    move_selection(self.keyboard_index, self.entries.len(), false);
+            }
+            if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                let id = self.entries[self.keyboard_index].id;
+                actions.push(UiAction::SelectSplitAssistWindow(id));
+                self.open = false;
+                return;
+            }
+        }
+
+        let mut open = self.open;
+        let mut selected = None;
+        egui::Window::new(self.title())
+            .fade_in(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(egui::pos2(
+                (frame_ctx.work.loc.x + frame_ctx.work.size.w / 2 - 240) as f32,
+                (frame_ctx.work.loc.y + 24) as f32,
+            ))
+            .default_width(480.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.heading("Choose a window for the remaining pane");
+                ui.label("Use arrow keys and Enter, or click. Esc leaves the pane empty.");
+                ui.separator();
+
+                for (index, entry) in self.entries.iter().enumerate() {
+                    let desired = egui::vec2(ui.available_width(), 66.0);
+                    let (rect, response) = ui.allocate_exact_size(desired, egui::Sense::click());
+                    if response.hovered() {
+                        self.keyboard_index = index;
+                    }
+                    let active = self.keyboard_index == index;
+                    response.widget_info(|| {
+                        egui::WidgetInfo::selected(
+                            egui::WidgetType::Button,
+                            true,
+                            active,
+                            format!("{} — {}", entry.title, entry.app_name),
+                        )
+                    });
+                    if active {
+                        response.request_focus();
+                    }
+                    ui.painter().rect_filled(
+                        rect,
+                        7.0,
+                        if active {
+                            egui::Color32::from_rgb(43, 65, 87)
+                        } else {
+                            egui::Color32::from_rgb(28, 34, 46)
+                        },
+                    );
+                    ui.painter().rect_stroke(
+                        rect,
+                        7.0,
+                        egui::Stroke::new(
+                            1.0,
+                            if active {
+                                egui::Color32::from_rgb(84, 188, 255)
+                            } else {
+                                egui::Color32::from_gray(76)
+                            },
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                    let icon = egui::Rect::from_min_size(
+                        rect.min + egui::vec2(10.0, 10.0),
+                        egui::vec2(46.0, 46.0),
+                    );
+                    ui.painter()
+                        .rect_filled(icon, 5.0, egui::Color32::from_rgb(51, 116, 166));
+                    let initial = entry
+                        .app_name
+                        .chars()
+                        .next()
+                        .unwrap_or('?')
+                        .to_uppercase()
+                        .to_string();
+                    ui.painter().text(
+                        icon.center(),
+                        egui::Align2::CENTER_CENTER,
+                        initial,
+                        egui::FontId::proportional(22.0),
+                        egui::Color32::WHITE,
+                    );
+                    ui.painter().text(
+                        rect.min + egui::vec2(68.0, 17.0),
+                        egui::Align2::LEFT_TOP,
+                        &entry.title,
+                        egui::FontId::proportional(16.0),
+                        egui::Color32::WHITE,
+                    );
+                    ui.painter().text(
+                        rect.min + egui::vec2(68.0, 41.0),
+                        egui::Align2::LEFT_TOP,
+                        &entry.app_name,
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_gray(170),
+                    );
+                    if response.clicked() {
+                        selected = Some(entry.id);
+                    }
+                }
+            });
+
+        if let Some(id) = selected {
+            actions.push(UiAction::SelectSplitAssistWindow(id));
+            open = false;
+        } else if !open {
+            actions.push(UiAction::CancelSplitAssist);
+        }
+        self.open = open;
+    }
+}
+
+impl EguiPanelView for SplitLayoutPanel {
+    fn title(&self) -> &'static str {
+        "Split Layout"
+    }
+
+    fn show(
+        &mut self,
+        ctx: &egui::Context,
+        frame_ctx: &DesktopFrameCtx,
+        actions: &mut Vec<UiAction>,
+    ) {
+        if !self.open {
+            return;
+        }
+
+        if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
+            self.open = false;
+            return;
+        }
+
+        let available_presets = split_available_presets(self.availability);
+        if !available_presets.contains(&self.keyboard_preset.unwrap_or(SplitLayoutPreset::LeftHalf))
+        {
+            self.keyboard_preset = available_presets.first().copied();
+        }
+        if let Some(current) = self.keyboard_preset {
+            let current_index = available_presets
+                .iter()
+                .position(|preset| *preset == current)
+                .unwrap_or(0);
+            let forward = ctx.input(|input| {
+                input.key_pressed(egui::Key::ArrowRight) || input.key_pressed(egui::Key::ArrowDown)
+            });
+            let backward = ctx.input(|input| {
+                input.key_pressed(egui::Key::ArrowLeft) || input.key_pressed(egui::Key::ArrowUp)
+            });
+            if forward || backward {
+                let index = move_selection(current_index, available_presets.len(), forward);
+                self.keyboard_preset = Some(available_presets[index]);
+            }
+            if ctx.input(|input| input.key_pressed(egui::Key::Enter)) {
+                actions.push(UiAction::ApplySplitLayout(self.keyboard_preset.unwrap()));
+                self.open = false;
+                return;
+            }
+        }
+
+        let mut open = self.open;
+        let mut selected = None;
+        egui::Window::new(self.title())
+            .fade_in(false)
+            .collapsible(false)
+            .resizable(false)
+            .default_pos(egui::pos2(
+                (frame_ctx.work.loc.x + frame_ctx.work.size.w / 2 - 220) as f32,
+                (frame_ctx.work.loc.y + 24) as f32,
+            ))
+            .default_width(440.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.heading("Place focused window");
+                ui.label("Use arrow keys and Enter, or hover and click to apply.");
+                ui.separator();
+
+                if !self.availability.focused_window {
+                    ui.label("Focus an application window to choose a split layout.");
+                    return;
+                }
+
+                ui.label("Side by side");
+                ui.horizontal(|ui| {
+                    split_preset_button(
+                        ui,
+                        "Left ½",
+                        SplitLayoutPreset::LeftHalf,
+                        self.availability.side_by_side,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                    split_preset_button(
+                        ui,
+                        "Right ½",
+                        SplitLayoutPreset::RightHalf,
+                        self.availability.side_by_side,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                    split_preset_button(
+                        ui,
+                        "Left ⅔",
+                        SplitLayoutPreset::LeftTwoThirds,
+                        self.availability.thirds,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                    split_preset_button(
+                        ui,
+                        "Right ⅓",
+                        SplitLayoutPreset::RightThird,
+                        self.availability.thirds,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                });
+                ui.horizontal(|ui| {
+                    split_preset_button(
+                        ui,
+                        "Left ⅓",
+                        SplitLayoutPreset::LeftThird,
+                        self.availability.thirds,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                    split_preset_button(
+                        ui,
+                        "Right ⅔",
+                        SplitLayoutPreset::RightTwoThirds,
+                        self.availability.thirds,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                });
+
+                ui.separator();
+                ui.label("Stacked");
+                ui.horizontal(|ui| {
+                    split_preset_button(
+                        ui,
+                        "Top ½",
+                        SplitLayoutPreset::TopHalf,
+                        self.availability.stacked,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                    split_preset_button(
+                        ui,
+                        "Bottom ½",
+                        SplitLayoutPreset::BottomHalf,
+                        self.availability.stacked,
+                        &mut self.keyboard_preset,
+                        &mut selected,
+                    );
+                });
+
+                ui.separator();
+                ui.label("Quadrants");
+                ui.horizontal(|ui| {
+                    for (label, preset) in [
+                        ("Top left", SplitLayoutPreset::TopLeft),
+                        ("Top right", SplitLayoutPreset::TopRight),
+                        ("Bottom left", SplitLayoutPreset::BottomLeft),
+                        ("Bottom right", SplitLayoutPreset::BottomRight),
+                    ] {
+                        split_preset_button(
+                            ui,
+                            label,
+                            preset,
+                            self.availability.quadrants,
+                            &mut self.keyboard_preset,
+                            &mut selected,
+                        );
+                    }
+                });
+            });
+
+        if let Some(preset) = selected {
+            actions.push(UiAction::ApplySplitLayout(preset));
+            open = false;
+        }
+        self.open = open;
+    }
+}
+
+fn split_preset_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    preset: SplitLayoutPreset,
+    enabled: bool,
+    keyboard_preset: &mut Option<SplitLayoutPreset>,
+    selected: &mut Option<SplitLayoutPreset>,
+) {
+    let response = ui.add_enabled(
+        enabled,
+        egui::Button::new(label)
+            .selected(*keyboard_preset == Some(preset))
+            .min_size(egui::vec2(88.0, 44.0)),
+    );
+    if response.hovered() {
+        *keyboard_preset = Some(preset);
+        response.clone().on_hover_ui(|ui| {
+            ui.label(format!("Preview: {label}"));
+            let (canvas, _) = ui.allocate_exact_size(egui::vec2(144.0, 81.0), egui::Sense::hover());
+            let pane = split_preview_rect(canvas.shrink(3.0), preset);
+            ui.painter()
+                .rect_filled(canvas, 5.0, egui::Color32::from_rgb(24, 29, 39));
+            ui.painter().rect_stroke(
+                canvas,
+                5.0,
+                egui::Stroke::new(1.0, egui::Color32::from_gray(95)),
+                egui::StrokeKind::Inside,
+            );
+            ui.painter()
+                .rect_filled(pane, 3.0, egui::Color32::from_rgb(66, 153, 220));
+        });
+    }
+    if response.clicked() {
+        *selected = Some(preset);
+    }
+    if *keyboard_preset == Some(preset) {
+        response.request_focus();
+    }
+}
+
+fn split_available_presets(availability: SplitLayoutAvailability) -> Vec<SplitLayoutPreset> {
+    let mut presets = Vec::new();
+    if availability.focused_window && availability.side_by_side {
+        presets.extend([SplitLayoutPreset::LeftHalf, SplitLayoutPreset::RightHalf]);
+    }
+    if availability.focused_window && availability.thirds {
+        presets.extend([
+            SplitLayoutPreset::LeftTwoThirds,
+            SplitLayoutPreset::RightThird,
+            SplitLayoutPreset::LeftThird,
+            SplitLayoutPreset::RightTwoThirds,
+        ]);
+    }
+    if availability.focused_window && availability.stacked {
+        presets.extend([SplitLayoutPreset::TopHalf, SplitLayoutPreset::BottomHalf]);
+    }
+    if availability.focused_window && availability.quadrants {
+        presets.extend([
+            SplitLayoutPreset::TopLeft,
+            SplitLayoutPreset::TopRight,
+            SplitLayoutPreset::BottomLeft,
+            SplitLayoutPreset::BottomRight,
+        ]);
+    }
+    presets
+}
+
+fn move_selection(current: usize, len: usize, forward: bool) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    if forward {
+        (current + 1) % len
+    } else {
+        (current + len - 1) % len
+    }
+}
+
+fn split_preview_rect(work: egui::Rect, preset: SplitLayoutPreset) -> egui::Rect {
+    let x1 = work.left() + work.width() / 3.0;
+    let x2 = work.left() + work.width() * 2.0 / 3.0;
+    let xm = work.center().x;
+    let ym = work.center().y;
+    match preset {
+        SplitLayoutPreset::LeftHalf => {
+            egui::Rect::from_min_max(work.min, egui::pos2(xm, work.bottom()))
+        }
+        SplitLayoutPreset::RightHalf => {
+            egui::Rect::from_min_max(egui::pos2(xm, work.top()), work.max)
+        }
+        SplitLayoutPreset::LeftTwoThirds => {
+            egui::Rect::from_min_max(work.min, egui::pos2(x2, work.bottom()))
+        }
+        SplitLayoutPreset::RightThird => {
+            egui::Rect::from_min_max(egui::pos2(x2, work.top()), work.max)
+        }
+        SplitLayoutPreset::LeftThird => {
+            egui::Rect::from_min_max(work.min, egui::pos2(x1, work.bottom()))
+        }
+        SplitLayoutPreset::RightTwoThirds => {
+            egui::Rect::from_min_max(egui::pos2(x1, work.top()), work.max)
+        }
+        SplitLayoutPreset::TopHalf => {
+            egui::Rect::from_min_max(work.min, egui::pos2(work.right(), ym))
+        }
+        SplitLayoutPreset::BottomHalf => {
+            egui::Rect::from_min_max(egui::pos2(work.left(), ym), work.max)
+        }
+        SplitLayoutPreset::TopLeft => egui::Rect::from_min_max(work.min, egui::pos2(xm, ym)),
+        SplitLayoutPreset::TopRight => {
+            egui::Rect::from_min_max(egui::pos2(xm, work.top()), egui::pos2(work.right(), ym))
+        }
+        SplitLayoutPreset::BottomLeft => {
+            egui::Rect::from_min_max(egui::pos2(work.left(), ym), egui::pos2(xm, work.bottom()))
+        }
+        SplitLayoutPreset::BottomRight => egui::Rect::from_min_max(egui::pos2(xm, ym), work.max),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1165,5 +1696,39 @@ impl EguiPanelView for DebugPanel {
                 ui.heading("Debug");
                 ui.label(format!("Work area: {:?}", frame_ctx.work));
             });
+    }
+}
+
+#[cfg(test)]
+mod split_keyboard_tests {
+    use super::{SplitLayoutAvailability, move_selection, split_available_presets};
+    use crate::types::SplitLayoutPreset;
+
+    #[test]
+    fn keyboard_selection_wraps_in_both_directions() {
+        assert_eq!(move_selection(0, 4, true), 1);
+        assert_eq!(move_selection(3, 4, true), 0);
+        assert_eq!(move_selection(0, 4, false), 3);
+        assert_eq!(move_selection(2, 0, false), 0);
+    }
+
+    #[test]
+    fn keyboard_navigation_skips_unavailable_layouts() {
+        let presets = split_available_presets(SplitLayoutAvailability {
+            focused_window: true,
+            side_by_side: true,
+            thirds: false,
+            stacked: true,
+            quadrants: false,
+        });
+        assert_eq!(
+            presets,
+            vec![
+                SplitLayoutPreset::LeftHalf,
+                SplitLayoutPreset::RightHalf,
+                SplitLayoutPreset::TopHalf,
+                SplitLayoutPreset::BottomHalf,
+            ]
+        );
     }
 }

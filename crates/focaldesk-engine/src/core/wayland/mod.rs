@@ -6,6 +6,7 @@ pub mod color_representation_protocol;
 pub mod compositor;
 pub mod data_device;
 pub mod dmabuf;
+pub mod frog_color_management_protocol;
 pub mod input_method;
 pub mod output;
 pub mod pointer_constraints;

@@ -98,6 +98,10 @@ not listed here should be treated as internal and may change without notice.
 | `FOCALDESK_SCREENCAST_OUTPUT` | Select the capture output when no portal chooser input is available |
 | `FOCALDESK_INPUT_METHOD_EXECUTABLES` | Colon-separated executable allowlist for privileged Wayland input-method clients; replaces the built-in fcitx5, IBus, and Maliit allowlist |
 | `FOCALDESK_HDR_CALIBRATION_PATTERN` | Set to `1` to replace active HDR output content with the session-only calibration pattern |
+| `FOCALDESK_AUTO_HDR_APPS` | Comma-separated executable, Wayland app-id, or X11 WM_CLASS allowlist for opt-in game Auto HDR |
+| `FOCALDESK_AUTO_HDR_SDR_NITS` | Auto HDR diffuse-white input level, clamped to 40–400 nits; defaults to 100 |
+| `FOCALDESK_AUTO_HDR_TARGET_NITS` | Optional Auto HDR highlight target, clamped to the active display's configured peak |
+| `FOCALDESK_AUTO_HDR_GAMUT_WIDENESS` | Optional linear-light saturation expansion from 0.0–0.35; defaults to 0 |
 | `FOCALDESK_VOSK_MODEL_DIR` | Point voice recognition at a Vosk model directory |
 | `FOCALD_SPEECH_BACKEND` | Select `espeak-ng` or `piper` for speech synthesis |
 

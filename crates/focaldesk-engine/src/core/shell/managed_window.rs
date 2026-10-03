@@ -152,6 +152,10 @@ pub struct ManagedWindow {
 
     // layout state
     pub tile_rect: Option<Rectangle<i32, Logical>>,
+    /// Floating geometry to restore when leaving split-screen placement.
+    pub split_restore_rect: Option<Rectangle<i32, Logical>>,
+    /// Pane retained while this window is temporarily maximized.
+    pub suspended_tile_rect: Option<Rectangle<i32, Logical>>,
     pub float_rect: Option<Rectangle<i32, Logical>>,
     pub restore_rect: Option<Rectangle<i32, Logical>>,
     /// `Some` while a window is being recreated from the durable session.
@@ -189,6 +193,8 @@ impl ManagedWindow {
             workspace,
             output: None,
             tile_rect: None,
+            split_restore_rect: None,
+            suspended_tile_rect: None,
             float_rect: None,
             restore_rect: None,
             session_restore_focus: None,
@@ -217,6 +223,8 @@ impl ManagedWindow {
             workspace,
             output: None,
             tile_rect: None,
+            split_restore_rect: None,
+            suspended_tile_rect: None,
             float_rect: None,
             restore_rect: None,
             session_restore_focus: None,

@@ -29,15 +29,19 @@ fn main() -> Result<()> {
 }
 
 fn notify_loop(manager: Arc<UpdateManager>) {
-    let mut last_count = manager.snapshot().available_count();
+    let initial = manager.snapshot();
+    let mut last_count = initial.available_count();
     let mut last_installing = false;
+    let mut last_error = initial.last_error;
     loop {
         thread::sleep(Duration::from_secs(2));
         let snapshot = manager.snapshot();
         maybe_notify_available(&snapshot, last_count);
+        maybe_notify_error(&snapshot, last_error.as_deref());
         maybe_notify_install(&snapshot, last_installing);
         last_count = snapshot.available_count();
         last_installing = snapshot.installing;
+        last_error = snapshot.last_error.clone();
     }
 }
 
@@ -71,25 +75,31 @@ fn maybe_notify_available(snapshot: &UpdateSnapshot, last_count: usize) {
 }
 
 fn maybe_notify_install(snapshot: &UpdateSnapshot, last_installing: bool) {
-    if last_installing && !snapshot.installing {
-        if let Some(error) = &snapshot.last_error {
-            let _ = send_notification_request(&NotificationIpcRequest::Notify {
-                title: "Update install failed".into(),
-                body: error.clone(),
-                timeout_ms: Some(10_000),
-            });
+    if last_installing && !snapshot.installing && snapshot.last_error.is_none() {
+        let remaining = snapshot.available_count();
+        let body = if remaining == 0 {
+            "All selected updates were installed.".to_string()
         } else {
-            let remaining = snapshot.available_count();
-            let body = if remaining == 0 {
-                "All selected updates were installed.".to_string()
-            } else {
-                format!("{remaining} update(s) still available.")
-            };
-            let _ = send_notification_request(&NotificationIpcRequest::Notify {
-                title: "Updates installed".into(),
-                body,
-                timeout_ms: Some(6_000),
-            });
-        }
+            format!("{remaining} update(s) still available.")
+        };
+        let _ = send_notification_request(&NotificationIpcRequest::Notify {
+            title: "Updates installed".into(),
+            body,
+            timeout_ms: Some(6_000),
+        });
     }
+}
+
+fn maybe_notify_error(snapshot: &UpdateSnapshot, previous_error: Option<&str>) {
+    let Some(error) = snapshot.last_error.as_deref() else {
+        return;
+    };
+    if previous_error == Some(error) {
+        return;
+    }
+    let _ = send_notification_request(&NotificationIpcRequest::Notify {
+        title: "System update error".into(),
+        body: error.to_string(),
+        timeout_ms: Some(10_000),
+    });
 }

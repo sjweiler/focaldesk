@@ -13,9 +13,11 @@ use protocol::client::{focaldesk_color_manager_v1, focaldesk_surface_color_v1};
 use std::env;
 use std::ffi::CString;
 use std::fs::File;
+use std::io::Write;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::ptr;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
@@ -24,9 +26,8 @@ use wayland_client::protocol::{
 use wayland_client::{Connection, Dispatch, QueueHandle};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
-const WIDTH: i32 = 256;
-const HEIGHT: i32 = 256;
-const STRIDE: i32 = WIDTH * 4;
+const DEFAULT_WIDTH: i32 = 256;
+const DEFAULT_HEIGHT: i32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransferTag {
@@ -53,6 +54,11 @@ impl TransferTag {
 
 struct App {
     transfer: TransferTag,
+    title: String,
+    app_id: String,
+    configure_log: Option<PathBuf>,
+    width: i32,
+    height: i32,
     compositor: Option<wl_compositor::WlCompositor>,
     shm: Option<wl_shm::WlShm>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
@@ -63,9 +69,19 @@ struct App {
 }
 
 impl App {
-    fn new(transfer: TransferTag) -> Self {
+    fn new(
+        transfer: TransferTag,
+        title: String,
+        app_id: String,
+        configure_log: Option<PathBuf>,
+    ) -> Self {
         Self {
             transfer,
+            title,
+            app_id,
+            configure_log,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
             compositor: None,
             shm: None,
             wm_base: None,
@@ -90,7 +106,8 @@ impl App {
 
         let xdg_surface = wm_base.get_xdg_surface(&surface, qh, ());
         let toplevel = xdg_surface.get_toplevel(qh, ());
-        toplevel.set_title(format!("focaldesk color tag test ({:?})", self.transfer));
+        toplevel.set_title(self.title.clone());
+        toplevel.set_app_id(self.app_id.clone());
 
         self.surface = Some(surface);
         Ok(())
@@ -98,14 +115,29 @@ impl App {
 
     fn attach_buffer(&self, surface: &wl_surface::WlSurface, qh: &QueueHandle<Self>) -> Result<()> {
         let shm = self.shm.as_ref().context("wl_shm missing")?;
-        let size = (STRIDE * HEIGHT) as usize;
+        let stride = self.width * 4;
+        let size = (stride * self.height) as usize;
         let memfd = create_memfd(size)?;
         let fd = memfd.as_raw_fd();
         let mut mapping = ShmMapping::map(fd, size, memfd)?;
-        fill_test_pattern(mapping.as_mut(), self.transfer);
+        fill_test_pattern(
+            mapping.as_mut(),
+            self.width,
+            self.height,
+            stride,
+            self.transfer,
+        );
 
         let pool = shm.create_pool(unsafe { BorrowedFd::borrow_raw(fd) }, size as i32, qh, ());
-        let buffer = pool.create_buffer(0, WIDTH, HEIGHT, STRIDE, wl_shm::Format::Argb8888, qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            self.width,
+            self.height,
+            stride,
+            wl_shm::Format::Argb8888,
+            qh,
+            (),
+        );
         surface.attach(Some(&buffer), 0, 0);
         std::mem::forget((pool, buffer, mapping));
         Ok(())
@@ -237,8 +269,26 @@ impl Dispatch<xdg_toplevel::XdgToplevel, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if matches!(event, xdg_toplevel::Event::Close) {
-            app.done = true;
+        match event {
+            xdg_toplevel::Event::Configure { width, height, .. } => {
+                if width > 0 {
+                    app.width = width;
+                }
+                if height > 0 {
+                    app.height = height;
+                }
+                if let Some(path) = app.configure_log.as_ref() {
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let _ = writeln!(file, "{} {}", app.width, app.height);
+                    }
+                }
+            }
+            xdg_toplevel::Event::Close => app.done = true,
+            _ => {}
         }
     }
 }
@@ -319,11 +369,17 @@ fn create_memfd(size: usize) -> Result<File> {
     Ok(file)
 }
 
-fn fill_test_pattern(pixels: &mut [u8], transfer: TransferTag) {
-    for y in 0..HEIGHT as usize {
-        for x in 0..WIDTH as usize {
-            let idx = (y * STRIDE as usize) + (x * 4);
-            let (r, g, b) = if x < WIDTH as usize / 2 {
+fn fill_test_pattern(
+    pixels: &mut [u8],
+    width: i32,
+    height: i32,
+    stride: i32,
+    transfer: TransferTag,
+) {
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let idx = (y * stride as usize) + (x * 4);
+            let (r, g, b) = if x < width as usize / 2 {
                 encoded_green(transfer, 0.18)
             } else {
                 encoded_green(transfer, 0.50)
@@ -352,8 +408,18 @@ fn linear_to_srgb(value: f32) -> f32 {
     }
 }
 
-fn parse_args() -> Result<TransferTag> {
+struct Args {
+    transfer: TransferTag,
+    title: String,
+    app_id: String,
+    configure_log: Option<PathBuf>,
+}
+
+fn parse_args() -> Result<Args> {
     let mut transfer = TransferTag::Linear;
+    let mut title = format!("focaldesk color tag test ({transfer:?})");
+    let mut app_id = "com.focaldesk.SplitE2eClient".to_string();
+    let mut configure_log = None;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -368,31 +434,45 @@ fn parse_args() -> Result<TransferTag> {
                         .context("--transfer requires a value (srgb or linear)")?,
                 )?;
             }
+            "--title" => title = args.next().context("--title requires a value")?,
+            "--app-id" => app_id = args.next().context("--app-id requires a value")?,
+            "--configure-log" => {
+                configure_log = Some(PathBuf::from(
+                    args.next().context("--configure-log requires a path")?,
+                ));
+            }
             other => bail!("unknown argument `{other}`"),
         }
     }
-    Ok(transfer)
+    Ok(Args {
+        transfer,
+        title,
+        app_id,
+        configure_log,
+    })
 }
 
 fn print_help() {
     println!("focaldesk-color-tag-test — exercise focaldesk_color_v1");
     println!();
     println!("Usage:");
-    println!("  focaldesk-color-tag-test [--transfer linear|srgb]");
+    println!(
+        "  focaldesk-color-tag-test [--transfer linear|srgb] [--title TITLE] [--app-id ID] [--configure-log PATH]"
+    );
     println!();
     println!("Environment:");
     println!("  WAYLAND_DISPLAY   FocalDesk compositor socket (required)");
 }
 
 fn main() -> Result<()> {
-    let transfer = parse_args()?;
+    let args = parse_args()?;
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let (globals, mut event_queue) =
         registry_queue_init::<App>(&conn).context("failed to read Wayland registry")?;
     let qh = event_queue.handle();
     let registry = globals.registry();
 
-    let mut app = App::new(transfer);
+    let mut app = App::new(args.transfer, args.title, args.app_id, args.configure_log);
     for global in globals.contents().clone_list() {
         match global.interface.as_str() {
             "wl_compositor" => {

@@ -91,7 +91,7 @@ impl DesktopState {
         let maximized = window.maximized;
         let fullscreen = window.fullscreen;
         let minimized = window.minimized;
-        let rect = window.float_rect;
+        let rect = window.tile_rect.or(window.float_rect);
         let mapped_window = window.mapped.then(|| window.window.clone());
         let size = if fullscreen {
             self.outputs
@@ -120,6 +120,7 @@ impl DesktopState {
             }
             state.size = size;
         });
+        self.apply_restored_xdg_split_state(window_id, surface);
         surface.send_pending_configure();
         if !minimized {
             if let (Some(window), Some(rect)) = (mapped_window, rect) {
@@ -151,7 +152,8 @@ impl XdgShellHandler for DesktopState {
         };
         let fullscreen_on_launch = restored && window.is_some_and(|window| window.fullscreen);
         let minimized_on_launch = restored && window.is_some_and(|window| window.minimized);
-        let restored_size = window.and_then(|window| window.float_rect.map(|rect| rect.size));
+        let restored_size =
+            window.and_then(|window| window.tile_rect.or(window.float_rect).map(|rect| rect.size));
         let size = if fullscreen_on_launch {
             self.outputs
                 .get(&output_id)
@@ -191,6 +193,7 @@ impl XdgShellHandler for DesktopState {
             }
             state.size = Some(size);
         });
+        self.apply_restored_xdg_split_state(window_id, &surface);
         surface.send_configure();
     }
 
@@ -340,6 +343,12 @@ impl XdgShellHandler for DesktopState {
     fn maximize_request(&mut self, surface: ToplevelSurface) {
         if let Some(id) = self.window_id_for_toplevel(&surface) {
             self.request_maximize(id);
+        }
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        if let Some(id) = self.window_id_for_toplevel(&surface) {
+            self.set_window_maximized(id, false);
         }
     }
 

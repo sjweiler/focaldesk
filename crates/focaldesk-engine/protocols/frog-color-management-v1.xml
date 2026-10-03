@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="frog_color_management_v1">
+  <copyright>
+    Copyright © 2023 Joshua Ashton for Valve Software
+    Copyright © 2023 Xaver Hugl
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included
+    in all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <interface name="frog_color_management_factory_v1" version="1">
+    <request name="destroy" type="destructor"/>
+    <request name="get_color_managed_surface">
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="callback" type="new_id" interface="frog_color_managed_surface"/>
+    </request>
+  </interface>
+
+  <interface name="frog_color_managed_surface" version="1">
+    <request name="destroy" type="destructor"/>
+    <enum name="transfer_function">
+      <entry name="undefined" value="0"/>
+      <entry name="srgb" value="1"/>
+      <entry name="gamma_22" value="2"/>
+      <entry name="st2084_pq" value="3"/>
+      <entry name="scrgb_linear" value="4"/>
+    </enum>
+    <request name="set_known_transfer_function">
+      <arg name="transfer_function" type="uint" enum="transfer_function"/>
+    </request>
+    <enum name="primaries">
+      <entry name="undefined" value="0"/>
+      <entry name="rec709" value="1"/>
+      <entry name="rec2020" value="2"/>
+    </enum>
+    <request name="set_known_container_color_volume">
+      <arg name="primaries" type="uint" enum="primaries"/>
+    </request>
+    <enum name="render_intent">
+      <entry name="perceptual" value="0"/>
+    </enum>
+    <request name="set_render_intent">
+      <arg name="render_intent" type="uint" enum="render_intent"/>
+    </request>
+    <request name="set_hdr_metadata">
+      <arg name="mastering_display_primary_red_x" type="uint"/>
+      <arg name="mastering_display_primary_red_y" type="uint"/>
+      <arg name="mastering_display_primary_green_x" type="uint"/>
+      <arg name="mastering_display_primary_green_y" type="uint"/>
+      <arg name="mastering_display_primary_blue_x" type="uint"/>
+      <arg name="mastering_display_primary_blue_y" type="uint"/>
+      <arg name="mastering_white_point_x" type="uint"/>
+      <arg name="mastering_white_point_y" type="uint"/>
+      <arg name="max_display_mastering_luminance" type="uint"/>
+      <arg name="min_display_mastering_luminance" type="uint"/>
+      <arg name="max_cll" type="uint"/>
+      <arg name="max_fall" type="uint"/>
+    </request>
+    <event name="preferred_metadata">
+      <arg name="transfer_function" type="uint" enum="transfer_function"/>
+      <arg name="output_display_primary_red_x" type="uint"/>
+      <arg name="output_display_primary_red_y" type="uint"/>
+      <arg name="output_display_primary_green_x" type="uint"/>
+      <arg name="output_display_primary_green_y" type="uint"/>
+      <arg name="output_display_primary_blue_x" type="uint"/>
+      <arg name="output_display_primary_blue_y" type="uint"/>
+      <arg name="output_white_point_x" type="uint"/>
+      <arg name="output_white_point_y" type="uint"/>
+      <arg name="max_luminance" type="uint"/>
+      <arg name="min_luminance" type="uint"/>
+      <arg name="max_full_frame_luminance" type="uint"/>
+    </event>
+  </interface>
+</protocol>

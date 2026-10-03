@@ -14,6 +14,52 @@ pub fn is_browser_like(app: &str) -> bool {
     is_chrome_like(app) || lower.contains("firefox") || lower.contains("librewolf")
 }
 
+/// Whether an application is explicitly opted into compositor Auto HDR.
+/// Entries are comma/semicolon separated and matched case-insensitively
+/// against an executable name, Wayland app-id, or X11 WM_CLASS. `*` is
+/// accepted for diagnostics but is intentionally never the default.
+pub fn auto_hdr_app_enabled(app: &str) -> bool {
+    let Ok(configured) = std::env::var("FOCALDESK_AUTO_HDR_APPS") else {
+        return false;
+    };
+    auto_hdr_app_matches(&configured, app)
+}
+
+fn auto_hdr_app_matches(configured: &str, app: &str) -> bool {
+    let app = app.trim().to_ascii_lowercase();
+    let basename = app.rsplit('/').next().unwrap_or(&app);
+    configured
+        .split([',', ';'])
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| entry == "*" || entry == app || entry == basename)
+}
+
+fn finite_env_f32(name: &str) -> Option<f32> {
+    std::env::var(name)
+        .ok()?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+pub fn auto_hdr_sdr_nits() -> f32 {
+    finite_env_f32("FOCALDESK_AUTO_HDR_SDR_NITS")
+        .unwrap_or(100.0)
+        .clamp(40.0, 400.0)
+}
+
+pub fn auto_hdr_target_nits() -> Option<f32> {
+    finite_env_f32("FOCALDESK_AUTO_HDR_TARGET_NITS").map(|value| value.clamp(100.0, 10_000.0))
+}
+
+pub fn auto_hdr_gamut_wideness() -> f32 {
+    finite_env_f32("FOCALDESK_AUTO_HDR_GAMUT_WIDENESS")
+        .unwrap_or(0.0)
+        .clamp(0.0, 0.35)
+}
+
 fn env_truthy(value: Option<&str>) -> bool {
     value.is_some_and(|value| {
         matches!(
@@ -81,7 +127,19 @@ pub fn chrome_command_args(
 
 #[cfg(test)]
 mod tests {
-    use super::{chrome_command_args, chrome_hdr_mode_active};
+    use super::{auto_hdr_app_matches, chrome_command_args, chrome_hdr_mode_active};
+
+    #[test]
+    fn auto_hdr_allowlist_is_exact_case_insensitive_and_off_by_default() {
+        assert!(!auto_hdr_app_matches("", "game.exe"));
+        assert!(auto_hdr_app_matches(
+            "other, GAME.EXE;steam_app_123",
+            "/games/game.exe"
+        ));
+        assert!(auto_hdr_app_matches("steam_app_123", "STEAM_APP_123"));
+        assert!(!auto_hdr_app_matches("game", "game.exe"));
+        assert!(auto_hdr_app_matches("*", "anything"));
+    }
 
     #[test]
     fn chrome_wayland_launch_enables_wp_color_management() {

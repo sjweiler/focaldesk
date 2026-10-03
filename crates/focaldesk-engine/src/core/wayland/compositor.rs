@@ -20,7 +20,7 @@ use smithay::xwayland::XWaylandClientData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use smithay::desktop::layer_map_for_output;
+use smithay::desktop::{layer_map_for_output, Window};
 use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
 
 use crate::core::desktop::DesktopState;
@@ -30,6 +30,60 @@ use smithay::reexports::wayland_server::Client;
 #[cfg_attr(not(feature = "xwayland"), allow(dead_code))]
 static XWAYLAND_BUFFER_LOGS: AtomicUsize = AtomicUsize::new(0);
 static DMABUF_BLOCKER_LOGS: AtomicUsize = AtomicUsize::new(0);
+
+impl DesktopState {
+    fn preferred_fractional_scale_for_surface(&self, surface: &WlSurface) -> f64 {
+        if let Some(window) = self.window_for_wl_surface(surface) {
+            return self
+                .outputs
+                .get(&self.preferred_output_id_for_window(&window))
+                .map(|output| output.scale_factor)
+                .unwrap_or(1.0);
+        }
+
+        for output in self.outputs.values() {
+            for layer in layer_map_for_output(&output.handle).layers() {
+                let mut belongs = false;
+                layer.with_surfaces(|candidate, _| belongs |= candidate == surface);
+                if belongs {
+                    return output.scale_factor;
+                }
+            }
+        }
+
+        self.outputs
+            .get(&self.focused_output)
+            .or_else(|| self.outputs.get(&self.primary_output))
+            .map(|output| output.scale_factor)
+            .unwrap_or(1.0)
+    }
+
+    pub(crate) fn refresh_window_fractional_scale(&self, window: &Window) {
+        let scale = self
+            .outputs
+            .get(&self.preferred_output_id_for_window(window))
+            .map(|output| output.scale_factor)
+            .unwrap_or(1.0);
+        window.with_surfaces(|_, states| {
+            with_fractional_scale(states, |fractional| fractional.set_preferred_scale(scale));
+        });
+    }
+
+    pub(crate) fn refresh_all_fractional_scales(&self) {
+        for window in self.space.elements() {
+            self.refresh_window_fractional_scale(window);
+        }
+        for output in self.outputs.values() {
+            for layer in layer_map_for_output(&output.handle).layers() {
+                layer.with_surfaces(|_, states| {
+                    with_fractional_scale(states, |fractional| {
+                        fractional.set_preferred_scale(output.scale_factor)
+                    });
+                });
+            }
+        }
+    }
+}
 
 impl CompositorHandler for DesktopState {
     fn compositor_state(&mut self) -> &mut SmithayCompositorState {
@@ -200,7 +254,7 @@ impl CompositorHandler for DesktopState {
                 .map(|state| state.scale_factor)
                 .unwrap_or_else(|| output.current_scale().fractional_scale());
             for layer in layer_map_for_output(&output).layers() {
-                with_states(layer.wl_surface(), |states| {
+                layer.with_surfaces(|_, states| {
                     with_fractional_scale(states, |fractional| {
                         fractional.set_preferred_scale(scale)
                     });
@@ -212,12 +266,7 @@ impl CompositorHandler for DesktopState {
 
 impl FractionalScaleHandler for DesktopState {
     fn new_fractional_scale(&mut self, surface: WlSurface) {
-        let scale = self
-            .outputs
-            .get(&self.focused_output)
-            .or_else(|| self.outputs.get(&self.primary_output))
-            .map(|output| output.scale_factor)
-            .unwrap_or(1.0);
+        let scale = self.preferred_fractional_scale_for_surface(&surface);
         with_states(&surface, |states| {
             with_fractional_scale(states, |fractional| fractional.set_preferred_scale(scale));
         });

@@ -9,8 +9,8 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -1367,6 +1367,8 @@ struct SystemRailWidgets {
     battery_image: gtk::Image,
     battery: gtk::Label,
     notifications_button: gtk::Button,
+    updates_button: gtk::Button,
+    updates_image: gtk::Image,
     clock: gtk::Label,
     workspaces: Rc<RefCell<RailWorkspaceWidgets>>,
     workspace_box: gtk::Box,
@@ -1412,6 +1414,8 @@ struct SystemRailState {
     externally_powered: bool,
     battery_charging: bool,
     notification_unread_count: usize,
+    update_available_count: usize,
+    update_busy: bool,
 }
 
 fn build_panel(
@@ -1611,6 +1615,14 @@ fn build_panel(
         move || open_shell_panel(&notifications_connector, ShellPanel::NotificationHistory),
     );
     bottom.append(&notifications_button);
+    let updates_connector = connector.clone();
+    let (updates_button, updates_image) = glass_icon_button(
+        "software-update-available-symbolic",
+        "System updates",
+        "rail-button",
+        move || open_shell_panel(&updates_connector, ShellPanel::Updates),
+    );
+    bottom.append(&updates_button);
     let power_connector = connector.clone();
     bottom.append(
         &glass_icon_button(
@@ -1637,6 +1649,8 @@ fn build_panel(
         battery_image,
         battery,
         notifications_button,
+        updates_button,
+        updates_image,
         clock,
         workspaces,
         workspace_box,
@@ -1834,6 +1848,33 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
     widgets
         .notifications_button
         .set_tooltip_text(Some(&notification_tooltip));
+    set_shell_icon(
+        &widgets.updates_image,
+        if snapshot.shell.update_busy {
+            "emblem-synchronizing-symbolic"
+        } else {
+            "software-update-available-symbolic"
+        },
+    );
+    set_button_active(
+        &widgets.updates_button,
+        snapshot.shell.update_available_count > 0 || snapshot.shell.update_busy,
+    );
+    let updates_tooltip = if snapshot.shell.update_busy {
+        "Installing or checking system updates…".to_string()
+    } else if snapshot.shell.update_available_count == 0 {
+        "System updates: up to date".to_string()
+    } else if snapshot.shell.update_available_count == 1 {
+        "1 system update available".to_string()
+    } else {
+        format!(
+            "{} system updates available",
+            snapshot.shell.update_available_count
+        )
+    };
+    widgets
+        .updates_button
+        .set_tooltip_text(Some(&updates_tooltip));
 }
 
 fn system_rail_state(snapshot: &DesktopSnapshot, connector: &str) -> SystemRailState {
@@ -1881,6 +1922,8 @@ fn system_rail_state(snapshot: &DesktopSnapshot, connector: &str) -> SystemRailS
         externally_powered,
         battery_charging: snapshot.shell.battery_charging,
         notification_unread_count: snapshot.shell.notification_unread_count,
+        update_available_count: snapshot.shell.update_available_count,
+        update_busy: snapshot.shell.update_busy,
     }
 }
 
@@ -2340,7 +2383,7 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
     };
 
     format!(
-         "{definitions}\n{SHELL_CSS_BASE}\n\
+        "{definitions}\n{SHELL_CSS_BASE}\n\
          window.focal-shell-window {{ font-size: {font_scale:.3}em; }}\n\
          window.focal-panel-window > .focal-panel {{ border-radius: {panel_corners}; {panel_edge} }}\n\
          .focal-dock {{ border-radius: {dock_corners}; border-width: {border_width:.1}px; }}\n\

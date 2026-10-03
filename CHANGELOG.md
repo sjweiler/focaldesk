@@ -10,6 +10,9 @@ version numbers where practical.
 
 ### Added
 
+- The login greeter now mirrors itself across every usable display, waits
+  briefly for cold-start EDID negotiation, assigns compatible CRTCs per output,
+  and keeps healthy outputs responsive when another connector fails or stalls.
 - Added a permanent AI Console button to the GTK system rail. It opens the
   console, focuses its existing window when already running, reflects its
   running/active state, and keeps the task shelf representation unpinned.
@@ -114,6 +117,11 @@ version numbers where practical.
 
 ### Changed
 
+- XWayland now unmaps windows when their paired Wayland surface dies while
+  retaining their identity for later surface reassociation, and excludes tiny,
+  fixed-size, non-interactive Wine implementation windows. This prevents blank
+  rectangles and phantom task-shelf entries without losing Battle.net's
+  relaunched CEF surface.
 - Raw Vulkan now bridges implicit DMA-BUF synchronization into Vulkan: each
   distinct client buffer's writer fence is imported as a temporary acquire
   semaphore, and the completed Vulkan read fence is published back to the

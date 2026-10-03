@@ -15,6 +15,25 @@ pub enum PanelKind {
     ClipboardHistory,
     NotificationHistory,
     Updates,
+    SplitLayout,
+    SplitAssist,
+    SplitGroup,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SplitLayoutPreset {
+    LeftHalf,
+    RightHalf,
+    LeftTwoThirds,
+    RightThird,
+    LeftThird,
+    RightTwoThirds,
+    TopHalf,
+    BottomHalf,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -48,6 +67,12 @@ pub enum UiAction {
     SystemCommand(SystemCommand),
     Custom(ElementId),
     SelectClipboardEntry(u64),
+    ApplySplitLayout(SplitLayoutPreset),
+    SelectSplitAssistWindow(focaldesk_types::WindowId),
+    CancelSplitAssist,
+    SwapSplitPanes,
+    ReplaceSplitWindow,
+    ExitSplitGroup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

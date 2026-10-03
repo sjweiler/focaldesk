@@ -106,6 +106,78 @@ const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("toggle_clipboard_history", "Clipboard history", "Super+V"),
     ("focus_previous", "Focus previous window", "Super+F7"),
     ("focus_next", "Focus next window", "Super+F8"),
+    ("split_left", "Place window in left half", "Super+Left"),
+    ("split_right", "Place window in right half", "Super+Right"),
+    ("split_top", "Place window in top half", "Super+Up"),
+    ("split_bottom", "Place window in bottom half", "Super+Down"),
+    ("toggle_split_layout", "Choose a split layout", "Super+Z"),
+    (
+        "swap_split_left",
+        "Swap with left split pane",
+        "Super+Shift+Left",
+    ),
+    (
+        "swap_split_right",
+        "Swap with right split pane",
+        "Super+Shift+Right",
+    ),
+    (
+        "swap_split_top",
+        "Swap with top split pane",
+        "Super+Shift+Up",
+    ),
+    (
+        "swap_split_bottom",
+        "Swap with bottom split pane",
+        "Super+Shift+Down",
+    ),
+    (
+        "resize_split_left",
+        "Move split divider left",
+        "Super+Alt+Left",
+    ),
+    (
+        "resize_split_right",
+        "Move split divider right",
+        "Super+Alt+Right",
+    ),
+    ("resize_split_top", "Move split divider up", "Super+Alt+Up"),
+    (
+        "resize_split_bottom",
+        "Move split divider down",
+        "Super+Alt+Down",
+    ),
+    (
+        "resize_split_left_fine",
+        "Nudge split divider left",
+        "Super+Alt+Shift+Left",
+    ),
+    (
+        "resize_split_right_fine",
+        "Nudge split divider right",
+        "Super+Alt+Shift+Right",
+    ),
+    (
+        "resize_split_top_fine",
+        "Nudge split divider up",
+        "Super+Alt+Shift+Up",
+    ),
+    (
+        "resize_split_bottom_fine",
+        "Nudge split divider down",
+        "Super+Alt+Shift+Down",
+    ),
+    ("focus_split_next", "Focus next split pane", "Super+Alt+Tab"),
+    (
+        "focus_split_previous",
+        "Focus previous split pane",
+        "Super+Alt+Shift+Tab",
+    ),
+    (
+        "undo_split_action",
+        "Undo last split action",
+        "Super+Alt+BackSpace",
+    ),
 ];
 
 fn normalized_shortcut(shortcut: &str) -> Result<String, String> {
@@ -8404,6 +8476,19 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
+    let restore_split_layouts = add_switch_row(
+        &behavior_group,
+        "Restore split layouts",
+        Some("Restore saved pane assignments and divider ratios after restart"),
+        settings.borrow().workspaces.restore_split_layouts,
+    );
+    {
+        let settings = settings.clone();
+        restore_split_layouts.connect_active_notify(move |switch| {
+            settings.borrow_mut().workspaces.restore_split_layouts = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     let maximize_on_launch = add_switch_row(
         &behavior_group,
         "Maximize app on launch",
@@ -8419,6 +8504,20 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
+
+    let split_screen = add_switch_row(
+        &behavior_group,
+        "Enable split screen",
+        Some("Allow supported windows to share the work area in split layouts"),
+        settings.borrow().workspaces.split_screen_enabled,
+    );
+    {
+        let settings = settings.clone();
+        split_screen.connect_active_notify(move |switch| {
+            settings.borrow_mut().workspaces.split_screen_enabled = switch.is_active();
+            persist_settings(&settings.borrow());
+        });
+    }
     page.add(&behavior_group);
 
     let keybind_group = adw::PreferencesGroup::new();
@@ -8431,6 +8530,18 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         "Alt+Shift+1",
     );
     add_info_row(&keybind_group, "Show all workspaces", None, "Alt+0");
+    add_info_row(
+        &keybind_group,
+        "Split window left or right",
+        None,
+        "Super+← / →",
+    );
+    add_info_row(
+        &keybind_group,
+        "Split window top or bottom",
+        None,
+        "Super+↑ / ↓",
+    );
     page.add(&keybind_group);
 
     adw::NavigationPage::new(&page, "Workspaces")

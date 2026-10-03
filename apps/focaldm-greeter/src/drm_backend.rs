@@ -1,8 +1,8 @@
 // Standalone DRM/KMS scanout for the greeter, deliberately independent of
 // focaldesk-engine's backend::drm (which is 3000+ lines of GBM/EGL/GLES/
-// wayland-server machinery for the real compositor). The greeter only ever
-// needs to show a login box on one output, so it uses legacy (non-atomic)
-// modesetting. Buffer allocation and FB creation follow the same rules as
+// wayland-server machinery for the real compositor). The greeter mirrors the
+// login box across every usable output using legacy (non-atomic) modesetting.
+// Buffer allocation and FB creation follow the same rules as
 // the compositor: `GbmAllocator` with `RENDERING|SCANOUT`, plane∩EGL
 // modifiers, and `framebuffer_from_bo` (AddFB2 + modifiers).
 //
@@ -39,6 +39,8 @@ use smithay::reexports::gbm::Device as GbmDevice;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{Buffer, DeviceFd, Physical, Rectangle, Size, Transform};
+use std::collections::HashSet;
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::glyph_atlas::GlyphAtlas;
@@ -148,6 +150,8 @@ void main() {
 "#;
 
 const GPU_COLOR_FORMATS: [Fourcc; 2] = [Fourcc::Xrgb8888, Fourcc::Argb8888];
+const CONNECTOR_SETTLE_ATTEMPTS: usize = 20;
+const CONNECTOR_SETTLE_DELAY: Duration = Duration::from_millis(100);
 
 pub struct GreeterOutput {
     session: LibSeatSession,
@@ -156,6 +160,11 @@ pub struct GreeterOutput {
     // objects allocated from it.
     #[allow(dead_code)]
     gbm: GbmDevice<DrmDeviceFd>,
+    scanouts: Vec<GreeterScanout>,
+    background_style: render::BackgroundStyle,
+}
+
+struct GreeterScanout {
     crtc: crtc::Handle,
     connector: connector::Handle,
     mode: Mode,
@@ -170,7 +179,6 @@ pub struct GreeterOutput {
     fbs: [GbmFramebuffer; 2],
     front: usize,
     flip_pending: bool,
-    background_style: render::BackgroundStyle,
     gpu: Option<GpuRenderer>,
     direct_gpu_scanout: bool,
 }
@@ -354,10 +362,11 @@ impl GpuRenderer {
 }
 
 impl GreeterOutput {
-    /// Opens the primary GPU via libseat, mode-sets the first connected
+    /// Opens the primary GPU via libseat, mode-sets every usable connected
     /// output at its preferred mode, and hands back the pieces the caller
     /// needs to register with calloop: the session notifier (Pause/Activate
-    /// events) and a libinput context (keyboard/pointer events).
+    /// events) and a libinput context (keyboard/pointer events). Individual
+    /// output failures are isolated so one bad link cannot hide the greeter.
     ///
     /// Expects the greeter VT to already be the foreground console (focaldmd
     /// switches with `VT_ACTIVATE` before spawn). Without an active seat
@@ -389,88 +398,52 @@ impl GreeterOutput {
             .resource_handles()
             .context("failed to load DRM resource handles")?;
 
-        let connector_info: Vec<connector::Info> = res
-            .connectors()
-            .iter()
-            .flat_map(|handle| fd.get_connector(*handle, false))
-            .collect();
-
-        let con = connector_info
-            .iter()
-            .find(|c| c.state() == connector::State::Connected)
-            .ok_or_else(|| anyhow!("no connected connector found on {}", gpu_path.display()))?;
-
-        let mode = *con
-            .modes()
-            .iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
-            .or_else(|| con.modes().first())
-            .ok_or_else(|| anyhow!("connector {:?} has no modes", con.handle()))?;
-
-        let crtc_handle = pick_crtc(&fd, &res, con)
-            .ok_or_else(|| anyhow!("no CRTC available for connector {:?}", con.handle()))?;
-
-        // Query primary-plane formats the same way the compositor does, then
-        // drop the DrmDevice — we still present with legacy set_crtc/page_flip.
-        let plane_formats = primary_plane_formats(&fd, crtc_handle)?;
-
+        let connector_info = wait_for_usable_connectors(&fd, &res, &gpu_path)?;
         let gbm = GbmDevice::new(fd.clone()).context("failed to create GBM device")?;
-        let (width, height) = mode.size();
-        let sizes = render::font_sizes(height as u32);
         let background_style = select_background_style();
         tracing::info!(
             style = background_style.as_str(),
             "selected greeter background"
         );
 
-        let (bos, fbs, gpu, direct_gpu_scanout) = match try_open_gpu_scanout(
-            &gbm,
-            &fd,
-            &plane_formats,
-            width,
-            height,
-            sizes,
-            background_style,
-        ) {
-            Ok(gpu_path) => {
-                tracing::info!(
-                    "greeter using GPU scanout path (GbmAllocator + framebuffer_from_bo)"
-                );
-                let (bos, fbs, gpu) = gpu_path;
-                (bos, fbs, gpu, true)
-            }
-            Err(e) => {
+        let mut used_crtcs = HashSet::new();
+        let mut scanouts = Vec::new();
+        for con in connector_info
+            .iter()
+            .filter(|con| con.state() == connector::State::Connected && !con.modes().is_empty())
+        {
+            let Some(crtc_handle) = pick_crtc(&fd, &res, con, &used_crtcs) else {
                 tracing::warn!(
-                    error = ?e,
-                    "direct GPU greeter scanout unavailable, trying GPU offscreen rendering"
+                    connector = ?con.handle(),
+                    "no unused compatible CRTC for connected greeter output"
                 );
-                let (bos, fbs) = make_cpu_buffers(&gbm, &fd, width, height)?;
-                match GpuRenderer::new(&gbm, sizes, background_style) {
-                    Ok(gpu) => {
-                        tracing::info!(
-                            "greeter using GPU offscreen rendering with linear KMS transfer"
-                        );
-                        (bos, fbs, Some(gpu), false)
-                    }
-                    Err(gpu_err) => {
-                        tracing::warn!(
-                            error = ?gpu_err,
-                            "GPU offscreen greeter unavailable, using CPU rendering"
-                        );
-                        (bos, fbs, None, false)
-                    }
+                continue;
+            };
+
+            match open_scanout(&gbm, &fd, con, crtc_handle, background_style) {
+                Ok(scanout) => {
+                    used_crtcs.insert(crtc_handle);
+                    scanouts.push(scanout);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        connector = ?con.handle(),
+                        crtc = ?crtc_handle,
+                        error = ?error,
+                        "greeter output initialization failed; trying remaining connectors"
+                    );
                 }
             }
-        };
+        }
 
-        fd.set_crtc(
-            crtc_handle,
-            Some(*fbs[0].as_ref()),
-            (0, 0),
-            &[con.handle()],
-            Some(mode),
-        )
-        .context("failed to set CRTC")?;
+        if scanouts.is_empty() {
+            return Err(anyhow!(
+                "no connected connector on {} could be initialized",
+                gpu_path.display()
+            ));
+        }
+
+        tracing::info!(outputs = scanouts.len(), "greeter scanout outputs ready");
 
         let mut libinput = Libinput::new_with_udev::<
             smithay::backend::libinput::LibinputSessionInterface<LibSeatSession>,
@@ -483,16 +456,8 @@ impl GreeterOutput {
             session,
             fd,
             gbm,
-            crtc: crtc_handle,
-            connector: con.handle(),
-            mode,
-            bos,
-            fbs,
-            front: 0,
-            flip_pending: false,
+            scanouts,
             background_style,
-            gpu,
-            direct_gpu_scanout,
         };
 
         Ok((output, notifier, libinput))
@@ -509,7 +474,7 @@ impl GreeterOutput {
     }
 
     pub fn mode_size(&self) -> (u32, u32) {
-        let (w, h) = self.mode.size();
+        let (w, h) = self.scanouts[0].mode.size();
         (w as u32, h as u32)
     }
 
@@ -518,7 +483,9 @@ impl GreeterOutput {
     }
 
     pub fn flip_pending(&self) -> bool {
-        self.flip_pending
+        // Callers use this to decide whether another frame can be submitted.
+        // A stalled output must not stop healthy outputs from rendering.
+        self.scanouts.iter().all(|scanout| scanout.flip_pending)
     }
 
     pub fn background_style(&self) -> render::BackgroundStyle {
@@ -529,18 +496,36 @@ impl GreeterOutput {
     /// process may have taken DRM master and scanned out something else
     /// while we were paused; this is a best-effort re-assertion, not a full
     /// atomic-KMS resume path. Re-asserts whichever buffer is currently
-    /// `front` — its content is always our last completed frame, since
-    /// `render` only ever touches the other one.
+    /// `front` on every configured output. A connector-specific failure is
+    /// logged and does not prevent the remaining outputs from recovering.
     pub fn reassert_scanout(&mut self) -> Result<()> {
-        self.fd
-            .set_crtc(
-                self.crtc,
-                Some(*self.fbs[self.front].as_ref()),
+        let mut restored = 0;
+        for scanout in &mut self.scanouts {
+            match self.fd.set_crtc(
+                scanout.crtc,
+                Some(*scanout.fbs[scanout.front].as_ref()),
                 (0, 0),
-                &[self.connector],
-                Some(self.mode),
-            )
-            .context("failed to re-set CRTC on session resume")
+                &[scanout.connector],
+                Some(scanout.mode),
+            ) {
+                Ok(()) => {
+                    scanout.flip_pending = false;
+                    restored += 1;
+                }
+                Err(error) => tracing::warn!(
+                    connector = ?scanout.connector,
+                    crtc = ?scanout.crtc,
+                    error = ?error,
+                    "failed to re-set greeter CRTC on session resume"
+                ),
+            }
+        }
+
+        if restored == 0 {
+            Err(anyhow!("failed to restore every greeter output"))
+        } else {
+            Ok(())
+        }
     }
 
     pub fn handle_drm_events(&mut self) -> Result<bool> {
@@ -557,8 +542,14 @@ impl GreeterOutput {
             let mut saw_event = false;
             for event in events {
                 saw_event = true;
-                if matches!(event, Event::PageFlip(_)) {
-                    self.flip_pending = false;
+                if let Event::PageFlip(event) = event {
+                    if let Some(scanout) = self
+                        .scanouts
+                        .iter_mut()
+                        .find(|scanout| scanout.crtc == event.crtc)
+                    {
+                        scanout.flip_pending = false;
+                    }
                     saw_page_flip = true;
                 }
             }
@@ -572,10 +563,45 @@ impl GreeterOutput {
     }
 
     pub fn render(&mut self, state: &render::FrameState<'_>) -> Result<render::FrameHitTargets> {
-        if self.flip_pending {
+        let mut primary_layout = None;
+        let mut fallback_layout = None;
+        let mut rendered = 0;
+        for (index, scanout) in self.scanouts.iter_mut().enumerate() {
+            if scanout.flip_pending {
+                continue;
+            }
+            match scanout.render(&self.fd, self.background_style, state) {
+                Ok(layout) => {
+                    rendered += 1;
+                    if index == 0 {
+                        primary_layout = Some(layout.clone());
+                    }
+                    fallback_layout.get_or_insert(layout);
+                }
+                Err(error) => tracing::warn!(
+                    connector = ?scanout.connector,
+                    crtc = ?scanout.crtc,
+                    error = ?error,
+                    "failed to render greeter output; continuing on remaining outputs"
+                ),
+            }
+        }
+
+        if rendered == 0 {
             return Ok(render::FrameHitTargets::default());
         }
 
+        Ok(primary_layout.or(fallback_layout).unwrap_or_default())
+    }
+}
+
+impl GreeterScanout {
+    fn render(
+        &mut self,
+        fd: &DrmDeviceFd,
+        background_style: render::BackgroundStyle,
+        state: &render::FrameState<'_>,
+    ) -> Result<render::FrameHitTargets> {
         let back = 1 - self.front;
         let (width, height) = self.mode.size();
 
@@ -617,7 +643,7 @@ impl GreeterOutput {
                         pointer: state.pointer,
                         power_menu_open: state.power_menu_open,
                         pulse_phase: state.pulse_phase,
-                        background_style: self.background_style,
+                        background_style,
                         paint_background: true,
                     };
 
@@ -626,14 +652,13 @@ impl GreeterOutput {
                 .context("failed to map GBM buffer object for render")?
         };
 
-        self.fd
-            .page_flip(
-                self.crtc,
-                *self.fbs[back].as_ref(),
-                PageFlipFlags::EVENT,
-                None,
-            )
-            .context("failed to queue page flip")?;
+        fd.page_flip(
+            self.crtc,
+            *self.fbs[back].as_ref(),
+            PageFlipFlags::EVENT,
+            None,
+        )
+        .context("failed to queue page flip")?;
 
         self.front = back;
         self.flip_pending = true;
@@ -641,16 +666,193 @@ impl GreeterOutput {
     }
 }
 
+fn open_scanout(
+    gbm: &GbmDevice<DrmDeviceFd>,
+    fd: &DrmDeviceFd,
+    con: &connector::Info,
+    crtc: crtc::Handle,
+    background_style: render::BackgroundStyle,
+) -> Result<GreeterScanout> {
+    let mode = *con
+        .modes()
+        .iter()
+        .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+        .or_else(|| con.modes().first())
+        .ok_or_else(|| anyhow!("connector {:?} has no modes", con.handle()))?;
+
+    // Query primary-plane formats the same way the compositor does, then
+    // drop the DrmDevice — presentation still uses legacy set_crtc/page_flip.
+    let plane_formats = primary_plane_formats(fd, crtc)?;
+    let (width, height) = mode.size();
+    let sizes = render::font_sizes(height as u32);
+
+    let (bos, fbs, gpu, direct_gpu_scanout) = match try_open_gpu_scanout(
+        gbm,
+        fd,
+        &plane_formats,
+        width,
+        height,
+        sizes,
+        background_style,
+    ) {
+        Ok(gpu_path) => {
+            tracing::info!(
+                connector = ?con.handle(),
+                crtc = ?crtc,
+                "greeter using GPU scanout path (GbmAllocator + framebuffer_from_bo)"
+            );
+            let (bos, fbs, gpu) = gpu_path;
+            (bos, fbs, gpu, true)
+        }
+        Err(error) => {
+            tracing::warn!(
+                connector = ?con.handle(),
+                crtc = ?crtc,
+                error = ?error,
+                "direct GPU greeter scanout unavailable, trying GPU offscreen rendering"
+            );
+            let (bos, fbs) = make_cpu_buffers(gbm, fd, width, height)?;
+            match GpuRenderer::new(gbm, sizes, background_style) {
+                Ok(gpu) => {
+                    tracing::info!(
+                        connector = ?con.handle(),
+                        crtc = ?crtc,
+                        "greeter using GPU offscreen rendering with linear KMS transfer"
+                    );
+                    (bos, fbs, Some(gpu), false)
+                }
+                Err(gpu_error) => {
+                    tracing::warn!(
+                        connector = ?con.handle(),
+                        crtc = ?crtc,
+                        error = ?gpu_error,
+                        "GPU offscreen greeter unavailable, using CPU rendering"
+                    );
+                    (bos, fbs, None, false)
+                }
+            }
+        }
+    };
+
+    fd.set_crtc(
+        crtc,
+        Some(*fbs[0].as_ref()),
+        (0, 0),
+        &[con.handle()],
+        Some(mode),
+    )
+    .with_context(|| {
+        format!(
+            "failed to set CRTC {crtc:?} for connector {:?}",
+            con.handle()
+        )
+    })?;
+
+    tracing::info!(
+        connector = ?con.handle(),
+        crtc = ?crtc,
+        width,
+        height,
+        refresh_hz = mode.vrefresh(),
+        "greeter output initialized"
+    );
+
+    Ok(GreeterScanout {
+        crtc,
+        connector: con.handle(),
+        mode,
+        bos,
+        fbs,
+        front: 0,
+        flip_pending: false,
+        gpu,
+        direct_gpu_scanout,
+    })
+}
+
+fn wait_for_usable_connectors(
+    fd: &DrmDeviceFd,
+    res: &smithay::reexports::drm::control::ResourceHandles,
+    gpu_path: &std::path::Path,
+) -> Result<Vec<connector::Info>> {
+    for attempt in 0..=CONNECTOR_SETTLE_ATTEMPTS {
+        let latest: Vec<_> = res
+            .connectors()
+            .iter()
+            .filter_map(|handle| match fd.get_connector(*handle, false) {
+                Ok(info) => Some(info),
+                Err(error) => {
+                    tracing::warn!(connector = ?handle, error = ?error, "failed to inspect connector");
+                    None
+                }
+            })
+            .collect();
+
+        let connected = latest
+            .iter()
+            .filter(|con| con.state() == connector::State::Connected)
+            .count();
+        let usable = latest
+            .iter()
+            .filter(|con| con.state() == connector::State::Connected && !con.modes().is_empty())
+            .count();
+
+        if connected > 0 && usable == connected {
+            return Ok(latest);
+        }
+        if attempt == CONNECTOR_SETTLE_ATTEMPTS {
+            if usable > 0 {
+                tracing::warn!(
+                    connected,
+                    usable,
+                    "some connected greeter outputs never advertised a mode; skipping them"
+                );
+                return Ok(latest);
+            }
+            break;
+        }
+
+        thread::sleep(CONNECTOR_SETTLE_DELAY);
+    }
+
+    Err(anyhow!(
+        "no connected connector with a usable mode found on {}",
+        gpu_path.display()
+    ))
+}
+
 fn pick_crtc(
     fd: &DrmDeviceFd,
     res: &smithay::reexports::drm::control::ResourceHandles,
     con: &connector::Info,
+    used: &HashSet<crtc::Handle>,
 ) -> Option<crtc::Handle> {
+    // Preserve the kernel's working connector -> encoder -> CRTC routing
+    // whenever possible. Picking the first compatible CRTC greedily can
+    // consume a CRTC needed by a later connector (notably DP-3 in the
+    // two-output NVIDIA topology), even though both outputs were already
+    // routed correctly before the greeter took over.
+    for enc in con.encoders() {
+        let Ok(enc_info) = fd.get_encoder(*enc) else {
+            continue;
+        };
+        let Some(current) = enc_info.crtc() else {
+            continue;
+        };
+        if !used.contains(&current)
+            && res
+                .filter_crtcs(enc_info.possible_crtcs())
+                .contains(&current)
+        {
+            return Some(current);
+        }
+    }
+
     con.encoders().iter().find_map(|enc| {
         let enc_info = fd.get_encoder(*enc).ok()?;
         res.filter_crtcs(enc_info.possible_crtcs())
             .into_iter()
-            .next()
+            .find(|crtc| !used.contains(crtc))
     })
 }
 

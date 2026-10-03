@@ -698,6 +698,12 @@ pub fn draw_output_stage(
         prepared.frame_ctx.rendering_output,
         prepared.frame_ctx.now,
     );
+    let split_dividers = state.split_divider_rects_for_output(prepared.frame_ctx.rendering_output);
+    let snap_preview = state.snap_preview_rect_for_output(prepared.frame_ctx.rendering_output);
+    let split_resize_percent = state.split_resize_percent_for_output(
+        prepared.frame_ctx.rendering_output,
+        prepared.frame_ctx.now,
+    );
 
     let semantic_metrics = state
         .theme
@@ -732,6 +738,9 @@ pub fn draw_output_stage(
             .topbar_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
         clock_pulse: state
             .clock_pulse_for_output(prepared.frame_ctx.rendering_output, prepared.frame_ctx.now),
+        split_dividers: &split_dividers,
+        split_resize_percent,
+        snap_preview,
         draw_software_cursor: prepared.draw_software_cursor,
         ui_focus: state.ui.focused,
         current_workspace: active_workspace,

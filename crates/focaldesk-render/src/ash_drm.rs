@@ -119,7 +119,8 @@ fn srgb_decode(value: f32) -> f32 {
 }
 
 fn decode_channel(value: f32) -> f32 {
-    let mode = pc.params.x;
+    var mode = pc.params.x;
+    if mode >= 8.0 { mode -= 8.0; }
     if mode < 0.5 { return srgb_decode(value); }
     if mode < 1.5 { return value * pc.params.z; }
     if mode < 2.5 { return pow(max(value, 0.0), 2.2); }
@@ -146,6 +147,7 @@ fn decode_channel(value: f32) -> f32 {
 }
 
 fn dither_code_value(color: vec3<f32>, position: vec2<f32>) -> vec3<f32> {
+    if pc.params.x >= 8.0 { return color; }
     if pc.params.w <= 1.0 { return color; }
     let code_step = 1.0 / (pow(2.0, pc.params.w) - 1.0);
     let pixel = floor(position);
@@ -158,14 +160,22 @@ fn decode_modulated_color(sampled: vec4<f32>, tint: vec4<f32>, position: vec2<f3
     let alpha = sampled.a * tint.a;
     if alpha <= 0.0 { return vec4(0.0); }
     var sampled_straight = sampled.rgb / sampled.a;
-    let mode = pc.params.x;
+    var mode = pc.params.x;
+    let auto_hdr = mode >= 8.0;
+    if auto_hdr { mode -= 8.0; }
     let extended = (mode >= 0.5 && mode < 1.5) || (mode >= 3.5 && mode < 4.5);
     if !extended { sampled_straight = clamp(sampled_straight, vec3(0.0), vec3(1.0)); }
     sampled_straight = dither_code_value(sampled_straight, position);
     let tint_straight = tint.rgb / tint.a;
     let sampled_linear = vec3(decode_channel(sampled_straight.r), decode_channel(sampled_straight.g), decode_channel(sampled_straight.b));
     let tint_linear = vec3(srgb_decode(tint_straight.r), srgb_decode(tint_straight.g), srgb_decode(tint_straight.b));
-    let linear = sampled_linear * tint_linear;
+    var linear = sampled_linear * tint_linear;
+    if auto_hdr {
+        let luminance = max(dot(linear, vec3(0.2126, 0.7152, 0.0722)), 0.0);
+        let widened = vec3(luminance) + (linear - vec3(luminance)) * (1.0 + pc.params.w);
+        let boost = 1.0 + (pc.params.z - 1.0) * pow(clamp(luminance, 0.0, 1.0), 2.0);
+        linear = max(widened, vec3(0.0)) * boost * pc.params.y;
+    }
     let mapped = vec3(dot(pc.matrix0.xyz, linear), dot(pc.matrix1.xyz, linear), dot(pc.matrix2.xyz, linear));
     return vec4(mapped * alpha, alpha);
 }
@@ -2548,12 +2558,8 @@ impl AshDrmRenderer {
         push[12..16].copy_from_slice(&surface.tint);
         let matrix = multiply_3x3(output_matrix, surface.color_transform.client_to_scene);
         write_push_matrix(&mut push[16..28], matrix);
-        push[28..].copy_from_slice(&[
-            surface.color_transform.transfer as u32 as f32,
-            surface.color_transform.reference_white_nits.max(1.0),
-            surface.color_transform.linear_to_scene_scale,
-            surface.color_transform.source_bits,
-        ]);
+        let params = texture_color_params(surface.color_transform);
+        push[28..].copy_from_slice(&params);
         unsafe {
             self.device.cmd_bind_pipeline(
                 command,
@@ -3409,6 +3415,33 @@ impl AshDrmRenderer {
     }
 }
 
+fn texture_color_params(transform: crate::TextureColorTransform) -> [f32; 4] {
+    if let Some(auto_hdr) = transform.auto_hdr.filter(|_| {
+        matches!(
+            transform.transfer,
+            crate::FrameTransferFunction::Srgb
+                | crate::FrameTransferFunction::Gamma22
+                | crate::FrameTransferFunction::Bt1886
+        )
+    }) {
+        let sdr_nits = auto_hdr.sdr_nits.clamp(1.0, 10_000.0);
+        let target_nits = auto_hdr.target_nits.clamp(sdr_nits, 10_000.0);
+        let scene_reference = auto_hdr.scene_reference_nits.clamp(1.0, 10_000.0);
+        return [
+            transform.transfer as u32 as f32 + 8.0,
+            sdr_nits / scene_reference,
+            target_nits / sdr_nits,
+            auto_hdr.gamut_wideness.clamp(0.0, 0.35),
+        ];
+    }
+    [
+        transform.transfer as u32 as f32,
+        transform.reference_white_nits.max(1.0),
+        transform.linear_to_scene_scale,
+        transform.source_bits,
+    ]
+}
+
 impl TextureResource {
     fn null() -> Self {
         Self {
@@ -3994,19 +4027,45 @@ mod tests {
         compile_shader, dmabuf_planes_share_object, effective_damage_regions,
         export_dmabuf_read_fence, identity_output_lut, import_dmabuf_read_fence,
         matrix_fingerprint, mesh_clip_transform, multiply_3x3, ndc_rect, output_state_fingerprint,
-        solid_push_constants, target_key, texture_components, texture_needs_refresh,
-        texture_upload_byte_len, texture_vk_format, transformed_uv, validate_meshes,
-        validate_output_lut, vk_format, AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut,
-        AshDrmTransfer, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER, SOLID_SHADER,
-        TEXTURE_SHADER, XBGR2101010, XRGB2101010, XRGB8888,
+        solid_push_constants, target_key, texture_color_params, texture_components,
+        texture_needs_refresh, texture_upload_byte_len, texture_vk_format, transformed_uv,
+        validate_meshes, validate_output_lut, vk_format, AshDrmCapture, AshDrmHdrOutput,
+        AshDrmOutputLut, AshDrmTransfer, ARGB2101010, ARGB8888, MESH_SHADER, OUTPUT_SHADER,
+        SOLID_SHADER, TEXTURE_SHADER, XBGR2101010, XRGB2101010, XRGB8888,
     };
     use crate::{
-        DrmRenderTarget, FramePixelFormat, FrameTransform, MeshVertex, SolidQuad, TexturedMesh,
+        AutoHdrParams, DrmRenderTarget, FramePixelFormat, FrameTransferFunction, FrameTransform,
+        MeshVertex, SolidQuad, TextureColorTransform, TexturedMesh,
     };
     use std::collections::VecDeque;
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;
+
+    #[test]
+    fn auto_hdr_parameters_are_opt_in_and_ignore_native_hdr() {
+        let auto_hdr = AutoHdrParams {
+            sdr_nits: 100.0,
+            target_nits: 1_000.0,
+            scene_reference_nits: 200.0,
+            gamut_wideness: 0.1,
+        };
+        let sdr = TextureColorTransform {
+            auto_hdr: Some(auto_hdr),
+            ..Default::default()
+        };
+        assert_eq!(texture_color_params(sdr), [8.0, 0.5, 10.0, 0.1]);
+
+        let native_hdr = TextureColorTransform {
+            transfer: FrameTransferFunction::St2084Pq,
+            auto_hdr: Some(auto_hdr),
+            reference_white_nits: 203.0,
+            linear_to_scene_scale: 2.0,
+            source_bits: 10.0,
+            ..Default::default()
+        };
+        assert_eq!(texture_color_params(native_hdr), [3.0, 203.0, 2.0, 10.0]);
+    }
 
     #[test]
     fn raw_vulkan_shaders_compile_to_spirv() {

@@ -28,8 +28,9 @@ use crate::chrome_shaders::ChromeShaders;
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::egui_panels::{
     AudioPanel, BluetoothPanel, CalendarPanel, ClipboardEntryView, ClipboardPanel, DebugPanel,
-    EguiPanelView, NetworkPanel, NotificationHistoryPanel, PowerPanel, SettingsPanel, UpdatesPanel,
-    WorkspaceDialog, WorkspaceEntryView, WorkspacesPanel,
+    EguiPanelView, NetworkPanel, NotificationHistoryPanel, PowerPanel, SettingsPanel,
+    SplitAssistEntryView, SplitAssistPanel, SplitGroupPanel, SplitLayoutAvailability,
+    SplitLayoutPanel, UpdatesPanel, WorkspaceDialog, WorkspaceEntryView, WorkspacesPanel,
 };
 use crate::types::{PanelKind, UiAction};
 
@@ -49,6 +50,9 @@ pub struct EguiLayer {
     clipboard: ClipboardPanel,
     notifications: NotificationHistoryPanel,
     updates: UpdatesPanel,
+    split_layout: SplitLayoutPanel,
+    split_assist: SplitAssistPanel,
+    split_group: SplitGroupPanel,
 
     textures_delta: TexturesDelta,
     primitives: Vec<ClippedPrimitive>,
@@ -487,6 +491,9 @@ impl Default for EguiLayer {
             clipboard: ClipboardPanel::default(),
             notifications: NotificationHistoryPanel::default(),
             updates: UpdatesPanel::default(),
+            split_layout: SplitLayoutPanel::default(),
+            split_assist: SplitAssistPanel::default(),
+            split_group: SplitGroupPanel::default(),
         }
     }
 }
@@ -600,6 +607,9 @@ impl EguiLayer {
             || self.clipboard.open
             || self.notifications.open
             || self.updates.open
+            || self.split_layout.open
+            || self.split_assist.open
+            || self.split_group.open
     }
 
     pub fn owner_output(&self) -> Option<OutputId> {
@@ -710,6 +720,19 @@ impl EguiLayer {
                 self.workspaces.open = !self.workspaces.open;
                 opened = self.workspaces.open;
             }
+            PanelKind::SplitLayout => {
+                self.split_layout.open = !self.split_layout.open;
+                opened = self.split_layout.open;
+            }
+            PanelKind::SplitAssist => {
+                self.split_assist.open = !self.split_assist.open;
+                opened = self.split_assist.open;
+            }
+            PanelKind::SplitGroup => {
+                self.split_group.anchor = self.last_pointer_pos;
+                self.split_group.open = !self.split_group.open;
+                opened = self.split_group.open;
+            }
             _ => {}
         }
 
@@ -751,6 +774,9 @@ impl EguiLayer {
             self.clipboard.show(ctx, frame_ctx, &mut self.actions);
             self.notifications.show(ctx, frame_ctx, &mut self.actions);
             self.updates.show(ctx, frame_ctx, &mut self.actions);
+            self.split_layout.show(ctx, frame_ctx, &mut self.actions);
+            self.split_assist.show(ctx, frame_ctx, &mut self.actions);
+            self.split_group.show(ctx, frame_ctx, &mut self.actions);
         });
 
         if let Some(update) = output.platform_output.accesskit_update.take() {
@@ -847,11 +873,39 @@ impl EguiLayer {
         self.workspace_dialog.open = false;
         self.workspaces.open = false;
         self.clipboard.open = false;
+        self.notifications.open = false;
+        self.updates.open = false;
+        self.split_layout.open = false;
+        self.split_assist.open = false;
+        self.split_group.open = false;
         self.owner_output = None;
     }
 
     pub fn close_clipboard_history(&mut self) {
         self.clipboard.open = false;
+    }
+
+    pub fn close_split_layout(&mut self) {
+        self.split_layout.open = false;
+        if !self.has_open_panels() {
+            self.owner_output = None;
+        }
+    }
+
+    pub fn close_split_assist(&mut self) {
+        self.split_assist.open = false;
+        self.split_assist.entries.clear();
+        self.split_assist.keyboard_index = 0;
+        if !self.has_open_panels() {
+            self.owner_output = None;
+        }
+    }
+
+    pub fn close_split_group(&mut self) {
+        self.split_group.open = false;
+        if !self.has_open_panels() {
+            self.owner_output = None;
+        }
     }
 
     pub fn set_clipboard_entries(&mut self, entries: Vec<ClipboardEntryView>) {
@@ -860,6 +914,14 @@ impl EguiLayer {
 
     pub fn set_workspace_entries(&mut self, entries: Vec<WorkspaceEntryView>) {
         self.workspaces.entries = entries;
+    }
+
+    pub fn set_split_layout_availability(&mut self, availability: SplitLayoutAvailability) {
+        self.split_layout.availability = availability;
+    }
+
+    pub fn set_split_assist_entries(&mut self, entries: Vec<SplitAssistEntryView>) {
+        self.split_assist.entries = entries;
     }
 
     pub fn refresh_power_status_now(&mut self) {

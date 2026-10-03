@@ -126,6 +126,121 @@ impl Keybinds {
 
         self.map.insert(
             KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_Left,
+            },
+            KeyAction::SplitLeft,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_Right,
+            },
+            KeyAction::SplitRight,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_Up,
+            },
+            KeyAction::SplitTop,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_Down,
+            },
+            KeyAction::SplitBottom,
+        );
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER,
+                sym: keysyms::KEY_z,
+            },
+            KeyAction::ToggleSplitLayout,
+        );
+
+        for (sym, action) in [
+            (keysyms::KEY_Left, KeyAction::SwapSplitLeft),
+            (keysyms::KEY_Right, KeyAction::SwapSplitRight),
+            (keysyms::KEY_Up, KeyAction::SwapSplitTop),
+            (keysyms::KEY_Down, KeyAction::SwapSplitBottom),
+        ] {
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SUPER | ModMask::SHIFT,
+                    sym,
+                },
+                action,
+            );
+        }
+
+        for (sym, action, fine_action) in [
+            (
+                keysyms::KEY_Left,
+                KeyAction::ResizeSplitLeft,
+                KeyAction::ResizeSplitLeftFine,
+            ),
+            (
+                keysyms::KEY_Right,
+                KeyAction::ResizeSplitRight,
+                KeyAction::ResizeSplitRightFine,
+            ),
+            (
+                keysyms::KEY_Up,
+                KeyAction::ResizeSplitTop,
+                KeyAction::ResizeSplitTopFine,
+            ),
+            (
+                keysyms::KEY_Down,
+                KeyAction::ResizeSplitBottom,
+                KeyAction::ResizeSplitBottomFine,
+            ),
+        ] {
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SUPER | ModMask::ALT,
+                    sym,
+                },
+                action,
+            );
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SUPER | ModMask::ALT | ModMask::SHIFT,
+                    sym,
+                },
+                fine_action,
+            );
+        }
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER | ModMask::ALT,
+                sym: keysyms::KEY_Tab,
+            },
+            KeyAction::FocusSplitNext,
+        );
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER | ModMask::ALT | ModMask::SHIFT,
+                sym: keysyms::KEY_Tab,
+            },
+            KeyAction::FocusSplitPrevious,
+        );
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER | ModMask::ALT,
+                sym: keysyms::KEY_BackSpace,
+            },
+            KeyAction::UndoSplitAction,
+        );
+
+        self.map.insert(
+            KeyCombo {
                 mods: ModMask::CTRL | ModMask::ALT,
                 sym: keysyms::KEY_Tab,
             },
@@ -403,6 +518,26 @@ fn action_from_name(name: &str) -> Option<KeyAction> {
         "launch_files" => KeyAction::LaunchFiles,
         "toggle_clipboard_history" => KeyAction::ToggleClipboardHistory,
         "toggle_voice_capture" => KeyAction::ToggleVoiceCapture,
+        "split_left" => KeyAction::SplitLeft,
+        "split_right" => KeyAction::SplitRight,
+        "split_top" => KeyAction::SplitTop,
+        "split_bottom" => KeyAction::SplitBottom,
+        "toggle_split_layout" => KeyAction::ToggleSplitLayout,
+        "swap_split_left" => KeyAction::SwapSplitLeft,
+        "swap_split_right" => KeyAction::SwapSplitRight,
+        "swap_split_top" => KeyAction::SwapSplitTop,
+        "swap_split_bottom" => KeyAction::SwapSplitBottom,
+        "resize_split_left" => KeyAction::ResizeSplitLeft,
+        "resize_split_right" => KeyAction::ResizeSplitRight,
+        "resize_split_top" => KeyAction::ResizeSplitTop,
+        "resize_split_bottom" => KeyAction::ResizeSplitBottom,
+        "resize_split_left_fine" => KeyAction::ResizeSplitLeftFine,
+        "resize_split_right_fine" => KeyAction::ResizeSplitRightFine,
+        "resize_split_top_fine" => KeyAction::ResizeSplitTopFine,
+        "resize_split_bottom_fine" => KeyAction::ResizeSplitBottomFine,
+        "focus_split_next" => KeyAction::FocusSplitNext,
+        "focus_split_previous" | "focus_split_prev" => KeyAction::FocusSplitPrevious,
+        "undo_split_action" => KeyAction::UndoSplitAction,
         _ => {
             if let Some(slot) = numbered_action(&normalized, "activate_workspace_") {
                 return Some(KeyAction::ActivateSlot(slot));
@@ -547,6 +682,48 @@ mod tests {
                     ModMask::CTRL | ModMask::ALT | ModMask::SHIFT
                 ),
                 Some(KeyAction::FocusShellPrevious)
+            );
+        }
+    }
+
+    #[test]
+    fn split_screen_bindings_are_available_on_every_backend() {
+        for backend in [BackendKind::Winit, BackendKind::Drm] {
+            let keybinds = Keybinds::with_defaults(backend);
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_Left, ModMask::SUPER),
+                Some(KeyAction::SplitLeft)
+            );
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_Down, ModMask::SUPER),
+                Some(KeyAction::SplitBottom)
+            );
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_z, ModMask::SUPER),
+                Some(KeyAction::ToggleSplitLayout)
+            );
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_Left, ModMask::SUPER | ModMask::SHIFT),
+                Some(KeyAction::SwapSplitLeft)
+            );
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_Right, ModMask::SUPER | ModMask::ALT),
+                Some(KeyAction::ResizeSplitRight)
+            );
+            assert_eq!(
+                keybinds.resolve(
+                    keysyms::KEY_Down,
+                    ModMask::SUPER | ModMask::ALT | ModMask::SHIFT
+                ),
+                Some(KeyAction::ResizeSplitBottomFine)
+            );
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_Tab, ModMask::SUPER | ModMask::ALT),
+                Some(KeyAction::FocusSplitNext)
+            );
+            assert_eq!(
+                keybinds.resolve(keysyms::KEY_BackSpace, ModMask::SUPER | ModMask::ALT),
+                Some(KeyAction::UndoSplitAction)
             );
         }
     }

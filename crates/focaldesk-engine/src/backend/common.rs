@@ -890,6 +890,9 @@ pub(crate) fn bootstrap_compositor_core(
     let image_copy_capture_state =
         smithay::wayland::image_copy_capture::ImageCopyCaptureState::new::<DesktopState>(&dh);
     crate::core::wayland::color_protocol::ColorTagState::bind_global::<DesktopState>(&dh);
+    crate::core::wayland::frog_color_management_protocol::FrogColorManagementState::bind_global::<
+        DesktopState,
+    >(&dh);
     if crate::core::color::wp_color_management_enabled() {
         crate::core::wayland::color_management_protocol::ColorManagementState::bind_global::<
             DesktopState,

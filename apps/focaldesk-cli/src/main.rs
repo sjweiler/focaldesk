@@ -5,9 +5,11 @@ use focaldesk_ai::{
 };
 use focaldesk_diagnostics::{DiagnosticsOptions, collect_diagnostics};
 use focaldesk_ipc::{
-    IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse, send_desktop_request,
-    send_notification_request,
+    DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
+    DesktopSplitLayout, IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
+    send_desktop_request, send_notification_request,
 };
+use focaldesk_settings_core::{DisplayColorProfile, HdrAppearance, OutputConfig};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -71,6 +73,232 @@ fn main() -> anyhow::Result<()> {
                 other => bail!("unexpected response: {other:?}"),
             }
         }
+        "window-geometry" => {
+            let title = args.next().context("window-geometry requires a title")?;
+            let snapshot = desktop_snapshot()?;
+            let window = snapshot
+                .windows
+                .iter()
+                .find(|window| window.title == title)
+                .with_context(|| format!("window `{title}` was not found"))?;
+            println!(
+                "{} {} {} {}",
+                window.x.context("window has no x coordinate")?,
+                window.y.context("window has no y coordinate")?,
+                window.width.context("window has no width")?,
+                window.height.context("window has no height")?
+            );
+            Ok(())
+        }
+        "window-workspace" => {
+            let title = args.next().context("window-workspace requires a title")?;
+            let snapshot = desktop_snapshot()?;
+            let window = snapshot
+                .windows
+                .iter()
+                .find(|window| window.title == title)
+                .with_context(|| format!("window `{title}` was not found"))?;
+            println!("{}", window.workspace_id);
+            Ok(())
+        }
+        "focused-window-title" => {
+            let snapshot = desktop_snapshot()?;
+            println!(
+                "{}",
+                snapshot.shell.focused_window_title.as_deref().unwrap_or("")
+            );
+            Ok(())
+        }
+        "split-resize-percent" => {
+            let snapshot = desktop_snapshot()?;
+            let percent = snapshot
+                .rendering
+                .split_resize_percent
+                .context("split resize HUD is not visible")?;
+            println!("{percent}");
+            Ok(())
+        }
+        "window-move-workspace" => {
+            let title = args
+                .next()
+                .context("window-move-workspace requires a title")?;
+            let workspace = args
+                .next()
+                .context("window-move-workspace requires a workspace number")?
+                .parse::<u32>()
+                .context("workspace must be an integer")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::MoveWindowToWorkspace {
+                window_id,
+                workspace,
+            })
+        }
+        "split-window" => {
+            let title = args.next().context("split-window requires a title")?;
+            let direction = match args
+                .next()
+                .context("split-window requires left, right, top, or bottom")?
+                .as_str()
+            {
+                "left" => DesktopDirection::Left,
+                "right" => DesktopDirection::Right,
+                "top" => DesktopDirection::Up,
+                "bottom" => DesktopDirection::Down,
+                other => bail!("unknown split direction `{other}`"),
+            };
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::SplitWindow {
+                window_id,
+                direction,
+            })
+        }
+        "split-ratio" => {
+            let title = args.next().context("split-ratio requires a title")?;
+            let ratio_per_mille = args
+                .next()
+                .context("split-ratio requires a per-mille value")?
+                .parse::<u16>()
+                .context("split ratio must be an integer")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::SetSplitRatio {
+                window_id,
+                ratio_per_mille,
+            })
+        }
+        "split-divider" => {
+            let title = args.next().context("split-divider requires a title")?;
+            let direction = parse_desktop_direction(
+                &args.next().context("split-divider requires a direction")?,
+            )?;
+            let ratio_per_mille = args
+                .next()
+                .context("split-divider requires a per-mille value")?
+                .parse::<u16>()
+                .context("split divider ratio must be an integer")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::SetSplitDivider {
+                window_id,
+                direction,
+                ratio_per_mille,
+            })
+        }
+        "split-layout" => {
+            let title = args.next().context("split-layout requires a title")?;
+            let layout =
+                parse_split_layout(&args.next().context("split-layout requires a layout")?)?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::ApplySplitLayout { window_id, layout })
+        }
+        "split-assist" => {
+            let title = args.next().context("split-assist requires a title")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::SelectSplitAssistWindow { window_id })
+        }
+        "split-swap" => {
+            let title = args.next().context("split-swap requires a title")?;
+            let direction =
+                parse_desktop_direction(&args.next().context("split-swap requires a direction")?)?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::SwapSplitWindow {
+                window_id,
+                direction,
+            })
+        }
+        "split-key" => {
+            let title = args.next().context("split-key requires a title")?;
+            let command =
+                parse_split_keyboard_action(&args.next().context("split-key requires a command")?)?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::InvokeSplitKeyboardAction { window_id, command })
+        }
+        "split-replace" => {
+            let title = args.next().context("split-replace requires a title")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::ReplaceSplitWindow { window_id })
+        }
+        "split-exit" => {
+            let title = args.next().context("split-exit requires a title")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::ExitSplitGroup { window_id })
+        }
+        "split-workspace" => {
+            let title = args.next().context("split-workspace requires a title")?;
+            let workspace = args
+                .next()
+                .context("split-workspace requires a workspace number")?
+                .parse::<u32>()
+                .context("workspace must be an integer")?;
+            let window_id = window_id_for_title(&title)?;
+            execute_desktop_action(DesktopAction::AssignSplitGroupToWorkspace {
+                window_id,
+                workspace,
+            })
+        }
+        "reload-settings" => {
+            match send_desktop_request(&IpcRequest::Reload).map_err(anyhow::Error::msg)? {
+                IpcResponse::Ok => Ok(()),
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        "checkpoint-session" => execute_desktop_action(DesktopAction::CheckpointSession),
+        "create-workspace" => execute_desktop_action(DesktopAction::CreateWorkspace),
+        "focus-workspace" => {
+            let workspace = args
+                .next()
+                .context("focus-workspace requires a workspace number")?
+                .parse::<u32>()
+                .context("workspace must be an integer")?;
+            execute_desktop_action(DesktopAction::FocusWorkspace { workspace })
+        }
+        "display-mode" => {
+            let connector = args.next().context("display-mode requires a connector")?;
+            let width = args
+                .next()
+                .context("display-mode requires a width")?
+                .parse::<i32>()
+                .context("invalid display width")?;
+            let height = args
+                .next()
+                .context("display-mode requires a height")?
+                .parse::<i32>()
+                .context("invalid display height")?;
+            let scale = args
+                .next()
+                .context("display-mode requires a scale")?
+                .parse::<f32>()
+                .context("invalid display scale")?;
+            let snapshot = desktop_snapshot()?;
+            let output = snapshot
+                .outputs
+                .iter()
+                .find(|output| output.connector == connector)
+                .with_context(|| format!("display `{connector}` was not found"))?;
+            match send_desktop_request(&IpcRequest::SetDisplays {
+                outputs: vec![OutputConfig {
+                    connector,
+                    enabled: true,
+                    x: output.x,
+                    y: output.y,
+                    width,
+                    height,
+                    refresh_mhz: output.refresh_mhz.max(60_000),
+                    scale,
+                    primary: true,
+                    color_profile: DisplayColorProfile::Auto,
+                    icc_profile_path: None,
+                    hdr_requested: output.hdr_requested,
+                    hdr_enabled: output.hdr_requested,
+                    hdr_appearance: HdrAppearance::default(),
+                }],
+            })
+            .map_err(anyhow::Error::msg)?
+            {
+                IpcResponse::Ok => Ok(()),
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         "diagnostics" => handle_diagnostics(args.collect()),
         "ai" => handle_ai(args.collect()),
         "help" | "--help" | "-h" => {
@@ -78,6 +306,78 @@ fn main() -> anyhow::Result<()> {
             Ok(())
         }
         other => bail!("unknown command: {other}"),
+    }
+}
+
+fn desktop_snapshot() -> anyhow::Result<DesktopSnapshot> {
+    match send_desktop_request(&IpcRequest::GetDesktopSnapshot).map_err(anyhow::Error::msg)? {
+        IpcResponse::DesktopSnapshot { snapshot } => Ok(snapshot),
+        IpcResponse::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
+    }
+}
+
+fn window_id_for_title(title: &str) -> anyhow::Result<u32> {
+    desktop_snapshot()?
+        .windows
+        .into_iter()
+        .find(|window| window.title == title)
+        .map(|window| window.id)
+        .with_context(|| format!("window `{title}` was not found"))
+}
+
+fn parse_desktop_direction(value: &str) -> anyhow::Result<DesktopDirection> {
+    match value {
+        "left" => Ok(DesktopDirection::Left),
+        "right" => Ok(DesktopDirection::Right),
+        "top" | "up" => Ok(DesktopDirection::Up),
+        "bottom" | "down" => Ok(DesktopDirection::Down),
+        other => bail!("unknown direction `{other}`"),
+    }
+}
+
+fn parse_split_layout(value: &str) -> anyhow::Result<DesktopSplitLayout> {
+    match value {
+        "left-half" => Ok(DesktopSplitLayout::LeftHalf),
+        "right-half" => Ok(DesktopSplitLayout::RightHalf),
+        "left-two-thirds" => Ok(DesktopSplitLayout::LeftTwoThirds),
+        "right-third" => Ok(DesktopSplitLayout::RightThird),
+        "left-third" => Ok(DesktopSplitLayout::LeftThird),
+        "right-two-thirds" => Ok(DesktopSplitLayout::RightTwoThirds),
+        "top-half" => Ok(DesktopSplitLayout::TopHalf),
+        "bottom-half" => Ok(DesktopSplitLayout::BottomHalf),
+        "top-left" => Ok(DesktopSplitLayout::TopLeft),
+        "top-right" => Ok(DesktopSplitLayout::TopRight),
+        "bottom-left" => Ok(DesktopSplitLayout::BottomLeft),
+        "bottom-right" => Ok(DesktopSplitLayout::BottomRight),
+        other => bail!("unknown split layout `{other}`"),
+    }
+}
+
+fn parse_split_keyboard_action(value: &str) -> anyhow::Result<DesktopSplitKeyboardAction> {
+    Ok(match value {
+        "resize-left" => DesktopSplitKeyboardAction::ResizeLeft,
+        "resize-right" => DesktopSplitKeyboardAction::ResizeRight,
+        "resize-up" => DesktopSplitKeyboardAction::ResizeUp,
+        "resize-down" => DesktopSplitKeyboardAction::ResizeDown,
+        "resize-left-fine" => DesktopSplitKeyboardAction::ResizeLeftFine,
+        "resize-right-fine" => DesktopSplitKeyboardAction::ResizeRightFine,
+        "resize-up-fine" => DesktopSplitKeyboardAction::ResizeUpFine,
+        "resize-down-fine" => DesktopSplitKeyboardAction::ResizeDownFine,
+        "focus-next" => DesktopSplitKeyboardAction::FocusNext,
+        "focus-previous" => DesktopSplitKeyboardAction::FocusPrevious,
+        "undo" => DesktopSplitKeyboardAction::Undo,
+        other => bail!("unknown split keyboard command `{other}`"),
+    })
+}
+
+fn execute_desktop_action(action: DesktopAction) -> anyhow::Result<()> {
+    match send_desktop_request(&IpcRequest::ExecuteDesktopAction { action })
+        .map_err(anyhow::Error::msg)?
+    {
+        IpcResponse::Ok => Ok(()),
+        IpcResponse::Error { message } => bail!(message),
+        other => bail!("unexpected response: {other:?}"),
     }
 }
 
@@ -404,6 +704,26 @@ fn print_usage() {
     eprintln!("  focaldesk-cli notify <title> [body...] [--timeout-ms <ms>]");
     eprintln!("  focaldesk-cli identify-displays");
     eprintln!("  focaldesk-cli desktop-snapshot");
+    eprintln!("  focaldesk-cli window-geometry <exact-title>");
+    eprintln!("  focaldesk-cli window-workspace <exact-title>");
+    eprintln!("  focaldesk-cli focused-window-title");
+    eprintln!("  focaldesk-cli window-move-workspace <exact-title> <workspace>");
+    eprintln!("  focaldesk-cli split-window <exact-title> <left|right|top|bottom>");
+    eprintln!("  focaldesk-cli split-ratio <exact-title> <per-mille>");
+    eprintln!("  focaldesk-cli split-divider <exact-title> <direction> <per-mille>");
+    eprintln!("  focaldesk-cli split-layout <exact-title> <layout>");
+    eprintln!("  focaldesk-cli split-assist <exact-title>");
+    eprintln!("  focaldesk-cli split-swap <exact-title> <left|right|top|bottom>");
+    eprintln!("  focaldesk-cli split-key <exact-title> <command>");
+    eprintln!("  focaldesk-cli split-resize-percent");
+    eprintln!("  focaldesk-cli split-replace <exact-title>");
+    eprintln!("  focaldesk-cli split-exit <exact-title>");
+    eprintln!("  focaldesk-cli split-workspace <exact-title> <workspace>");
+    eprintln!("  focaldesk-cli reload-settings");
+    eprintln!("  focaldesk-cli checkpoint-session");
+    eprintln!("  focaldesk-cli create-workspace");
+    eprintln!("  focaldesk-cli focus-workspace <workspace>");
+    eprintln!("  focaldesk-cli display-mode <connector> <width> <height> <scale>");
     eprintln!("  focaldesk-cli diagnostics [--output <archive.tar.gz>] [--no-logs]");
     eprintln!("  focaldesk-cli ai providers");
     eprintln!(
@@ -589,7 +909,8 @@ fn strip_terminal_sequences(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_diagnostics_options, render_ai_output};
+    use super::{parse_diagnostics_options, parse_split_keyboard_action, render_ai_output};
+    use focaldesk_ipc::DesktopSplitKeyboardAction;
     use std::path::Path;
 
     #[test]
@@ -602,6 +923,23 @@ mod tests {
         .unwrap();
         assert!(!options.include_logs);
         assert_eq!(options.output, Path::new("report.tar.gz"));
+    }
+
+    #[test]
+    fn split_keyboard_commands_cover_coarse_fine_focus_and_undo() {
+        for (name, expected) in [
+            ("resize-right", DesktopSplitKeyboardAction::ResizeRight),
+            (
+                "resize-right-fine",
+                DesktopSplitKeyboardAction::ResizeRightFine,
+            ),
+            ("focus-next", DesktopSplitKeyboardAction::FocusNext),
+            ("focus-previous", DesktopSplitKeyboardAction::FocusPrevious),
+            ("undo", DesktopSplitKeyboardAction::Undo),
+        ] {
+            assert_eq!(parse_split_keyboard_action(name).unwrap(), expected);
+        }
+        assert!(parse_split_keyboard_action("unknown").is_err());
     }
 
     #[test]

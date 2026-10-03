@@ -63,6 +63,14 @@ pub fn install_updates(kind: UpdateBackendKind, ids: &[String]) -> Result<(), St
     }
 }
 
+pub fn install_all_updates(kind: UpdateBackendKind) -> Result<(), String> {
+    match kind {
+        UpdateBackendKind::PackageKit => install_packagekit(&[]),
+        UpdateBackendKind::Dnf5 => install_dnf("dnf5", &[]),
+        UpdateBackendKind::Dnf => install_dnf("dnf", &[]),
+    }
+}
+
 fn list_packagekit(refresh_metadata: bool) -> Result<Vec<UpdatePackage>, String> {
     if refresh_metadata {
         let _ = run("pkcon", &["refresh", "--noninteractive"]);
@@ -74,17 +82,26 @@ fn list_packagekit(refresh_metadata: bool) -> Result<Vec<UpdatePackage>, String>
             stderr_or_status(&output)
         ));
     }
-    let stdout = decode_output(&output);
-    let packages = parse_pkcon_plain(&stdout);
+    parse_pkcon_output(&decode_output(&output))
+}
+
+fn parse_pkcon_output(stdout: &str) -> Result<Vec<UpdatePackage>, String> {
+    let packages = parse_pkcon_plain(stdout);
     if !packages.is_empty() {
         return Ok(packages);
     }
-    parse_pkcon_human(&stdout)
+    parse_pkcon_human(stdout)
 }
 
 fn install_packagekit(ids: &[String]) -> Result<(), String> {
+    let mut seen = std::collections::HashSet::new();
+    let names = ids
+        .iter()
+        .map(|id| package_name(id))
+        .filter(|name| seen.insert(*name))
+        .collect::<Vec<_>>();
     let mut args = vec!["update", "--noninteractive"];
-    args.extend(ids.iter().map(String::as_str));
+    args.extend(names);
     let output = run("pkcon", &args)?;
     if output.status.success() {
         Ok(())
@@ -209,18 +226,14 @@ pub fn parse_pkcon_plain(stdout: &str) -> Vec<UpdatePackage> {
 
 fn parse_pkcon_package_id(line: &str) -> Option<UpdatePackage> {
     let line = line.trim();
-    if line.is_empty() || line.starts_with("Transaction") {
-        return None;
-    }
     let package_id = line
         .split_whitespace()
-        .find(|token| token.contains(';'))
-        .unwrap_or(line);
+        .find(|token| token.matches(';').count() >= 3)?;
     let mut parts = package_id.split(';');
     let name = parts.next()?.trim();
-    let version = parts.next().unwrap_or("").trim();
-    let arch = parts.next().unwrap_or("").trim();
-    let repo = parts.next().unwrap_or("").trim();
+    let version = parts.next()?.trim();
+    let arch = parts.next()?.trim();
+    let repo = parts.next()?.trim();
     if name.is_empty() || name.contains(' ') {
         return None;
     }
@@ -266,18 +279,22 @@ fn parse_pkcon_human_package(line: &str) -> Option<UpdatePackage> {
         .or_else(|| trimmed.strip_prefix("Available"))
         .or_else(|| trimmed.strip_prefix("Important"))
         .or_else(|| trimmed.strip_prefix("Security"))
+        .or_else(|| trimmed.strip_prefix("Bug fix"))
         .or_else(|| trimmed.strip_prefix("Bugfix"))
         .or_else(|| trimmed.strip_prefix("Enhancement"))
         .map(str::trim)?;
     let (nevra, repo) = split_repo_suffix(rest);
-    parse_nevra(nevra).map(|(name, version, arch)| UpdatePackage {
-        id: nevra.to_string(),
-        name,
-        version,
-        arch,
-        repo: repo.unwrap_or_default(),
-        summary: None,
-        description: None,
+    parse_nevra(nevra).map(|(name, version, arch)| {
+        let id = name.clone();
+        UpdatePackage {
+            id,
+            name,
+            version,
+            arch,
+            repo: repo.unwrap_or_default(),
+            summary: None,
+            description: None,
+        }
     })
 }
 
@@ -397,6 +414,30 @@ mod tests {
         assert_eq!(packages[0].name, "firefox");
         assert_eq!(packages[0].version, "142.0-1.fc43");
         assert_eq!(packages[1].id, "kernel;6.16.3-200.fc43;x86_64;updates");
+    }
+
+    #[test]
+    fn parses_real_pkcon_human_output_without_treating_progress_as_a_package() {
+        let packages = parse_pkcon_output(
+            "Transaction:\tGetting updates\n\
+             Status: \tWaiting in queue\n\
+             Status: \tStarting\n\
+             Status: \tFinished\n\
+             Results:\n\
+             Available    dnf5-5.4.5.0-1.fc44.x86_64 (updates)\n\
+             Security     kernel-7.2.7-200.fc44.x86_64 (updates)\n\
+             Bug fix      firefox-156.0.1-1.fc44.x86_64 (updates)\n",
+        )
+        .unwrap();
+
+        assert_eq!(packages.len(), 3);
+        assert_eq!(packages[0].name, "dnf5");
+        assert_eq!(packages[0].id, "dnf5");
+        assert_eq!(packages[1].name, "kernel");
+        assert_eq!(packages[1].id, "kernel");
+        assert_eq!(packages[1].version, "7.2.7-200.fc44");
+        assert_eq!(packages[2].name, "firefox");
+        assert!(packages.iter().all(|package| package.name != "Results:"));
     }
 
     #[test]

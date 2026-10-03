@@ -13,6 +13,7 @@ use accesskit_unix::Adapter;
 use focaldesk_ui::{accessibility::AccessibleRole, types::ElementId, uitree::UiTree};
 
 const ROOT_ID: NodeId = NodeId(1);
+const ANNOUNCEMENT_ID: NodeId = NodeId(u64::MAX - 1);
 const NODE_ID_OFFSET: u64 = 2;
 const DIALOG_TAG: u64 = 1 << 63;
 
@@ -94,11 +95,12 @@ pub struct AccessibilityBridge {
     latest: Arc<RwLock<TreeUpdate>>,
     actions: Receiver<AccessibilityAction>,
     dialog_focus: Option<NodeId>,
+    announcement: Option<String>,
 }
 
 impl AccessibilityBridge {
     pub fn new() -> Self {
-        let initial = tree_update(&UiTree::default(), None, None);
+        let initial = tree_update(&UiTree::default(), None, None, None);
         let latest = Arc::new(RwLock::new(initial));
         let (sender, actions) = mpsc::channel();
         let adapter = Adapter::new(
@@ -113,6 +115,7 @@ impl AccessibilityBridge {
             latest,
             actions,
             dialog_focus: None,
+            announcement: None,
         }
     }
 
@@ -124,7 +127,7 @@ impl AccessibilityBridge {
         }) {
             self.dialog_focus = None;
         }
-        let update = tree_update(ui, dialog, self.dialog_focus);
+        let update = tree_update(ui, dialog, self.dialog_focus, self.announcement.as_deref());
         if self.latest.read().is_ok_and(|latest| *latest == update) {
             return;
         }
@@ -138,6 +141,10 @@ impl AccessibilityBridge {
 
     pub fn focus_dialog_button(&mut self, dialog: u32, button: usize) {
         self.dialog_focus = Some(dialog_button_id(dialog, button));
+    }
+
+    pub fn set_announcement(&mut self, message: impl Into<String>) {
+        self.announcement = Some(message.into());
     }
 
     pub fn blur_dialog_button(&mut self, dialog: u32, button: usize) {
@@ -206,12 +213,13 @@ fn tree_update(
     ui: &UiTree,
     dialog: Option<&AccessibleDialog>,
     requested_dialog_focus: Option<NodeId>,
+    announcement: Option<&str>,
 ) -> TreeUpdate {
     let chrome_children: Vec<NodeId> = ui
         .accessible_elements()
         .map(|element| node_id(element.id))
         .collect();
-    let children = match dialog {
+    let mut children = match dialog {
         Some(dialog) if dialog.modal => vec![dialog_id(dialog.id)],
         Some(dialog) => chrome_children
             .iter()
@@ -220,6 +228,9 @@ fn tree_update(
             .collect(),
         None => chrome_children.clone(),
     };
+    if announcement.is_some() {
+        children.push(ANNOUNCEMENT_ID);
+    }
     let mut root = Node::new(Role::Window);
     root.set_label("FocalDesk shell");
     root.set_children(children);
@@ -231,6 +242,13 @@ fn tree_update(
     }
     if let Some(dialog) = dialog {
         append_dialog_nodes(&mut nodes, dialog);
+    }
+    if let Some(message) = announcement {
+        let mut node = Node::new(Role::Status);
+        node.set_label(message);
+        node.set_live(Live::Polite);
+        node.set_live_atomic();
+        nodes.push((ANNOUNCEMENT_ID, node));
     }
 
     let dialog_focus = dialog.map(|dialog| {
@@ -367,7 +385,7 @@ mod tests {
         };
         tree.set_focus(7);
 
-        let update = tree_update(&tree, None, None);
+        let update = tree_update(&tree, None, None, None);
         assert_eq!(update.nodes.len(), 2);
         assert_eq!(update.focus, node_id(7));
         assert!(update.nodes[1].1.supports_action(Action::Click));
@@ -387,10 +405,24 @@ mod tests {
                 bounds: [20, 120, 80, 32],
             }],
         };
-        let update = tree_update(&UiTree::default(), Some(&dialog), None);
+        let update = tree_update(&UiTree::default(), Some(&dialog), None, None);
         assert_eq!(update.nodes.len(), 3);
         assert_eq!(update.focus, dialog_button_id(9, 0));
         assert_eq!(update.nodes[0].1.children(), &[dialog_id(9)]);
         assert!(update.nodes[1].1.is_modal());
+    }
+
+    #[test]
+    fn split_feedback_is_exposed_as_a_live_status() {
+        let update = tree_update(
+            &UiTree::default(),
+            None,
+            None,
+            Some("Split divider 60 percent"),
+        );
+        assert_eq!(update.nodes.len(), 2);
+        assert_eq!(update.nodes[0].1.children(), &[ANNOUNCEMENT_ID]);
+        assert_eq!(update.nodes[1].1.role(), Role::Status);
+        assert_eq!(update.nodes[1].1.label(), Some("Split divider 60 percent"));
     }
 }

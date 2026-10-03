@@ -12,6 +12,10 @@ pub struct LaunchRequest {
     pub browser_backend: BrowserBackend,
     /// Whether the compositor has an HDR output for this launch.
     pub hdr_output_active: bool,
+    /// Explicit per-launch request for HDR WSI exposure. Defaults off so older
+    /// serialized launch clients remain compatible.
+    #[serde(default)]
+    pub auto_hdr: bool,
     pub source: LaunchSource,
 }
 

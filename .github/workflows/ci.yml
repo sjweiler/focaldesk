@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   rust:
@@ -14,6 +15,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Detect split-screen changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            split:
+              - '.github/workflows/ci.yml'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'apps/focaldesk-cli/**'
+              - 'apps/focaldesk-color-tag-test/**'
+              - 'apps/focaldesk-desktop/**'
+              - 'crates/focaldesk-engine/**'
+              - 'crates/focaldesk-flow/**'
+              - 'crates/focaldesk-ipc/**'
+              - 'crates/focaldesk-render/**'
+              - 'crates/focaldesk-settings-core/**'
+              - 'crates/focaldesk-ui/**'
+              - 'scripts/nested-split-e2e.sh'
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -114,6 +135,21 @@ jobs:
           name: nested-smoke
           path: target/nested-smoke
           if-no-files-found: warn
+
+      - name: Nested split-screen end-to-end test
+        if: steps.changes.outputs.split == 'true'
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: timeout 300 bash scripts/nested-split-e2e.sh
+
+      - name: Upload nested split-screen artifacts
+        if: always() && steps.changes.outputs.split == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nested-split-e2e
+          path: target/nested-split-e2e
+          if-no-files-found: warn
+          retention-days: 7
 
       - name: focald-secrets end-to-end security tests
         run: bash crates/focald-secrets/tests/integration.sh

@@ -11,9 +11,9 @@ use crate::core::fonts::{FontId, TextStyle};
 use anyhow::{anyhow, Context, Result};
 use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_render::{
-    FramePixelFormat, FrameRetention, FrameTransferFunction, FrameTransform, LinuxDmabuf,
-    MeshVertex, PresentRenderer, PresentResult, SolidQuad, TextureColorTransform, TextureQuad,
-    TexturedMesh, WgpuVulkanRenderer,
+    AutoHdrParams, FramePixelFormat, FrameRetention, FrameTransferFunction, FrameTransform,
+    LinuxDmabuf, MeshVertex, PresentRenderer, PresentResult, SolidQuad, TextureColorTransform,
+    TextureQuad, TexturedMesh, WgpuVulkanRenderer,
 };
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
@@ -1780,6 +1780,19 @@ fn collect_shm_surfaces(
             &desktop.state.surface_colors,
             &mut window_surfaces,
         );
+        if let Some(auto_hdr) = auto_hdr_for_window(desktop, window) {
+            for surface in &mut window_surfaces {
+                if matches!(
+                    surface.color_transform.transfer,
+                    FrameTransferFunction::Srgb
+                        | FrameTransferFunction::Gamma22
+                        | FrameTransferFunction::Bt1886
+                ) {
+                    surface.color_transform.auto_hdr = Some(auto_hdr);
+                    surface.color_transform.source_peak_nits = auto_hdr.target_nits;
+                }
+            }
+        }
         output.extend(window_surfaces.into_iter().rev());
     }
     if let Some(output_state) = output_state {
@@ -1795,6 +1808,33 @@ fn collect_shm_surfaces(
         );
     }
     output
+}
+
+fn auto_hdr_for_window(
+    desktop: &WgpuSceneDesktop<'_>,
+    window: &smithay::desktop::Window,
+) -> Option<AutoHdrParams> {
+    let output = desktop.state.outputs.get(&desktop.output_id)?;
+    if !output.hdr_kms_applied {
+        return None;
+    }
+    let managed = desktop
+        .state
+        .windows
+        .iter()
+        .find(|managed| &managed.window == window)?;
+    if !focal_launch_shared::auto_hdr_app_enabled(&managed.display_name()) {
+        return None;
+    }
+    let appearance = output.hdr_appearance.validate().ok()?;
+    Some(AutoHdrParams {
+        sdr_nits: focal_launch_shared::auto_hdr_sdr_nits(),
+        target_nits: focal_launch_shared::auto_hdr_target_nits()
+            .unwrap_or(appearance.peak_nits)
+            .min(appearance.peak_nits),
+        scene_reference_nits: appearance.reference_white_nits,
+        gamut_wideness: focal_launch_shared::auto_hdr_gamut_wideness(),
+    })
 }
 
 fn collect_shm_layers(
@@ -1967,6 +2007,7 @@ fn texture_color_transform(color: SurfaceColorRenderState) -> TextureColorTransf
         source_peak_nits: color.source_peak_nits.max(1.0),
         linear_to_scene_scale: color.description.linear_to_scene_scale(),
         source_bits: color.src_bits,
+        auto_hdr: None,
     }
 }
 

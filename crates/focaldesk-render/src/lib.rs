@@ -72,6 +72,18 @@ pub enum FrameTransferFunction {
     Hlg = 6,
 }
 
+/// Optional inverse tone mapping applied to an SDR client before it enters the
+/// scene-linear compositor. The scene reference is supplied by the output so
+/// the shader never assumes that scene-linear `1.0` means 80 or 100 nits.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AutoHdrParams {
+    pub sdr_nits: f32,
+    pub target_nits: f32,
+    pub scene_reference_nits: f32,
+    /// Additional saturation in linear Rec.709. Zero preserves the source gamut.
+    pub gamut_wideness: f32,
+}
+
 /// Per-texture transform from decoded client RGB into the linear scene gamut.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TextureColorTransform {
@@ -81,6 +93,8 @@ pub struct TextureColorTransform {
     pub source_peak_nits: f32,
     pub linear_to_scene_scale: f32,
     pub source_bits: f32,
+    /// Opt-in SDR inverse tone mapping. Native HDR transfer functions ignore it.
+    pub auto_hdr: Option<AutoHdrParams>,
 }
 
 impl Default for TextureColorTransform {
@@ -92,6 +106,7 @@ impl Default for TextureColorTransform {
             source_peak_nits: 80.0,
             linear_to_scene_scale: 1.0,
             source_bits: 0.0,
+            auto_hdr: None,
         }
     }
 }

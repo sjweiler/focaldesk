@@ -21,15 +21,37 @@ use crate::core::wayland::data_device::ClipboardSelectionOwner;
 use focaldesk_logging::session_id;
 use tracing::{debug, info_span, trace};
 
+fn constrained_window_geometry(
+    fullscreen: bool,
+    maximized: bool,
+    output: Option<Rectangle<i32, Logical>>,
+    work_area: Option<Rectangle<i32, Logical>>,
+) -> Option<Rectangle<i32, Logical>> {
+    if fullscreen {
+        output
+    } else if maximized {
+        work_area.or(output)
+    } else {
+        None
+    }
+}
+
 impl XWaylandShellHandler for DesktopState {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
     }
 
-    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, surface: X11Surface) {
-        let known_window = self.window_id_for_x11_surface(&surface).is_some();
+    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, surface: X11Surface) {
+        let known_window = self.window_id_for_x11_surface(&surface);
+        if let Some(window_id) = known_window {
+            self.remember_xwayland_surface_association(&wl_surface, window_id);
+        }
         self.sync_xwayland_window_meta(&surface);
-        if known_window {
+        // Association alone is not a map request. In Smithay, `is_mapped()`
+        // only means that this association now exists, so using it here maps
+        // withdrawn Wine/CEF hosts as blank phantom windows. Consult the X11
+        // map lifecycle tracked from MapRequest/MapNotify instead.
+        if known_window.is_some_and(|window_id| self.xwayland_window_is_mapped(window_id)) {
             self.map_xwayland_window(surface);
             return;
         }
@@ -49,7 +71,10 @@ impl XwmHandler for DesktopState {
     fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
     fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.map_xwayland_window(window);
+        self.map_xwayland_window(window.clone());
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.set_xwayland_window_mapped(id, true);
+        }
     }
 
     fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -83,7 +108,10 @@ impl XwmHandler for DesktopState {
         )
         .entered();
         trace!(target: "focaldesk", "xwayland override-redirect mapped");
-        self.map_xwayland_window(window);
+        self.map_xwayland_window(window.clone());
+        if let Some(id) = self.window_id_for_x11_surface(&window) {
+            self.set_xwayland_window_mapped(id, true);
+        }
     }
 
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
@@ -107,6 +135,8 @@ impl XwmHandler for DesktopState {
             let managed = self.windows.remove(idx);
             self.space.unmap_elem(&managed.window);
         }
+        self.forget_xwayland_surface_associations(id);
+        self.set_xwayland_window_mapped(id, false);
         if !window.is_override_redirect() {
             let _ = window.set_mapped(false);
         }
@@ -135,6 +165,8 @@ impl XwmHandler for DesktopState {
             let managed = self.windows.remove(idx);
             self.space.unmap_elem(&managed.window);
         }
+        self.forget_xwayland_surface_associations(id);
+        self.set_xwayland_window_mapped(id, false);
         if self.focused_window == Some(id) {
             self.focused_window = None;
         }
@@ -179,6 +211,22 @@ impl XwmHandler for DesktopState {
 
         if let Some(id) = self.window_id_for_x11_surface(&window) {
             let output_id = self.xwayland_output_id_for_window(id);
+            let constrained_geometry = self.window(id).and_then(|managed| {
+                constrained_window_geometry(
+                    managed.fullscreen,
+                    managed.maximized,
+                    self.output_logical_rect(output_id),
+                    self.work_recess_for_output(output_id),
+                )
+            });
+            if let Some(geometry) = constrained_geometry {
+                // A window manager must answer ConfigureRequest even when the
+                // requested size is denied. Wine/DXGI waits for this reply while
+                // rebuilding a swapchain; returning without it can hang or abort
+                // an in-game resolution change.
+                let _ = window.configure(geometry);
+                return;
+            }
             if self.window(id).is_some_and(|managed| managed.floating) {
                 if let Some(x) = x {
                     geometry.loc.x = x;
@@ -246,28 +294,32 @@ impl XwmHandler for DesktopState {
             self.map_window_bbox_location(managed, rect.loc, false);
         } else {
             let output_id = self.xwayland_output_id_for_window(id);
-            let fills_output = self.xwayland_request_fills_output(output_id, geometry.size);
-            let maximized = self
+            let (fullscreen, maximized) = self
                 .window(id)
-                .map(|state| state.maximized)
-                .unwrap_or(false);
+                .map(|state| (state.fullscreen, state.maximized))
+                .unwrap_or_default();
+            let constrained_geometry = constrained_window_geometry(
+                fullscreen,
+                maximized,
+                self.output_logical_rect(output_id),
+                self.work_recess_for_output(output_id),
+            );
+            let fills_output = self.xwayland_request_fills_output(output_id, geometry.size);
 
-            if fills_output && !maximized {
+            if fills_output && !fullscreen && !maximized {
                 self.set_window_maximized(id, true);
                 return;
             }
 
-            let rect = if maximized {
-                self.work_recess_for_output(output_id).unwrap_or(geometry)
-            } else {
+            let rect = constrained_geometry.unwrap_or_else(|| {
                 let current_loc = self.xwayland_compositor_loc_for_window(id);
                 Rectangle::from_loc_and_size(current_loc, geometry.size)
-            };
+            });
             if let Some(state) = self.window_mut(id) {
                 state.float_rect = Some(rect);
             }
             self.map_window_bbox_location(managed, rect.loc, false);
-            if maximized && geometry != rect {
+            if constrained_geometry.is_some() && geometry != rect {
                 let _ = window.configure(rect);
             }
         }
@@ -333,7 +385,7 @@ impl XwmHandler for DesktopState {
         _currently_active_window: Option<X11Surface>,
     ) {
         if let Some(id) = self.window_id_for_x11_surface(&window) {
-            self.focus_window_id(id);
+            self.focus_xwayland_active_window(id);
         }
     }
 
@@ -433,5 +485,43 @@ fn x11_resize_edge_to_xdg(
         X11ResizeEdge::TopRight => ResizeEdge::TopRight,
         X11ResizeEdge::BottomLeft => ResizeEdge::BottomLeft,
         X11ResizeEdge::BottomRight => ResizeEdge::BottomRight,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constrained_window_geometry;
+    use smithay::utils::Rectangle;
+
+    #[test]
+    fn fullscreen_geometry_wins_over_maximized_work_area() {
+        let output = Rectangle::from_loc_and_size((0, 0), (3840, 2160));
+        let work_area = Rectangle::from_loc_and_size((0, 40), (3840, 2120));
+
+        assert_eq!(
+            constrained_window_geometry(true, true, Some(output), Some(work_area)),
+            Some(output)
+        );
+    }
+
+    #[test]
+    fn maximized_geometry_uses_work_area() {
+        let output = Rectangle::from_loc_and_size((0, 0), (3840, 2160));
+        let work_area = Rectangle::from_loc_and_size((0, 40), (3840, 2120));
+
+        assert_eq!(
+            constrained_window_geometry(false, true, Some(output), Some(work_area)),
+            Some(work_area)
+        );
+    }
+
+    #[test]
+    fn unconstrained_window_accepts_client_geometry() {
+        let output = Rectangle::from_loc_and_size((0, 0), (3840, 2160));
+
+        assert_eq!(
+            constrained_window_geometry(false, false, Some(output), None),
+            None
+        );
     }
 }
