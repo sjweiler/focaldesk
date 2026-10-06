@@ -494,6 +494,7 @@ fn runtime_display_status_value(state: &DesktopState) -> serde_json::Value {
             hdr_supported: output.hdr_supported,
             hdr_requested: output.hdr_requested,
             hdr_active: output.hdr_enabled,
+            hdr_appearance: output.hdr_appearance,
             exclusive_hdr_phase: if exclusive.connector.as_deref()
                 == Some(output.handle.name().as_str())
             {
@@ -4241,6 +4242,7 @@ impl DesktopState {
                 hdr_supported: output.hdr_supported,
                 hdr_requested: output.hdr_requested,
                 hdr_active: output.hdr_enabled,
+                hdr_appearance: output.hdr_appearance,
                 exclusive_hdr_phase: if exclusive.connector.as_deref()
                     == Some(output.handle.name().as_str())
                 {

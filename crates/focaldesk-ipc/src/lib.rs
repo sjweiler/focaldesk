@@ -321,6 +321,9 @@ pub struct DisplayRuntimeOutputStatus {
     pub hdr_requested: bool,
     #[serde(default)]
     pub hdr_active: bool,
+    /// The values currently driving the final HDR output transform.
+    #[serde(default)]
+    pub hdr_appearance: HdrAppearance,
     #[serde(default)]
     pub exclusive_hdr_phase: ExclusiveHdrPhase,
     #[serde(default)]

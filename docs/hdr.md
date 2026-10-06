@@ -66,6 +66,25 @@ successful compatibility results, not a blanket support guarantee: the display,
 connector, mode, kernel, application version, and output topology can all affect
 the result.
 
+### Validation status
+
+As of October 5, 2026, the implementation has automated software coverage for
+client transfer decoding, linear FP16 composition, gamut conversion, tone
+mapping, PQ encoding, 10-bit scanout selection, HDR metadata, connector-state
+verification, SDR capture mapping, and the calibration runner's parsing and
+threshold logic. The full Rust workspace test suite passes; tests explicitly
+marked as requiring external services, special session infrastructure, or live
+hardware remain opt-in.
+
+The ArgyllCMS measurement workflow is implemented but has not yet been run with
+a meter. Until a dated measurement report is recorded, FocalDesk does **not**
+claim measured luminance accuracy, D65 accuracy, EOTF tracking, gamut coverage,
+or calibrated SDR/HDR matching. The current evidence is therefore:
+
+- software-verified rendering and signaling contracts;
+- visual compatibility on the displays listed above; and
+- instrumented end-to-end output validation pending.
+
 For a reproducible compatibility report, record those details together with the
 driver's complete version and whether Chrome was running as a native Wayland or
 XWayland client. See [Compatibility Testing](compatibility-testing.md#hardware-result-record).
@@ -115,6 +134,28 @@ bypass appearance saturation and midtone shaping but still use the normal ST
 2084 encode and 10-bit output path. Select **Off** when finished. The legacy
 `FOCALDESK_HDR_CALIBRATION_PATTERN=1` overview remains available for startup
 diagnostics; neither mechanism is persisted as a display setting.
+
+With an ArgyllCMS-compatible meter centered on the display, the SDR white
+anchor and HDR headroom checks can be automated while HDR is active:
+
+```sh
+just hdr-output-test DP-3 --report /tmp/focaldesk-hdr-DP-3.tsv
+```
+
+The runner reads the connector's live appearance targets, measures reference
+white, the 10% peak window, and sustained full-frame output with `spotread`,
+checks luminance and D65 chromaticity tolerances, and restores the calibration
+pattern to **Off** even on failure. Pass instrument-specific ArgyllCMS options
+one at a time with `--spotread-arg`; for example,
+`--spotread-arg=-y --spotread-arg=l`. Use `--luminance-tolerance` or
+`--chromaticity-tolerance` when the display or meter requires wider limits.
+Passing the runner's `--self-test` verifies its parser and pass/fail logic only;
+it is not evidence that an HDR signal reached the panel correctly.
+
+When the physical run is complete, retain the generated TSV report together
+with the date, connector, display model, meter model, ArgyllCMS display type or
+CCSS/CCMX correction, display picture mode, GPU and driver, resolution, refresh
+rate, and the configured reference-white, peak-window, and full-frame targets.
 
 ## SDR wide gamut and 10-bit output
 

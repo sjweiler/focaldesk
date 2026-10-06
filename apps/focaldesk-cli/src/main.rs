@@ -9,7 +9,9 @@ use focaldesk_ipc::{
     DesktopSplitLayout, IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
     send_desktop_request, send_notification_request,
 };
-use focaldesk_settings_core::{DisplayColorProfile, HdrAppearance, OutputConfig};
+use focaldesk_settings_core::{
+    DisplayColorProfile, HdrAppearance, HdrCalibrationPattern, OutputConfig,
+};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -69,6 +71,35 @@ fn main() -> anyhow::Result<()> {
                     println!("{}", serde_json::to_string_pretty(&snapshot)?);
                     Ok(())
                 }
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        "display-runtime-status" => {
+            let response = send_desktop_request(&IpcRequest::GetDisplayRuntimeStatus)
+                .map_err(anyhow::Error::msg)?;
+            match response {
+                IpcResponse::DisplayRuntimeStatus { outputs } => {
+                    println!("{}", serde_json::to_string_pretty(&outputs)?);
+                    Ok(())
+                }
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
+        "hdr-calibration-pattern" => {
+            let connector = args
+                .next()
+                .context("hdr-calibration-pattern requires a connector")?;
+            let pattern = parse_hdr_calibration_pattern(
+                &args
+                    .next()
+                    .context("hdr-calibration-pattern requires a pattern")?,
+            )?;
+            match send_desktop_request(&IpcRequest::SetHdrCalibrationPattern { connector, pattern })
+                .map_err(anyhow::Error::msg)?
+            {
+                IpcResponse::Ok => Ok(()),
                 IpcResponse::Error { message } => bail!(message),
                 other => bail!("unexpected response: {other:?}"),
             }
@@ -333,6 +364,18 @@ fn parse_desktop_direction(value: &str) -> anyhow::Result<DesktopDirection> {
         "top" | "up" => Ok(DesktopDirection::Up),
         "bottom" | "down" => Ok(DesktopDirection::Down),
         other => bail!("unknown direction `{other}`"),
+    }
+}
+
+fn parse_hdr_calibration_pattern(value: &str) -> anyhow::Result<HdrCalibrationPattern> {
+    match value {
+        "off" => Ok(HdrCalibrationPattern::Off),
+        "overview" => Ok(HdrCalibrationPattern::Overview),
+        "near-black" => Ok(HdrCalibrationPattern::NearBlack),
+        "reference-white" => Ok(HdrCalibrationPattern::ReferenceWhite),
+        "peak-window" => Ok(HdrCalibrationPattern::PeakWindow),
+        "peak-full-frame" => Ok(HdrCalibrationPattern::PeakFullFrame),
+        other => bail!("unknown HDR calibration pattern `{other}`"),
     }
 }
 
@@ -704,6 +747,10 @@ fn print_usage() {
     eprintln!("  focaldesk-cli notify <title> [body...] [--timeout-ms <ms>]");
     eprintln!("  focaldesk-cli identify-displays");
     eprintln!("  focaldesk-cli desktop-snapshot");
+    eprintln!("  focaldesk-cli display-runtime-status");
+    eprintln!(
+        "  focaldesk-cli hdr-calibration-pattern <connector> <off|overview|near-black|reference-white|peak-window|peak-full-frame>"
+    );
     eprintln!("  focaldesk-cli window-geometry <exact-title>");
     eprintln!("  focaldesk-cli window-workspace <exact-title>");
     eprintln!("  focaldesk-cli focused-window-title");
@@ -909,8 +956,12 @@ fn strip_terminal_sequences(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_diagnostics_options, parse_split_keyboard_action, render_ai_output};
+    use super::{
+        parse_diagnostics_options, parse_hdr_calibration_pattern, parse_split_keyboard_action,
+        render_ai_output,
+    };
     use focaldesk_ipc::DesktopSplitKeyboardAction;
+    use focaldesk_settings_core::HdrCalibrationPattern;
     use std::path::Path;
 
     #[test]
@@ -923,6 +974,19 @@ mod tests {
         .unwrap();
         assert!(!options.include_logs);
         assert_eq!(options.output, Path::new("report.tar.gz"));
+    }
+
+    #[test]
+    fn hdr_calibration_pattern_names_are_explicit() {
+        assert_eq!(
+            parse_hdr_calibration_pattern("reference-white").unwrap(),
+            HdrCalibrationPattern::ReferenceWhite
+        );
+        assert_eq!(
+            parse_hdr_calibration_pattern("peak-window").unwrap(),
+            HdrCalibrationPattern::PeakWindow
+        );
+        assert!(parse_hdr_calibration_pattern("white").is_err());
     }
 
     #[test]

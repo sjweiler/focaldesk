@@ -31,6 +31,13 @@ drm-wgpu-check: drm-vulkan-check
 nested-compat-matrix:
     bash scripts/nested-compat-matrix.sh
 
+# Measure SDR reference white and HDR highlights with ArgyllCMS spotread.
+hdr-output-test connector *args:
+    bash scripts/regression-hdr-output.sh --connector "{{ connector }}" {{ args }}
+
+hdr-output-test-self-test:
+    bash scripts/regression-hdr-output.sh --self-test
+
 release-readiness:
     bash scripts/check-release-readiness.sh
 
