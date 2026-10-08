@@ -1,36 +1,49 @@
 
 # FocalDesk Architecture
 
-FocalDesk is a Rust-based Wayland desktop environment and compositor for Linux. It combines a custom compositor, desktop shell, launcher service, GTK companion applications, rendering effects, XWayland compatibility, PipeWire capture, and planned AI-assisted desktop workflows.
+FocalDesk is a Rust-based Wayland desktop environment and compositor for Linux. It combines a custom compositor, desktop shell, launcher service, GTK companion applications, rendering effects, XWayland compatibility, PipeWire capture, and an experimental permissioned AIOS agent platform.
 
 ## Goals
 
 - Build a functional Linux desktop environment around a custom Wayland compositor
 - Keep the compositor focused on display, input, surfaces, rendering, and session behavior
-- Move process launching and future automation into separate services
+- Move process launching, automation, and AI workflows into separate services
 - Move shell-based Wi-Fi, Bluetooth, and volume control out of the compositor
 - Support real-world applications, including GTK, X11/XWayland, Wine, browsers, OBS, and games
-- Provide a modular foundation for future AI-assisted workflows
+- Provide modular, permissioned AI-assisted workflows with explicit capabilities
 - Favor practical usability over a toy compositor demo
 
 ## High-Level Overview
 
 The diagrams below are conceptual maps of FocalDesk rather than exact module or
 process diagrams. They show which parts of the desktop own a responsibility and
-the general direction in which frames and messages move. Items labeled
-**Future** or **Planned** describe the intended architecture and are not yet
-complete.
+the general direction in which frames and messages move. Experimental services
+and hardware-dependent paths are labeled as such; they are implemented but may
+remain incomplete or change during alpha development.
 
 ## System Architecture
 
 ![FocalDesk Architecture](diagrams/architecture-overview.png)
 
+This raster diagram is a broad compositor and service-boundary sketch. The
+AIOS runtime described below has grown beyond the components shown here; its
+service contracts and safety controls are documented in the linked AIOS guides.
+
 Applications submit Wayland or XWayland surfaces to the compositor. The
 compositor owns window and workspace state, input routing, shell behavior, and
-output coordination. It passes the scene to the renderer, which uses the active
-backend to present it on a display. Work that does not need direct access to
-compositor state—such as launching applications, settings, file management, and
-future AI features—lives in separate services and communicates through IPC.
+output coordination, split-screen layouts, and surface damage tracking with
+safe fallbacks. It passes the scene to the active GLES or raw Ash Vulkan
+renderer, which presents through DRM/KMS or the nested winit backend. Work that
+does not need direct access to compositor state—such as launching applications,
+settings, file management, and AIOS workflows—lives in separate services and
+communicates through typed IPC.
+
+The AIOS runtime includes Agent Studio, a bounded multi-agent workflow
+supervisor, scoped and expiring capability leases, opt-in voice and context,
+consented event sources and connectors, Mission Control, Scenario Lab, and
+signed package management. These services do not share the compositor's frame
+loop. They remain experimental and permission-gated; package activation does
+not itself grant connector network access or background execution consent.
 
 ## Rendering Pipeline
 
@@ -81,7 +94,8 @@ commits and layer-shell rearrangements that can move sibling surfaces.
 The IPC diagram highlights the process boundary between the compositor and
 desktop services. Typed requests, responses, and events cross that boundary so
 a failed or slow service does not have to run inside the rendering and input
-loop. The launcher service is an example of this separation. The permission
-service, AI service, additional transports, and other boxes explicitly marked
-as future work describe the planned direction rather than the current feature
-set.
+loop. The launcher, settings, control, and AI services implement this
+separation. AIOS components use service-owned registries and typed IPC; the MCP
+adapter exposes bounded tools, and mutating desktop actions still require a
+native one-shot approval. The diagram is conceptual, so it does not enumerate
+every AIOS service or runtime.
