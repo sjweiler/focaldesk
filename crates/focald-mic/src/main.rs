@@ -1,5 +1,6 @@
-//! Push-to-talk microphone and speech-to-text daemon for FocalDesk.
+//! Exclusive microphone-session and speech-to-text daemon for FocalDesk.
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -7,30 +8,19 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use focaldesk_ipc::transport;
-use focaldesk_voice::{VoiceEvent, VoiceSession};
-use serde::{Deserialize, Serialize};
+use focaldesk_ipc::{
+    transport, MicrophoneEvent, MicrophoneEventRecord, MicrophoneIpcRequest, MicrophoneIpcResponse,
+};
+use focaldesk_voice::{AmbientVoiceConfig, VoiceEvent, VoiceSession};
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum MicCommand {
-    Start,
-    Stop,
-    Toggle,
-    Status,
-}
+const MAX_EVENTS: usize = 128;
+const AMBIENT_LEASE_IDLE: Duration = Duration::from_secs(15);
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireRequest {
-    command: MicCommand,
-}
-
-#[derive(Debug, Serialize)]
-struct WireResponse<'a> {
-    status: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    message: Option<String>,
+struct MicLease {
+    id: String,
+    requester: String,
+    ambient: bool,
+    last_heartbeat: Instant,
 }
 
 #[derive(Default)]
@@ -40,6 +30,10 @@ struct MicState {
     transcript_parts: Vec<String>,
     ready: bool,
     stopping: bool,
+    killed: bool,
+    lease: Option<MicLease>,
+    events_log: VecDeque<MicrophoneEventRecord>,
+    next_sequence: u64,
 }
 
 impl MicState {
@@ -55,46 +49,137 @@ impl MicState {
         }
     }
 
-    fn start(&mut self) -> Result<&'static str, String> {
+    fn response(
+        &self,
+        message: Option<String>,
+        events: Vec<MicrophoneEventRecord>,
+    ) -> MicrophoneIpcResponse {
+        MicrophoneIpcResponse {
+            status: self.status().into(),
+            message,
+            lease_id: self.lease.as_ref().map(|lease| lease.id.clone()),
+            owner: self.lease.as_ref().map(|lease| lease.requester.clone()),
+            killed: self.killed,
+            latest_sequence: self.next_sequence.saturating_sub(1),
+            events,
+        }
+    }
+
+    fn start(
+        &mut self,
+        requester: String,
+        ambient: Option<AmbientVoiceConfig>,
+    ) -> Result<MicrophoneIpcResponse, String> {
+        if self.killed {
+            return Err("microphone kill switch is active".into());
+        }
         if self.session.is_some() {
-            return if self.stopping {
-                Err("microphone capture is still stopping".into())
-            } else {
-                Ok(self.status())
-            };
+            let owner = self
+                .lease
+                .as_ref()
+                .map(|lease| lease.requester.as_str())
+                .unwrap_or("unknown");
+            return Err(format!("microphone is already leased to {owner}"));
         }
 
         let model_dir =
             focaldesk_voice::find_model_dir().ok_or_else(focaldesk_voice::install_instructions)?;
         stop_speech();
         let (events_tx, events_rx) = mpsc::channel();
-        let session = VoiceSession::start(model_dir, events_tx)
-            .map_err(|err| format!("start microphone capture: {err:#}"))?;
+        let is_ambient = ambient.is_some();
+        let session = match ambient {
+            Some(config) => VoiceSession::start_ambient(model_dir, events_tx, config),
+            None => VoiceSession::start(model_dir, events_tx),
+        }
+        .map_err(|err| format!("start microphone capture: {err:#}"))?;
+        let lease_id = format!("mic-{:032x}", rand::random::<u128>());
         self.session = Some(session);
         self.events = Some(events_rx);
+        self.lease = Some(MicLease {
+            id: lease_id,
+            requester,
+            ambient: is_ambient,
+            last_heartbeat: Instant::now(),
+        });
+        self.events_log.clear();
+        self.next_sequence = 1;
         self.transcript_parts.clear();
         self.ready = false;
         self.stopping = false;
         eprintln!("[starting]");
-        Ok("starting")
+        Ok(self.response(None, Vec::new()))
     }
 
-    fn stop(&mut self) -> &'static str {
+    fn stop(&mut self, lease_id: Option<&str>) -> Result<MicrophoneIpcResponse, String> {
+        if let (Some(supplied), Some(lease)) = (lease_id, self.lease.as_ref()) {
+            if supplied != lease.id {
+                return Err("microphone lease does not match the active owner".into());
+            }
+        }
         if let Some(session) = &self.session {
             session.stop();
             self.stopping = true;
             eprintln!("[stopping]");
-            "stopping"
+        }
+        Ok(self.response(None, Vec::new()))
+    }
+
+    fn toggle(&mut self, requester: String) -> Result<MicrophoneIpcResponse, String> {
+        if self.session.is_some() {
+            if self
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.requester != requester)
+            {
+                return Err("microphone is leased to another application".into());
+            }
+            self.stop(None)
         } else {
-            "idle"
+            self.start(requester, None)
         }
     }
 
-    fn toggle(&mut self) -> Result<&'static str, String> {
-        if self.session.is_some() {
-            Ok(self.stop())
-        } else {
-            self.start()
+    fn record(&mut self, event: MicrophoneEvent) {
+        let record = MicrophoneEventRecord {
+            sequence: self.next_sequence,
+            event,
+        };
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        if self.events_log.len() == MAX_EVENTS {
+            self.events_log.pop_front();
+        }
+        self.events_log.push_back(record);
+    }
+
+    fn poll(
+        &mut self,
+        lease_id: &str,
+        after_sequence: u64,
+    ) -> Result<MicrophoneIpcResponse, String> {
+        let lease = self
+            .lease
+            .as_mut()
+            .ok_or_else(|| "microphone lease is no longer active".to_string())?;
+        if lease.id != lease_id {
+            return Err("microphone lease does not match the active owner".into());
+        }
+        lease.last_heartbeat = Instant::now();
+        let events = self
+            .events_log
+            .iter()
+            .filter(|record| record.sequence > after_sequence)
+            .cloned()
+            .collect();
+        Ok(self.response(None, events))
+    }
+
+    fn expire_stale_lease(&mut self) {
+        let expired = self.lease.as_ref().is_some_and(|lease| {
+            lease.ambient && lease.last_heartbeat.elapsed() > AMBIENT_LEASE_IDLE
+        });
+        if expired && !self.stopping {
+            eprintln!("[lease-expired]");
+            let _ = self.stop(None);
         }
     }
 
@@ -105,7 +190,9 @@ impl MicState {
                 Some(Err(TryRecvError::Empty)) | None => break,
                 Some(Err(TryRecvError::Disconnected)) => {
                     let transcript = std::mem::take(&mut self.transcript_parts).join(" ");
-                    let should_forward = self.stopping && !transcript.trim().is_empty();
+                    let should_forward = self.stopping
+                        && self.lease.as_ref().is_some_and(|lease| !lease.ambient)
+                        && !transcript.trim().is_empty();
                     self.events = None;
                     self.session = None;
                     self.ready = false;
@@ -122,16 +209,30 @@ impl MicState {
             match event {
                 VoiceEvent::Ready => {
                     self.ready = true;
+                    self.record(MicrophoneEvent::Ready);
                     eprintln!("[listening]");
                 }
-                VoiceEvent::Partial(_) => {}
+                VoiceEvent::Partial(text) => self.record(MicrophoneEvent::Partial(text)),
                 VoiceEvent::Final(text) if !text.trim().is_empty() => {
                     let text = text.trim().to_string();
                     eprintln!("[transcript-part] {text:?}");
-                    self.transcript_parts.push(text);
+                    if self.lease.as_ref().is_some_and(|lease| !lease.ambient) {
+                        self.transcript_parts.push(text.clone());
+                    }
+                    self.record(MicrophoneEvent::Final(text));
                 }
                 VoiceEvent::Final(_) => {}
+                VoiceEvent::VoiceActivity(active) => {
+                    if active {
+                        stop_speech();
+                    }
+                    self.record(MicrophoneEvent::VoiceActivity(active));
+                }
+                VoiceEvent::WakeDetected => self.record(MicrophoneEvent::WakeDetected),
+                VoiceEvent::Command(command) => self.record(MicrophoneEvent::Command(command)),
+                VoiceEvent::Stopped => self.record(MicrophoneEvent::Stopped),
                 VoiceEvent::Error(message) => {
+                    self.record(MicrophoneEvent::Error(message.clone()));
                     eprintln!("[failed] {message}");
                 }
             }
@@ -159,8 +260,16 @@ fn run_server() -> Result<()> {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    if transport::require_authorized_peer(&stream, transport::MIC_POLICY).is_ok() {
-                        handle_client(stream, &mut state);
+                    if let Ok(identity) =
+                        transport::require_authorized_peer(&stream, transport::MIC_POLICY)
+                    {
+                        let requester = identity
+                            .executable
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("authorized-client")
+                            .to_string();
+                        handle_client(stream, &mut state, &requester);
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -168,25 +277,28 @@ fn run_server() -> Result<()> {
             }
         }
         state.poll_events();
+        state.expire_stale_lease();
         std::thread::sleep(Duration::from_millis(25));
     }
 }
 
-fn handle_client(mut stream: UnixStream, state: &mut MicState) {
+fn handle_client(mut stream: UnixStream, state: &mut MicState, peer_requester: &str) {
     let result = transport::read_limited(&mut stream)
         .map_err(|err| format!("reading request: {err}"))
         .and_then(|payload| transport::decode_message::<String>(&payload))
         .and_then(|payload| decode_request(&payload))
-        .and_then(|command| execute_command(command, state));
+        .and_then(|request| execute_request(request, state, peer_requester));
 
     let response = match result {
-        Ok(status) => WireResponse {
-            status,
-            message: None,
-        },
-        Err(message) => WireResponse {
-            status: "error",
+        Ok(response) => response,
+        Err(message) => MicrophoneIpcResponse {
+            status: "error".into(),
             message: Some(message),
+            lease_id: state.lease.as_ref().map(|lease| lease.id.clone()),
+            owner: state.lease.as_ref().map(|lease| lease.requester.clone()),
+            killed: state.killed,
+            latest_sequence: state.next_sequence.saturating_sub(1),
+            events: Vec::new(),
         },
     };
     if let Ok(response) = serde_json::to_string(&response) {
@@ -196,18 +308,69 @@ fn handle_client(mut stream: UnixStream, state: &mut MicState) {
     }
 }
 
-fn decode_request(payload: &str) -> Result<MicCommand, String> {
-    serde_json::from_str::<WireRequest>(payload)
-        .map(|request| request.command)
-        .map_err(|err| format!("invalid JSON request: {err}"))
+fn decode_request(payload: &str) -> Result<MicrophoneIpcRequest, String> {
+    serde_json::from_str(payload).map_err(|err| format!("invalid JSON request: {err}"))
 }
 
-fn execute_command(command: MicCommand, state: &mut MicState) -> Result<&'static str, String> {
-    match command {
-        MicCommand::Start => state.start(),
-        MicCommand::Stop => Ok(state.stop()),
-        MicCommand::Toggle => state.toggle(),
-        MicCommand::Status => Ok(state.status()),
+fn execute_request(
+    request: MicrophoneIpcRequest,
+    state: &mut MicState,
+    peer_requester: &str,
+) -> Result<MicrophoneIpcResponse, String> {
+    match request {
+        MicrophoneIpcRequest::Start { .. } => state.start(peer_requester.to_string(), None),
+        MicrophoneIpcRequest::StartAmbient {
+            wake_phrase,
+            blocked_applications,
+            ..
+        } => state.start(
+            peer_requester.to_string(),
+            Some(AmbientVoiceConfig {
+                wake_phrase,
+                requester_application: peer_requester.to_string(),
+                blocked_applications,
+                ..AmbientVoiceConfig::default()
+            }),
+        ),
+        MicrophoneIpcRequest::Stop { lease_id } => {
+            if lease_id.is_none()
+                && state
+                    .lease
+                    .as_ref()
+                    .is_some_and(|lease| lease.requester != peer_requester)
+            {
+                return Err("microphone is leased to another application".into());
+            }
+            state.stop(lease_id.as_deref())
+        }
+        MicrophoneIpcRequest::Toggle { .. } => state.toggle(peer_requester.to_string()),
+        MicrophoneIpcRequest::Status => Ok(state.response(None, Vec::new())),
+        MicrophoneIpcRequest::Poll {
+            lease_id,
+            after_sequence,
+        } => state.poll(&lease_id, after_sequence),
+        MicrophoneIpcRequest::ClearEvents { lease_id } => {
+            if state
+                .lease
+                .as_ref()
+                .is_none_or(|lease| lease.id != lease_id)
+            {
+                return Err("microphone lease does not match the active owner".into());
+            }
+            state.events_log.clear();
+            Ok(state.response(None, Vec::new()))
+        }
+        MicrophoneIpcRequest::Kill => {
+            focaldesk_voice::set_microphone_killed(true);
+            state.killed = true;
+            let _ = state.stop(None);
+            Ok(state.response(None, Vec::new()))
+        }
+        MicrophoneIpcRequest::Enable => {
+            focaldesk_voice::set_microphone_killed(false);
+            state.killed = false;
+            Ok(state.response(None, Vec::new()))
+        }
     }
 }
 
@@ -262,20 +425,28 @@ fn send_socket_request(path: PathBuf, payload: &str, timeout: Duration) -> Resul
 }
 
 fn run_client(args: &[String]) -> Result<()> {
-    let command = match args {
-        [arg] if arg == "--start" => "start",
-        [arg] if arg == "--stop" => "stop",
-        [arg] if arg == "--toggle" => "toggle",
-        [arg] if arg == "--status" => "status",
+    let request = match args {
+        [arg] if arg == "--start" => MicrophoneIpcRequest::Start {
+            requester: "focald-mic-cli".into(),
+        },
+        [arg] if arg == "--stop" => MicrophoneIpcRequest::Stop { lease_id: None },
+        [arg] if arg == "--toggle" => MicrophoneIpcRequest::Toggle {
+            requester: "focald-mic-cli".into(),
+        },
+        [arg] if arg == "--status" => MicrophoneIpcRequest::Status,
+        [arg] if arg == "--kill" => MicrophoneIpcRequest::Kill,
+        [arg] if arg == "--enable" => MicrophoneIpcRequest::Enable,
         [arg] if arg == "--help" || arg == "-h" => {
             println!(
-                "Usage:\n  focald-mic --start\n  focald-mic --stop\n  focald-mic --toggle\n  focald-mic --status"
+                "Usage:\n  focald-mic --start\n  focald-mic --stop\n  focald-mic --toggle\n  focald-mic --status\n  focald-mic --kill\n  focald-mic --enable"
             );
             return Ok(());
         }
-        _ => anyhow::bail!("usage: focald-mic --start | --stop | --toggle | --status"),
+        _ => anyhow::bail!(
+            "usage: focald-mic --start | --stop | --toggle | --status | --kill | --enable"
+        ),
     };
-    let request = serde_json::json!({ "command": command }).to_string();
+    let request = serde_json::to_string(&request)?;
     let response = send_socket_request(mic_socket_path()?, &request, Duration::from_secs(5))?;
     print!("{response}");
     Ok(())
@@ -305,19 +476,23 @@ mod tests {
     fn commands_decode() {
         assert_eq!(
             decode_request(r#"{"command":"start"}"#).unwrap(),
-            MicCommand::Start
+            MicrophoneIpcRequest::Start {
+                requester: "focaldesk-desktop".into()
+            }
         );
         assert_eq!(
             decode_request(r#"{"command":"stop"}"#).unwrap(),
-            MicCommand::Stop
+            MicrophoneIpcRequest::Stop { lease_id: None }
         );
         assert_eq!(
             decode_request(r#"{"command":"toggle"}"#).unwrap(),
-            MicCommand::Toggle
+            MicrophoneIpcRequest::Toggle {
+                requester: "focaldesk-desktop".into()
+            }
         );
         assert_eq!(
             decode_request(r#"{"command":"status"}"#).unwrap(),
-            MicCommand::Status
+            MicrophoneIpcRequest::Status
         );
     }
 
@@ -332,6 +507,42 @@ mod tests {
     fn idle_state_reports_idle_and_stops_idempotently() {
         let mut state = MicState::default();
         assert_eq!(state.status(), "idle");
-        assert_eq!(state.stop(), "idle");
+        assert_eq!(state.stop(None).unwrap().status, "idle");
+    }
+
+    #[test]
+    fn lease_events_are_bounded_and_cursor_filtered() {
+        let mut state = MicState {
+            lease: Some(MicLease {
+                id: "lease-1".into(),
+                requester: "test-client".into(),
+                ambient: true,
+                last_heartbeat: Instant::now(),
+            }),
+            ..MicState::default()
+        };
+        for index in 0..(MAX_EVENTS + 10) {
+            state.record(MicrophoneEvent::Command(format!("command-{index}")));
+        }
+        assert_eq!(state.events_log.len(), MAX_EVENTS);
+        let after = state.events_log[state.events_log.len() - 2].sequence;
+        let response = state.poll("lease-1", after).unwrap();
+        assert_eq!(response.events.len(), 1);
+        assert_eq!(response.events[0].sequence, response.latest_sequence);
+    }
+
+    #[test]
+    fn mismatched_lease_cannot_poll_or_stop() {
+        let mut state = MicState {
+            lease: Some(MicLease {
+                id: "lease-1".into(),
+                requester: "test-client".into(),
+                ambient: true,
+                last_heartbeat: Instant::now(),
+            }),
+            ..MicState::default()
+        };
+        assert!(state.poll("lease-2", 0).is_err());
+        assert!(state.stop(Some("lease-2")).is_err());
     }
 }

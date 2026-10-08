@@ -1,0 +1,28 @@
+[Unit]
+Description=FocalDesk managed connector host
+PartOf=focaldesk-session.target
+Wants=focaldesk-server.service focaldesk-notificationsd.service
+After=focaldesk-server.service focaldesk-notificationsd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/focald-connectors
+Restart=on-failure
+RestartSec=5
+Environment=FOCALD_CONNECTORS_SOCKET=%t/focaldesk/focald-connectors.sock
+Environment=FOCALDESK_AI_SOCKET=%t/focaldesk/focaldesk-ai.sock
+Environment=FOCALDESK_NOTIFICATIONS_SOCKET_PATH=%t/focaldesk/notifications.sock
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+LimitCORE=0
+
+[Install]
+WantedBy=focaldesk-session.target

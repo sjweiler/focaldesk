@@ -1,0 +1,220 @@
+{
+  "manifest": {
+    "package_version": 1,
+    "id": "focus-kit",
+    "name": "Focus Kit",
+    "version": "1.0.0",
+    "description": "A read-only daily focus agent, bounded start-of-day workflow, and suggestion-only morning routine for FocalDesk AIOS.",
+    "dependencies": [],
+    "signer": {
+      "id": "focaldesk-focus-kit",
+      "public_key_hex": "7ba2a8f7f471d29fefde802bf39fb69ef83899d1c7203fcaf448370fcb25a126"
+    }
+  },
+  "payload": {
+    "agents": [
+      {
+        "manifest_version": 1,
+        "id": "daily-focus",
+        "name": "Daily Focus",
+        "description": "Inspects the current desktop and turns observed state into a concise, voice-friendly focus brief.",
+        "instructions": "Use only observed session, window, and workspace state. Separate facts from suggestions, never invent calendar items or deadlines, and return at most three priorities plus one clearly labeled next action. Do not propose or perform desktop mutations.",
+        "tool_allowlist": [
+          "get_session_status",
+          "list_windows",
+          "list_workspaces"
+        ],
+        "max_tool_steps": 3,
+        "max_context_chars": 16000,
+        "max_output_tokens": 512,
+        "timeout_seconds": 90,
+        "memory": false,
+        "voice": true,
+        "triggers": [],
+        "daily_token_limit": 12000,
+        "daily_cost_limit_microusd": null,
+        "input_cost_microusd_per_million": null,
+        "output_cost_microusd_per_million": null,
+        "capability_policy": {
+          "filesystem_roots": [],
+          "network_origins": [],
+          "applications": [],
+          "workspaces": [],
+          "services": [],
+          "secret_handles": [],
+          "context_kinds": [
+            "active_window",
+            "workspace"
+          ],
+          "lease_seconds": 120
+        },
+        "built_in": false
+      }
+    ],
+    "workflows": [
+      {
+        "manifest_version": 1,
+        "id": "focus-start",
+        "name": "Start My Day",
+        "description": "Builds a bounded focus brief from the currently visible FocalDesk session without changing desktop state.",
+        "nodes": [
+          {
+            "id": "observe",
+            "agent_id": "daily-focus",
+            "objective": "Inspect the current session, open windows, and workspaces. Report only observed facts, unfinished-looking work, and visible attention risks.",
+            "depends_on": []
+          },
+          {
+            "id": "prioritize",
+            "agent_id": "daily-focus",
+            "objective": "Use the supplied observation artifact to produce at most three priorities and one clearly labeled next action. Do not invent meetings, deadlines, or tasks.",
+            "depends_on": [
+              "observe"
+            ]
+          }
+        ],
+        "max_parallelism": 1,
+        "timeout_seconds": 240,
+        "max_total_tokens": 6000,
+        "capability_ceiling": {
+          "filesystem_roots": [],
+          "network_origins": [],
+          "applications": [],
+          "workspaces": [],
+          "services": [],
+          "secret_handles": [],
+          "context_kinds": [
+            "active_window",
+            "workspace"
+          ],
+          "lease_seconds": 180
+        },
+        "built_in": false
+      }
+    ],
+    "routines": [
+      {
+        "id": "focus-kit-morning",
+        "name": "Focus Kit morning suggestion",
+        "description": "Offers the Start My Day workflow when an explicitly supplied context event contains the phrase start my day.",
+        "event_kind": "context",
+        "match_contains": "start my day",
+        "suggestion_title": "Start your focus brief?",
+        "suggestion_body": "Focus Kit received this context: {event}",
+        "priority": "normal",
+        "promotion": {
+          "kind": "workflow",
+          "workflow_id": "focus-start"
+        },
+        "cooldown_seconds": 14400,
+        "max_suggestions_per_hour": 1,
+        "quiet_hours": {
+          "start_hour_utc": 22,
+          "end_hour_utc": 6
+        }
+      }
+    ],
+    "connectors": []
+  },
+  "scenarios": [
+    {
+      "scenario_version": 1,
+      "name": "focus-read-only-plan",
+      "description": "The Daily Focus agent stays inside its declared read-only desktop inspection authority.",
+      "synthetic": true,
+      "initial": {
+        "event_fabric_connected": true,
+        "routines_suspended": false,
+        "source_fields": {},
+        "connectors": {},
+        "agent_tools": {
+          "daily-focus": [
+            "get_session_status",
+            "list_windows",
+            "list_workspaces"
+          ]
+        },
+        "token_budget": 6000
+      },
+      "steps": [
+        {
+          "type": "agent_plan",
+          "agent_id": "daily-focus",
+          "tools": [
+            "get_session_status",
+            "list_windows",
+            "list_workspaces"
+          ],
+          "proposed_mutation": false,
+          "confirmation_present": false,
+          "lease": "active",
+          "estimated_tokens": 512
+        }
+      ],
+      "expected_violation_codes": []
+    },
+    {
+      "scenario_version": 1,
+      "name": "focus-mutation-denied",
+      "description": "A mutation outside Focus Kit authority is rejected without native confirmation.",
+      "synthetic": true,
+      "initial": {
+        "event_fabric_connected": true,
+        "routines_suspended": false,
+        "source_fields": {},
+        "connectors": {},
+        "agent_tools": {
+          "daily-focus": [
+            "get_session_status",
+            "list_windows",
+            "list_workspaces"
+          ]
+        },
+        "token_budget": 6000
+      },
+      "steps": [
+        {
+          "type": "agent_plan",
+          "agent_id": "daily-focus",
+          "tools": [
+            "focus_window"
+          ],
+          "proposed_mutation": true,
+          "confirmation_present": false,
+          "lease": "active",
+          "estimated_tokens": 256
+        }
+      ],
+      "expected_violation_codes": [
+        "mutation_without_confirmation",
+        "tool_outside_allowlist"
+      ]
+    },
+    {
+      "scenario_version": 1,
+      "name": "focus-routine-is-simulation-only",
+      "description": "Morning-context evaluation remains an inert Scenario Lab simulation.",
+      "synthetic": true,
+      "initial": {
+        "event_fabric_connected": true,
+        "routines_suspended": false,
+        "source_fields": {},
+        "connectors": {},
+        "agent_tools": {},
+        "token_budget": 1000
+      },
+      "steps": [
+        {
+          "type": "routine_event",
+          "event": {
+            "kind": "context",
+            "value": "start my day with a morning focus brief",
+            "source": "focus-kit-synthetic"
+          }
+        }
+      ],
+      "expected_violation_codes": []
+    }
+  ],
+  "signature_hex": "c176678a2f95979143ab0b8da936addc9726de7a32c2cf9197df75ac4efe3d6a8fa672da6b42db8e29ff561d1aff987910886dbe8693188d711243d31c312702"
+}

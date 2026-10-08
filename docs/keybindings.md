@@ -12,6 +12,7 @@ saves them. Invalid or conflicting overrides are ignored individually.
 | Shortcut | Action | Status |
 | --- | --- | --- |
 | `Super+Enter` | Launch the configured terminal | Working |
+| `Super+Ctrl+Shift+A` | Open AI Console directly to Desktop Agent | Working |
 | `Super+B` | Launch the configured browser | Working |
 | `Super+Q` | Close the focused window | Working |
 | `Super+L` | Lock the session | Working |
@@ -89,7 +90,7 @@ Separate modifiers and the key with `+`. Supported modifier names are `Shift`,
 Key names use XKB names such as `Return`, `Escape`, `Tab`, `Print`, `Space`,
 `F1` through `F12`, or a single character.
 
-Supported action names are `launch_terminal`, `launch_browser`, `launch_files`,
+Supported action names are `launch_terminal`, `launch_ai_console`, `launch_browser`, `launch_files`,
 `toggle_launcher`, `close_focused`, `lock_screen`, `focus_next`,
 `focus_previous`, `focus_shell_next`, `focus_shell_previous`,
 `toggle_clipboard_history`, `toggle_voice_capture`, `split_left`,

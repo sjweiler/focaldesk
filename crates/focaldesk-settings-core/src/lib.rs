@@ -88,6 +88,8 @@ pub struct OutputConfig {
     pub height: i32,
     pub refresh_mhz: i32,
     pub scale: f32,
+    #[serde(default)]
+    pub transform: DisplayTransform,
     pub primary: bool,
     #[serde(default)]
     pub color_profile: DisplayColorProfile,
@@ -99,6 +101,15 @@ pub struct OutputConfig {
     pub hdr_enabled: bool,
     #[serde(default)]
     pub hdr_appearance: HdrAppearance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum DisplayTransform {
+    #[default]
+    Normal,
+    Rotate90,
+    Rotate180,
+    Rotate270,
 }
 
 /// Per-output creative controls for the final HDR10 encode pass.

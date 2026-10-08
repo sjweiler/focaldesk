@@ -1,7 +1,8 @@
 use anyhow::{Context, bail};
 use focaldesk_ai::{
-    AgentRequest, AiIpcRequest, AiIpcResponse, AiStreamEvent, ChatRequest, Citation,
-    RetrievalEvalCase, send_ai_request, stream_ai_chat,
+    AgentRequest, AgentRunStatus, AgentTriggerKind, AiIpcRequest, AiIpcResponse, AiStreamEvent,
+    ChatRequest, Citation, FaiBundle, FaiForgeProject, FaiLocalRegistry, FaiSigner,
+    RetrievalEvalCase, ScenarioFixture, evaluate_scenario, send_ai_request, stream_ai_chat,
 };
 use focaldesk_diagnostics::{DiagnosticsOptions, collect_diagnostics};
 use focaldesk_ipc::{
@@ -13,7 +14,9 @@ use focaldesk_settings_core::{
     DisplayColorProfile, HdrAppearance, HdrCalibrationPattern, OutputConfig,
 };
 use std::io::{self, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use zeroize::Zeroizing;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -315,6 +318,7 @@ fn main() -> anyhow::Result<()> {
                     height,
                     refresh_mhz: output.refresh_mhz.max(60_000),
                     scale,
+                    transform: output.transform,
                     primary: true,
                     color_profile: DisplayColorProfile::Auto,
                     icc_profile_path: None,
@@ -665,12 +669,565 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
                 other => bail!("unexpected AI response: {other:?}"),
             }
         }
+        "scenario" => {
+            let path = PathBuf::from(
+                args.next()
+                    .context("ai scenario requires a JSON fixture path")?,
+            );
+            if args.next().is_some() {
+                bail!("ai scenario accepts exactly one JSON fixture path");
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect scenario fixture {}", path.display()))?;
+            if !metadata.file_type().is_file()
+                || metadata.file_type().is_symlink()
+                || metadata.len() > 192 * 1024
+            {
+                bail!("scenario fixture must be a regular non-symlink file no larger than 192 KiB");
+            }
+            let input = std::fs::read_to_string(&path)
+                .with_context(|| format!("read scenario fixture {}", path.display()))?;
+            let fixture: ScenarioFixture = serde_json::from_str(&input)
+                .with_context(|| format!("invalid Scenario Lab JSON in {}", path.display()))?;
+            let report = evaluate_scenario(fixture)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if report.passed {
+                Ok(())
+            } else {
+                bail!("Scenario Lab contract failed")
+            }
+        }
+        "package" => {
+            let action = args.next().context(
+                "ai package requires a Forge, registry, inspection, or lifecycle action",
+            )?;
+            match action.as_str() {
+                "init" => {
+                    let directory = PathBuf::from(
+                        args.next()
+                            .context("ai package init requires a new project directory")?,
+                    );
+                    let mut id = None;
+                    let mut name = None;
+                    let mut signer = None;
+                    while let Some(option) = args.next() {
+                        match option.as_str() {
+                            "--id" => id = Some(args.next().context("--id requires a value")?),
+                            "--name" => {
+                                name = Some(args.next().context("--name requires a value")?)
+                            }
+                            "--signer" => {
+                                signer = Some(args.next().context("--signer requires a value")?)
+                            }
+                            _ => bail!("unknown ai package init option: {option}"),
+                        }
+                    }
+                    let project = FaiForgeProject::example(
+                        id.context("ai package init requires --id")?,
+                        name.context("ai package init requires --name")?,
+                        signer.context("ai package init requires --signer")?,
+                    );
+                    write_forge_scaffold(&directory, &project)?;
+                    println!("created {}", directory.display());
+                    Ok(())
+                }
+                "keygen" => {
+                    let signer_id = args
+                        .next()
+                        .context("ai package keygen requires a signer id")?;
+                    if args.next().is_some() {
+                        bail!("ai package keygen accepts exactly one signer id");
+                    }
+                    match send_ai_request(&AiIpcRequest::GeneratePackageSigner { signer_id })? {
+                        AiIpcResponse::PackageSignerGenerated { signer } => {
+                            println!("{}\t{}", signer.id, signer.public_key_hex);
+                            Ok(())
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                "test" => {
+                    let project = read_forge_project(&PathBuf::from(
+                        args.next()
+                            .context("ai package test requires a project path")?,
+                    ))?;
+                    if args.next().is_some() {
+                        bail!("ai package test accepts exactly one project path");
+                    }
+                    let report = project.test()?;
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                    if report.passed {
+                        Ok(())
+                    } else {
+                        bail!("AIOS package project failed its Scenario Lab suite")
+                    }
+                }
+                "build" | "sign" => {
+                    let project_path =
+                        PathBuf::from(args.next().with_context(|| {
+                            format!("ai package {action} requires a project path")
+                        })?);
+                    let output =
+                        PathBuf::from(args.next().with_context(|| {
+                            format!("ai package {action} requires an output path")
+                        })?);
+                    if args.next().is_some() {
+                        bail!("ai package {action} accepts a project path and output path");
+                    }
+                    let project = read_forge_project(&project_path)?;
+                    match send_ai_request(&AiIpcRequest::BuildPackageProject {
+                        project: Box::new(project),
+                    })? {
+                        AiIpcResponse::PackageBuilt { bundle } => {
+                            write_new_json(&output, &*bundle)?;
+                            println!("built {}", output.display());
+                            Ok(())
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                "verify" => {
+                    let bundle = read_fai_bundle(&PathBuf::from(
+                        args.next()
+                            .context("ai package verify requires a .fai path")?,
+                    ))?;
+                    if args.next().is_some() {
+                        bail!("ai package verify accepts exactly one .fai path");
+                    }
+                    match send_ai_request(&AiIpcRequest::InspectPackage {
+                        bundle: Box::new(bundle),
+                    })? {
+                        AiIpcResponse::PackageInspected { inspection } => {
+                            println!("{}", serde_json::to_string_pretty(&inspection)?);
+                            if inspection.signature_valid && inspection.scenarios_passed {
+                                Ok(())
+                            } else {
+                                bail!("AIOS package verification failed")
+                            }
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                "registry" => handle_fai_registry(args.collect()),
+                "inspect" | "stage" => {
+                    let path =
+                        PathBuf::from(args.next().with_context(|| {
+                            format!("ai package {action} requires a .fai path")
+                        })?);
+                    if args.next().is_some() {
+                        bail!("ai package {action} accepts exactly one .fai path");
+                    }
+                    let bundle = read_fai_bundle(&path)?;
+                    let request = if action == "inspect" {
+                        AiIpcRequest::InspectPackage {
+                            bundle: Box::new(bundle),
+                        }
+                    } else {
+                        AiIpcRequest::StagePackage {
+                            bundle: Box::new(bundle),
+                        }
+                    };
+                    match send_ai_request(&request)? {
+                        AiIpcResponse::PackageInspected { inspection } => {
+                            println!("{}", serde_json::to_string_pretty(&inspection)?);
+                            Ok(())
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                "trust" => {
+                    let id = args
+                        .next()
+                        .context("ai package trust requires a signer id")?;
+                    let public_key_hex = args
+                        .next()
+                        .context("ai package trust requires an Ed25519 public key")?;
+                    if args.next().is_some() {
+                        bail!("ai package trust accepts a signer id and public key");
+                    }
+                    match send_ai_request(&AiIpcRequest::TrustPackageSigner {
+                        signer: FaiSigner { id, public_key_hex },
+                    })? {
+                        AiIpcResponse::PackageSignerTrusted => {
+                            println!("package signer trusted");
+                            Ok(())
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                "activate" | "rollback" => {
+                    let package_id = args
+                        .next()
+                        .with_context(|| format!("ai package {action} requires a package id"))?;
+                    if args.next().is_some() {
+                        bail!("ai package {action} accepts exactly one package id");
+                    }
+                    let request = if action == "activate" {
+                        AiIpcRequest::ActivatePackage { package_id }
+                    } else {
+                        AiIpcRequest::RollbackPackage { package_id }
+                    };
+                    match send_ai_request(&request)? {
+                        AiIpcResponse::PackageActivated { bundle } => {
+                            println!(
+                                "{}\t{}\t{}",
+                                bundle.manifest.id, bundle.manifest.version, action
+                            );
+                            Ok(())
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                "list" => {
+                    if args.next().is_some() {
+                        bail!("ai package list does not accept arguments");
+                    }
+                    match send_ai_request(&AiIpcRequest::ListPackages)? {
+                        AiIpcResponse::Packages { packages } => {
+                            println!("{}", serde_json::to_string_pretty(&packages)?);
+                            Ok(())
+                        }
+                        AiIpcResponse::Error { message } => bail!(message),
+                        other => bail!("unexpected AI response: {other:?}"),
+                    }
+                }
+                other => bail!("unknown ai package action: {other}"),
+            }
+        }
+        "agents" => {
+            if args.next().is_some() {
+                bail!("ai agents does not accept arguments");
+            }
+            match send_ai_request(&AiIpcRequest::ListAgents)? {
+                AiIpcResponse::Agents { agents } => {
+                    for agent in agents {
+                        println!(
+                            "{}\t{}\tvoice={}\tsteps={}\ttriggers={}\t{}",
+                            agent.id,
+                            agent.name,
+                            agent.voice,
+                            agent.max_tool_steps,
+                            agent.triggers.len(),
+                            agent.description
+                        );
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-runs" => {
+            if args.next().is_some() {
+                bail!("ai agent-runs does not accept arguments");
+            }
+            match send_ai_request(&AiIpcRequest::ListAgentRuns)? {
+                AiIpcResponse::AgentRuns { runs } => {
+                    for run in runs {
+                        print_agent_run(&run);
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-status" => {
+            let run_id = args.next().context("ai agent-status requires a run id")?;
+            if args.next().is_some() {
+                bail!("ai agent-status accepts exactly one run id");
+            }
+            match send_ai_request(&AiIpcRequest::GetAgentRun {
+                run_id: run_id.clone(),
+            })? {
+                AiIpcResponse::AgentRun {
+                    status: Some(status),
+                    ..
+                } => {
+                    print_agent_run(&status);
+                    Ok(())
+                }
+                AiIpcResponse::AgentRun { status: None, .. } => {
+                    bail!("unknown agent run: {run_id}")
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-cancel" => {
+            let run_id = args.next().context("ai agent-cancel requires a run id")?;
+            if args.next().is_some() {
+                bail!("ai agent-cancel accepts exactly one run id");
+            }
+            match send_ai_request(&AiIpcRequest::CancelAgentRun {
+                run_id: run_id.clone(),
+            })? {
+                AiIpcResponse::AgentRunCancellation { accepted, .. } => {
+                    if accepted {
+                        println!("cancelled {run_id}");
+                        Ok(())
+                    } else {
+                        bail!("agent run is unknown or no longer cancellable: {run_id}")
+                    }
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-retry" => {
+            let run_id = args.next().context("ai agent-retry requires a run id")?;
+            if args.next().is_some() {
+                bail!("ai agent-retry accepts exactly one run id");
+            }
+            match send_ai_request(&AiIpcRequest::RetryAgentRun { run_id })? {
+                AiIpcResponse::AgentStarted { run_id } => {
+                    println!("retried as {run_id}");
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-trigger" => {
+            let agent_id = args
+                .next()
+                .context("ai agent-trigger requires an agent id")?;
+            let trigger_id = args
+                .next()
+                .context("ai agent-trigger requires a trigger id")?;
+            if args.next().is_some() {
+                bail!("ai agent-trigger accepts exactly an agent id and trigger id");
+            }
+            match send_ai_request(&AiIpcRequest::FireAgentTrigger {
+                agent_id,
+                trigger_id,
+            })? {
+                AiIpcResponse::AgentStarted { run_id } => {
+                    println!("triggered {run_id}");
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-event" => {
+            let kind = parse_agent_trigger_kind(
+                &args
+                    .next()
+                    .context("ai agent-event requires an event kind")?,
+            )?;
+            let value = args.collect::<Vec<_>>().join(" ");
+            if value.is_empty() {
+                bail!("ai agent-event requires an event value");
+            }
+            match send_ai_request(&AiIpcRequest::DispatchAgentEvent { kind, value })? {
+                AiIpcResponse::AgentTriggersStarted { run_ids } => {
+                    for run_id in run_ids {
+                        println!("triggered {run_id}");
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-triggers" => {
+            let action = args.next().unwrap_or_else(|| "status".into());
+            if args.next().is_some() {
+                bail!("ai agent-triggers accepts status, suspend, or resume");
+            }
+            let request = match action.as_str() {
+                "status" => AiIpcRequest::GetAgentTriggerState,
+                "suspend" => AiIpcRequest::SetAgentTriggersSuspended { suspended: true },
+                "resume" => AiIpcRequest::SetAgentTriggersSuspended { suspended: false },
+                _ => bail!("ai agent-triggers accepts status, suspend, or resume"),
+            };
+            match send_ai_request(&request)? {
+                AiIpcResponse::AgentTriggerState { suspended } => {
+                    println!(
+                        "agent triggers: {}",
+                        if suspended { "suspended" } else { "active" }
+                    );
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "agent-control" => {
+            let action = args.next().unwrap_or_else(|| "status".into());
+            let agent_id = args.next();
+            if args.next().is_some() {
+                bail!("ai agent-control accepts an action and optional agent id");
+            }
+            let request = match action.as_str() {
+                "status" => AiIpcRequest::GetAgentControlStatuses,
+                "reload" => AiIpcRequest::ReloadAgents,
+                "enable" => AiIpcRequest::SetAgentEnabled {
+                    agent_id: agent_id.context("enable requires an agent id")?,
+                    enabled: true,
+                },
+                "disable" => AiIpcRequest::SetAgentEnabled {
+                    agent_id: agent_id.context("disable requires an agent id")?,
+                    enabled: false,
+                },
+                "rollback" => AiIpcRequest::RollbackAgent {
+                    agent_id: agent_id.context("rollback requires an agent id")?,
+                },
+                _ => bail!("agent-control accepts status, reload, enable, disable, or rollback"),
+            };
+            match send_ai_request(&request)? {
+                AiIpcResponse::AgentControlStatuses { agents } => {
+                    for agent in agents {
+                        println!(
+                            "{}\t{}\truns={}\tfailures={}\ttokens={}\tcost_microusd={}",
+                            agent.definition.id,
+                            if agent.enabled { "enabled" } else { "disabled" },
+                            agent.runs_today,
+                            agent.failures_today,
+                            agent
+                                .input_tokens_today
+                                .saturating_add(agent.output_tokens_today),
+                            agent.estimated_cost_microusd_today,
+                        );
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::Agents { agents } => {
+                    println!("loaded {} agents", agents.len());
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "workflow" => {
+            let action = args.next().unwrap_or_else(|| "list".into());
+            let value = args.next();
+            if args.next().is_some() {
+                bail!("ai workflow accepts one action and optional id");
+            }
+            let request = match action.as_str() {
+                "list" => AiIpcRequest::ListWorkflows,
+                "runs" => AiIpcRequest::ListWorkflowRuns,
+                "start" => AiIpcRequest::StartWorkflow {
+                    workflow_id: value.context("workflow start requires a workflow id")?,
+                },
+                "status" => AiIpcRequest::GetWorkflowRun {
+                    run_id: value.context("workflow status requires a run id")?,
+                },
+                "pause" | "resume" => AiIpcRequest::SetWorkflowPaused {
+                    run_id: value.context("workflow pause/resume requires a run id")?,
+                    paused: action == "pause",
+                },
+                "cancel" => AiIpcRequest::CancelWorkflow {
+                    run_id: value.context("workflow cancel requires a run id")?,
+                },
+                "retry" => AiIpcRequest::RetryWorkflow {
+                    run_id: value.context("workflow retry requires a run id")?,
+                },
+                _ => bail!(
+                    "workflow accepts list, runs, start, status, pause, resume, cancel, or retry"
+                ),
+            };
+            match send_ai_request(&request)? {
+                AiIpcResponse::Workflows { workflows } => {
+                    for workflow in workflows {
+                        println!(
+                            "{}\t{}\tnodes={}\tparallel={}\ttokens={}\t{}",
+                            workflow.id,
+                            workflow.name,
+                            workflow.nodes.len(),
+                            workflow.max_parallelism,
+                            workflow.max_total_tokens,
+                            workflow.description
+                        );
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::WorkflowRuns { runs } => {
+                    for run in runs {
+                        println!(
+                            "{}\t{}\t{:?}\ttokens={}/{}\tnodes={}",
+                            run.run_id,
+                            run.workflow_id,
+                            run.state,
+                            run.total_tokens,
+                            run.max_total_tokens,
+                            run.nodes.len()
+                        );
+                    }
+                    Ok(())
+                }
+                AiIpcResponse::WorkflowRun { status, .. } => {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                    Ok(())
+                }
+                AiIpcResponse::WorkflowStarted { run_id } => {
+                    println!("workflow started {run_id}");
+                    Ok(())
+                }
+                AiIpcResponse::WorkflowControl { run_id, accepted } => {
+                    println!(
+                        "workflow {run_id}: {}",
+                        if accepted { "accepted" } else { "unchanged" }
+                    );
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
+        "capabilities" => {
+            let action = args.next().unwrap_or_else(|| "leases".into());
+            let value = args.next();
+            if args.next().is_some() {
+                bail!("ai capabilities accepts one action and optional id");
+            }
+            let request = match action.as_str() {
+                "preview" => AiIpcRequest::PreviewCapabilities {
+                    agent_id: value.context("capabilities preview requires an agent id")?,
+                    ceiling: None,
+                },
+                "leases" => AiIpcRequest::ListCapabilityLeases,
+                "revoke" => AiIpcRequest::RevokeCapabilityLease {
+                    lease_id: value.context("capabilities revoke requires a lease id")?,
+                },
+                _ => bail!("capabilities accepts preview, leases, or revoke"),
+            };
+            match send_ai_request(&request)? {
+                AiIpcResponse::CapabilityPreview { preview } => {
+                    println!("{}", serde_json::to_string_pretty(&preview)?);
+                    Ok(())
+                }
+                AiIpcResponse::CapabilityLeases { leases } => {
+                    println!("{}", serde_json::to_string_pretty(&leases)?);
+                    Ok(())
+                }
+                AiIpcResponse::CapabilityRevocation { lease_id, revoked } => {
+                    println!("{lease_id}\trevoked={revoked}");
+                    Ok(())
+                }
+                AiIpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected AI response: {other:?}"),
+            }
+        }
         "agent" => {
+            let mut agent_id = None;
             let mut provider = None;
             let mut model = None;
             let mut objective_parts = Vec::new();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
+                    "--profile" => {
+                        agent_id = Some(args.next().context("--profile requires a value")?);
+                    }
                     "--provider" => {
                         provider = Some(args.next().context("--provider requires a value")?);
                     }
@@ -686,13 +1243,15 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
             match send_ai_request(&AiIpcRequest::RunAgent {
                 request: AgentRequest {
                     objective: objective_parts.join(" "),
+                    agent_id,
                     provider,
                     model,
                 },
             })? {
                 AiIpcResponse::Agent { response } => {
                     eprintln!(
-                        "[ai-agent] provider={} model={} tools={}",
+                        "[ai-agent] run={} provider={} model={} tools={}",
+                        response.run_id,
                         response.provider,
                         response.model.as_deref().unwrap_or("-"),
                         response.steps.len()
@@ -742,6 +1301,408 @@ fn handle_ai(args: Vec<String>) -> anyhow::Result<()> {
     }
 }
 
+fn read_fai_bundle(path: &std::path::Path) -> anyhow::Result<FaiBundle> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("inspect AIOS package {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 2 * 1024 * 1024
+    {
+        bail!("AIOS package must be a regular non-symlink file no larger than 2 MiB");
+    }
+    let input = std::fs::read_to_string(path)
+        .with_context(|| format!("read AIOS package {}", path.display()))?;
+    serde_json::from_str(&input).with_context(|| format!("invalid .fai JSON in {}", path.display()))
+}
+
+fn read_forge_project(path: &std::path::Path) -> anyhow::Result<FaiForgeProject> {
+    let path = if path.is_dir() {
+        path.join("fai-project.json")
+    } else {
+        path.to_path_buf()
+    };
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect AIOS Forge project {}", path.display()))?;
+    if !metadata.file_type().is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.len() > 2 * 1024 * 1024
+    {
+        bail!("Forge project must be a regular non-symlink file no larger than 2 MiB");
+    }
+    serde_json::from_slice(&std::fs::read(&path)?)
+        .with_context(|| format!("invalid Forge project JSON in {}", path.display()))
+}
+
+fn write_forge_scaffold(
+    directory: &std::path::Path,
+    project: &FaiForgeProject,
+) -> anyhow::Result<()> {
+    if directory.exists() {
+        bail!("Forge project directory already exists");
+    }
+    std::fs::create_dir(directory)
+        .with_context(|| format!("create Forge project directory {}", directory.display()))?;
+    write_new_json(&directory.join("fai-project.json"), project)?;
+    let readme_path = directory.join("README.md");
+    let mut readme = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&readme_path)?;
+    writeln!(
+        readme,
+        "# {}\n\nTest and build this package with:\n\n```text\nfocaldesk-cli ai package test .\nfocaldesk-cli ai package build . {}.fai\n```",
+        project.manifest.name, project.manifest.id
+    )?;
+    readme.sync_all()?;
+    Ok(())
+}
+
+fn write_new_json(path: &std::path::Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    if path.exists() {
+        bail!("refusing to overwrite existing file: {}", path.display());
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut file, value)?;
+    writeln!(file)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn handle_fai_registry(args: Vec<String>) -> anyhow::Result<()> {
+    let mut args = args.into_iter();
+    let action = args
+        .next()
+        .context("ai package registry requires a local or remote action")?;
+    let root = std::env::var_os("FOCALDESK_FAI_REGISTRY")
+        .map(PathBuf::from)
+        .or_else(|| dirs::data_dir().map(|path| path.join("focaldesk/fai-registry")))
+        .context("cannot resolve local AIOS registry path")?;
+    let registry = FaiLocalRegistry::open(root)?;
+    match action.as_str() {
+        "add" => {
+            let bundle_path = PathBuf::from(
+                args.next()
+                    .context("ai package registry add requires a .fai path")?,
+            );
+            let mut overwrite = false;
+            for option in args {
+                match option.as_str() {
+                    "--overwrite" => overwrite = true,
+                    _ => bail!("unknown registry add option: {option}"),
+                }
+            }
+            let entry = registry.add(&read_fai_bundle(&bundle_path)?, overwrite)?;
+            println!("{}", serde_json::to_string_pretty(&entry)?);
+            Ok(())
+        }
+        "list" => {
+            if args.next().is_some() {
+                bail!("ai package registry list does not accept arguments");
+            }
+            println!("{}", serde_json::to_string_pretty(&registry.list(None)?)?);
+            Ok(())
+        }
+        "search" => {
+            let query = args
+                .next()
+                .context("ai package registry search requires a query")?;
+            if args.next().is_some() {
+                bail!("ai package registry search accepts exactly one query");
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&registry.list(Some(&query))?)?
+            );
+            Ok(())
+        }
+        "sync" => {
+            let base_url = args.next().context("registry sync requires a base URL")?;
+            let catalog_key = args
+                .next()
+                .context("registry sync requires a pinned catalog public key")?;
+            let token = read_private_token(&PathBuf::from(
+                args.next().context("registry sync requires a token file")?,
+            ))?;
+            let output = PathBuf::from(
+                args.next()
+                    .context("registry sync requires a catalog output path")?,
+            );
+            if args.next().is_some() {
+                bail!("registry sync received too many arguments");
+            }
+            let previous = if output.exists() {
+                let prior = read_signed_catalog(&output)?;
+                focaldesk_ai::verify_registry_catalog(&prior, &catalog_key, None)?;
+                Some(prior.catalog.sequence)
+            } else {
+                None
+            };
+            let catalog = tokio::runtime::Runtime::new()?.block_on(
+                focaldesk_ai::fetch_registry_catalog(&base_url, &token, &catalog_key, previous),
+            )?;
+            write_json_atomic(&output, &catalog)?;
+            println!(
+                "registry={} sequence={} packages={}",
+                catalog.catalog.registry_id,
+                catalog.catalog.sequence,
+                catalog.catalog.packages.len()
+            );
+            Ok(())
+        }
+        "browse" => {
+            let catalog_path = PathBuf::from(
+                args.next()
+                    .context("registry browse requires a catalog path")?,
+            );
+            let catalog_key = args
+                .next()
+                .context("registry browse requires a pinned catalog public key")?;
+            let query = args.next().map(|value| value.to_ascii_lowercase());
+            if args.next().is_some() {
+                bail!("registry browse accepts at most one query");
+            }
+            let catalog = read_signed_catalog(&catalog_path)?;
+            focaldesk_ai::verify_registry_catalog(&catalog, &catalog_key, None)?;
+            let entries = catalog
+                .catalog
+                .packages
+                .into_iter()
+                .filter(|entry| {
+                    query.as_ref().is_none_or(|query| {
+                        entry.package_id.to_ascii_lowercase().contains(query)
+                            || entry.name.to_ascii_lowercase().contains(query)
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&entries)?);
+            Ok(())
+        }
+        "lock" => {
+            let catalog_path = PathBuf::from(
+                args.next()
+                    .context("registry lock requires a catalog path")?,
+            );
+            let catalog_key = args
+                .next()
+                .context("registry lock requires a pinned catalog public key")?;
+            let package_id = args.next().context("registry lock requires a package id")?;
+            let version = args.next().context("registry lock requires a version")?;
+            let output = PathBuf::from(
+                args.next()
+                    .context("registry lock requires an output path")?,
+            );
+            if args.next().is_some() {
+                bail!("registry lock received too many arguments");
+            }
+            let catalog = read_signed_catalog(&catalog_path)?;
+            focaldesk_ai::verify_registry_catalog(&catalog, &catalog_key, None)?;
+            write_new_json(
+                &output,
+                &focaldesk_ai::resolve_catalog_lock(&catalog, &package_id, &version)?,
+            )?;
+            println!("wrote {}", output.display());
+            Ok(())
+        }
+        "diff" => {
+            let catalog_path = PathBuf::from(
+                args.next()
+                    .context("registry diff requires a catalog path")?,
+            );
+            let catalog_key = args
+                .next()
+                .context("registry diff requires a pinned catalog public key")?;
+            let package_id = args.next().context("registry diff requires a package id")?;
+            let from_version = args
+                .next()
+                .context("registry diff requires a from version")?;
+            let to_version = args.next().context("registry diff requires a to version")?;
+            if args.next().is_some() {
+                bail!("registry diff received too many arguments");
+            }
+            let catalog = read_signed_catalog(&catalog_path)?;
+            focaldesk_ai::verify_registry_catalog(&catalog, &catalog_key, None)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&focaldesk_ai::compare_catalog_versions(
+                    &catalog,
+                    &package_id,
+                    &from_version,
+                    &to_version,
+                )?)?
+            );
+            Ok(())
+        }
+        "download" => {
+            let base_url = args
+                .next()
+                .context("registry download requires a base URL")?;
+            let catalog_key = args
+                .next()
+                .context("registry download requires a pinned catalog public key")?;
+            let token = read_private_token(&PathBuf::from(
+                args.next()
+                    .context("registry download requires a token file")?,
+            ))?;
+            let catalog_path = PathBuf::from(
+                args.next()
+                    .context("registry download requires a catalog path")?,
+            );
+            let package_id = args
+                .next()
+                .context("registry download requires a package id")?;
+            let version = args
+                .next()
+                .context("registry download requires a version")?;
+            let output = PathBuf::from(
+                args.next()
+                    .context("registry download requires a quarantine output path")?,
+            );
+            if args.next().is_some() {
+                bail!("registry download received too many arguments");
+            }
+            let catalog = read_signed_catalog(&catalog_path)?;
+            focaldesk_ai::verify_registry_catalog(&catalog, &catalog_key, None)?;
+            let bundle = tokio::runtime::Runtime::new()?.block_on(
+                focaldesk_ai::download_registry_package(
+                    &base_url,
+                    &token,
+                    &catalog,
+                    &package_id,
+                    &version,
+                ),
+            )?;
+            write_new_json(&output, &bundle)?;
+            println!("verified download quarantined at {}", output.display());
+            Ok(())
+        }
+        "publish" => {
+            let base_url = args
+                .next()
+                .context("registry publish requires a base URL")?;
+            let token = read_private_token(&PathBuf::from(
+                args.next()
+                    .context("registry publish requires a token file")?,
+            ))?;
+            let bundle = read_fai_bundle(&PathBuf::from(
+                args.next()
+                    .context("registry publish requires a .fai path")?,
+            ))?;
+            if args.next().is_some() {
+                bail!("registry publish received too many arguments");
+            }
+            let entry = tokio::runtime::Runtime::new()?.block_on(
+                focaldesk_ai::publish_registry_package(&base_url, &token, &bundle),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&entry)?);
+            Ok(())
+        }
+        "approve" => {
+            let base_url = args
+                .next()
+                .context("registry approve requires a base URL")?;
+            let token = read_private_token(&PathBuf::from(
+                args.next()
+                    .context("registry approve requires a publish-token file")?,
+            ))?;
+            let signer = FaiSigner {
+                id: args
+                    .next()
+                    .context("registry approve requires a signer id")?,
+                public_key_hex: args
+                    .next()
+                    .context("registry approve requires a signer public key")?,
+            };
+            if args.next().is_some() {
+                bail!("registry approve received too many arguments");
+            }
+            let policy = tokio::runtime::Runtime::new()?.block_on(
+                focaldesk_ai::approve_registry_signer(&base_url, &token, &signer),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&policy)?);
+            Ok(())
+        }
+        "revoke" => {
+            let base_url = args.next().context("registry revoke requires a base URL")?;
+            let token = read_private_token(&PathBuf::from(
+                args.next()
+                    .context("registry revoke requires a publish-token file")?,
+            ))?;
+            let package_id = args
+                .next()
+                .context("registry revoke requires a package id")?;
+            let version = args.next().context("registry revoke requires a version")?;
+            let reason = args.collect::<Vec<_>>().join(" ");
+            let revocation =
+                tokio::runtime::Runtime::new()?.block_on(focaldesk_ai::revoke_registry_package(
+                    &base_url,
+                    &token,
+                    &package_id,
+                    &version,
+                    &reason,
+                ))?;
+            println!("{}", serde_json::to_string_pretty(&revocation)?);
+            Ok(())
+        }
+        _ => bail!("unknown ai package registry action: {action}"),
+    }
+}
+
+fn read_private_token(path: &std::path::Path) -> anyhow::Result<Zeroizing<String>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > 4096
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        bail!("registry token must be a private regular file no larger than 4 KiB");
+    }
+    Ok(Zeroizing::new(
+        std::fs::read_to_string(path)?.trim().to_string(),
+    ))
+}
+
+fn read_signed_catalog(path: &std::path::Path) -> anyhow::Result<focaldesk_ai::FaiSignedCatalog> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() || metadata.len() > 4 * 1024 * 1024
+    {
+        bail!("registry catalog must be a regular file no larger than 4 MiB");
+    }
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+fn write_json_atomic(path: &std::path::Path, value: &impl serde::Serialize) -> anyhow::Result<()> {
+    let parent = path.parent().context("output path has no parent")?;
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("output file name is invalid")?;
+    let temp = parent.join(format!(".{name}.sync.{}.tmp", std::process::id()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        writeln!(file)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
 fn print_usage() {
     eprintln!("usage:");
     eprintln!("  focaldesk-cli notify <title> [body...] [--timeout-ms <ms>]");
@@ -780,9 +1741,92 @@ fn print_usage() {
     eprintln!("  focaldesk-cli ai sources");
     eprintln!("  focaldesk-cli ai remove-source <canonical-path>");
     eprintln!("  focaldesk-cli ai eval <cases.json> [--top-k <n>]");
-    eprintln!("  focaldesk-cli ai agent [--provider <id>] [--model <model>] <objective...>");
+    eprintln!("  focaldesk-cli ai scenario <fixture.json>");
+    eprintln!("  focaldesk-cli ai package inspect <bundle.fai>");
+    eprintln!("  focaldesk-cli ai package init <directory> --id <id> --name <name> --signer <id>");
+    eprintln!("  focaldesk-cli ai package keygen <signer-id>");
+    eprintln!("  focaldesk-cli ai package test <project-directory-or-json>");
+    eprintln!("  focaldesk-cli ai package build <project> <bundle.fai>");
+    eprintln!("  focaldesk-cli ai package sign <project> <bundle.fai>");
+    eprintln!("  focaldesk-cli ai package verify <bundle.fai>");
+    eprintln!("  focaldesk-cli ai package registry add <bundle.fai> [--overwrite]");
+    eprintln!("  focaldesk-cli ai package registry list");
+    eprintln!("  focaldesk-cli ai package registry search <query>");
+    eprintln!(
+        "  focaldesk-cli ai package registry sync <url> <catalog-key> <token-file> <catalog.json>"
+    );
+    eprintln!("  focaldesk-cli ai package registry browse <catalog.json> <catalog-key> [query]");
+    eprintln!(
+        "  focaldesk-cli ai package registry lock <catalog.json> <catalog-key> <id> <version> <lock.json>"
+    );
+    eprintln!(
+        "  focaldesk-cli ai package registry diff <catalog.json> <catalog-key> <id> <from> <to>"
+    );
+    eprintln!(
+        "  focaldesk-cli ai package registry download <url> <catalog-key> <token-file> <catalog.json> <id> <version> <output.fai>"
+    );
+    eprintln!("  focaldesk-cli ai package registry publish <url> <token-file> <bundle.fai>");
+    eprintln!(
+        "  focaldesk-cli ai package registry approve <url> <publish-token-file> <signer-id> <public-key>"
+    );
+    eprintln!(
+        "  focaldesk-cli ai package registry revoke <url> <publish-token-file> <id> <version> <reason...>"
+    );
+    eprintln!("  focaldesk-cli ai package trust <signer-id> <public-key-hex>");
+    eprintln!("  focaldesk-cli ai package stage <bundle.fai>");
+    eprintln!("  focaldesk-cli ai package activate <package-id>");
+    eprintln!("  focaldesk-cli ai package rollback <package-id>");
+    eprintln!("  focaldesk-cli ai package list");
+    eprintln!("  focaldesk-cli ai agents");
+    eprintln!(
+        "  focaldesk-cli ai agent [--profile <id>] [--provider <id>] [--model <model>] <objective...>"
+    );
+    eprintln!("  focaldesk-cli ai agent-runs");
+    eprintln!("  focaldesk-cli ai agent-status <run-id>");
+    eprintln!("  focaldesk-cli ai agent-cancel <run-id>");
+    eprintln!("  focaldesk-cli ai agent-retry <run-id>");
+    eprintln!("  focaldesk-cli ai agent-trigger <agent-id> <trigger-id>");
+    eprintln!(
+        "  focaldesk-cli ai agent-event <desktop_event|voice_phrase|hotkey|ipc_event> <value>"
+    );
+    eprintln!("  focaldesk-cli ai agent-triggers [status|suspend|resume]");
+    eprintln!(
+        "  focaldesk-cli ai agent-control [status|reload|enable <id>|disable <id>|rollback <id>]"
+    );
+    eprintln!(
+        "  focaldesk-cli ai workflow [list|runs|start <id>|status <run>|pause <run>|resume <run>|cancel <run>|retry <run>]"
+    );
+    eprintln!("  focaldesk-cli ai capabilities [preview <agent-id>|leases|revoke <lease-id>]");
     eprintln!("  focaldesk-cli ai confirm <plan-id>");
     eprintln!("  focaldesk-cli ai deny <plan-id>");
+}
+
+fn print_agent_run(run: &AgentRunStatus) {
+    println!(
+        "{}\t{}\tprovider={}\tsteps={}/{}\tcontext={}\toutput_tokens={}\t{}",
+        run.run_id,
+        run.state.as_str(),
+        run.provider,
+        run.completed_tool_steps,
+        run.max_tool_steps,
+        run.max_context_chars,
+        run.max_output_tokens,
+        run.objective_preview
+    );
+    if let Some(error) = run.error.as_deref() {
+        eprintln!("[ai-agent] {}: {error}", run.run_id);
+    }
+}
+
+fn parse_agent_trigger_kind(value: &str) -> anyhow::Result<AgentTriggerKind> {
+    match value {
+        "desktop_event" => Ok(AgentTriggerKind::DesktopEvent),
+        "voice_phrase" => Ok(AgentTriggerKind::VoicePhrase),
+        "hotkey" => Ok(AgentTriggerKind::Hotkey),
+        "ipc_event" => Ok(AgentTriggerKind::IpcEvent),
+        "schedule" => bail!("schedule events are dispatched by the daemon"),
+        other => bail!("unknown agent event kind: {other}"),
+    }
 }
 
 fn render_ai_output(content: &str) -> String {

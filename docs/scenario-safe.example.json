@@ -1,0 +1,46 @@
+{
+  "scenario_version": 1,
+  "name": "safe-connector-agent-contract",
+  "description": "Synthetic connector and agent safety contract for CI.",
+  "synthetic": true,
+  "initial": {
+    "event_fabric_connected": true,
+    "routines_suspended": false,
+    "source_fields": {
+      "calendar": ["event", "title"]
+    },
+    "connectors": {
+      "calendar-fixture": {
+        "enabled": true,
+        "sources": {
+          "calendar": ["event", "title"]
+        }
+      }
+    },
+    "agent_tools": {
+      "desktop": ["desktop_snapshot"]
+    },
+    "token_budget": 4000
+  },
+  "steps": [
+    {
+      "type": "connector_event",
+      "connector_id": "calendar-fixture",
+      "source": "calendar",
+      "payload": {
+        "event": "calendar meeting",
+        "title": "Synthetic review"
+      }
+    },
+    {
+      "type": "agent_plan",
+      "agent_id": "desktop",
+      "tools": ["desktop_snapshot"],
+      "proposed_mutation": false,
+      "confirmation_present": false,
+      "lease": "active",
+      "estimated_tokens": 800
+    }
+  ],
+  "expected_violation_codes": []
+}

@@ -29,7 +29,8 @@ tracked in [Known Issues](docs/known-issues.md).
 - GLES and Vulkan rendering with damage tracking and experimental HDR and color
   management. Raw Ash Vulkan is the project owner's primary daily-tested path;
   GLES remains the packaged compatibility and recovery default.
-- First-party launcher, Settings, file manager, login greeter, and AI Console.
+- First-party launcher, Settings, file manager, login greeter, and AI Console
+  with a permissioned Desktop Agent and external coding-agent launcher.
 - Versioned theme editor with semantic surface tokens, wide-gamut/HDR paint
   intent, live compositor preview, wallpaper processing, and portable theme
   packages ([details](docs/theme-editor.md)).
@@ -455,6 +456,112 @@ focaldesk-cli ai deny <plan-id>
 The daemon removes a plan before prompting to prevent replay. Model-generated
 confirmation fields are rejected and never count as user consent.
 
+Custom profiles can be built with the validation-backed Rust `AgentBuilder` or
+installed as declarative `agent.toml` package directories. See the
+[FocalDesk Agent SDK](docs/agent-sdk.md) for resource budgets, deterministic
+test utilities, durable runs, package rules, and permissioned schedules or
+desktop/voice/hotkey/IPC triggers.
+The AI Console's Agent Studio can author, hot-reload, disable, simulate, and
+roll back these packages, enforce daily token/estimated-cost ceilings, inspect
+live health and durable history, and suspend all background triggers in an emergency.
+Its installed-agent view shows each profile's tools, limits, triggers, usage,
+and declared capability scopes, with controls to enable, disable, or roll back
+the selected agent. See the [Agent Studio guide](docs/agent-studio.md).
+
+The AIOS Supervisor coordinates bounded multi-agent DAGs with parallel ready
+nodes, typed artifact handoffs, shared deadlines/token ceilings, durable safe
+checkpoints, and pause/resume/cancel/retry controls. Its built-in workflows
+cover morning briefing, workspace troubleshooting, and meeting preparation.
+
+The capability kernel gives each managed run an expiring, revocable lease over
+tools and scoped filesystem, network, application, workspace, service, and
+opaque-secret-handle resources. Workflow authority is an intersection, and
+Agent Studio provides previews, a live lease map, and immediate revocation.
+
+The AI Console's **Ambient Voice** workspace adds explicitly started, offline
+Vosk listening behind the default wake phrase “hello focaldesk.” Raw audio is
+held only in a bounded RAM buffer and discarded on stop; transcript retention
+is off by default and remains session-only when enabled. A visible microphone
+state, immediate kill switch, and barge-in cancellation remain local to the
+Console. Recognized requests can start a named workflow (`run workflow …`),
+start a named agent (`ask agent … to …`), or enter normal chat, but they cannot
+approve mutations. See [Ambient Voice](docs/voice.md) for the exact behavior
+and privacy boundaries.
+
+The **Context Fabric** workspace can publish only selected typed desktop
+metadata or the active conversation as bounded, expiring envelopes. Each item
+has provenance and sensitivity metadata, and an agent receives it only through
+an explicit live grant intersected with its manifest's `context_kinds`
+capability. The inspector can revoke grants or clear envelopes immediately.
+Natural requests such as “summarize this,” “prepare for my next meeting,” and
+“what is wrong here?” use deterministic, explainable routing before falling
+back to ordinary chat. See [Context Fabric](docs/context-fabric.md).
+
+The **Event Fabric** workspace is the consent boundary for proactive inputs.
+Desktop, calendar, notification, service-health, and workflow sources begin
+disabled and require an explicit supported-field allowlist, bounded retention,
+and forwarding choice. Only a newly constructed redacted envelope enters the
+256-item in-memory journal. Simulation, redacted replay, immediate clearing,
+and an emergency disconnect are built in. See
+[Event Fabric and Consent Center](docs/event-fabric.md).
+
+The **Connector SDK and Trust Store** adds validated versioned producer
+manifests, five disabled-by-default local connector identities, namespaced
+opaque signing-key handles, signed event requests with freshness and replay
+protection, persistent source consent, health reporting, explicit network
+domain authority, and reversible updates. See
+[Connector SDK and Trust Store](docs/connector-sdk.md).
+
+The **Managed Connector Host** (`focald-connectors`) turns explicitly enabled
+connector identities into supervised local producers. It includes minimized
+desktop, service-health, notification, and opt-in ICS adapters, plus transient
+systemd-sandboxed custom runtimes with resource limits, bounded backoff, and
+quarantine. The Console can inspect, pause, poll, and recover the host; install
+alone grants no source or network consent. See
+[Managed Connector Host](docs/connector-host.md).
+
+The **AIOS Mission Control** workspace correlates the redacted event timeline,
+context provenance, routine suggestions, active agents and workflows,
+capability leases, microphone/connector runtime state, budgets, and durable control audit. It supports
+bounded search, live refresh, simulation-only event replay, scoped run
+cancellation, and a restart-persistent emergency pause without exposing tool
+arguments, results, context payloads, or raw failures. See
+[AIOS Mission Control](docs/mission-control.md).
+
+The **AIOS Scenario Lab** evaluates synthetic voice, connector, context,
+routine, agent-plan, failure, restart, and minimized-trace fixtures in a pure
+shadow runtime. Stable violation codes make safe and expected-denial scenarios
+CI-testable, while reports guarantee zero provider calls, tool executions, and
+live mutations. The Console includes an editor and minimized Mission Control
+capture; `focaldesk-cli ai scenario` runs the same contract locally. See
+[AIOS Scenario Lab](docs/scenario-lab.md).
+
+The **AIOS Package Manager** installs signed, versioned `.fai` bundles for
+agents, workflows, routines, and connectors. Explicit signer trust, authority
+inspection, and passing Scenario Lab fixtures are mandatory before staging;
+activation preserves separate consent for network access and background
+execution. See [AIOS Package Manager](docs/package-manager.md).
+
+The **AIOS Package Forge** supplies reproducible project scaffolding, protected
+signer generation through `focald-secrets`, local Scenario Lab testing, signed
+builds, verification, an offline dependency-aware catalog, CI guidance, and a
+Console project editor. See [AIOS Package Forge](docs/package-forge.md).
+
+The opt-in **Private AIOS Registry** adds authenticated publishing,
+operator-signed catalogs, pinned catalog keys, approved package signers,
+revocations, exact dependency lockfiles, verified quarantine downloads, and
+audited administration. It never auto-downloads, auto-trusts, or auto-installs
+packages. See [Private AIOS Registry](docs/private-aios-registry.md).
+
+The **Attention** workspace evaluates bounded typed events against declarative
+routines and publishes suggestions only. Built-ins cover morning briefing,
+meeting preparation, and repeated service failure, with explainable matching,
+UTC quiet hours, cooldowns, hourly limits, duplicate suppression, simulation,
+and a global emergency pause. Starting the proposed agent or workflow requires
+a separate explicit promotion and retains all normal capability, permission,
+and native confirmation boundaries. See
+[Attention and Routine Engine](docs/attention-routines.md).
+
 Provider and agent regressions are covered by deterministic tests. Provider
 tests use loopback-only one-shot HTTP fixtures for the OpenAI, Anthropic,
 Ollama, and vLLM wire contracts; they require no API credentials, internet
@@ -487,6 +594,7 @@ That installs and enables the core services:
 - `focald-voice`
 - `focald-speech`
 - `focald-mic`
+- `focald-connectors`
 
 It also installs `focaldesk-remoted` but leaves it disabled and stopped. Remote
 desktop must be started explicitly after reviewing the

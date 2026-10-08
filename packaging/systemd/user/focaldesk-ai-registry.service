@@ -1,0 +1,22 @@
+[Unit]
+Description=FocalDesk private AIOS package registry
+ConditionPathExists=%h/.config/focaldesk/ai-registry.env
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/focaldesk/ai-registry.env
+ExecStart=%h/.local/bin/focaldesk-ai-registry
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/focaldesk/private-registry
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=default.target

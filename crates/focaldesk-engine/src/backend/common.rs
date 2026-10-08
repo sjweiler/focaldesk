@@ -30,7 +30,7 @@ use smithay::output::{Output, PhysicalProperties, Subpixel};
 #[cfg(feature = "xwayland")]
 use smithay::reexports::calloop::{EventLoop, LoopHandle};
 use smithay::reexports::wayland_server::{Client, Display, DisplayHandle, ListeningSocket};
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::DmabufState;
 use smithay::wayland::output::OutputManagerState;
@@ -353,6 +353,7 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
     input: &InputEvent<B>,
     pointer_pos: Point<f64, Logical>,
     clamp_rect: Rectangle<i32, Logical>,
+    output_transform: Transform,
     _scale_factor: f64,
     modifiers: FlowModifiers,
 ) -> Option<FlowInputEvent> {
@@ -388,7 +389,16 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
             })
         }
         InputEvent::PointerMotionAbsolute { event, .. } => {
-            let local = event.position_transformed(clamp_rect.size).to_f64();
+            // Absolute devices report coordinates in the panel's unrotated
+            // coordinate space. Map that space through the output transform so
+            // a tablet or other absolute device mapped to a portrait output follows the
+            // pixels instead of retaining landscape axes.
+            let source_size = output_transform.invert().transform_size(clamp_rect.size);
+            let local = transform_absolute_position(
+                event.position_transformed(source_size).to_f64(),
+                source_size.to_f64(),
+                output_transform,
+            );
             let pos = Point::<f64, Logical>::from((
                 clamp_rect.loc.x as f64 + local.x,
                 clamp_rect.loc.y as f64 + local.y,
@@ -463,6 +473,43 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
             })
         }
         _ => None,
+    }
+}
+
+fn transform_absolute_position(
+    position: Point<f64, Logical>,
+    source_size: Size<f64, Logical>,
+    transform: Transform,
+) -> Point<f64, Logical> {
+    transform.transform_point_in(position, &source_size)
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::transform_absolute_position;
+    use smithay::utils::{Logical, Point, Size, Transform};
+
+    #[test]
+    fn absolute_pointer_coordinates_follow_output_orientation() {
+        let size = Size::<f64, Logical>::from((1920.0, 1080.0));
+        let point = Point::<f64, Logical>::from((480.0, 270.0));
+
+        assert_eq!(
+            transform_absolute_position(point, size, Transform::Normal),
+            (480.0, 270.0).into()
+        );
+        assert_eq!(
+            transform_absolute_position(point, size, Transform::_90),
+            (810.0, 480.0).into()
+        );
+        assert_eq!(
+            transform_absolute_position(point, size, Transform::_180),
+            (1440.0, 810.0).into()
+        );
+        assert_eq!(
+            transform_absolute_position(point, size, Transform::_270),
+            (270.0, 1440.0).into()
+        );
     }
 }
 

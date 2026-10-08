@@ -16,6 +16,7 @@ working configuration before testing a new revision.
 | `$XDG_CONFIG_HOME/focaldesk/displays.json` | Detected output topology and runtime display choices | Generated; do not edit while FocalDesk is running |
 | `$XDG_DATA_HOME/focaldesk/themes/` | Theme packages installed by the Theme Editor | Manage through Theme Editor import and uninstall actions |
 | `$XDG_CONFIG_HOME/focaldesk/ai_permissions.toml` | Persisted AI permission decisions; stored mode `0600` | Manage through the permission UI when possible |
+| `$XDG_CONFIG_HOME/focaldesk/ai_console.json` | AI Console conversations, UI preferences, default external coding agent, and its project directory; stored mode `0600` | Manage through AI Console |
 | `$XDG_CONFIG_HOME/focaldesk/automation/automations.toml` | Scheduled automation definitions | Experimental; service is opt-in |
 | `$XDG_CONFIG_HOME/focaldesk/automation/scripts/` | Lua automation scripts referenced by `automations.toml` | Experimental and security-sensitive |
 | `$XDG_CONFIG_HOME/focaldesk/secrets-acl.toml` | Per-systemd-unit access to native credential-broker keys | Security-sensitive; default deny |
@@ -95,6 +96,8 @@ not listed here should be treated as internal and may change without notice.
 | `FOCALDESK_OLLAMA_BASE_URL` | Override the Ollama service URL |
 | `FOCALDESK_OLLAMA_MODEL` | Select the default Ollama model |
 | `FOCALDESK_AI_SOCKET` | Override the AI service Unix-socket path for development |
+| `FOCALDESK_AGENT_DIR` | Override the declarative agent-manifest directory; defaults to `$XDG_CONFIG_HOME/focaldesk/agents` |
+| `FOCALDESK_AGENT_RUN_DB` | Override the private durable agent-run database; defaults to `$XDG_DATA_HOME/focaldesk/agent-runs.db` |
 | `FOCALDESK_SCREENCAST_OUTPUT` | Select the capture output when no portal chooser input is available |
 | `FOCALDESK_INPUT_METHOD_EXECUTABLES` | Colon-separated executable allowlist for privileged Wayland input-method clients; replaces the built-in fcitx5, IBus, and Maliit allowlist |
 | `FOCALDESK_HDR_CALIBRATION_PATTERN` | Set to `1` to replace active HDR output content with the session-only calibration pattern |

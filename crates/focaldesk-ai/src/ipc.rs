@@ -16,14 +16,19 @@ use crate::types::{
     AiDaemonStatus, AiStreamEvent, ChatRequest, ChatResponse, ProviderInfo, ProviderModelInfo,
     RetrievalEvalCase, RetrievalEvalReport,
 };
-use crate::{AgentActionResponse, AgentRequest, AgentResponse};
+use crate::{
+    AgentActionResponse, AgentControlStatus, AgentDefinition, AgentDryRunReport, AgentRequest,
+    AgentResponse, AgentRunEvent, AgentRunState, AgentRunStatus, AgentTriggerKind,
+};
 use focaldesk_ipc::transport;
 
 pub const AI_SOCKET_NAME: &str = "focaldesk-ai.sock";
 pub const AI_SOCKET_ENV: &str = "FOCALDESK_AI_SOCKET";
 pub const AI_PROTOCOL_VERSION: u16 = 2;
 pub const AI_LEGACY_PROTOCOL_VERSION: u16 = 1;
-pub const AI_MAX_REQUEST_BYTES: u64 = 256 * 1024;
+// Signed .fai bundles are bounded to 2 MiB before transport. Leave envelope
+// headroom while retaining a strict daemon-side request ceiling.
+pub const AI_MAX_REQUEST_BYTES: u64 = 3 * 1024 * 1024;
 // Source listings for large repositories can contain thousands of paths and
 // hashes. Keep responses bounded, but leave enough room for the documented
 // 10,000-file directory-ingestion ceiling.
@@ -62,6 +67,10 @@ enum AiWireMode {
 
 fn default_recall_top_k() -> usize {
     5
+}
+
+fn default_mission_control_limit() -> usize {
+    100
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -115,6 +124,205 @@ pub enum AiIpcRequest {
     ClearMemory,
     RunAgent {
         request: AgentRequest,
+    },
+    StartAgent {
+        request: AgentRequest,
+    },
+    RetryAgentRun {
+        run_id: String,
+    },
+    FireAgentTrigger {
+        agent_id: String,
+        trigger_id: String,
+    },
+    DispatchAgentEvent {
+        kind: AgentTriggerKind,
+        value: String,
+    },
+    GetAgentTriggerState,
+    GetMissionControl {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default = "default_mission_control_limit")]
+        limit: usize,
+    },
+    ActivateMissionControlPause,
+    EvaluateScenario {
+        fixture: Box<crate::ScenarioFixture>,
+    },
+    CaptureScenario {
+        name: String,
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default = "default_mission_control_limit")]
+        limit: usize,
+    },
+    InspectPackage {
+        bundle: Box<crate::FaiBundle>,
+    },
+    GeneratePackageSigner {
+        signer_id: String,
+    },
+    BuildPackageProject {
+        project: Box<crate::FaiForgeProject>,
+    },
+    TrustPackageSigner {
+        signer: crate::FaiSigner,
+    },
+    StagePackage {
+        bundle: Box<crate::FaiBundle>,
+    },
+    ActivatePackage {
+        package_id: String,
+    },
+    RollbackPackage {
+        package_id: String,
+    },
+    ListPackages,
+    SetAgentTriggersSuspended {
+        suspended: bool,
+    },
+    GetAgentRun {
+        run_id: String,
+    },
+    /// Long-polls until a newer event is available or the run stops.
+    WatchAgentRun {
+        run_id: String,
+        #[serde(default)]
+        after_sequence: u64,
+    },
+    ListAgentRuns,
+    ListAgents,
+    ReloadAgents,
+    InstallAgent {
+        definition: Box<AgentDefinition>,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    GetAgentControlStatuses,
+    SetAgentEnabled {
+        agent_id: String,
+        enabled: bool,
+    },
+    RollbackAgent {
+        agent_id: String,
+    },
+    DryRunAgent {
+        request: AgentRequest,
+    },
+    ListWorkflows,
+    StartWorkflow {
+        workflow_id: String,
+    },
+    ListWorkflowRuns,
+    GetWorkflowRun {
+        run_id: String,
+    },
+    SetWorkflowPaused {
+        run_id: String,
+        paused: bool,
+    },
+    CancelWorkflow {
+        run_id: String,
+    },
+    RetryWorkflow {
+        run_id: String,
+    },
+    PreviewCapabilities {
+        agent_id: String,
+        #[serde(default)]
+        ceiling: Option<crate::CapabilityPolicy>,
+    },
+    ListCapabilityLeases,
+    RevokeCapabilityLease {
+        lease_id: String,
+    },
+    PublishContext {
+        kind: crate::ContextKind,
+        provenance: String,
+        sensitivity: crate::ContextSensitivity,
+        payload: serde_json::Value,
+        ttl_seconds: u64,
+    },
+    GrantContext {
+        agent_id: String,
+        kinds: Vec<crate::ContextKind>,
+        ttl_seconds: u64,
+    },
+    GetContextState,
+    RevokeContextGrant {
+        grant_id: String,
+    },
+    ClearContext,
+    PublishSuggestion {
+        agent_id: String,
+        title: String,
+        body: String,
+        ttl_seconds: u64,
+    },
+    DismissSuggestion {
+        suggestion_id: String,
+    },
+    RouteIntent {
+        text: String,
+    },
+    GetRoutineState,
+    DispatchRoutineEvent {
+        event: crate::RoutineEvent,
+    },
+    SimulateRoutineEvent {
+        event: crate::RoutineEvent,
+    },
+    SetRoutinesSuspended {
+        suspended: bool,
+    },
+    DismissRoutineSuggestion {
+        suggestion_id: String,
+    },
+    PromoteRoutineSuggestion {
+        suggestion_id: String,
+    },
+    GetEventFabricState,
+    ConfigureEventSource {
+        policy: crate::EventSourcePolicy,
+    },
+    SetEventFabricConnected {
+        connected: bool,
+    },
+    ListConnectors,
+    InstallConnector {
+        manifest: crate::ConnectorManifest,
+        #[serde(default)]
+        overwrite: bool,
+    },
+    SetConnectorEnabled {
+        connector_id: String,
+        enabled: bool,
+        #[serde(default)]
+        network_allowed: bool,
+    },
+    RollbackConnector {
+        connector_id: String,
+    },
+    PublishConnectorEvent {
+        request: crate::ConnectorEventRequest,
+    },
+    PublishManagedConnectorEvent {
+        connector_id: String,
+        source: crate::EventSource,
+        payload: serde_json::Value,
+    },
+    SimulateEvent {
+        source: crate::EventSource,
+        producer: String,
+        payload: serde_json::Value,
+    },
+    ReplayEventSimulation {
+        event_id: String,
+    },
+    ClearEventJournal,
+    CancelAgentRun {
+        run_id: String,
     },
     ConfirmAgentAction {
         plan_id: String,
@@ -179,6 +387,159 @@ pub enum AiIpcResponse {
     },
     Agent {
         response: AgentResponse,
+    },
+    AgentStarted {
+        run_id: String,
+    },
+    AgentTriggersStarted {
+        run_ids: Vec<String>,
+    },
+    AgentTriggerState {
+        suspended: bool,
+    },
+    MissionControlState {
+        state: crate::MissionControlSnapshot,
+    },
+    ScenarioEvaluated {
+        report: crate::ScenarioReport,
+    },
+    ScenarioCaptured {
+        fixture: crate::ScenarioFixture,
+    },
+    PackageInspected {
+        inspection: crate::FaiPackageInspection,
+    },
+    PackageSignerGenerated {
+        signer: crate::FaiSigner,
+    },
+    PackageBuilt {
+        bundle: Box<crate::FaiBundle>,
+    },
+    PackageSignerTrusted,
+    PackageActivated {
+        bundle: Box<crate::FaiBundle>,
+    },
+    Packages {
+        packages: Vec<crate::FaiPackageStatus>,
+    },
+    AgentRun {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<AgentRunStatus>,
+    },
+    AgentRuns {
+        runs: Vec<AgentRunStatus>,
+    },
+    AgentRunEvents {
+        run_id: String,
+        events: Vec<AgentRunEvent>,
+        state: AgentRunState,
+    },
+    Agents {
+        agents: Vec<AgentDefinition>,
+    },
+    AgentControlStatuses {
+        agents: Vec<AgentControlStatus>,
+    },
+    AgentDryRun {
+        report: AgentDryRunReport,
+    },
+    Workflows {
+        workflows: Vec<crate::WorkflowDefinition>,
+    },
+    WorkflowStarted {
+        run_id: String,
+    },
+    WorkflowRuns {
+        runs: Vec<crate::WorkflowRunStatus>,
+    },
+    WorkflowRun {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<crate::WorkflowRunStatus>,
+    },
+    WorkflowControl {
+        run_id: String,
+        accepted: bool,
+    },
+    CapabilityPreview {
+        preview: crate::CapabilityPreview,
+    },
+    CapabilityLeases {
+        leases: Vec<crate::CapabilityLease>,
+    },
+    CapabilityRevocation {
+        lease_id: String,
+        revoked: bool,
+    },
+    ContextPublished {
+        envelope: crate::ContextEnvelope,
+    },
+    ContextGranted {
+        grant: crate::ContextGrant,
+    },
+    ContextState {
+        envelopes: Vec<crate::ContextEnvelope>,
+        grants: Vec<crate::ContextGrant>,
+        suggestions: Vec<crate::ContextSuggestion>,
+    },
+    ContextGrantRevocation {
+        grant_id: String,
+        revoked: bool,
+    },
+    ContextCleared {
+        cleared: usize,
+    },
+    SuggestionPublished {
+        suggestion: crate::ContextSuggestion,
+    },
+    SuggestionDismissed {
+        suggestion_id: String,
+        dismissed: bool,
+    },
+    IntentRouted {
+        route: crate::IntentRoute,
+    },
+    RoutineState {
+        state: crate::RoutineStateSnapshot,
+    },
+    RoutineEvaluated {
+        evaluations: Vec<crate::RoutineEvaluation>,
+    },
+    RoutinesSuspended {
+        suspended: bool,
+    },
+    RoutineSuggestionDismissed {
+        suggestion_id: String,
+        dismissed: bool,
+    },
+    RoutineSuggestionPromoted {
+        outcome: crate::RoutinePromotionOutcome,
+    },
+    EventFabricState {
+        state: crate::EventFabricSnapshot,
+    },
+    EventSourceConfigured {
+        policy: crate::EventSourcePolicy,
+    },
+    EventFabricConnection {
+        connected: bool,
+    },
+    EventDelivered {
+        delivery: crate::EventDelivery,
+    },
+    EventJournalCleared {
+        cleared: usize,
+    },
+    Connectors {
+        connectors: Vec<crate::ConnectorStatus>,
+    },
+    ConnectorChanged {
+        status: crate::ConnectorStatus,
+    },
+    AgentRunCancellation {
+        run_id: String,
+        accepted: bool,
     },
     AgentAction {
         response: AgentActionResponse,
@@ -432,6 +793,524 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
                     message: err.to_string(),
                 },
             },
+            Ok(AiIpcRequest::StartAgent { request }) => match service.start_agent(request).await {
+                Ok(run_id) => AiIpcResponse::AgentStarted { run_id },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::RetryAgentRun { run_id }) => {
+                match service.retry_agent_run(&run_id).await {
+                    Ok(run_id) => AiIpcResponse::AgentStarted { run_id },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::FireAgentTrigger {
+                agent_id,
+                trigger_id,
+            }) => match service.fire_agent_trigger(&agent_id, &trigger_id) {
+                Ok(run_id) => AiIpcResponse::AgentStarted { run_id },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::DispatchAgentEvent { kind, value }) => {
+                match service.dispatch_agent_event(kind, &value) {
+                    Ok(run_ids) => AiIpcResponse::AgentTriggersStarted { run_ids },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::GetAgentTriggerState) => AiIpcResponse::AgentTriggerState {
+                suspended: service.triggers_suspended(),
+            },
+            Ok(AiIpcRequest::GetMissionControl { query, limit }) => {
+                match service.mission_control_snapshot(query.as_deref(), limit) {
+                    Ok(state) => AiIpcResponse::MissionControlState { state },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ActivateMissionControlPause) => {
+                match service.activate_mission_control_pause() {
+                    Ok(state) => AiIpcResponse::MissionControlState { state },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::EvaluateScenario { fixture }) => {
+                match crate::evaluate_scenario(*fixture) {
+                    Ok(report) => AiIpcResponse::ScenarioEvaluated { report },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::CaptureScenario { name, query, limit }) => service
+                .mission_control_snapshot(query.as_deref(), limit)
+                .and_then(|snapshot| {
+                    crate::ScenarioFixture::from_timeline(name, &snapshot.timeline)
+                })
+                .map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |fixture| AiIpcResponse::ScenarioCaptured { fixture },
+                ),
+            Ok(AiIpcRequest::InspectPackage { bundle }) => {
+                service.inspect_package(&bundle).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |inspection| AiIpcResponse::PackageInspected { inspection },
+                )
+            }
+            Ok(AiIpcRequest::GeneratePackageSigner { signer_id }) => {
+                service.generate_package_signer(&signer_id).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |signer| AiIpcResponse::PackageSignerGenerated { signer },
+                )
+            }
+            Ok(AiIpcRequest::BuildPackageProject { project }) => {
+                service.build_package_project(&project).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |bundle| AiIpcResponse::PackageBuilt {
+                        bundle: Box::new(bundle),
+                    },
+                )
+            }
+            Ok(AiIpcRequest::TrustPackageSigner { signer }) => {
+                service.trust_package_signer(signer).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |()| AiIpcResponse::PackageSignerTrusted,
+                )
+            }
+            Ok(AiIpcRequest::StagePackage { bundle }) => {
+                service.stage_package(*bundle).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |inspection| AiIpcResponse::PackageInspected { inspection },
+                )
+            }
+            Ok(AiIpcRequest::ActivatePackage { package_id }) => {
+                service.activate_package(&package_id).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |bundle| AiIpcResponse::PackageActivated {
+                        bundle: Box::new(bundle),
+                    },
+                )
+            }
+            Ok(AiIpcRequest::RollbackPackage { package_id }) => {
+                service.rollback_package(&package_id).map_or_else(
+                    |err| AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                    |bundle| AiIpcResponse::PackageActivated {
+                        bundle: Box::new(bundle),
+                    },
+                )
+            }
+            Ok(AiIpcRequest::ListPackages) => service.package_statuses().map_or_else(
+                |err| AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+                |packages| AiIpcResponse::Packages { packages },
+            ),
+            Ok(AiIpcRequest::SetAgentTriggersSuspended { suspended }) => {
+                match service.set_triggers_suspended(suspended) {
+                    Ok(()) => AiIpcResponse::AgentTriggerState { suspended },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::GetAgentRun { run_id }) => match service.agent_run_status(&run_id) {
+                Ok(status) => AiIpcResponse::AgentRun { run_id, status },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::WatchAgentRun {
+                run_id,
+                after_sequence,
+            }) => match service.watch_agent_run(&run_id, after_sequence).await {
+                Ok((events, state)) => AiIpcResponse::AgentRunEvents {
+                    run_id,
+                    events,
+                    state,
+                },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::ListAgentRuns) => match service.agent_runs() {
+                Ok(runs) => AiIpcResponse::AgentRuns { runs },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::ListAgents) => AiIpcResponse::Agents {
+                agents: service.agent_definitions(),
+            },
+            Ok(AiIpcRequest::ReloadAgents) => match service.reload_agent_definitions() {
+                Ok(agents) => AiIpcResponse::Agents { agents },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::InstallAgent {
+                definition,
+                overwrite,
+            }) => match service.install_agent_package(&definition, overwrite) {
+                Ok(agents) => AiIpcResponse::Agents { agents },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::GetAgentControlStatuses) => match service.agent_control_statuses() {
+                Ok(agents) => AiIpcResponse::AgentControlStatuses { agents },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::SetAgentEnabled { agent_id, enabled }) => {
+                match service.set_agent_enabled(&agent_id, enabled) {
+                    Ok(()) => match service.agent_control_statuses() {
+                        Ok(agents) => AiIpcResponse::AgentControlStatuses { agents },
+                        Err(err) => AiIpcResponse::Error {
+                            message: err.to_string(),
+                        },
+                    },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::RollbackAgent { agent_id }) => {
+                match service.rollback_agent_package(&agent_id) {
+                    Ok(agents) => AiIpcResponse::Agents { agents },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::DryRunAgent { request }) => {
+                match service.dry_run_agent(request).await {
+                    Ok(report) => AiIpcResponse::AgentDryRun { report },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ListWorkflows) => AiIpcResponse::Workflows {
+                workflows: service.workflow_definitions(),
+            },
+            Ok(AiIpcRequest::StartWorkflow { workflow_id }) => {
+                match service.start_workflow(&workflow_id) {
+                    Ok(run_id) => AiIpcResponse::WorkflowStarted { run_id },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ListWorkflowRuns) => match service.workflow_runs() {
+                Ok(runs) => AiIpcResponse::WorkflowRuns { runs },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::GetWorkflowRun { run_id }) => match service.workflow_run(&run_id) {
+                Ok(status) => AiIpcResponse::WorkflowRun { run_id, status },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::SetWorkflowPaused { run_id, paused }) => {
+                match service.set_workflow_paused(&run_id, paused) {
+                    Ok(()) => AiIpcResponse::WorkflowControl {
+                        run_id,
+                        accepted: true,
+                    },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::CancelWorkflow { run_id }) => match service.cancel_workflow(&run_id) {
+                Ok(accepted) => AiIpcResponse::WorkflowControl { run_id, accepted },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::RetryWorkflow { run_id }) => match service.retry_workflow(&run_id) {
+                Ok(run_id) => AiIpcResponse::WorkflowStarted { run_id },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::PreviewCapabilities { agent_id, ceiling }) => {
+                match service.capability_preview(&agent_id, ceiling.as_ref()) {
+                    Ok(preview) => AiIpcResponse::CapabilityPreview { preview },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ListCapabilityLeases) => match service.capability_leases() {
+                Ok(leases) => AiIpcResponse::CapabilityLeases { leases },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::RevokeCapabilityLease { lease_id }) => {
+                match service.revoke_capability_lease(&lease_id) {
+                    Ok(revoked) => AiIpcResponse::CapabilityRevocation { lease_id, revoked },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::PublishContext {
+                kind,
+                provenance,
+                sensitivity,
+                payload,
+                ttl_seconds,
+            }) => {
+                match service.publish_context(kind, provenance, sensitivity, payload, ttl_seconds) {
+                    Ok(envelope) => AiIpcResponse::ContextPublished { envelope },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::GrantContext {
+                agent_id,
+                kinds,
+                ttl_seconds,
+            }) => match service.grant_context(agent_id, kinds, ttl_seconds) {
+                Ok(grant) => AiIpcResponse::ContextGranted { grant },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::GetContextState) => match service.context_snapshot() {
+                Ok((envelopes, grants, suggestions)) => AiIpcResponse::ContextState {
+                    envelopes,
+                    grants,
+                    suggestions,
+                },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::RevokeContextGrant { grant_id }) => {
+                match service.revoke_context_grant(&grant_id) {
+                    Ok(revoked) => AiIpcResponse::ContextGrantRevocation { grant_id, revoked },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ClearContext) => match service.clear_context() {
+                Ok(cleared) => AiIpcResponse::ContextCleared { cleared },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::PublishSuggestion {
+                agent_id,
+                title,
+                body,
+                ttl_seconds,
+            }) => match service.publish_suggestion(agent_id, title, body, ttl_seconds) {
+                Ok(suggestion) => AiIpcResponse::SuggestionPublished { suggestion },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::DismissSuggestion { suggestion_id }) => {
+                match service.dismiss_suggestion(&suggestion_id) {
+                    Ok(dismissed) => AiIpcResponse::SuggestionDismissed {
+                        suggestion_id,
+                        dismissed,
+                    },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::RouteIntent { text }) => AiIpcResponse::IntentRouted {
+                route: crate::route_intent(&text),
+            },
+            Ok(AiIpcRequest::GetRoutineState) => match service.routine_state() {
+                Ok(state) => AiIpcResponse::RoutineState { state },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::DispatchRoutineEvent { event }) => {
+                match service.dispatch_routine_event(event) {
+                    Ok(evaluations) => AiIpcResponse::RoutineEvaluated { evaluations },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::SimulateRoutineEvent { event }) => {
+                match service.simulate_routine_event(event) {
+                    Ok(evaluations) => AiIpcResponse::RoutineEvaluated { evaluations },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::SetRoutinesSuspended { suspended }) => {
+                match service.set_routines_suspended(suspended) {
+                    Ok(suspended) => AiIpcResponse::RoutinesSuspended { suspended },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::DismissRoutineSuggestion { suggestion_id }) => {
+                match service.dismiss_routine_suggestion(&suggestion_id) {
+                    Ok(dismissed) => AiIpcResponse::RoutineSuggestionDismissed {
+                        suggestion_id,
+                        dismissed,
+                    },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::PromoteRoutineSuggestion { suggestion_id }) => {
+                match service.promote_routine_suggestion(&suggestion_id).await {
+                    Ok(outcome) => AiIpcResponse::RoutineSuggestionPromoted { outcome },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::GetEventFabricState) => match service.event_fabric_state() {
+                Ok(state) => AiIpcResponse::EventFabricState { state },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::ConfigureEventSource { policy }) => {
+                match service.configure_event_source(policy) {
+                    Ok(policy) => AiIpcResponse::EventSourceConfigured { policy },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::SetEventFabricConnected { connected }) => {
+                match service.set_event_fabric_connected(connected) {
+                    Ok(connected) => AiIpcResponse::EventFabricConnection { connected },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ListConnectors) => match service.connector_statuses() {
+                Ok(connectors) => AiIpcResponse::Connectors { connectors },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::InstallConnector {
+                manifest,
+                overwrite,
+            }) => match service.install_connector(manifest, overwrite) {
+                Ok(status) => AiIpcResponse::ConnectorChanged { status },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::SetConnectorEnabled {
+                connector_id,
+                enabled,
+                network_allowed,
+            }) => match service.set_connector_enabled(&connector_id, enabled, network_allowed) {
+                Ok(status) => AiIpcResponse::ConnectorChanged { status },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::RollbackConnector { connector_id }) => {
+                match service.rollback_connector(&connector_id) {
+                    Ok(status) => AiIpcResponse::ConnectorChanged { status },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::PublishConnectorEvent { request }) => {
+                match service.ingest_connector_event(request) {
+                    Ok(delivery) => AiIpcResponse::EventDelivered { delivery },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::PublishManagedConnectorEvent {
+                connector_id,
+                source,
+                payload,
+            }) => match service.ingest_managed_connector_event(connector_id, source, payload) {
+                Ok(delivery) => AiIpcResponse::EventDelivered { delivery },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::SimulateEvent {
+                source,
+                producer,
+                payload,
+            }) => match service.simulate_event(source, producer, payload) {
+                Ok(delivery) => AiIpcResponse::EventDelivered { delivery },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::ReplayEventSimulation { event_id }) => {
+                match service.replay_event_simulation(&event_id) {
+                    Ok(delivery) => AiIpcResponse::EventDelivered { delivery },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
+            Ok(AiIpcRequest::ClearEventJournal) => match service.clear_event_journal() {
+                Ok(cleared) => AiIpcResponse::EventJournalCleared { cleared },
+                Err(err) => AiIpcResponse::Error {
+                    message: err.to_string(),
+                },
+            },
+            Ok(AiIpcRequest::CancelAgentRun { run_id }) => {
+                match service.cancel_agent_run(&run_id) {
+                    Ok(accepted) => AiIpcResponse::AgentRunCancellation { run_id, accepted },
+                    Err(err) => AiIpcResponse::Error {
+                        message: err.to_string(),
+                    },
+                }
+            }
             Ok(AiIpcRequest::ConfirmAgentAction { plan_id, approved }) => {
                 match service.confirm_agent_action(plan_id, approved).await {
                     Ok(response) => AiIpcResponse::AgentAction { response },
@@ -1082,6 +1961,66 @@ mod tests {
         .unwrap();
         let (_, response_mode) = decode_ai_response(&response, Some("test-42")).unwrap();
         assert!(matches!(response_mode, AiWireMode::Versioned { .. }));
+    }
+
+    #[test]
+    fn asynchronous_agent_start_round_trips_without_losing_profile() {
+        let encoded = encode_ai_request(
+            &AiIpcRequest::StartAgent {
+                request: AgentRequest {
+                    objective: "Inspect the current workspace".into(),
+                    agent_id: Some("accessibility".into()),
+                    provider: Some("ollama".into()),
+                    model: None,
+                },
+            },
+            "agent-start-1",
+        )
+        .unwrap();
+        let (_, request) = decode_ai_request(&encoded);
+        let AiIpcRequest::StartAgent { request } = request.unwrap() else {
+            panic!("expected asynchronous agent request");
+        };
+        assert_eq!(request.agent_id.as_deref(), Some("accessibility"));
+        assert_eq!(request.objective, "Inspect the current workspace");
+    }
+
+    #[test]
+    fn mission_control_request_round_trips_bounded_search() {
+        let encoded = encode_ai_request(
+            &AiIpcRequest::GetMissionControl {
+                query: Some("workflow failed".into()),
+                limit: 75,
+            },
+            "mission-control-1",
+        )
+        .unwrap();
+        let (_, request) = decode_ai_request(&encoded);
+        let AiIpcRequest::GetMissionControl { query, limit } = request.unwrap() else {
+            panic!("expected Mission Control request");
+        };
+        assert_eq!(query.as_deref(), Some("workflow failed"));
+        assert_eq!(limit, 75);
+    }
+
+    #[test]
+    fn scenario_capture_request_round_trips_without_live_inputs() {
+        let encoded = encode_ai_request(
+            &AiIpcRequest::CaptureScenario {
+                name: "ci-trace".into(),
+                query: Some("failed".into()),
+                limit: 25,
+            },
+            "scenario-capture-1",
+        )
+        .unwrap();
+        let (_, request) = decode_ai_request(&encoded);
+        let AiIpcRequest::CaptureScenario { name, query, limit } = request.unwrap() else {
+            panic!("expected Scenario Lab capture request");
+        };
+        assert_eq!(name, "ci-trace");
+        assert_eq!(query.as_deref(), Some("failed"));
+        assert_eq!(limit, 25);
     }
 
     #[test]

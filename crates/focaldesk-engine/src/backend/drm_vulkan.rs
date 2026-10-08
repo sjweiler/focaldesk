@@ -14,7 +14,7 @@ use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_render::{
     AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer,
-    DrmRenderTarget,
+    DrmRenderTarget, FrameTransform,
 };
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
@@ -151,6 +151,7 @@ struct OutputConfig {
     available_modes: Vec<DisplayModeConfig>,
     width: u32,
     height: u32,
+    transform: Transform,
     scale: f64,
     origin: Point<i32, Logical>,
     primary: bool,
@@ -172,6 +173,7 @@ struct VulkanOutput {
     connector: connector::Handle,
     width: u32,
     height: u32,
+    transform: Transform,
     output_id: OutputId,
     origin: Point<i32, Logical>,
     crtc: crtc::Handle,
@@ -211,6 +213,81 @@ fn expand_dmabuf_damage(scene: &mut VulkanCompositorScene) {
         if !scene.damage.contains(&rect) {
             scene.damage.push(rect);
         }
+    }
+}
+
+fn frame_transform_to_smithay(transform: FrameTransform) -> Transform {
+    match transform {
+        FrameTransform::Normal => Transform::Normal,
+        FrameTransform::Rotate90 => Transform::_90,
+        FrameTransform::Rotate180 => Transform::_180,
+        FrameTransform::Rotate270 => Transform::_270,
+        FrameTransform::Flipped => Transform::Flipped,
+        FrameTransform::Flipped90 => Transform::Flipped90,
+        FrameTransform::Flipped180 => Transform::Flipped180,
+        FrameTransform::Flipped270 => Transform::Flipped270,
+    }
+}
+
+fn smithay_to_frame_transform(transform: Transform) -> FrameTransform {
+    match transform {
+        Transform::Normal => FrameTransform::Normal,
+        Transform::_90 => FrameTransform::Rotate90,
+        Transform::_180 => FrameTransform::Rotate180,
+        Transform::_270 => FrameTransform::Rotate270,
+        Transform::Flipped => FrameTransform::Flipped,
+        Transform::Flipped90 => FrameTransform::Flipped90,
+        Transform::Flipped180 => FrameTransform::Flipped180,
+        Transform::Flipped270 => FrameTransform::Flipped270,
+    }
+}
+
+fn transform_rect(rect: [i32; 4], area: Size<i32, Physical>, transform: Transform) -> [i32; 4] {
+    let rect = transform.transform_rect_in(
+        Rectangle::<i32, Physical>::from_loc_and_size((rect[0], rect[1]), (rect[2], rect[3])),
+        &area,
+    );
+    [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h]
+}
+
+fn transform_scene(
+    scene: &mut VulkanCompositorScene,
+    area: Size<i32, Physical>,
+    transform: Transform,
+) {
+    if transform == Transform::Normal {
+        return;
+    }
+    for quad in scene
+        .background
+        .iter_mut()
+        .chain(scene.overlay.iter_mut())
+        .chain(scene.foreground.iter_mut())
+    {
+        quad.destination = transform_rect(quad.destination, area, transform);
+    }
+    for quad in scene
+        .surfaces
+        .iter_mut()
+        .chain(scene.egui_textures.iter_mut())
+    {
+        quad.destination = transform_rect(quad.destination, area, transform);
+        quad.transform =
+            smithay_to_frame_transform(frame_transform_to_smithay(quad.transform) + transform);
+    }
+    for mesh in &mut scene.egui_meshes {
+        mesh.clip_rect = transform_rect(mesh.clip_rect, area, transform);
+        let area_f32 = Size::<f32, Physical>::from((area.w as f32, area.h as f32));
+        for vertex in &mut mesh.vertices {
+            let point = transform.transform_point_in(
+                Point::<f32, Physical>::from((vertex.position[0], vertex.position[1])),
+                &area_f32,
+            );
+            vertex.position = [point.x, point.y];
+        }
+    }
+    for damage in &mut scene.damage {
+        *damage = transform_rect(*damage, area, transform);
     }
 }
 
@@ -416,6 +493,14 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             .filter(|scale| scale.is_finite() && (1.0..=4.0).contains(scale))
             .unwrap_or(1.0);
         let logical_width = (f64::from(width) / scale).round() as i32;
+        let transform = saved
+            .map(|display| display.transform.smithay())
+            .unwrap_or(Transform::Normal);
+        let logical_width = if matches!(transform, Transform::_90 | Transform::_270) {
+            (f64::from(height) / scale).round() as i32
+        } else {
+            logical_width
+        };
         let origin = saved
             .map(|display| Point::from((display.logical_x, display.logical_y)))
             .unwrap_or_else(|| Point::from((next_x, 0)));
@@ -439,6 +524,7 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
                 .collect(),
             width: u32::from(width),
             height: u32::from(height),
+            transform,
             scale,
             origin,
             primary: saved.is_some_and(|display| display.primary),
@@ -581,12 +667,70 @@ fn create_kms_cursor(
     }))
 }
 
-fn cursor_image_key(icon: focaldesk_cursor::CursorIcon, width: u32, height: u32) -> u64 {
+fn cursor_image_key(
+    icon: focaldesk_cursor::CursorIcon,
+    width: u32,
+    height: u32,
+    transform: Transform,
+) -> u64 {
     let mut hash = DefaultHasher::new();
     icon.hash(&mut hash);
     width.hash(&mut hash);
     height.hash(&mut hash);
+    transform.hash(&mut hash);
     hash.finish()
+}
+
+fn transform_cursor_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    transform: Transform,
+) -> Result<(Vec<u8>, u32, u32)> {
+    let source_len = width as usize * height as usize * 4;
+    if rgba.len() < source_len {
+        return Err(anyhow!("cursor pixel buffer is truncated"));
+    }
+    if transform == Transform::Normal {
+        return Ok((rgba[..source_len].to_vec(), width, height));
+    }
+
+    let source_size = Size::<i32, Physical>::from((width as i32, height as i32));
+    let destination_size = transform.transform_size(source_size);
+    let mut destination = vec![0; destination_size.w as usize * destination_size.h as usize * 4];
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            let destination_rect = transform.transform_rect_in(
+                Rectangle::<i32, Physical>::from_loc_and_size((x, y), (1, 1)),
+                &source_size,
+            );
+            let source_offset = (y as usize * width as usize + x as usize) * 4;
+            let destination_offset = (destination_rect.loc.y as usize
+                * destination_size.w as usize
+                + destination_rect.loc.x as usize)
+                * 4;
+            destination[destination_offset..destination_offset + 4]
+                .copy_from_slice(&rgba[source_offset..source_offset + 4]);
+        }
+    }
+    Ok((
+        destination,
+        destination_size.w as u32,
+        destination_size.h as u32,
+    ))
+}
+
+fn transformed_cursor_rect(
+    hotspot_location: Point<i32, Physical>,
+    hotspot: Point<i32, Physical>,
+    image_size: Size<i32, Physical>,
+    content_size: Size<i32, Physical>,
+    transform: Transform,
+) -> Rectangle<i32, Physical> {
+    transform.transform_rect_in(
+        Rectangle::from_loc_and_size(hotspot_location - hotspot, image_size),
+        &content_size,
+    )
 }
 
 fn upload_kms_cursor(cursor: &mut KmsCursor, rgba: &[u8], width: u32, height: u32) -> Result<()> {
@@ -734,9 +878,12 @@ fn update_kms_cursor(data: &mut VulkanDrmData) {
         let Some(output_state) = data.desktop.state.outputs.get(&output.output_id) else {
             continue;
         };
-        let key = cursor_image_key(icon, width, height);
+        let key = cursor_image_key(icon, width, height, output.transform);
         if cursor.uploaded_key != Some(key) {
-            if let Err(error) = upload_kms_cursor(cursor, rgba, width, height) {
+            let transformed = transform_cursor_rgba(rgba, width, height, output.transform);
+            let uploaded = transformed
+                .and_then(|(rgba, width, height)| upload_kms_cursor(cursor, &rgba, width, height));
+            if let Err(error) = uploaded {
                 cursor.retry_after = Some(Instant::now() + Duration::from_millis(250));
                 if !cursor.failure_logged {
                     flog_warn!("KMS cursor upload failed on {}: {error:#}", output.name);
@@ -746,12 +893,25 @@ fn update_kms_cursor(data: &mut VulkanDrmData) {
             }
             cursor.uploaded_key = Some(key);
         }
-        let x = ((pointer_x - f64::from(output_state.logical_origin.x)) * output_state.scale_factor)
-            .round() as i32
-            - hotspot_x as i32;
-        let y = ((pointer_y - f64::from(output_state.logical_origin.y)) * output_state.scale_factor)
-            .round() as i32
-            - hotspot_y as i32;
+        let hotspot_location = Point::<i32, Physical>::from((
+            ((pointer_x - f64::from(output_state.logical_origin.x)) * output_state.scale_factor)
+                .round() as i32,
+            ((pointer_y - f64::from(output_state.logical_origin.y)) * output_state.scale_factor)
+                .round() as i32,
+        ));
+        let content_size = output
+            .transform
+            .invert()
+            .transform_size(Size::from((output.width as i32, output.height as i32)));
+        let cursor_rect = transformed_cursor_rect(
+            hotspot_location,
+            Point::from((hotspot_x as i32, hotspot_y as i32)),
+            Size::from((width as i32, height as i32)),
+            content_size,
+            output.transform,
+        );
+        let x = cursor_rect.loc.x;
+        let y = cursor_rect.loc.y;
         if cursor.enabled
             && cursor.uploaded_key == Some(key)
             && cursor.last_location == Some((x, y))
@@ -878,7 +1038,7 @@ fn initialize_vulkan_outputs(
         };
         output.change_current_state(
             Some(wl_mode),
-            Some(Transform::Normal),
+            Some(config.transform),
             Some(OutputScale::Custom {
                 advertised_integer: config.scale.round().max(1.0) as i32,
                 fractional: config.scale,
@@ -981,6 +1141,7 @@ fn initialize_vulkan_outputs(
             connector: config.connector,
             width: config.width,
             height: config.height,
+            transform: config.transform,
             output_id: config.output_id,
             origin: config.origin,
             crtc: config.crtc,
@@ -1838,6 +1999,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 true,
             );
             expand_dmabuf_damage(&mut scene);
+            let output_transform = data.outputs[index].transform;
+            let content_size = output_transform.invert().transform_size(Size::from((
+                data.outputs[index].width as i32,
+                data.outputs[index].height as i32,
+            )));
+            transform_scene(&mut scene, content_size, output_transform);
             let capture_requested = (data.desktop.state.screenshot_request() == Some(output_id)
                 || data.desktop.state.screenshot_all_requested
                 || data
@@ -2073,11 +2240,15 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_cursor_rgba_to_argb, expand_dmabuf_damage, hdr_source_peak_changed};
+    use super::{
+        copy_cursor_rgba_to_argb, expand_dmabuf_damage, hdr_source_peak_changed,
+        transform_cursor_rgba, transform_scene, transformed_cursor_rect,
+    };
     use crate::backend::wgpu_nested::VulkanCompositorScene;
     use focaldesk_render::{
         FramePixelFormat, FrameTransform, LinuxDmabuf, TextureColorTransform, TextureQuad,
     };
+    use smithay::utils::{Physical, Point, Size, Transform};
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
 
@@ -2142,6 +2313,21 @@ mod tests {
     }
 
     #[test]
+    fn output_rotation_transforms_scene_geometry_and_texture_orientation() {
+        let mut scene = test_scene(vec![test_texture(false, Vec::new(), [10, 20, 30, 40])]);
+
+        transform_scene(
+            &mut scene,
+            Size::<i32, Physical>::from((100, 200)),
+            Transform::_90,
+        );
+
+        assert_eq!(scene.surfaces[0].destination, [140, 10, 40, 30]);
+        assert_eq!(scene.surfaces[0].transform, FrameTransform::Rotate90);
+        assert_eq!(scene.damage, vec![[194, 1, 4, 3]]);
+    }
+
+    #[test]
     fn hdr_source_peak_change_requires_full_damage_after_first_present() {
         let peak_1000 = Some(1000.0_f32.to_bits());
         let peak_4000 = Some(4000.0_f32.to_bits());
@@ -2166,5 +2352,33 @@ mod tests {
     #[test]
     fn cursor_upload_rejects_truncated_pixels() {
         assert!(copy_cursor_rgba_to_argb(&mut [0; 4], 4, &[0; 3], 1, 1).is_err());
+    }
+
+    #[test]
+    fn portrait_cursor_bitmap_and_kms_position_use_the_output_transform() {
+        let rgba = [
+            1, 0, 0, 255, 2, 0, 0, 255, // source row 0
+            3, 0, 0, 255, 4, 0, 0, 255, // source row 1
+            5, 0, 0, 255, 6, 0, 0, 255, // source row 2
+        ];
+        let (rotated, width, height) = transform_cursor_rgba(&rgba, 2, 3, Transform::_270).unwrap();
+        assert_eq!((width, height), (3, 2));
+        assert_eq!(
+            rotated
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            vec![2, 4, 6, 1, 3, 5]
+        );
+
+        let rect = transformed_cursor_rect(
+            Point::from((150, 300)),
+            Point::from((4, 4)),
+            Size::from((32, 32)),
+            Size::from((2160, 3840)),
+            Transform::_270,
+        );
+        assert_eq!(rect.loc, (296, 1982).into());
+        assert_eq!(rect.size, (32, 32).into());
     }
 }

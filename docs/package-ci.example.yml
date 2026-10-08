@@ -1,0 +1,22 @@
+name: AIOS package checks
+
+on:
+  pull_request:
+    paths:
+      - "fai-project.json"
+      - ".github/workflows/aios-package.yml"
+  push:
+    branches: [main]
+
+jobs:
+  test-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install FocalDesk CLI
+        run: echo "Install the pinned FocalDesk build used by your registry"
+      - name: Validate manifests and Scenario Lab contracts
+        run: focaldesk-cli ai package test .
+
+  # Keep signing in a separately approved release environment. Package Forge
+  # intentionally does not accept private key material on the command line.

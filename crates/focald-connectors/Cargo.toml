@@ -1,0 +1,19 @@
+[package]
+name = "focald-connectors"
+version = "0.1.0"
+edition = "2024"
+description = "FocalDesk managed connector host"
+license = "MIT"
+
+[[bin]]
+name = "focald-connectors"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+focaldesk-ai = { path = "../focaldesk-ai" }
+focaldesk-ipc = { path = "../focaldesk-ipc" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

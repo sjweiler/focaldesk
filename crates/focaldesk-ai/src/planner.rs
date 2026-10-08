@@ -29,22 +29,38 @@ impl Planner {
     }
 
     pub fn system_prompt(tools: &[AgentToolSpec]) -> Result<String> {
+        Self::system_prompt_for(tools, MAX_AGENT_STEPS, "")
+    }
+
+    pub fn system_prompt_for(
+        tools: &[AgentToolSpec],
+        max_steps: usize,
+        agent_instructions: &str,
+    ) -> Result<String> {
         let catalog = serde_json::to_string(tools).context("serialize agent tool catalog")?;
         Ok(format!(
             "You are the FocalDesk read-only desktop planner. Return exactly one JSON object and no markdown. \
              The schema is {{\"steps\":[{{\"tool\":\"name\",\"arguments\":{{}}}}],\"answer\":null}}. \
-             Use no more than {MAX_AGENT_STEPS} steps. Only use tools in this catalog: {catalog}. \
+             Use no more than {max_steps} steps. Only use tools in this catalog: {catalog}. \
              If no tool is needed, return an empty steps array and put the complete answer in `answer`. \
              Mutating tools may only be proposed, never considered executed. Never set or invent a `confirmed` argument. \
-             Never invent tool names or arguments."
+             Never invent tool names or arguments. Agent-specific instructions: {agent_instructions}"
         ))
     }
 
     pub fn parse(content: &str, tools: &[AgentToolSpec]) -> Result<Plan> {
+        Self::parse_with_limit(content, tools, MAX_AGENT_STEPS)
+    }
+
+    pub fn parse_with_limit(
+        content: &str,
+        tools: &[AgentToolSpec],
+        max_steps: usize,
+    ) -> Result<Plan> {
         let plan: Plan = serde_json::from_str(content.trim())
             .context("planner response must be a single JSON object")?;
-        if plan.steps.len() > MAX_AGENT_STEPS {
-            bail!("planner requested more than {MAX_AGENT_STEPS} tool steps");
+        if plan.steps.len() > max_steps {
+            bail!("planner requested more than {max_steps} tool steps");
         }
         for step in &plan.steps {
             let Some(_) = tools.iter().find(|tool| tool.name == step.tool) else {

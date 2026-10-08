@@ -20,6 +20,7 @@ async fn main() -> Result<()> {
     flog_info!("Initialized agent: {}", agent.name);
 
     let ai_service = Arc::new(AiService::from_env()?.with_tool_executor(Arc::new(McpAgentTools)));
+    let scheduled_agents = ai_service.start_trigger_scheduler();
     flog_info!(
         "AI IPC listening on {}; default provider: {}; providers: {}",
         focaldesk_ai::ai_socket_path()?.display(),
@@ -34,6 +35,10 @@ async fn main() -> Result<()> {
     flog_info!(
         "Control Center IPC listening on {}",
         control_center_socket_path()?.display()
+    );
+    flog_info!(
+        "Initialized {} scheduled AI agent triggers",
+        scheduled_agents
     );
 
     // later:

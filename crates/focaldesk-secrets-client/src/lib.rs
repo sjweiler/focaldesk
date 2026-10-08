@@ -18,7 +18,16 @@ const MAX_FRAME: u32 = 1 << 20;
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum Request<'a> {
-    Get { key: &'a str },
+    Get {
+        key: &'a str,
+    },
+    Set {
+        key: &'a str,
+        value_b64: &'a str,
+        label: &'a str,
+        attributes: std::collections::BTreeMap<String, String>,
+        content_type: &'a str,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +87,36 @@ pub fn get_from(socket: &Path, key: &str) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(value))
 }
 
+/// Store a UTF-8 credential through the broker's ACL-protected native API.
+/// The encoded request buffer and base64 intermediary are zeroized on drop.
+pub fn set(key: &str, value: &str, label: &str) -> Result<()> {
+    set_at(&socket_path()?, key, value, label)
+}
+
+/// Store a UTF-8 credential through an explicit broker socket.
+pub fn set_at(socket: &Path, key: &str, value: &str, label: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(socket)
+        .with_context(|| format!("connect to credential broker at {}", socket.display()))?;
+    let encoded = Zeroizing::new(base64::engine::general_purpose::STANDARD.encode(value));
+    let request = Zeroizing::new(serde_json::to_vec(&Request::Set {
+        key,
+        value_b64: &encoded,
+        label,
+        attributes: std::collections::BTreeMap::new(),
+        content_type: "application/octet-stream",
+    })?);
+    write_frame(&mut stream, &request)?;
+    let response = Zeroizing::new(read_frame(&mut stream)?);
+    let decoded: Response = serde_json::from_slice(&response).context("decode broker response")?;
+    if !decoded.ok {
+        bail!(
+            "credential broker rejected write to {key:?}: {}",
+            decoded.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    Ok(())
+}
+
 fn write_frame(stream: &mut UnixStream, body: &[u8]) -> Result<()> {
     let len = u32::try_from(body.len()).context("broker request is too large")?;
     if len == 0 || len > MAX_FRAME {
@@ -103,7 +142,7 @@ fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::get_from;
+    use super::{get_from, set_at};
     use base64::Engine as _;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixListener;
@@ -143,6 +182,41 @@ mod tests {
 
         let value = get_from(&path, "ai/openai-api-key").unwrap();
         assert_eq!(value.as_str(), "secret-value");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn stores_secret_without_plaintext_wire_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets-set.sock");
+        let listener = match UnixListener::bind(&path) {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind test credential socket: {err}"),
+        };
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut len = [0_u8; 4];
+            stream.read_exact(&mut len).unwrap();
+            let mut request = vec![0; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(request["op"], "set");
+            assert_eq!(request["key"], "aios/signers/local-dev/ed25519");
+            assert_ne!(request["value_b64"], "private-seed");
+            let response = serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap();
+            stream
+                .write_all(&(response.len() as u32).to_be_bytes())
+                .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        set_at(
+            &path,
+            "aios/signers/local-dev/ed25519",
+            "private-seed",
+            "Local signer",
+        )
+        .unwrap();
         server.join().unwrap();
     }
 }

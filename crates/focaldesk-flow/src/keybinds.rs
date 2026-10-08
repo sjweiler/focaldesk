@@ -70,6 +70,14 @@ impl Keybinds {
 
         self.map.insert(
             KeyCombo {
+                mods: ModMask::SUPER | ModMask::CTRL | ModMask::SHIFT,
+                sym: keysyms::KEY_a,
+            },
+            KeyAction::LaunchAiConsole,
+        );
+
+        self.map.insert(
+            KeyCombo {
                 mods: ModMask::SUPER,
                 sym: keysyms::KEY_q,
             },
@@ -511,6 +519,7 @@ fn action_from_name(name: &str) -> Option<KeyAction> {
         "quit_compositor" => KeyAction::QuitCompositor,
         "toggle_launcher" => KeyAction::ToggleLauncher,
         "launch_terminal" => KeyAction::LaunchTerminal,
+        "launch_ai_console" | "launch_agent" => KeyAction::LaunchAiConsole,
         "lock_screen" => KeyAction::LockScreen,
         "take_screenshot" => KeyAction::TakeScreenshot,
         "take_screenshot_all" => KeyAction::TakeScreenshotAll,
@@ -682,6 +691,20 @@ mod tests {
                     ModMask::CTRL | ModMask::ALT | ModMask::SHIFT
                 ),
                 Some(KeyAction::FocusShellPrevious)
+            );
+        }
+    }
+
+    #[test]
+    fn ai_console_binding_is_available_on_every_backend() {
+        for backend in [BackendKind::Winit, BackendKind::Drm] {
+            let keybinds = Keybinds::with_defaults(backend);
+            assert_eq!(
+                keybinds.resolve(
+                    keysyms::KEY_a,
+                    ModMask::SUPER | ModMask::CTRL | ModMask::SHIFT
+                ),
+                Some(KeyAction::LaunchAiConsole)
             );
         }
     }

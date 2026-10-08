@@ -17,9 +17,9 @@ use focaldesk_permissions::{
 };
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
-    BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, ExclusiveHdrPhase, ExclusiveHdrState,
-    HdrAppearance, HdrCalibrationPattern, HdrToneMapper, LidCloseAction, LowBatteryAction,
-    OutputConfig, PerformanceMode, PowerButtonAction, Settings,
+    BrowserLaunchBackend, DebugLogLevel, DisplayColorProfile, DisplayTransform, ExclusiveHdrPhase,
+    ExclusiveHdrState, HdrAppearance, HdrCalibrationPattern, HdrToneMapper, LidCloseAction,
+    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, Settings,
 };
 use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 use focaldesk_themes::{
@@ -99,6 +99,11 @@ const HDR_CALIBRATION_PATTERN_OPTIONS: &[&str] = &[
 ];
 const EDITABLE_KEYBINDINGS: &[(&str, &str, &str)] = &[
     ("launch_terminal", "Open terminal", "Super+Enter"),
+    (
+        "launch_ai_console",
+        "Open Desktop Agent",
+        "Super+Ctrl+Shift+A",
+    ),
     ("launch_browser", "Open browser", "Super+B"),
     ("toggle_launcher", "Open launcher", "Ctrl+Alt+D"),
     ("close_focused", "Close focused window", "Super+Q"),
@@ -474,6 +479,12 @@ fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
         height: display.mode_height,
         refresh_mhz: display.refresh_mhz,
         scale: display.scale as f32,
+        transform: match display.transform.as_str() {
+            "Rotate90" => DisplayTransform::Rotate90,
+            "Rotate180" => DisplayTransform::Rotate180,
+            "Rotate270" => DisplayTransform::Rotate270,
+            _ => DisplayTransform::Normal,
+        },
         primary: display.primary,
         color_profile: display.color_profile,
         icc_profile_path: display.icc_profile_path.clone(),
@@ -10293,7 +10304,7 @@ mod tests {
 
     #[test]
     fn display_output_config_keeps_hdr_request_and_runtime_state_separate() {
-        let display = DisplayConfig {
+        let mut display = DisplayConfig {
             name: "DP-1".to_string(),
             monitor_make: None,
             monitor_model: None,
@@ -10329,6 +10340,12 @@ mod tests {
         assert!(output.hdr_requested);
         assert!(!output.hdr_enabled);
         assert_eq!(output.hdr_appearance, HdrAppearance::default());
+
+        display.transform = "Rotate90".to_string();
+        assert_eq!(
+            output_config_from_display(&display).transform,
+            DisplayTransform::Rotate90
+        );
     }
 
     fn test_display(name: &str, hdr_requested: bool) -> DisplayConfig {

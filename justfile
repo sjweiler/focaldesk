@@ -98,6 +98,9 @@ release-desktop:
 release-server:
     cargo build --release -p focaldesk-server
 
+release-ai-registry:
+    cargo build --release -p focaldesk-ai-registry
+
 release-remoted:
     cargo build --release -p focaldesk-remoted
 
@@ -183,7 +186,7 @@ install-shell-services: install-session-target
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
 
-install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic
+install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic install-focald-connectors
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -304,15 +307,51 @@ install-ai-console:
     cargo build --release -p focaldesk-ai-console
     sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
 
+# Install the same FocalDesk workflow skill for common agent harnesses.
+install-agent-skill:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    source="assets/agent-skills/focaldesk/SKILL.md"
+    targets=(
+      "$HOME/.agents/skills/focaldesk/SKILL.md"
+      "$HOME/.codex/skills/focaldesk/SKILL.md"
+      "$HOME/.claude/skills/focaldesk/SKILL.md"
+      "$HOME/.cursor/skills/focaldesk/SKILL.md"
+      "$HOME/.gemini/config/skills/focaldesk/SKILL.md"
+      "$HOME/.pi/agent/skills/focaldesk/SKILL.md"
+    )
+    for target in "${targets[@]}"; do
+      install -Dm644 "$source" "$target"
+    done
+    echo "Installed the FocalDesk agent skill for ${#targets[@]} harness locations."
+
 # Install the AI IPC backend used at session boot and the console launched from
 # the desktop. The console is an application, so it is intentionally not a
 # long-running systemd service of its own.
-install-ai: install-dialog-service install-vector-service install-server-service install-ai-console
+install-ai: install-dialog-service install-vector-service install-server-service install-ai-console install-agent-skill
+
+# The network registry is intentionally separate from install-ai. Installing
+# it does not create configuration, initialize secrets, or enable the unit.
+install-ai-registry:
+    cargo build --release -p focaldesk-ai-registry
+    install -Dm755 target/release/focaldesk-ai-registry "$HOME/.local/bin/focaldesk-ai-registry"
+    install -Dm644 packaging/systemd/user/focaldesk-ai-registry.service "$HOME/.config/systemd/user/focaldesk-ai-registry.service"
+    install -d -m700 "$HOME/.local/share/focaldesk/private-registry"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    @echo "Installed focaldesk-ai-registry.service disabled; configure and initialize it explicitly."
 
 # Fedora system-installed variant: use the /usr/bin daemon and the Fedora
 # user-unit path. It is still managed by systemctl --user because it belongs
 # to the logged-in graphical desktop session.
-install-ai-fedora: migrate-ai-user-units install-dialog-service-fedora install-vector-service-fedora install-server-service-fedora install-ai-console
+install-ai-fedora: migrate-ai-user-units install-dialog-service-fedora install-vector-service-fedora install-server-service-fedora install-ai-console install-agent-skill
+
+install-ai-registry-fedora:
+    cargo build --release -p focaldesk-ai-registry
+    sudo install -Dm755 target/release/focaldesk-ai-registry /usr/bin/focaldesk-ai-registry
+    sudo install -Dm644 packaging/systemd/user/focaldesk-ai-registry-fedora.service /usr/lib/systemd/user/focaldesk-ai-registry.service
+    install -d -m700 "$HOME/.local/share/focaldesk/private-registry"
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    @echo "Installed focaldesk-ai-registry.service disabled; configure and initialize it explicitly."
 
 # Remove the older per-user development units before installing Fedora's
 # system-provided user units. A unit in ~/.config/systemd/user overrides the
@@ -345,6 +384,14 @@ install-focald-mic:
     systemctl --user daemon-reload
     systemctl --user enable --now focald-mic.service
     systemctl --user restart focald-mic.service
+
+install-focald-connectors:
+    cargo build --release -p focald-connectors
+    install -Dm755 target/release/focald-connectors "$HOME/.local/bin/focald-connectors"
+    install -Dm644 packaging/systemd/user/focald-connectors.service "$HOME/.config/systemd/user/focald-connectors.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now focald-connectors.service
+    systemctl --user restart focald-connectors.service
 
 install-polkit:
     cargo build --release -p focaldesk-polkitd
@@ -419,7 +466,7 @@ install-remoted-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     @echo "Installed focaldesk-remoted.service without enabling or starting it"
 
-install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-vector-service-fedora install-server-service-fedora install-remoted-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora
+install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-vector-service-fedora install-server-service-fedora install-remoted-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora install-connectors-service-fedora
 
 # Both the system credential socket and user-session IPC use this directory.
 # Prepare it before starting user services so a directory created by PID 1
@@ -612,6 +659,13 @@ install-mic-service-fedora:
     sudo install -Dm644 packaging/systemd/user/focald-mic-fedora.service /usr/lib/systemd/user/focald-mic.service
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focald-mic.service || echo "Skipping systemd user enable: no user bus available"
+
+install-connectors-service-fedora:
+    cargo build --release -p focald-connectors
+    sudo install -Dm755 target/release/focald-connectors /usr/bin/focald-connectors
+    sudo install -Dm644 packaging/systemd/user/focald-connectors-fedora.service /usr/lib/systemd/user/focald-connectors.service
+    systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
+    systemctl --user enable --now focald-connectors.service || echo "Skipping systemd user enable: no user bus available"
 
 run:
     cargo run

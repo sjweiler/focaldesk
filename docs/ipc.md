@@ -297,6 +297,72 @@ provider reports it. Telemetry contains only bounded error summaries and is
 reset when the daemon restarts; prompts and response bodies are never stored in
 the snapshot.
 
+Agent execution has a separate, service-owned lifecycle. `RunAgent` responses
+include a random run ID. `ListAgentRuns` and `GetAgentRun` expose bounded
+in-memory records with permission, queue, execution, confirmation, terminal,
+deadline, and completed-tool-step state. `CancelAgentRun` can cancel queued or
+running work and can discard an action awaiting confirmation; it never confirms
+or executes a mutation. The daemon retains at most 128 run records, evicting
+only terminal records, and checkpoints them in a private SQLite database.
+Terminal history survives restart. Interrupted runs are recovered as failed;
+`RetryAgentRun` starts a new run with the normal permission flow and resumes
+from any checkpointed read-only observations. Pending confirmations are
+deliberately invalidated on restart.
+
+`StartAgent` is the non-blocking form: it validates and registers the run
+synchronously, returns `AgentStarted` with its run ID, and continues permission,
+queue, model, and tool work in the daemon. `GetAgentRun` includes the bounded
+final `AgentResponse` once available, so clients can disconnect, reconnect, and
+recover results. `WatchAgentRun { run_id, after_sequence }` long-polls the
+service-owned journal and returns newer sequenced `AgentRunEvents` or the stable
+run state. The latest 64 lifecycle, planning, tool, proposal, and terminal
+events are retained. The AI Console uses this event-driven path while offering
+cancellation through the known run ID. `RunAgent` remains as the blocking
+compatibility operation.
+
+The CLI exposes these operations as `ai agent-runs`, `ai agent-status <run-id>`,
+`ai agent-cancel <run-id>`, and `ai agent-retry <run-id>`.
+
+`ListAgents` returns the service-owned registry of built-in and validated custom
+agent definitions. `RunAgent` accepts an optional `agent_id`; the runtime limits
+the planner to that definition's tool allowlist and step budget before any model
+call or tool execution. Manifests never add tools or permissions.
+
+`FireAgentTrigger` starts one named declarative trigger. `DispatchAgentEvent`
+matches a bounded desktop, voice, hotkey, or IPC event against enabled trigger
+definitions and returns `AgentTriggersStarted`. Schedule events cannot be
+spoofed through IPC; the daemon owns their timers. Cooldowns and hourly limits
+are evaluated from durable run records, and every triggered run records its
+source before entering the ordinary permission and confirmation lifecycle.
+`GetAgentTriggerState` and `SetAgentTriggersSuspended` expose the persistent
+global emergency state. Suspension blocks new scheduled and event-driven runs,
+but does not cancel manual or already-running work.
+
+`InstallAgent` writes a validated package through the daemon's configured agent
+directory, creates the explicit update backup, audits the change, and reloads
+the registry. `ReloadAgents` atomically replaces the live custom-agent registry
+only after every package validates. `GetAgentControlStatuses` reports per-agent enablement,
+daily health, token usage, and explicitly priced estimated cost.
+`SetAgentEnabled` persists lifecycle state, while `RollbackAgent` restores the
+validated backup and reloads it. `DryRunAgent` performs one bounded provider
+planning call and returns its plan and usage without invoking any tool. These
+lifecycle operations are written to the private control-event audit table.
+
+The AIOS supervisor uses `ListWorkflows`, `StartWorkflow`,
+`ListWorkflowRuns`, `GetWorkflowRun`, `SetWorkflowPaused`, `CancelWorkflow`,
+and `RetryWorkflow`. Workflow status includes the validated node graph state,
+child agent run IDs, shared token consumption, deadline, errors, and typed
+dependency artifacts. Child nodes cannot bypass the ordinary agent permission,
+budget, tool-allowlist, or mutation-confirmation boundaries. Active workflow
+state is recovered fail-closed after restart while completed artifacts remain
+available to a fresh retry.
+
+`PreviewCapabilities`, `ListCapabilityLeases`, and `RevokeCapabilityLease`
+expose the AIOS capability kernel. Leases include tool authority, resource
+scopes, issue/expiry timestamps, revocation state, and related agent/workflow
+run IDs, but never secret values. Enforcement happens again immediately before
+every tool invocation, including a mutation that has received native approval.
+
 AI memory lifecycle operations are also part of v2. `MemoryStatus` reports the
 schema version, current record count, retention window, capacity, and oldest
 and newest record timestamps. `ClearMemory` atomically deletes relational and
@@ -313,6 +379,56 @@ Sockets normally live below `$XDG_RUNTIME_DIR/focaldesk`. The directory is
 required to be owned by the current user with mode `0700`; sockets use mode
 `0600`. FocalDesk refuses to replace a non-socket, symlinked runtime directory,
 or foreign-owned socket path.
+
+`focald-connectors.sock` exposes the managed connector host's typed status,
+poll-now, pause/resume, and quarantine-clear operations. Only the AI Console
+and FocalDesk CLI transport identities are accepted. Event publication itself
+goes to the AI service, which revalidates connector enablement, manifest schema,
+source consent, and the Event Fabric emergency state.
+
+`GetMissionControl` returns a bounded, optionally filtered operational snapshot
+covering minimized timeline entries, active agent/workflow runs, capability
+leases, context grants, agent budgets, connector health, suggestions, and proactive
+safety state. It excludes tool arguments/results, context payloads, artifacts,
+answers, and raw failures. `ActivateMissionControlPause` persistently suspends
+agent triggers and routines and disconnects Event Fabric; it does not cancel
+already-running work. The Console separately requests connector-host pause and
+uses the existing cancellation and simulation IPC for scoped controls.
+
+`EvaluateScenario` accepts one bounded, explicitly synthetic Scenario Lab
+fixture and returns a deterministic report. Evaluation constructs only fresh
+shadow state and records zero provider calls, tool executions, or live
+mutations. `CaptureScenario` converts a bounded Mission Control query into
+inert minimized timeline steps and returns the fixture without writing it.
+Unknown fixture fields and unmarked, oversized, or unbounded fixtures are
+rejected before evaluation.
+
+AIOS package management uses `InspectPackage`, `TrustPackageSigner`,
+`StagePackage`, `ActivatePackage`, `RollbackPackage`, and `ListPackages`.
+Bundles are capped at 2 MiB; the AI IPC request ceiling is 3 MiB to allow for
+the signed bundle envelope. Staging requires a trusted valid signature and a
+passing bundled Scenario Lab suite. Activation never enables a packaged
+connector or grants it network authority.
+
+Package Forge adds `GeneratePackageSigner` and `BuildPackageProject`.
+Generation and signing execute inside the AI service: the private Ed25519 seed
+is stored under `aios/signers/<id>/ed25519` in `focald-secrets` and is never
+returned over AI IPC. `BuildPackageProject` validates the typed project, runs
+its complete synthetic scenario suite, and returns only the signed bundle.
+
+### Microphone and speech sessions
+
+`focald-mic.sock` accepts the typed `MicrophoneIpcRequest` contract. Authorized
+executables can request normal dictation or ambient wake-gated capture, poll a
+bounded sequenced event journal, clear retained events, stop their lease, or
+operate the FocalDesk-wide kill gate. The daemon binds ownership to the
+authenticated peer executable rather than trusting a caller-supplied name. One
+exclusive lease exists at a time; ambient leases expire when their heartbeat
+is abandoned.
+
+`focald-speech.sock` accepts `SpeechIpcRequest`. Interrupt-priority requests
+replace current output, and live microphone activity issues a stop request for
+barge-in. Neither endpoint can resolve an AI mutation confirmation.
 
 ## Open Questions
 

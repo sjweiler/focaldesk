@@ -95,9 +95,9 @@ use focaldesk_power::{
 use focaldesk_settings_core::{
     load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AppSettings,
     BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings,
-    DisplayColorProfile, HdrAppearance, HdrCalibrationPattern, LidCloseAction, LowBatteryAction,
-    OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings, PrivacySettings,
-    WorkspaceSettings,
+    DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern, LidCloseAction,
+    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings,
+    PrivacySettings, WorkspaceSettings,
 };
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
 use focaldesk_ui::atlas::IconId;
@@ -249,6 +249,68 @@ fn clamp_rect_to_any_bounds(
     };
 
     clamp_rect_to_bounds(geometry, best_bounds)
+}
+
+const POINTER_EDGE_EPSILON: f64 = 1.0e-6;
+
+fn pointer_in_bounds(pointer: Point<f64, Logical>, bounds: Rectangle<i32, Logical>) -> bool {
+    pointer.x >= f64::from(bounds.loc.x)
+        && pointer.x < f64::from(bounds.loc.x + bounds.size.w)
+        && pointer.y >= f64::from(bounds.loc.y)
+        && pointer.y < f64::from(bounds.loc.y + bounds.size.h)
+}
+
+fn clamp_pointer_to_bounds(
+    pointer: Point<f64, Logical>,
+    bounds: Rectangle<i32, Logical>,
+) -> Point<f64, Logical> {
+    let min_x = f64::from(bounds.loc.x);
+    let min_y = f64::from(bounds.loc.y);
+    let max_x = (f64::from(bounds.loc.x + bounds.size.w) - POINTER_EDGE_EPSILON).max(min_x);
+    let max_y = (f64::from(bounds.loc.y + bounds.size.h) - POINTER_EDGE_EPSILON).max(min_y);
+    Point::from((pointer.x.clamp(min_x, max_x), pointer.y.clamp(min_y, max_y)))
+}
+
+/// Keep a pointer proposal on the union of real output rectangles.
+///
+/// Bounding-box clamping alone leaves invisible pointer territory beside a
+/// portrait monitor or between staggered outputs. A proposal that lands on a
+/// different output is accepted, while a proposal into empty layout space is
+/// clipped to the edge of the output it came from.
+fn confine_pointer_to_output_bounds<I>(
+    previous: Point<f64, Logical>,
+    proposed: Point<f64, Logical>,
+    bounds: I,
+) -> Point<f64, Logical>
+where
+    I: Clone + IntoIterator<Item = Rectangle<i32, Logical>>,
+{
+    let mut candidates = bounds.clone().into_iter().peekable();
+    if candidates.peek().is_none() || candidates.any(|bounds| pointer_in_bounds(proposed, bounds)) {
+        return proposed;
+    }
+
+    if let Some(current) = bounds
+        .clone()
+        .into_iter()
+        .find(|bounds| pointer_in_bounds(previous, *bounds))
+    {
+        return clamp_pointer_to_bounds(proposed, current);
+    }
+
+    // Recover gracefully after hotplug or a formerly invalid saved layout by
+    // choosing the output requiring the shortest correction.
+    bounds
+        .into_iter()
+        .map(|bounds| {
+            let clamped = clamp_pointer_to_bounds(proposed, bounds);
+            let dx = proposed.x - clamped.x;
+            let dy = proposed.y - clamped.y;
+            (dx * dx + dy * dy, clamped)
+        })
+        .min_by(|(left, _), (right, _)| left.total_cmp(right))
+        .map(|(_, clamped)| clamped)
+        .unwrap_or(proposed)
 }
 
 fn should_wait_for_lid_open_on_resume(last_lid_state: Option<bool>) -> bool {
@@ -3350,6 +3412,12 @@ impl DesktopState {
                 x: output.logical_origin.x,
                 y: output.logical_origin.y,
                 scale: output.scale_factor,
+                transform: match output.handle.current_transform() {
+                    Transform::_90 | Transform::Flipped90 => DisplayTransform::Rotate90,
+                    Transform::_180 | Transform::Flipped180 => DisplayTransform::Rotate180,
+                    Transform::_270 | Transform::Flipped270 => DisplayTransform::Rotate270,
+                    Transform::Normal | Transform::Flipped => DisplayTransform::Normal,
+                },
                 active_workspace_id: output.active_workspace.0,
                 focused: *id == self.focused_output,
                 hdr_supported: output.hdr_supported,
@@ -3373,6 +3441,8 @@ impl DesktopState {
                     title: bounded_metadata(&window.title()),
                     app_id: window.app_id().map(bounded_metadata),
                     class: window.class().map(bounded_metadata),
+                    x11: window.protocol()
+                        == crate::core::shell::managed_window::WindowProtocol::Xwayland,
                     workspace_id: window.workspace.0,
                     output_id: window.output.map(|id| id.0),
                     mapped: window.mapped,
@@ -3544,6 +3614,9 @@ impl DesktopState {
                 self.mark_focused_output_full_damage(DamageSource::Unknown);
             }
             DesktopAction::CloseFocused => self.close_focused(),
+            DesktopAction::TerminateX11Application { window_id } => {
+                self.terminate_x11_application(WindowId(window_id))?;
+            }
             DesktopAction::SetVolume { percent } => {
                 if percent > 100 {
                     return Err(format!("volume {percent}% is out of range"));
@@ -3998,6 +4071,13 @@ impl DesktopState {
 
             let physical_size = Size::<i32, Physical>::from((config.width, config.height));
             let logical_origin = Point::<i32, Logical>::from((config.x, config.y));
+            let transform = match config.transform {
+                DisplayTransform::Normal => Transform::Normal,
+                DisplayTransform::Rotate90 => Transform::_90,
+                DisplayTransform::Rotate180 => Transform::_180,
+                DisplayTransform::Rotate270 => Transform::_270,
+            };
+            let render_size = transform.transform_size(physical_size);
 
             if physical_size.w <= 0 || physical_size.h <= 0 {
                 return Err(format!(
@@ -4018,9 +4098,10 @@ impl DesktopState {
                         .current_mode()
                         .is_none_or(|mode| mode.refresh != config.refresh_mhz);
                     (
-                        output.physical_size != physical_size
+                        output.physical_size != render_size
                             || (output.scale_factor - scale_factor).abs() > f64::EPSILON
                             || output.logical_origin != logical_origin
+                            || output.handle.current_transform() != transform
                             || refresh_changed,
                         output.color_profile_override != config.color_profile
                             || output.icc_profile_path != config.icc_profile_path,
@@ -4037,6 +4118,9 @@ impl DesktopState {
 
             if let Some(output) = self.outputs.get_mut(&output_id) {
                 output.logical_origin = logical_origin;
+                output
+                    .handle
+                    .change_current_state(None, Some(transform), None, None);
                 output.hdr_requested = requested_hdr;
                 output.hdr_enabled = !output.hdr_verification_pending
                     && crate::core::color::output_hdr_render_active(
@@ -7288,6 +7372,7 @@ impl DesktopState {
         physical_size: Size<i32, Physical>,
         scale_factor: f64,
     ) {
+        let physical_size = handle.current_transform().transform_size(physical_size);
         let logical_w = ((physical_size.w as f64) / scale_factor).round() as i32;
         let logical_h = ((physical_size.h as f64) / scale_factor).round() as i32;
         let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
@@ -7766,6 +7851,20 @@ impl DesktopState {
             max_y = max_y.max(o.logical_origin.y + o.logical_size.h);
         }
         Rectangle::from_loc_and_size((min_x, min_y), (max_x - min_x, max_y - min_y))
+    }
+
+    fn confine_pointer_to_outputs(
+        &self,
+        previous: Point<f64, Logical>,
+        proposed: Point<f64, Logical>,
+    ) -> Point<f64, Logical> {
+        confine_pointer_to_output_bounds(
+            previous,
+            proposed,
+            self.outputs.values().map(|output| {
+                Rectangle::from_loc_and_size(output.logical_origin, output.logical_size)
+            }),
+        )
     }
 
     /// Which output the pointer lies in (first match in output map order), if any.
@@ -9819,6 +9918,17 @@ impl DesktopState {
                 );
             }
 
+            KeyAction::LaunchAiConsole => {
+                let launch_trace_id = self.launch_app_with_args(
+                    focaldesk_ai_console_command(),
+                    vec!["--agent".to_string()],
+                );
+                flog_info!(
+                    "dispatch launch trace_id={} action=keybind-ai-agent",
+                    launch_trace_id
+                );
+            }
+
             KeyAction::LockScreen => {
                 self.lock_session();
             }
@@ -9970,6 +10080,42 @@ impl DesktopState {
         }
         if let Some(bbox) = self.global_window_bbox(&window) {
             self.mark_window_bbox_damage_source(bbox, DamageSource::Unknown);
+        }
+    }
+
+    fn terminate_x11_application(&self, window_id: WindowId) -> Result<(), String> {
+        #[cfg(feature = "xwayland")]
+        {
+            let surface = self
+                .window(window_id)
+                .and_then(|window| window.window.x11_surface())
+                .ok_or_else(|| format!("window {} is not an X11 application", window_id.0))?;
+            let pid = surface
+                .get_client_pid()
+                .map_err(|error| format!("could not identify X11 application process: {error}"))?;
+            if pid <= 1 || pid > i32::MAX as u32 {
+                return Err(format!("X11 application reported invalid process ID {pid}"));
+            }
+            // XRes supplies the server-verified local client PID. The kernel
+            // still enforces the compositor user's normal signal permissions.
+            let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+            if result != 0 {
+                return Err(format!(
+                    "could not terminate X11 application {pid}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            flog_info!(
+                "terminated X11 application window_id={} pid={}",
+                window_id.0,
+                pid
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "xwayland"))]
+        {
+            let _ = window_id;
+            Err("XWayland support is unavailable".to_string())
         }
     }
 
@@ -10652,6 +10798,7 @@ impl DesktopState {
                 let previous_pos = self.pointer_pos;
                 let pointer_locked = self.pointer_lock_active_at(previous_pos);
                 let position = self.constrained_pointer_position(previous_pos, position);
+                let position = self.confine_pointer_to_outputs(previous_pos, position);
                 self.input.pointer_pos = position;
                 self.pointer_pos = position;
                 if let Some(id) = self.output_under_pointer(position) {
@@ -11200,16 +11347,26 @@ impl DesktopState {
             refresh: 60_000,
         };
         let scale_int = scale_factor.round().max(1.0) as i32;
-        let logical_w = (physical_size.w as f64 / scale_factor).round() as i32;
-        let logical_h = (physical_size.h as f64 / scale_factor).round() as i32;
+        let render_size = self
+            .outputs
+            .get(&output_id)
+            .map(|output| {
+                output
+                    .handle
+                    .current_transform()
+                    .transform_size(physical_size)
+            })
+            .unwrap_or(physical_size);
+        let logical_w = (render_size.w as f64 / scale_factor).round() as i32;
+        let logical_h = (render_size.h as f64 / scale_factor).round() as i32;
         let logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
 
         if let Some(output) = self.outputs.get_mut(&output_id) {
             output.scale_factor = scale_factor;
             output.scale = Scale::from((scale_factor, scale_factor));
-            output.physical_size = physical_size;
+            output.physical_size = render_size;
             output.logical_size = logical_size;
-            output.pending_damage = vec![Rectangle::from_loc_and_size((0, 0), physical_size)];
+            output.pending_damage = vec![Rectangle::from_loc_and_size((0, 0), render_size)];
             output.sdr_base_generation = output.sdr_base_generation.wrapping_add(1);
             output.last_sw_cursor_rect = None;
 
@@ -14428,13 +14585,13 @@ fn is_obs_like(app_name: &str) -> bool {
 mod tests {
     use super::{
         ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds,
-        complementary_split_rect, encoding_from_fourcc, is_browser_like,
-        logical_damage_to_physical, output_with_largest_overlap, power_action_interaction,
-        remove_surface_root_membership, resized_split_rects, restored_split_rect,
-        restored_split_rect_for_minimum, saved_split_placement, session_power_command,
-        set_surface_root_membership, should_wait_for_lid_open_on_resume, snap_target_for_pointer,
-        split_assist_targets, split_direction_for_rect, split_preset_rect, split_rect,
-        split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
+        complementary_split_rect, confine_pointer_to_output_bounds, encoding_from_fourcc,
+        is_browser_like, logical_damage_to_physical, output_with_largest_overlap,
+        power_action_interaction, remove_surface_root_membership, resized_split_rects,
+        restored_split_rect, restored_split_rect_for_minimum, saved_split_placement,
+        session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
+        snap_target_for_pointer, split_assist_targets, split_direction_for_rect, split_preset_rect,
+        split_rect, split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
         topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding, DamageSource, Fourcc,
         OutputId, PowerActionInteraction, SplitAxis, SplitDirection, TopbarPulseTarget,
         UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
@@ -15284,6 +15441,43 @@ mod tests {
 
         assert_eq!(clamped.loc, (50, 10).into());
         assert_eq!(clamped.size, (50, 50).into());
+    }
+
+    #[test]
+    fn pointer_cannot_enter_dead_space_beside_a_staggered_portrait_output() {
+        let landscape = Rectangle::from_loc_and_size((0, 0), (1920, 1080));
+        let portrait = Rectangle::from_loc_and_size((1920, 200), (1080, 1920));
+        let bounds = [landscape, portrait];
+
+        let clipped = confine_pointer_to_output_bounds(
+            (1800.0, 100.0).into(),
+            (2000.0, 100.0).into(),
+            bounds.iter().copied(),
+        );
+        assert!(clipped.x < 1920.0);
+        assert!((clipped.x - 1920.0).abs() < 0.001);
+        assert_eq!(clipped.y, 100.0);
+
+        let crossed = confine_pointer_to_output_bounds(
+            (1800.0, 300.0).into(),
+            (2000.0, 300.0).into(),
+            bounds.iter().copied(),
+        );
+        assert_eq!(crossed, (2000.0, 300.0).into());
+    }
+
+    #[test]
+    fn pointer_recovers_to_nearest_output_after_hotplug() {
+        let left = Rectangle::from_loc_and_size((0, 0), (1000, 1000));
+        let right = Rectangle::from_loc_and_size((1200, 0), (1000, 1000));
+
+        let recovered = confine_pointer_to_output_bounds(
+            (1100.0, 500.0).into(),
+            (1150.0, 500.0).into(),
+            [left, right].into_iter(),
+        );
+
+        assert_eq!(recovered, (1200.0, 500.0).into());
     }
 
     #[test]

@@ -257,6 +257,26 @@ pub enum DisplayTransform {
     Rotate270,
 }
 
+impl DisplayTransform {
+    pub(super) fn smithay(&self) -> Transform {
+        match self {
+            Self::Normal => Transform::Normal,
+            Self::Rotate90 => Transform::_90,
+            Self::Rotate180 => Transform::_180,
+            Self::Rotate270 => Transform::_270,
+        }
+    }
+
+    fn from_smithay(transform: Transform) -> Self {
+        match transform {
+            Transform::_90 | Transform::Flipped90 => Self::Rotate90,
+            Transform::_180 | Transform::Flipped180 => Self::Rotate180,
+            Transform::_270 | Transform::Flipped270 => Self::Rotate270,
+            Transform::Normal | Transform::Flipped => Self::Normal,
+        }
+    }
+}
+
 render_elements! {
     pub DrmPresentElement<=GlesRenderer>;
     Texture=TextureRenderElement<GlesTexture>,
@@ -2582,7 +2602,7 @@ pub(crate) fn collect_display_configs(
 
             primary,
 
-            transform: DisplayTransform::Normal,
+            transform: DisplayTransform::from_smithay(surface.output.current_transform()),
 
             hdr_supported,
             hdr_max_luminance_nits: core_output
@@ -3469,8 +3489,13 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
         .get(&output_id)
         .map(|o| o.scale_factor)
         .unwrap_or(1.0);
+    let output_transform = state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.handle.current_transform())
+        .unwrap_or(Transform::Normal);
 
-    // Absolute devices (touchpad/tablet in absolute mode) must transform against the
+    // Absolute devices (for example, a tablet in absolute mode) must transform against the
     // focused output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
     let clamp_rect = match input {
         InputEvent::PointerMotionAbsolute { .. } => {
@@ -3483,6 +3508,7 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
         input,
         state.input.pointer_pos,
         clamp_rect,
+        output_transform,
         scale,
         state.input.modifiers,
     ) {
@@ -3814,6 +3840,19 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         crate::backend::common::pump_desktop_services(&mut data.core.state);
 
         event_loop.dispatch(Some(Duration::from_millis(16)), &mut data)?;
+        if data.core.state.take_display_reconfigure_request()
+            && data.session_active
+            && !data.resume_pending
+            && data.lifecycle == DrmLifecycle::Running
+        {
+            let nodes = data.backend.devices.keys().copied().collect::<Vec<_>>();
+            for node in nodes {
+                flog("DRM display settings changed; rebuilding outputs");
+                if let Err(err) = reinitialize_drm_device(&mut data, &loop_handle, node) {
+                    flog_warn!("Failed to rebuild DRM outputs after settings change: {err}");
+                }
+            }
+        }
         process_deferred_drm_topology_change(&mut data, &loop_handle);
         let exclusive_recovery_nodes = std::mem::take(&mut data.exclusive_hdr_recovery_nodes);
         for node in exclusive_recovery_nodes {
@@ -5323,9 +5362,14 @@ fn device_added(
                 .filter(|scale| scale.is_finite() && (1.0..=4.0).contains(scale))
                 .unwrap_or(1.0);
             let output_scale_int = output_scale.round().max(1.0) as i32;
+            let output_transform = saved_display
+                .map(|display| display.transform.smithay())
+                .unwrap_or(Transform::Normal);
+            let render_size =
+                output_transform.transform_size(Size::<i32, Physical>::from((w as i32, h as i32)));
             let logical_size = Size::<i32, Logical>::from((
-                (w as f64 / output_scale).round() as i32,
-                (h as f64 / output_scale).round() as i32,
+                (render_size.w as f64 / output_scale).round() as i32,
+                (render_size.h as f64 / output_scale).round() as i32,
             ));
             let origin = saved_display
                 .map(|display| Point::<i32, Logical>::from((display.logical_x, display.logical_y)))
@@ -5362,7 +5406,7 @@ fn device_added(
 
             output.change_current_state(
                 Some(wl_mode),
-                Some(Transform::Normal),
+                Some(output_transform),
                 Some(smithay::output::Scale::Custom {
                     advertised_integer: output_scale_int,
                     fractional: output_scale,
@@ -5415,7 +5459,7 @@ fn device_added(
                 .planes(&crtc)
                 .context("Failed to query planes for connector")?;
 
-            let tex_phys_size: Size<i32, Physical> = Size::from((i32::from(w), i32::from(h)));
+            let tex_phys_size = render_size;
 
             let linear_sdr_supported = supports_linear_sdr(&mut renderer, tex_phys_size);
             flog(&format!(
@@ -5496,7 +5540,7 @@ fn device_added(
             let output_id = OutputId(id);
             if let Some(out) = data.core.state.outputs.get_mut(&output_id) {
                 out.handle = output.clone();
-                out.physical_size = Size::<i32, Physical>::from((w as i32, h as i32));
+                out.physical_size = render_size;
                 out.logical_size = logical_size;
                 out.scale_factor = output_scale;
                 out.scale = smithay::utils::Scale::from((output_scale, output_scale));
@@ -5542,7 +5586,7 @@ fn device_added(
                 output,
                 mode: wl_mode,
                 available_modes,
-                size: Size::<i32, Physical>::from((w as i32, h as i32)),
+                size: render_size,
                 physical_size_mm: (mm_w, mm_h),
                 output_id,
                 origin,

@@ -48,6 +48,63 @@ truth for what is usable today.
   vector retrieval, deterministic reranking, retrieval evaluation, and an
   Indexed Sources console page.
 - [x] Add deterministic provider-contract and agent-loop integration tests.
+- [x] Add service-owned agent run lifecycle records, queue visibility, bounded
+  retention, status inspection, and cancellation over typed AI IPC.
+- [x] Add versioned declarative agent manifests, built-in profiles, bounded
+  tool allowlists, runtime discovery, and a public validation API.
+- [x] Add non-blocking agent starts, reconnectable retained results, live
+  Console lifecycle polling, and direct cancellation by run ID.
+- [x] Replan after each bounded tool observation and expose retained sequenced
+  run events through `WatchAgentRun` for live Console timelines.
+- [x] Persist bounded agent run history and retry requests in private SQLite,
+  recover interrupted work fail-closed, and retry under a fresh permissioned run.
+- [x] Add a public validation-backed `AgentBuilder`, per-agent context/output/
+  deadline budgets, declarative package directories, and deterministic SDK mocks.
+- [x] Add bounded declarative schedules, desktop/voice/hotkey/IPC triggers,
+  durable trigger auditing, cooldowns, hourly limits, and daemon-owned timers.
+- [x] Add an AI Console Agent Studio with bounded package authoring, validation,
+  explicit backed-up updates, searchable run history, and emergency suspension.
+- [x] Add the agent control plane: hot reload, persistent enable/disable,
+  reversible rollback, no-tool plan simulation, health, usage, and daily budgets.
+- [x] Add a durable AIOS workflow supervisor with bounded DAG validation,
+  typed handoffs, parallel scheduling, shared budgets, recovery, and lifecycle UI.
+- [x] Add an AIOS capability kernel with resource scopes, expiring leases,
+  workflow intersection, runtime enforcement, revocation, previews, and audit.
+- [x] Add an opt-in ambient voice runtime with local wake-phrase detection,
+  bounded RAM-only capture, visible activity, barge-in, session-only transcript
+  controls, a hard microphone gate, and agent/workflow routing.
+- [x] Add a typed AIOS context and intent fabric with expiring provenance,
+  sensitivity labels, explicit per-agent grants, capability intersection,
+  inspection/revocation, and deterministic voice routing.
+- [x] Add an AIOS attention and routine engine with typed event intake,
+  suggestion-only declarative rules, quiet hours, cooldown/rate/deduplication
+  controls, simulation, explicit promotion, and a global emergency pause.
+- [x] Add an AIOS Event Fabric and Consent Center with disabled-by-default
+  sources, supported-field disclosure, bounded redacted retention, typed
+  desktop/workflow hooks, simulation replay, clearing, and emergency disconnect.
+- [x] Add a connector SDK and private trust store with versioned schemas,
+  authenticated/replay-protected producer identity, persistent consent,
+  built-in local connector identities, health controls, explicit network
+  authority, validated installation, updates, and rollback.
+- [x] Add a managed connector host with minimized local adapters, transient
+  systemd-sandboxed custom runtimes, resource limits, bounded retry/backoff,
+  quarantine, control IPC, Console operations, and disabled-by-default consent.
+- [x] Add AIOS Mission Control with a minimized cross-runtime timeline,
+  provenance, live inventory, bounded audit search, simulation replay, scoped
+  cancellation, and a restart-persistent proactive emergency pause.
+- [x] Add an isolated AIOS Scenario Lab with bounded synthetic fixtures,
+  minimized trace capture, deterministic routing/routine evaluation, safety
+  invariant codes, expected-denial contracts, Console authoring, and local CI.
+- [x] Add an AIOS Package Manager with signed declarative `.fai` bundles,
+  explicit signer trust, authority diffs, mandatory Scenario Lab gates,
+  staged activation, dependency checks, and rollback.
+- [x] Add AIOS Package Forge with safe scaffolding, secrets-backed signer
+  generation, reproducible builds, local testing and verification, an offline
+  exact-dependency registry, Console authoring, and a CI template.
+- [x] Add an opt-in private AIOS registry with authenticated immutable
+  publishing, signed rollback-resistant catalogs, organization signer policy,
+  revocation quarantine, lockfiles, explicit verified downloads, audit history,
+  and Console catalog review.
 
 ## Desktop experience
 

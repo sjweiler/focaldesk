@@ -1,5 +1,6 @@
 # mode path (relative to the user's home directory)
 755 .local/bin/focaldesk-server
+755 .local/bin/focaldesk-ai-registry
 755 .local/bin/focal-server
 755 .local/bin/focaldesk-remoted
 755 .local/bin/focaldesk-system-rail
@@ -21,8 +22,10 @@
 755 .local/bin/focald-voice
 755 .local/bin/focald-speech
 755 .local/bin/focald-mic
+755 .local/bin/focald-connectors
 644 .config/systemd/user/focaldesk-session.target
 644 .config/systemd/user/focaldesk-server.service
+644 .config/systemd/user/focaldesk-ai-registry.service
 644 .config/systemd/user/focal-vector.service
 644 .config/systemd/user/focaldesk-remoted.service
 644 .config/systemd/user/focaldesk-system-rail.service
@@ -42,5 +45,12 @@
 644 .config/systemd/user/focald-voice.service
 644 .config/systemd/user/focald-speech.service
 644 .config/systemd/user/focald-mic.service
+644 .config/systemd/user/focald-connectors.service
 644 .local/share/xdg-desktop-portal/portals/focaldesk.portal
 644 .local/share/xdg-desktop-portal/focaldesk-portals.conf
+644 .agents/skills/focaldesk/SKILL.md
+644 .codex/skills/focaldesk/SKILL.md
+644 .claude/skills/focaldesk/SKILL.md
+644 .cursor/skills/focaldesk/SKILL.md
+644 .gemini/config/skills/focaldesk/SKILL.md
+644 .pi/agent/skills/focaldesk/SKILL.md

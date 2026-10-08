@@ -28,6 +28,7 @@ pub enum KeyAction {
     QuitCompositor,
     ToggleLauncher,
     LaunchTerminal,
+    LaunchAiConsole,
     LockScreen,
     ActivateSlot(usize),
     AssignSlot(usize),

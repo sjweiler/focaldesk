@@ -65,6 +65,11 @@ fn dispatch_backend_events(
                 &input,
                 state.input.pointer_pos,
                 clamp_rect,
+                state
+                    .outputs
+                    .get(&state.primary_output)
+                    .map(|output| output.handle.current_transform())
+                    .unwrap_or(smithay::utils::Transform::Normal),
                 scale_factor,
                 state.input.modifiers,
             ) {

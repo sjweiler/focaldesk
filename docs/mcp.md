@@ -145,3 +145,32 @@ during planning. The daemon stores its exact name and arguments under a random
 shows a non-persistent native prompt, and only then invokes the confirmed MCP
 executor. The executor injects its own confirmation marker. Model-generated
 `confirmed` fields are rejected and never treated as user consent.
+
+### Desktop Agent user interface
+
+The AI Console exposes this planner as **Desktop Agent**. Its result view shows
+the final answer, every executed read-only tool with bounded arguments and
+results, and the exact final mutation when one is proposed. **Approve once**
+consumes the expiring plan and then opens the native confirmation prompt;
+**Deny** consumes it without executing the action. Closing the Console or
+allowing the plan to expire does not grant permission.
+
+Launch the Console directly into this workspace with:
+
+```sh
+focaldesk-ai-console --agent
+```
+
+`just install-ai` and `just install-ai-fedora` also install the FocalDesk agent
+skill for common harness locations. The skill teaches external agents to prefer
+the typed MCP and CLI surfaces, preserve configuration, and respect native
+permission boundaries.
+
+The Console's **Coding Agents** workspace discovers supported harnesses already
+on `PATH`, stores a default selection and project directory in the private AI
+Console state, and launches the selected harness in the configured terminal.
+The initial project directory is `~/Work` when that directory exists, otherwise
+the home directory. Choose a specific repository before launching so project
+trust and conversation context attach to the intended working directory.
+FocalDesk invokes the harness directly as an argument vector and does not read
+or copy its login tokens.

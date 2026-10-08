@@ -738,6 +738,7 @@ fn rebuild_running_apps(
                     identity: identity.clone(),
                     title: window.title.clone(),
                     focused: window.focused,
+                    x11: window.x11,
                 })
                 .collect::<Vec<_>>();
             let group_ui = overflow_ui.clone();
@@ -757,6 +758,9 @@ fn rebuild_running_apps(
         };
         button.add_css_class("running-app");
         set_button_active(&button, windows.iter().any(|window| window.focused));
+        if let Some(window) = windows.iter().find(|window| window.x11) {
+            attach_x11_terminate_context_menu(&button, window.id);
+        }
         if windows.len() > 1 {
             let overlay = gtk::Overlay::new();
             overlay.set_child(Some(&button));
@@ -781,6 +785,7 @@ fn rebuild_running_apps(
                     identity: identity.clone(),
                     title: window.title.clone(),
                     focused: window.focused,
+                    x11: window.x11,
                 })
             })
             .collect::<Vec<_>>();
@@ -811,6 +816,7 @@ struct ShelfOverflowEntry {
     identity: String,
     title: String,
     focused: bool,
+    x11: bool,
 }
 
 fn present_shelf_overflow(
@@ -857,6 +863,9 @@ fn present_shelf_overflow(
             let mut state = row_state.borrow_mut();
             state.hide_after = Some(Instant::now() + TASK_SHELF_HIDE_DELAY);
         });
+        if entry.x11 {
+            attach_x11_terminate_context_menu(&row, entry.id);
+        }
         ui.list.append(&row);
     }
     if let Some(window) = ui.window.upgrade() {
@@ -867,6 +876,41 @@ fn present_shelf_overflow(
     let mut state = shelf_state.borrow_mut();
     state.overflow_open = true;
     state.hide_after = None;
+}
+
+fn attach_x11_terminate_context_menu(widget: &impl IsA<gtk::Widget>, window_id: u32) {
+    let click = gtk::GestureClick::new();
+    click.set_button(gdk::BUTTON_SECONDARY);
+    click.connect_pressed(move |gesture, _, x, y| {
+        let Some(parent) = gesture.widget() else {
+            return;
+        };
+        let popover = gtk::Popover::new();
+        popover.set_has_arrow(false);
+        popover.set_parent(&parent);
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| popover.unparent());
+
+        let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        menu.set_margin_top(6);
+        menu.set_margin_bottom(6);
+        menu.set_margin_start(6);
+        menu.set_margin_end(6);
+        let terminate = gtk::Button::with_label("Terminate application");
+        terminate.add_css_class("flat");
+        terminate.add_css_class("destructive-action");
+        terminate.set_halign(gtk::Align::Fill);
+        let popover_for_action = popover.clone();
+        terminate.connect_clicked(move |_| {
+            popover_for_action.popdown();
+            send_action(DesktopAction::TerminateX11Application { window_id });
+        });
+        menu.append(&terminate);
+        popover.set_child(Some(&menu));
+        popover.popup();
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    widget.add_controller(click);
 }
 
 fn dismiss_shelf_overflow(
@@ -2620,6 +2664,7 @@ mod tests {
             identity: "untitled".into(),
             title: "Untitled".into(),
             focused: false,
+            x11: false,
         };
         assert_eq!(shelf_window_label(&entry, 0), "Window 1");
         assert_eq!(shelf_window_label(&entry, 18), "Window 19");
@@ -2644,6 +2689,7 @@ mod tests {
             x,
             y: 0,
             scale: 1.0,
+            transform: focaldesk_settings_core::DisplayTransform::Normal,
             active_workspace_id: 1,
             focused,
             hdr_supported: false,
@@ -2660,6 +2706,7 @@ mod tests {
             title: "Terminal".into(),
             app_id: Some("terminal".into()),
             class: None,
+            x11: false,
             workspace_id: 1,
             output_id: None,
             mapped: true,

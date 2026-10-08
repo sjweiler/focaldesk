@@ -45,13 +45,16 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-ai-console",
         "focaldesk-mcp",
         "focald-voice",
+        "focald-connectors",
     ],
     allowed_units: &[
         "focaldesk-dock.service",
         "focaldesk-panel.service",
         "focaldesk-system-rail.service",
         "focaldesk-task-shelf.service",
+        "focaldesk-server.service",
         "focald-voice.service",
+        "focald-connectors.service",
     ],
 };
 
@@ -82,8 +85,13 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-ai-console",
         "focaldesk-mcp",
         "focaldesk-updatesd",
+        "focald-connectors",
     ],
-    allowed_units: &["focaldesk-automation.service", "focaldesk-updatesd.service"],
+    allowed_units: &[
+        "focaldesk-automation.service",
+        "focaldesk-updatesd.service",
+        "focald-connectors.service",
+    ],
 };
 
 pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -100,7 +108,18 @@ pub const UPDATES_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "ai",
-    allowed_executables: &["focaldesk-desktop", "focaldesk-cli", "focaldesk-ai-console"],
+    allowed_executables: &[
+        "focaldesk-desktop",
+        "focaldesk-cli",
+        "focaldesk-ai-console",
+        "focald-connectors",
+    ],
+    allowed_units: &["focald-connectors.service"],
+};
+
+pub const CONNECTOR_HOST_POLICY: PeerPolicy<'static> = PeerPolicy {
+    endpoint: "connector-host",
+    allowed_executables: &["focaldesk-cli", "focaldesk-ai-console"],
     allowed_units: &[],
 };
 
@@ -124,7 +143,7 @@ pub const LAUNCH_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const MIC_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "microphone",
-    allowed_executables: &["focaldesk-desktop", "focald-mic"],
+    allowed_executables: &["focaldesk-desktop", "focaldesk-ai-console", "focald-mic"],
     allowed_units: &["focald-mic.service"],
 };
 
@@ -136,7 +155,7 @@ pub const VOICE_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const SPEECH_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "speech",
-    allowed_executables: &["focald-mic", "focald-speech"],
+    allowed_executables: &["focald-mic", "focald-speech", "focaldesk-ai-console"],
     allowed_units: &["focald-mic.service", "focald-speech.service"],
 };
 
@@ -451,6 +470,19 @@ mod tests {
         };
 
         assert!(policy_allows(&identity, NOTIFICATIONS_POLICY));
+    }
+
+    #[test]
+    fn desktop_policy_allows_user_installed_ai_service_unit() {
+        let identity = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/home/user/.local/bin/focaldesk-server"),
+            unit: Some("focaldesk-server.service".to_string()),
+            executable_trusted: false,
+        };
+
+        assert!(policy_allows(&identity, DESKTOP_POLICY));
     }
 
     #[test]

@@ -8,6 +8,7 @@
 755 usr/libexec/focaldm-greeter
 755 usr/sbin/focaldmd
 755 usr/bin/focaldesk-server
+755 usr/bin/focaldesk-ai-registry
 755 usr/bin/focal-server
 755 usr/bin/focaldesk-remoted
 755 usr/bin/focaldesk-system-rail
@@ -28,12 +29,14 @@
 755 usr/bin/focald-voice
 755 usr/bin/focald-speech
 755 usr/bin/focald-mic
+755 usr/bin/focald-connectors
 755 usr/lib64/security/pam_focald_secrets.so
 644 usr/share/focaldesk/default.toml
 644 usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png
 644 usr/share/wayland-sessions/focaldesk.desktop
 644 usr/lib/systemd/user/focaldesk-session.target
 644 usr/lib/systemd/user/focaldesk-server.service
+644 usr/lib/systemd/user/focaldesk-ai-registry.service
 644 usr/lib/systemd/user/focal-vector.service
 644 usr/lib/systemd/user/focaldesk-remoted.service
 644 usr/lib/systemd/user/focaldesk-system-rail.service
@@ -51,6 +54,7 @@
 644 usr/lib/systemd/user/focald-voice.service
 644 usr/lib/systemd/user/focald-speech.service
 644 usr/lib/systemd/user/focald-mic.service
+644 usr/lib/systemd/user/focald-connectors.service
 644 usr/lib/systemd/system/focaldmd.service
 644 usr/lib/systemd/system/focaldesk-runtime-dir@.service
 644 usr/lib/systemd/system/focald-secrets@.service

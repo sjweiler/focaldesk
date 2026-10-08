@@ -10,6 +10,88 @@ version numbers where practical.
 
 ### Added
 
+- Added an opt-in Ambient Voice workspace to the AI Console with offline Vosk
+  wake-phrase gating, a bounded RAM-only audio buffer, visible activity state,
+  barge-in cancellation, an immediate microphone kill switch, optional
+  session-only transcripts, and routing into existing chat, agent, and workflow
+  permission boundaries.
+- Promoted microphone ownership into `focald-mic` with authenticated exclusive
+  application leases, heartbeat expiry, a bounded RAM-only event journal,
+  typed polling/clear/kill IPC, shell-visible capture state, local response
+  speech, and speech interruption on live voice activity. Console dictation and
+  ambient capture now share this single system session owner.
+- Added the AIOS Context Fabric: bounded expiring envelopes with provenance and
+  sensitivity, explicit per-agent grants, capability-policy intersection,
+  inspection/revocation/clear controls, typed IPC, and deterministic natural
+  intent routing for current-context, meeting, and troubleshooting requests.
+- Added the AIOS Attention and Routine Engine with typed event intake, three
+  declarative built-in routines, suggestion-only dispatch, explainable
+  suppression, UTC quiet hours, cooldown/hourly/deduplication limits,
+  non-mutating simulation, explicit single-use promotion, and a global pause.
+- Added the AIOS Event Fabric and Consent Center with disabled-by-default typed
+  sources, per-source supported-field allowlists and retention, a bounded
+  redacted in-memory journal, desktop/workflow hooks, non-retaining simulation,
+  redacted replay fixtures, immediate clearing, and emergency disconnect.
+- Added the Connector SDK and Trust Store with versioned manifests, five
+  disabled built-in identities, namespaced broker key handles, HMAC-SHA256
+  event authentication, freshness/replay checks, persistent consent and
+  health, explicit network-domain authority, reversible updates, and rollback.
+- Added `focald-connectors`, a managed connector host with minimized local
+  adapters, transient systemd sandboxing for declared custom runtimes,
+  resource limits, network allow rules, bounded retry/backoff and quarantine,
+  private control IPC, and AI Console runtime controls.
+- Added AIOS Mission Control with a privacy-minimized live timeline, context
+  provenance, active run/lease/grant inventory, bounded persistent audit
+  search, simulation-only replay, scoped cancellation, and a restart-persistent
+  emergency pause for proactive intake.
+- Added AIOS Scenario Lab with a deny-unknown-fields synthetic fixture schema,
+  pure shadow evaluation of voice/connector/context/routine/agent safety,
+  stable expected violation contracts, minimized Mission Control capture,
+  Console authoring, and a local nonzero-on-failure CI command.
+- Added the AIOS Package Manager for Ed25519-signed, versioned `.fai` bundles,
+  explicit local signer trust, authority inspection, required Scenario Lab
+  gates, staged activation, dependency validation, disabled-by-default packaged
+  connectors, and rollback from the Console or CLI.
+- Added AIOS Package Forge with project scaffolding, `focald-secrets`-backed
+  signer generation, deterministic build/sign/verify commands, mandatory local
+  Scenario Lab tests, an offline searchable exact-dependency registry, Console
+  authoring, and a least-authority CI template.
+- Added the opt-in private AIOS registry service and client protocol with
+  separate read/publish credentials, operator-signed catalogs, pinned keys,
+  approved signer policy, immutable versions, revocation quarantine, exact
+  lockfiles, verified explicit downloads, and minimized administrative audit.
+- AI agent runs now replan after every read-only observation, retain a bounded
+  sequenced event journal, and support long-poll run watching in AI IPC and the
+  Console while preserving explicit confirmation for mutations.
+- Agent run history and retry requests now survive daemon restarts in a private
+  SQLite database. Interrupted runs recover as failed and can be retried from
+  checkpointed read-only observations with a new ID; interrupted mutation
+  confirmations are invalidated rather than resumed.
+- Added a Rust `AgentBuilder`, enforced per-agent resource budgets,
+  declarative `agent.toml` package directories, and deterministic scripted
+  provider/mock-tool utilities for agent contract tests.
+- Added declarative scheduled and event-driven agent triggers with durable
+  source auditing, cooldown/hourly rate limits, delayed scheduler startup, and
+  the same permission and one-shot mutation confirmation boundaries as manual runs.
+- Added Agent Studio to the AI Console for visual manifest/trigger authoring,
+  normalized TOML previews, safe package installation and updates, searchable
+  durable history, and a persistent global trigger emergency switch.
+- Agent Studio now provides a live control plane with validated hot reload,
+  persistent per-agent enablement, reversible rollback, no-tool dry-run plans,
+  health and usage reporting, and daily token or explicitly priced cost ceilings.
+- Added the AIOS Supervisor for bounded multi-agent DAGs, parallel ready-node
+  execution, typed artifact handoffs, shared deadlines and token ceilings,
+  durable fail-closed recovery, lifecycle controls, and three built-in workflows.
+- Added the AIOS capability kernel with scoped manifest policies, expiring and
+  revocable per-run leases, workflow authority intersection, execution-time
+  resource checks, authority previews, live lease controls, and durable auditing.
+- Added first-class AI Console workspaces for the permissioned Desktop Agent
+  and external coding agents. Desktop Agent shows its bounded tool trace and
+  exact proposed mutation before one-shot native approval; Coding Agents
+  discovers installed harnesses, remembers a default and project directory,
+  and launches it without reading its credentials. `Super+Ctrl+Shift+A` opens
+  Desktop Agent directly, and AI installation now distributes a shared
+  FocalDesk workflow skill to common agent harness locations.
 - The login greeter now mirrors itself across every usable display, waits
   briefly for cold-start EDID negotiation, assigns compatible CRTCs per output,
   and keeps healthy outputs responsive when another connector fails or stalls.

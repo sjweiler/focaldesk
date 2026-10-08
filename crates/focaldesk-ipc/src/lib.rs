@@ -1,16 +1,20 @@
 // crates/focaldesk-ipc/src/lib.rs
+pub mod connector_host;
 pub mod controls;
 pub mod dialog;
+pub mod microphone;
 pub mod notifications;
 pub mod power;
 pub mod settings;
+pub mod speech;
 pub mod transport;
 pub mod updates;
 
 use focaldesk_config::FocalDeskConfig;
 use focaldesk_power::PowerSnapshot;
 use focaldesk_settings_core::{
-    ExclusiveHdrPhase, HdrAppearance, HdrCalibrationPattern, OutputConfig, Settings,
+    DisplayTransform, ExclusiveHdrPhase, HdrAppearance, HdrCalibrationPattern, OutputConfig,
+    Settings,
 };
 use focaldesk_themes::ThemeDocument;
 use serde::{Deserialize, Serialize};
@@ -186,6 +190,11 @@ pub enum DesktopAction {
         direction: DesktopDirection,
     },
     CloseFocused,
+    /// Ask the compositor to terminate the X11 client that owns this window.
+    /// The compositor rejects Wayland windows and unknown window IDs.
+    TerminateX11Application {
+        window_id: u32,
+    },
     SetVolume {
         percent: u8,
     },
@@ -397,6 +406,8 @@ pub struct OutputSnapshot {
     pub x: i32,
     pub y: i32,
     pub scale: f64,
+    #[serde(default)]
+    pub transform: DisplayTransform,
     pub active_workspace_id: u32,
     pub focused: bool,
     pub hdr_supported: bool,
@@ -412,6 +423,8 @@ pub struct WindowSnapshot {
     pub title: String,
     pub app_id: Option<String>,
     pub class: Option<String>,
+    #[serde(default)]
+    pub x11: bool,
     pub workspace_id: u32,
     pub output_id: Option<u64>,
     pub mapped: bool,
@@ -535,6 +548,11 @@ pub fn send_desktop_config(config: FocalDeskConfig) -> Result<(), String> {
     }
 }
 
+pub use connector_host::{
+    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, ConnectorHostIpcRequest,
+    ConnectorHostIpcResponse, ConnectorRuntimeStatus, connector_host_socket_path,
+    send_connector_host_request,
+};
 pub use controls::{
     CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME, ControlIpcRequest, ControlIpcResponse, ControlSetting,
     control_socket_path, send_control_request, serve_control_ipc,
@@ -542,6 +560,10 @@ pub use controls::{
 pub use dialog::{
     DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME, DialogIpcRequest, DialogIpcResponse, dialog_socket_path,
     send_dialog_request, serve_dialog_ipc,
+};
+pub use microphone::{
+    MICROPHONE_SOCKET_ENV, MICROPHONE_SOCKET_NAME, MicrophoneEvent, MicrophoneEventRecord,
+    MicrophoneIpcRequest, MicrophoneIpcResponse, microphone_socket_path, send_microphone_request,
 };
 pub use notifications::{
     NOTIFICATIONS_SOCKET_ENV, NOTIFICATIONS_SOCKET_NAME, NotificationIpcRequest,
@@ -553,6 +575,10 @@ pub use power::{
     send_power_request, serve_power_ipc,
 };
 pub use settings::serve_settings_ipc;
+pub use speech::{
+    SPEECH_SOCKET_ENV, SPEECH_SOCKET_NAME, SpeechCommand, SpeechIpcRequest, SpeechIpcResponse,
+    SpeechPriority, send_speech_request, speech_socket_path,
+};
 pub use updates::{
     UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME, UpdateIpcRequest, UpdateIpcResponse,
     send_update_request, serve_update_ipc, updates_socket_path,

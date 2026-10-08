@@ -117,6 +117,7 @@ impl AgentToolExecutor for RecordingTools {
 fn request() -> AgentRequest {
     AgentRequest {
         objective: "Inspect the desktop".into(),
+        agent_id: None,
         provider: Some("scripted".into()),
         model: Some("deterministic".into()),
     }
@@ -258,4 +259,43 @@ async fn tool_failure_stops_the_loop_without_requesting_synthesis() {
     );
     assert_eq!(tools.calls.lock().unwrap().len(), 1);
     assert_eq!(provider.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn agent_definition_limits_the_visible_tool_catalog() {
+    let provider = ScriptedProvider::with_responses([
+        r#"{"steps":[{"tool":"focus_window","arguments":{"id":7}}],"answer":null}"#,
+    ]);
+    let tools = RecordingTools::default();
+    let definition = focaldesk_ai::AgentDefinition {
+        manifest_version: focaldesk_ai::AGENT_MANIFEST_VERSION,
+        id: "read-only-test".into(),
+        name: "Read-only test".into(),
+        description: "test".into(),
+        instructions: "Use only inspection tools.".into(),
+        tool_allowlist: vec!["list_windows".into()],
+        max_tool_steps: 1,
+        max_context_chars: 8_000,
+        max_output_tokens: 256,
+        timeout_seconds: 30,
+        memory: false,
+        voice: false,
+        triggers: Vec::new(),
+        daily_token_limit: None,
+        daily_cost_limit_microusd: None,
+        input_cost_microusd_per_million: None,
+        output_cost_microusd_per_million: None,
+        capability_policy: None,
+        built_in: false,
+    };
+
+    let error = Agent::new("integration-agent".into())
+        .run_with_definition(&provider, &tools, request(), Some(&definition))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown tool: focus_window"));
+    assert!(tools.calls.lock().unwrap().is_empty());
+    let planning_prompt = &provider.requests.lock().unwrap()[0].messages[0].content;
+    assert!(planning_prompt.contains("list_windows"));
+    assert!(!planning_prompt.contains("focus_window"));
 }

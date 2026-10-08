@@ -2441,12 +2441,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "focald-connectors"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ai",
+ "focaldesk-ipc",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "focald-mic"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "focaldesk-ipc",
  "focaldesk-voice",
+ "rand 0.8.6",
  "serde",
  "serde_json",
 ]
@@ -2521,21 +2535,25 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs 6.0.0",
+ "ed25519-dalek",
  "focaldesk-ipc",
  "focaldesk-memory",
  "focaldesk-permissions",
  "focaldesk-secrets-client",
  "futures-util",
+ "hmac 0.12.1",
  "pdf-extract",
  "quick-xml 0.38.4",
  "rand 0.8.6",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tokio",
  "toml 0.8.23",
  "tracing",
+ "url",
  "zeroize",
  "zip",
 ]
@@ -2557,6 +2575,21 @@ dependencies = [
  "gtk4",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "focaldesk-ai-registry"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ai",
+ "focaldesk-secrets-client",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -2593,13 +2626,17 @@ name = "focaldesk-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs 6.0.0",
  "focaldesk-ai",
  "focaldesk-diagnostics",
  "focaldesk-ipc",
  "focaldesk-settings-core",
+ "serde",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
