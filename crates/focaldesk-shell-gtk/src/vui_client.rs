@@ -515,35 +515,51 @@ fn button(
     disabled: bool,
 ) -> Box<dyn Widget> {
     if let Some(icon) = button_icon(label) {
-        let accessible_label = button_accessible_label(label);
-        let click_actions = actions.clone();
-        let click_action = action.clone();
-        let icon_button = IconButton::data(icon, accessible_label, move || {
-            click_actions.borrow_mut().push(click_action.clone());
-        })
-        .disabled(disabled);
-        let control = Surface::new(icon_button)
-            .background(if selected {
-                vui_core::Color::rgba(52, 118, 168, 110)
-            } else {
-                vui_core::Color::rgba(74, 88, 110, 26)
-            })
-            .border(
-                if selected {
-                    vui_core::Color::rgba(102, 190, 244, 190)
-                } else {
-                    vui_core::Color::rgba(112, 132, 156, 70)
-                },
-                1.0,
-            )
-            .radius(14.0);
-        return Box::new(vui_core::SizedBox::new(control).width(44.0).height(44.0));
+        return status_button(
+            icon,
+            button_accessible_label(label),
+            action,
+            actions,
+            selected,
+            disabled,
+        );
     }
     let widget = Button::new(label, move || actions.borrow_mut().push(action.clone()))
         .variant(ButtonVariant::Icon)
         .selected(selected)
         .disabled(disabled);
     Box::new(vui_core::SizedBox::new(widget).width(44.0).height(44.0))
+}
+
+fn status_button(
+    icon: IconData,
+    accessible_label: String,
+    action: DesktopAction,
+    actions: Rc<RefCell<Vec<DesktopAction>>>,
+    selected: bool,
+    disabled: bool,
+) -> Box<dyn Widget> {
+    let click_actions = actions.clone();
+    let icon_button = IconButton::data(icon, accessible_label, move || {
+        click_actions.borrow_mut().push(action.clone());
+    })
+    .disabled(disabled);
+    let control = Surface::new(icon_button)
+        .background(if selected {
+            vui_core::Color::rgba(52, 118, 168, 110)
+        } else {
+            vui_core::Color::rgba(74, 88, 110, 26)
+        })
+        .border(
+            if selected {
+                vui_core::Color::rgba(102, 190, 244, 190)
+            } else {
+                vui_core::Color::rgba(112, 132, 156, 70)
+            },
+            1.0,
+        )
+        .radius(14.0);
+    Box::new(vui_core::SizedBox::new(control).width(44.0).height(44.0))
 }
 
 fn button_accessible_label(label: &str) -> String {
@@ -561,7 +577,7 @@ fn button_accessible_label(label: &str) -> String {
         "Cl" => "Calendar and clock".into(),
         "Nt" => "Notification center".into(),
         "Up" => "System updates".into(),
-        "Pw" | "Pwr" => "Battery and power".into(),
+        "Pw" | "Pwr" => "Power menu".into(),
         "Ma" => "Email".into(),
         "Br" => "Browser".into(),
         "Te" => "Terminal".into(),
@@ -578,7 +594,21 @@ fn button_icon(label: &str) -> Option<IconData> {
     let point = Point::new;
     let commands = match label {
         "AI" => return Some(IconName::Command.data()),
-        "QS" | "Se" => return Some(IconName::Settings.data()),
+        "Se" => return Some(IconName::Settings.data()),
+        "QS" => vec![
+            MoveTo(point(4.0, 7.0)),
+            LineTo(point(20.0, 7.0)),
+            MoveTo(point(4.0, 12.0)),
+            LineTo(point(20.0, 12.0)),
+            MoveTo(point(4.0, 17.0)),
+            LineTo(point(20.0, 17.0)),
+            MoveTo(point(9.0, 5.0)),
+            LineTo(point(9.0, 9.0)),
+            MoveTo(point(15.0, 10.0)),
+            LineTo(point(15.0, 14.0)),
+            MoveTo(point(7.0, 15.0)),
+            LineTo(point(7.0, 19.0)),
+        ],
         "Wi" => vec![
             MoveTo(point(4.0, 9.0)),
             CurveTo(point(8.5, 5.0), point(15.5, 5.0), point(20.0, 9.0)),
@@ -822,6 +852,28 @@ fn app_icon(icon: AppIcon) -> IconData {
     IconData::new(Size::new(24.0, 24.0), commands)
 }
 
+fn power_source_plug_icon() -> IconData {
+    use PathCommand::{CurveTo, LineTo, MoveTo};
+    let p = Point::new;
+    IconData::new(
+        Size::new(24.0, 24.0),
+        vec![
+            MoveTo(p(8.0, 4.0)),
+            LineTo(p(8.0, 10.0)),
+            MoveTo(p(16.0, 4.0)),
+            LineTo(p(16.0, 10.0)),
+            MoveTo(p(5.0, 10.0)),
+            LineTo(p(19.0, 10.0)),
+            LineTo(p(19.0, 13.0)),
+            CurveTo(p(19.0, 17.0), p(16.0, 19.0), p(12.0, 19.0)),
+            CurveTo(p(8.0, 19.0), p(5.0, 17.0), p(5.0, 13.0)),
+            LineTo(p(5.0, 10.0)),
+            MoveTo(p(12.0, 19.0)),
+            LineTo(p(12.0, 22.0)),
+        ],
+    )
+}
+
 fn open_panel(connector: &str, panel: ShellPanel) -> DesktopAction {
     DesktopAction::OpenShellPanel {
         connector: connector.to_owned(),
@@ -994,16 +1046,33 @@ fn rail_root(
                 false,
             ));
         }
-        let label = snapshot
-            .shell
-            .battery_percent
-            .map(|percent| format!("{percent}%"))
-            .unwrap_or_else(|| "Pwr".into());
-        buttons.push(button(
-            &label,
+        let shell = &snapshot.shell;
+        let externally_powered = shell.line_power_online == Some(true);
+        let status_label = match (
+            shell.battery_percent,
+            shell.line_power_online,
+            shell.battery_charging,
+        ) {
+            (Some(percent), Some(true), true) => {
+                format!("Plugged in · Battery {percent}% · charging")
+            }
+            (Some(percent), Some(true), false) => format!("Plugged in · Battery {percent}%"),
+            (Some(percent), Some(false), _) => format!("On battery · {percent}%"),
+            (Some(percent), None, true) => format!("Battery {percent}% · charging"),
+            (Some(percent), None, false) => format!("Battery {percent}%"),
+            (None, Some(true), _) => "External power".into(),
+            (None, _, _) => "Power source unavailable".into(),
+        };
+        buttons.push(status_button(
+            if externally_powered || shell.battery_charging {
+                power_source_plug_icon()
+            } else {
+                app_icon(AppIcon::Battery)
+            },
+            status_label,
             open_panel(connector, ShellPanel::Power),
             actions.clone(),
-            snapshot.shell.battery_charging,
+            shell.battery_charging,
             false,
         ));
     }
@@ -1535,6 +1604,10 @@ fn snapshot_signature(
         output.is_some_and(|output| output.hdr_requested),
         output.is_some_and(|output| output.wide_gamut_active),
         output.is_some_and(|output| output.icc_lut_fallback_active),
+    ));
+    signature.push(format!(
+        "{:?}:{}",
+        snapshot.shell.line_power_online, snapshot.shell.battery_charging,
     ));
     if role == ShellRole::Dock {
         signature.push(crate::preferred_email_command().unwrap_or_default());
