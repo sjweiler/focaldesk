@@ -93,11 +93,17 @@ impl DesktopState {
         let minimized = window.minimized;
         let rect = window.tile_rect.or(window.float_rect);
         let mapped_window = window.mapped.then(|| window.window.clone());
+        let fullscreen_rect = fullscreen
+            .then(|| {
+                self.work_recess_for_output(output_id).or_else(|| {
+                    self.outputs
+                        .get(&output_id)
+                        .and_then(|output| self.space.output_geometry(&output.handle))
+                })
+            })
+            .flatten();
         let size = if fullscreen {
-            self.outputs
-                .get(&output_id)
-                .and_then(|output| self.space.output_geometry(&output.handle))
-                .map(|rect| rect.size)
+            fullscreen_rect.map(|rect| rect.size)
         } else if maximized {
             self.work_recess_for_output(output_id).map(|rect| rect.size)
         } else {
@@ -123,7 +129,7 @@ impl DesktopState {
         self.apply_restored_xdg_split_state(window_id, surface);
         surface.send_pending_configure();
         if !minimized {
-            if let (Some(window), Some(rect)) = (mapped_window, rect) {
+            if let (Some(window), Some(rect)) = (mapped_window, fullscreen_rect.or(rect)) {
                 self.map_window_bbox_location(window, rect.loc, false);
             }
         }

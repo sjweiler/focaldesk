@@ -7635,6 +7635,40 @@ impl DesktopState {
         }
     }
 
+    fn reflow_constrained_windows_for_output(&mut self, output_id: OutputId) {
+        let Some(work) = self.work_recess_for_output(output_id) else {
+            return;
+        };
+        let windows: Vec<_> = self
+            .windows
+            .iter()
+            .filter(|window| {
+                window.output == Some(output_id)
+                    && window.mapped
+                    && !window.minimized
+                    && (window.fullscreen || window.maximized)
+            })
+            .map(|window| window.window.clone())
+            .collect();
+
+        for window in windows {
+            let old_bbox = self.global_window_bbox(&window);
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| state.size = Some(work.size));
+                toplevel.send_pending_configure();
+            }
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.configure(work);
+            }
+            self.map_window_bbox_location(window.clone(), work.loc, true);
+            if let Some(rect) = old_bbox {
+                self.mark_window_bbox_damage_source(rect, DamageSource::WindowResize);
+            }
+            self.mark_window_bbox_damage_source(work, DamageSource::WindowResize);
+        }
+        self.space.refresh();
+    }
+
     fn restore_displaced_split_windows(&mut self, outputs_by_name: &HashMap<String, OutputId>) {
         let candidates: Vec<_> = self
             .displaced_split_windows
@@ -7684,6 +7718,7 @@ impl DesktopState {
         }
         for (output_id, old_work) in changes {
             self.reflow_split_windows_for_output(output_id, old_work);
+            self.reflow_constrained_windows_for_output(output_id);
         }
 
         let outputs_by_name = self
@@ -9401,9 +9436,12 @@ impl DesktopState {
             self.xwayland_request_fills_output(output_id, requested_geometry.size);
         let (bbox_location, configure_size, maximize_on_map) = if restored_fullscreen {
             let geometry = self
-                .outputs
-                .get(&output_id)
-                .and_then(|output| self.space.output_geometry(&output.handle))
+                .work_recess_for_output(output_id)
+                .or_else(|| {
+                    self.outputs
+                        .get(&output_id)
+                        .and_then(|output| self.space.output_geometry(&output.handle))
+                })
                 .unwrap_or(requested_geometry);
             (geometry.loc, geometry.size, false)
         } else if restored_maximized {
@@ -11443,6 +11481,7 @@ impl DesktopState {
         }
         if let Some(old_work) = old_work {
             self.reflow_split_windows_for_output(output_id, old_work);
+            self.reflow_constrained_windows_for_output(output_id);
         }
         if let Some(work) = self.work_recess_for_output(output_id) {
             self.split_work_areas.insert(output_id, work);
@@ -13910,13 +13949,19 @@ impl DesktopState {
 
         if fullscreen {
             let rect = self
-                .outputs
-                .get(&output_id)
-                .and_then(|output| self.space.output_geometry(&output.handle))
+                .work_recess_for_output(output_id)
                 .or_else(|| {
                     self.outputs
-                        .get(&self.primary_output)
+                        .get(&output_id)
                         .and_then(|output| self.space.output_geometry(&output.handle))
+                })
+                .or_else(|| {
+                    self.work_recess_for_output(self.primary_output)
+                        .or_else(|| {
+                            self.outputs
+                                .get(&self.primary_output)
+                                .and_then(|output| self.space.output_geometry(&output.handle))
+                        })
                 });
 
             let Some(rect) = rect else {

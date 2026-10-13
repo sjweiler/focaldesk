@@ -28,7 +28,7 @@ fn constrained_window_geometry(
     work_area: Option<Rectangle<i32, Logical>>,
 ) -> Option<Rectangle<i32, Logical>> {
     if fullscreen {
-        output
+        work_area.or(output)
     } else if maximized {
         work_area.or(output)
     } else {
@@ -494,13 +494,13 @@ mod tests {
     use smithay::utils::Rectangle;
 
     #[test]
-    fn fullscreen_geometry_wins_over_maximized_work_area() {
+    fn fullscreen_geometry_respects_reserved_work_area() {
         let output = Rectangle::from_loc_and_size((0, 0), (3840, 2160));
         let work_area = Rectangle::from_loc_and_size((0, 40), (3840, 2120));
 
         assert_eq!(
             constrained_window_geometry(true, true, Some(output), Some(work_area)),
-            Some(output)
+            Some(work_area)
         );
     }
 
