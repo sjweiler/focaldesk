@@ -146,6 +146,18 @@ release-focald-secrets:
 release-shell:
     cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf
 
+# Opt into the Vello UI shell-layer clients on the next login.
+enable-vui-shell:
+    install -Dm644 packaging/vui-shell/90-focaldesk-vui-shell.conf "$HOME/.config/environment.d/90-focaldesk-vui-shell.conf"
+    systemctl --user daemon-reload || echo "Skipping user daemon reload: no user bus available"
+    @echo "Vello UI rail and dock layer clients enabled for the next login"
+
+# Restore the GTK rail and task shelf on the next login.
+disable-vui-shell:
+    rm -f "$HOME/.config/environment.d/90-focaldesk-vui-shell.conf"
+    systemctl --user daemon-reload || echo "Skipping user daemon reload: no user bus available"
+    @echo "GTK shell fallback enabled for the next login"
+
 install-server-service:
     cargo build --release -p focaldesk-server
     install -Dm755 target/release/focaldesk-server "$HOME/.local/bin/focaldesk-server"

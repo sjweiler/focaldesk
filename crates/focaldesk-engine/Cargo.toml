@@ -20,6 +20,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zeroize.workspace = true
 focaldesk-ui = { path = "../focaldesk-ui" }
 focaldesk-render = { path = "../focaldesk-render", default-features = false, optional = true }
+vui-core = { path = "../../../vello-ui/crates/vui-core", optional = true }
+vui-vello = { path = "../../../vello-ui/crates/vui-vello", optional = true }
+vui-ash = { path = "../../../vello-ui/crates/vui-ash", optional = true }
+ash = { workspace = true, optional = true }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
 focaldesk-flow = { path = "../focaldesk-flow" }
@@ -67,10 +71,22 @@ md5 = "0.7"
 [features]
 default = ["winit"]
 winit = ["dep:winit"]
-wgpu = ["dep:winit", "dep:focaldesk-render", "focaldesk-render/wgpu"]
+wgpu = [
+    "dep:winit",
+    "dep:focaldesk-render",
+    "dep:vui-core",
+    "dep:vui-vello",
+    "focaldesk-render/wgpu",
+]
 xwayland = ["smithay/xwayland"]
 drm = []
-drm-vulkan = ["drm", "wgpu", "focaldesk-render/ash-drm"]
+drm-vulkan = [
+    "drm",
+    "wgpu",
+    "dep:vui-ash",
+    "dep:ash",
+    "focaldesk-render/ash-drm",
+]
 # Compatibility alias for existing build scripts. The DRM renderer is raw ash;
 # wgpu is used only by the nested backend and shared scene extraction code.
 drm-wgpu = ["drm-vulkan"]

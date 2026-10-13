@@ -3479,6 +3479,15 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
     state: &mut DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
 ) {
+    if let Some(event) = translate_backend_input_event(state, input) {
+        state.handle_input(event);
+    }
+}
+
+pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBackend>(
+    state: &DesktopState,
+    input: &smithay::backend::input::InputEvent<B>,
+) -> Option<crate::core::input::FlowInputEvent> {
     use smithay::backend::input::InputEvent;
 
     let output_id = state
@@ -3504,14 +3513,15 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
         _ => state.logical_pointer_clamp_rect(),
     };
 
-    if let Some(mut event) = translate_backend_input(
+    translate_backend_input(
         input,
         state.input.pointer_pos,
         clamp_rect,
         output_transform,
         scale,
         state.input.modifiers,
-    ) {
+    )
+    .map(|mut event| {
         if matches!(input, InputEvent::PointerMotion { .. }) {
             if let crate::core::input::FlowInputEvent::PointerMoved { position, .. } = &mut event {
                 let scale = scale.max(1.0);
@@ -3530,8 +3540,8 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
                 ));
             }
         }
-        state.handle_input(event);
-    }
+        event
+    })
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {

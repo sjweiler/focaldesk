@@ -522,6 +522,15 @@ struct CachedTexture {
     last_used_frame: u64,
 }
 
+struct BorrowedTexture {
+    image: vk::Image,
+    view: vk::ImageView,
+    descriptor_set: vk::DescriptorSet,
+    width: u32,
+    height: u32,
+    format: FramePixelFormat,
+}
+
 #[derive(Clone, Copy)]
 struct DrawTexture {
     image: vk::Image,
@@ -769,6 +778,8 @@ pub struct AshDrmRenderer {
     linear_scenes: HashMap<u64, LinearScene>,
     output_resources: HashMap<u64, OutputResources>,
     texture_cache: HashMap<u64, CachedTexture>,
+    borrowed_textures: HashMap<u64, BorrowedTexture>,
+    retired_borrowed_descriptors: Vec<vk::DescriptorSet>,
     frame_no: u64,
     pending: Vec<PendingFrame>,
     completed_captures: VecDeque<AshDrmCapture>,
@@ -1040,6 +1051,8 @@ impl AshDrmRenderer {
             linear_scenes: HashMap::new(),
             output_resources: HashMap::new(),
             texture_cache: HashMap::new(),
+            borrowed_textures: HashMap::new(),
+            retired_borrowed_descriptors: Vec::new(),
             frame_no: 0,
             pending: Vec::new(),
             completed_captures: VecDeque::new(),
@@ -1059,6 +1072,112 @@ impl AshDrmRenderer {
 
     pub fn info(&self) -> &RendererInfo {
         &self.info
+    }
+
+    /// Vulkan instance used by the raw compositor renderer.
+    pub fn instance(&self) -> &ash::Instance {
+        &self.instance
+    }
+
+    /// Physical device used by the raw compositor renderer.
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// Logical device used by the raw compositor renderer.
+    pub fn device(&self) -> &ash::Device {
+        &self.device
+    }
+
+    /// Graphics queue used by the raw compositor renderer.
+    pub fn queue(&self) -> vk::Queue {
+        self.queue
+    }
+
+    /// Graphics queue-family index used by the raw compositor renderer.
+    pub fn queue_family(&self) -> u32 {
+        self.queue_family
+    }
+
+    /// Registers a same-device image that remains owned by another renderer.
+    ///
+    /// The caller keeps the image and view alive and in
+    /// `SHADER_READ_ONLY_OPTIMAL` while frames referring to `cache_key` may be
+    /// in flight. Queue access must be externally synchronized.
+    pub fn register_borrowed_texture(
+        &mut self,
+        cache_key: u64,
+        image: vk::Image,
+        view: vk::ImageView,
+        width: u32,
+        height: u32,
+        format: FramePixelFormat,
+    ) -> Result<()> {
+        ensure!(image != vk::Image::null(), "borrowed Vulkan image is null");
+        ensure!(
+            view != vk::ImageView::null(),
+            "borrowed Vulkan image view is null"
+        );
+        ensure!(width > 0 && height > 0, "borrowed Vulkan image is empty");
+        if self
+            .borrowed_textures
+            .get(&cache_key)
+            .is_some_and(|texture| {
+                texture.image == image
+                    && texture.view == view
+                    && texture.width == width
+                    && texture.height == height
+                    && texture.format == format
+            })
+        {
+            return Ok(());
+        }
+        let layouts = [self.descriptor_layout];
+        let descriptor_set = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&layouts),
+            )?
+        }[0];
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_view(view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let sampler_info = [vk::DescriptorImageInfo::default().sampler(self.sampler)];
+        unsafe {
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(0)
+                        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                        .image_info(&image_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(descriptor_set)
+                        .dst_binding(1)
+                        .descriptor_type(vk::DescriptorType::SAMPLER)
+                        .image_info(&sampler_info),
+                ],
+                &[],
+            );
+        }
+        if let Some(previous) = self.borrowed_textures.insert(
+            cache_key,
+            BorrowedTexture {
+                image,
+                view,
+                descriptor_set,
+                width,
+                height,
+                format,
+            },
+        ) {
+            // Descriptor sets can still be referenced by queued compositor
+            // work. Retain replacements until device-idle teardown.
+            self.retired_borrowed_descriptors
+                .push(previous.descriptor_set);
+        }
+        Ok(())
     }
 
     /// Formats the renderer can use as GBM scanout render targets.
@@ -1459,6 +1578,19 @@ impl AshDrmRenderer {
         let output_descriptor = self.output_resources[&stream_id].descriptor_set;
         let output_grid_size = self.output_resources[&stream_id].grid_size;
         for surface in surfaces {
+            if let Some(texture) = self.borrowed_textures.get(&surface.cache_key) {
+                if texture.width == surface.width
+                    && texture.height == surface.height
+                    && texture.format == surface.format
+                {
+                    textures.push(Some(DrawTexture {
+                        image: texture.image,
+                        descriptor_set: texture.descriptor_set,
+                        foreign: false,
+                    }));
+                    continue;
+                }
+            }
             let modifier = surface.dmabuf.as_ref().map(|dmabuf| dmabuf.modifier);
             let compatible = self
                 .texture_cache
@@ -3539,6 +3671,17 @@ impl Drop for AshDrmRenderer {
                     .destroy_image_view(cached.resource.image.view, None);
                 self.device.destroy_image(cached.resource.image.image, None);
                 self.device.free_memory(cached.resource.image.memory, None);
+            }
+            let borrowed = self
+                .borrowed_textures
+                .drain()
+                .map(|(_, texture)| texture.descriptor_set)
+                .chain(self.retired_borrowed_descriptors.drain(..))
+                .collect::<Vec<_>>();
+            if !borrowed.is_empty() {
+                self.device
+                    .free_descriptor_sets(self.descriptor_pool, &borrowed)
+                    .ok();
             }
             for (_, pipeline) in self.pipelines.drain() {
                 self.device.destroy_pipeline(pipeline.solid, None);

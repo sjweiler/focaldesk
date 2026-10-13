@@ -40,7 +40,7 @@ fn rect_area(rect: Rectangle<i32, Physical>) -> i64 {
     i64::from(rect.size.w.max(0)) * i64::from(rect.size.h.max(0))
 }
 
-fn damage_area_percent(
+pub(crate) fn damage_area_percent(
     damage: &[Rectangle<i32, Physical>],
     output_size: Size<i32, Physical>,
 ) -> i64 {
@@ -59,7 +59,10 @@ fn damage_area_permyriad(
     (damage_area * 10_000 / output_area.max(1)).clamp(0, 10_000)
 }
 
-fn is_full_damage(damage: &[Rectangle<i32, Physical>], output_size: Size<i32, Physical>) -> bool {
+pub(crate) fn is_full_damage(
+    damage: &[Rectangle<i32, Physical>],
+    output_size: Size<i32, Physical>,
+) -> bool {
     damage.len() == 1 && damage[0] == Rectangle::from_loc_and_size((0, 0), output_size)
 }
 
@@ -262,6 +265,7 @@ pub fn prepare_output(
                 damage_area_percent(&frame_damage, buffer_size),
                 true,
                 state.render.redraw_all,
+                &frame_damage,
             );
             frame_damage
         } else {
@@ -276,6 +280,7 @@ pub fn prepare_output(
                 damage_area_percent(&frame_damage, buffer_size),
                 is_full_damage(&frame_damage, buffer_size),
                 false,
+                &frame_damage,
             );
             frame_damage
         }

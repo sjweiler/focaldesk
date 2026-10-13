@@ -19,7 +19,7 @@ use wgpu::{
 use winit::window::Window;
 
 use crate::{
-    DrmRenderNode, FramePixelFormat, FrameRetention, FrameTransform, GraphicsApi,
+    DrmRenderNode, FramePixelFormat, FrameRetention, FrameTransform, GraphicsApi, LinuxDmabuf,
     LinuxDmabufFormat, PresentRenderer, PresentResult, RendererInfo, SolidQuad, TextureQuad,
 };
 
@@ -154,7 +154,7 @@ fn clamp_damage(damage: &[[i32; 4]], width: u32, height: u32) -> Vec<[u32; 4]> {
 }
 
 struct CachedTexture {
-    _texture: wgpu::Texture,
+    _texture: Option<wgpu::Texture>,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -329,6 +329,58 @@ impl WgpuVulkanRenderer {
         self.device
             .features()
             .contains(Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+    }
+
+    /// The compositor-owned device used by embedded GPU renderers.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The compositor-owned queue used by embedded GPU renderers.
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    /// Registers a texture rendered on this renderer's device for composition.
+    ///
+    /// The caller must keep `texture` alive while submitting quads with
+    /// `cache_key`. The bind group retains the underlying GPU resource, while
+    /// ownership remains with the embedded renderer so it can redraw in place.
+    pub fn register_shared_texture(
+        &mut self,
+        cache_key: u64,
+        texture: &wgpu::Texture,
+        width: u32,
+        height: u32,
+        format: FramePixelFormat,
+    ) {
+        let texture_view = texture.create_view(&TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
+            label: Some("focaldesk-shared-texture-bind-group"),
+            layout: &self.surface_bind_group_layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&texture_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&self.surface_sampler),
+                },
+            ],
+        });
+        self.texture_cache.insert(
+            cache_key,
+            CachedTexture {
+                _texture: None,
+                bind_group,
+                width,
+                height,
+                format,
+                external: true,
+                last_used_frame: self.frame_no,
+            },
+        );
     }
 
     pub fn dmabuf_import_stats(&self) -> (u64, u64) {
@@ -863,7 +915,7 @@ impl PresentRenderer for WgpuVulkanRenderer {
                 self.texture_cache.insert(
                     surface.cache_key,
                     CachedTexture {
-                        _texture: texture,
+                        _texture: Some(texture),
                         bind_group,
                         width: surface.width,
                         height: surface.height,
@@ -895,7 +947,10 @@ impl PresentRenderer for WgpuVulkanRenderer {
                 let offset = u64::from(y) * u64::from(surface.stride) + u64::from(x) * 4;
                 self.queue.write_texture(
                     TexelCopyTextureInfo {
-                        texture: &cached._texture,
+                        texture: cached
+                            ._texture
+                            .as_ref()
+                            .expect("upload-backed texture must be owned by the cache"),
                         mip_level: 0,
                         origin: wgpu::Origin3d { x, y, z: 0 },
                         aspect: TextureAspect::All,
@@ -1131,6 +1186,356 @@ impl PresentRenderer for WgpuVulkanRenderer {
         } else {
             Ok(PresentResult::Presented)
         }
+    }
+}
+
+/// Vulkan/wgpu device used to render directly into compositor-owned DMA-BUFs.
+///
+/// The bridge deliberately completes the producer submission before returning
+/// the buffer to the raw-ash compositor. That costs a queue wait when VUI
+/// changes, but keeps the common unchanged-frame path free and removes the
+/// readback/upload copy without relying on implicit cross-device ordering.
+#[cfg(all(unix, feature = "ash-drm"))]
+pub struct WgpuDmabufDevice {
+    _instance: wgpu::Instance,
+    _adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    raw_device: ash::Device,
+    raw_queue: ash::vk::Queue,
+    queue_family: u32,
+    command_pool: ash::vk::CommandPool,
+    formats: Vec<LinuxDmabufFormat>,
+}
+
+#[cfg(all(unix, feature = "ash-drm"))]
+pub struct WgpuDmabufTexture {
+    pub texture: wgpu::Texture,
+    pub dmabuf: LinuxDmabuf,
+    pub width: u32,
+    pub height: u32,
+    raw_image: ash::vk::Image,
+    initialized: std::cell::Cell<bool>,
+}
+
+#[cfg(all(unix, feature = "ash-drm"))]
+impl WgpuDmabufDevice {
+    pub fn new(node: DrmRenderNode) -> Result<Self> {
+        use wgpu::hal::api::Vulkan;
+
+        let mut instance_descriptor = InstanceDescriptor::new_without_display_handle();
+        instance_descriptor.backends = Backends::VULKAN;
+        let instance = wgpu::Instance::new(instance_descriptor);
+        let adapters = pollster::block_on(instance.enumerate_adapters(Backends::VULKAN));
+        let adapter = adapters
+            .into_iter()
+            .find(|adapter| vulkan_dmabuf_capabilities(adapter).1 == Some(node))
+            .context("find Vulkan adapter for the compositor DRM node")?;
+        let required_features = adapter.features() & Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        ensure!(
+            required_features.contains(Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF),
+            "Vulkan adapter cannot import DMA-BUF storage images"
+        );
+        let descriptor = DeviceDescriptor {
+            label: Some("focaldesk-vui-dmabuf-device"),
+            required_features,
+            ..Default::default()
+        };
+        let open = unsafe {
+            let hal_adapter = adapter
+                .as_hal::<Vulkan>()
+                .context("wgpu Vulkan HAL adapter is unavailable")?;
+            hal_adapter.open_with_callback(
+                descriptor.required_features,
+                &descriptor.required_limits,
+                &descriptor.memory_hints,
+                Some(Box::new(|args| {
+                    if !args
+                        .extensions
+                        .contains(&ash::ext::queue_family_foreign::NAME)
+                    {
+                        args.extensions.push(ash::ext::queue_family_foreign::NAME);
+                    }
+                })),
+            )?
+        };
+        let (device, queue) =
+            unsafe { adapter.create_device_from_hal::<Vulkan>(open, &descriptor) }
+                .context("create VUI DMA-BUF Vulkan device")?;
+        let (raw_device, queue_family) = unsafe {
+            let hal_device = device
+                .as_hal::<Vulkan>()
+                .context("wgpu Vulkan HAL device is unavailable")?;
+            (
+                hal_device.raw_device().clone(),
+                hal_device.queue_family_index(),
+            )
+        };
+        let raw_queue = unsafe {
+            queue
+                .as_hal::<Vulkan>()
+                .context("wgpu Vulkan HAL queue is unavailable")?
+                .as_raw()
+        };
+        let command_pool = unsafe {
+            raw_device.create_command_pool(
+                &ash::vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family)
+                    .flags(ash::vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            )
+        }
+        .context("create VUI DMA-BUF command pool")?;
+        let formats = vulkan_dmabuf_capabilities(&adapter)
+            .0
+            .into_iter()
+            .filter(|format| format.format == FramePixelFormat::Rgba8Srgb)
+            .collect();
+        Ok(Self {
+            _instance: instance,
+            _adapter: adapter,
+            device,
+            queue,
+            raw_device,
+            raw_queue,
+            queue_family,
+            command_pool,
+            formats,
+        })
+    }
+
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
+    pub fn formats(&self) -> &[LinuxDmabufFormat] {
+        &self.formats
+    }
+
+    pub fn import(
+        &self,
+        dmabuf: LinuxDmabuf,
+        width: u32,
+        height: u32,
+    ) -> Result<WgpuDmabufTexture> {
+        use wgpu::hal::{self, api::Vulkan};
+        ensure!(dmabuf.planes.len() == 1, "VUI DMA-BUF must have one plane");
+        let descriptor = TextureDescriptor {
+            label: Some("focaldesk-vui-dmabuf-texture"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        };
+        let hal_descriptor = hal::TextureDescriptor {
+            label: descriptor.label,
+            size: descriptor.size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: descriptor.dimension,
+            format: descriptor.format,
+            usage: TextureUses::STORAGE_READ_WRITE | TextureUses::RESOURCE,
+            memory_flags: hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        let fd = dmabuf.planes[0]
+            .try_clone()
+            .context("duplicate VUI DMA-BUF fd")?;
+        let (texture, raw_image) = unsafe {
+            let hal_device = self
+                .device
+                .as_hal::<Vulkan>()
+                .context("Vulkan HAL device unavailable")?;
+            let hal_texture = hal_device.texture_from_dmabuf_fd(
+                fd,
+                &hal_descriptor,
+                dmabuf.modifier,
+                u64::from(dmabuf.strides[0]),
+                u64::from(dmabuf.offsets[0]),
+            )?;
+            let raw_image = hal_texture.raw_handle();
+            let texture = self.device.create_texture_from_hal::<Vulkan>(
+                hal_texture,
+                &descriptor,
+                TextureUses::STORAGE_READ_WRITE,
+            );
+            (texture, raw_image)
+        };
+        Ok(WgpuDmabufTexture {
+            texture,
+            dmabuf,
+            width,
+            height,
+            raw_image,
+            initialized: std::cell::Cell::new(false),
+        })
+    }
+
+    pub fn acquire_for_write(&self, texture: &WgpuDmabufTexture) -> Result<()> {
+        wait_for_dmabuf_reservation(&texture.dmabuf)?;
+        let initialized = texture.initialized.get();
+        self.ownership_barrier(
+            texture.raw_image,
+            if initialized {
+                ash::vk::QUEUE_FAMILY_FOREIGN_EXT
+            } else {
+                ash::vk::QUEUE_FAMILY_IGNORED
+            },
+            self.queue_family,
+            if initialized {
+                ash::vk::AccessFlags::MEMORY_READ
+            } else {
+                ash::vk::AccessFlags::empty()
+            },
+            ash::vk::AccessFlags::SHADER_WRITE,
+            if initialized {
+                ash::vk::ImageLayout::GENERAL
+            } else {
+                ash::vk::ImageLayout::UNDEFINED
+            },
+            ash::vk::ImageLayout::GENERAL,
+        )
+    }
+
+    pub fn release_after_write(&self, texture: &WgpuDmabufTexture) -> Result<()> {
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
+            .context("wait for Vello DMA-BUF rendering")?;
+        self.ownership_barrier(
+            texture.raw_image,
+            self.queue_family,
+            ash::vk::QUEUE_FAMILY_FOREIGN_EXT,
+            ash::vk::AccessFlags::SHADER_WRITE,
+            ash::vk::AccessFlags::MEMORY_READ,
+            ash::vk::ImageLayout::GENERAL,
+            ash::vk::ImageLayout::GENERAL,
+        )?;
+        texture.initialized.set(true);
+        Ok(())
+    }
+
+    fn ownership_barrier(
+        &self,
+        image: ash::vk::Image,
+        source_family: u32,
+        destination_family: u32,
+        source_access: ash::vk::AccessFlags,
+        destination_access: ash::vk::AccessFlags,
+        old_layout: ash::vk::ImageLayout,
+        new_layout: ash::vk::ImageLayout,
+    ) -> Result<()> {
+        use ash::vk;
+        unsafe {
+            self.raw_device
+                .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())?;
+            let command = self.raw_device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )?[0];
+            self.raw_device.begin_command_buffer(
+                command,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
+            let barrier = vk::ImageMemoryBarrier::default()
+                .src_access_mask(source_access)
+                .dst_access_mask(destination_access)
+                .old_layout(old_layout)
+                .new_layout(new_layout)
+                .src_queue_family_index(source_family)
+                .dst_queue_family_index(destination_family)
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                );
+            self.raw_device.cmd_pipeline_barrier(
+                command,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            self.raw_device.end_command_buffer(command)?;
+            self.raw_device.queue_submit(
+                self.raw_queue,
+                &[vk::SubmitInfo::default().command_buffers(&[command])],
+                vk::Fence::null(),
+            )?;
+            self.raw_device.queue_wait_idle(self.raw_queue)?;
+            self.raw_device
+                .free_command_buffers(self.command_pool, &[command]);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(all(unix, feature = "ash-drm"))]
+impl Drop for WgpuDmabufDevice {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.raw_device.device_wait_idle();
+            self.raw_device
+                .destroy_command_pool(self.command_pool, None);
+        }
+    }
+}
+
+#[cfg(all(unix, feature = "ash-drm"))]
+fn wait_for_dmabuf_reservation(dmabuf: &LinuxDmabuf) -> Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    #[repr(C)]
+    struct ExportSyncFile {
+        flags: u32,
+        fd: i32,
+    }
+    nix::ioctl_readwrite!(export_sync_file, b'b', 2, ExportSyncFile);
+    let Some(plane) = dmabuf.planes.first() else {
+        return Ok(());
+    };
+    let mut export = ExportSyncFile { flags: 3, fd: -1 };
+    match unsafe { export_sync_file(plane.as_raw_fd(), &mut export) } {
+        Ok(_) if export.fd >= 0 => {
+            let fence = unsafe { OwnedFd::from_raw_fd(export.fd) };
+            let mut poll = libc::pollfd {
+                fd: fence.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let result = unsafe { libc::poll(&mut poll, 1, 5000) };
+            ensure!(
+                result > 0,
+                "timed out waiting for compositor DMA-BUF readers"
+            );
+            Ok(())
+        }
+        Err(nix::errno::Errno::ENOTTY | nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {
+            Ok(())
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "DMA-BUF fence export returned no sync file"
+        )),
+        Err(error) => Err(error).context("export DMA-BUF reservation fence"),
     }
 }
 

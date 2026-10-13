@@ -51,12 +51,15 @@ use super::common::{
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    connector_edid, disable_explicit_kms_fences, dispatch_backend_input_event, drm_card_vendor_id,
-    hdr_appearance_from_support, hdr_detection, load_display_config,
-    merge_disconnected_display_configs, parse_edid_identity, saved_monitor_config,
-    select_connector_mode, write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
+    connector_edid, disable_explicit_kms_fences, drm_card_vendor_id, hdr_appearance_from_support,
+    hdr_detection, load_display_config, merge_disconnected_display_configs, parse_edid_identity,
+    saved_monitor_config, select_connector_mode, translate_backend_input_event,
+    write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
 };
+use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
+use crate::core::backend_render::{damage_area_percent, is_full_damage};
+use crate::core::input::{FlowInputEvent, FlowKeyState};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -315,8 +318,12 @@ struct VulkanDrmData {
     desktop: NestedDesktop,
     #[cfg(feature = "xwayland")]
     xwayland_event_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
+    // Must drop before the host renderer whose Vulkan device it borrows.
+    vui_shell: Option<VuiShell>,
     renderer: AshDrmRenderer,
     scene_builder: VulkanSceneBuilder,
+    vui_output: Option<OutputId>,
+    vui_text_keys: HashSet<u32>,
     drm: DrmDevice,
     drm_fd: DrmDeviceFd,
     primary_node: DrmNode,
@@ -334,6 +341,231 @@ struct VulkanDrmData {
     screenshot_all_captures: HashMap<OutputId, (u32, u32, Vec<u8>)>,
     fatal_error: Option<anyhow::Error>,
     surface_blocker_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
+}
+
+fn configure_vui_shell(data: &mut VulkanDrmData) {
+    data.vui_text_keys.clear();
+    if !VuiShell::enabled_from_env() {
+        data.vui_shell = None;
+        data.vui_output = None;
+        return;
+    }
+
+    let output_id = data.desktop.state.primary_output;
+    let Some(output) = data
+        .outputs
+        .iter()
+        .find(|output| output.output_id == output_id)
+    else {
+        flog_warn!("VUI shell not started because the primary DRM output is unavailable");
+        data.vui_shell = None;
+        data.vui_output = None;
+        return;
+    };
+    let content_size: Size<i32, Physical> = output
+        .transform
+        .invert()
+        .transform_size(Size::from((output.width as i32, output.height as i32)));
+    let scale_factor = data
+        .desktop
+        .state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.scale_factor)
+        .unwrap_or(1.0);
+    let initial = QuickSettingsState {
+        wifi: data.desktop.state.network_state.wifi.is_some(),
+        bluetooth: false,
+        do_not_disturb: data.desktop.state.do_not_disturb,
+        volume: 0.7,
+    };
+    let mut shell = VuiShell::new(
+        u32::try_from(content_size.w).unwrap_or(1),
+        u32::try_from(content_size.h).unwrap_or(1),
+        scale_factor,
+        initial,
+    );
+    let ash_result = unsafe {
+        shell.use_ash_renderer(
+            data.renderer.instance(),
+            data.renderer.physical_device(),
+            data.renderer.device(),
+            data.renderer.queue(),
+            data.renderer.queue_family(),
+        )
+    };
+    if let Err(error) = ash_result {
+        flog_warn!("VUI raw Vulkan renderer unavailable: {error:#}");
+        data.vui_shell = None;
+        data.vui_output = None;
+        return;
+    }
+    flog("VUI raw Vulkan shell is using the compositor's Ash device");
+    data.vui_shell = Some(shell);
+    data.vui_output = Some(output_id);
+    data.desktop
+        .state
+        .mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+    flog(format!(
+        "enabled experimental VUI compositor shell on raw Vulkan output {}",
+        output.name
+    ));
+}
+
+fn vui_event(event: &FlowInputEvent) -> FlowInputEvent {
+    let mut event = event.clone();
+    if let FlowInputEvent::Key { keycode, .. } = &mut event {
+        *keycode = keycode.saturating_sub(8);
+    }
+    event
+}
+
+fn sync_vui_shell_context(data: &mut VulkanDrmData) {
+    let session_locked = data.desktop.state.lock_screen.active;
+    let right_inset = data
+        .vui_output
+        .and_then(|output_id| data.desktop.state.outputs.get(&output_id))
+        .map(|output| {
+            crate::core::wayland::trusted_shell::reservation_for_output(&output.handle).right
+        })
+        .unwrap_or_default();
+    if let Some(shell) = data.vui_shell.as_mut() {
+        shell.set_session_locked(session_locked);
+        shell.set_right_inset(f64::from(right_inset));
+    }
+    if session_locked {
+        data.vui_text_keys.clear();
+    }
+}
+
+fn trusted_shell_ready_for_output(data: &VulkanDrmData, output_id: OutputId) -> bool {
+    data.desktop
+        .state
+        .outputs
+        .get(&output_id)
+        .is_some_and(|output| {
+            let presence = crate::core::wayland::trusted_shell::presence_for_output(&output.handle);
+            presence.system_rail
+                && presence.task_shelf
+                && data
+                    .desktop
+                    .state
+                    .trusted_shell_ready_for_connector(&output.handle.name())
+        })
+}
+
+fn dispatch_pending_vui_request(data: &mut VulkanDrmData) {
+    let Some(output_id) = data.desktop.state.take_vui_quick_settings_request() else {
+        return;
+    };
+    if data.vui_output != Some(output_id) {
+        flog_warn!("ignoring Quick Settings request for an output without a VUI shell");
+        return;
+    }
+    sync_vui_shell_context(data);
+    if data
+        .vui_shell
+        .as_mut()
+        .is_some_and(VuiShell::toggle_quick_settings)
+    {
+        data.desktop
+            .state
+            .mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+    }
+}
+
+fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
+    data: &mut VulkanDrmData,
+    input: &InputEvent<B>,
+) {
+    let Some(event) = translate_backend_input_event(&data.desktop.state, input) else {
+        return;
+    };
+    sync_vui_shell_context(data);
+    let fallback_input_active = data.vui_output.map_or(true, |output_id| {
+        !trusted_shell_ready_for_output(data, output_id)
+            || data
+                .vui_shell
+                .as_ref()
+                .is_some_and(VuiShell::quick_settings_open)
+    });
+    let origin = data
+        .vui_output
+        .and_then(|output_id| data.desktop.state.outputs.get(&output_id))
+        .map(|output| {
+            let shell_origin = data
+                .vui_shell
+                .as_ref()
+                .map_or((0.0, 0.0), VuiShell::input_origin);
+            (
+                f64::from(output.logical_origin.x) + shell_origin.0,
+                f64::from(output.logical_origin.y) + shell_origin.1,
+            )
+        })
+        .unwrap_or((0.0, 0.0));
+
+    if let FlowInputEvent::Key {
+        keycode,
+        state: FlowKeyState::Released,
+        ..
+    } = &event
+    {
+        if fallback_input_active && data.vui_text_keys.remove(&keycode) {
+            return;
+        }
+    }
+
+    let text_handled = fallback_input_active
+        && match &event {
+            FlowInputEvent::Key {
+                keycode,
+                state: FlowKeyState::Pressed,
+                modifiers,
+                ..
+            } => crate::core::desktop::DesktopState::egui_text_for_keycode(*keycode, *modifiers)
+                .is_some_and(|text| {
+                    data.vui_shell
+                        .as_mut()
+                        .is_some_and(|shell| shell.handle_text_input(&text))
+                }),
+            _ => false,
+        };
+    let handled = fallback_input_active
+        && (text_handled
+            || data
+                .vui_shell
+                .as_mut()
+                .is_some_and(|shell| shell.handle_input_with_origin(&vui_event(&event), origin)));
+    if text_handled {
+        if let FlowInputEvent::Key { keycode, .. } = &event {
+            data.vui_text_keys.insert(*keycode);
+        }
+    }
+    let actions = data
+        .vui_shell
+        .as_ref()
+        .map_or_else(Vec::new, VuiShell::take_actions);
+    if fallback_input_active {
+        for action in actions {
+            flog_warn!("raw Vulkan compositor VUI fallback action: {action:?}");
+            data.desktop.state.dispatch_ui_action(action);
+        }
+    } else {
+        data.vui_text_keys.clear();
+    }
+    if handled {
+        if let Some(output_id) = data.vui_output {
+            data.desktop
+                .state
+                .mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+        }
+    }
+
+    // Keep the compositor pointer position and hardware cursor current even
+    // while VUI owns hover. Button, scroll, and keyboard events remain captured.
+    if !handled || matches!(event, FlowInputEvent::PointerMoved { .. }) {
+        data.desktop.state.handle_input(event);
+    }
 }
 
 fn pause_vulkan_session(data: &mut VulkanDrmData, reason: &str) {
@@ -1216,6 +1448,7 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         output_configs,
     )?;
     data.desktop.state.restore_output_topology(snapshot);
+    configure_vui_shell(data);
     data.desktop.state.mark_redraw();
     Ok(true)
 }
@@ -1596,6 +1829,12 @@ fn recover_vulkan_renderer(data: &mut VulkanDrmData, reason: &anyhow::Error) -> 
     // resend its retained font/image atlases instead of referring to cache keys
     // that only existed on the abandoned Vulkan device.
     data.desktop.state.invalidate_gpu_state();
+    // VUI owns child resources on this logical device. Drop it before the
+    // device is abandoned, then output rebuild will create it on the replacement.
+    if let Some(shell) = data.vui_shell.as_mut() {
+        shell.abandon_ash_renderer();
+    }
+    data.vui_shell = None;
     data.renderer.abandon_device();
     let replacement = AshDrmRenderer::new(data.primary_node.major(), data.primary_node.minor())
         .context("recreate raw Vulkan device")?;
@@ -1681,6 +1920,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         xwayland_event_loop,
         renderer,
         scene_builder: VulkanSceneBuilder::default(),
+        vui_shell: None,
+        vui_output: None,
+        vui_text_keys: HashSet::new(),
         drm,
         drm_fd: fd,
         primary_node: node,
@@ -1699,6 +1941,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         fatal_error: None,
         surface_blocker_loop,
     };
+    configure_vui_shell(&mut data);
 
     if data.disable_explicit_kms_fences {
         flog_warn!(
@@ -1754,7 +1997,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     .handle_lid_switch(matches!(event.state(), SwitchState::On));
             }
         }
-        dispatch_backend_input_event::<LibinputInputBackend>(&mut data.desktop.state, &event);
+        dispatch_vui_input::<LibinputInputBackend>(data, &event);
         update_kms_cursor(data);
     })?;
 
@@ -1908,6 +2151,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             .dispatch(Some(Duration::ZERO), &mut data.desktop.state)?;
         data.desktop.state.process_hdr_safe_session_action();
         data.desktop.state.process_deferred_ui_and_launches();
+        dispatch_pending_vui_request(&mut data);
         stage_vulkan_hdr_transitions(&mut data);
         if let Err(error) = data.renderer.poll() {
             recover_vulkan_renderer(&mut data, &error)?;
@@ -1942,6 +2186,14 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             continue;
         }
         maintain_vulkan_hdr_state(&mut data);
+        if data.vui_shell.as_mut().is_some_and(VuiShell::tick) {
+            if let Some(output_id) = data.vui_output {
+                data.desktop.state.mark_output_full_damage(
+                    output_id,
+                    crate::core::desktop::DamageSource::Unknown,
+                );
+            }
+        }
         while let Some(stream) = data.desktop.listener.accept()? {
             let client_state = client_state_from_stream(&stream);
             let client = data
@@ -1979,6 +2231,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         {
             continue;
         }
+        let redraw_all = data.desktop.state.render.redraw_all;
         data.desktop.state.materialize_full_redraw_damage();
 
         let mut presented_any = false;
@@ -1990,6 +2243,18 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 continue;
             }
 
+            let pending_damage = data
+                .desktop
+                .state
+                .outputs
+                .get(&output_id)
+                .map(|output| output.pending_damage.clone())
+                .unwrap_or_default();
+            let output_transform = data.outputs[index].transform;
+            let content_size = output_transform.invert().transform_size(Size::from((
+                data.outputs[index].width as i32,
+                data.outputs[index].height as i32,
+            )));
             let software_cursor = data.desktop.state.cursor_manager.software_cursor_needed();
             let mut scene = data.scene_builder.build_for_output_with_cursor_policy(
                 &mut data.desktop.state,
@@ -1998,12 +2263,30 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 false,
                 true,
             );
+            let trusted_shell_ready = trusted_shell_ready_for_output(&data, output_id);
+            let quick_settings_fallback_open = data
+                .vui_shell
+                .as_ref()
+                .is_some_and(VuiShell::quick_settings_open);
+            if data.vui_output == Some(output_id)
+                && (!trusted_shell_ready || quick_settings_fallback_open)
+            {
+                sync_vui_shell_context(&mut data);
+                let vui_error = data
+                    .vui_shell
+                    .as_mut()
+                    .and_then(|shell| shell.composite_ash(&mut data.renderer, &mut scene).err());
+                if let Some(error) = vui_error {
+                    flog_warn!("disabling raw Vulkan VUI shell after render failure: {error:#}");
+                    if let Some(damage) = data.vui_shell.as_ref().and_then(VuiShell::damage_rect) {
+                        scene.damage.push(damage);
+                    }
+                    data.vui_shell = None;
+                    data.vui_output = None;
+                    data.vui_text_keys.clear();
+                }
+            }
             expand_dmabuf_damage(&mut scene);
-            let output_transform = data.outputs[index].transform;
-            let content_size = output_transform.invert().transform_size(Size::from((
-                data.outputs[index].width as i32,
-                data.outputs[index].height as i32,
-            )));
             transform_scene(&mut scene, content_size, output_transform);
             let capture_requested = (data.desktop.state.screenshot_request() == Some(output_id)
                 || data.desktop.state.screenshot_all_requested
@@ -2133,6 +2416,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 };
                 target_from_dmabuf(&dmabuf)?
             };
+            let output_size = Size::from((
+                data.outputs[index].width as i32,
+                data.outputs[index].height as i32,
+            ));
+            let rendered_damage = scene
+                .damage
+                .iter()
+                .map(|[x, y, width, height]| {
+                    Rectangle::from_loc_and_size((*x, *y), (*width, *height))
+                })
+                .collect::<Vec<_>>();
             let submission = match data.renderer.render(
                 &target,
                 &scene.background,
@@ -2163,6 +2457,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     continue 'main;
                 }
             };
+            data.desktop.state.log_damage_frame(
+                output_id,
+                pending_damage.len(),
+                rendered_damage.len(),
+                damage_area_percent(&pending_damage, content_size),
+                damage_area_percent(&rendered_damage, output_size),
+                is_full_damage(&rendered_damage, output_size),
+                redraw_all,
+                &rendered_damage,
+            );
             if capture_requested {
                 data.capture_pending.insert(output_id);
             }
@@ -2242,9 +2546,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::{
         copy_cursor_rgba_to_argb, expand_dmabuf_damage, hdr_source_peak_changed,
-        transform_cursor_rgba, transform_scene, transformed_cursor_rect,
+        transform_cursor_rgba, transform_scene, transformed_cursor_rect, vui_event,
     };
     use crate::backend::wgpu_nested::VulkanCompositorScene;
+    use crate::core::input::{FlowInputEvent, FlowKeyState, FlowModifiers};
     use focaldesk_render::{
         FramePixelFormat, FrameTransform, LinuxDmabuf, TextureColorTransform, TextureQuad,
     };
@@ -2336,6 +2641,21 @@ mod tests {
         assert!(!hdr_source_peak_changed(true, peak_1000, peak_1000));
         assert!(hdr_source_peak_changed(true, peak_1000, peak_4000));
         assert!(hdr_source_peak_changed(true, peak_1000, None));
+    }
+
+    #[test]
+    fn raw_xkb_keycodes_are_normalized_for_vui() {
+        let event = FlowInputEvent::Key {
+            keycode: 38,
+            state: FlowKeyState::Pressed,
+            repeat: false,
+            modifiers: FlowModifiers::default(),
+        };
+
+        assert!(matches!(
+            vui_event(&event),
+            FlowInputEvent::Key { keycode: 30, .. }
+        ));
     }
 
     #[test]

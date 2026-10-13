@@ -25,6 +25,8 @@ pub use ash_drm::{
 
 #[cfg(feature = "wgpu")]
 pub use wgpu_vulkan::WgpuVulkanRenderer;
+#[cfg(all(feature = "wgpu", feature = "ash-drm", unix))]
+pub use wgpu_vulkan::{WgpuDmabufDevice, WgpuDmabufTexture};
 
 /// Information useful for diagnostics and backend capability decisions.
 #[derive(Clone, Debug, PartialEq, Eq)]

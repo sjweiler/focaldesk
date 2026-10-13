@@ -62,6 +62,16 @@ published back to each reservation object for implicit consumers. Explicit
 place. SHM textures use Vulkan staging uploads. There is no
 Vulkan display surface, Vulkan WSI swapchain, GLES copy, or EGL import bridge.
 
+The opt-in VUI shell (`FOCALDESK_VUI=1`) also stays on this raw-Ash boundary.
+It builds VUI scenes with `vui-ash` on the compositor's existing Vulkan
+instance, logical device, and graphics queue, then registers the resulting
+sampleable image directly with the Ash texture pass. The raw DRM path therefore
+uses neither Vello/wgpu, a CPU readback, nor a cross-device DMA-BUF bridge for
+VUI. Queue ordering provides frame synchronization; target recreation waits for
+host sampling to finish, and device-loss recovery abandons child handles before
+the host Vulkan device. The nested winit/wgpu development backend retains its
+Vello renderer as a compatibility path.
+
 `focaldmd` selects the renderer before the user session starts. The Vulkan DRM
 backend creates an explicit-sync GBM swapchain for every enabled connected
 output and applies the saved mode, fractional scale, logical position, and

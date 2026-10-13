@@ -53,6 +53,7 @@ use super::common::{
     bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
     BootstrapOutput, NestedDesktop,
 };
+use super::vui_shell::{QuickSettingsState, VuiShell};
 use crate::core::color::{SurfaceColorRenderState, TransferFunction};
 use crate::core::input::{
     FlowInputEvent, FlowKeyState, FlowModifiers, FlowMouseButton, FlowScrollDelta,
@@ -344,6 +345,8 @@ struct NestedVulkanApp {
     logged_dmabuf_import: bool,
     modifiers: FlowModifiers,
     scene_builder: VulkanSceneBuilder,
+    vui_shell: Option<VuiShell>,
+    vui_text_keys: HashSet<u32>,
     surface_blocker_loop: Option<CalloopEventLoop<'static, crate::core::desktop::DesktopState>>,
     fatal_error: Option<anyhow::Error>,
 }
@@ -410,6 +413,9 @@ impl NestedVulkanApp {
         if width == 0 || height == 0 {
             return;
         }
+        if let Some(vui_shell) = self.vui_shell.as_mut() {
+            vui_shell.resize(width, height, scale_factor);
+        }
         let Some(desktop) = self.desktop.as_mut() else {
             return;
         };
@@ -435,9 +441,66 @@ impl NestedVulkanApp {
     }
 
     fn handle_input(&mut self, event: FlowInputEvent) {
+        self.sync_vui_lock_state();
+        let origin = self
+            .vui_shell
+            .as_ref()
+            .map_or((0.0, 0.0), VuiShell::input_origin);
+        let handled = self
+            .vui_shell
+            .as_mut()
+            .is_some_and(|vui_shell| vui_shell.handle_input_with_origin(&event, origin));
+        self.dispatch_vui_actions();
+        if handled {
+            return;
+        }
         if let Some(desktop) = self.desktop.as_mut() {
             desktop.state.handle_input(event);
         }
+    }
+
+    fn sync_vui_lock_state(&mut self) {
+        let locked = self
+            .desktop
+            .as_ref()
+            .is_some_and(|desktop| desktop.state.lock_screen.active);
+        if let Some(shell) = self.vui_shell.as_mut() {
+            shell.set_session_locked(locked);
+        }
+        if locked {
+            self.vui_text_keys.clear();
+        }
+    }
+
+    fn dispatch_vui_actions(&mut self) {
+        let actions = self
+            .vui_shell
+            .as_ref()
+            .map_or_else(Vec::new, VuiShell::take_actions);
+        if let Some(desktop) = self.desktop.as_mut() {
+            for action in actions {
+                desktop.state.dispatch_ui_action(action);
+            }
+        }
+    }
+
+    fn dispatch_pending_vui_request(&mut self) -> bool {
+        let request = self
+            .desktop
+            .as_mut()
+            .and_then(|desktop| desktop.state.take_vui_quick_settings_request());
+        let Some(output_id) = request else {
+            return false;
+        };
+        let is_primary = self
+            .desktop
+            .as_ref()
+            .is_some_and(|desktop| desktop.state.primary_output == output_id);
+        is_primary
+            && self
+                .vui_shell
+                .as_mut()
+                .is_some_and(VuiShell::toggle_quick_settings)
     }
 }
 
@@ -604,6 +667,21 @@ impl ApplicationHandler for NestedVulkanApp {
         );
         window.set_cursor_visible(false);
         window.request_redraw();
+        self.vui_shell = VuiShell::enabled_from_env().then(|| {
+            info!(target: "focaldesk", "enabled experimental VUI compositor shell");
+            let quick_settings = QuickSettingsState {
+                wifi: desktop.state.network_state.wifi.is_some(),
+                bluetooth: false,
+                do_not_disturb: desktop.state.do_not_disturb,
+                volume: 0.7,
+            };
+            VuiShell::new(
+                window_size.width,
+                window_size.height,
+                window.scale_factor(),
+                quick_settings,
+            )
+        });
         self.renderer = Some(renderer);
         self.desktop = Some(desktop);
         self.surface_blocker_loop = Some(surface_blocker_loop);
@@ -622,6 +700,7 @@ impl ApplicationHandler for NestedVulkanApp {
         if window.id() != window_id {
             return;
         }
+        self.sync_vui_lock_state();
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -715,6 +794,24 @@ impl ApplicationHandler for NestedVulkanApp {
                     let Some(keycode) = event.physical_key.to_scancode() else {
                         return;
                     };
+                    if event.state == ElementState::Released && self.vui_text_keys.remove(&keycode)
+                    {
+                        window.request_redraw();
+                        return;
+                    }
+                    if event.state == ElementState::Pressed {
+                        let text_handled = event.text.as_deref().is_some_and(|text| {
+                            self.vui_shell
+                                .as_mut()
+                                .is_some_and(|vui_shell| vui_shell.handle_text_input(text))
+                        });
+                        if text_handled {
+                            self.vui_text_keys.insert(keycode);
+                            self.dispatch_vui_actions();
+                            window.request_redraw();
+                            return;
+                        }
+                    }
                     self.handle_input(FlowInputEvent::Key {
                         keycode,
                         state: match event.state {
@@ -733,10 +830,49 @@ impl ApplicationHandler for NestedVulkanApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let scene = self
+                self.sync_vui_lock_state();
+                let trusted_shell_ready = self.desktop.as_ref().is_some_and(|desktop| {
+                    desktop.state.outputs.values().any(|output| {
+                        let presence = crate::core::wayland::trusted_shell::presence_for_output(
+                            &output.handle,
+                        );
+                        presence.system_rail
+                            && presence.task_shelf
+                            && desktop
+                                .state
+                                .trusted_shell_ready_for_connector(&output.handle.name())
+                    })
+                });
+                let quick_settings_fallback_open = self
+                    .vui_shell
+                    .as_ref()
+                    .is_some_and(VuiShell::quick_settings_open);
+                let mut scene = self
                     .desktop
                     .as_mut()
                     .map(|desktop| self.scene_builder.build(&mut desktop.state));
+                let vui_error = match (
+                    self.vui_shell.as_mut(),
+                    self.renderer.as_mut(),
+                    scene.as_mut(),
+                ) {
+                    (Some(vui_shell), Some(renderer), Some(scene))
+                        if !trusted_shell_ready || quick_settings_fallback_open =>
+                    {
+                        vui_shell.composite(renderer, scene).err()
+                    }
+                    _ => None,
+                };
+                if let Some(error) = vui_error {
+                    warn!(%error, "disabling VUI shell after a rendering failure");
+                    if let (Some(damage), Some(scene)) = (
+                        self.vui_shell.as_ref().and_then(VuiShell::damage_rect),
+                        scene.as_mut(),
+                    ) {
+                        scene.damage.push(damage);
+                    }
+                    self.vui_shell = None;
+                }
                 let result = self
                     .renderer
                     .as_mut()
@@ -801,16 +937,28 @@ impl ApplicationHandler for NestedVulkanApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let vui_changed = self.dispatch_pending_vui_request();
         match self.dispatch_wayland() {
-            Ok(true) => {
+            Ok(true) if !vui_changed => {
                 if let Some(window) = self.window.as_ref() {
                     window.request_redraw();
                 }
             }
-            Ok(false) => {}
+            Ok(_) => {
+                if vui_changed {
+                    if let Some(window) = self.window.as_ref() {
+                        window.request_redraw();
+                    }
+                }
+            }
             Err(error) => {
                 self.fail(event_loop, error);
                 return;
+            }
+        }
+        if self.vui_shell.as_mut().is_some_and(VuiShell::tick) {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
             }
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME_INTERVAL));
@@ -820,6 +968,8 @@ impl ApplicationHandler for NestedVulkanApp {
         warn!("nested wgpu Vulkan window suspended");
         self.desktop = None;
         self.renderer = None;
+        self.vui_shell = None;
+        self.vui_text_keys.clear();
         self.surface_blocker_loop = None;
         self.window = None;
         self.logged_first_present = false;

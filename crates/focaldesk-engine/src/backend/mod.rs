@@ -6,6 +6,9 @@ pub mod winit;
 #[cfg(feature = "wgpu")]
 pub mod wgpu_nested;
 
+#[cfg(feature = "wgpu")]
+mod vui_shell;
+
 #[cfg(feature = "drm")]
 pub mod drm;
 

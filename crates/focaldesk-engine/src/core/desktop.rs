@@ -1877,7 +1877,8 @@ pub struct DesktopState {
     wp_color_surface_outputs: HashMap<wayland_server::backend::ObjectId, OutputId>,
     pub damage_debug_enabled: bool,
     pub damage_source_counts: DamageSourceCounts,
-    damage_last_logged_surface_commit: u64,
+    damage_last_logged_surface_commit: HashMap<OutputId, u64>,
+    damage_last_logged_frame: HashMap<OutputId, u64>,
     pub sidebar_pulse: Option<SidebarPulse>,
     pub topbar_pulse: Option<TopbarPulse>,
     pub clock_pulse: Option<ClockPulse>,
@@ -1889,8 +1890,13 @@ pub struct DesktopState {
     next_dialog_id: DialogId,
     pending_ui_actions: Vec<UiAction>,
     pending_egui_ops: Vec<PendingEguiOp>,
+    pending_vui_quick_settings: Option<OutputId>,
     pending_sidebar_dialogs: HashMap<DialogId, SidebarDialogKind>,
     pending_app_launches: Vec<(u64, String, Vec<String>, LaunchSource)>,
+    /// Trusted shell chrome that has actually painted, keyed by namespace and
+    /// output connector. A wildcard entry preserves compatibility with older
+    /// shell clients that only report a global ready signal.
+    ready_shell_clients: HashSet<(String, String)>,
     /// Map/focus deferred out of `handle_commit` so Wayland dispatch does not re-enter seat/xdg.
     pending_window_maps: Vec<(WindowId, Point<i32, Logical>)>,
     pending_focus_window: Option<WindowId>,
@@ -3275,11 +3281,36 @@ impl DesktopState {
             IpcRequest::ShellReady {
                 namespace,
                 output_count,
+                connector,
+                ready,
             } => {
                 if crate::core::wayland::trusted_shell::is_trusted_namespace(&namespace) {
+                    let connector_name = connector.as_deref().unwrap_or("all");
+                    let changed = match connector.as_ref() {
+                        Some(connector) if ready => self
+                            .ready_shell_clients
+                            .insert((namespace.clone(), connector.clone())),
+                        Some(connector) => self
+                            .ready_shell_clients
+                            .remove(&(namespace.clone(), connector.clone())),
+                        None if ready => self
+                            .ready_shell_clients
+                            .insert((namespace.clone(), "*".into())),
+                        None => {
+                            let previous_len = self.ready_shell_clients.len();
+                            self.ready_shell_clients
+                                .retain(|(client, _)| client != &namespace);
+                            self.ready_shell_clients.len() != previous_len
+                        }
+                    };
+                    if changed {
+                        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+                    }
                     flog_info!(
-                        "trusted shell ready namespace={} outputs={output_count}",
-                        namespace
+                        "trusted shell frame state namespace={} connector={} ready={} outputs={output_count}",
+                        namespace,
+                        connector_name,
+                        ready,
                     );
                     Some(IpcResponse::Ok)
                 } else {
@@ -3939,7 +3970,13 @@ impl DesktopState {
                     .iter()
                     .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
                     .ok_or_else(|| format!("output {connector} does not exist"))?;
+                if matches!(panel, focaldesk_ipc::ShellPanel::QuickSettings) {
+                    self.pending_vui_quick_settings = Some(output);
+                    self.mark_output_full_damage(output, DamageSource::Unknown);
+                    return Ok(());
+                }
                 let panel = match panel {
+                    focaldesk_ipc::ShellPanel::QuickSettings => unreachable!(),
                     focaldesk_ipc::ShellPanel::Network => focaldesk_ui::types::PanelKind::Network,
                     focaldesk_ipc::ShellPanel::Bluetooth => {
                         focaldesk_ui::types::PanelKind::Bluetooth
@@ -4187,6 +4224,10 @@ impl DesktopState {
 
     pub(crate) fn take_display_reconfigure_request(&mut self) -> bool {
         std::mem::take(&mut self.display_reconfigure_requested)
+    }
+
+    pub(crate) fn take_vui_quick_settings_request(&mut self) -> Option<OutputId> {
+        self.pending_vui_quick_settings.take()
     }
 
     fn set_hdr_appearance(
@@ -5111,7 +5152,7 @@ impl DesktopState {
         }
     }
 
-    fn egui_text_for_keycode(keycode: u32, modifiers: FlowModifiers) -> Option<String> {
+    pub(crate) fn egui_text_for_keycode(keycode: u32, modifiers: FlowModifiers) -> Option<String> {
         if modifiers.ctrl || modifiers.alt || modifiers.super_key {
             return None;
         }
@@ -9074,7 +9115,8 @@ impl DesktopState {
             wp_color_surface_outputs: HashMap::new(),
             damage_debug_enabled: debug_damage_enabled(&debug),
             damage_source_counts: DamageSourceCounts::default(),
-            damage_last_logged_surface_commit: 0,
+            damage_last_logged_surface_commit: HashMap::new(),
+            damage_last_logged_frame: HashMap::new(),
             sidebar_pulse: None,
             topbar_pulse: None,
             clock_pulse: None,
@@ -9086,8 +9128,10 @@ impl DesktopState {
             next_dialog_id: 1,
             pending_ui_actions: Vec::new(),
             pending_egui_ops: Vec::new(),
+            pending_vui_quick_settings: None,
             pending_sidebar_dialogs: HashMap::new(),
             pending_app_launches: Vec::new(),
+            ready_shell_clients: HashSet::new(),
             pending_window_maps: Vec::new(),
             pending_focus_window: None,
             next_launch_trace_id: 1,
@@ -9105,6 +9149,21 @@ impl DesktopState {
         let id = self.next_window_id.0;
         self.next_window_id = WindowId(id.checked_add(1).expect("window id counter overflowed"));
         WindowId(id)
+    }
+
+    pub fn trusted_shell_ready_for_connector(&self, connector: &str) -> bool {
+        [
+            crate::core::wayland::trusted_shell::PANEL_NAMESPACE,
+            crate::core::wayland::trusted_shell::DOCK_NAMESPACE,
+        ]
+        .into_iter()
+        .all(|namespace| {
+            self.ready_shell_clients
+                .contains(&(namespace.to_owned(), connector.to_owned()))
+                || self
+                    .ready_shell_clients
+                    .contains(&(namespace.to_owned(), "*".to_owned()))
+        })
     }
 
     pub fn add_xdg_toplevel(&mut self, surface: ToplevelSurface) -> WindowId {
@@ -11571,6 +11630,7 @@ impl DesktopState {
         post_area_percent: i64,
         full_damage: bool,
         redraw_all: bool,
+        regions: &[Rectangle<i32, Physical>],
     ) {
         if !self.damage_debug_enabled {
             return;
@@ -11578,13 +11638,31 @@ impl DesktopState {
 
         let c = self.damage_source_counts;
         let surface = self.surface_damage_metrics;
-        let surface_changed = surface.tree_commits != self.damage_last_logged_surface_commit;
-        if !surface_changed && !self.render.frame_no.is_multiple_of(120) {
+        let last_logged_commit = self
+            .damage_last_logged_surface_commit
+            .get(&output_id)
+            .copied()
+            .unwrap_or_default();
+        let surface_changed = surface.tree_commits != last_logged_commit;
+        let last_logged_frame = self.damage_last_logged_frame.get(&output_id).copied();
+        let movement_active = c.window_move > 0 || c.window_resize > 0;
+        let movement_sample_due = movement_active
+            && last_logged_frame.is_none_or(|last| self.render.frame_no.saturating_sub(last) >= 12);
+        if !surface_changed && !movement_sample_due && !self.render.frame_no.is_multiple_of(120) {
             return;
         }
-        self.damage_last_logged_surface_commit = surface.tree_commits;
+        self.damage_last_logged_surface_commit
+            .insert(output_id, surface.tree_commits);
+        self.damage_last_logged_frame
+            .insert(output_id, self.render.frame_no);
+        let regions_truncated = regions.len() > 16;
+        let regions = regions
+            .iter()
+            .take(16)
+            .map(|rect| [rect.loc.x, rect.loc.y, rect.size.w, rect.size.h])
+            .collect::<Vec<_>>();
         flog(format!(
-            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} src(move={}, resize={}, cursor={}, egui={}, shader={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
+            "damage output={:?} frame={} rects={}->{} area={}%%->{}%% full={} redraw_all={} regions={:?}{} src(move={}, resize={}, cursor={}, egui={}, shader={}, hover={}, commit={}, full_fallback={}, unknown={}) surface(trees={}, precise={}, unchanged={}, callback_only={}, fallback={}, rects={}, destroyed={})",
             output_id,
             self.render.frame_no,
             pre_rects,
@@ -11593,6 +11671,8 @@ impl DesktopState {
             post_area_percent,
             full_damage,
             redraw_all,
+            regions,
+            if regions_truncated { " (first 16)" } else { "" },
             c.window_move,
             c.window_resize,
             c.cursor,

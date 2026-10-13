@@ -31,6 +31,8 @@ use focaldesk_themes::{theme_by_name, FlowTheme};
 use gtk::{gdk, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
+mod vui_client;
+
 /// Canonical shell geometry shared by the GTK panel and dock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShellMetrics {
@@ -160,32 +162,61 @@ fn rebuild_shell_windows(
             .map(|name| name.to_string())
             .unwrap_or_else(|| format!("output-{}", index + 1));
         let window = match role {
-            ShellRole::Dock => build_dock(app, config, connector),
-            ShellRole::Panel => build_panel(app, index + 1, config, connector),
+            ShellRole::Dock => build_dock(app, config, connector.clone()),
+            ShellRole::Panel => build_panel(app, index + 1, config, connector.clone()),
         };
+        let vui_client = window
+            .child()
+            .is_some_and(|child| child.is::<gtk::DrawingArea>());
         configure_layer_window(&window, role, &monitor, config);
+        if vui_client {
+            report_shell_frame_state(role, connector.clone(), monitors.n_items() as usize, false);
+        }
         window.present();
+        if !vui_client {
+            report_shell_frame_state(role, connector, monitors.n_items() as usize, true);
+        }
         output_count += 1;
     }
 
     if output_count == 0 {
+        let connector = "output-1".to_string();
         let window = match role {
-            ShellRole::Dock => build_dock(app, config, "output-1".into()),
-            ShellRole::Panel => build_panel(app, 1, config, "output-1".into()),
+            ShellRole::Dock => build_dock(app, config, connector.clone()),
+            ShellRole::Panel => build_panel(app, 1, config, connector.clone()),
         };
+        let vui_client = window
+            .child()
+            .is_some_and(|child| child.is::<gtk::DrawingArea>());
         configure_layer_window_without_monitor(&window, role, config);
+        if vui_client {
+            report_shell_frame_state(role, connector.clone(), 1, false);
+        }
         window.present();
+        if !vui_client {
+            report_shell_frame_state(role, connector, 1, true);
+        }
         output_count = 1;
     }
 
-    let _ = send_desktop_request(&IpcRequest::ShellReady {
-        namespace: role.namespace().to_string(),
-        output_count,
-    });
     flog(format!(
         "{}: presented {output_count} GTK layer surface(s)",
         role.namespace()
     ));
+}
+
+fn report_shell_frame_state(role: ShellRole, connector: String, output_count: usize, ready: bool) {
+    if let Err(error) = send_desktop_request(&IpcRequest::ShellReady {
+        namespace: role.namespace().to_string(),
+        output_count,
+        connector: Some(connector.clone()),
+        ready,
+    }) {
+        focaldesk_logging::flog_warn!(
+            "{} could not report frame readiness for {connector}: {error}",
+            role.namespace()
+        );
+    }
 }
 
 fn configure_layer_window(
@@ -195,6 +226,18 @@ fn configure_layer_window(
     config: &FocalDeskConfig,
 ) {
     configure_layer_window_without_monitor(window, role, config);
+    if role == ShellRole::Panel
+        && window
+            .child()
+            .is_some_and(|child| child.is::<gtk::DrawingArea>())
+    {
+        // A VUI rail is a single DrawingArea with a one-pixel natural height.
+        // Do not rely on layer-shell inferring a stretched size from that
+        // child; give the anchored surface its actual per-monitor height.
+        let geometry = monitor.geometry();
+        let height = (geometry.height() - 24).max(1);
+        window.set_default_size(SYSTEM_RAIL_WIDTH, height);
+    }
     window.set_monitor(monitor);
 }
 
@@ -314,6 +357,18 @@ fn build_dock(
     window.add_css_class("focal-shell-window");
     window.add_css_class("task-shelf-window");
 
+    if vui_client::enabled(ShellRole::Dock) {
+        if vui_client::build(&window, ShellRole::Dock, connector.clone()).is_some() {
+            return window;
+        }
+        focaldesk_logging::flog_warn!(
+            "VUI dock client initialization failed; using GTK dock fallback"
+        );
+    } else {
+        focaldesk_logging::flog_info!(
+            "VUI dock client disabled for {connector}; using GTK dock fallback"
+        );
+    }
     let widgets = Rc::new(RefCell::new(ShelfWidgets::default()));
     let overflow_ui = build_shelf_overflow_ui(&window, &widgets);
 
@@ -1476,6 +1531,20 @@ fn build_panel(
     window.add_css_class("focal-shell-window");
     window.add_css_class("system-rail-window");
 
+    if vui_client::enabled(ShellRole::Panel) {
+        if vui_client::build(&window, ShellRole::Panel, connector.clone()).is_some() {
+            return window;
+        }
+        focaldesk_logging::flog_warn!(
+            "VUI rail client initialization failed; using GTK rail fallback"
+        );
+    } else {
+        focaldesk_logging::flog_info!(
+            "VUI rail client disabled for {connector}; using GTK rail fallback"
+        );
+    }
+
+    // Legacy GTK rail implementation used when VUI is disabled or unavailable.
     let rail = gtk::Box::new(gtk::Orientation::Vertical, 8);
     rail.add_css_class("system-rail");
     rail.add_css_class("shell-surface");
@@ -1512,6 +1581,16 @@ fn build_panel(
     );
     ai_console_button.add_css_class("rail-primary-action");
     primary.append(&ai_console_button);
+    let quick_settings_connector = connector.clone();
+    primary.append(
+        &glass_icon_button(
+            "preferences-system-symbolic",
+            "Quick Settings",
+            "rail-button",
+            move || open_shell_panel(&quick_settings_connector, ShellPanel::QuickSettings),
+        )
+        .0,
+    );
     rail.append(&primary);
 
     let top = gtk::Box::new(gtk::Orientation::Vertical, 4);

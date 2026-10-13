@@ -714,6 +714,8 @@ impl LayerShellHandler for ShellClient {
             let _ = send_desktop_request(&IpcRequest::ShellReady {
                 namespace: self.role.namespace().into(),
                 output_count: self.layers.len(),
+                connector: None,
+                ready: true,
             });
         }
     }
