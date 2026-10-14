@@ -6,8 +6,9 @@ use focaldesk_ai::{
 };
 use focaldesk_diagnostics::{DiagnosticsOptions, collect_diagnostics};
 use focaldesk_ipc::{
-    DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
-    DesktopSplitLayout, IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
+    ConnectorHostIpcRequest, DesktopAction, DesktopDirection, DesktopSnapshot,
+    DesktopSplitKeyboardAction, DesktopSplitLayout, IpcRequest, IpcResponse,
+    NotificationIpcRequest, NotificationIpcResponse, send_connector_host_request,
     send_desktop_request, send_notification_request,
 };
 use focaldesk_settings_core::{
@@ -335,6 +336,48 @@ fn main() -> anyhow::Result<()> {
             }
         }
         "diagnostics" => handle_diagnostics(args.collect()),
+        "calendar" => {
+            let subcommand = args.next().unwrap_or_else(|| "upcoming".into());
+            if subcommand != "upcoming" {
+                bail!("unknown calendar command: {subcommand}");
+            }
+            let days = args
+                .next()
+                .map(|value| {
+                    value
+                        .parse::<u64>()
+                        .context("calendar days must be an integer")
+                })
+                .transpose()?
+                .unwrap_or(7)
+                .clamp(1, 365);
+            if args.next().is_some() {
+                bail!("calendar upcoming accepts at most one day-count argument");
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let response =
+                send_connector_host_request(&ConnectorHostIpcRequest::CalendarUpcoming {
+                    after_unix: now,
+                    before_unix: now.saturating_add((days * 86_400) as i64),
+                    limit: 100,
+                })
+                .map_err(anyhow::Error::msg)?;
+            if response.status != "ok" {
+                bail!(
+                    response
+                        .message
+                        .unwrap_or_else(|| "calendar query failed".into())
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response.calendar_events)?
+            );
+            Ok(())
+        }
         "ai" => handle_ai(args.collect()),
         "help" | "--help" | "-h" => {
             print_usage();
@@ -1733,6 +1776,7 @@ fn print_usage() {
     eprintln!("  focaldesk-cli focus-workspace <workspace>");
     eprintln!("  focaldesk-cli display-mode <connector> <width> <height> <scale>");
     eprintln!("  focaldesk-cli diagnostics [--output <archive.tar.gz>] [--no-logs]");
+    eprintln!("  focaldesk-cli calendar upcoming [days]");
     eprintln!("  focaldesk-cli ai providers");
     eprintln!(
         "  focaldesk-cli ai chat [--stream] [--memory] [--provider <id>] [--model <model>] <prompt...>"

@@ -506,7 +506,7 @@ and an emergency disconnect are built in. See
 [Event Fabric and Consent Center](docs/event-fabric.md).
 
 The **Connector SDK and Trust Store** adds validated versioned producer
-manifests, five disabled-by-default local connector identities, namespaced
+manifests, seven disabled-by-default connector identities, namespaced
 opaque signing-key handles, signed event requests with freshness and replay
 protection, persistent source consent, health reporting, explicit network
 domain authority, and reversible updates. See

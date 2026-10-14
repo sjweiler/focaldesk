@@ -564,9 +564,10 @@ pub fn send_desktop_config(config: FocalDeskConfig) -> Result<(), String> {
 }
 
 pub use connector_host::{
-    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, ConnectorHostIpcRequest,
-    ConnectorHostIpcResponse, ConnectorRuntimeStatus, connector_host_socket_path,
-    send_connector_host_request,
+    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, CalendarAccountSnapshot,
+    CalendarAvailableSnapshot, CalendarEventSnapshot, CalendarOAuthSnapshot,
+    ConnectorHostIpcRequest, ConnectorHostIpcResponse, ConnectorRuntimeStatus,
+    connector_host_socket_path, send_connector_host_request,
 };
 pub use controls::{
     CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME, ControlIpcRequest, ControlIpcResponse, ControlSetting,

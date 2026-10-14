@@ -28,6 +28,24 @@ enum Request<'a> {
         attributes: std::collections::BTreeMap<String, String>,
         content_type: &'a str,
     },
+    Delete {
+        key: &'a str,
+    },
+}
+
+pub fn delete(key: &str) -> Result<()> {
+    let mut stream = UnixStream::connect(socket_path()?).context("connect to credential broker")?;
+    let request = Zeroizing::new(serde_json::to_vec(&Request::Delete { key })?);
+    write_frame(&mut stream, &request)?;
+    let response = Zeroizing::new(read_frame(&mut stream)?);
+    let decoded: Response = serde_json::from_slice(&response)?;
+    if !decoded.ok {
+        bail!(
+            "credential broker rejected delete for {key:?}: {}",
+            decoded.error.as_deref().unwrap_or("unknown error")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]

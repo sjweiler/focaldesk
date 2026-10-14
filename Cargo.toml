@@ -52,6 +52,7 @@ members = [
     "crates/focaldesk-audio",
     "crates/focaldesk-bluetooth",
     "crates/focaldesk-notifications",
+    "crates/focaldesk-calendar",
     "crates/focaldesk-updates",
     "crates/focaldesk-resources",
     "crates/focaldesk-cursor",

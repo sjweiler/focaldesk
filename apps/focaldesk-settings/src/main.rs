@@ -4,10 +4,10 @@ use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSna
 use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
-    send_desktop_config, send_desktop_request, send_desktop_set, send_power_request,
-    send_settings_request, watch_desktop_keys, DesktopAction, DisplayRuntimeOutputStatus,
-    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse, ThemeEditorCommand,
-    THEME_EDITOR_PROTOCOL_VERSION,
+    send_connector_host_request, send_desktop_config, send_desktop_request, send_desktop_set,
+    send_power_request, send_settings_request, watch_desktop_keys, ConnectorHostIpcRequest,
+    DesktopAction, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse, PowerIpcRequest,
+    PowerIpcResponse, ThemeEditorCommand, THEME_EDITOR_PROTOCOL_VERSION,
 };
 use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
 use focaldesk_launcher_state::clear_recent_apps;
@@ -33,13 +33,13 @@ use gtk::cairo;
 use gtk::glib;
 use serde_json::json;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{error, info, warn};
 
 mod audio;
@@ -2973,6 +2973,7 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
         "Appearance",
         "Theme Editor",
         "Network",
+        "Calendar",
         "Bluetooth",
         "Printers",
         "Displays",
@@ -3016,6 +3017,7 @@ fn build_ui(app: &adw::Application, initial_panel: Option<&str>) {
     );
     pages.insert("Theme Editor".to_string(), theme_editor_page());
     pages.insert("Network".to_string(), network_page());
+    pages.insert("Calendar".to_string(), calendar_page());
     pages.insert("Bluetooth".to_string(), bluetooth_page());
     pages.insert("Printers".to_string(), printers_page());
     pages.insert(
@@ -7256,6 +7258,597 @@ fn network_page() -> adw::NavigationPage {
     }
 
     adw::NavigationPage::new(&page, "Network")
+}
+
+fn calendar_page() -> adw::NavigationPage {
+    let page = adw::PreferencesPage::new();
+    page.set_title("Calendar");
+    let intro = adw::PreferencesGroup::new();
+    intro.set_title("Connected Calendars");
+    intro.set_description(Some("Read-only access. OAuth tokens are stored by the FocalDesk secrets broker, never in Settings."));
+    page.add(&intro);
+    let upcoming = adw::PreferencesGroup::new();
+    upcoming.set_title("Next 7 days");
+    let upcoming_rows: DynamicRows = Rc::new(RefCell::new(Vec::new()));
+    let upcoming_status = StatusBanner::new("Loading upcoming events…");
+    upcoming.add(&upcoming_status.widget());
+    let upcoming_refresh = gtk::Button::with_label("Refresh");
+    upcoming_refresh.add_css_class("pill");
+    let upcoming_refresh_row = adw::ActionRow::new();
+    upcoming_refresh_row.set_title("Upcoming events");
+    upcoming_refresh_row.add_suffix(&upcoming_refresh);
+    upcoming.add(&upcoming_refresh_row);
+    page.add(&upcoming);
+    refresh_upcoming_events(&upcoming, &upcoming_rows, &upcoming_status);
+    {
+        let group = upcoming.clone();
+        let rows = upcoming_rows.clone();
+        let status = upcoming_status.clone();
+        upcoming_refresh.connect_clicked(move |_| refresh_upcoming_events(&group, &rows, &status));
+    }
+    let accounts = adw::PreferencesGroup::new();
+    accounts.set_title("Accounts");
+    let account_rows: DynamicRows = Rc::new(RefCell::new(Vec::new()));
+    let account_status = StatusBanner::new("Loading connected accounts…");
+    accounts.add(&account_status.widget());
+    let refresh = gtk::Button::with_label("Refresh accounts");
+    refresh.add_css_class("pill");
+    let refresh_row = adw::ActionRow::new();
+    refresh_row.set_title("Account status");
+    refresh_row.add_suffix(&refresh);
+    accounts.add(&refresh_row);
+    page.add(&accounts);
+    refresh_calendar_accounts(&accounts, &account_rows, &account_status);
+    {
+        let accounts = accounts.clone();
+        let rows = account_rows.clone();
+        let status = account_status.clone();
+        refresh.connect_clicked(move |_| refresh_calendar_accounts(&accounts, &rows, &status));
+    }
+    page.add(&calendar_provider_group("Google Calendar", "google", false));
+    page.add(&calendar_provider_group("Microsoft 365", "microsoft", true));
+    adw::NavigationPage::new(&page, "Calendar")
+}
+
+fn refresh_upcoming_events(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &StatusBanner,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading upcoming events…");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let request = ConnectorHostIpcRequest::CalendarUpcoming {
+        after_unix: now,
+        before_unix: now + 7 * 86_400,
+        limit: 20,
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(&request));
+    });
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            if response.calendar_events.is_empty() {
+                status.set_text("No events cached for the next 7 days");
+            } else {
+                status.set_text(&format!(
+                    "{} upcoming event(s)",
+                    response.calendar_events.len()
+                ));
+            }
+            for event in response.calendar_events {
+                let row = adw::ActionRow::new();
+                row.set_title(&event.title);
+                row.set_subtitle(&format!(
+                    "{} · {} · {}",
+                    event.start_time.replace('T', " ").trim_end_matches('Z'),
+                    event.provider,
+                    event.account_id
+                ));
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not load events"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn refresh_calendar_accounts(
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &StatusBanner,
+) {
+    clear_dynamic_rows(group, rows);
+    status.set_text("Loading connected accounts…");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(
+            &ConnectorHostIpcRequest::CalendarAccounts,
+        ));
+    });
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            if response.calendar_accounts.is_empty() {
+                status.set_text("No calendar accounts connected");
+            } else {
+                status.set_text(&format!(
+                    "{} calendar account(s)",
+                    response.calendar_accounts.len()
+                ));
+            }
+            for account in response.calendar_accounts {
+                let row = adw::ActionRow::new();
+                row.set_title(&account.account_id);
+                let connection = if account.connected {
+                    "connected"
+                } else {
+                    "disconnected"
+                };
+                let mut subtitle = format!(
+                    "{} · {} · {} cached event(s) · {}",
+                    account.provider, connection, account.cached_events, account.sync_state
+                );
+                if let Some(error) = &account.last_error {
+                    subtitle.push_str(&format!(" · {error}"));
+                }
+                row.set_subtitle(&subtitle);
+                let purge = gtk::CheckButton::with_label("Delete local data");
+                row.add_suffix(&purge);
+                let disconnect = gtk::Button::with_label("Disconnect");
+                disconnect.add_css_class("destructive-action");
+                disconnect.add_css_class("pill");
+                row.add_suffix(&disconnect);
+                let manage = gtk::Button::with_label("Calendars");
+                manage.add_css_class("pill");
+                row.add_suffix(&manage);
+                let sync = gtk::Button::with_label("Sync now");
+                sync.add_css_class("pill");
+                row.add_suffix(&sync);
+                let manage_account = account.account_id.clone();
+                let manage_group = group.clone();
+                let manage_rows = rows.clone();
+                let manage_status = status.clone();
+                let reminder_minutes = account.reminder_minutes;
+                manage.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    discover_calendar_preferences(
+                        &manage_account,
+                        reminder_minutes,
+                        &manage_group,
+                        &manage_rows,
+                        &manage_status,
+                    );
+                });
+                let sync_account = account.account_id.clone();
+                let sync_status = status.clone();
+                sync.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    sync_status.set_text("Calendar sync requested…");
+                    let request = ConnectorHostIpcRequest::CalendarSyncNow {
+                        account_id: sync_account.clone(),
+                    };
+                    let (tx, rx) = mpsc::channel();
+                    thread::spawn(move || {
+                        let _ = tx.send(send_connector_host_request(&request));
+                    });
+                    let button = button.clone();
+                    let status = sync_status.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(response)) if response.status == "ok" => {
+                                status.set_text("Sync queued");
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Ok(response)) => {
+                                status
+                                    .set_text(response.message.as_deref().unwrap_or("Sync failed"));
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status.set_text(&error);
+                                button.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(_) => glib::ControlFlow::Break,
+                        }
+                    });
+                });
+                let account_id = account.account_id.clone();
+                let group_next = group.clone();
+                let rows_next = rows.clone();
+                let status_next = status.clone();
+                disconnect.connect_clicked(move |button| {
+                    button.set_sensitive(false);
+                    let request = ConnectorHostIpcRequest::CalendarDisconnect {
+                        account_id: account_id.clone(),
+                        delete_local_data: purge.is_active(),
+                    };
+                    let (tx, rx) = mpsc::channel();
+                    thread::spawn(move || {
+                        let _ = tx.send(send_connector_host_request(&request));
+                    });
+                    let group_done = group_next.clone();
+                    let rows_done = rows_next.clone();
+                    let status_done = status_next.clone();
+                    glib::timeout_add_local(Duration::from_millis(50), move || {
+                        match rx.try_recv() {
+                            Ok(Ok(response)) if response.status == "ok" => {
+                                status_done.set_text("Account disconnected; credentials removed");
+                                refresh_calendar_accounts(&group_done, &rows_done, &status_done);
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Ok(response)) => {
+                                status_done.set_text(
+                                    response.message.as_deref().unwrap_or("Disconnect failed"),
+                                );
+                                glib::ControlFlow::Break
+                            }
+                            Ok(Err(error)) => {
+                                status_done.set_text(&error);
+                                glib::ControlFlow::Break
+                            }
+                            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                            Err(_) => glib::ControlFlow::Break,
+                        }
+                    });
+                });
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+            }
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not load accounts"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn save_calendar_preferences(
+    account_id: String,
+    selected: Rc<RefCell<BTreeSet<String>>>,
+    reminder_minutes: Rc<Cell<u32>>,
+    status: StatusBanner,
+) {
+    let calendar_ids = selected.borrow().iter().cloned().collect::<Vec<_>>();
+    if calendar_ids.is_empty() {
+        status.set_text("Keep at least one calendar selected");
+        return;
+    }
+    let request = ConnectorHostIpcRequest::CalendarUpdatePreferences {
+        account_id,
+        calendar_ids,
+        reminder_minutes: reminder_minutes.get(),
+    };
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(&request));
+    });
+    status.set_text("Saving calendar preferences…");
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            status.set_text("Calendar preferences saved");
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not save preferences"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn discover_calendar_preferences(
+    account_id: &str,
+    current_reminder: u32,
+    group: &adw::PreferencesGroup,
+    rows: &DynamicRows,
+    status: &StatusBanner,
+) {
+    status.set_text("Loading provider calendars…");
+    let request = ConnectorHostIpcRequest::CalendarDiscover {
+        account_id: account_id.into(),
+    };
+    let account_id = account_id.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(send_connector_host_request(&request));
+    });
+    let group = group.clone();
+    let rows = rows.clone();
+    let status = status.clone();
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(Ok(response)) if response.status == "ok" => {
+            let selected = Rc::new(RefCell::new(
+                response
+                    .available_calendars
+                    .iter()
+                    .filter(|calendar| calendar.selected)
+                    .map(|calendar| calendar.id.clone())
+                    .collect::<BTreeSet<_>>(),
+            ));
+            let reminder = Rc::new(Cell::new(current_reminder));
+            let reminder_row = adw::ActionRow::new();
+            reminder_row.set_title(&format!("{account_id} reminder"));
+            reminder_row.set_subtitle("Notification time before each event");
+            let labels = [
+                "Off",
+                "5 minutes",
+                "10 minutes",
+                "15 minutes",
+                "30 minutes",
+                "1 hour",
+            ];
+            let values = [0_u32, 5, 10, 15, 30, 60];
+            let dropdown = gtk::DropDown::from_strings(&labels);
+            dropdown.set_selected(
+                values
+                    .iter()
+                    .position(|value| *value == current_reminder)
+                    .unwrap_or(2) as u32,
+            );
+            reminder_row.add_suffix(&dropdown);
+            group.add(&reminder_row);
+            rows.borrow_mut().push(reminder_row.upcast());
+            let reminder_account = account_id.clone();
+            let reminder_selected = selected.clone();
+            let reminder_value = reminder.clone();
+            let reminder_status = status.clone();
+            dropdown.connect_selected_notify(move |dropdown| {
+                reminder_value.set(values[dropdown.selected() as usize]);
+                save_calendar_preferences(
+                    reminder_account.clone(),
+                    reminder_selected.clone(),
+                    reminder_value.clone(),
+                    reminder_status.clone(),
+                );
+            });
+            for calendar in response.available_calendars {
+                let row = adw::ActionRow::new();
+                row.set_title(&calendar.name);
+                row.set_subtitle(if calendar.primary {
+                    "Primary calendar"
+                } else {
+                    &calendar.id
+                });
+                let toggle = gtk::Switch::new();
+                toggle.set_active(calendar.selected);
+                toggle.set_valign(gtk::Align::Center);
+                row.add_suffix(&toggle);
+                group.add(&row);
+                rows.borrow_mut().push(row.upcast());
+                let toggle_account = account_id.clone();
+                let toggle_id = calendar.id;
+                let toggle_selected = selected.clone();
+                let toggle_reminder = reminder.clone();
+                let toggle_status = status.clone();
+                toggle.connect_active_notify(move |toggle| {
+                    if toggle.is_active() {
+                        toggle_selected.borrow_mut().insert(toggle_id.clone());
+                    } else {
+                        toggle_selected.borrow_mut().remove(&toggle_id);
+                        if toggle_selected.borrow().is_empty() {
+                            toggle_selected.borrow_mut().insert(toggle_id.clone());
+                            toggle.set_active(true);
+                            toggle_status.set_text("Keep at least one calendar selected");
+                            return;
+                        }
+                    }
+                    save_calendar_preferences(
+                        toggle_account.clone(),
+                        toggle_selected.clone(),
+                        toggle_reminder.clone(),
+                        toggle_status.clone(),
+                    );
+                });
+            }
+            status.set_text("Choose calendars and reminder timing");
+            glib::ControlFlow::Break
+        }
+        Ok(Ok(response)) => {
+            status.set_text(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("Could not load calendars"),
+            );
+            glib::ControlFlow::Break
+        }
+        Ok(Err(error)) => {
+            status.set_text(&error);
+            glib::ControlFlow::Break
+        }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(_) => glib::ControlFlow::Break,
+    });
+}
+
+fn calendar_provider_group(
+    title: &str,
+    provider: &'static str,
+    microsoft: bool,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title(title);
+    let account = adw::EntryRow::new();
+    account.set_title("Account name");
+    account.set_text(if microsoft { "work-m365" } else { "google" });
+    group.add(&account);
+    let client = adw::EntryRow::new();
+    client.set_title("OAuth client ID");
+    group.add(&client);
+    let secret = adw::PasswordEntryRow::new();
+    secret.set_title("Client secret (Google only)");
+    if microsoft {
+        secret.set_visible(false);
+    }
+    group.add(&secret);
+    let tenant = adw::EntryRow::new();
+    tenant.set_title("Tenant");
+    tenant.set_text("common");
+    if !microsoft {
+        tenant.set_visible(false);
+    }
+    group.add(&tenant);
+    let status = StatusBanner::new("Not connected");
+    group.add(&status.widget());
+    let row = adw::ActionRow::new();
+    row.set_title("Connect account");
+    row.set_subtitle(if microsoft {
+        "Microsoft device-code sign-in with Calendars.Read"
+    } else {
+        "Browser sign-in using PKCE and calendar.readonly"
+    });
+    let button = gtk::Button::with_label("Connect");
+    button.add_css_class("suggested-action");
+    button.add_css_class("pill");
+    row.add_suffix(&button);
+    group.add(&row);
+    button.connect_clicked(move |button| {
+        let account_id = account.text().trim().to_string();
+        let client_id = client.text().trim().to_string();
+        if account_id.is_empty() || client_id.is_empty() {
+            status.set_text("Enter an account name and OAuth client ID");
+            return;
+        }
+        button.set_sensitive(false);
+        status.set_text("Starting secure sign-in…");
+        let request = ConnectorHostIpcRequest::CalendarConnect {
+            provider: provider.into(),
+            account_id,
+            client_id,
+            client_secret: (!microsoft && !secret.text().is_empty())
+                .then(|| secret.text().to_string()),
+            tenant: microsoft.then(|| tenant.text().to_string()),
+        };
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(send_connector_host_request(&request));
+        });
+        let status_poll = status.clone();
+        let button_poll = button.clone();
+        glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+            Ok(Ok(response)) => {
+                let Some(flow) = response.oauth else {
+                    status_poll.set_text(
+                        response
+                            .message
+                            .as_deref()
+                            .unwrap_or("Could not start sign-in"),
+                    );
+                    button_poll.set_sensitive(true);
+                    return glib::ControlFlow::Break;
+                };
+                if let Some(uri) = &flow.verification_uri {
+                    let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                        uri,
+                        None::<&gtk::gio::AppLaunchContext>,
+                    );
+                }
+                status_poll.set_text(
+                    &flow
+                        .user_code
+                        .as_ref()
+                        .map(|code| format!("Enter code {code} in the browser"))
+                        .unwrap_or_else(|| "Finish signing in with your browser".into()),
+                );
+                let flow_id = flow.flow_id;
+                let status_done = status_poll.clone();
+                let button_done = button_poll.clone();
+                glib::timeout_add_local(Duration::from_secs(1), move || {
+                    match send_connector_host_request(
+                        &ConnectorHostIpcRequest::CalendarOAuthStatus {
+                            flow_id: flow_id.clone(),
+                        },
+                    ) {
+                        Ok(response) => match response.oauth {
+                            Some(flow) if flow.state == "connected" => {
+                                status_done.set_text(
+                                    "Connected · enable calendar consent in the AI Console to sync",
+                                );
+                                button_done.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            Some(flow) if flow.state == "error" => {
+                                status_done
+                                    .set_text(flow.message.as_deref().unwrap_or("Sign-in failed"));
+                                button_done.set_sensitive(true);
+                                glib::ControlFlow::Break
+                            }
+                            _ => glib::ControlFlow::Continue,
+                        },
+                        Err(error) => {
+                            status_done.set_text(&error);
+                            button_done.set_sensitive(true);
+                            glib::ControlFlow::Break
+                        }
+                    }
+                });
+                glib::ControlFlow::Break
+            }
+            Ok(Err(error)) => {
+                status_poll.set_text(&error);
+                button_poll.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+            Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(_) => {
+                status_poll.set_text("Sign-in worker stopped");
+                button_poll.set_sensitive(true);
+                glib::ControlFlow::Break
+            }
+        });
+    });
+    group
 }
 
 fn populate_bluetooth_list(

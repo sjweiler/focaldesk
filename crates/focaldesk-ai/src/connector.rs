@@ -688,6 +688,49 @@ pub fn built_in_connectors() -> Vec<ConnectorManifest> {
         runtime: None,
         built_in: true,
     })
+    .chain([
+        ConnectorManifest {
+            manifest_version: CONNECTOR_MANIFEST_VERSION,
+            id: "google-calendar".into(),
+            name: "Google Calendar".into(),
+            description: "Read-only Google Calendar incremental sync.".into(),
+            version: "1.0.0".into(),
+            event_sources: vec![crate::EventSource::Calendar],
+            event_fields: BTreeMap::from([(
+                crate::EventSource::Calendar,
+                crate::supported_event_fields(crate::EventSource::Calendar)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )]),
+            network_domains: vec!["oauth2.googleapis.com".into(), "www.googleapis.com".into()],
+            signing_key_handle: None,
+            runtime: None,
+            built_in: true,
+        },
+        ConnectorManifest {
+            manifest_version: CONNECTOR_MANIFEST_VERSION,
+            id: "microsoft-calendar".into(),
+            name: "Microsoft 365 Calendar".into(),
+            description: "Read-only Microsoft Graph calendar incremental sync.".into(),
+            version: "1.0.0".into(),
+            event_sources: vec![crate::EventSource::Calendar],
+            event_fields: BTreeMap::from([(
+                crate::EventSource::Calendar,
+                crate::supported_event_fields(crate::EventSource::Calendar)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )]),
+            network_domains: vec![
+                "login.microsoftonline.com".into(),
+                "graph.microsoft.com".into(),
+            ],
+            signing_key_handle: None,
+            runtime: None,
+            built_in: true,
+        },
+    ])
     .collect()
 }
 
@@ -857,12 +900,15 @@ mod tests {
     #[test]
     fn builtins_are_installed_disabled_and_have_no_network_authority() {
         let statuses = ConnectorRegistry::memory().statuses().unwrap();
-        assert_eq!(statuses.len(), 5);
+        assert_eq!(statuses.len(), 7);
         assert!(statuses.iter().all(|status| {
             status.manifest.built_in
                 && !status.enabled
                 && !status.network_allowed
-                && status.manifest.network_domains.is_empty()
+                && (matches!(
+                    status.manifest.id.as_str(),
+                    "google-calendar" | "microsoft-calendar"
+                ) || status.manifest.network_domains.is_empty())
         }));
     }
 
