@@ -41,6 +41,11 @@ hdr-output-test-self-test:
 release-readiness:
     bash scripts/check-release-readiness.sh
 
+architecture-check:
+    python3 scripts/check-crate-boundaries.py --self-test
+    python3 scripts/check-crate-boundaries.py
+    cargo check -p focaldesk-input --no-default-features
+
 verify-install scope="all":
     bash scripts/verify-installation.sh "{{ scope }}"
 
