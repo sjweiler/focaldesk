@@ -1,5 +1,7 @@
 #![allow(unused_imports)]
 
+mod input;
+
 use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
@@ -59,23 +61,17 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use crate::core::input::FlowKeyState;
-use crate::core::input::FlowModifiers;
-use crate::core::input::FlowMouseButton;
-use crate::core::input::FlowScrollDelta;
-use crate::core::input::FlowScrollSource;
-use crate::core::input::{FlowInputEvent, InputState};
 use crate::core::lock::{
     authenticate_current_user, LockPulseKind, LockScreenState, LOCK_PULSE_DURATION,
 };
 use crate::core::shell::ManagedWindow;
+use crate::core::BackendEvent;
 use crate::core::RenderState;
 use focal_launch_shared::{request_launch, BrowserBackend, LaunchRequest, LaunchSource};
 use focaldesk_config::{load_config, save_config, FocalDeskConfig};
-use focaldesk_flow::actions::KeyAction;
-use focaldesk_flow::keybinds::BackendKind;
-use focaldesk_flow::Keybinds;
-use focaldesk_flow::ModMask;
+use focaldesk_input::{
+    InputEvent, InputState, KeyState, Modifiers, MouseButton, ScrollDelta, ScrollSource,
+};
 use focaldesk_ipc::{
     desktop_socket_path, send_control_request, send_notification_request, send_power_request,
     send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
@@ -99,7 +95,9 @@ use focaldesk_settings_core::{
     LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings,
     PrivacySettings, WorkspaceSettings,
 };
+use focaldesk_shortcuts::{KeyAction, KeySymbol, Keybinds, ModMask};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
+use focaldesk_types::CompositorBackend;
 use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::chrome::Chrome;
 use focaldesk_ui::chrome::ChromeMetrics;
@@ -1602,7 +1600,7 @@ pub struct DesktopInit {
     pub color_representation_state:
         crate::core::wayland::color_representation_protocol::ColorRepresentationState,
     pub cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
-    pub backend_kind: BackendKind,
+    pub backend_kind: CompositorBackend,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
     pub notification_snapshots: Vec<NotificationSnapshot>,
@@ -1724,7 +1722,7 @@ pub struct DesktopState {
         HashMap<OutputId, crate::core::linear_compositing::LinearOffscreenTargets>,
     /// Set after the first successful DRM present; portal capture waits for this.
     pub compositor_ready: bool,
-    pub backend_kind: BackendKind,
+    pub backend_kind: CompositorBackend,
     pub cursor_manager: CursorManager,
     pub seat: Seat<DesktopState>,
     // desktop model
@@ -1928,7 +1926,7 @@ struct LaunchContext {
     #[cfg(feature = "xwayland")]
     xwayland_display: Option<String>,
     browser_launch_backend: BrowserLaunchBackend,
-    backend_kind: BackendKind,
+    backend_kind: CompositorBackend,
     /// True once any output is rendering, or is about to render, a PQ frame.
     /// Browser launch policy must follow live compositor state rather than the
     /// persisted exclusive-HDR state, which does not cover normal HDR toggles.
@@ -3021,7 +3019,7 @@ impl DesktopState {
         use smithay::input::keyboard::FilterResult;
 
         let Some(keyboard) = self.seat.get_keyboard() else {
-            self.input.modifiers = FlowModifiers::default();
+            self.input.modifiers = Modifiers::default();
             return;
         };
 
@@ -3035,7 +3033,7 @@ impl DesktopState {
                 |_, _, _| FilterResult::<()>::Forward,
             );
         }
-        self.input.modifiers = FlowModifiers::default();
+        self.input.modifiers = Modifiers::default();
     }
 
     pub(crate) fn on_resume(&mut self) {
@@ -3132,7 +3130,9 @@ impl DesktopState {
         self.apply_config(config);
 
         let settings = load_settings();
-        let mut keybinds = Keybinds::with_defaults(self.backend_kind);
+        let mut keybinds = Keybinds::with_defaults(crate::backend::common::shortcut_capabilities(
+            self.backend_kind,
+        ));
         for warning in keybinds.apply_overrides(
             settings
                 .input
@@ -4636,7 +4636,7 @@ impl DesktopState {
             .unwrap_or_default();
         presence.internal_chrome_with_startup_policy(
             now.saturating_duration_since(self.render.start_time),
-            self.backend_kind == BackendKind::Drm,
+            self.backend_kind == CompositorBackend::Drm,
         )
     }
 
@@ -4917,7 +4917,7 @@ impl DesktopState {
         true
     }
 
-    fn egui_modifiers(modifiers: FlowModifiers) -> EguiModifiers {
+    fn egui_modifiers(modifiers: Modifiers) -> EguiModifiers {
         EguiModifiers {
             alt: modifiers.alt,
             ctrl: modifiers.ctrl,
@@ -4942,7 +4942,7 @@ impl DesktopState {
             rendering_output: output_id,
             now,
             start_time: self.render.start_time,
-            flip_egui_y: self.backend_kind == BackendKind::Drm,
+            flip_egui_y: self.backend_kind == CompositorBackend::Drm,
             portal_capture: false,
         })
     }
@@ -5120,14 +5120,14 @@ impl DesktopState {
         }
     }
 
-    fn egui_pointer_button(button: FlowMouseButton) -> Option<EguiPointerButton> {
+    fn egui_pointer_button(button: MouseButton) -> Option<EguiPointerButton> {
         match button {
-            FlowMouseButton::Left => Some(EguiPointerButton::Primary),
-            FlowMouseButton::Right => Some(EguiPointerButton::Secondary),
-            FlowMouseButton::Middle => Some(EguiPointerButton::Middle),
-            FlowMouseButton::Back => Some(EguiPointerButton::Extra1),
-            FlowMouseButton::Forward => Some(EguiPointerButton::Extra2),
-            FlowMouseButton::Other(_) => None,
+            MouseButton::Left => Some(EguiPointerButton::Primary),
+            MouseButton::Right => Some(EguiPointerButton::Secondary),
+            MouseButton::Middle => Some(EguiPointerButton::Middle),
+            MouseButton::Back => Some(EguiPointerButton::Extra1),
+            MouseButton::Forward => Some(EguiPointerButton::Extra2),
+            MouseButton::Other(_) => None,
         }
     }
 
@@ -5152,7 +5152,7 @@ impl DesktopState {
         }
     }
 
-    pub(crate) fn egui_text_for_keycode(keycode: u32, modifiers: FlowModifiers) -> Option<String> {
+    pub(crate) fn egui_text_for_keycode(keycode: u32, modifiers: Modifiers) -> Option<String> {
         if modifiers.ctrl || modifiers.alt || modifiers.super_key {
             return None;
         }
@@ -5508,12 +5508,14 @@ impl DesktopState {
             .is_some_and(|output| output.egui.wants_pointer_input())
     }
 
-    fn handle_egui_input(&mut self, event: &FlowInputEvent) -> bool {
+    fn handle_egui_input(&mut self, event: &InputEvent) -> bool {
         let output_id = match *event {
-            FlowInputEvent::PointerMoved { position, .. }
-            | FlowInputEvent::PointerButton { position, .. }
-            | FlowInputEvent::PointerScroll { position, .. } => self.output_under_pointer(position),
-            FlowInputEvent::PointerLeft | FlowInputEvent::Key { .. } => Some(self.focused_output),
+            InputEvent::PointerMoved { position, .. }
+            | InputEvent::PointerButton { position, .. }
+            | InputEvent::PointerScroll { position, .. } => {
+                self.output_under_pointer(position.into())
+            }
+            InputEvent::PointerLeft | InputEvent::Key { .. } => Some(self.focused_output),
             _ => None,
         };
         let Some(output_id) = output_id else {
@@ -5528,13 +5530,13 @@ impl DesktopState {
         }
 
         let egui_event = match *event {
-            FlowInputEvent::PointerMoved { .. } => {
+            InputEvent::PointerMoved { .. } => {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
                 EguiInputEvent::PointerMoved { position: local }
             }
-            FlowInputEvent::PointerButton { button, state, .. } => {
+            InputEvent::PointerButton { button, state, .. } => {
                 let Some(button) = Self::egui_pointer_button(button) else {
                     return false;
                 };
@@ -5543,22 +5545,22 @@ impl DesktopState {
                 };
                 EguiInputEvent::PointerButton {
                     button,
-                    pressed: matches!(state, FlowKeyState::Pressed),
+                    pressed: matches!(state, KeyState::Pressed),
                     position: local,
                     modifiers: Self::egui_modifiers(self.input.modifiers),
                 }
             }
-            FlowInputEvent::PointerScroll { delta, .. } => {
+            InputEvent::PointerScroll { delta, .. } => {
                 let Some(local) = self.pointer_relative_to_output_logical(output_id) else {
                     return false;
                 };
                 let delta = match delta {
-                    FlowScrollDelta::Line { x, y } => EguiScrollDelta::Line { x, y },
-                    FlowScrollDelta::Pixel { x, y } => EguiScrollDelta::Point {
+                    ScrollDelta::Line { x, y } => EguiScrollDelta::Line { x, y },
+                    ScrollDelta::Pixel { x, y } => EguiScrollDelta::Point {
                         x: x as f32,
                         y: y as f32,
                     },
-                    FlowScrollDelta::Axis { x, y, .. } => EguiScrollDelta::Point {
+                    ScrollDelta::Axis { x, y, .. } => EguiScrollDelta::Point {
                         x: x as f32,
                         y: y as f32,
                     },
@@ -5569,8 +5571,8 @@ impl DesktopState {
                     modifiers: Self::egui_modifiers(self.input.modifiers),
                 }
             }
-            FlowInputEvent::PointerLeft => EguiInputEvent::PointerGone,
-            FlowInputEvent::Key {
+            InputEvent::PointerLeft => EguiInputEvent::PointerGone,
+            InputEvent::Key {
                 keycode,
                 state,
                 repeat,
@@ -5578,7 +5580,7 @@ impl DesktopState {
             } => EguiInputEvent::Key {
                 key: Self::egui_key(keycode),
                 text: Self::egui_text_for_keycode(keycode, modifiers),
-                pressed: matches!(state, FlowKeyState::Pressed),
+                pressed: matches!(state, KeyState::Pressed),
                 repeat,
                 modifiers: Self::egui_modifiers(modifiers),
             },
@@ -5598,14 +5600,14 @@ impl DesktopState {
             .unwrap_or(0)
     }
 
-    fn flow_mouse_to_evdev(button: FlowMouseButton) -> u32 {
+    fn flow_mouse_to_evdev(button: MouseButton) -> u32 {
         match button {
-            FlowMouseButton::Left => 0x110,
-            FlowMouseButton::Right => 0x111,
-            FlowMouseButton::Middle => 0x112,
-            FlowMouseButton::Back => 0x113,
-            FlowMouseButton::Forward => 0x114,
-            FlowMouseButton::Other(v) => v as u32,
+            MouseButton::Left => 0x110,
+            MouseButton::Right => 0x111,
+            MouseButton::Middle => 0x112,
+            MouseButton::Back => 0x113,
+            MouseButton::Forward => 0x114,
+            MouseButton::Other(v) => v as u32,
         }
     }
 
@@ -6492,16 +6494,16 @@ impl DesktopState {
     fn forward_pointer_button(
         &mut self,
         _pos: Point<f64, Logical>,
-        button: FlowMouseButton,
-        state: FlowKeyState,
+        button: MouseButton,
+        state: KeyState,
     ) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
         let smithay_state = match state {
-            FlowKeyState::Pressed => ButtonState::Pressed,
-            FlowKeyState::Released => ButtonState::Released,
+            KeyState::Pressed => ButtonState::Pressed,
+            KeyState::Released => ButtonState::Released,
         };
         pointer.button(
             self,
@@ -6515,26 +6517,26 @@ impl DesktopState {
         pointer.frame(self);
     }
 
-    fn forward_pointer_scroll(&mut self, delta: FlowScrollDelta) {
+    fn forward_pointer_scroll(&mut self, delta: ScrollDelta) {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let time = Self::wl_pointer_time_ms();
         let mut frame = match delta {
-            FlowScrollDelta::Line { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
-            FlowScrollDelta::Pixel { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
-            FlowScrollDelta::Axis { source, .. } => {
+            ScrollDelta::Line { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
+            ScrollDelta::Pixel { .. } => AxisFrame::new(time).source(AxisSource::Wheel),
+            ScrollDelta::Axis { source, .. } => {
                 let source = match source {
-                    FlowScrollSource::Finger => AxisSource::Finger,
-                    FlowScrollSource::Continuous => AxisSource::Continuous,
-                    FlowScrollSource::Wheel => AxisSource::Wheel,
-                    FlowScrollSource::WheelTilt => AxisSource::WheelTilt,
+                    ScrollSource::Finger => AxisSource::Finger,
+                    ScrollSource::Continuous => AxisSource::Continuous,
+                    ScrollSource::Wheel => AxisSource::Wheel,
+                    ScrollSource::WheelTilt => AxisSource::WheelTilt,
                 };
                 AxisFrame::new(time).source(source)
             }
         };
         match delta {
-            FlowScrollDelta::Line { x, y } => {
+            ScrollDelta::Line { x, y } => {
                 if x != 0.0 {
                     frame = frame.value(Axis::Horizontal, f64::from(x));
                 }
@@ -6542,7 +6544,7 @@ impl DesktopState {
                     frame = frame.value(Axis::Vertical, f64::from(y));
                 }
             }
-            FlowScrollDelta::Pixel { x, y } => {
+            ScrollDelta::Pixel { x, y } => {
                 if x != 0.0 {
                     frame = frame.value(Axis::Horizontal, x);
                 }
@@ -6550,7 +6552,7 @@ impl DesktopState {
                     frame = frame.value(Axis::Vertical, y);
                 }
             }
-            FlowScrollDelta::Axis {
+            ScrollDelta::Axis {
                 x,
                 y,
                 x_v120,
@@ -7790,7 +7792,7 @@ impl DesktopState {
                 ));
             }
         }
-        self.input.pointer_pos = self.pointer_pos;
+        self.input.pointer_pos = self.pointer_pos.into();
 
         let fallback_workspace = self
             .outputs
@@ -8043,7 +8045,7 @@ impl DesktopState {
     pub(crate) fn xwayland_output_id_for_window(&self, id: WindowId) -> OutputId {
         self.window(id)
             .and_then(|window| window.output)
-            .or_else(|| self.output_under_pointer(self.input.pointer_pos))
+            .or_else(|| self.output_under_pointer(self.input.pointer_pos.into()))
             .unwrap_or(self.focused_output)
     }
 
@@ -9422,7 +9424,7 @@ impl DesktopState {
             .window_id_for_x11_surface(&surface)
             .map(|window_id| self.xwayland_output_id_for_window(window_id))
             .unwrap_or_else(|| {
-                self.output_under_pointer(self.input.pointer_pos)
+                self.output_under_pointer(self.input.pointer_pos.into())
                     .unwrap_or(self.primary_output)
             });
 
@@ -9787,7 +9789,7 @@ impl DesktopState {
         let mut mapped_window = false;
         if let Some(idx) = to_map.filter(|idx| !self.windows[*idx].minimized) {
             let output_id = self
-                .output_under_pointer(self.input.pointer_pos)
+                .output_under_pointer(self.input.pointer_pos.into())
                 .unwrap_or(self.primary_output);
 
             let map_loc = self.windows[idx]
@@ -10324,175 +10326,134 @@ impl DesktopState {
         launch_trace_id
     }
 
-    pub fn handle_key_event(&mut self, keycode: u32, state: FlowKeyState) {
-        use smithay::backend::input::KeyState as SmithayKeyState;
-        use smithay::input::keyboard::ModifiersState;
-
-        let smithay_state = match state {
-            FlowKeyState::Pressed => SmithayKeyState::Pressed,
-            FlowKeyState::Released => SmithayKeyState::Released,
-        };
-
-        let serial = SERIAL_COUNTER.next_serial();
-        let time = 0;
-
-        let Some(keyboard) = self.seat.get_keyboard() else {
+    pub fn handle_key_event(&mut self, keycode: u32, state: KeyState) {
+        let Some(prepared) = self.prepare_key_event(keycode, state) else {
             flog_info!("no keyboard on seat");
             return;
         };
 
-        let keybinds = self.keybinds.clone();
-        let mut resolved_action = None;
+        self.dispatch_prepared_key_event(prepared);
+    }
 
-        keyboard.input(
-            self,
-            keycode.into(),
+    fn dispatch_prepared_key_event(&mut self, prepared: input::PreparedKeyEvent) {
+        let input::PreparedKeyEvent {
+            keycode,
+            state,
             smithay_state,
             serial,
             time,
-            |ds, mods: &ModifiersState, handle| {
-                let sym = handle.modified_sym().raw();
+            modifiers_changed,
+            symbol: sym,
+            modifiers,
+        } = prepared;
 
-                ds.input.modifiers = FlowModifiers {
-                    shift: mods.shift,
-                    ctrl: mods.ctrl,
-                    alt: mods.alt,
-                    super_key: mods.logo,
-                };
+        let keybinds = self.keybinds.clone();
+        flog(format!(
+            "KEY DEBUG: keycode={} sym={} state={:?} modifiers={:?}",
+            keycode, sym, state, modifiers.input
+        ));
 
-                let mut mask = ModMask::empty();
-                if mods.shift {
-                    mask |= ModMask::SHIFT;
-                }
-                if mods.ctrl {
-                    mask |= ModMask::CTRL;
-                }
-                if mods.alt {
-                    mask |= ModMask::ALT;
-                }
-                if mods.logo {
-                    mask |= ModMask::SUPER;
-                }
-
-                flog(format!(
-                    "KEY DEBUG: keycode={} sym={} state={:?} mods={:?}",
-                    keycode, sym, state, mods
-                ));
-
-                // Modal dialogs: keyboard still updates XKB via `keyboard.input`, but compositor
-                // shortcuts stay disabled and Wayland clients do not receive these events.
-                if let Some(did) = ds.active_dialog {
-                    if let Some(dialog) = ds.dialogs.iter().find(|d| d.id == did) {
-                        match smithay_state {
-                            SmithayKeyState::Pressed => {
-                                if sym == keysyms::KEY_Escape && dialog.dismissible {
-                                    ds.close_dialog(did);
-                                    return FilterResult::<()>::Intercept(());
-                                }
-                                if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
-                                    let choice = dialog
-                                        .buttons
-                                        .iter()
-                                        .find(|b| matches!(b.action, DialogAction::Confirm))
-                                        .map(|b| b.action)
-                                        .or_else(|| dialog.buttons.first().map(|b| b.action))
-                                        .unwrap_or(DialogAction::Cancel);
-                                    ds.handle_dialog_action(did, choice);
-                                    return FilterResult::<()>::Intercept(());
-                                }
-                                // Other keys don't trigger compositor actions while open.
-                                return FilterResult::<()>::Intercept(());
-                            }
-                            SmithayKeyState::Released => {
-                                return FilterResult::<()>::Intercept(());
-                            }
-                        }
+        // XKB has already been updated by `prepare_key_event`; modal input and
+        // compositor shortcuts can now intercept without applying the key twice.
+        if let Some(did) = self.active_dialog {
+            if let Some(dialog) = self.dialogs.iter().find(|d| d.id == did) {
+                if matches!(state, KeyState::Pressed) {
+                    if sym == keysyms::KEY_Escape && dialog.dismissible {
+                        self.close_dialog(did);
+                        return;
+                    }
+                    if sym == keysyms::KEY_Return || sym == keysyms::KEY_KP_Enter {
+                        let choice = dialog
+                            .buttons
+                            .iter()
+                            .find(|b| matches!(b.action, DialogAction::Confirm))
+                            .map(|b| b.action)
+                            .or_else(|| dialog.buttons.first().map(|b| b.action))
+                            .unwrap_or(DialogAction::Cancel);
+                        self.handle_dialog_action(did, choice);
                     }
                 }
+                return;
+            }
+        }
 
-                // Once shell navigation is entered with Ctrl+Alt+Tab, ordinary Tab navigation and
-                // activation stay in the compositor until Escape or activation exits the mode.
-                // Outside this mode these keys continue to reach the focused client normally.
-                if ds.ui.focused.is_some() {
-                    let navigation_key = matches!(
-                        sym,
-                        keysyms::KEY_Tab
-                            | keysyms::KEY_ISO_Left_Tab
-                            | keysyms::KEY_Return
-                            | keysyms::KEY_KP_Enter
-                            | keysyms::KEY_space
-                            | keysyms::KEY_Escape
+        if self.ui.focused.is_some() {
+            let navigation_key = matches!(
+                sym,
+                keysyms::KEY_Tab
+                    | keysyms::KEY_ISO_Left_Tab
+                    | keysyms::KEY_Return
+                    | keysyms::KEY_KP_Enter
+                    | keysyms::KEY_space
+                    | keysyms::KEY_Escape
+            );
+            if navigation_key {
+                if matches!(state, KeyState::Pressed) {
+                    match sym {
+                        keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => {
+                            if modifiers.input.shift || sym == keysyms::KEY_ISO_Left_Tab {
+                                self.ui.focus_previous();
+                            } else {
+                                self.ui.focus_next();
+                            }
+                        }
+                        keysyms::KEY_Return | keysyms::KEY_KP_Enter | keysyms::KEY_space => {
+                            let action = self.ui.focused_action();
+                            self.ui.clear_focus();
+                            if let Some(action) = action {
+                                self.dispatch_ui_action(action);
+                            }
+                        }
+                        keysyms::KEY_Escape => self.ui.clear_focus(),
+                        _ => {}
+                    }
+                    self.publish_accessibility_tree();
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
+                return;
+            }
+        }
+
+        if matches!(state, KeyState::Pressed)
+            && matches!(sym, keysyms::KEY_XF86PowerOff | keysyms::KEY_XF86Sleep)
+        {
+            self.dispatch_power_button_action();
+            return;
+        }
+
+        match input::shortcut_dispatch(
+            &keybinds,
+            KeySymbol::from_raw(sym),
+            modifiers.shortcuts,
+            state,
+        ) {
+            input::ShortcutDispatch::Forward => {
+                if let Some(keyboard) = self.seat.get_keyboard() {
+                    keyboard.input_forward(
+                        self,
+                        keycode.into(),
+                        smithay_state,
+                        serial,
+                        time,
+                        modifiers_changed,
                     );
-                    if navigation_key {
-                        if matches!(smithay_state, SmithayKeyState::Pressed) {
-                            match sym {
-                                keysyms::KEY_Tab | keysyms::KEY_ISO_Left_Tab => {
-                                    if mods.shift || sym == keysyms::KEY_ISO_Left_Tab {
-                                        ds.ui.focus_previous();
-                                    } else {
-                                        ds.ui.focus_next();
-                                    }
-                                }
-                                keysyms::KEY_Return
-                                | keysyms::KEY_KP_Enter
-                                | keysyms::KEY_space => {
-                                    let action = ds.ui.focused_action();
-                                    ds.ui.clear_focus();
-                                    if let Some(action) = action {
-                                        ds.dispatch_ui_action(action);
-                                    }
-                                }
-                                keysyms::KEY_Escape => ds.ui.clear_focus(),
-                                _ => {}
-                            }
-                            ds.publish_accessibility_tree();
-                            ds.mark_focused_output_full_damage(DamageSource::Unknown);
-                        }
-                        return FilterResult::<()>::Intercept(());
-                    }
                 }
-
-                if sym == keysyms::KEY_Print && matches!(state, FlowKeyState::Released) {
-                    if mask.contains(ModMask::SHIFT) {
-                        resolved_action = Some(KeyAction::TakeScreenshotAll);
-                    } else {
-                        resolved_action = Some(KeyAction::TakeScreenshot);
-                    }
-                    return FilterResult::<()>::Intercept(());
-                }
-
-                if matches!(state, FlowKeyState::Pressed)
-                    && matches!(sym, keysyms::KEY_XF86PowerOff | keysyms::KEY_XF86Sleep)
-                {
-                    ds.dispatch_power_button_action();
-                    return FilterResult::<()>::Intercept(());
-                }
-
-                if matches!(state, FlowKeyState::Pressed) {
-                    resolved_action = keybinds.resolve(sym, mask);
-                    if resolved_action.is_some() {
-                        return FilterResult::<()>::Intercept(());
-                    }
-                }
-
-                FilterResult::<()>::Forward
-            },
-        );
-
-        if let Some(action) = resolved_action {
-            flog(format!("ACTION={:?}", action,));
-
-            self.handle_action(action);
+            }
+            input::ShortcutDispatch::Intercept => {}
+            input::ShortcutDispatch::Trigger(action) => {
+                flog(format!("ACTION={action:?}"));
+                self.handle_action(action);
+            }
         }
     }
 
-    fn handle_lock_key_event(&mut self, keycode: u32, state: FlowKeyState) {
+    fn handle_lock_key_event(&mut self, keycode: u32, state: KeyState) {
         use smithay::backend::input::KeyState as SmithayKeyState;
         use smithay::input::keyboard::ModifiersState;
 
         let smithay_state = match state {
-            FlowKeyState::Pressed => SmithayKeyState::Pressed,
-            FlowKeyState::Released => SmithayKeyState::Released,
+            KeyState::Pressed => SmithayKeyState::Pressed,
+            KeyState::Released => SmithayKeyState::Released,
         };
         let serial = SERIAL_COUNTER.next_serial();
         let time = 0;
@@ -10508,12 +10469,7 @@ impl DesktopState {
             serial,
             time,
             |ds, mods: &ModifiersState, handle| {
-                ds.input.modifiers = FlowModifiers {
-                    shift: mods.shift,
-                    ctrl: mods.ctrl,
-                    alt: mods.alt,
-                    super_key: mods.logo,
-                };
+                ds.input.modifiers = input::keyboard_modifiers(mods).input;
 
                 if !matches!(smithay_state, SmithayKeyState::Pressed) {
                     return FilterResult::<()>::Intercept(());
@@ -10699,11 +10655,11 @@ impl DesktopState {
         false
     }
 
-    fn process_toplevel_pointer_button(&mut self, button: FlowMouseButton, state: FlowKeyState) {
-        if !matches!(button, FlowMouseButton::Left) {
+    fn process_toplevel_pointer_button(&mut self, button: MouseButton, state: KeyState) {
+        if !matches!(button, MouseButton::Left) {
             return;
         }
-        if !matches!(state, FlowKeyState::Released) {
+        if !matches!(state, KeyState::Released) {
             return;
         }
         let snap_preview = self.snap_preview.take();
@@ -10784,572 +10740,7 @@ impl DesktopState {
         self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
-    pub fn handle_input(&mut self, event: FlowInputEvent) {
-        if self.debug.show_input_events {
-            focaldesk_logging::logging::flog(FLogLevel::Debug, format!("input event: {event:?}"));
-        }
-
-        if !self.lock_screen.active
-            && matches!(
-                event,
-                FlowInputEvent::Key { .. }
-                    | FlowInputEvent::PointerMoved { .. }
-                    | FlowInputEvent::PointerButton { .. }
-                    | FlowInputEvent::PointerScroll { .. }
-                    | FlowInputEvent::PointerEntered
-                    | FlowInputEvent::PointerLeft
-            )
-        {
-            self.record_user_activity();
-        }
-
-        if self.lock_screen.active {
-            match event {
-                FlowInputEvent::Key { keycode, state, .. } => {
-                    self.handle_lock_key_event(keycode, state);
-                }
-                FlowInputEvent::PointerMoved { position, .. } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
-                }
-                FlowInputEvent::PointerButton {
-                    button,
-                    state,
-                    position,
-                } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
-                    if matches!(
-                        (button, state),
-                        (FlowMouseButton::Left, FlowKeyState::Pressed)
-                    ) {
-                        self.toggle_lock_password_visibility_at(position);
-                    }
-                }
-                FlowInputEvent::PointerScroll { position, .. } => {
-                    self.input.pointer_pos = position;
-                    self.pointer_pos = position;
-                    self.cursor_manager.move_to(position.x, position.y);
-                    self.clear_client_pointer_focus(position);
-                }
-                FlowInputEvent::PointerEntered => {
-                    self.cursor_manager.set_visible(true);
-                }
-                FlowInputEvent::PointerLeft => {
-                    self.cursor_manager.set_visible(false);
-                }
-                FlowInputEvent::Resized {
-                    output_id,
-                    width,
-                    height,
-                    scale_factor,
-                } => {
-                    let size = Size::<i32, Physical>::from((width as i32, height as i32));
-                    self.update_output_size(output_id, size, scale_factor);
-                }
-                FlowInputEvent::CloseRequested => {
-                    self.running = false;
-                }
-            }
-
-            self.pending_compositor_move = None;
-            self.pending_xdg_move = None;
-            self.toplevel_pointer = None;
-            self.split_divider_drag = None;
-            self.input.pointer_left_down = false;
-            self.mark_all_outputs_full_damage(DamageSource::Unknown);
-            return;
-        }
-
-        match event {
-            FlowInputEvent::Key { keycode, state, .. } => {
-                if matches!(state, FlowKeyState::Pressed)
-                    && keycode == 1
-                    && self.egui_open_on_output(self.focused_output)
-                {
-                    if let Some(output) = self.desktop_outputs.get_mut(&self.focused_output) {
-                        output.egui.close_all_panels();
-                    }
-                    self.pending_split_assist = None;
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                if self.handle_egui_input(&event) {
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                // Modal dialogs intercept inside `keyboard.input` (still updates XKB / modifier state).
-                self.handle_key_event(keycode, state);
-                self.mark_focused_output_full_damage(DamageSource::Unknown);
-            }
-
-            FlowInputEvent::PointerMoved {
-                position,
-                delta,
-                delta_unaccel,
-            } => {
-                let previous_pos = self.pointer_pos;
-                let pointer_locked = self.pointer_lock_active_at(previous_pos);
-                let position = self.constrained_pointer_position(previous_pos, position);
-                let position = self.confine_pointer_to_outputs(previous_pos, position);
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                // Keep the visible cursor in lockstep with the compositor's
-                // logical pointer before an overlay gets a chance to consume
-                // the event. The old ordering returned from the egui branch
-                // first, leaving the KMS/software cursor frozen at the panel
-                // edge while egui received an invisible moving pointer.
-                self.cursor_manager.move_to(position.x, position.y);
-                self.drm_submit_hw_cursor = true;
-                let cursor_owner_damage = self.update_cursor_owner_damage();
-                let stale_cursor_damage = self.clear_stale_software_cursor_damage();
-                if self.egui_open_on_output(self.focused_output) {
-                    let _ = self.handle_egui_input(&event);
-                    if self.egui_wants_pointer_on_output(self.focused_output) {
-                        self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_egui_damage(self.focused_output);
-                        return;
-                    }
-                } else if self.handle_egui_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                if self.handle_dialog_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-                if self.input.pointer_left_down {
-                    if let Some(drag) = self.split_divider_drag {
-                        self.resize_split_grid_divider(drag.divider, position);
-                        self.clear_client_pointer_focus(position);
-                        self.update_pointer_cursor(position);
-                        self.mark_output_full_damage(
-                            drag.divider.output,
-                            DamageSource::WindowResize,
-                        );
-                        return;
-                    }
-                }
-                const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
-                if self.input.pointer_left_down {
-                    if let Some((id, start)) = self.pending_xdg_move {
-                        let d = position - start;
-                        if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
-                            self.pending_xdg_move = None;
-                            self.request_move(id);
-                        }
-                    }
-                    if let Some((id, start)) = self.pending_compositor_move {
-                        let d = position - start;
-                        if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
-                            self.pending_compositor_move = None;
-                            self.try_begin_compositor_move(id);
-                        }
-                    }
-                } else {
-                    self.pending_xdg_move = None;
-                    if matches!(
-                        self.toplevel_pointer,
-                        Some(ToplevelPointerInteraction::Move { .. })
-                    ) {
-                        self.toplevel_pointer = None;
-                        self.forward_pointer_to_clients(self.pointer_pos);
-                    }
-                }
-                let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
-                let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
-                self.update_pointer_cursor(position);
-                if !self.compositor_pointer_grab_active() {
-                    if let (Some(delta), Some(delta_unaccel)) = (delta, delta_unaccel) {
-                        self.forward_pointer_relative_motion(position, delta, delta_unaccel);
-                    }
-                    if pointer_locked {
-                        if let Some(pointer) = self.seat.get_pointer() {
-                            pointer.frame(self);
-                        }
-                    } else {
-                        // Relative motion belongs to the same logical event and
-                        // must precede the wl_pointer frame emitted here.
-                        self.forward_pointer_to_clients(position);
-                        self.activate_pointer_constraint_at(position);
-                    }
-                }
-                let precise_cursor_damage =
-                    self.software_cursor_damage_pending_for_output(self.focused_output);
-                if !precise_toplevel_damage
-                    && !precise_hover_damage
-                    && !precise_cursor_damage
-                    && !stale_cursor_damage
-                    && !cursor_owner_damage
-                {
-                    // A hardware cursor still needs a render/present cycle so KMS can move its
-                    // cursor plane, but the primary plane has not visually changed. Queue the
-                    // smallest possible cursor-classified damage instead of invalidating the
-                    // entire retained wallpaper/chrome base on every pointer motion event.
-                    self.mark_output_damage_source(
-                        self.focused_output,
-                        Rectangle::from_loc_and_size((0, 0), (1, 1)),
-                        DamageSource::Cursor,
-                    );
-                }
-            }
-
-            FlowInputEvent::PointerButton {
-                button,
-                state,
-                position,
-                ..
-            } => {
-                if matches!(state, FlowKeyState::Pressed) && self.ui.focused.is_some() {
-                    self.ui.clear_focus();
-                    self.publish_accessibility_tree();
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                }
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                // Rendering rebuilds the compositor's single UiTree once per
-                // output. Resolve this click against the output that actually
-                // received it, not whichever output happened to render last.
-                self.rebuild_ui_tree_for_output(self.focused_output);
-                let cursor_owner_damage = self.update_cursor_owner_damage();
-                let stale_cursor_damage = self.clear_stale_software_cursor_damage();
-
-                if self.egui_open_on_output(self.focused_output) {
-                    let _ = self.handle_egui_input(&event);
-                } else if self.handle_egui_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-
-                if self.handle_dialog_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-
-                if matches!(button, FlowMouseButton::Right)
-                    && matches!(state, FlowKeyState::Pressed)
-                {
-                    if let Some(divider) = self.split_divider_at(position) {
-                        if !self.focused_window.is_some_and(|id| {
-                            divider.before.contains(&Some(id)) || divider.after.contains(&Some(id))
-                        }) {
-                            if let Some(id) = divider
-                                .before
-                                .into_iter()
-                                .chain(divider.after)
-                                .flatten()
-                                .next()
-                            {
-                                self.focus_window_id(id);
-                            }
-                        }
-                        self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::SplitGroup));
-                        self.clear_client_pointer_focus(position);
-                        self.mark_output_full_damage(divider.output, DamageSource::Egui);
-                        return;
-                    }
-                }
-
-                if matches!(button, FlowMouseButton::Left) {
-                    match state {
-                        FlowKeyState::Pressed => {
-                            if let Some(divider) = self.split_divider_at(position) {
-                                self.input.pointer_left_down = true;
-                                self.record_split_undo(
-                                    divider.before.into_iter().chain(divider.after).flatten(),
-                                );
-                                self.split_divider_drag = Some(SplitDividerDrag { divider });
-                                self.pending_compositor_move = None;
-                                self.pending_xdg_move = None;
-                                self.clear_client_pointer_focus(position);
-                                self.update_pointer_cursor(position);
-                                self.mark_output_full_damage(
-                                    divider.output,
-                                    DamageSource::WindowResize,
-                                );
-                                return;
-                            }
-                        }
-                        FlowKeyState::Released => {
-                            if let Some(drag) = self.split_divider_drag.take() {
-                                if let Some(pair) = self.split_pair_for_output(drag.divider.output)
-                                {
-                                    self.remember_split_ratio(pair);
-                                }
-                                self.input.pointer_left_down = false;
-                                self.clear_client_pointer_focus(position);
-                                self.update_pointer_cursor(position);
-                                self.mark_output_full_damage(
-                                    drag.divider.output,
-                                    DamageSource::WindowResize,
-                                );
-                                return;
-                            }
-                        }
-                    }
-                }
-
-                if matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Released)
-                    && self.suppress_next_left_release
-                {
-                    self.suppress_next_left_release = false;
-                    self.input.pointer_left_down = false;
-                    self.pending_compositor_move = None;
-                    self.pending_xdg_move = None;
-                    self.update_pointer_cursor(position);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-
-                if matches!(button, FlowMouseButton::Left)
-                    && self.peek_ui_action_at_pointer().is_some()
-                {
-                    let mut damaged_precisely = false;
-                    match state {
-                        FlowKeyState::Pressed => {
-                            self.input.pointer_left_down = true;
-                            let pressed_element = self
-                                .ui_element_at_pointer_for_output(self.focused_output)
-                                .map(|el| (el.id, el.kind));
-                            self.ui.pressed = pressed_element.map(|(id, _)| id);
-                            self.clear_client_pointer_focus(position);
-                            damaged_precisely = match pressed_element {
-                                Some((_, UiElementKind::SidebarButton)) => {
-                                    self.trigger_sidebar_pulse_at_pointer(self.focused_output)
-                                }
-                                Some((
-                                    _,
-                                    UiElementKind::TopbarIndicator | UiElementKind::TopbarButton,
-                                )) => self.trigger_topbar_pulse_at_pointer(self.focused_output),
-                                Some((_, UiElementKind::Clock)) => {
-                                    self.trigger_clock_pulse_at_pointer(self.focused_output)
-                                }
-                                _ => false,
-                            };
-                        }
-                        FlowKeyState::Released => {
-                            self.input.pointer_left_down = false;
-                            if let Some(pressed_id) = self.ui.pressed.take() {
-                                let clicked = self
-                                    .ui_element_at_pointer_for_output(self.focused_output)
-                                    .is_some_and(|el| el.id == pressed_id && el.enabled);
-                                if clicked && self.click_ui_at_pointer() {
-                                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                                }
-                            }
-                            self.pending_compositor_move = None;
-                        }
-                    }
-                    self.update_pointer_cursor(position);
-                    if !damaged_precisely
-                        && !matches!(state, FlowKeyState::Released)
-                        && self.sidebar_pulse.is_none()
-                        && self.topbar_pulse.is_none()
-                        && self.clock_pulse.is_none()
-                    {
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    }
-                    return;
-                }
-
-                if matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Released)
-                    && self.ui.pressed.is_some()
-                {
-                    self.input.pointer_left_down = false;
-                    self.ui.pressed = None;
-                    self.pending_compositor_move = None;
-                    self.clear_client_pointer_focus(position);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-
-                if self.egui_open_on_output(self.focused_output)
-                    && matches!(button, FlowMouseButton::Left)
-                    && matches!(state, FlowKeyState::Pressed | FlowKeyState::Released)
-                {
-                    self.process_egui_actions();
-                    if matches!(state, FlowKeyState::Released)
-                        && self.egui_wants_pointer_on_output(self.focused_output)
-                    {
-                        self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_egui_damage(self.focused_output);
-                        return;
-                    }
-                }
-
-                if matches!(button, FlowMouseButton::Left) {
-                    match state {
-                        FlowKeyState::Pressed => {
-                            self.input.pointer_left_down = true;
-                        }
-                        FlowKeyState::Released => {
-                            self.input.pointer_left_down = false;
-                            self.pending_compositor_move = None;
-                            self.pending_xdg_move = None;
-                        }
-                    }
-                }
-
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                self.cursor_manager.move_to(position.x, position.y);
-                let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
-                let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
-                if matches!(state, FlowKeyState::Pressed) {
-                    if matches!(button, FlowMouseButton::Left)
-                        && self.pointer_on_chrome_host_drag_region(position)
-                    {
-                        self.host_window_drag_requested = true;
-                        self.pending_compositor_move = None;
-                    } else if matches!(button, FlowMouseButton::Left)
-                        && self.handle_xwayland_titlebar_press(position)
-                    {
-                        self.clear_client_pointer_focus(position);
-                        self.update_pointer_cursor(position);
-                        self.mark_focused_output_full_damage(DamageSource::Unknown);
-                        return;
-                    } else {
-                        self.focus_window_at(position);
-                        if matches!(button, FlowMouseButton::Left)
-                            && self.pointer_in_work_recess(position)
-                        {
-                            if let Some((id, edges)) = self.top_window_resize_edge_at(position) {
-                                self.pending_compositor_move = None;
-                                if let Ok(edge) = ResizeEdge::try_from(edges) {
-                                    self.try_begin_compositor_resize(id, edge);
-                                }
-                            }
-                        }
-                    }
-                }
-                if self.compositor_pointer_grab_active() {
-                    if matches!(button, FlowMouseButton::Left)
-                        && matches!(state, FlowKeyState::Released)
-                    {
-                        self.process_toplevel_pointer_button(button, state);
-                        self.forward_pointer_button(position, button, state);
-                    }
-                } else {
-                    self.forward_pointer_to_clients(position);
-                    self.forward_pointer_button(position, button, state);
-                    self.process_toplevel_pointer_button(button, state);
-                }
-                self.update_pointer_cursor(position);
-                let precise_cursor_damage =
-                    self.software_cursor_damage_pending_for_output(self.focused_output);
-                if !precise_toplevel_damage
-                    && !precise_hover_damage
-                    && !precise_cursor_damage
-                    && !stale_cursor_damage
-                    && !cursor_owner_damage
-                {
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                }
-            }
-
-            FlowInputEvent::PointerScroll {
-                position, delta, ..
-            } => {
-                self.input.pointer_pos = position;
-                self.pointer_pos = position;
-                if let Some(id) = self.output_under_pointer(position) {
-                    self.set_focused_output(id);
-                }
-                self.update_cursor_owner_damage();
-                self.clear_stale_software_cursor_damage();
-                if self.egui_open_on_output(self.focused_output) {
-                    let _ = self.handle_egui_input(&event);
-                    if self.egui_wants_pointer_on_output(self.focused_output) {
-                        self.clear_client_pointer_focus(self.pointer_pos);
-                        self.mark_egui_damage(self.focused_output);
-                        return;
-                    }
-                } else if self.handle_egui_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_egui_damage(self.focused_output);
-                    return;
-                }
-                if self.handle_dialog_input(&event) {
-                    self.clear_client_pointer_focus(self.pointer_pos);
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                    return;
-                }
-                self.cursor_manager.move_to(position.x, position.y);
-                if !self.compositor_pointer_grab_active() {
-                    self.forward_pointer_to_clients(position);
-                    self.forward_pointer_scroll(delta);
-                }
-                if self.egui_open_on_output(self.focused_output) {
-                    self.mark_egui_damage(self.focused_output);
-                } else {
-                    self.mark_focused_output_full_damage(DamageSource::Unknown);
-                }
-            }
-
-            FlowInputEvent::PointerEntered => {
-                self.cursor_manager.set_visible(true);
-                self.update_cursor_owner_damage();
-                self.mark_focused_output_full_damage(DamageSource::Cursor);
-            }
-
-            FlowInputEvent::PointerLeft => {
-                let _ = self.handle_egui_input(&event);
-                self.process_toplevel_pointer_button(FlowMouseButton::Left, FlowKeyState::Released);
-                self.input.pointer_left_down = false;
-                self.pending_compositor_move = None;
-                self.pending_xdg_move = None;
-                self.split_divider_drag = None;
-                self.cursor_manager.set_visible(false);
-                self.update_cursor_owner_damage();
-                self.clear_all_software_cursor_damage();
-                self.mark_focused_output_full_damage(DamageSource::Cursor);
-            }
-
-            FlowInputEvent::Resized {
-                output_id,
-                width,
-                height,
-                scale_factor,
-            } => {
-                //let id = OutputId(1);
-                let size = Size::<i32, Physical>::from((width as i32, height as i32));
-                self.update_output_size(output_id, size, scale_factor);
-
-                // if let Some(output) = self.outputs.get_mut(&id) {
-                //     output.scale_factor = scale_factor;
-                //     output.scale = Scale::from((scale_factor, scale_factor));
-                //     output.physical_size = size;
-                //     let logical_w = (size.w as f64 / scale_factor).round() as i32;
-                //     let logical_h = (size.h as f64 / scale_factor).round() as i32;
-                //     output.logical_size = Size::<i32, Logical>::from((logical_w, logical_h));
-                // }
-            }
-
-            FlowInputEvent::CloseRequested => {
-                self.running = false;
-            }
-        }
-    }
-
-    fn handle_dialog_input(&mut self, event: &FlowInputEvent) -> bool {
+    fn handle_dialog_input(&mut self, event: &InputEvent) -> bool {
         let Some(dialog_id) = self.active_dialog else {
             return false;
         };
@@ -11366,8 +10757,8 @@ impl DesktopState {
         let layout = layout_dialog(dialog, screen);
 
         match event {
-            FlowInputEvent::PointerButton { state, .. } => {
-                if !matches!(state, FlowKeyState::Pressed) {
+            InputEvent::PointerButton { state, .. } => {
+                if !matches!(state, KeyState::Pressed) {
                     return true;
                 }
 
@@ -11397,11 +10788,11 @@ impl DesktopState {
                 true
             }
 
-            FlowInputEvent::PointerMoved { .. } => true,
+            InputEvent::PointerMoved { .. } => true,
 
-            FlowInputEvent::PointerScroll { .. } => true,
+            InputEvent::PointerScroll { .. } => true,
 
-            FlowInputEvent::Key { .. } => false,
+            InputEvent::Key { .. } => false,
 
             _ => false,
         }
@@ -15599,7 +14990,7 @@ mod tests {
         let recovered = confine_pointer_to_output_bounds(
             (1100.0, 500.0).into(),
             (1150.0, 500.0).into(),
-            [left, right].into_iter(),
+            [left, right],
         );
 
         assert_eq!(recovered, (1200.0, 500.0).into());

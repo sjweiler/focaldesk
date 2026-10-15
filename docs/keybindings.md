@@ -66,7 +66,7 @@ workspace exists.
 | `Alt+0` | Open the complete workspace list |
 
 This document follows the bindings in
-`crates/focaldesk-flow/src/keybinds.rs`, which is the current source of truth.
+`crates/focaldesk-shortcuts/src/keybinds.rs`, which is the current source of truth.
 
 ## Configuration syntax
 

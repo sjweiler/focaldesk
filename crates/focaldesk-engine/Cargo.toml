@@ -26,7 +26,8 @@ vui-ash = { path = "../../../vello-ui/crates/vui-ash", optional = true }
 ash = { workspace = true, optional = true }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
-focaldesk-flow = { path = "../focaldesk-flow" }
+focaldesk-input = { path = "../focaldesk-input", features = ["smithay"] }
+focaldesk-shortcuts = { path = "../focaldesk-shortcuts" }
 focaldesk-types = { path = "../focaldesk-types" }
 focaldesk-logging = { path = "../focaldesk-logging" }
 focaldesk-resources = { path = "../focaldesk-resources" }

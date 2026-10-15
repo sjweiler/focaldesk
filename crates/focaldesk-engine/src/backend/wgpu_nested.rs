@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use crate::core::fonts::{FontId, TextStyle};
 use anyhow::{anyhow, Context, Result};
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_render::{
     AutoHdrParams, FramePixelFormat, FrameRetention, FrameTransferFunction, FrameTransform,
     LinuxDmabuf, MeshVertex, PresentRenderer, PresentResult, SolidQuad, TextureColorTransform,
     TextureQuad, TexturedMesh, WgpuVulkanRenderer,
 };
+use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
 use focaldesk_ui::dialog_layout::layout_dialog;
@@ -43,7 +43,7 @@ use tracing::{error, info, trace, warn};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
+    event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     platform::scancode::PhysicalKeyExtScancode,
     window::{Window, WindowId},
@@ -55,9 +55,8 @@ use super::common::{
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
 use crate::core::color::{SurfaceColorRenderState, TransferFunction};
-use crate::core::input::{
-    FlowInputEvent, FlowKeyState, FlowModifiers, FlowMouseButton, FlowScrollDelta,
-};
+use crate::core::BackendEvent;
+use focaldesk_input::{InputEvent, KeyState, Modifiers, MouseButton, ScrollDelta};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
@@ -343,7 +342,7 @@ struct NestedVulkanApp {
     logged_first_surface_present: bool,
     logged_first_cursor_present: bool,
     logged_dmabuf_import: bool,
-    modifiers: FlowModifiers,
+    modifiers: Modifiers,
     scene_builder: VulkanSceneBuilder,
     vui_shell: Option<VuiShell>,
     vui_text_keys: HashSet<u32>,
@@ -432,15 +431,17 @@ impl NestedVulkanApp {
             Size::<i32, Physical>::from((width as i32, height as i32)),
             scale_factor,
         );
-        desktop.state.handle_input(FlowInputEvent::Resized {
-            output_id: OutputId(1),
-            width,
-            height,
-            scale_factor,
-        });
+        desktop
+            .state
+            .handle_backend_event(BackendEvent::OutputResized {
+                output_id: OutputId(1),
+                width,
+                height,
+                scale_factor,
+            });
     }
 
-    fn handle_input(&mut self, event: FlowInputEvent) {
+    fn handle_input(&mut self, event: InputEvent) {
         self.sync_vui_lock_state();
         let origin = self
             .vui_shell
@@ -540,7 +541,7 @@ impl ApplicationHandler for NestedVulkanApp {
                 )),
                 scale_factor: window.scale_factor(),
             }),
-            BackendKind::Winit,
+            CompositorBackend::Winit,
         ) {
             Ok(desktop) => desktop,
             Err(error) => {
@@ -703,7 +704,14 @@ impl ApplicationHandler for NestedVulkanApp {
         self.sync_vui_lock_state();
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if let Some(desktop) = self.desktop.as_mut() {
+                    desktop
+                        .state
+                        .handle_backend_event(BackendEvent::CloseRequested);
+                }
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(renderer) = self.renderer.as_mut() {
                     renderer.resize(size.width, size.height);
@@ -717,18 +725,18 @@ impl ApplicationHandler for NestedVulkanApp {
                 window.request_redraw();
             }
             WindowEvent::CursorEntered { .. } => {
-                self.handle_input(FlowInputEvent::PointerEntered);
+                self.handle_input(InputEvent::PointerEntered);
                 window.request_redraw();
             }
             WindowEvent::CursorLeft { .. } => {
-                self.handle_input(FlowInputEvent::PointerLeft);
+                self.handle_input(InputEvent::PointerLeft);
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let scale = window.scale_factor();
                 let logical_position = position.to_logical::<f64>(scale);
-                self.handle_input(FlowInputEvent::PointerMoved {
-                    position: Point::from((logical_position.x, logical_position.y)),
+                self.handle_input(InputEvent::PointerMoved {
+                    position: (logical_position.x, logical_position.y).into(),
                     delta: None,
                     delta_unaccel: None,
                 });
@@ -736,23 +744,23 @@ impl ApplicationHandler for NestedVulkanApp {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let button = match button {
-                    MouseButton::Left => FlowMouseButton::Left,
-                    MouseButton::Right => FlowMouseButton::Right,
-                    MouseButton::Middle => FlowMouseButton::Middle,
-                    MouseButton::Back => FlowMouseButton::Back,
-                    MouseButton::Forward => FlowMouseButton::Forward,
-                    MouseButton::Other(button) => FlowMouseButton::Other(button),
+                    WinitMouseButton::Left => MouseButton::Left,
+                    WinitMouseButton::Right => MouseButton::Right,
+                    WinitMouseButton::Middle => MouseButton::Middle,
+                    WinitMouseButton::Back => MouseButton::Back,
+                    WinitMouseButton::Forward => MouseButton::Forward,
+                    WinitMouseButton::Other(button) => MouseButton::Other(button),
                 };
                 let state = match state {
-                    ElementState::Pressed => FlowKeyState::Pressed,
-                    ElementState::Released => FlowKeyState::Released,
+                    ElementState::Pressed => KeyState::Pressed,
+                    ElementState::Released => KeyState::Released,
                 };
                 let position = self
                     .desktop
                     .as_ref()
                     .map(|desktop| desktop.state.input.pointer_pos)
                     .unwrap_or_default();
-                self.handle_input(FlowInputEvent::PointerButton {
+                self.handle_input(InputEvent::PointerButton {
                     button,
                     state,
                     position,
@@ -761,10 +769,10 @@ impl ApplicationHandler for NestedVulkanApp {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let delta = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => FlowScrollDelta::Line { x, y: -y },
+                    MouseScrollDelta::LineDelta(x, y) => ScrollDelta::Line { x, y: -y },
                     MouseScrollDelta::PixelDelta(delta) => {
                         let logical = delta.to_logical::<f64>(window.scale_factor());
-                        FlowScrollDelta::Pixel {
+                        ScrollDelta::Pixel {
                             x: logical.x,
                             y: -logical.y,
                         }
@@ -775,12 +783,12 @@ impl ApplicationHandler for NestedVulkanApp {
                     .as_ref()
                     .map(|desktop| desktop.state.input.pointer_pos)
                     .unwrap_or_default();
-                self.handle_input(FlowInputEvent::PointerScroll { delta, position });
+                self.handle_input(InputEvent::PointerScroll { delta, position });
                 window.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let state = modifiers.state();
-                self.modifiers = FlowModifiers {
+                self.modifiers = Modifiers {
                     shift: state.shift_key(),
                     ctrl: state.control_key(),
                     alt: state.alt_key(),
@@ -812,11 +820,11 @@ impl ApplicationHandler for NestedVulkanApp {
                             return;
                         }
                     }
-                    self.handle_input(FlowInputEvent::Key {
+                    self.handle_input(InputEvent::Key {
                         keycode,
                         state: match event.state {
-                            ElementState::Pressed => FlowKeyState::Pressed,
-                            ElementState::Released => FlowKeyState::Released,
+                            ElementState::Pressed => KeyState::Pressed,
+                            ElementState::Released => KeyState::Released,
                         },
                         repeat: false,
                         modifiers: self.modifiers,

@@ -1,0 +1,1033 @@
+use super::*;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedKeyEvent {
+    pub(super) keycode: u32,
+    pub(super) state: KeyState,
+    pub(super) smithay_state: smithay::backend::input::KeyState,
+    pub(super) serial: Serial,
+    pub(super) time: u32,
+    pub(super) modifiers_changed: bool,
+    pub(super) symbol: u32,
+    pub(super) modifiers: KeyboardModifiers,
+}
+
+impl PreparedKeyEvent {
+    pub(crate) fn input_event(self) -> InputEvent {
+        InputEvent::Key {
+            keycode: self.keycode,
+            state: self.state,
+            repeat: false,
+            modifiers: self.modifiers.input,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct KeyboardModifiers {
+    pub input: Modifiers,
+    pub shortcuts: ModMask,
+}
+
+/// Translate Smithay's keyboard state once at the engine boundary so the
+/// input and shortcut crates share the same backend-neutral modifier snapshot.
+pub(super) fn keyboard_modifiers(
+    modifiers: &smithay::input::keyboard::ModifiersState,
+) -> KeyboardModifiers {
+    let input = Modifiers {
+        shift: modifiers.shift,
+        ctrl: modifiers.ctrl,
+        alt: modifiers.alt,
+        super_key: modifiers.logo,
+    };
+
+    let mut shortcuts = ModMask::empty();
+    if input.shift {
+        shortcuts |= ModMask::SHIFT;
+    }
+    if input.ctrl {
+        shortcuts |= ModMask::CTRL;
+    }
+    if input.alt {
+        shortcuts |= ModMask::ALT;
+    }
+    if input.super_key {
+        shortcuts |= ModMask::SUPER;
+    }
+
+    KeyboardModifiers { input, shortcuts }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputTarget {
+    LockScreen,
+    Desktop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputRoute {
+    target: InputTarget,
+    record_user_activity: bool,
+}
+
+fn input_route(lock_screen_active: bool) -> InputRoute {
+    if lock_screen_active {
+        InputRoute {
+            target: InputTarget::LockScreen,
+            record_user_activity: false,
+        }
+    } else {
+        InputRoute {
+            target: InputTarget::Desktop,
+            record_user_activity: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientButtonDelivery {
+    Forward,
+    FinishGrab,
+    Suppress,
+}
+
+fn client_button_delivery(
+    compositor_grab_active: bool,
+    button: MouseButton,
+    state: KeyState,
+) -> ClientButtonDelivery {
+    match (compositor_grab_active, button, state) {
+        (false, _, _) => ClientButtonDelivery::Forward,
+        (true, MouseButton::Left, KeyState::Released) => ClientButtonDelivery::FinishGrab,
+        (true, _, _) => ClientButtonDelivery::Suppress,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ShortcutDispatch {
+    Forward,
+    Intercept,
+    Trigger(KeyAction),
+}
+
+/// Resolve compositor shortcuts once per key cycle: trigger on press, consume
+/// the matching release, and forward keys that are not bound in this session.
+pub(super) fn shortcut_dispatch(
+    keybinds: &Keybinds,
+    sym: KeySymbol,
+    mods: ModMask,
+    state: KeyState,
+) -> ShortcutDispatch {
+    let Some(action) = keybinds.resolve(sym, mods) else {
+        return ShortcutDispatch::Forward;
+    };
+
+    match state {
+        KeyState::Pressed => ShortcutDispatch::Trigger(action),
+        KeyState::Released => ShortcutDispatch::Intercept,
+    }
+}
+
+impl DesktopState {
+    /// Advance Smithay's XKB state before any compositor overlay inspects the
+    /// key. The returned event can then be intercepted or dispatched exactly
+    /// once without applying the key transition a second time.
+    pub(crate) fn prepare_key_event(
+        &mut self,
+        keycode: u32,
+        state: KeyState,
+    ) -> Option<PreparedKeyEvent> {
+        use smithay::backend::input::KeyState as SmithayKeyState;
+
+        let smithay_state = match state {
+            KeyState::Pressed => SmithayKeyState::Pressed,
+            KeyState::Released => SmithayKeyState::Released,
+        };
+        let keyboard = self.seat.get_keyboard()?;
+        let ((symbol, modifiers), modifiers_changed) = keyboard.input_intercept(
+            self,
+            keycode.into(),
+            smithay_state,
+            |ds, modifiers, handle| {
+                let modifiers = keyboard_modifiers(modifiers);
+                ds.input.modifiers = modifiers.input;
+                (handle.modified_sym().raw(), modifiers)
+            },
+        );
+
+        Some(PreparedKeyEvent {
+            keycode,
+            state,
+            smithay_state,
+            serial: SERIAL_COUNTER.next_serial(),
+            time: 0,
+            modifiers_changed,
+            symbol,
+            modifiers,
+        })
+    }
+
+    pub(crate) fn finish_external_key_event(
+        &mut self,
+        prepared: PreparedKeyEvent,
+        intercepted: bool,
+    ) {
+        if self.debug.show_input_events {
+            focaldesk_logging::logging::flog(
+                FLogLevel::Debug,
+                format!("input event: {:?}", prepared.input_event()),
+            );
+        }
+        self.record_user_activity();
+        if !intercepted {
+            self.dispatch_prepared_key_event(prepared);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+    }
+
+    pub fn handle_input(&mut self, event: InputEvent) {
+        if self.debug.show_input_events {
+            focaldesk_logging::logging::flog(FLogLevel::Debug, format!("input event: {event:?}"));
+        }
+
+        let route = input_route(self.lock_screen.active);
+        if route.record_user_activity {
+            self.record_user_activity();
+        }
+
+        if route.target == InputTarget::LockScreen {
+            self.handle_lock_screen_input(event);
+            return;
+        }
+
+        match event {
+            event @ InputEvent::Key { .. } => self.handle_keyboard_input(event),
+
+            event @ InputEvent::PointerMoved { .. } => self.handle_pointer_motion(event),
+
+            event @ InputEvent::PointerButton { .. } => self.handle_pointer_button(event),
+            event @ InputEvent::PointerScroll { .. } => self.handle_pointer_scroll(event),
+            InputEvent::PointerEntered => self.handle_pointer_entered(),
+            InputEvent::PointerLeft => self.handle_pointer_left(),
+        }
+    }
+
+    fn handle_lock_screen_input(&mut self, event: InputEvent) {
+        match event {
+            InputEvent::Key { keycode, state, .. } => {
+                self.handle_lock_key_event(keycode, state);
+            }
+            InputEvent::PointerMoved { position, .. } => {
+                self.input.pointer_pos = position;
+                let position = position.into();
+                self.pointer_pos = position;
+                self.cursor_manager.move_to(position.x, position.y);
+                self.clear_client_pointer_focus(position);
+            }
+            InputEvent::PointerButton {
+                button,
+                state,
+                position,
+            } => {
+                self.input.pointer_pos = position;
+                let position = position.into();
+                self.pointer_pos = position;
+                self.cursor_manager.move_to(position.x, position.y);
+                self.clear_client_pointer_focus(position);
+                if matches!((button, state), (MouseButton::Left, KeyState::Pressed)) {
+                    self.toggle_lock_password_visibility_at(position);
+                }
+            }
+            InputEvent::PointerScroll { position, .. } => {
+                self.input.pointer_pos = position;
+                let position = position.into();
+                self.pointer_pos = position;
+                self.cursor_manager.move_to(position.x, position.y);
+                self.clear_client_pointer_focus(position);
+            }
+            InputEvent::PointerEntered => {
+                self.cursor_manager.set_visible(true);
+            }
+            InputEvent::PointerLeft => {
+                self.cursor_manager.set_visible(false);
+            }
+        }
+
+        self.pending_compositor_move = None;
+        self.pending_xdg_move = None;
+        self.toplevel_pointer = None;
+        self.split_divider_drag = None;
+        self.input.pointer_left_down = false;
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    fn handle_pointer_button(&mut self, event: InputEvent) {
+        let InputEvent::PointerButton {
+            button,
+            state,
+            position,
+        } = &event
+        else {
+            unreachable!("pointer-button handler received another event");
+        };
+        let (button, state, position) = (*button, *state, *position);
+
+        if matches!(state, KeyState::Pressed) && self.ui.focused.is_some() {
+            self.ui.clear_focus();
+            self.publish_accessibility_tree();
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+        self.input.pointer_pos = position;
+        let position = position.into();
+        self.pointer_pos = position;
+
+        if let Some(id) = self.output_under_pointer(position) {
+            self.set_focused_output(id);
+        }
+        // Rendering rebuilds the compositor's single UiTree once per
+        // output. Resolve this click against the output that actually
+        // received it, not whichever output happened to render last.
+        self.rebuild_ui_tree_for_output(self.focused_output);
+        let cursor_owner_damage = self.update_cursor_owner_damage();
+        let stale_cursor_damage = self.clear_stale_software_cursor_damage();
+
+        if self.pointer_button_consumed_by_overlay(&event) {
+            return;
+        }
+        if self.handle_split_divider_button(button, state, position) {
+            return;
+        }
+        if self.handle_shell_pointer_button(button, state, position) {
+            return;
+        }
+        self.forward_pointer_button_to_desktop(
+            button,
+            state,
+            position,
+            cursor_owner_damage,
+            stale_cursor_damage,
+        );
+    }
+
+    fn pointer_button_consumed_by_overlay(&mut self, event: &InputEvent) -> bool {
+        if self.egui_open_on_output(self.focused_output) {
+            let _ = self.handle_egui_input(event);
+        } else if self.handle_egui_input(event) {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.mark_egui_damage(self.focused_output);
+            return true;
+        }
+
+        if self.handle_dialog_input(event) {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+            return true;
+        }
+
+        false
+    }
+
+    fn handle_split_divider_button(
+        &mut self,
+        button: MouseButton,
+        state: KeyState,
+        position: Point<f64, Logical>,
+    ) -> bool {
+        if matches!(button, MouseButton::Right) && matches!(state, KeyState::Pressed) {
+            if let Some(divider) = self.split_divider_at(position) {
+                if !self.focused_window.is_some_and(|id| {
+                    divider.before.contains(&Some(id)) || divider.after.contains(&Some(id))
+                }) {
+                    if let Some(id) = divider
+                        .before
+                        .into_iter()
+                        .chain(divider.after)
+                        .flatten()
+                        .next()
+                    {
+                        self.focus_window_id(id);
+                    }
+                }
+                self.dispatch_ui_action(UiAction::OpenPanel(PanelKind::SplitGroup));
+                self.clear_client_pointer_focus(position);
+                self.mark_output_full_damage(divider.output, DamageSource::Egui);
+                return true;
+            }
+        }
+
+        if matches!(button, MouseButton::Left) {
+            match state {
+                KeyState::Pressed => {
+                    if let Some(divider) = self.split_divider_at(position) {
+                        self.input.pointer_left_down = true;
+                        self.record_split_undo(
+                            divider.before.into_iter().chain(divider.after).flatten(),
+                        );
+                        self.split_divider_drag = Some(SplitDividerDrag { divider });
+                        self.pending_compositor_move = None;
+                        self.pending_xdg_move = None;
+                        self.clear_client_pointer_focus(position);
+                        self.update_pointer_cursor(position);
+                        self.mark_output_full_damage(divider.output, DamageSource::WindowResize);
+                        return true;
+                    }
+                }
+                KeyState::Released => {
+                    if let Some(drag) = self.split_divider_drag.take() {
+                        if let Some(pair) = self.split_pair_for_output(drag.divider.output) {
+                            self.remember_split_ratio(pair);
+                        }
+                        self.input.pointer_left_down = false;
+                        self.clear_client_pointer_focus(position);
+                        self.update_pointer_cursor(position);
+                        self.mark_output_full_damage(
+                            drag.divider.output,
+                            DamageSource::WindowResize,
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
+    }
+
+    fn handle_shell_pointer_button(
+        &mut self,
+        button: MouseButton,
+        state: KeyState,
+        position: Point<f64, Logical>,
+    ) -> bool {
+        if matches!(button, MouseButton::Left)
+            && matches!(state, KeyState::Released)
+            && self.suppress_next_left_release
+        {
+            self.suppress_next_left_release = false;
+            self.input.pointer_left_down = false;
+            self.pending_compositor_move = None;
+            self.pending_xdg_move = None;
+            self.update_pointer_cursor(position);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+            return true;
+        }
+
+        if matches!(button, MouseButton::Left) && self.peek_ui_action_at_pointer().is_some() {
+            let mut damaged_precisely = false;
+            match state {
+                KeyState::Pressed => {
+                    self.input.pointer_left_down = true;
+                    let pressed_element = self
+                        .ui_element_at_pointer_for_output(self.focused_output)
+                        .map(|el| (el.id, el.kind));
+                    self.ui.pressed = pressed_element.map(|(id, _)| id);
+                    self.clear_client_pointer_focus(position);
+                    damaged_precisely = match pressed_element {
+                        Some((_, UiElementKind::SidebarButton)) => {
+                            self.trigger_sidebar_pulse_at_pointer(self.focused_output)
+                        }
+                        Some((_, UiElementKind::TopbarIndicator | UiElementKind::TopbarButton)) => {
+                            self.trigger_topbar_pulse_at_pointer(self.focused_output)
+                        }
+                        Some((_, UiElementKind::Clock)) => {
+                            self.trigger_clock_pulse_at_pointer(self.focused_output)
+                        }
+                        _ => false,
+                    };
+                }
+                KeyState::Released => {
+                    self.input.pointer_left_down = false;
+                    if let Some(pressed_id) = self.ui.pressed.take() {
+                        let clicked = self
+                            .ui_element_at_pointer_for_output(self.focused_output)
+                            .is_some_and(|el| el.id == pressed_id && el.enabled);
+                        if clicked && self.click_ui_at_pointer() {
+                            self.mark_focused_output_full_damage(DamageSource::Unknown);
+                        }
+                    }
+                    self.pending_compositor_move = None;
+                }
+            }
+            self.update_pointer_cursor(position);
+            if !damaged_precisely
+                && !matches!(state, KeyState::Released)
+                && self.sidebar_pulse.is_none()
+                && self.topbar_pulse.is_none()
+                && self.clock_pulse.is_none()
+            {
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+            }
+            return true;
+        }
+
+        if matches!(button, MouseButton::Left)
+            && matches!(state, KeyState::Released)
+            && self.ui.pressed.is_some()
+        {
+            self.input.pointer_left_down = false;
+            self.ui.pressed = None;
+            self.pending_compositor_move = None;
+            self.clear_client_pointer_focus(position);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+            return true;
+        }
+
+        if self.egui_open_on_output(self.focused_output)
+            && matches!(button, MouseButton::Left)
+            && matches!(state, KeyState::Pressed | KeyState::Released)
+        {
+            self.process_egui_actions();
+            if matches!(state, KeyState::Released)
+                && self.egui_wants_pointer_on_output(self.focused_output)
+            {
+                self.clear_client_pointer_focus(self.pointer_pos);
+                self.mark_egui_damage(self.focused_output);
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn forward_pointer_button_to_desktop(
+        &mut self,
+        button: MouseButton,
+        state: KeyState,
+        position: Point<f64, Logical>,
+        cursor_owner_damage: bool,
+        stale_cursor_damage: bool,
+    ) {
+        if matches!(button, MouseButton::Left) {
+            match state {
+                KeyState::Pressed => {
+                    self.input.pointer_left_down = true;
+                }
+                KeyState::Released => {
+                    self.input.pointer_left_down = false;
+                    self.pending_compositor_move = None;
+                    self.pending_xdg_move = None;
+                }
+            }
+        }
+
+        if let Some(id) = self.output_under_pointer(position) {
+            self.set_focused_output(id);
+        }
+        self.cursor_manager.move_to(position.x, position.y);
+        let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
+        let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
+        if matches!(state, KeyState::Pressed) {
+            if matches!(button, MouseButton::Left)
+                && self.pointer_on_chrome_host_drag_region(position)
+            {
+                self.host_window_drag_requested = true;
+                self.pending_compositor_move = None;
+            } else if matches!(button, MouseButton::Left)
+                && self.handle_xwayland_titlebar_press(position)
+            {
+                self.clear_client_pointer_focus(position);
+                self.update_pointer_cursor(position);
+                self.mark_focused_output_full_damage(DamageSource::Unknown);
+                return;
+            } else {
+                self.focus_window_at(position);
+                if matches!(button, MouseButton::Left) && self.pointer_in_work_recess(position) {
+                    if let Some((id, edges)) = self.top_window_resize_edge_at(position) {
+                        self.pending_compositor_move = None;
+                        if let Ok(edge) = ResizeEdge::try_from(edges) {
+                            self.try_begin_compositor_resize(id, edge);
+                        }
+                    }
+                }
+            }
+        }
+        match client_button_delivery(self.compositor_pointer_grab_active(), button, state) {
+            ClientButtonDelivery::FinishGrab => {
+                self.process_toplevel_pointer_button(button, state);
+                self.forward_pointer_button(position, button, state);
+            }
+            ClientButtonDelivery::Forward => {
+                self.forward_pointer_to_clients(position);
+                self.forward_pointer_button(position, button, state);
+                self.process_toplevel_pointer_button(button, state);
+            }
+            ClientButtonDelivery::Suppress => {}
+        }
+        self.update_pointer_cursor(position);
+        let precise_cursor_damage =
+            self.software_cursor_damage_pending_for_output(self.focused_output);
+        if !precise_toplevel_damage
+            && !precise_hover_damage
+            && !precise_cursor_damage
+            && !stale_cursor_damage
+            && !cursor_owner_damage
+        {
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+    }
+
+    fn handle_keyboard_input(&mut self, event: InputEvent) {
+        let InputEvent::Key { keycode, state, .. } = &event else {
+            unreachable!("keyboard handler received a non-key event");
+        };
+        let (keycode, state) = (*keycode, *state);
+
+        let Some(prepared) = self.prepare_key_event(keycode, state) else {
+            flog_info!("no keyboard on seat");
+            return;
+        };
+        let event = prepared.input_event();
+
+        if matches!(state, KeyState::Pressed)
+            && keycode == 1
+            && self.egui_open_on_output(self.focused_output)
+        {
+            if let Some(output) = self.desktop_outputs.get_mut(&self.focused_output) {
+                output.egui.close_all_panels();
+            }
+            self.pending_split_assist = None;
+            self.mark_egui_damage(self.focused_output);
+            return;
+        }
+        if self.handle_egui_input(&event) {
+            self.mark_egui_damage(self.focused_output);
+            return;
+        }
+        self.dispatch_prepared_key_event(prepared);
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
+    }
+
+    fn handle_pointer_motion(&mut self, event: InputEvent) {
+        let InputEvent::PointerMoved {
+            position,
+            delta,
+            delta_unaccel,
+        } = &event
+        else {
+            unreachable!("pointer-motion handler received another event");
+        };
+        let (position, delta, delta_unaccel) = (*position, *delta, *delta_unaccel);
+
+        let previous_pos = self.pointer_pos;
+        let pointer_locked = self.pointer_lock_active_at(previous_pos);
+        let position = self.constrained_pointer_position(previous_pos, position.into());
+        let position = self.confine_pointer_to_outputs(previous_pos, position);
+        self.input.pointer_pos = position.into();
+        self.pointer_pos = position;
+        if let Some(id) = self.output_under_pointer(position) {
+            self.set_focused_output(id);
+        }
+        // Keep the visible cursor in lockstep with the compositor's logical pointer before an
+        // overlay gets a chance to consume the event.
+        self.cursor_manager.move_to(position.x, position.y);
+        self.drm_submit_hw_cursor = true;
+        let cursor_owner_damage = self.update_cursor_owner_damage();
+        let stale_cursor_damage = self.clear_stale_software_cursor_damage();
+        if self.egui_open_on_output(self.focused_output) {
+            let _ = self.handle_egui_input(&event);
+            if self.egui_wants_pointer_on_output(self.focused_output) {
+                self.clear_client_pointer_focus(self.pointer_pos);
+                self.mark_egui_damage(self.focused_output);
+                return;
+            }
+        } else if self.handle_egui_input(&event) {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.mark_egui_damage(self.focused_output);
+            return;
+        }
+        if self.handle_dialog_input(&event) {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+            return;
+        }
+        if self.input.pointer_left_down {
+            if let Some(drag) = self.split_divider_drag {
+                self.resize_split_grid_divider(drag.divider, position);
+                self.clear_client_pointer_focus(position);
+                self.update_pointer_cursor(position);
+                self.mark_output_full_damage(drag.divider.output, DamageSource::WindowResize);
+                return;
+            }
+        }
+        const DRAG_THRESHOLD_SQ: f64 = 5.0 * 5.0;
+        if self.input.pointer_left_down {
+            if let Some((id, start)) = self.pending_xdg_move {
+                let d = position - start;
+                if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
+                    self.pending_xdg_move = None;
+                    self.request_move(id);
+                }
+            }
+            if let Some((id, start)) = self.pending_compositor_move {
+                let d = position - start;
+                if d.x * d.x + d.y * d.y >= DRAG_THRESHOLD_SQ {
+                    self.pending_compositor_move = None;
+                    self.try_begin_compositor_move(id);
+                }
+            }
+        } else {
+            self.pending_xdg_move = None;
+            if matches!(
+                self.toplevel_pointer,
+                Some(ToplevelPointerInteraction::Move { .. })
+            ) {
+                self.toplevel_pointer = None;
+                self.forward_pointer_to_clients(self.pointer_pos);
+            }
+        }
+        let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
+        let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
+        self.update_pointer_cursor(position);
+        if !self.compositor_pointer_grab_active() {
+            if let (Some(delta), Some(delta_unaccel)) = (delta, delta_unaccel) {
+                self.forward_pointer_relative_motion(position, delta.into(), delta_unaccel.into());
+            }
+            if pointer_locked {
+                if let Some(pointer) = self.seat.get_pointer() {
+                    pointer.frame(self);
+                }
+            } else {
+                // Relative motion belongs to the same logical event and must precede the
+                // wl_pointer frame emitted here.
+                self.forward_pointer_to_clients(position);
+                self.activate_pointer_constraint_at(position);
+            }
+        }
+        let precise_cursor_damage =
+            self.software_cursor_damage_pending_for_output(self.focused_output);
+        if !precise_toplevel_damage
+            && !precise_hover_damage
+            && !precise_cursor_damage
+            && !stale_cursor_damage
+            && !cursor_owner_damage
+        {
+            // A hardware cursor still needs a render/present cycle so KMS can move its cursor
+            // plane, but the primary plane has not visually changed.
+            self.mark_output_damage_source(
+                self.focused_output,
+                Rectangle::from_loc_and_size((0, 0), (1, 1)),
+                DamageSource::Cursor,
+            );
+        }
+    }
+
+    fn handle_pointer_scroll(&mut self, event: InputEvent) {
+        let InputEvent::PointerScroll { position, delta } = &event else {
+            unreachable!("scroll handler received a non-scroll event");
+        };
+        let (position, delta) = (*position, *delta);
+
+        self.input.pointer_pos = position;
+        let position = position.into();
+        self.pointer_pos = position;
+        if let Some(id) = self.output_under_pointer(position) {
+            self.set_focused_output(id);
+        }
+        self.update_cursor_owner_damage();
+        self.clear_stale_software_cursor_damage();
+        if self.egui_open_on_output(self.focused_output) {
+            let _ = self.handle_egui_input(&event);
+            if self.egui_wants_pointer_on_output(self.focused_output) {
+                self.clear_client_pointer_focus(self.pointer_pos);
+                self.mark_egui_damage(self.focused_output);
+                return;
+            }
+        } else if self.handle_egui_input(&event) {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.mark_egui_damage(self.focused_output);
+            return;
+        }
+        if self.handle_dialog_input(&event) {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+            return;
+        }
+        self.cursor_manager.move_to(position.x, position.y);
+        if !self.compositor_pointer_grab_active() {
+            self.forward_pointer_to_clients(position);
+            self.forward_pointer_scroll(delta);
+        }
+        if self.egui_open_on_output(self.focused_output) {
+            self.mark_egui_damage(self.focused_output);
+        } else {
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+    }
+
+    fn handle_pointer_entered(&mut self) {
+        self.cursor_manager.set_visible(true);
+        self.update_cursor_owner_damage();
+        self.mark_focused_output_full_damage(DamageSource::Cursor);
+    }
+
+    fn handle_pointer_left(&mut self) {
+        let _ = self.handle_egui_input(&InputEvent::PointerLeft);
+        self.process_toplevel_pointer_button(MouseButton::Left, KeyState::Released);
+        self.input.pointer_left_down = false;
+        self.pending_compositor_move = None;
+        self.pending_xdg_move = None;
+        self.split_divider_drag = None;
+        self.cursor_manager.set_visible(false);
+        self.update_cursor_owner_damage();
+        self.clear_all_software_cursor_damage();
+        self.mark_focused_output_full_damage(DamageSource::Cursor);
+    }
+
+    pub fn handle_backend_event(&mut self, event: BackendEvent) {
+        match event {
+            BackendEvent::OutputResized {
+                output_id,
+                width,
+                height,
+                scale_factor,
+            } => {
+                let size = Size::<i32, Physical>::from((width as i32, height as i32));
+                self.update_output_size(output_id, size, scale_factor);
+            }
+            BackendEvent::CloseRequested => {
+                self.running = false;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use focaldesk_shortcuts::ShortcutCapabilities;
+    use smithay::backend::input::KeyState as SmithayKeyState;
+    use smithay::input::keyboard::{keysyms, ModifiersState};
+
+    fn prepared_key_event(state: KeyState, modifiers: Modifiers) -> PreparedKeyEvent {
+        PreparedKeyEvent {
+            keycode: 30,
+            state,
+            smithay_state: match state {
+                KeyState::Pressed => SmithayKeyState::Pressed,
+                KeyState::Released => SmithayKeyState::Released,
+            },
+            serial: SERIAL_COUNTER.next_serial(),
+            time: 0,
+            modifiers_changed: true,
+            symbol: keysyms::KEY_a,
+            modifiers: KeyboardModifiers {
+                input: modifiers,
+                shortcuts: ModMask::empty(),
+            },
+        }
+    }
+
+    #[test]
+    fn prepared_key_sequence_exposes_current_press_and_release_modifiers() {
+        let sequence = [
+            (KeyState::Pressed, Modifiers::default()),
+            (
+                KeyState::Pressed,
+                Modifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                KeyState::Pressed,
+                Modifiers {
+                    shift: true,
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                KeyState::Released,
+                Modifiers {
+                    ctrl: true,
+                    ..Default::default()
+                },
+            ),
+            (KeyState::Released, Modifiers::default()),
+        ];
+
+        for (state, expected_modifiers) in sequence {
+            assert_eq!(
+                prepared_key_event(state, expected_modifiers).input_event(),
+                InputEvent::Key {
+                    keycode: 30,
+                    state,
+                    repeat: false,
+                    modifiers: expected_modifiers,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_modifier_adapter_maps_every_supported_combination() {
+        for bits in 0_u8..16 {
+            let modifiers = ModifiersState {
+                shift: bits & 0b0001 != 0,
+                ctrl: bits & 0b0010 != 0,
+                alt: bits & 0b0100 != 0,
+                logo: bits & 0b1000 != 0,
+                ..Default::default()
+            };
+            let mapped = keyboard_modifiers(&modifiers);
+
+            assert_eq!(
+                mapped.input,
+                Modifiers {
+                    shift: modifiers.shift,
+                    ctrl: modifiers.ctrl,
+                    alt: modifiers.alt,
+                    super_key: modifiers.logo,
+                },
+                "input modifier mismatch for combination {bits:04b}"
+            );
+
+            let mut expected_shortcuts = ModMask::empty();
+            if modifiers.shift {
+                expected_shortcuts |= ModMask::SHIFT;
+            }
+            if modifiers.ctrl {
+                expected_shortcuts |= ModMask::CTRL;
+            }
+            if modifiers.alt {
+                expected_shortcuts |= ModMask::ALT;
+            }
+            if modifiers.logo {
+                expected_shortcuts |= ModMask::SUPER;
+            }
+            assert_eq!(
+                mapped.shortcuts, expected_shortcuts,
+                "shortcut modifier mismatch for combination {bits:04b}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_modifier_adapter_ignores_lock_and_level_modifiers() {
+        let mapped = keyboard_modifiers(&ModifiersState {
+            caps_lock: true,
+            num_lock: true,
+            iso_level3_shift: true,
+            iso_level5_shift: true,
+            ..Default::default()
+        });
+
+        assert_eq!(mapped.input, Modifiers::default());
+        assert_eq!(mapped.shortcuts, ModMask::empty());
+    }
+
+    #[test]
+    fn locked_input_routes_only_to_lock_screen_without_activity_recording() {
+        assert_eq!(
+            input_route(true),
+            InputRoute {
+                target: InputTarget::LockScreen,
+                record_user_activity: false,
+            }
+        );
+    }
+
+    #[test]
+    fn unlocked_input_routes_to_desktop_and_records_activity() {
+        assert_eq!(
+            input_route(false),
+            InputRoute {
+                target: InputTarget::Desktop,
+                record_user_activity: true,
+            }
+        );
+    }
+
+    #[test]
+    fn compositor_grab_suppresses_buttons_until_left_release() {
+        assert_eq!(
+            client_button_delivery(true, MouseButton::Left, KeyState::Pressed),
+            ClientButtonDelivery::Suppress
+        );
+        assert_eq!(
+            client_button_delivery(true, MouseButton::Right, KeyState::Released),
+            ClientButtonDelivery::Suppress
+        );
+        assert_eq!(
+            client_button_delivery(true, MouseButton::Left, KeyState::Released),
+            ClientButtonDelivery::FinishGrab
+        );
+    }
+
+    #[test]
+    fn ungrabbed_buttons_are_forwarded() {
+        assert_eq!(
+            client_button_delivery(false, MouseButton::Right, KeyState::Pressed),
+            ClientButtonDelivery::Forward
+        );
+    }
+
+    #[test]
+    fn desktop_screenshot_shortcut_triggers_once_per_key_cycle() {
+        let keybinds = Keybinds::with_defaults(ShortcutCapabilities::DESKTOP);
+        let dispatches = [KeyState::Pressed, KeyState::Released].map(|state| {
+            shortcut_dispatch(
+                &keybinds,
+                KeySymbol::from_raw(keysyms::KEY_Print),
+                ModMask::empty(),
+                state,
+            )
+        });
+
+        assert_eq!(
+            dispatches,
+            [
+                ShortcutDispatch::Trigger(KeyAction::TakeScreenshot),
+                ShortcutDispatch::Intercept,
+            ]
+        );
+        assert_eq!(
+            dispatches
+                .iter()
+                .filter(|dispatch| matches!(dispatch, ShortcutDispatch::Trigger(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn nested_screenshot_key_is_forwarded_to_clients() {
+        let keybinds = Keybinds::with_defaults(ShortcutCapabilities::NESTED);
+
+        for state in [KeyState::Pressed, KeyState::Released] {
+            assert_eq!(
+                shortcut_dispatch(
+                    &keybinds,
+                    KeySymbol::from_raw(keysyms::KEY_Print),
+                    ModMask::empty(),
+                    state,
+                ),
+                ShortcutDispatch::Forward
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_desktop_screenshot_uses_all_outputs_action_once() {
+        let keybinds = Keybinds::with_defaults(ShortcutCapabilities::DESKTOP);
+
+        assert_eq!(
+            shortcut_dispatch(
+                &keybinds,
+                KeySymbol::from_raw(keysyms::KEY_Print),
+                ModMask::SHIFT,
+                KeyState::Pressed,
+            ),
+            ShortcutDispatch::Trigger(KeyAction::TakeScreenshotAll)
+        );
+        assert_eq!(
+            shortcut_dispatch(
+                &keybinds,
+                KeySymbol::from_raw(keysyms::KEY_Print),
+                ModMask::SHIFT,
+                KeyState::Released,
+            ),
+            ShortcutDispatch::Intercept
+        );
+    }
+}

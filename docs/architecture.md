@@ -45,6 +45,34 @@ signed package management. These services do not share the compositor's frame
 loop. They remain experimental and permission-gated; package activation does
 not itself grant connector network access or background execution consent.
 
+## Input and Shortcut Boundaries
+
+Input handling is divided by responsibility:
+
+- `focaldesk-types` owns shared identifiers and compositor backend identity.
+- `focaldesk-input` owns normalized input events, runtime input state, native
+  geometry, coordinate transforms, and physical-to-logical pointer scaling and
+  clamping. Its optional `smithay` feature provides backend-event translation
+  without exposing Smithay types in the core model.
+- `focaldesk-shortcuts` owns key combinations, configurable bindings, default
+  bindings, backend-neutral shortcut capabilities, and the desktop actions
+  produced by shortcut resolution. It uses `xkbcommon` directly for key-symbol
+  parsing, exposes its own `KeySymbol` type so keysyms cannot be confused with
+  hardware keycodes, and has no Smithay or `focaldesk-types` dependency. Binding
+  storage is private and normalizes every `KeyCombo` insertion; consumers can
+  inspect bindings through a read-only iterator.
+- `focaldesk-engine` owns lock-screen and desktop routing, focus, grabs, hit
+  testing, Wayland delivery, and action execution. At this boundary it converts
+  Smithay keyboard modifiers once into both the normalized input snapshot and
+  the shortcut mask before an overlay can consume the event. Captured keys
+  therefore advance XKB state without being forwarded or processed twice,
+  keeping backend-specific state out of the lower-level crates.
+
+Run `just architecture-check` to enforce these boundaries. The check requires
+`focaldesk-engine` to depend directly on `focaldesk-input` and
+`focaldesk-shortcuts`, and rejects direct Smithay or `focaldesk-types`
+dependencies from `focaldesk-shortcuts`.
+
 ## Rendering Pipeline
 
 ![Rendering Pipeline](diagrams/rendering-pipeline.png)

@@ -6,7 +6,8 @@ members = [
     "crates/focaldesk-render",
     "crates/focaldesk-engine",
     "crates/focaldesk-remote-protocol",
-    "crates/focaldesk-flow",
+    "crates/focaldesk-input",
+    "crates/focaldesk-shortcuts",
     "crates/focaldesk-ai",
     "crates/focaldesk-memory",
     "crates/focaldesk-ipc",
@@ -91,6 +92,7 @@ smithay = { git = "https://github.com/Smithay/smithay", rev = "a394efa7058e987c8
   "use_system_lib",
   "xwayland"
 ] }
+xkbcommon = { version = "0.9", default-features = false }
 anyhow = "1"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
 ash = "0.38"

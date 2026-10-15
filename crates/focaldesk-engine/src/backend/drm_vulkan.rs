@@ -10,12 +10,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_render::{
     AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer,
     DrmRenderTarget, FrameTransform,
 };
+use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{
@@ -26,7 +26,8 @@ use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface, PlaneClaim,
 };
 use smithay::backend::input::{
-    InputEvent, KeyState, KeyboardKeyEvent, SwitchState, SwitchToggleEvent,
+    InputEvent as SmithayInputEvent, KeyState as SmithayKeyState, KeyboardKeyEvent, SwitchState,
+    SwitchToggleEvent,
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::sync::{Fence, Interrupted, SyncPoint};
@@ -59,7 +60,7 @@ use super::drm::{
 use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
 use crate::core::backend_render::{damage_area_percent, is_full_damage};
-use crate::core::input::{FlowInputEvent, FlowKeyState};
+use focaldesk_input::{InputEvent, KeyState};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -412,9 +413,9 @@ fn configure_vui_shell(data: &mut VulkanDrmData) {
     ));
 }
 
-fn vui_event(event: &FlowInputEvent) -> FlowInputEvent {
+fn vui_event(event: &InputEvent) -> InputEvent {
     let mut event = event.clone();
-    if let FlowInputEvent::Key { keycode, .. } = &mut event {
+    if let InputEvent::Key { keycode, .. } = &mut event {
         *keycode = keycode.saturating_sub(8);
     }
     event
@@ -476,13 +477,25 @@ fn dispatch_pending_vui_request(data: &mut VulkanDrmData) {
 
 fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
     data: &mut VulkanDrmData,
-    input: &InputEvent<B>,
+    input: &SmithayInputEvent<B>,
 ) {
-    let Some(event) = translate_backend_input_event(&data.desktop.state, input) else {
+    let Some(mut event) = translate_backend_input_event(&data.desktop.state, input) else {
         return;
     };
     sync_vui_shell_context(data);
-    let fallback_input_active = data.vui_output.map_or(true, |output_id| {
+    let prepared_key = if !data.desktop.state.lock_screen.active {
+        match &event {
+            InputEvent::Key { keycode, state, .. } => data
+                .desktop
+                .state
+                .prepare_key_event(*keycode, *state)
+                .inspect(|prepared| event = prepared.input_event()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let fallback_input_active = data.vui_output.is_none_or(|output_id| {
         !trusted_shell_ready_for_output(data, output_id)
             || data
                 .vui_shell
@@ -504,22 +517,29 @@ fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
         })
         .unwrap_or((0.0, 0.0));
 
-    if let FlowInputEvent::Key {
+    let captured_text_release = if let InputEvent::Key {
         keycode,
-        state: FlowKeyState::Released,
+        state: KeyState::Released,
         ..
     } = &event
     {
-        if fallback_input_active && data.vui_text_keys.remove(&keycode) {
-            return;
+        fallback_input_active && data.vui_text_keys.remove(keycode)
+    } else {
+        false
+    };
+
+    if captured_text_release {
+        if let Some(prepared) = prepared_key {
+            data.desktop.state.finish_external_key_event(prepared, true);
         }
+        return;
     }
 
     let text_handled = fallback_input_active
         && match &event {
-            FlowInputEvent::Key {
+            InputEvent::Key {
                 keycode,
-                state: FlowKeyState::Pressed,
+                state: KeyState::Pressed,
                 modifiers,
                 ..
             } => crate::core::desktop::DesktopState::egui_text_for_keycode(*keycode, *modifiers)
@@ -537,7 +557,7 @@ fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
                 .as_mut()
                 .is_some_and(|shell| shell.handle_input_with_origin(&vui_event(&event), origin)));
     if text_handled {
-        if let FlowInputEvent::Key { keycode, .. } = &event {
+        if let InputEvent::Key { keycode, .. } = &event {
             data.vui_text_keys.insert(*keycode);
         }
     }
@@ -561,9 +581,16 @@ fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
         }
     }
 
+    if let Some(prepared) = prepared_key {
+        data.desktop
+            .state
+            .finish_external_key_event(prepared, handled);
+        return;
+    }
+
     // Keep the compositor pointer position and hardware cursor current even
     // while VUI owns hover. Button, scroll, and keyboard events remain captured.
-    if !handled || matches!(event, FlowInputEvent::PointerMoved { .. }) {
+    if !handled || matches!(event, InputEvent::PointerMoved { .. }) {
         data.desktop.state.handle_input(event);
     }
 }
@@ -1884,7 +1911,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         ).into());
     }
 
-    let mut desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
+    let mut desktop = bootstrap_compositor_core(None, CompositorBackend::Drm)?;
     desktop.state.cpu_output_capture_available = true;
     let output_configs = select_outputs(&drm)?;
     let outputs =
@@ -1970,8 +1997,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let _input_token = loop_handle.insert_source(input_backend, move |event, _, data| {
-        if let InputEvent::Keyboard { event, .. } = &event {
-            if event.state() == KeyState::Pressed {
+        if let SmithayInputEvent::Keyboard { event, .. } = &event {
+            if event.state() == SmithayKeyState::Pressed {
                 let keycode: u32 = event.key_code().into();
                 let mods = data.desktop.state.input.modifiers;
                 if mods.ctrl && mods.alt {
@@ -1990,7 +2017,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        if let InputEvent::SwitchToggle { event, .. } = &event {
+        if let SmithayInputEvent::SwitchToggle { event, .. } = &event {
             if matches!(event.switch(), Some(InputSwitch::Lid)) {
                 data.desktop
                     .state
@@ -2549,7 +2576,7 @@ mod tests {
         transform_cursor_rgba, transform_scene, transformed_cursor_rect, vui_event,
     };
     use crate::backend::wgpu_nested::VulkanCompositorScene;
-    use crate::core::input::{FlowInputEvent, FlowKeyState, FlowModifiers};
+    use focaldesk_input::{InputEvent, KeyState, Modifiers};
     use focaldesk_render::{
         FramePixelFormat, FrameTransform, LinuxDmabuf, TextureColorTransform, TextureQuad,
     };
@@ -2645,16 +2672,16 @@ mod tests {
 
     #[test]
     fn raw_xkb_keycodes_are_normalized_for_vui() {
-        let event = FlowInputEvent::Key {
+        let event = InputEvent::Key {
             keycode: 38,
-            state: FlowKeyState::Pressed,
+            state: KeyState::Pressed,
             repeat: false,
-            modifiers: FlowModifiers::default(),
+            modifiers: Modifiers::default(),
         };
 
         assert!(matches!(
             vui_event(&event),
-            FlowInputEvent::Key { keycode: 30, .. }
+            InputEvent::Key { keycode: 30, .. }
         ));
     }
 

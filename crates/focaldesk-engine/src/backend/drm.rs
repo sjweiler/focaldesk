@@ -25,12 +25,12 @@ use smithay::backend::renderer::element::{
     render_elements, texture::TextureRenderElement, Id, Kind,
 };
 
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::flog_warn;
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, save_exclusive_hdr_state, DisplayColorProfile, ExclusiveHdrPhase,
     ExclusiveHdrState, HdrAppearance,
 };
+use focaldesk_types::CompositorBackend;
 
 // DRM/KMS backend for FocalDesk.
 //
@@ -54,8 +54,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::backend::common::translate_backend_input;
 use calloop::{EventLoop, LoopHandle, RegistrationToken};
+use focaldesk_input::translate_backend_input;
 use focaldesk_logging::flog;
 use focaldesk_resources::RenderResources;
 use focaldesk_types::OutputId;
@@ -3487,7 +3487,7 @@ pub(crate) fn dispatch_backend_input_event<B: smithay::backend::input::InputBack
 pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBackend>(
     state: &DesktopState,
     input: &smithay::backend::input::InputEvent<B>,
-) -> Option<crate::core::input::FlowInputEvent> {
+) -> Option<focaldesk_input::InputEvent> {
     use smithay::backend::input::InputEvent;
 
     let output_id = state
@@ -3515,33 +3515,12 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
 
     translate_backend_input(
         input,
-        state.input.pointer_pos,
+        state.input.pointer_pos.into(),
         clamp_rect,
         output_transform,
         scale,
         state.input.modifiers,
     )
-    .map(|mut event| {
-        if matches!(input, InputEvent::PointerMotion { .. }) {
-            if let crate::core::input::FlowInputEvent::PointerMoved { position, .. } = &mut event {
-                let scale = scale.max(1.0);
-                let old_pos = state.input.pointer_pos;
-                let scaled = Point::<f64, Logical>::from((
-                    old_pos.x + (position.x - old_pos.x) / scale,
-                    old_pos.y + (position.y - old_pos.y) / scale,
-                ));
-                let min_x = clamp_rect.loc.x as f64;
-                let min_y = clamp_rect.loc.y as f64;
-                let max_x = (clamp_rect.loc.x + clamp_rect.size.w) as f64 - f64::EPSILON;
-                let max_y = (clamp_rect.loc.y + clamp_rect.size.h) as f64 - f64::EPSILON;
-                *position = Point::from((
-                    scaled.x.clamp(min_x, max_x.max(min_x)),
-                    scaled.y.clamp(min_y, max_y.max(min_y)),
-                ));
-            }
-        }
-        event
-    })
 }
 
 pub fn run() -> Result<(), Box<dyn Error>> {
@@ -3558,7 +3537,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     //
     // Shared compositor state
     //
-    let desktop = bootstrap_compositor_core(None, BackendKind::Drm)?;
+    let desktop = bootstrap_compositor_core(None, CompositorBackend::Drm)?;
 
     //
     // Pick primary KMS device (same node udev will report for the card — open only in `device_added`).

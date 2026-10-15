@@ -201,7 +201,7 @@ impl XwmHandler for DesktopState {
                 .window_id_for_x11_surface(&window)
                 .map(|window_id| self.xwayland_output_id_for_window(window_id))
                 .unwrap_or_else(|| {
-                    self.output_under_pointer(self.input.pointer_pos)
+                    self.output_under_pointer(self.input.pointer_pos.into())
                         .unwrap_or(self.primary_output)
                 });
             geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
@@ -248,7 +248,7 @@ impl XwmHandler for DesktopState {
         }
 
         let output_id = self
-            .output_under_pointer(self.input.pointer_pos)
+            .output_under_pointer(self.input.pointer_pos.into())
             .unwrap_or(self.primary_output);
         if self.xwayland_request_fills_output(output_id, geometry.size) {
             if let Some(work) = self.work_recess_for_output(output_id) {

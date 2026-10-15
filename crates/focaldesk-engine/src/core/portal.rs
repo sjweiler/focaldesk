@@ -680,7 +680,7 @@ fn complete_portal_frame(
     }
 
     let transform = match state.backend_kind {
-        focaldesk_flow::keybinds::BackendKind::Winit => Transform::Flipped180,
+        focaldesk_types::CompositorBackend::Winit => Transform::Flipped180,
         _ => Transform::Normal,
     };
     let capture_shader = state.render.chrome_shaders.portal_capture_sdr.clone();

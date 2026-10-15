@@ -1,0 +1,12 @@
+[package]
+name = "focaldesk-input"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-neutral input events, state, and coordinate transforms for FocalDesk"
+
+[features]
+default = []
+smithay = ["dep:smithay"]
+
+[dependencies]
+smithay = { workspace = true, optional = true }

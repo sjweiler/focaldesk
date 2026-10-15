@@ -16,10 +16,10 @@ use crate::core::render::{
 use crate::core::ui_builder::{AiFlowMode, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::FLogLevel;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowTheme;
+use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
@@ -664,7 +664,7 @@ pub fn draw_output_stage(
         rendering_output: prepared.frame_ctx.rendering_output,
         now: prepared.frame_ctx.now,
         start_time: state.render.start_time,
-        flip_egui_y: state.backend_kind == BackendKind::Drm,
+        flip_egui_y: state.backend_kind == CompositorBackend::Drm,
         portal_capture: prepared.frame_ctx.portal_capture,
     };
     if matches!(
@@ -760,7 +760,7 @@ pub fn draw_output_stage(
         notification_unread_count: state.notification_unread_count,
         update_available_count: state.update_state.available_count(),
         lock_screen: &lock_screen,
-        flip_egui_y: state.backend_kind == BackendKind::Drm,
+        flip_egui_y: state.backend_kind == CompositorBackend::Drm,
         client_compositing,
         chrome_glass_pass,
         defer_egui_to_sdr,

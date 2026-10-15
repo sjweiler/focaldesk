@@ -27,7 +27,7 @@ use vui_core::{
 use vui_vello::TextureRenderer;
 
 use super::wgpu_nested::VulkanCompositorScene;
-use crate::core::input::{FlowInputEvent, FlowKeyState, FlowMouseButton, FlowScrollDelta};
+use focaldesk_input::{InputEvent, KeyState, MouseButton, ScrollDelta};
 
 const TEXTURE_CACHE_KEY: u64 = 0x5655_492d_5348_454c;
 const MAX_SURFACE_LOGICAL_WIDTH: f64 = 560.0;
@@ -86,12 +86,28 @@ impl VuiShell {
         scale_factor: f64,
         initial: QuickSettingsState,
     ) -> Self {
+        Self::new_with_visibility(
+            width,
+            height,
+            scale_factor,
+            initial,
+            Self::rail_enabled_from_env(),
+            Self::dock_enabled_from_env(),
+        )
+    }
+
+    fn new_with_visibility(
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+        initial: QuickSettingsState,
+        rail_visible: bool,
+        dock_visible: bool,
+    ) -> Self {
         let actions = Rc::new(RefCell::new(Vec::new()));
         let settings = Rc::new(Cell::new(initial));
         let overlay_open = Rc::new(Cell::new(false));
         let open_requested = Rc::new(Cell::new(false));
-        let rail_visible = Self::rail_enabled_from_env();
-        let dock_visible = Self::dock_enabled_from_env();
         let trigger = QuickSettingsAnchor::new(
             open_requested.clone(),
             overlay_open.clone(),
@@ -273,23 +289,23 @@ impl VuiShell {
         self.ash_renderer = None;
     }
 
-    pub(crate) fn handle_input(&mut self, event: &FlowInputEvent) -> bool {
+    pub(crate) fn handle_input(&mut self, event: &InputEvent) -> bool {
         self.handle_input_with_origin(event, (0.0, 0.0))
     }
 
     pub(crate) fn handle_input_with_origin(
         &mut self,
-        event: &FlowInputEvent,
+        event: &InputEvent,
         origin: (f64, f64),
     ) -> bool {
         if self.session_locked {
             return false;
         }
         let event = match event {
-            FlowInputEvent::PointerMoved { position, .. } => {
+            InputEvent::PointerMoved { position, .. } => {
                 Event::PointerMoved(Point::new(position.x - origin.0, position.y - origin.1))
             }
-            FlowInputEvent::PointerButton {
+            InputEvent::PointerButton {
                 button,
                 state,
                 position,
@@ -299,15 +315,15 @@ impl VuiShell {
                 };
                 let position = Point::new(position.x - origin.0, position.y - origin.1);
                 match state {
-                    FlowKeyState::Pressed => Event::PointerDown {
+                    KeyState::Pressed => Event::PointerDown {
                         position,
                         button,
                         click_count: 1,
                     },
-                    FlowKeyState::Released => Event::PointerUp { position, button },
+                    KeyState::Released => Event::PointerUp { position, button },
                 }
             }
-            FlowInputEvent::PointerScroll { delta, position } => {
+            InputEvent::PointerScroll { delta, position } => {
                 let (delta_x, delta_y) = scroll_delta(*delta);
                 Event::Scroll {
                     position: Point::new(position.x - origin.0, position.y - origin.1),
@@ -315,8 +331,8 @@ impl VuiShell {
                     delta_y,
                 }
             }
-            FlowInputEvent::PointerLeft => Event::PointerLeft,
-            FlowInputEvent::Key {
+            InputEvent::PointerLeft => Event::PointerLeft,
+            InputEvent::Key {
                 keycode,
                 state,
                 modifiers,
@@ -334,13 +350,11 @@ impl VuiShell {
                     .handle_event(&Event::ModifiersChanged(vui_modifiers));
                 let key = key_from_evdev(*keycode);
                 match state {
-                    FlowKeyState::Pressed => Event::KeyDown(key),
-                    FlowKeyState::Released => Event::KeyUp(key),
+                    KeyState::Pressed => Event::KeyDown(key),
+                    KeyState::Released => Event::KeyUp(key),
                 }
             }
-            FlowInputEvent::PointerEntered
-            | FlowInputEvent::Resized { .. }
-            | FlowInputEvent::CloseRequested => return false,
+            InputEvent::PointerEntered => return false,
         };
         self.runtime.handle_event(&event)
     }
@@ -1263,19 +1277,19 @@ fn logical_size(width: u32, height: u32, scale_factor: f64, full_output: bool) -
     )
 }
 
-fn pointer_button(button: FlowMouseButton) -> Option<PointerButton> {
+fn pointer_button(button: MouseButton) -> Option<PointerButton> {
     match button {
-        FlowMouseButton::Left => Some(PointerButton::Primary),
-        FlowMouseButton::Right => Some(PointerButton::Secondary),
-        FlowMouseButton::Middle => Some(PointerButton::Middle),
-        FlowMouseButton::Back | FlowMouseButton::Forward | FlowMouseButton::Other(_) => None,
+        MouseButton::Left => Some(PointerButton::Primary),
+        MouseButton::Right => Some(PointerButton::Secondary),
+        MouseButton::Middle => Some(PointerButton::Middle),
+        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
     }
 }
 
-fn scroll_delta(delta: FlowScrollDelta) -> (f64, f64) {
+fn scroll_delta(delta: ScrollDelta) -> (f64, f64) {
     match delta {
-        FlowScrollDelta::Line { x, y } => (f64::from(x) * 40.0, f64::from(y) * 40.0),
-        FlowScrollDelta::Pixel { x, y } | FlowScrollDelta::Axis { x, y, .. } => (x, y),
+        ScrollDelta::Line { x, y } => (f64::from(x) * 40.0, f64::from(y) * 40.0),
+        ScrollDelta::Pixel { x, y } | ScrollDelta::Axis { x, y, .. } => (x, y),
     }
 }
 
@@ -1305,7 +1319,7 @@ mod tests {
 
     #[test]
     fn compositor_shell_starts_closed_and_does_not_steal_space() {
-        let mut shell = VuiShell::new(
+        let mut shell = VuiShell::new_with_visibility(
             1920,
             1080,
             1.0,
@@ -1315,13 +1329,15 @@ mod tests {
                 do_not_disturb: false,
                 volume: 0.7,
             },
+            false,
+            false,
         );
         assert!(!shell.overlay_open.get());
-        assert!(!shell.handle_input(&FlowInputEvent::Key {
+        assert!(!shell.handle_input(&InputEvent::Key {
             keycode: 57,
-            state: FlowKeyState::Pressed,
+            state: KeyState::Pressed,
             repeat: false,
-            modifiers: crate::core::input::FlowModifiers::default(),
+            modifiers: focaldesk_input::Modifiers::default(),
         }));
 
         shell.set_right_inset(80.0);
@@ -1341,23 +1357,23 @@ mod tests {
             node.role == vui_core::SemanticRole::Button && node.label == "Quick Settings"
         }));
 
-        assert!(shell.handle_input(&FlowInputEvent::PointerButton {
-            button: FlowMouseButton::Left,
-            state: FlowKeyState::Pressed,
-            position: smithay::utils::Point::from((10.0, 900.0)),
+        assert!(shell.handle_input(&InputEvent::PointerButton {
+            button: MouseButton::Left,
+            state: KeyState::Pressed,
+            position: (10.0, 900.0).into(),
         }));
         assert!(!shell.overlay_open.get());
-        assert!(!shell.handle_input(&FlowInputEvent::Key {
+        assert!(!shell.handle_input(&InputEvent::Key {
             keycode: 57,
-            state: FlowKeyState::Pressed,
+            state: KeyState::Pressed,
             repeat: false,
-            modifiers: crate::core::input::FlowModifiers::default(),
+            modifiers: focaldesk_input::Modifiers::default(),
         }));
     }
 
     #[test]
     fn locked_session_dismisses_quick_settings_and_releases_enter() {
-        let mut shell = VuiShell::new(
+        let mut shell = VuiShell::new_with_visibility(
             1920,
             1080,
             1.0,
@@ -1367,6 +1383,8 @@ mod tests {
                 do_not_disturb: false,
                 volume: 0.7,
             },
+            false,
+            false,
         );
         assert!(shell.toggle_quick_settings());
         assert!(shell.overlay_open.get());
@@ -1374,11 +1392,11 @@ mod tests {
         shell.set_session_locked(true);
 
         assert!(!shell.overlay_open.get());
-        assert!(!shell.handle_input(&FlowInputEvent::Key {
+        assert!(!shell.handle_input(&InputEvent::Key {
             keycode: 28,
-            state: FlowKeyState::Pressed,
+            state: KeyState::Pressed,
             repeat: false,
-            modifiers: crate::core::input::FlowModifiers::default(),
+            modifiers: focaldesk_input::Modifiers::default(),
         }));
         let locked = shell.runtime.render_frame().expect("lock transition frame");
         assert!(!locked.semantics.iter().any(|node| node.label == "Wi-Fi"));

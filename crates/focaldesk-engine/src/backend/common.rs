@@ -13,17 +13,12 @@ use std::time::Duration;
 use std::time::Instant;
 
 use focaldesk_cursor::CursorManager;
-use focaldesk_flow::Keybinds;
 use focaldesk_logging::{flog, flog_info, session_id};
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_resources::RenderResources;
+use focaldesk_shortcuts::{Keybinds, ShortcutCapabilities};
 use focaldesk_types::OutputId;
 use focaldesk_ui::chrome::{Chrome, ChromeMetrics};
-use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, InputEvent,
-    KeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionAbsoluteEvent,
-    PointerMotionEvent,
-};
 use smithay::backend::renderer::gles::GlesTexture;
 use smithay::input::keyboard::XkbConfig;
 use smithay::output::{Output, PhysicalProperties, Subpixel};
@@ -41,26 +36,30 @@ use zbus::blocking::{Connection, MessageIterator};
 use zbus::{MatchRule, MessageType};
 
 use crate::core::desktop::{DesktopInit, DesktopState};
-use crate::core::input::{
-    FlowInputEvent, FlowKeyState, FlowModifiers, FlowMouseButton, FlowScrollDelta, FlowScrollSource,
-};
 use crate::core::render::RenderState;
 use crate::core::ui_state::UiState;
 use crate::core::wayland::client::ClientState;
 use crate::core::OutputState;
 use crate::core::SceneState;
 use focaldesk_config::configured_theme;
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_settings_core::load_settings;
 use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::{ThemeDocument, ThemeManager, SYSTEM_DEFAULT_THEME_PATH};
+use focaldesk_types::CompositorBackend;
 use smithay::wayland::xdg_activation::XdgActivationState;
 #[cfg(feature = "xwayland")]
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 #[cfg(feature = "xwayland")]
 use smithay::xwayland::{X11Wm, XWayland, XWaylandEvent};
 use tracing::{error, info, warn};
+
+pub(crate) fn shortcut_capabilities(backend: CompositorBackend) -> ShortcutCapabilities {
+    match backend {
+        CompositorBackend::Winit => ShortcutCapabilities::NESTED,
+        CompositorBackend::Drm => ShortcutCapabilities::DESKTOP,
+    }
+}
 
 pub(crate) fn client_state_from_stream(stream: &std::os::unix::net::UnixStream) -> ClientState {
     ClientState::from_stream(stream)
@@ -347,170 +346,6 @@ pub fn finish_xwayland_startup(
         state.disable_xwayland();
     }
     Ok(())
-}
-
-pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
-    input: &InputEvent<B>,
-    pointer_pos: Point<f64, Logical>,
-    clamp_rect: Rectangle<i32, Logical>,
-    output_transform: Transform,
-    _scale_factor: f64,
-    modifiers: FlowModifiers,
-) -> Option<FlowInputEvent> {
-    match input {
-        InputEvent::Keyboard { event, .. } => {
-            let state = match event.state() {
-                KeyState::Pressed => FlowKeyState::Pressed,
-                KeyState::Released => FlowKeyState::Released,
-            };
-
-            Some(FlowInputEvent::Key {
-                keycode: event.key_code().into(),
-                state,
-                repeat: false,
-                modifiers,
-            })
-        }
-        InputEvent::PointerMotion { event, .. } => {
-            let pos = pointer_pos + event.delta();
-            let delta_unaccel = event.delta_unaccel();
-            let min_x = clamp_rect.loc.x as f64;
-            let min_y = clamp_rect.loc.y as f64;
-            let max_x = (clamp_rect.loc.x + clamp_rect.size.w) as f64 - f64::EPSILON;
-            let max_y = (clamp_rect.loc.y + clamp_rect.size.h) as f64 - f64::EPSILON;
-
-            Some(FlowInputEvent::PointerMoved {
-                position: Point::from((
-                    pos.x.clamp(min_x, max_x.max(min_x)),
-                    pos.y.clamp(min_y, max_y.max(min_y)),
-                )),
-                delta: Some(event.delta()),
-                delta_unaccel: Some(delta_unaccel),
-            })
-        }
-        InputEvent::PointerMotionAbsolute { event, .. } => {
-            // Absolute devices report coordinates in the panel's unrotated
-            // coordinate space. Map that space through the output transform so
-            // a tablet or other absolute device mapped to a portrait output follows the
-            // pixels instead of retaining landscape axes.
-            let source_size = output_transform.invert().transform_size(clamp_rect.size);
-            let local = transform_absolute_position(
-                event.position_transformed(source_size).to_f64(),
-                source_size.to_f64(),
-                output_transform,
-            );
-            let pos = Point::<f64, Logical>::from((
-                clamp_rect.loc.x as f64 + local.x,
-                clamp_rect.loc.y as f64 + local.y,
-            ));
-
-            Some(FlowInputEvent::PointerMoved {
-                position: pos,
-                delta: None,
-                delta_unaccel: None,
-            })
-        }
-        InputEvent::PointerButton { event, .. } => {
-            let button = match event.button_code() {
-                0x110 => FlowMouseButton::Left,
-                0x111 => FlowMouseButton::Right,
-                0x112 => FlowMouseButton::Middle,
-                0x113 => FlowMouseButton::Back,
-                0x114 => FlowMouseButton::Forward,
-                other => FlowMouseButton::Other(other as u16),
-            };
-
-            let state = match event.state() {
-                ButtonState::Pressed => FlowKeyState::Pressed,
-                ButtonState::Released => FlowKeyState::Released,
-            };
-
-            Some(FlowInputEvent::PointerButton {
-                button,
-                state,
-                position: pointer_pos,
-            })
-        }
-        InputEvent::PointerAxis { event, .. } => {
-            let x_v120 = event
-                .amount_v120(Axis::Horizontal)
-                .map(|value| value as i32);
-            let y_v120 = event.amount_v120(Axis::Vertical).map(|value| value as i32);
-            let x = event.amount(Axis::Horizontal).unwrap_or_else(|| {
-                x_v120
-                    .map(|value| f64::from(value) * 15.0 / 120.0)
-                    .unwrap_or(0.0)
-            });
-            let y = event.amount(Axis::Vertical).unwrap_or_else(|| {
-                y_v120
-                    .map(|value| f64::from(value) * 15.0 / 120.0)
-                    .unwrap_or(0.0)
-            });
-            let is_finger = event.source() == AxisSource::Finger;
-            let source = match event.source() {
-                AxisSource::Finger => FlowScrollSource::Finger,
-                AxisSource::Continuous => FlowScrollSource::Continuous,
-                AxisSource::Wheel => FlowScrollSource::Wheel,
-                AxisSource::WheelTilt => FlowScrollSource::WheelTilt,
-            };
-            let delta = FlowScrollDelta::Axis {
-                x,
-                y,
-                x_v120,
-                y_v120,
-                source,
-                x_inverted: event.relative_direction(Axis::Horizontal)
-                    == AxisRelativeDirection::Inverted,
-                y_inverted: event.relative_direction(Axis::Vertical)
-                    == AxisRelativeDirection::Inverted,
-                stop_x: is_finger && event.amount(Axis::Horizontal) == Some(0.0),
-                stop_y: is_finger && event.amount(Axis::Vertical) == Some(0.0),
-            };
-
-            Some(FlowInputEvent::PointerScroll {
-                delta,
-                position: pointer_pos,
-            })
-        }
-        _ => None,
-    }
-}
-
-fn transform_absolute_position(
-    position: Point<f64, Logical>,
-    source_size: Size<f64, Logical>,
-    transform: Transform,
-) -> Point<f64, Logical> {
-    transform.transform_point_in(position, &source_size)
-}
-
-#[cfg(test)]
-mod input_tests {
-    use super::transform_absolute_position;
-    use smithay::utils::{Logical, Point, Size, Transform};
-
-    #[test]
-    fn absolute_pointer_coordinates_follow_output_orientation() {
-        let size = Size::<f64, Logical>::from((1920.0, 1080.0));
-        let point = Point::<f64, Logical>::from((480.0, 270.0));
-
-        assert_eq!(
-            transform_absolute_position(point, size, Transform::Normal),
-            (480.0, 270.0).into()
-        );
-        assert_eq!(
-            transform_absolute_position(point, size, Transform::_90),
-            (810.0, 480.0).into()
-        );
-        assert_eq!(
-            transform_absolute_position(point, size, Transform::_180),
-            (1440.0, 810.0).into()
-        );
-        assert_eq!(
-            transform_absolute_position(point, size, Transform::_270),
-            (270.0, 1440.0).into()
-        );
-    }
 }
 
 /// Wayland socket + [`DesktopState`] and render helpers used by nested backend loops.
@@ -878,11 +713,11 @@ pub(crate) fn refresh_portal_services(wayland_display: &str) {
 /// Build [`Display`], globals, and [`DesktopState`] for a nested output of the given size and scale.
 pub(crate) fn bootstrap_compositor_core(
     bootstrap_output: Option<BootstrapOutput>,
-    backend: BackendKind,
+    backend: CompositorBackend,
 ) -> anyhow::Result<NestedDesktop> {
     let (listener, wayland_display) = bind_wayland_socket()?;
     publish_portal_environment(&wayland_display);
-    if backend == BackendKind::Drm {
+    if backend == CompositorBackend::Drm {
         // Nested/winit dev sessions typically run inside an already-active desktop
         // session; only the real DRM-backed session should touch the shared
         // FocalDesk session target (the matching stop lives in backend::drm::run).
@@ -1014,7 +849,7 @@ pub(crate) fn bootstrap_compositor_core(
             ),
         }
     }
-    let mut keybinds = Keybinds::with_defaults(backend);
+    let mut keybinds = Keybinds::with_defaults(shortcut_capabilities(backend));
     for warning in keybinds.apply_overrides(
         settings
             .input

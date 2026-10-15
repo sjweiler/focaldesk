@@ -5,11 +5,12 @@
 use crate::backend::common::client_state_from_stream;
 use crate::backend::common::{
     bootstrap_compositor_core, drain_session_sleep_notifications, is_nonfatal_wayland_io_error,
-    spawn_session_sleep_watch, translate_backend_input, BootstrapOutput,
+    spawn_session_sleep_watch, BootstrapOutput,
 };
 #[cfg(feature = "xwayland")]
 use crate::backend::common::{finish_xwayland_startup, start_xwayland};
 
+use focaldesk_input::translate_backend_input;
 use smithay::backend::winit as winit_backend;
 use smithay::backend::winit::WinitEvent;
 use smithay::reexports::calloop::EventLoop;
@@ -27,17 +28,19 @@ use crate::core::portal::{
     publish_portal_capture_source,
 };
 use crate::core::wayland::client::ClientState;
-use focaldesk_flow::keybinds::BackendKind;
 use focaldesk_logging::session_id;
+use focaldesk_types::CompositorBackend;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::Renderer;
 use smithay::utils::{IsAlive, Physical, Size, Transform};
 
-use crate::core::input::FlowInputEvent;
+use focaldesk_input::InputEvent;
 use focaldesk_types::OutputId;
 use smithay::backend::winit::WinitEventLoop;
 use tracing::{debug, info, warn};
+
+use crate::core::BackendEvent;
 
 fn dispatch_backend_events(
     state: &mut DesktopState,
@@ -48,7 +51,7 @@ fn dispatch_backend_events(
         WinitEvent::Resized { size, scale_factor } => {
             state.winit_scale_factor = scale_factor;
 
-            state.handle_input(FlowInputEvent::Resized {
+            state.handle_backend_event(BackendEvent::OutputResized {
                 output_id: OutputId(1),
                 width: size.w as u32,
                 height: size.h as u32,
@@ -63,7 +66,7 @@ fn dispatch_backend_events(
 
             if let Some(event) = translate_backend_input(
                 &input,
-                state.input.pointer_pos,
+                state.input.pointer_pos.into(),
                 clamp_rect,
                 state
                     .outputs
@@ -85,7 +88,7 @@ fn dispatch_backend_events(
         }
 
         WinitEvent::CloseRequested => {
-            state.running = false;
+            state.handle_backend_event(BackendEvent::CloseRequested);
         }
 
         _ => {}
@@ -119,7 +122,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             buffer_size: size,
             scale_factor: scale,
         }),
-        BackendKind::Winit,
+        CompositorBackend::Winit,
     )?;
 
     #[cfg(feature = "xwayland")]

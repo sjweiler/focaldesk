@@ -1,14 +1,7 @@
-// all my keybind stuff goes here
-use crate::actions::KeyAction;
+use crate::KeyAction;
 use bitflags::bitflags;
-use smithay::input::keyboard::{keysyms, xkb};
 use std::collections::HashMap;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackendKind {
-    Winit,
-    Drm,
-}
+use xkbcommon::xkb::{self, keysyms};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -20,33 +13,136 @@ bitflags! {
     }
 }
 
+/// An XKB key symbol, distinct from a hardware keycode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeySymbol(u32);
+
+impl KeySymbol {
+    /// Wrap a raw XKB keysym at a backend or parser boundary.
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Return the raw XKB representation for diagnostics or backend interop.
+    pub const fn raw(self) -> u32 {
+        self.0
+    }
+
+    fn normalized(self) -> Self {
+        if self.0 == keysyms::KEY_ISO_Left_Tab {
+            return Self(keysyms::KEY_Tab);
+        }
+
+        let utf32 = xkb::keysym_to_utf32(self.0.into());
+        if utf32 == 0 {
+            return self;
+        }
+        let Some(ch) = char::from_u32(utf32) else {
+            return self;
+        };
+
+        let mut lower = ch.to_lowercase();
+        let Some(ch) = lower.next() else {
+            return self;
+        };
+        if lower.next().is_some() {
+            return self;
+        }
+
+        Self(xkb::utf32_to_keysym(ch as u32).raw())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyCombo {
-    pub mods: ModMask,
-    pub sym: u32,
+    mods: ModMask,
+    sym: KeySymbol,
+}
+
+impl KeyCombo {
+    pub fn new(mods: ModMask, sym: KeySymbol) -> Self {
+        Self {
+            mods,
+            sym: sym.normalized(),
+        }
+    }
+
+    pub const fn modifiers(self) -> ModMask {
+        self.mods
+    }
+
+    pub const fn symbol(self) -> KeySymbol {
+        self.sym
+    }
+
+    fn normalized(self) -> Self {
+        Self::new(self.mods, self.sym)
+    }
+}
+
+#[derive(Clone, Default)]
+struct BindingMap {
+    inner: HashMap<KeyCombo, KeyAction>,
+}
+
+impl BindingMap {
+    fn insert(&mut self, combo: KeyCombo, action: KeyAction) -> Option<KeyAction> {
+        self.inner.insert(combo.normalized(), action)
+    }
+
+    fn get(&self, combo: &KeyCombo) -> Option<&KeyAction> {
+        self.inner.get(combo)
+    }
+
+    fn retain(&mut self, predicate: impl FnMut(&KeyCombo, &mut KeyAction) -> bool) {
+        self.inner.retain(predicate);
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = (&KeyCombo, &KeyAction)> {
+        self.inner.iter()
+    }
+}
+
+/// Optional shortcut facilities provided by the embedding compositor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShortcutCapabilities {
+    /// Reserve system-session keys such as Super+Space for the desktop shell.
+    pub global_launcher: bool,
+    /// Bind Print Screen shortcuts to the compositor's capture implementation.
+    pub screen_capture: bool,
+}
+
+impl ShortcutCapabilities {
+    /// Conservative bindings for a compositor nested inside another desktop.
+    pub const NESTED: Self = Self {
+        global_launcher: false,
+        screen_capture: false,
+    };
+
+    /// Full bindings for a compositor that owns the desktop session.
+    pub const DESKTOP: Self = Self {
+        global_launcher: true,
+        screen_capture: true,
+    };
 }
 
 #[derive(Clone)]
 pub struct Keybinds {
-    pub map: HashMap<KeyCombo, KeyAction>,
+    map: BindingMap,
 }
 
 impl Keybinds {
     pub fn new() -> Self {
         Self {
-            map: HashMap::new(),
+            map: BindingMap::default(),
         }
     }
 
-    pub fn with_defaults(backend: BackendKind) -> Self {
+    pub fn with_defaults(capabilities: ShortcutCapabilities) -> Self {
         let mut kb = Self::new();
 
         kb.common_keybindings();
-
-        match backend {
-            BackendKind::Winit => kb.winit_keybindings(),
-            BackendKind::Drm => kb.drm_keybindings(),
-        }
+        kb.capability_keybindings(capabilities);
 
         kb
     }
@@ -55,7 +151,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_Return,
+                sym: KeySymbol::from_raw(keysyms::KEY_Return),
             },
             KeyAction::LaunchTerminal, // or whatever you call it
         );
@@ -63,7 +159,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_b,
+                sym: KeySymbol::from_raw(keysyms::KEY_b),
             },
             KeyAction::LaunchBrowser,
         );
@@ -71,7 +167,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::CTRL | ModMask::SHIFT,
-                sym: keysyms::KEY_a,
+                sym: KeySymbol::from_raw(keysyms::KEY_a),
             },
             KeyAction::LaunchAiConsole,
         );
@@ -79,7 +175,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_q,
+                sym: KeySymbol::from_raw(keysyms::KEY_q),
             },
             KeyAction::CloseFocused,
         );
@@ -87,7 +183,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_l,
+                sym: KeySymbol::from_raw(keysyms::KEY_l),
             },
             KeyAction::LockScreen,
         );
@@ -95,7 +191,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_v,
+                sym: KeySymbol::from_raw(keysyms::KEY_v),
             },
             KeyAction::ToggleClipboardHistory,
         );
@@ -103,7 +199,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
-                sym: keysyms::KEY_v,
+                sym: KeySymbol::from_raw(keysyms::KEY_v),
             },
             KeyAction::ToggleVoiceCapture,
         );
@@ -111,7 +207,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
-                sym: keysyms::KEY_q,
+                sym: KeySymbol::from_raw(keysyms::KEY_q),
             },
             KeyAction::QuitCompositor,
         );
@@ -119,7 +215,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_F8,
+                sym: KeySymbol::from_raw(keysyms::KEY_F8),
             },
             KeyAction::FocusNext,
         );
@@ -127,7 +223,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_F7,
+                sym: KeySymbol::from_raw(keysyms::KEY_F7),
             },
             KeyAction::FocusPrev,
         );
@@ -135,7 +231,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_Left,
+                sym: KeySymbol::from_raw(keysyms::KEY_Left),
             },
             KeyAction::SplitLeft,
         );
@@ -143,7 +239,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_Right,
+                sym: KeySymbol::from_raw(keysyms::KEY_Right),
             },
             KeyAction::SplitRight,
         );
@@ -151,7 +247,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_Up,
+                sym: KeySymbol::from_raw(keysyms::KEY_Up),
             },
             KeyAction::SplitTop,
         );
@@ -159,7 +255,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_Down,
+                sym: KeySymbol::from_raw(keysyms::KEY_Down),
             },
             KeyAction::SplitBottom,
         );
@@ -167,7 +263,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER,
-                sym: keysyms::KEY_z,
+                sym: KeySymbol::from_raw(keysyms::KEY_z),
             },
             KeyAction::ToggleSplitLayout,
         );
@@ -181,7 +277,7 @@ impl Keybinds {
             self.map.insert(
                 KeyCombo {
                     mods: ModMask::SUPER | ModMask::SHIFT,
-                    sym,
+                    sym: KeySymbol::from_raw(sym),
                 },
                 action,
             );
@@ -212,14 +308,14 @@ impl Keybinds {
             self.map.insert(
                 KeyCombo {
                     mods: ModMask::SUPER | ModMask::ALT,
-                    sym,
+                    sym: KeySymbol::from_raw(sym),
                 },
                 action,
             );
             self.map.insert(
                 KeyCombo {
                     mods: ModMask::SUPER | ModMask::ALT | ModMask::SHIFT,
-                    sym,
+                    sym: KeySymbol::from_raw(sym),
                 },
                 fine_action,
             );
@@ -228,21 +324,21 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::ALT,
-                sym: keysyms::KEY_Tab,
+                sym: KeySymbol::from_raw(keysyms::KEY_Tab),
             },
             KeyAction::FocusSplitNext,
         );
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_Tab,
+                sym: KeySymbol::from_raw(keysyms::KEY_Tab),
             },
             KeyAction::FocusSplitPrevious,
         );
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::ALT,
-                sym: keysyms::KEY_BackSpace,
+                sym: KeySymbol::from_raw(keysyms::KEY_BackSpace),
             },
             KeyAction::UndoSplitAction,
         );
@@ -250,7 +346,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::CTRL | ModMask::ALT,
-                sym: keysyms::KEY_Tab,
+                sym: KeySymbol::from_raw(keysyms::KEY_Tab),
             },
             KeyAction::FocusShellNext,
         );
@@ -258,7 +354,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::CTRL | ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_Tab,
+                sym: KeySymbol::from_raw(keysyms::KEY_Tab),
             },
             KeyAction::FocusShellPrevious,
         );
@@ -266,7 +362,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::CTRL | ModMask::ALT,
-                sym: keysyms::KEY_d,
+                sym: KeySymbol::from_raw(keysyms::KEY_d),
             },
             KeyAction::ToggleLauncher,
         );
@@ -274,7 +370,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_0,
+                sym: KeySymbol::from_raw(keysyms::KEY_0),
             },
             KeyAction::OverflowView,
         );
@@ -282,7 +378,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_1,
+                sym: KeySymbol::from_raw(keysyms::KEY_1),
             },
             KeyAction::ActivateSlot(0),
         );
@@ -290,7 +386,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_2,
+                sym: KeySymbol::from_raw(keysyms::KEY_2),
             },
             KeyAction::ActivateSlot(1),
         );
@@ -298,7 +394,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_3,
+                sym: KeySymbol::from_raw(keysyms::KEY_3),
             },
             KeyAction::ActivateSlot(2),
         );
@@ -306,7 +402,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_4,
+                sym: KeySymbol::from_raw(keysyms::KEY_4),
             },
             KeyAction::ActivateSlot(3),
         );
@@ -314,7 +410,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_5,
+                sym: KeySymbol::from_raw(keysyms::KEY_5),
             },
             KeyAction::ActivateSlot(4),
         );
@@ -322,7 +418,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_6,
+                sym: KeySymbol::from_raw(keysyms::KEY_6),
             },
             KeyAction::ActivateSlot(5),
         );
@@ -330,7 +426,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_7,
+                sym: KeySymbol::from_raw(keysyms::KEY_7),
             },
             KeyAction::ActivateSlot(6),
         );
@@ -338,7 +434,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_8,
+                sym: KeySymbol::from_raw(keysyms::KEY_8),
             },
             KeyAction::ActivateSlot(7),
         );
@@ -346,7 +442,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT,
-                sym: keysyms::KEY_9,
+                sym: KeySymbol::from_raw(keysyms::KEY_9),
             },
             KeyAction::ActivateSlot(8),
         );
@@ -354,7 +450,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_1,
+                sym: KeySymbol::from_raw(keysyms::KEY_1),
             },
             KeyAction::AssignSlot(0),
         );
@@ -362,7 +458,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_2,
+                sym: KeySymbol::from_raw(keysyms::KEY_2),
             },
             KeyAction::AssignSlot(1),
         );
@@ -370,7 +466,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_3,
+                sym: KeySymbol::from_raw(keysyms::KEY_3),
             },
             KeyAction::AssignSlot(2),
         );
@@ -378,7 +474,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_4,
+                sym: KeySymbol::from_raw(keysyms::KEY_4),
             },
             KeyAction::AssignSlot(3),
         );
@@ -386,7 +482,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_5,
+                sym: KeySymbol::from_raw(keysyms::KEY_5),
             },
             KeyAction::AssignSlot(4),
         );
@@ -394,7 +490,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_6,
+                sym: KeySymbol::from_raw(keysyms::KEY_6),
             },
             KeyAction::AssignSlot(5),
         );
@@ -402,7 +498,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_7,
+                sym: KeySymbol::from_raw(keysyms::KEY_7),
             },
             KeyAction::AssignSlot(6),
         );
@@ -410,7 +506,7 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_8,
+                sym: KeySymbol::from_raw(keysyms::KEY_8),
             },
             KeyAction::AssignSlot(7),
         );
@@ -418,57 +514,50 @@ impl Keybinds {
         self.map.insert(
             KeyCombo {
                 mods: ModMask::ALT | ModMask::SHIFT,
-                sym: keysyms::KEY_9,
+                sym: KeySymbol::from_raw(keysyms::KEY_9),
             },
             KeyAction::AssignSlot(8),
         );
     }
 
-    fn winit_keybindings(&mut self) {
-        // Nested-only bindings go here later.
-        // Example:
-        // self.map.insert(
-        //     KeyCombo { mods: ModMask::SUPER, sym: keysyms::KEY_F11 },
-        //     KeyAction::ToggleFullscreen,
-        // );
+    fn capability_keybindings(&mut self, capabilities: ShortcutCapabilities) {
+        if capabilities.global_launcher {
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SUPER,
+                    sym: KeySymbol::from_raw(keysyms::KEY_space),
+                },
+                KeyAction::ToggleLauncher,
+            );
+        }
+
+        if capabilities.screen_capture {
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::empty(),
+                    sym: KeySymbol::from_raw(keysyms::KEY_Print),
+                },
+                KeyAction::TakeScreenshot,
+            );
+
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SHIFT,
+                    sym: KeySymbol::from_raw(keysyms::KEY_Print),
+                },
+                KeyAction::TakeScreenshotAll,
+            );
+        }
     }
 
-    fn drm_keybindings(&mut self) {
-        self.map.insert(
-            KeyCombo {
-                mods: ModMask::SUPER,
-                sym: keysyms::KEY_space,
-            },
-            KeyAction::ToggleLauncher,
-        );
-
-        self.map.insert(
-            KeyCombo {
-                mods: ModMask::empty(),
-                sym: keysyms::KEY_Print,
-            },
-            KeyAction::TakeScreenshot,
-        );
-
-        self.map.insert(
-            KeyCombo {
-                mods: ModMask::SHIFT,
-                sym: keysyms::KEY_Print,
-            },
-            KeyAction::TakeScreenshotAll,
-        );
-    }
-
-    pub fn resolve(&self, sym: u32, mods: ModMask) -> Option<KeyAction> {
-        // XKB commonly reports Shift+Tab as ISO_Left_Tab. Treat it as the same
-        // physical navigation key and let the modifier mask select direction.
-        let sym = if sym == keysyms::KEY_ISO_Left_Tab {
-            keysyms::KEY_Tab
-        } else {
-            keysym_to_lower(sym)
-        };
-        let combo = KeyCombo { mods, sym };
+    pub fn resolve(&self, sym: KeySymbol, mods: ModMask) -> Option<KeyAction> {
+        let combo = KeyCombo::new(mods, sym);
         self.map.get(&combo).copied()
+    }
+
+    /// Iterate over the active bindings without exposing mutable storage.
+    pub fn bindings(&self) -> impl ExactSizeIterator<Item = (KeyCombo, KeyAction)> + '_ {
+        self.map.iter().map(|(&combo, &action)| (combo, action))
     }
 
     /// Apply user shortcut overrides while retaining defaults for invalid
@@ -603,35 +692,12 @@ fn parse_shortcut(shortcut: &str) -> Result<KeyCombo, String> {
         return Err(format!("unknown key `{key_name}`"));
     }
 
-    Ok(KeyCombo {
-        mods,
-        sym: keysym_to_lower(sym),
-    })
-}
-
-fn keysym_to_lower(sym: u32) -> u32 {
-    let utf32 = xkb::keysym_to_utf32(sym.into());
-    if utf32 == 0 {
-        return sym;
-    }
-    let Some(ch) = char::from_u32(utf32) else {
-        return sym;
-    };
-
-    let mut lower = ch.to_lowercase();
-    let Some(ch) = lower.next() else {
-        return sym;
-    };
-    if lower.next().is_some() {
-        return sym;
-    }
-
-    xkb::utf32_to_keysym(ch as u32).raw()
+    Ok(KeyCombo::new(mods, KeySymbol::from_raw(sym)))
 }
 
 impl Default for Keybinds {
     fn default() -> Self {
-        Self::with_defaults(BackendKind::Winit)
+        Self::with_defaults(ShortcutCapabilities::default())
     }
 }
 
@@ -639,55 +705,128 @@ impl Default for Keybinds {
 mod tests {
     use super::*;
 
+    fn key(raw: u32) -> KeySymbol {
+        KeySymbol::from_raw(raw)
+    }
+
     #[test]
-    fn drm_defaults_include_common_and_drm_bindings() {
-        let keybinds = Keybinds::with_defaults(BackendKind::Drm);
+    fn key_symbol_round_trips_its_backend_representation() {
+        let symbol = KeySymbol::from_raw(keysyms::KEY_F8);
+
+        assert_eq!(symbol.raw(), keysyms::KEY_F8);
+    }
+
+    #[test]
+    fn key_combo_constructor_normalizes_and_exposes_read_only_parts() {
+        let combo = KeyCombo::new(ModMask::SUPER, key(keysyms::KEY_A));
+
+        assert_eq!(combo.modifiers(), ModMask::SUPER);
+        assert_eq!(combo.symbol().raw(), keysyms::KEY_a);
+    }
+
+    #[test]
+    fn binding_storage_normalizes_internal_insertions() {
+        let mut bindings = BindingMap::default();
+        bindings.insert(
+            KeyCombo {
+                mods: ModMask::SUPER,
+                sym: key(keysyms::KEY_A),
+            },
+            KeyAction::LaunchAiConsole,
+        );
 
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            bindings
+                .get(&KeyCombo::new(ModMask::SUPER, key(keysyms::KEY_a)))
+                .copied(),
+            Some(KeyAction::LaunchAiConsole)
+        );
+    }
+
+    #[test]
+    fn desktop_capabilities_include_common_and_system_bindings() {
+        let keybinds = Keybinds::with_defaults(ShortcutCapabilities::DESKTOP);
+
+        assert_eq!(
+            keybinds.resolve(key(keysyms::KEY_Return), ModMask::SUPER),
             Some(KeyAction::LaunchTerminal)
         );
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_space, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_space), ModMask::SUPER),
             Some(KeyAction::ToggleLauncher)
         );
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_Print, ModMask::empty()),
+            keybinds.resolve(key(keysyms::KEY_Print), ModMask::empty()),
             Some(KeyAction::TakeScreenshot)
         );
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_Print, ModMask::SHIFT),
+            keybinds.resolve(key(keysyms::KEY_Print), ModMask::SHIFT),
             Some(KeyAction::TakeScreenshotAll)
         );
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_F8, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_F8), ModMask::SUPER),
             Some(KeyAction::FocusNext)
         );
     }
 
     #[test]
-    fn winit_defaults_exclude_drm_only_bindings() {
-        let keybinds = Keybinds::with_defaults(BackendKind::Winit);
+    fn nested_capabilities_exclude_system_session_bindings() {
+        let keybinds = Keybinds::with_defaults(ShortcutCapabilities::NESTED);
 
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_Return), ModMask::SUPER),
             Some(KeyAction::LaunchTerminal)
         );
-        assert_eq!(keybinds.resolve(keysyms::KEY_space, ModMask::SUPER), None);
-        assert_eq!(keybinds.resolve(keysyms::KEY_Print, ModMask::empty()), None);
+        assert_eq!(
+            keybinds.resolve(key(keysyms::KEY_space), ModMask::SUPER),
+            None
+        );
+        assert_eq!(
+            keybinds.resolve(key(keysyms::KEY_Print), ModMask::empty()),
+            None
+        );
     }
 
     #[test]
-    fn shell_navigation_bindings_are_available_on_every_backend() {
-        for backend in [BackendKind::Winit, BackendKind::Drm] {
-            let keybinds = Keybinds::with_defaults(backend);
+    fn optional_capabilities_are_independent() {
+        let launcher_only = Keybinds::with_defaults(ShortcutCapabilities {
+            global_launcher: true,
+            screen_capture: false,
+        });
+        assert_eq!(
+            launcher_only.resolve(key(keysyms::KEY_space), ModMask::SUPER),
+            Some(KeyAction::ToggleLauncher)
+        );
+        assert_eq!(
+            launcher_only.resolve(key(keysyms::KEY_Print), ModMask::empty()),
+            None
+        );
+
+        let capture_only = Keybinds::with_defaults(ShortcutCapabilities {
+            global_launcher: false,
+            screen_capture: true,
+        });
+        assert_eq!(
+            capture_only.resolve(key(keysyms::KEY_space), ModMask::SUPER),
+            None
+        );
+        assert_eq!(
+            capture_only.resolve(key(keysyms::KEY_Print), ModMask::empty()),
+            Some(KeyAction::TakeScreenshot)
+        );
+    }
+
+    #[test]
+    fn shell_navigation_bindings_are_available_with_every_capability_set() {
+        for capabilities in [ShortcutCapabilities::NESTED, ShortcutCapabilities::DESKTOP] {
+            let keybinds = Keybinds::with_defaults(capabilities);
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_Tab, ModMask::CTRL | ModMask::ALT),
+                keybinds.resolve(key(keysyms::KEY_Tab), ModMask::CTRL | ModMask::ALT),
                 Some(KeyAction::FocusShellNext)
             );
             assert_eq!(
                 keybinds.resolve(
-                    keysyms::KEY_ISO_Left_Tab,
+                    key(keysyms::KEY_ISO_Left_Tab),
                     ModMask::CTRL | ModMask::ALT | ModMask::SHIFT
                 ),
                 Some(KeyAction::FocusShellPrevious)
@@ -696,12 +835,12 @@ mod tests {
     }
 
     #[test]
-    fn ai_console_binding_is_available_on_every_backend() {
-        for backend in [BackendKind::Winit, BackendKind::Drm] {
-            let keybinds = Keybinds::with_defaults(backend);
+    fn ai_console_binding_is_available_with_every_capability_set() {
+        for capabilities in [ShortcutCapabilities::NESTED, ShortcutCapabilities::DESKTOP] {
+            let keybinds = Keybinds::with_defaults(capabilities);
             assert_eq!(
                 keybinds.resolve(
-                    keysyms::KEY_a,
+                    key(keysyms::KEY_a),
                     ModMask::SUPER | ModMask::CTRL | ModMask::SHIFT
                 ),
                 Some(KeyAction::LaunchAiConsole)
@@ -710,42 +849,42 @@ mod tests {
     }
 
     #[test]
-    fn split_screen_bindings_are_available_on_every_backend() {
-        for backend in [BackendKind::Winit, BackendKind::Drm] {
-            let keybinds = Keybinds::with_defaults(backend);
+    fn split_screen_bindings_are_available_with_every_capability_set() {
+        for capabilities in [ShortcutCapabilities::NESTED, ShortcutCapabilities::DESKTOP] {
+            let keybinds = Keybinds::with_defaults(capabilities);
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_Left, ModMask::SUPER),
+                keybinds.resolve(key(keysyms::KEY_Left), ModMask::SUPER),
                 Some(KeyAction::SplitLeft)
             );
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_Down, ModMask::SUPER),
+                keybinds.resolve(key(keysyms::KEY_Down), ModMask::SUPER),
                 Some(KeyAction::SplitBottom)
             );
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_z, ModMask::SUPER),
+                keybinds.resolve(key(keysyms::KEY_z), ModMask::SUPER),
                 Some(KeyAction::ToggleSplitLayout)
             );
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_Left, ModMask::SUPER | ModMask::SHIFT),
+                keybinds.resolve(key(keysyms::KEY_Left), ModMask::SUPER | ModMask::SHIFT),
                 Some(KeyAction::SwapSplitLeft)
             );
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_Right, ModMask::SUPER | ModMask::ALT),
+                keybinds.resolve(key(keysyms::KEY_Right), ModMask::SUPER | ModMask::ALT),
                 Some(KeyAction::ResizeSplitRight)
             );
             assert_eq!(
                 keybinds.resolve(
-                    keysyms::KEY_Down,
+                    key(keysyms::KEY_Down),
                     ModMask::SUPER | ModMask::ALT | ModMask::SHIFT
                 ),
                 Some(KeyAction::ResizeSplitBottomFine)
             );
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_Tab, ModMask::SUPER | ModMask::ALT),
+                keybinds.resolve(key(keysyms::KEY_Tab), ModMask::SUPER | ModMask::ALT),
                 Some(KeyAction::FocusSplitNext)
             );
             assert_eq!(
-                keybinds.resolve(keysyms::KEY_BackSpace, ModMask::SUPER | ModMask::ALT),
+                keybinds.resolve(key(keysyms::KEY_BackSpace), ModMask::SUPER | ModMask::ALT),
                 Some(KeyAction::UndoSplitAction)
             );
         }
@@ -753,32 +892,35 @@ mod tests {
 
     #[test]
     fn configurable_shortcuts_replace_defaults() {
-        let mut keybinds = Keybinds::with_defaults(BackendKind::Drm);
+        let mut keybinds = Keybinds::with_defaults(ShortcutCapabilities::DESKTOP);
         let warnings = keybinds.apply_overrides([("launch_terminal", "Ctrl+Alt+T")]);
 
         assert!(warnings.is_empty());
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_t, ModMask::CTRL | ModMask::ALT),
+            keybinds.resolve(key(keysyms::KEY_t), ModMask::CTRL | ModMask::ALT),
             Some(KeyAction::LaunchTerminal)
         );
-        assert_eq!(keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER), None);
+        assert_eq!(
+            keybinds.resolve(key(keysyms::KEY_Return), ModMask::SUPER),
+            None
+        );
     }
 
     #[test]
     fn invalid_shortcuts_leave_the_default_binding_intact() {
-        let mut keybinds = Keybinds::with_defaults(BackendKind::Winit);
+        let mut keybinds = Keybinds::with_defaults(ShortcutCapabilities::NESTED);
         let warnings = keybinds.apply_overrides([("launch_terminal", "Hyper+DefinitelyNotAKey")]);
 
         assert_eq!(warnings.len(), 1);
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_Return), ModMask::SUPER),
             Some(KeyAction::LaunchTerminal)
         );
     }
 
     #[test]
     fn numbered_workspace_actions_are_configurable() {
-        let mut keybinds = Keybinds::with_defaults(BackendKind::Winit);
+        let mut keybinds = Keybinds::with_defaults(ShortcutCapabilities::NESTED);
         let warnings = keybinds.apply_overrides([
             ("activate_workspace_4", "Super+4"),
             ("move_to_workspace_4", "Super+Shift+4"),
@@ -786,27 +928,27 @@ mod tests {
 
         assert!(warnings.is_empty());
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_4, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_4), ModMask::SUPER),
             Some(KeyAction::ActivateSlot(3))
         );
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_4, ModMask::SUPER | ModMask::SHIFT),
+            keybinds.resolve(key(keysyms::KEY_4), ModMask::SUPER | ModMask::SHIFT),
             Some(KeyAction::AssignSlot(3))
         );
     }
 
     #[test]
     fn conflicting_override_does_not_displace_an_existing_action() {
-        let mut keybinds = Keybinds::with_defaults(BackendKind::Winit);
+        let mut keybinds = Keybinds::with_defaults(ShortcutCapabilities::NESTED);
         let warnings = keybinds.apply_overrides([("launch_terminal", "Super+B")]);
 
         assert_eq!(warnings.len(), 1);
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_b, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_b), ModMask::SUPER),
             Some(KeyAction::LaunchBrowser)
         );
         assert_eq!(
-            keybinds.resolve(keysyms::KEY_Return, ModMask::SUPER),
+            keybinds.resolve(key(keysyms::KEY_Return), ModMask::SUPER),
             Some(KeyAction::LaunchTerminal)
         );
     }

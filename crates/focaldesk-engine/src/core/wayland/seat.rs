@@ -1,4 +1,4 @@
-use focaldesk_flow::keybinds::BackendKind;
+use focaldesk_types::CompositorBackend;
 use smithay::input::{
     pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     Seat, SeatHandler, SeatState,
@@ -29,7 +29,7 @@ impl SeatHandler for DesktopState {
         match image {
             // GTK/XWayland often hides the seat cursor while using a subsurface cursor; keep the
             // compositor fallback visible on DRM so the pointer does not disappear entirely.
-            CursorImageStatus::Hidden if self.backend_kind == BackendKind::Drm => {
+            CursorImageStatus::Hidden if self.backend_kind == CompositorBackend::Drm => {
                 self.render.clear_sw_cursor_texture();
                 self.cursor_manager.set_visible(true);
                 self.cursor_manager.set_icon(CursorIcon::Default);
@@ -44,7 +44,7 @@ impl SeatHandler for DesktopState {
                 self.cursor_manager.set_icon(icon);
                 self.drm_submit_hw_cursor = true;
             }
-            CursorImageStatus::Surface(_) if self.backend_kind == BackendKind::Drm => {
+            CursorImageStatus::Surface(_) if self.backend_kind == CompositorBackend::Drm => {
                 // XWayland subsurface cursors: keep the theme cursor on the KMS plane.
                 // Rendering client cursor surfaces in-frame was hiding the HW cursor entirely.
                 self.render.clear_sw_cursor_texture();

@@ -72,7 +72,7 @@ impl ImageCopyCaptureHandler for DesktopState {
         // require a GPU readback (`copy_texture`) on every frame.
         let wide_gamut = portal::portal_capture_color_mode().requires_ten_bit();
         let shm = if wide_gamut
-            || (dma.is_some() && self.backend_kind == focaldesk_flow::keybinds::BackendKind::Drm)
+            || (dma.is_some() && self.backend_kind == focaldesk_types::CompositorBackend::Drm)
         {
             vec![]
         } else {
