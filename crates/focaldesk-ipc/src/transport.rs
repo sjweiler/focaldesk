@@ -39,6 +39,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-panel",
         "focaldesk-system-rail",
         "focaldesk-task-shelf",
+        "focaldesk-launcher",
         "focaldesk-settings",
         "focaldesk-portal",
         "focaldesk-cli",
@@ -457,6 +458,9 @@ mod tests {
                 .allowed_units
                 .contains(&"focaldesk-system-rail.service")
         );
+        assert!(DESKTOP_POLICY
+            .allowed_executables
+            .contains(&"focaldesk-launcher"));
     }
 
     #[test]

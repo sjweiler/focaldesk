@@ -13,7 +13,7 @@ Each workspace contains its own collection of windows while sharing the same des
 - Low rendering overhead
 - Per-monitor workspace support
 - Predictable window placement
-- Future animation support
+- Interactive, reduced-motion-aware transitions
 
 ## Current Implementation
 
@@ -25,7 +25,8 @@ Each workspace maintains:
 - Layout state
 - Rendering state
 
-Only the active workspace for an output is rendered.
+Only the active workspace for an output is normally rendered. During a bounded
+transition, the outgoing and incoming workspace are composited side by side.
 
 ## High-Level Architecture
 
@@ -75,14 +76,32 @@ When the user switches workspaces:
 4. Schedule a repaint.
 5. Update shell UI.
 
+Keyboard and sidebar changes settle through a short eased slide. A configured
+three- or four-finger swipe moves both workspaces interactively, commits after
+the distance threshold or a fast horizontal fling, and otherwise snaps back.
+Transitions are output-local and are skipped when **Reduce Motion** is enabled.
+
 The default shortcuts are `Alt+1` through `Alt+9`. `Alt+Shift+1` through
 `Alt+Shift+9` move the focused window and follow it to the destination.
 `Alt+0` opens a selectable list containing every workspace, including entries
 that do not fit in the sidebar.
 
+The same overview presents every workspace as a live window-layout thumbnail.
+Click a card to switch to it, or drag a window rectangle onto another card to
+move it there without changing the active workspace. Split-group members move
+together so their layout remains valid.
+
+**Settings → Workspaces → Workspace Wallpapers** can assign a local image path
+to each numbered workspace. Empty entries inherit the active theme wallpaper.
+The active workspace's image is rendered through the same wallpaper and color
+management path as theme wallpapers.
+
 ## Rendering
 
-Only windows belonging to the active workspace on each output are composited into the scene.
+Only windows belonging to the active workspace on each output are normally
+composited into the scene. An active transition temporarily includes the two
+participating workspaces with opposite horizontal offsets; shell chrome and
+layer surfaces remain fixed.
 
 Inactive workspaces remain in memory but are not rendered.
 
@@ -183,11 +202,7 @@ windows immediately.
 
 ## Future Enhancements
 
-- Workspace overview
-- Drag windows between workspaces
-- Workspace thumbnails
 - Animated transitions
-- Per-workspace wallpapers
 - Multi-monitor synchronization options
 
 ## Design Principles

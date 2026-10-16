@@ -10,6 +10,65 @@ version numbers where practical.
 
 ### Added
 
+- Replaced local Files copy/move work with a bounded background transfer engine
+  providing byte progress, throughput and ETA reporting, mid-file cancellation,
+  Replace/Skip/Keep Both batch conflict choices, staged commits and cleanup,
+  symlink/hard-link/mode/time preservation, and exact undo for replacements.
+- Added interoperable local folder bookmarks to Files using the standard GTK
+  bookmarks file, with `Ctrl+D`, current-folder and selected-folder actions,
+  rename/reorder/remove controls, unavailable-folder handling, bounded parsing,
+  and atomic writes that preserve unrelated entries.
+- Added local Unix permission editing to Files Properties with owner/group/mode
+  inspection, mixed multi-selection, an executable shortcut, bounded confirmed
+  recursion that skips symlinks and mount boundaries, rollback on batch
+  failure, and exact `Ctrl+Z` restoration.
+- Added preview-first bulk rename to Files with find/replace, prefix, suffix,
+  numbering, case conversion, extension preservation, collision validation,
+  transactional rollback, and transactional undo.
+- Added cancellable, undoable archive extraction to Files for ZIP, TAR, gzip
+  TAR, and xz TAR, with keep-both conflict handling, traversal/link rejection,
+  bounded expansion, and automatic partial-output cleanup.
+- Completed the Files Trash workflow with conflict-safe restore to the original
+  location, original-location properties, and confirmed permanent deletion for
+  selected items.
+- Added cancellable, non-blocking recursive filename search to Files, with
+  relative-path results, hidden-file handling, symlink-loop avoidance, bounded
+  traversal, and clear partial-result status.
+- Added Connect to Server support to Files for SMB, SFTP, FTP/FTPS, and
+  WebDAV/WebDAVS, using native GIO authentication, live mounted-server entries,
+  safe disconnect, and bounded private URI-only bookmarks that reject embedded
+  credentials and tokens.
+- Added bounded per-tab file-operation undo to Files for rename, move, copy,
+  drag-copy, new-folder, and move-to-Trash actions, available from operation
+  toasts and `Ctrl+Z`, with conflict checks and retryable partial failures.
+- Added a live Devices section to Files with GIO-backed hotplug updates,
+  mount-and-open behavior, platform unlock prompts, and capability-aware safe
+  unmount/eject actions with busy and authentication error feedback.
+- Added asynchronous JPEG, PNG, and first-page PDF thumbnails to Files, plus a
+  selection preview pane for supported images, PDFs, bounded text, folders,
+  multi-selection totals, and file metadata. Preview work is local-only,
+  size/dimension/time limited, generation-cancelled during navigation, and
+  stored in a bounded private XDG cache.
+- Expanded the Launcher into a ranked system search palette for applications,
+  Settings pages, favorite/recent files, and open windows, with keyboard-first
+  activation and a bounded local arithmetic calculator. Files records opened
+  documents under the existing recent-activity privacy control, and typed
+  compositor actions handle Settings navigation and window focus.
+- Added an `org.freedesktop.Notifications` session service with replacement,
+  urgency, application metadata, bounded actions, close/action signals, and
+  transient/resident behavior. The notification center now groups entries by
+  application, exposes live actions, marks critical alerts, and lets critical
+  notifications bypass Do Not Disturb.
+- Added per-output workspace slide transitions across the GLES, WGPU, and raw
+  Vulkan compositor paths. Touchpad swipes track interactively, fast horizontal
+  flings commit, cancelled gestures snap back, keyboard and sidebar changes use
+  the same animation, and Reduce Motion disables transitions.
+- Added a Mouse & Touchpad Settings page with live pointer speed, natural
+  scrolling, and configurable three- or four-finger horizontal workspace
+  swipes. It discovers libinput pointer devices and exposes capability-aware,
+  persistent per-device controls for enablement, tap-to-click,
+  disable-while-typing, acceleration, scrolling, handedness, and middle-click
+  emulation. Unreserved swipe gestures continue to Wayland applications.
 - Added an opt-in Ambient Voice workspace to the AI Console with offline Vosk
   wake-phrase gating, a bounded RAM-only audio buffer, visible activity state,
   barge-in cancellation, an immediate microphone kill switch, optional

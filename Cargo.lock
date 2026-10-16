@@ -2863,6 +2863,7 @@ dependencies = [
  "tracing-subscriber",
  "vui-ash",
  "vui-core",
+ "vui-text",
  "vui-vello",
  "wayland-backend",
  "wayland-protocols",
@@ -2879,6 +2880,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "dirs 5.0.1",
+ "flate2",
  "focaldesk-config",
  "focaldesk-gtk",
  "focaldesk-launcher-state",
@@ -2886,11 +2888,14 @@ dependencies = [
  "focaldesk-settings-core",
  "focaldesk-themes",
  "gtk4",
+ "image",
  "libadwaita",
+ "md5",
  "serde",
  "serde_json",
  "toml 0.8.23",
  "tracing",
+ "zip",
 ]
 
 [[package]]
@@ -2946,6 +2951,7 @@ dependencies = [
  "anyhow",
  "focaldesk-config",
  "focaldesk-gtk",
+ "focaldesk-ipc",
  "focaldesk-launcher-state",
  "focaldesk-logging",
  "focaldesk-settings-core",
@@ -3035,8 +3041,10 @@ dependencies = [
  "focaldesk-logging",
  "focaldesk-notifications",
  "focaldesk-settings-core",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "zbus 5.18.0",
 ]
 
 [[package]]

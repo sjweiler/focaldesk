@@ -3,8 +3,8 @@
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 
 use crate::core::ui::panel::{
-    draw_panel_frame, inset_rect, AccentEdge, PanelPalette, PanelStyle, QuadRenderer,
-    ResolvedPanelStyle,
+    AccentEdge, PanelPalette, PanelStyle, QuadRenderer, ResolvedPanelStyle, draw_panel_frame,
+    inset_rect,
 };
 
 #[derive(Clone, Copy, Debug)]

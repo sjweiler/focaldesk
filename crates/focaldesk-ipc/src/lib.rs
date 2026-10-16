@@ -75,6 +75,8 @@ pub enum IpcRequest {
     GetDisplayRuntimeStatus,
     /// Returns a bounded, secret-free snapshot of compositor-owned desktop state.
     GetDesktopSnapshot,
+    /// Returns bounded capability and current-state metadata for pointer devices.
+    GetInputDevices,
     GetThemeEditorStatus {
         protocol_version: u16,
     },
@@ -308,6 +310,9 @@ pub enum IpcResponse {
     DesktopSnapshot {
         snapshot: DesktopSnapshot,
     },
+    InputDevices {
+        devices: Vec<InputDeviceSnapshot>,
+    },
     ThemeEditorStatus {
         protocol_version: u16,
         preview_active: bool,
@@ -330,6 +335,36 @@ pub enum IpcResponse {
     Error {
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputDeviceSnapshot {
+    pub id: String,
+    pub name: String,
+    pub sysname: String,
+    pub vendor_id: u32,
+    pub product_id: u32,
+    pub touchpad: bool,
+    pub enabled: bool,
+    pub can_disable: bool,
+    pub tap_finger_count: u32,
+    pub tap_to_click: bool,
+    pub supports_disable_while_typing: bool,
+    pub disable_while_typing: bool,
+    pub supports_acceleration: bool,
+    pub supports_adaptive_acceleration: bool,
+    pub supports_flat_acceleration: bool,
+    pub acceleration_profile: Option<String>,
+    pub acceleration_speed: f64,
+    pub supports_two_finger_scroll: bool,
+    pub supports_edge_scroll: bool,
+    pub supports_button_scroll: bool,
+    pub supports_disabled_scroll: bool,
+    pub scroll_method: Option<String>,
+    pub supports_left_handed: bool,
+    pub left_handed: bool,
+    pub supports_middle_button_emulation: bool,
+    pub middle_button_emulation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -564,40 +599,40 @@ pub fn send_desktop_config(config: FocalDeskConfig) -> Result<(), String> {
 }
 
 pub use connector_host::{
-    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, CalendarAccountSnapshot,
+    connector_host_socket_path, send_connector_host_request, CalendarAccountSnapshot,
     CalendarAvailableSnapshot, CalendarEventSnapshot, CalendarOAuthSnapshot,
     ConnectorHostIpcRequest, ConnectorHostIpcResponse, ConnectorRuntimeStatus,
-    connector_host_socket_path, send_connector_host_request,
+    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME,
 };
 pub use controls::{
-    CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME, ControlIpcRequest, ControlIpcResponse, ControlSetting,
-    control_socket_path, send_control_request, serve_control_ipc,
+    control_socket_path, send_control_request, serve_control_ipc, ControlIpcRequest,
+    ControlIpcResponse, ControlSetting, CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME,
 };
 pub use dialog::{
-    DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME, DialogIpcRequest, DialogIpcResponse, dialog_socket_path,
-    send_dialog_request, serve_dialog_ipc,
+    dialog_socket_path, send_dialog_request, serve_dialog_ipc, DialogIpcRequest, DialogIpcResponse,
+    DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME,
 };
 pub use microphone::{
-    MICROPHONE_SOCKET_ENV, MICROPHONE_SOCKET_NAME, MicrophoneEvent, MicrophoneEventRecord,
-    MicrophoneIpcRequest, MicrophoneIpcResponse, microphone_socket_path, send_microphone_request,
+    microphone_socket_path, send_microphone_request, MicrophoneEvent, MicrophoneEventRecord,
+    MicrophoneIpcRequest, MicrophoneIpcResponse, MICROPHONE_SOCKET_ENV, MICROPHONE_SOCKET_NAME,
 };
 pub use notifications::{
-    NOTIFICATIONS_SOCKET_ENV, NOTIFICATIONS_SOCKET_NAME, NotificationIpcRequest,
-    NotificationIpcResponse, notifications_socket_path, send_notification_request,
-    serve_notification_ipc,
+    notifications_socket_path, send_notification_request, serve_notification_ipc,
+    NotificationIpcRequest, NotificationIpcResponse, NOTIFICATIONS_SOCKET_ENV,
+    NOTIFICATIONS_SOCKET_NAME,
 };
 pub use power::{
-    POWER_SOCKET_ENV, POWER_SOCKET_NAME, PowerIpcRequest, PowerIpcResponse, power_socket_path,
-    send_power_request, serve_power_ipc,
+    power_socket_path, send_power_request, serve_power_ipc, PowerIpcRequest, PowerIpcResponse,
+    POWER_SOCKET_ENV, POWER_SOCKET_NAME,
 };
 pub use settings::serve_settings_ipc;
 pub use speech::{
-    SPEECH_SOCKET_ENV, SPEECH_SOCKET_NAME, SpeechCommand, SpeechIpcRequest, SpeechIpcResponse,
-    SpeechPriority, send_speech_request, speech_socket_path,
+    send_speech_request, speech_socket_path, SpeechCommand, SpeechIpcRequest, SpeechIpcResponse,
+    SpeechPriority, SPEECH_SOCKET_ENV, SPEECH_SOCKET_NAME,
 };
 pub use updates::{
-    UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME, UpdateIpcRequest, UpdateIpcResponse,
-    send_update_request, serve_update_ipc, updates_socket_path,
+    send_update_request, serve_update_ipc, updates_socket_path, UpdateIpcRequest,
+    UpdateIpcResponse, UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME,
 };
 
 #[cfg(test)]

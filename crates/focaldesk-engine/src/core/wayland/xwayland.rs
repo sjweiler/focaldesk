@@ -1,6 +1,7 @@
 use std::os::fd::OwnedFd;
 
 use smithay::utils::{Logical, Rectangle};
+use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::selection::data_device::{
     clear_data_device_selection, current_data_device_selection_userdata,
     request_data_device_client_selection, set_data_device_selection,
@@ -9,7 +10,6 @@ use smithay::wayland::selection::primary_selection::{
     clear_primary_selection, current_primary_selection_userdata, request_primary_client_selection,
     set_primary_selection,
 };
-use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge as X11ResizeEdge, WmWindowProperty, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};

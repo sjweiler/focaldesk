@@ -1,14 +1,14 @@
 use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::UiAction;
-use focaldesk_ai::{AiPermissionRecord, list_ai_permission_records, revoke_ai_permission};
-use focaldesk_config::{FocalDeskConfig, load_config, save_config};
-use focaldesk_ipc::{PowerIpcRequest, PowerIpcResponse, send_power_request};
+use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use focaldesk_ipc::{send_power_request, PowerIpcRequest, PowerIpcResponse};
 use focaldesk_permissions::request::PermissionTarget;
 use focaldesk_permissions::{PermissionDecision, PermissionScope};
-use focaldesk_power::{LOW_BATTERY_THRESHOLD_PERCENT, PowerSnapshot};
+use focaldesk_power::{PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT};
 use focaldesk_settings_core::{
-    LidCloseAction, LowBatteryAction, PerformanceMode, PowerButtonAction, PowerSettings,
-    load_settings, save_settings,
+    load_settings, save_settings, LidCloseAction, LowBatteryAction, PerformanceMode,
+    PowerButtonAction, PowerSettings,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;

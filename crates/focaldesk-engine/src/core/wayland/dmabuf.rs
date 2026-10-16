@@ -1,5 +1,5 @@
-use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::drm_syncobj::{DrmSyncobjHandler, DrmSyncobjState};

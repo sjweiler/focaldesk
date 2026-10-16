@@ -1,7 +1,7 @@
-use crate::{IpcRequest, IpcResponse, settings_socket_path, transport};
+use crate::{settings_socket_path, transport, IpcRequest, IpcResponse};
 use focaldesk_settings_core::{
-    BrowserLaunchBackend, DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode,
-    PowerButtonAction, Settings, load_settings, save_settings,
+    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, LidCloseAction,
+    LowBatteryAction, PerformanceMode, PowerButtonAction, Settings,
 };
 use std::{
     io::Write,
@@ -92,6 +92,7 @@ fn handle_settings_client(stream: &mut UnixStream, settings: &Arc<Mutex<Settings
             | IpcRequest::SetHdrCalibrationPattern { .. }
             | IpcRequest::GetDisplayRuntimeStatus
             | IpcRequest::GetDesktopSnapshot
+            | IpcRequest::GetInputDevices
             | IpcRequest::GetThemeEditorStatus { .. }
             | IpcRequest::ThemeEditor { .. }
             | IpcRequest::Notify { .. }
@@ -147,6 +148,26 @@ fn apply_setting_value(
 
         "input.natural_scroll" => {
             settings.input.natural_scroll = value.as_bool().ok_or("natural_scroll must be bool")?;
+        }
+
+        "input.workspace_swipe_fingers" => {
+            let fingers = value
+                .as_u64()
+                .ok_or("workspace_swipe_fingers must be integer")? as u32;
+            if !matches!(fingers, 0 | 3 | 4) {
+                return Err("workspace_swipe_fingers must be 0, 3, or 4".to_string());
+            }
+            settings.input.workspace_swipe_fingers = fingers;
+        }
+
+        "input.workspace_swipe_distance" => {
+            let distance = value
+                .as_f64()
+                .ok_or("workspace_swipe_distance must be number")?;
+            if !distance.is_finite() {
+                return Err("workspace_swipe_distance must be finite".to_string());
+            }
+            settings.input.workspace_swipe_distance = distance.clamp(40.0, 400.0);
         }
 
         "input.keyboard_layout" => {

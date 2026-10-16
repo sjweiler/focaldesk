@@ -51,6 +51,7 @@ sudo dnf install \
   gtk4-devel \
   gtk4-layer-shell-devel \
   libadwaita-devel \
+  poppler-utils \
   xorg-x11-server-Xwayland
 ```
 
@@ -80,6 +81,7 @@ sudo apt install -y \
   libgbm-dev \
   libgtk-4-dev \
   libadwaita-1-dev \
+  poppler-utils \
   libpam0g-dev
 ```
 

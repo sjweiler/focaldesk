@@ -9,13 +9,13 @@ use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::types::{ElementId, UiElementKind};
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::gles::ffi;
 use smithay::backend::renderer::gles::GlesFrame;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::gles::GlesTexture;
-use smithay::backend::renderer::Color32F;
-use smithay::backend::renderer::Frame;
+use smithay::backend::renderer::gles::ffi;
 use smithay::backend::renderer::{ImportMem, Texture};
 use smithay::desktop::Window;
 use smithay::desktop::{PopupManager, Space};
@@ -35,7 +35,7 @@ use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use focaldesk_logging::{flog, flog_error, flog_info, session_id};
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_types::OutputId;
-use focaldesk_ui::atlas::{render_atlas_icon_with_alpha, IconId, IconState};
+use focaldesk_ui::atlas::{IconId, IconState, render_atlas_icon_with_alpha};
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -43,32 +43,32 @@ use smithay::backend::renderer::element::{Element, Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
-use crate::core::color::{srgb_to_linear, SurfaceColorRenderState};
+use crate::core::color::{SurfaceColorRenderState, srgb_to_linear};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
-    ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget,
+    ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget, WorkspaceRenderView,
 };
-use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
+use crate::core::fonts::style_for;
 use crate::core::fonts::{FontId, FontSystem, TextStyle};
-use crate::core::lock::{LockPulseKind, LockScreenSnapshot, LOCK_PULSE_DURATION};
+use crate::core::lock::{LOCK_PULSE_DURATION, LockPulseKind, LockScreenSnapshot};
 use crate::core::shell::ManagedWindow;
 use focaldesk_resources::RenderResources;
-use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::BackgroundTheme;
 use focaldesk_themes::FlowTheme;
 use focaldesk_themes::IconTheme;
 use focaldesk_themes::TextTheme;
 use focaldesk_themes::WallpaperTheme;
+use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_types::WorkspaceId;
 use focaldesk_ui::chrome_draw::draw_flow_field;
 use focaldesk_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use focaldesk_ui::chrome_shaders::ChromeShaders;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::dialog::{Dialog, DialogId};
-use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::dialog_layout::DialogLayout;
+use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::{UiVisualState, UiVisualStyle};
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
@@ -474,10 +474,10 @@ pub(crate) fn managed_window_is_visible_on_output(
 #[cfg(test)]
 mod color_run_tests {
     use super::{
-        clipped_dest_local_damage, contiguous_runs_by_key, preferred_output_index, semantic_color,
-        themed_icon_style, RenderState, UiVisualState,
+        RenderState, UiVisualState, clipped_dest_local_damage, contiguous_runs_by_key,
+        preferred_output_index, semantic_color, themed_icon_style,
     };
-    use focaldesk_themes::{theme_by_name, SemanticTheme, ThemeColor};
+    use focaldesk_themes::{SemanticTheme, ThemeColor, theme_by_name};
     use smithay::utils::{Logical, Physical, Rectangle};
 
     #[test]
@@ -3637,7 +3637,7 @@ impl RenderState {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
 
-        use crate::core::wallpaper::{compute_wallpaper_blits, RectI, SizeI, WallpaperMode};
+        use crate::core::wallpaper::{RectI, SizeI, WallpaperMode, compute_wallpaper_blits};
 
         let Some(tex) = self.wallpaper_texture.as_ref() else {
             return;
@@ -3762,7 +3762,7 @@ impl RenderState {
         if theme.fit != focaldesk_themes::ThemeWallpaperFit::Fill {
             return;
         }
-        use crate::core::wallpaper::{compute_wallpaper_blit, RectI, SizeI, WallpaperMode};
+        use crate::core::wallpaper::{RectI, SizeI, WallpaperMode, compute_wallpaper_blit};
         use smithay::backend::renderer::gles::Uniform;
 
         let Some(texture) = self.wallpaper_texture.as_ref() else {
@@ -3846,11 +3846,11 @@ impl RenderState {
     ///
     /// Must run while the GLES renderer is current (during an active `GlesFrame`), so dmabuf
     /// textures are imported at draw time rather than during Wayland dispatch.
-    pub fn build_client_elements_for_output(
+    pub(crate) fn build_client_elements_for_output(
         &mut self,
         space: &Space<Window>,
         windows: &[ManagedWindow],
-        active_workspace: WorkspaceId,
+        workspace_views: &[WorkspaceRenderView],
         output: &Output,
         layers_on: Option<&Output>,
         renderer: &mut GlesRenderer,
@@ -3866,84 +3866,88 @@ impl RenderState {
         let scale = output.current_scale().fractional_scale();
         let mut out = Vec::new();
 
-        let on_workspace: std::collections::HashSet<_> = windows
-            .iter()
-            .filter(|mw| managed_window_is_visible_on_output(space, mw, active_workspace, output))
-            .map(|mw| &mw.window)
-            .collect();
+        for view in workspace_views {
+            let on_workspace: std::collections::HashSet<_> = windows
+                .iter()
+                .filter(|mw| managed_window_is_visible_on_output(space, mw, view.workspace, output))
+                .map(|mw| &mw.window)
+                .collect();
 
-        // `Space::elements()` is back-to-front. `draw_render_elements` expects
-        // front-to-back input so opaque-region culling cannot hide top windows
-        // behind older mapped windows.
-        for window in space.elements().rev() {
-            if !on_workspace.contains(window) {
-                continue;
-            }
+            // `Space::elements()` is back-to-front. `draw_render_elements` expects
+            // front-to-back input so opaque-region culling cannot hide top windows
+            // behind older mapped windows.
+            for window in space.elements().rev() {
+                if !on_workspace.contains(window) {
+                    continue;
+                }
 
-            let popup_bbox = space.element_location(window).map(|element_loc| {
-                let mut bbox = window.bbox_with_popups();
-                bbox.loc += element_loc - window.geometry().loc;
-                bbox
-            });
-            let bbox = match (space.element_bbox(window), popup_bbox) {
-                (Some(space_bbox), Some(popup_bbox)) => space_bbox.merge(popup_bbox),
-                (Some(space_bbox), None) => space_bbox,
-                (None, Some(popup_bbox)) => popup_bbox,
-                (None, None) => continue,
-            };
-            if !region.overlaps(bbox) {
-                continue;
-            }
+                let popup_bbox = space.element_location(window).map(|element_loc| {
+                    let mut bbox = window.bbox_with_popups();
+                    bbox.loc += element_loc - window.geometry().loc;
+                    bbox
+                });
+                let mut bbox = match (space.element_bbox(window), popup_bbox) {
+                    (Some(space_bbox), Some(popup_bbox)) => space_bbox.merge(popup_bbox),
+                    (Some(space_bbox), None) => space_bbox,
+                    (None, Some(popup_bbox)) => popup_bbox,
+                    (None, None) => continue,
+                };
+                bbox.loc.x += view.offset_x;
+                if !region.overlaps(bbox) {
+                    continue;
+                }
 
-            window.on_commit();
+                window.on_commit();
 
-            let render_loc = space
-                .element_location(window)
-                .map(|element_loc| {
-                    let geo = window.geometry();
-                    Point::<i32, Logical>::from((
-                        element_loc.x - geo.loc.x,
-                        element_loc.y - geo.loc.y,
-                    ))
-                })
-                .unwrap_or(Point::from((0, 0)));
+                let mut render_loc = space
+                    .element_location(window)
+                    .map(|element_loc| {
+                        let geo = window.geometry();
+                        Point::<i32, Logical>::from((
+                            element_loc.x - geo.loc.x,
+                            element_loc.y - geo.loc.y,
+                        ))
+                    })
+                    .unwrap_or(Point::from((0, 0)));
+                render_loc.x += view.offset_x;
 
-            let location = render_loc - region.loc;
-            let render_pos = location.to_physical_precise_round(scale);
+                let location = render_loc - region.loc;
+                let render_pos = location.to_physical_precise_round(scale);
 
-            // Render the window surface tree here, but keep xdg popups out of this pass.
-            // Popups are composited separately below so they can sit above the compositor chrome
-            // without being drawn twice.
-            let Some(surface) = window.wl_surface() else {
-                continue;
-            };
-            let elems = render_elements_from_surface_tree::<_, FlowRenderElement>(
-                renderer,
-                &surface,
-                render_pos,
-                Scale::from(scale),
-                1.0,
-                Kind::Unspecified,
-            );
+                // Render the window surface tree here, but keep xdg popups out of this pass.
+                // Popups are composited separately below so they can sit above the compositor chrome
+                // without being drawn twice.
+                let Some(surface) = window.wl_surface() else {
+                    continue;
+                };
+                let elems = render_elements_from_surface_tree::<_, FlowRenderElement>(
+                    renderer,
+                    &surface,
+                    render_pos,
+                    Scale::from(scale),
+                    1.0,
+                    Kind::Unspecified,
+                );
 
-            #[cfg(feature = "xwayland")]
-            if window.x11_surface().is_some() {
-                if let Some(managed) = windows.iter().find(|mw| &mw.window == window) {
-                    let seq = XWAYLAND_RENDER_LOGS.fetch_add(1, Ordering::Relaxed);
-                    if seq < 300 {
-                        flog(&format!(
-                            "XWayland render id={:?} title={:?} region={:?} render_pos={:?} elems={}",
-                            managed.id,
-                            managed.title(),
-                            region,
-                            render_pos,
-                            elems.len()
-                        ));
+                #[cfg(feature = "xwayland")]
+                if window.x11_surface().is_some() {
+                    if let Some(managed) = windows.iter().find(|mw| &mw.window == window) {
+                        let seq = XWAYLAND_RENDER_LOGS.fetch_add(1, Ordering::Relaxed);
+                        if seq < 300 {
+                            flog(&format!(
+                                "XWayland render id={:?} title={:?} region={:?} render_pos={:?} elems={}",
+                                managed.id,
+                                managed.title(),
+                                region,
+                                render_pos,
+                                elems.len()
+                            ));
+                        }
                     }
                 }
-            }
 
-            out.extend(elems);
+                out.extend(elems);
+            }
         }
 
         if let Some(out_handle) = layers_on {
@@ -3964,11 +3968,11 @@ impl RenderState {
     /// `Window::render_elements` includes popups in the client layer, but FocalDesk draws shell
     /// chrome after that layer. Menus need a second top pass so browser/app popups are not covered
     /// by compositor trim and icons.
-    pub fn build_popup_elements_for_output(
+    pub(crate) fn build_popup_elements_for_output(
         &mut self,
         space: &Space<Window>,
         windows: &[ManagedWindow],
-        active_workspace: WorkspaceId,
+        workspace_views: &[WorkspaceRenderView],
         output: &Output,
         renderer: &mut GlesRenderer,
     ) -> Vec<FlowRenderElement> {
@@ -3979,47 +3983,50 @@ impl RenderState {
         let scale = output.current_scale().fractional_scale();
         let mut out = Vec::new();
 
-        let on_workspace: std::collections::HashSet<_> = windows
-            .iter()
-            .filter(|mw| managed_window_is_visible_on_output(space, mw, active_workspace, output))
-            .map(|mw| &mw.window)
-            .collect();
+        for view in workspace_views {
+            let on_workspace: std::collections::HashSet<_> = windows
+                .iter()
+                .filter(|mw| managed_window_is_visible_on_output(space, mw, view.workspace, output))
+                .map(|mw| &mw.window)
+                .collect();
 
-        for window in space.elements().rev() {
-            if !on_workspace.contains(window) {
-                continue;
-            }
-
-            let Some(window_loc) = space.element_location(window) else {
-                continue;
-            };
-            let Some(surface) = window.wl_surface() else {
-                continue;
-            };
-
-            for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
-                let geo = window.geometry();
-
-                let popup_loc = window_loc - geo.loc + popup_offset - popup.geometry().loc;
-
-                let mut popup_bbox = popup.geometry();
-                popup_bbox.loc += popup_loc;
-
-                if !region.overlaps(popup_bbox) {
+            for window in space.elements().rev() {
+                if !on_workspace.contains(window) {
                     continue;
                 }
 
-                let output_loc = popup_loc - region.loc;
-                let render_pos = output_loc.to_physical_precise_round(scale);
+                let Some(window_loc) = space.element_location(window) else {
+                    continue;
+                };
+                let Some(surface) = window.wl_surface() else {
+                    continue;
+                };
 
-                out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
-                    renderer,
-                    popup.wl_surface(),
-                    render_pos,
-                    Scale::from(scale),
-                    1.0,
-                    Kind::Unspecified,
-                ));
+                for (popup, popup_offset) in PopupManager::popups_for_surface(&surface) {
+                    let geo = window.geometry();
+
+                    let popup_loc = window_loc - geo.loc + popup_offset - popup.geometry().loc;
+
+                    let mut popup_bbox = popup.geometry();
+                    popup_bbox.loc += popup_loc;
+                    popup_bbox.loc.x += view.offset_x;
+
+                    if !region.overlaps(popup_bbox) {
+                        continue;
+                    }
+
+                    let output_loc = popup_loc - region.loc + Point::from((view.offset_x, 0));
+                    let render_pos = output_loc.to_physical_precise_round(scale);
+
+                    out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
+                        renderer,
+                        popup.wl_surface(),
+                        render_pos,
+                        Scale::from(scale),
+                        1.0,
+                        Kind::Unspecified,
+                    ));
+                }
             }
         }
 

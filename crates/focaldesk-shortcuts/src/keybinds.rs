@@ -204,6 +204,44 @@ impl Keybinds {
             KeyAction::ToggleVoiceCapture,
         );
 
+        for (mods, sym) in [
+            (ModMask::SUPER, keysyms::KEY_equal),
+            (ModMask::SUPER | ModMask::SHIFT, keysyms::KEY_plus),
+            (ModMask::SUPER, keysyms::KEY_KP_Add),
+        ] {
+            self.map.insert(
+                KeyCombo {
+                    mods,
+                    sym: KeySymbol::from_raw(sym),
+                },
+                KeyAction::MagnifierZoomIn,
+            );
+        }
+        for sym in [keysyms::KEY_minus, keysyms::KEY_KP_Subtract] {
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SUPER,
+                    sym: KeySymbol::from_raw(sym),
+                },
+                KeyAction::MagnifierZoomOut,
+            );
+        }
+
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER | ModMask::SHIFT,
+                sym: KeySymbol::from_raw(keysyms::KEY_N),
+            },
+            KeyAction::ToggleNightLight,
+        );
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::SUPER | ModMask::SHIFT,
+                sym: KeySymbol::from_raw(keysyms::KEY_C),
+            },
+            KeyAction::CycleColorFilter,
+        );
+
         self.map.insert(
             KeyCombo {
                 mods: ModMask::SUPER | ModMask::SHIFT,
@@ -224,6 +262,20 @@ impl Keybinds {
             KeyCombo {
                 mods: ModMask::SUPER,
                 sym: KeySymbol::from_raw(keysyms::KEY_F7),
+            },
+            KeyAction::FocusPrev,
+        );
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::ALT,
+                sym: KeySymbol::from_raw(keysyms::KEY_Tab),
+            },
+            KeyAction::FocusNext,
+        );
+        self.map.insert(
+            KeyCombo {
+                mods: ModMask::ALT | ModMask::SHIFT,
+                sym: KeySymbol::from_raw(keysyms::KEY_Tab),
             },
             KeyAction::FocusPrev,
         );
@@ -616,6 +668,10 @@ fn action_from_name(name: &str) -> Option<KeyAction> {
         "launch_files" => KeyAction::LaunchFiles,
         "toggle_clipboard_history" => KeyAction::ToggleClipboardHistory,
         "toggle_voice_capture" => KeyAction::ToggleVoiceCapture,
+        "magnifier_zoom_in" => KeyAction::MagnifierZoomIn,
+        "magnifier_zoom_out" => KeyAction::MagnifierZoomOut,
+        "toggle_night_light" => KeyAction::ToggleNightLight,
+        "cycle_color_filter" => KeyAction::CycleColorFilter,
         "split_left" => KeyAction::SplitLeft,
         "split_right" => KeyAction::SplitRight,
         "split_top" => KeyAction::SplitTop,
@@ -766,6 +822,14 @@ mod tests {
         assert_eq!(
             keybinds.resolve(key(keysyms::KEY_F8), ModMask::SUPER),
             Some(KeyAction::FocusNext)
+        );
+        assert_eq!(
+            keybinds.resolve(key(keysyms::KEY_equal), ModMask::SUPER),
+            Some(KeyAction::MagnifierZoomIn)
+        );
+        assert_eq!(
+            keybinds.resolve(key(keysyms::KEY_minus), ModMask::SUPER),
+            Some(KeyAction::MagnifierZoomOut)
         );
     }
 

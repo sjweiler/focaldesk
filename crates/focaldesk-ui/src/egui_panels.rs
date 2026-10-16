@@ -2,8 +2,8 @@ use crate::desktop_frame::DesktopFrameCtx;
 use crate::types::{SettingKey, SplitLayoutPreset, SystemCommand, UiAction};
 use chrono::{Datelike, Local, NaiveDate};
 use focaldesk_ipc::{
-    NotificationIpcRequest, NotificationIpcResponse, UpdateIpcRequest, UpdateIpcResponse,
-    send_notification_request, send_update_request,
+    send_notification_request, send_update_request, NotificationIpcRequest,
+    NotificationIpcResponse, UpdateIpcRequest, UpdateIpcResponse,
 };
 use focaldesk_types::WindowId;
 use focaldesk_updates::UpdateSnapshot;
@@ -137,18 +137,70 @@ impl EguiPanelView for NotificationHistoryPanel {
                 if self.entries.is_empty() {
                     ui.label("No notifications");
                 } else {
+                    let mut applications = Vec::new();
                     for entry in &self.entries {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.strong(&entry.title);
-                                if ui.small_button("Dismiss").clicked() {
-                                    let _ = send_notification_request(
-                                        &NotificationIpcRequest::Dismiss { id: entry.id },
-                                    );
+                        let application = if entry.app_name.trim().is_empty() {
+                            "System"
+                        } else {
+                            entry.app_name.as_str()
+                        };
+                        if !applications.contains(&application) {
+                            applications.push(application);
+                        }
+                    }
+                    for application in applications {
+                        ui.horizontal(|ui| {
+                            ui.strong(application);
+                            if let Some(icon) = self
+                                .entries
+                                .iter()
+                                .find(|entry| entry.app_name == application)
+                                .and_then(|entry| entry.app_icon.as_deref())
+                            {
+                                ui.small("●")
+                                    .on_hover_text(format!("Application icon: {icon}"));
+                            }
+                        });
+                        for entry in self.entries.iter().filter(|entry| {
+                            let entry_application = if entry.app_name.trim().is_empty() {
+                                "System"
+                            } else {
+                                entry.app_name.as_str()
+                            };
+                            entry_application == application
+                        }) {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.strong(&entry.title);
+                                    if entry.urgency
+                                        == focaldesk_notifications::NotificationUrgency::Critical
+                                    {
+                                        ui.colored_label(egui::Color32::LIGHT_RED, "Critical");
+                                    }
+                                    if ui.small_button("Dismiss").clicked() {
+                                        let _ = send_notification_request(
+                                            &NotificationIpcRequest::Dismiss { id: entry.id },
+                                        );
+                                    }
+                                });
+                                ui.label(&entry.body);
+                                if !entry.actions.is_empty() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        for action in &entry.actions {
+                                            if ui.small_button(&action.label).clicked() {
+                                                let _ = send_notification_request(
+                                                    &NotificationIpcRequest::InvokeAction {
+                                                        id: entry.id,
+                                                        action_key: action.key.clone(),
+                                                    },
+                                                );
+                                            }
+                                        }
+                                    });
                                 }
                             });
-                            ui.label(&entry.body);
-                        });
+                        }
+                        ui.add_space(4.0);
                     }
                 }
             });
@@ -391,6 +443,7 @@ pub struct WorkspaceEntryView {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceWindowPreview {
+    pub id: WindowId,
     pub title: String,
     pub x: f32,
     pub y: f32,
@@ -402,6 +455,7 @@ pub struct WorkspaceWindowPreview {
 pub struct WorkspacesPanel {
     pub open: bool,
     pub entries: Vec<WorkspaceEntryView>,
+    dragging_window: Option<WindowId>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -1052,6 +1106,8 @@ impl WorkspacesPanel {
 
         let mut open = self.open;
         let mut selected = None;
+        let mut move_request = None;
+        let pointer_released = ctx.input(|input| input.pointer.any_released());
         egui::Window::new("Workspaces")
             .fade_in(false)
             .collapsible(false)
@@ -1116,6 +1172,14 @@ impl WorkspacesPanel {
                             egui::Color32::from_rgb(76, 82, 116)
                         };
                         ui.painter().rect_filled(window_rect, 2.0, color);
+                        let window_response = ui.interact(
+                            window_rect,
+                            egui::Id::new(("workspace-window", window.id.0)),
+                            egui::Sense::drag(),
+                        );
+                        if window_response.drag_started() {
+                            self.dragging_window = Some(window.id);
+                        }
                     }
                     ui.painter().text(
                         rect.min + egui::vec2(12.0, 8.0),
@@ -1130,7 +1194,11 @@ impl WorkspacesPanel {
                         windows => format!("{} windows", windows.len()),
                     };
                     response.clone().on_hover_text(window_summary);
-                    if response.clicked() {
+                    if pointer_released && response.hovered() {
+                        if let Some(window_id) = self.dragging_window {
+                            move_request = Some((window_id, entry.number));
+                        }
+                    } else if response.clicked() && self.dragging_window.is_none() {
                         selected = Some(entry.number);
                     }
                     ui.add_space(6.0);
@@ -1140,6 +1208,12 @@ impl WorkspacesPanel {
         if let Some(workspace) = selected {
             actions.push(UiAction::FocusWorkspace(workspace));
             open = false;
+        }
+        if let Some((window_id, workspace)) = move_request {
+            actions.push(UiAction::MoveWindowToWorkspace(window_id, workspace));
+        }
+        if pointer_released {
+            self.dragging_window = None;
         }
         self.open = open;
     }
@@ -1701,7 +1775,7 @@ impl EguiPanelView for DebugPanel {
 
 #[cfg(test)]
 mod split_keyboard_tests {
-    use super::{SplitLayoutAvailability, move_selection, split_available_presets};
+    use super::{move_selection, split_available_presets, SplitLayoutAvailability};
     use crate::types::SplitLayoutPreset;
 
     #[test]

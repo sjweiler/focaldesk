@@ -325,11 +325,15 @@ mod tests {
             ),
             InternalChromeVisibility::hidden()
         );
-        assert!(no_shell
-            .internal_chrome_with_startup_policy(NATIVE_CHROME_STARTUP_GRACE, true)
-            .any());
-        assert!(no_shell
-            .internal_chrome_with_startup_policy(Duration::ZERO, false)
-            .any());
+        assert!(
+            no_shell
+                .internal_chrome_with_startup_policy(NATIVE_CHROME_STARTUP_GRACE, true)
+                .any()
+        );
+        assert!(
+            no_shell
+                .internal_chrome_with_startup_policy(Duration::ZERO, false)
+                .any()
+        );
     }
 }

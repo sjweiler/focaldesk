@@ -12,7 +12,7 @@ use std::thread;
 use std::time::Duration;
 
 use focaldesk_remote_protocol::{
-    send_fd, write_message, DamageRect, Event, OutputTransform, PixelFormat, Request,
+    DamageRect, Event, OutputTransform, PixelFormat, Request, send_fd, write_message,
 };
 use focaldesk_types::OutputId;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -402,18 +402,21 @@ fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
         let reader_commands = commands.clone();
         let _ = thread::Builder::new()
             .name("focaldesk-remote-reader".into())
-            .spawn(move || loop {
-                match focaldesk_remote_protocol::read_message::<Request>(&reader) {
-                    Ok(Request::StopCapture {
-                        session_id: requested,
-                    }) if requested == session_id => {
-                        let _ = reader_commands.send(RemoteCommand::Stop { session_id });
-                        return;
-                    }
-                    Ok(_) => continue,
-                    Err(_) => {
-                        let _ = reader_commands.send(RemoteCommand::Disconnected { session_id });
-                        return;
+            .spawn(move || {
+                loop {
+                    match focaldesk_remote_protocol::read_message::<Request>(&reader) {
+                        Ok(Request::StopCapture {
+                            session_id: requested,
+                        }) if requested == session_id => {
+                            let _ = reader_commands.send(RemoteCommand::Stop { session_id });
+                            return;
+                        }
+                        Ok(_) => continue,
+                        Err(_) => {
+                            let _ =
+                                reader_commands.send(RemoteCommand::Disconnected { session_id });
+                            return;
+                        }
                     }
                 }
             });

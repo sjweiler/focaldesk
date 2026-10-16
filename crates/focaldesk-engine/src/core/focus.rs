@@ -3,6 +3,7 @@
 
 use smithay::backend::input::KeyState;
 use smithay::desktop::{PopupKind, Window};
+use smithay::input::Seat;
 use smithay::input::dnd::{DndFocus, OfferData, Source};
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
 use smithay::input::pointer::{
@@ -10,7 +11,6 @@ use smithay::input::pointer::{
     GesturePinchEndEvent, GesturePinchUpdateEvent, GestureSwipeBeginEvent, GestureSwipeEndEvent,
     GestureSwipeUpdateEvent, MotionEvent, PointerTarget, RelativeMotionEvent,
 };
-use smithay::input::Seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Serial};
 use smithay::wayland::seat::WaylandFocus;

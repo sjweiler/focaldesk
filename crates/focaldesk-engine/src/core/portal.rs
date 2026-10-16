@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 
 use focaldesk_logging::flog;
 use focaldesk_types::OutputId;
-use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer as AllocatorBuffer;
 use smithay::backend::allocator::Fourcc;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::gles::{GlesRenderer, GlesTexProgram, GlesTexture, Uniform};
 use smithay::backend::renderer::{Bind, ExportMem, ImportMem, Offscreen, Renderer};
 use smithay::desktop::layer_map_for_output;
@@ -20,15 +20,15 @@ use smithay::utils::{Buffer, IsAlive, Physical, Point, Rectangle, Size, Transfor
 use smithay::wayland::image_copy_capture::{CaptureFailureReason, Frame};
 use smithay::wayland::shm::{with_buffer_contents, with_buffer_contents_mut};
 
+use crate::core::OutputState;
 use crate::core::capture::{CaptureConsumerId, CaptureGeometry};
 use crate::core::desktop::DesktopState;
 use crate::core::linear_compositing::{
-    render_output_offscreen, select_hdr_offscreen_format, supports_linear_sdr,
-    LinearOffscreenTargets,
+    LinearOffscreenTargets, render_output_offscreen, select_hdr_offscreen_format,
+    supports_linear_sdr,
 };
 use crate::core::scene::SceneState;
 use crate::core::ui_state::UiState;
-use crate::core::OutputState;
 use smithay::backend::renderer::Frame as RendererFrame;
 use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::image_capture_source::ImageCaptureSource;

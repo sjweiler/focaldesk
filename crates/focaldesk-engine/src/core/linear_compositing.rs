@@ -2,29 +2,29 @@
 //! and HDR PQ scanout (C3b: scRGB working space, 10-bit PQ offscreen).
 
 use crate::core::backend_render::{
-    build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
-    prepare_output, PreparedOutput,
+    PreparedOutput, build_output_client_elements, build_output_popup_elements, draw_output,
+    draw_output_stage, prepare_output,
 };
 use crate::core::color::{
-    hdr10_pq_encode_transforms, hdr_render_runtime_enabled, kms_scanout_encode_description,
-    linear_sdr_runtime_enabled, output_encode_scanout_needed, scene_to_output_matrix,
-    ColorPrimaries, RenderingIntent,
+    ColorPrimaries, RenderingIntent, hdr_render_runtime_enabled, hdr10_pq_encode_transforms,
+    kms_scanout_encode_description, linear_sdr_runtime_enabled, output_encode_scanout_needed,
+    scene_to_output_matrix,
 };
 use crate::core::desktop::DesktopState;
 use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::render::{
-    work_area_glass_style, ChromeGlassPass, ClientCompositingMode, FlowRenderElement, GlassStyle,
-    OutputRenderStage,
+    ChromeGlassPass, ClientCompositingMode, FlowRenderElement, GlassStyle, OutputRenderStage,
+    work_area_glass_style,
 };
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::gles::{
-    ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
+    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, ffi,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Offscreen, Renderer, Texture};
@@ -329,7 +329,7 @@ fn resolve_hdr_encode_state(
 }
 
 fn wallpaper_grade_parameters(output: &crate::core::desktop::OutputState) -> (f32, f32, f32) {
-    use crate::core::color::{primaries_wider_than, ColorPrimaries};
+    use crate::core::color::{ColorPrimaries, primaries_wider_than};
 
     let selected = crate::core::color::hdr_output_selected(&output.handle.name());
     let test_encode = selected
@@ -413,6 +413,7 @@ pub fn apply_output_encode(
                     state,
                     renderer,
                     targets,
+                    output_id,
                     buffer_size,
                     appearance.peak_nits,
                     appearance.full_frame_peak_nits,
@@ -475,7 +476,10 @@ pub fn apply_output_encode(
         .outputs
         .get(&output_id)
         .and_then(|output| output.output_icc_lut.clone());
-    if !output_encode_scanout_needed(output_encode, lut_owned.as_ref()) {
+    let display_comfort_active = state.outputs.get(&output_id).is_some_and(|output| {
+        crate::core::display_comfort::active(&state.accessibility_settings, &output.handle.name())
+    });
+    if !display_comfort_active && !output_encode_scanout_needed(output_encode, lut_owned.as_ref()) {
         return Ok(None);
     }
 
@@ -525,6 +529,18 @@ pub fn apply_output_encode(
         output_encode,
         &parametric_shader,
     )
+}
+
+fn output_accessibility_matrix(
+    state: &DesktopState,
+    output_id: OutputId,
+) -> crate::core::display_comfort::ColorMatrix {
+    let connector = state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.handle.name())
+        .unwrap_or_default();
+    crate::core::display_comfort::output_matrix(&state.accessibility_settings, &connector)
 }
 
 fn disable_output_icc_lut(state: &mut DesktopState, output_id: OutputId, reason: &str) {
@@ -593,6 +609,7 @@ fn hdr_pq_shader_uniforms(
     midtone_gamma: f32,
     calibration_pattern: f32,
     tone_mapper: f32,
+    accessibility: crate::core::display_comfort::ColorMatrix,
 ) -> Vec<Uniform<'static>> {
     let (scene_to_panel, panel_to_bt2020, luma) = hdr10_pq_encode_transforms(panel);
     vec![
@@ -612,6 +629,9 @@ fn hdr_pq_shader_uniforms(
         Uniform::new("u_p1", panel_to_bt2020[1]),
         Uniform::new("u_p2", panel_to_bt2020[2]),
         Uniform::new("u_panel_luma", luma),
+        Uniform::new("u_a0", accessibility[0]),
+        Uniform::new("u_a1", accessibility[1]),
+        Uniform::new("u_a2", accessibility[2]),
     ]
 }
 
@@ -648,6 +668,7 @@ fn apply_hdr_pq_encode(
     state: &DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     max_nits: f32,
     full_frame_nits: f32,
@@ -730,6 +751,7 @@ fn apply_hdr_pq_encode(
             midtone_gamma,
             calibration_pattern,
             tone_mapper,
+            output_accessibility_matrix(state, output_id),
         ),
         "linear-scRGB-to-PQ",
         &damage,
@@ -752,6 +774,7 @@ fn apply_output_encode_lut(
     destination_current: bool,
     source_is_lut_intermediate: bool,
 ) -> Result<Option<SyncPoint>> {
+    let accessibility = output_accessibility_matrix(state, output_id);
     let lut_texture = state
         .render
         .ensure_output_icc_lut_texture(renderer, output_id, lut)
@@ -788,6 +811,9 @@ fn apply_output_encode_lut(
     let uniforms = vec![
         Uniform::new("u_lut_tex", 1i32),
         Uniform::new("u_grid", grid),
+        Uniform::new("u_a0", accessibility[0]),
+        Uniform::new("u_a1", accessibility[1]),
+        Uniform::new("u_a2", accessibility[2]),
     ];
 
     let mut target = renderer
@@ -848,10 +874,10 @@ fn apply_output_encode_lut(
 }
 
 fn apply_output_encode_parametric(
-    _state: &DesktopState,
+    state: &DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
-    _output_id: OutputId,
+    output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     output_encode: crate::core::color::ColorDescription,
     shader: &GlesTexProgram,
@@ -871,6 +897,7 @@ fn apply_output_encode_parametric(
     use smithay::backend::renderer::gles::Uniform;
 
     let scene_to_output = scene_to_output_matrix(output_encode, RenderingIntent::Relative);
+    let accessibility = output_accessibility_matrix(state, output_id);
     let encode_tf = output_encode.transfer.encode_mode() as u32 as f32;
     let uniforms = vec![
         Uniform::new("u_encode_tf", encode_tf),
@@ -898,6 +925,9 @@ fn apply_output_encode_parametric(
                 scene_to_output[2][2],
             ],
         ),
+        Uniform::new("u_a0", accessibility[0]),
+        Uniform::new("u_a1", accessibility[1]),
+        Uniform::new("u_a2", accessibility[2]),
     ];
 
     let mut target = renderer
@@ -934,6 +964,8 @@ fn apply_output_encode_parametric(
 }
 
 fn apply_linear_output_encode_parametric(
+    state: &DesktopState,
+    output_id: OutputId,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
     buffer_size: Size<i32, Physical>,
@@ -973,6 +1005,7 @@ fn apply_linear_output_encode_parametric(
     }
 
     let scene_to_output = scene_to_output_matrix(output_encode, RenderingIntent::Relative);
+    let accessibility = output_accessibility_matrix(state, output_id);
     let encode_tf = output_encode.transfer.encode_mode() as u32 as f32;
     let uniforms = vec![
         Uniform::new("u_encode_tf", encode_tf),
@@ -1000,6 +1033,9 @@ fn apply_linear_output_encode_parametric(
                 scene_to_output[2][2],
             ],
         ),
+        Uniform::new("u_a0", accessibility[0]),
+        Uniform::new("u_a1", accessibility[1]),
+        Uniform::new("u_a2", accessibility[2]),
     ];
 
     let destination = if intermediate_for_lut {
@@ -1033,6 +1069,7 @@ fn apply_linear_hdr_pq_encode(
     state: &DesktopState,
     renderer: &mut GlesRenderer,
     targets: &mut LinearOffscreenTargets,
+    output_id: OutputId,
     buffer_size: Size<i32, Physical>,
     max_nits: f32,
     full_frame_nits: f32,
@@ -1075,6 +1112,7 @@ fn apply_linear_hdr_pq_encode(
         midtone_gamma,
         calibration_pattern,
         tone_mapper,
+        output_accessibility_matrix(state, output_id),
     );
     let destination = &mut targets
         .hdr_offscreen
@@ -1154,6 +1192,7 @@ fn apply_linear_output_encode(
                     state,
                     renderer,
                     targets,
+                    output_id,
                     buffer_size,
                     appearance.peak_nits,
                     appearance.full_frame_peak_nits,
@@ -1211,6 +1250,8 @@ fn apply_linear_output_encode(
     let use_lut = lut_owned.is_some() && icc_lut_shader_enabled() && lut_shader.is_some();
 
     let mut sync = apply_linear_output_encode_parametric(
+        state,
+        output_id,
         renderer,
         targets,
         buffer_size,
@@ -1243,6 +1284,8 @@ fn apply_linear_output_encode(
                     );
                     disable_output_icc_lut(state, output_id, "linear-scene ICC LUT encode failed");
                     sync = apply_linear_output_encode_parametric(
+                        state,
+                        output_id,
                         renderer,
                         targets,
                         buffer_size,
@@ -2057,11 +2100,8 @@ pub fn present_offscreen_texture(
     frame: &mut smithay::backend::renderer::gles::GlesFrame<'_, '_>,
     texture: &GlesTexture,
     buffer_size: Size<i32, Physical>,
+    src_rect: Rectangle<f64, Buffer>,
 ) -> Result<(), GlesError> {
-    let src_rect = smithay::utils::Rectangle::<f64, Buffer>::from_loc_and_size(
-        (0.0, 0.0),
-        (buffer_size.w as f64, buffer_size.h as f64),
-    );
     let dst_rect =
         smithay::utils::Rectangle::<i32, Physical>::from_loc_and_size((0, 0), buffer_size);
     let damage = [dst_rect];
@@ -2103,11 +2143,11 @@ mod tests {
             0.0,
         );
         assert_eq!(pixels.len(), 8 * 6 * 4);
-        assert!(pixels
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|pixel| { pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3] }));
+        assert!(
+            pixels.as_chunks::<4>().0.iter().all(|pixel| {
+                pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3]
+            })
+        );
     }
 
     #[test]

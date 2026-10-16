@@ -506,6 +506,9 @@ impl ChromeShaders {
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
+                    UniformName::new("u_a0", UniformType::_3f),
+                    UniformName::new("u_a1", UniformType::_3f),
+                    UniformName::new("u_a2", UniformType::_3f),
                 ],
             )?);
         }
@@ -533,6 +536,9 @@ impl ChromeShaders {
                     UniformName::new("u_m0", UniformType::_3f),
                     UniformName::new("u_m1", UniformType::_3f),
                     UniformName::new("u_m2", UniformType::_3f),
+                    UniformName::new("u_a0", UniformType::_3f),
+                    UniformName::new("u_a1", UniformType::_3f),
+                    UniformName::new("u_a2", UniformType::_3f),
                 ],
             )?);
         }
@@ -543,6 +549,9 @@ impl ChromeShaders {
                 &[
                     UniformName::new("u_lut_tex", UniformType::_1i),
                     UniformName::new("u_grid", UniformType::_1f),
+                    UniformName::new("u_a0", UniformType::_3f),
+                    UniformName::new("u_a1", UniformType::_3f),
+                    UniformName::new("u_a2", UniformType::_3f),
                 ],
             ) {
                 Ok(program) => {
@@ -585,6 +594,9 @@ impl ChromeShaders {
                     UniformName::new("u_p1", UniformType::_3f),
                     UniformName::new("u_p2", UniformType::_3f),
                     UniformName::new("u_panel_luma", UniformType::_3f),
+                    UniformName::new("u_a0", UniformType::_3f),
+                    UniformName::new("u_a1", UniformType::_3f),
+                    UniformName::new("u_a2", UniformType::_3f),
                 ],
             )?);
         }
@@ -1598,6 +1610,10 @@ vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
 }
 
+vec3 accessibility_color(vec3 v) {
+    return clamp(vec3(dot(u_a0, v), dot(u_a1, v), dot(u_a2, v)), 0.0, 1.0);
+}
+
 void main() {
     vec4 src = texture2D(tex, v_coords);
 #if defined(NO_ALPHA)
@@ -1682,6 +1698,9 @@ uniform float u_encode_tf;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
+uniform vec3 u_a0;
+uniform vec3 u_a1;
+uniform vec3 u_a2;
 
 vec3 linear_to_srgb(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.0031308));
@@ -1696,6 +1715,10 @@ vec3 linear_to_gamma22(vec3 c) {
 
 vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
+}
+
+vec3 accessibility_color(vec3 v) {
+    return clamp(vec3(dot(u_a0, v), dot(u_a1, v), dot(u_a2, v)), 0.0, 1.0);
 }
 
 vec3 encode_color(vec3 c) {
@@ -1719,7 +1742,7 @@ void main() {
     // the large black triangle on NVIDIA).  The base pass guarantees opaque
     // coverage, but keep the zero-alpha fallback deterministic as well.
     vec3 straight = src.a > 0.0001 ? src.rgb / src.a : src.rgb;
-    vec3 encoded = encode_color(mul_mat3(straight));
+    vec3 encoded = accessibility_color(encode_color(mul_mat3(straight)));
     gl_FragColor = vec4(encoded, 1.0) * alpha;
 }
 "#;
@@ -1857,6 +1880,9 @@ uniform float u_encode_tf;
 uniform vec3 u_m0;
 uniform vec3 u_m1;
 uniform vec3 u_m2;
+uniform vec3 u_a0;
+uniform vec3 u_a1;
+uniform vec3 u_a2;
 
 vec3 srgb_to_linear(vec3 c) {
     bvec3 cutoff = lessThanEqual(c, vec3(0.04045));
@@ -1880,6 +1906,10 @@ vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
 }
 
+vec3 accessibility_color(vec3 v) {
+    return clamp(vec3(dot(u_a0, v), dot(u_a1, v), dot(u_a2, v)), 0.0, 1.0);
+}
+
 vec3 encode_color(vec3 c) {
     if (u_encode_tf < 0.5) {
         return linear_to_srgb(c);
@@ -1896,7 +1926,7 @@ void main() {
     src.a = 1.0;
 #endif
     vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
-    vec3 encoded = encode_color(mul_mat3(srgb_to_linear(straight)));
+    vec3 encoded = accessibility_color(encode_color(mul_mat3(srgb_to_linear(straight))));
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;
@@ -1922,6 +1952,9 @@ varying vec2 v_coords;
 uniform float alpha;
 uniform sampler2D u_lut_tex;
 uniform float u_grid;
+uniform vec3 u_a0;
+uniform vec3 u_a1;
+uniform vec3 u_a2;
 
 vec3 lut_sample_at(vec3 cell) {
     float n = u_grid;
@@ -1965,7 +1998,8 @@ void main() {
 #endif
     // Guard against division-by-zero or NaN injection 
     vec3 straight = src.a > 0.0001 ? clamp(src.rgb / src.a, 0.0, 1.0) : src.rgb;
-    vec3 encoded = lut_lookup(straight);
+    vec3 calibrated = lut_lookup(straight);
+    vec3 encoded = clamp(vec3(dot(u_a0, calibrated), dot(u_a1, calibrated), dot(u_a2, calibrated)), 0.0, 1.0);
     gl_FragColor = vec4(encoded * src.a, src.a) * alpha;
 }
 "#;
@@ -2048,6 +2082,9 @@ uniform vec3 u_p0;
 uniform vec3 u_p1;
 uniform vec3 u_p2;
 uniform vec3 u_panel_luma;
+uniform vec3 u_a0;
+uniform vec3 u_a1;
+uniform vec3 u_a2;
 
 vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
@@ -2240,6 +2277,7 @@ void main() {
     vec3 pq = clamp(vec3(pq_oetf(nits.r), pq_oetf(nits.g), pq_oetf(nits.b)), 0.0, 1.0);
     if (!calibration) {
         pq = clamp(pq + vec3(pq_output_dither()), 0.0, 1.0);
+        pq = clamp(vec3(dot(u_a0, pq), dot(u_a1, pq), dot(u_a2, pq)), 0.0, 1.0);
     }
     float output_alpha = calibration ? 1.0 : src.a;
     gl_FragColor = vec4(pq * output_alpha, output_alpha) * alpha;

@@ -724,8 +724,8 @@ fn capture_rgb_to_srgb8(
             let bt2020 = encoded.map(pq_to_nits);
             let linear_srgb_nits = [
                 1.660_491 * bt2020[0] - 0.587_641 * bt2020[1] - 0.072_850 * bt2020[2],
-                -0.124_550 * bt2020[0] + 1.132_900 * bt2020[1] - 0.008_349 * bt2020[2],
-                -0.018_151 * bt2020[0] - 0.100_579 * bt2020[1] + 1.118_730 * bt2020[2],
+                -0.124_550 * bt2020[0] + 1.132_9 * bt2020[1] - 0.008_349 * bt2020[2],
+                -0.018_151 * bt2020[0] - 0.100_579 * bt2020[1] + 1.118_73 * bt2020[2],
             ];
             let white = reference_white_nits.max(1.0);
             linear_srgb_nits.map(|value| linear_to_srgb((value / white).clamp(0.0, 1.0)))

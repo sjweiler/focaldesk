@@ -1,6 +1,7 @@
 #![allow(unused_imports)]
 
 mod input;
+mod magnifier;
 
 use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
@@ -37,7 +38,13 @@ use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
 use smithay::input::keyboard::{keysyms, xkb, XkbConfig};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, MotionEvent, RelativeMotionEvent,
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, GestureSwipeBeginEvent,
+    GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
+};
+use smithay::reexports::input::{
+    AccelProfile as LibinputAccelProfile, Device as LibinputDevice,
+    DeviceCapability as LibinputDeviceCapability, ScrollMethod as LibinputScrollMethod,
+    SendEventsMode,
 };
 use smithay::reexports::wayland_server::Resource;
 
@@ -46,7 +53,8 @@ use crate::core::session_restore::{
     SavedSplitPlacement, SavedWindow, SessionRestoreState, SessionSnapshot,
 };
 use crate::core::shell::xwayland::{
-    is_noninteractive_fixed_size_helper, XwaylandSurfaceRole, XwaylandWindowMeta,
+    is_noninteractive_fixed_size_helper, workspace_from_process_env, XwaylandSurfaceRole,
+    XwaylandWindowMeta,
 };
 use crate::core::shell::WaylandWindowMeta;
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
@@ -61,6 +69,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use crate::core::keyboard_accessibility::KeyboardAccessibilityFilter;
 use crate::core::lock::{
     authenticate_current_user, LockPulseKind, LockScreenState, LOCK_PULSE_DURATION,
 };
@@ -76,7 +85,7 @@ use focaldesk_ipc::{
     desktop_socket_path, send_control_request, send_notification_request, send_power_request,
     send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
     DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
-    DesktopSplitLayout, DisplayRuntimeOutputStatus, IpcRequest, IpcResponse,
+    DesktopSplitLayout, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
     NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
     PowerIpcResponse, RenderingStatus, SessionStatus, ThemeEditorCommand, UpdateIpcRequest,
     UpdateIpcResponse, WindowSnapshot, WorkspaceSnapshot, THEME_EDITOR_PROTOCOL_VERSION,
@@ -89,11 +98,12 @@ use focaldesk_power::{
     PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
 };
 use focaldesk_settings_core::{
-    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AppSettings,
-    BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel, DebugSettings,
-    DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern, LidCloseAction,
-    LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction, PowerSettings,
-    PrivacySettings, WorkspaceSettings,
+    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AccessibilitySettings,
+    AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel,
+    DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern,
+    InputAccelerationProfile, InputDeviceSettings, InputScrollMethod, InputSettings,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
+    PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings,
 };
 use focaldesk_shortcuts::{KeyAction, KeySymbol, Keybinds, ModMask};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
@@ -1609,6 +1619,9 @@ pub struct DesktopInit {
     pub client_wayland_display: String,
     pub theme_manager: ThemeManager,
     pub apps: AppSettings,
+    pub animations_enabled: bool,
+    pub input_settings: InputSettings,
+    pub accessibility_settings: AccessibilitySettings,
     pub workspaces: WorkspaceSettings,
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
@@ -1636,6 +1649,91 @@ struct UiBuildCache {
     scale_factor: f64,
     metrics: ChromeMetrics,
     theme_id: FlowThemeId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceSwipe {
+    captured: bool,
+    delta_x: f64,
+    delta_y: f64,
+    velocity_x: f64,
+    velocity_y: f64,
+    last_update_msec: u32,
+}
+
+const WORKSPACE_TRANSITION_DURATION: Duration = Duration::from_millis(220);
+
+#[derive(Debug, Clone, Copy)]
+enum WorkspaceTransitionPhase {
+    Interactive,
+    Settling {
+        started_at: Instant,
+        start_progress: f64,
+        target_progress: f64,
+        duration: Duration,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WorkspaceTransition {
+    from: WorkspaceId,
+    to: WorkspaceId,
+    progress: f64,
+    phase: WorkspaceTransitionPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WorkspaceRenderView {
+    pub workspace: WorkspaceId,
+    pub offset_x: i32,
+}
+
+impl WorkspaceTransition {
+    fn sampled_progress(self, now: Instant) -> (f64, bool) {
+        match self.phase {
+            WorkspaceTransitionPhase::Interactive => (self.progress.clamp(0.0, 1.0), false),
+            WorkspaceTransitionPhase::Settling {
+                started_at,
+                start_progress,
+                target_progress,
+                duration,
+            } => {
+                let elapsed = now.saturating_duration_since(started_at);
+                if elapsed >= duration || duration.is_zero() {
+                    return (target_progress, true);
+                }
+                let linear = (elapsed.as_secs_f64() / duration.as_secs_f64()).clamp(0.0, 1.0);
+                let eased = 1.0 - (1.0 - linear).powi(3);
+                (
+                    start_progress + (target_progress - start_progress) * eased,
+                    false,
+                )
+            }
+        }
+    }
+}
+
+fn workspace_transition_views(
+    transition: WorkspaceTransition,
+    progress: f64,
+    output_width: i32,
+) -> [WorkspaceRenderView; 2] {
+    let direction = if transition.to.0 > transition.from.0 {
+        1.0
+    } else {
+        -1.0
+    };
+    let width = f64::from(output_width.max(1));
+    [
+        WorkspaceRenderView {
+            workspace: transition.from,
+            offset_x: (-direction * progress * width).round() as i32,
+        },
+        WorkspaceRenderView {
+            workspace: transition.to,
+            offset_x: (direction * (1.0 - progress) * width).round() as i32,
+        },
+    ]
 }
 
 pub struct DesktopState {
@@ -1809,7 +1907,15 @@ pub struct DesktopState {
 
     pub client_wayland_display: String,
     pub apps: AppSettings,
+    pub animations_enabled: bool,
+    pub input_settings: InputSettings,
+    keyboard_accessibility: KeyboardAccessibilityFilter,
+    pub accessibility_settings: AccessibilitySettings,
+    magnifier_views: HashMap<OutputId, crate::core::magnifier::MagnifierView>,
+    libinput_devices: HashMap<String, LibinputDevice>,
     pub workspaces: WorkspaceSettings,
+    workspace_swipe: Option<WorkspaceSwipe>,
+    workspace_transitions: HashMap<OutputId, WorkspaceTransition>,
     pub privacy: PrivacySettings,
     pub power: PowerSettings,
     pub debug: DebugSettings,
@@ -1890,7 +1996,7 @@ pub struct DesktopState {
     pending_egui_ops: Vec<PendingEguiOp>,
     pending_vui_quick_settings: Option<OutputId>,
     pending_sidebar_dialogs: HashMap<DialogId, SidebarDialogKind>,
-    pending_app_launches: Vec<(u64, String, Vec<String>, LaunchSource)>,
+    pending_app_launches: Vec<(u64, String, Vec<String>, LaunchSource, WorkspaceId)>,
     /// Trusted shell chrome that has actually painted, keyed by namespace and
     /// output connector. A wildcard entry preserves compatibility with older
     /// shell clients that only report a global ready signal.
@@ -1948,6 +2054,7 @@ enum PendingEguiOp {
 #[derive(Debug, Clone, Copy)]
 enum SidebarDialogKind {
     DeleteWorkspace,
+    ToggleStickyKeys,
 }
 
 fn apply_debug_log_level(level: DebugLogLevel) {
@@ -2098,6 +2205,109 @@ fn encoding_from_fourcc(code: Fourcc) -> ClientBufferEncoding {
             } else {
                 ClientBufferEncoding::Unknown
             }
+        }
+    }
+}
+
+fn libinput_device_id(device: &LibinputDevice) -> String {
+    let mut slug = String::with_capacity(64);
+    let mut previous_dash = false;
+    for character in device.name().chars().flat_map(char::to_lowercase) {
+        if slug.len() >= 64 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("pointer");
+    }
+    let sysname = device
+        .sysname()
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '-')
+        .take(32)
+        .collect::<String>();
+    format!(
+        "{:04x}:{:04x}:{slug}:{}",
+        device.id_vendor(),
+        device.id_product(),
+        if sysname.is_empty() {
+            "device"
+        } else {
+            &sysname
+        }
+    )
+}
+
+fn apply_libinput_device_settings(device: &mut LibinputDevice, settings: &InputDeviceSettings) {
+    let can_disable = !device.has_capability(LibinputDeviceCapability::Keyboard)
+        && device
+            .config_send_events_modes()
+            .contains(SendEventsMode::DISABLED);
+    if can_disable {
+        if let Some(enabled) = settings.enabled {
+            let mode = if enabled {
+                SendEventsMode::ENABLED
+            } else {
+                SendEventsMode::DISABLED
+            };
+            let _ = device.config_send_events_set_mode(mode);
+        }
+    }
+    if device.config_tap_finger_count() > 0 {
+        if let Some(enabled) = settings.tap_to_click {
+            let _ = device.config_tap_set_enabled(enabled);
+        }
+    }
+    if device.config_dwt_is_available() {
+        if let Some(enabled) = settings.disable_while_typing {
+            let _ = device.config_dwt_set_enabled(enabled);
+        }
+    }
+    if device.config_accel_is_available() {
+        let profile = match settings.acceleration_profile {
+            InputAccelerationProfile::Default => device.config_accel_default_profile(),
+            InputAccelerationProfile::Adaptive => Some(LibinputAccelProfile::Adaptive),
+            InputAccelerationProfile::Flat => Some(LibinputAccelProfile::Flat),
+        };
+        if let Some(profile) = profile {
+            if device.config_accel_profiles().contains(&profile) {
+                let _ = device.config_accel_set_profile(profile);
+            }
+        }
+        if let Some(speed) = settings.acceleration_speed {
+            let _ = device.config_accel_set_speed(speed.clamp(-1.0, 1.0));
+        }
+    }
+    let scroll_method = match settings.scroll_method {
+        InputScrollMethod::Default => device.config_scroll_default_method(),
+        InputScrollMethod::TwoFinger => Some(LibinputScrollMethod::TwoFinger),
+        InputScrollMethod::Edge => Some(LibinputScrollMethod::Edge),
+        InputScrollMethod::OnButtonDown => Some(LibinputScrollMethod::OnButtonDown),
+        InputScrollMethod::Disabled => Some(LibinputScrollMethod::NoScroll),
+    };
+    if let Some(method) = scroll_method {
+        if device.config_scroll_methods().contains(&method) {
+            let _ = device.config_scroll_set_method(method);
+        }
+    }
+    if device.config_left_handed_is_available() {
+        if let Some(enabled) = settings.left_handed {
+            let _ = device.config_left_handed_set(enabled);
+        }
+    }
+    if device.config_middle_emulation_is_available() {
+        if let Some(enabled) = settings.middle_button_emulation {
+            let _ = device.config_middle_emulation_set_enabled(enabled);
         }
     }
 }
@@ -2287,16 +2497,18 @@ impl DesktopState {
                 .values()
                 .any(|output| output.hdr_kms_applied || output.hdr_transition_target == Some(true)),
         };
-        let apps: Vec<(u64, String, Vec<String>, LaunchSource)> =
+        let apps: Vec<(u64, String, Vec<String>, LaunchSource, WorkspaceId)> =
             std::mem::take(&mut self.pending_app_launches);
-        for (launch_trace_id, app, args, source) in apps {
+        for (launch_trace_id, app, args, source, workspace) in apps {
             flog_info!(
                 "dequeuing app launch trace_id={} app={}",
                 launch_trace_id,
                 app
             );
             let ctx = ctx.clone();
-            thread::spawn(move || spawn_app_detached(ctx, launch_trace_id, app, args, source));
+            thread::spawn(move || {
+                spawn_app_detached(ctx, launch_trace_id, app, args, source, workspace)
+            });
         }
     }
 
@@ -2315,6 +2527,13 @@ impl DesktopState {
         }
         if queued > 0 {
             flog_info!("Session restore queued {queued} application launch(es)");
+        }
+    }
+
+    fn queue_startup_apps(&mut self) {
+        let startup_apps = self.apps.startup_apps.clone();
+        for startup in startup_apps.into_iter().filter(|startup| startup.enabled) {
+            self.launch_app_with_args(startup.command, startup.arguments);
         }
     }
 
@@ -2440,7 +2659,7 @@ impl DesktopState {
                     && self.workspaces.split_screen_enabled)
                     .then(|| {
                         let work = self.work_recess_for_output(output_id)?;
-                        saved_split_placement(work, window.tile_rect?)
+                        saved_split_placement(work, window.tile_rect.or(window.restore_rect)?)
                     })
                     .flatten();
 
@@ -3129,7 +3348,14 @@ impl DesktopState {
         self.settings_ipc_config = config.clone();
         self.apply_config(config);
 
-        let settings = load_settings();
+        let mut settings = load_settings();
+        settings.input.accessibility = settings.input.accessibility.sanitized();
+        let releases = self
+            .keyboard_accessibility
+            .reconfigure(settings.input.accessibility);
+        for release in releases {
+            self.handle_key_event(release.keycode, release.state);
+        }
         let mut keybinds = Keybinds::with_defaults(crate::backend::common::shortcut_capabilities(
             self.backend_kind,
         ));
@@ -3164,11 +3390,32 @@ impl DesktopState {
         }
         self.keybinds = keybinds;
         self.apps = settings.apps;
+        self.animations_enabled = settings.appearance.animations;
+        if !self.animations_enabled {
+            self.workspace_transitions.clear();
+        }
+        self.input_settings = settings.input;
+        let start_on_screen_keyboard = !self.accessibility_settings.on_screen_keyboard_enabled
+            && settings.accessibility.on_screen_keyboard_enabled;
+        self.accessibility_settings = settings.accessibility;
+        if start_on_screen_keyboard {
+            self.launch_app("maliit-keyboard".to_string());
+        }
+        self.refresh_magnifier_targets();
+        let cursor_scale = self
+            .outputs
+            .get(&self.focused_output)
+            .map(|output| output.scale_factor as f32)
+            .unwrap_or(1.0);
+        self.cursor_manager
+            .set_base_size_and_scale(self.cursor_base_size(), cursor_scale);
+        self.apply_all_libinput_device_settings();
         if self.workspaces.split_screen_enabled && !settings.workspaces.split_screen_enabled {
             self.clear_snap_preview();
             self.restore_all_split_windows();
         }
         self.workspaces = settings.workspaces;
+        self.apply_workspace_name_overrides();
         self.session_restore
             .set_enabled(self.workspaces.restore_session);
         self.privacy = settings.privacy;
@@ -3177,6 +3424,92 @@ impl DesktopState {
         self.apply_power_settings();
         self.apply_debug_settings(settings.debug);
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn register_libinput_device(&mut self, mut device: LibinputDevice) {
+        if !device.has_capability(LibinputDeviceCapability::Pointer) {
+            return;
+        }
+        let id = libinput_device_id(&device);
+        if let Some(settings) = self.input_settings.devices.get(&id) {
+            apply_libinput_device_settings(&mut device, settings);
+        }
+        self.libinput_devices.insert(id, device);
+    }
+
+    pub(crate) fn unregister_libinput_device(&mut self, device: &LibinputDevice) {
+        self.libinput_devices.remove(&libinput_device_id(device));
+    }
+
+    fn apply_all_libinput_device_settings(&mut self) {
+        for (id, device) in &mut self.libinput_devices {
+            if let Some(settings) = self.input_settings.devices.get(id) {
+                apply_libinput_device_settings(device, settings);
+            }
+        }
+    }
+
+    fn input_device_snapshots(&self) -> Vec<InputDeviceSnapshot> {
+        let mut devices = self
+            .libinput_devices
+            .iter()
+            .take(32)
+            .map(|(id, device)| {
+                let acceleration_profiles = device.config_accel_profiles();
+                let scroll_methods = device.config_scroll_methods();
+                let send_events_modes = device.config_send_events_modes();
+                InputDeviceSnapshot {
+                    id: id.clone(),
+                    name: device.name().chars().take(128).collect(),
+                    sysname: device.sysname().chars().take(64).collect(),
+                    vendor_id: device.id_vendor(),
+                    product_id: device.id_product(),
+                    touchpad: device.config_tap_finger_count() > 0,
+                    enabled: !device
+                        .config_send_events_mode()
+                        .contains(SendEventsMode::DISABLED),
+                    can_disable: !device.has_capability(LibinputDeviceCapability::Keyboard)
+                        && send_events_modes.contains(SendEventsMode::DISABLED),
+                    tap_finger_count: device.config_tap_finger_count(),
+                    tap_to_click: device.config_tap_enabled(),
+                    supports_disable_while_typing: device.config_dwt_is_available(),
+                    disable_while_typing: device.config_dwt_enabled(),
+                    supports_acceleration: device.config_accel_is_available(),
+                    supports_adaptive_acceleration: acceleration_profiles
+                        .contains(&LibinputAccelProfile::Adaptive),
+                    supports_flat_acceleration: acceleration_profiles
+                        .contains(&LibinputAccelProfile::Flat),
+                    acceleration_profile: device.config_accel_profile().map(
+                        |profile| match profile {
+                            LibinputAccelProfile::Adaptive => "adaptive".to_string(),
+                            LibinputAccelProfile::Flat => "flat".to_string(),
+                            _ => "custom".to_string(),
+                        },
+                    ),
+                    acceleration_speed: device.config_accel_speed(),
+                    supports_two_finger_scroll: scroll_methods
+                        .contains(&LibinputScrollMethod::TwoFinger),
+                    supports_edge_scroll: scroll_methods.contains(&LibinputScrollMethod::Edge),
+                    supports_button_scroll: scroll_methods
+                        .contains(&LibinputScrollMethod::OnButtonDown),
+                    supports_disabled_scroll: scroll_methods
+                        .contains(&LibinputScrollMethod::NoScroll),
+                    scroll_method: device.config_scroll_method().map(|method| match method {
+                        LibinputScrollMethod::NoScroll => "disabled".to_string(),
+                        LibinputScrollMethod::TwoFinger => "two_finger".to_string(),
+                        LibinputScrollMethod::Edge => "edge".to_string(),
+                        LibinputScrollMethod::OnButtonDown => "on_button_down".to_string(),
+                        _ => "unknown".to_string(),
+                    }),
+                    supports_left_handed: device.config_left_handed_is_available(),
+                    left_handed: device.config_left_handed(),
+                    supports_middle_button_emulation: device.config_middle_emulation_is_available(),
+                    middle_button_emulation: device.config_middle_emulation_enabled(),
+                }
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.cmp(&right.id)));
+        devices
     }
 
     fn handle_settings_ipc_request(
@@ -3341,6 +3674,9 @@ impl DesktopState {
             }),
             IpcRequest::GetDesktopSnapshot => Some(IpcResponse::DesktopSnapshot {
                 snapshot: self.desktop_snapshot(),
+            }),
+            IpcRequest::GetInputDevices => Some(IpcResponse::InputDevices {
+                devices: self.input_device_snapshots(),
             }),
             IpcRequest::GetThemeEditorStatus { protocol_version } => {
                 if protocol_version != THEME_EDITOR_PROTOCOL_VERSION {
@@ -3940,7 +4276,9 @@ impl DesktopState {
             DesktopAction::OpenSettingsPanel { panel } => {
                 const PANELS: &[&str] = &[
                     "appearance",
+                    "theme editor",
                     "network",
+                    "calendar",
                     "bluetooth",
                     "printers",
                     "displays",
@@ -3948,6 +4286,7 @@ impl DesktopState {
                     "applications",
                     "chrome",
                     "workspaces",
+                    "mouse & touchpad",
                     "keyboard",
                     "privacy",
                     "power",
@@ -4203,7 +4542,7 @@ impl DesktopState {
             }
             self.mark_all_outputs_full_damage(DamageSource::Unknown);
             self.cursor_manager.set_base_size_and_scale(
-                24,
+                self.cursor_base_size(),
                 self.outputs
                     .get(&self.focused_output)
                     .or_else(|| self.outputs.get(&self.primary_output))
@@ -5005,6 +5344,7 @@ impl DesktopState {
                         let work_width = frame_ctx.work.size.w.max(1) as f32;
                         let work_height = frame_ctx.work.size.h.max(1) as f32;
                         Some(focaldesk_ui::egui_panels::WorkspaceWindowPreview {
+                            id: window.id,
                             title: window.title(),
                             x: (clipped.loc.x - frame_ctx.work.loc.x) as f32 / work_width,
                             y: (clipped.loc.y - frame_ctx.work.loc.y) as f32 / work_height,
@@ -6314,6 +6654,9 @@ impl DesktopState {
 
     fn compositor_pointer_grab_active(&self) -> bool {
         self.toplevel_pointer.is_some()
+            || self
+                .workspace_transitions
+                .contains_key(&self.focused_output)
     }
 
     /// True when the seat pointer has an active click grab matching `serial` on `surface`.
@@ -6463,6 +6806,12 @@ impl DesktopState {
             let Some(constraint) = constraint.filter(|constraint| !constraint.is_active()) else {
                 return;
             };
+            // See `PointerConstraintsHandler::new_constraint`: an unrequested
+            // cursor lock must never freeze desktop pointer motion.  Confining
+            // a pointer to a client-provided region remains supported.
+            if matches!(&*constraint, PointerConstraint::Locked(_)) {
+                return;
+            }
             let local = (position - surface_loc).to_i32_round();
             if constraint
                 .region()
@@ -6667,6 +7016,10 @@ impl DesktopState {
                 self.set_focused_workspace(WorkspaceId(workspace));
             }
 
+            UiAction::MoveWindowToWorkspace(window_id, workspace) => {
+                self.move_window_to_workspace(window_id, WorkspaceId(workspace));
+            }
+
             UiAction::CreateWorkspace(name) => {
                 self.create_workspace_from_dialog(name);
             }
@@ -6677,6 +7030,16 @@ impl DesktopState {
 
             UiAction::SetSetting(setting, enabled) => {
                 self.set_system_setting(setting, enabled);
+            }
+
+            UiAction::SetNightLight(enabled) => {
+                let mut settings = load_settings();
+                settings.accessibility.night_light.enabled = enabled;
+                if let Err(error) = save_settings(&settings) {
+                    flog_warn!("could not save Night Light setting: {error}");
+                } else {
+                    self.reload_settings_from_disk();
+                }
             }
 
             UiAction::SetVolume(volume) => {
@@ -7221,10 +7584,87 @@ impl DesktopState {
             .unwrap_or(self.active_workspace)
     }
 
+    fn apply_workspace_name_overrides(&mut self) {
+        for (index, name) in self.workspace_names.iter_mut().enumerate() {
+            if let Some(configured) = self.workspaces.workspace_names.get(&((index + 1) as u32)) {
+                let configured = configured.trim();
+                if !configured.is_empty() {
+                    *name = configured.chars().take(64).collect();
+                }
+            }
+        }
+    }
+
+    /// Apply the first configured rule for a newly-created window. Rules are
+    /// deliberately skipped for restored windows so a saved session remains
+    /// authoritative over current defaults.
+    pub(crate) fn apply_window_rule(
+        &mut self,
+        window_id: WindowId,
+        app_id: Option<&str>,
+        title: &str,
+    ) -> Option<WindowRule> {
+        let rule = self
+            .apps
+            .window_rules
+            .iter()
+            .find(|rule| rule.matches(app_id, title))
+            .cloned()?;
+        let output = rule.output.as_deref().and_then(|connector| {
+            self.outputs
+                .iter()
+                .find_map(|(id, output)| (output.handle.name() == connector).then_some(*id))
+        });
+        let workspace = rule
+            .workspace
+            .filter(|workspace| *workspace as usize <= self.workspace_names.len())
+            .map(WorkspaceId);
+
+        if let Some(window) = self.window_mut(window_id) {
+            if let Some(workspace) = workspace {
+                window.set_workspace(workspace);
+            }
+            if let Some(output) = output {
+                window.output = Some(output);
+            }
+            if let Some(floating) = rule.floating {
+                window.floating = floating;
+            }
+        }
+        Some(rule)
+    }
+
     pub fn set_focused_workspace(&mut self, workspace: WorkspaceId) {
         if workspace.0 == 0 || workspace.0 as usize > self.workspace_names.len() {
             return;
         }
+        let previous_workspace = self.focused_workspace();
+        if previous_workspace == workspace {
+            return;
+        }
+        let output_id = self.focused_output;
+        self.activate_focused_workspace(workspace);
+        if self.animations_enabled {
+            self.clear_client_pointer_focus(self.pointer_pos);
+            self.workspace_transitions.insert(
+                output_id,
+                WorkspaceTransition {
+                    from: previous_workspace,
+                    to: workspace,
+                    progress: 0.0,
+                    phase: WorkspaceTransitionPhase::Settling {
+                        started_at: Instant::now(),
+                        start_progress: 0.0,
+                        target_progress: 1.0,
+                        duration: WORKSPACE_TRANSITION_DURATION,
+                    },
+                },
+            );
+        }
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
+    }
+
+    fn activate_focused_workspace(&mut self, workspace: WorkspaceId) {
         let previous_workspace = self.focused_workspace();
         if let Some(window_id) = self.focused_window {
             if self.window(window_id).is_some_and(|window| {
@@ -7241,6 +7681,101 @@ impl DesktopState {
         self.rebuild_ui_tree_for_output(self.focused_output);
         self.mark_focused_output_full_damage(DamageSource::Unknown);
         self.focus_top_window_on_focused_output(workspace);
+    }
+
+    pub(crate) fn workspace_render_views(
+        &mut self,
+        output_id: OutputId,
+        output_width: i32,
+        now: Instant,
+    ) -> Vec<WorkspaceRenderView> {
+        let active = self
+            .outputs
+            .get(&output_id)
+            .map(|output| output.active_workspace)
+            .unwrap_or(self.active_workspace);
+        let Some(transition) = self.workspace_transitions.get(&output_id).copied() else {
+            return vec![WorkspaceRenderView {
+                workspace: active,
+                offset_x: 0,
+            }];
+        };
+        let (progress, complete) = transition.sampled_progress(now);
+        if complete {
+            self.workspace_transitions.remove(&output_id);
+            return vec![WorkspaceRenderView {
+                workspace: active,
+                offset_x: 0,
+            }];
+        }
+        workspace_transition_views(transition, progress, output_width).to_vec()
+    }
+
+    pub(crate) fn has_workspace_transition(&self, output_id: OutputId) -> bool {
+        self.workspace_transitions.contains_key(&output_id)
+    }
+
+    pub(crate) fn forget_workspace_transition(&mut self, output_id: OutputId) {
+        self.workspace_transitions.remove(&output_id);
+    }
+
+    pub(crate) fn update_interactive_workspace_transition(&mut self, delta_x: f64, delta_y: f64) {
+        if !self.animations_enabled || delta_x.abs() < delta_y.abs() * 1.05 {
+            return;
+        }
+        let from = self.focused_workspace();
+        let to = if delta_x < 0.0 {
+            WorkspaceId(from.0.saturating_add(1))
+        } else {
+            WorkspaceId(from.0.saturating_sub(1))
+        };
+        if to.0 == 0 || to.0 as usize > self.workspace_names.len() {
+            self.workspace_transitions.remove(&self.focused_output);
+            return;
+        }
+        let distance = self.input_settings.workspace_swipe_distance.max(1.0);
+        let progress = (delta_x.abs() / (distance * 1.5)).clamp(0.0, 1.0);
+        if !self
+            .workspace_transitions
+            .contains_key(&self.focused_output)
+        {
+            self.clear_client_pointer_focus(self.pointer_pos);
+        }
+        self.workspace_transitions.insert(
+            self.focused_output,
+            WorkspaceTransition {
+                from,
+                to,
+                progress,
+                phase: WorkspaceTransitionPhase::Interactive,
+            },
+        );
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
+    }
+
+    pub(crate) fn settle_interactive_workspace_transition(&mut self, target: Option<WorkspaceId>) {
+        let output_id = self.focused_output;
+        let Some(mut transition) = self.workspace_transitions.get(&output_id).copied() else {
+            if let Some(target) = target {
+                self.set_focused_workspace(target);
+            }
+            return;
+        };
+        let commits = target == Some(transition.to);
+        if commits {
+            self.activate_focused_workspace(transition.to);
+        }
+        let target_progress = if commits { 1.0 } else { 0.0 };
+        let remaining = (target_progress - transition.progress).abs();
+        let duration = WORKSPACE_TRANSITION_DURATION.mul_f64(remaining.max(0.35));
+        transition.phase = WorkspaceTransitionPhase::Settling {
+            started_at: Instant::now(),
+            start_progress: transition.progress,
+            target_progress,
+            duration,
+        };
+        self.workspace_transitions.insert(output_id, transition);
+        self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
     fn focus_top_window_on_focused_output(&mut self, workspace: WorkspaceId) {
@@ -7343,6 +7878,7 @@ impl DesktopState {
         if self.workspace_names.len() <= 1 {
             return;
         }
+        self.workspace_transitions.clear();
 
         let current = self.focused_workspace().0.max(1) as usize;
         let delete_index = current.min(self.workspace_names.len()) - 1;
@@ -7777,21 +8313,15 @@ impl DesktopState {
             .map(|output| output.active_workspace)
             .unwrap_or(self.active_workspace);
 
-        // Put the pointer on a real output before re-applying fullscreen/maximized
-        // state; those paths intentionally choose the output under the pointer first.
-        let clamp = self.logical_pointer_clamp_rect();
-        let max_x = (clamp.loc.x + clamp.size.w - 1).max(clamp.loc.x) as f64;
-        let max_y = (clamp.loc.y + clamp.size.h - 1).max(clamp.loc.y) as f64;
-        self.pointer_pos.x = self.pointer_pos.x.clamp(clamp.loc.x as f64, max_x);
-        self.pointer_pos.y = self.pointer_pos.y.clamp(clamp.loc.y as f64, max_y);
-        if self.output_under_pointer(self.pointer_pos).is_none() {
-            if let Some(output) = self.outputs.get(&focused) {
-                self.pointer_pos = Point::from((
-                    output.logical_origin.x as f64 + output.logical_size.w as f64 / 2.0,
-                    output.logical_origin.y as f64 + output.logical_size.h as f64 / 2.0,
-                ));
-            }
-        }
+        // Preserve the nearest valid pointer position when outputs change.
+        // Centering the focused display here made a transient topology refresh
+        // feel like the mouse was repeatedly pulled to screen center.
+        let pointer_bounds = self
+            .outputs
+            .values()
+            .map(|output| Rectangle::from_loc_and_size(output.logical_origin, output.logical_size));
+        self.pointer_pos =
+            confine_pointer_to_output_bounds(self.pointer_pos, self.pointer_pos, pointer_bounds);
         self.input.pointer_pos = self.pointer_pos.into();
 
         let fallback_workspace = self
@@ -8802,6 +9332,7 @@ impl DesktopState {
         if let Some(rect) = new_focus_bbox {
             self.mark_window_bbox_damage_source(rect, DamageSource::Unknown);
         }
+        self.update_magnifier_keyboard_focus();
     }
 
     /// Honor an X11 `_NET_ACTIVE_WINDOW` request without letting a normal
@@ -8937,11 +9468,24 @@ impl DesktopState {
             .unwrap_or(len - 1);
 
         let next = (idx + delta).rem_euclid(len) as usize;
-        self.focus_window_id(ids[next]);
+        let next_id = ids[next];
+        let label = self
+            .window(next_id)
+            .map(|window| format!("{} — {}", window.display_name(), window.title()));
+        self.focus_window_id(next_id);
+        if let Some(label) = label {
+            notification_service_notify(
+                "Application switcher",
+                label,
+                Some(Duration::from_secs(2)),
+            );
+        }
     }
 
     pub fn new(init: DesktopInit) -> Self {
         let debug = init.debug.clone();
+        let keyboard_accessibility =
+            KeyboardAccessibilityFilter::new(init.input_settings.accessibility);
         apply_debug_log_level(debug.log_level);
         let (clipboard_capture_tx, clipboard_capture_rx) = mpsc::channel();
         let (microphone_detection_tx, microphone_detection_rx) = mpsc::channel();
@@ -9117,7 +9661,15 @@ impl DesktopState {
             keybinds: init.keybinds,
             client_wayland_display: init.client_wayland_display,
             apps: init.apps,
+            animations_enabled: init.animations_enabled,
+            input_settings: init.input_settings,
+            keyboard_accessibility,
+            accessibility_settings: init.accessibility_settings,
+            magnifier_views: HashMap::new(),
+            libinput_devices: HashMap::new(),
             workspaces: init.workspaces,
+            workspace_swipe: None,
+            workspace_transitions: HashMap::new(),
             privacy: init.privacy,
             power: init.power,
             debug: debug.clone(),
@@ -9176,9 +9728,12 @@ impl DesktopState {
         };
 
         state.apply_power_settings();
+        state.apply_workspace_name_overrides();
+        state.refresh_magnifier_targets();
         if let Some(snapshot) = restore_snapshot {
             state.queue_session_restore_launches(&snapshot);
         }
+        state.queue_startup_apps();
         state
     }
 
@@ -9290,7 +9845,9 @@ impl DesktopState {
         )
         .entered();
         let window = Window::new_x11_window(surface.clone());
-        let workspace = self.focused_workspace();
+        let workspace = self
+            .xwayland_workspace_for_surface(&surface, None)
+            .unwrap_or_else(|| self.focused_workspace());
         let meta = XwaylandWindowMeta::from_surface(&surface)
             .with_override_redirect(override_redirect)
             .with_role(XwaylandSurfaceRole::from_surface(&surface));
@@ -9305,6 +9862,44 @@ impl DesktopState {
             "xwayland window added"
         );
         id
+    }
+
+    #[cfg(feature = "xwayland")]
+    fn xwayland_workspace_for_surface(
+        &self,
+        surface: &smithay::xwayland::X11Surface,
+        exclude: Option<WindowId>,
+    ) -> Option<WorkspaceId> {
+        if let Some(parent_xid) = surface.is_transient_for() {
+            if let Some(parent) = self.windows.iter().find(|managed| {
+                Some(managed.id) != exclude
+                    && managed
+                        .window
+                        .x11_surface()
+                        .is_some_and(|x11| x11.window_id() == parent_xid)
+            }) {
+                return Some(parent.workspace);
+            }
+        }
+
+        let pid = surface.pid().or_else(|| surface.get_client_pid().ok());
+        // Some X11 clients omit WM_TRANSIENT_FOR but use one process for the
+        // main window and its dialogs. Keep those windows together as well,
+        // including when the user has since moved the main window.
+        let process_workspace = pid.and_then(|pid| {
+            self.windows.iter().find_map(|managed| {
+                (Some(managed.id) != exclude
+                    && managed.window.x11_surface().and_then(|x11| x11.pid()) == Some(pid))
+                .then_some(managed.workspace)
+            })
+        });
+        if process_workspace.is_some() {
+            return process_workspace;
+        }
+
+        pid.and_then(workspace_from_process_env)
+            .filter(|workspace| *workspace as usize <= self.workspace_names.len())
+            .map(WorkspaceId)
     }
 
     #[cfg(feature = "xwayland")]
@@ -9361,6 +9956,11 @@ impl DesktopState {
         .entered();
 
         self.sync_xwayland_window_meta(&surface);
+        if let Some(workspace) = self.xwayland_workspace_for_surface(&surface, Some(id)) {
+            if let Some(window) = self.window_mut(id) {
+                window.set_workspace(workspace);
+            }
+        }
         let role = XwaylandSurfaceRole::from_surface(&surface);
         let min_size = surface.min_size().map(|size| (size.w, size.h));
         let max_size = surface.max_size().map(|size| (size.w, size.h));
@@ -9396,6 +9996,9 @@ impl DesktopState {
         let restored = restore_unresolved
             && !x11_class.trim().is_empty()
             && self.try_restore_window(id, SavedProtocol::Xwayland, &x11_class);
+        let rule = (!restored && !surface.is_override_redirect())
+            .then(|| self.apply_window_rule(id, Some(&x11_class), &surface.title()))
+            .flatten();
 
         if !surface.is_override_redirect() {
             let _ = surface.set_mapped(true);
@@ -9422,13 +10025,14 @@ impl DesktopState {
         let requested_geometry = surface.geometry();
         let output_id = self
             .window_id_for_x11_surface(&surface)
-            .map(|window_id| self.xwayland_output_id_for_window(window_id))
+            .and_then(|window_id| self.window(window_id).and_then(|window| window.output))
             .unwrap_or_else(|| {
                 self.output_under_pointer(self.input.pointer_pos.into())
                     .unwrap_or(self.primary_output)
             });
 
         let should_float = self.windows[idx].floating;
+        let rule_maximize = rule.and_then(|rule| rule.maximize);
         let restored_maximized = restored && self.windows[idx].maximized;
         let restored_fullscreen = restored && self.windows[idx].fullscreen;
         let restored_rect = restored
@@ -9466,7 +10070,7 @@ impl DesktopState {
             let geometry = Rectangle::from_loc_and_size(location, requested_geometry.size);
             let geometry = self.xwayland_clamp_to_output_geometry(output_id, geometry);
             (geometry.loc, geometry.size, false)
-        } else if requested_fills_output {
+        } else if requested_fills_output && rule_maximize != Some(false) {
             // Wine implements borderless "Fullscreen (Windowed)" with a normal
             // X11 toplevel whose initial geometry fills the monitor. Honor that
             // current request ahead of stale session geometry; otherwise every
@@ -9478,7 +10082,7 @@ impl DesktopState {
             (geometry.loc, geometry.size, true)
         } else if let Some(geometry) = restored_rect {
             (geometry.loc, geometry.size, false)
-        } else if self.workspaces.maximize_on_launch {
+        } else if rule_maximize.unwrap_or(self.workspaces.maximize_on_launch) {
             let work = self
                 .work_recess_for_output(output_id)
                 .unwrap_or(requested_geometry);
@@ -9577,6 +10181,27 @@ impl DesktopState {
                 SidebarDialogKind::DeleteWorkspace => {
                     if matches!(action, DialogAction::Confirm) {
                         self.delete_focused_workspace();
+                    }
+                }
+                SidebarDialogKind::ToggleStickyKeys => {
+                    if matches!(action, DialogAction::Confirm) {
+                        let enabled = !self.input_settings.accessibility.sticky_keys;
+                        let mut settings = load_settings();
+                        settings.input.accessibility.sticky_keys = enabled;
+                        if let Err(error) = save_settings(&settings) {
+                            flog_warn!("could not save Sticky Keys setting: {error}");
+                        } else {
+                            self.reload_settings_from_disk();
+                            notification_service_notify(
+                                "Keyboard accessibility",
+                                if enabled {
+                                    "Sticky Keys enabled"
+                                } else {
+                                    "Sticky Keys disabled"
+                                },
+                                Some(Duration::from_secs(3)),
+                            );
+                        }
                     }
                 }
             }
@@ -10104,6 +10729,10 @@ impl DesktopState {
                 self.mark_all_outputs_full_damage(DamageSource::Unknown);
                 toggle_voice_capture(self.voice_capture_status_tx.clone());
             }
+            KeyAction::MagnifierZoomIn => self.adjust_magnifier_zoom(1),
+            KeyAction::MagnifierZoomOut => self.adjust_magnifier_zoom(-1),
+            KeyAction::ToggleNightLight => self.toggle_night_light(),
+            KeyAction::CycleColorFilter => self.cycle_color_filter(),
             KeyAction::SplitLeft => self.split_focused_window(SplitDirection::Left),
             KeyAction::SplitRight => self.split_focused_window(SplitDirection::Right),
             KeyAction::SplitTop => self.split_focused_window(SplitDirection::Top),
@@ -10266,6 +10895,34 @@ impl DesktopState {
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
     }
 
+    /// Move a window from the workspace overview without changing the active
+    /// workspace. Split groups remain together so their shared layout stays
+    /// valid on the destination workspace.
+    fn move_window_to_workspace(&mut self, window_id: WindowId, workspace: WorkspaceId) {
+        if workspace.0 == 0 || workspace.0 as usize > self.workspace_names.len() {
+            return;
+        }
+        let Some(window) = self.window(window_id) else {
+            return;
+        };
+        if !window.mapped || window.workspace == workspace {
+            return;
+        }
+        let output = window.output.unwrap_or(self.focused_output);
+        let window_ids = if window.tile_rect.is_some() {
+            self.split_group_window_ids(output, window.workspace)
+        } else {
+            vec![window_id]
+        };
+        for id in window_ids {
+            if let Some(window) = self.window_mut(id) {
+                window.set_workspace(workspace);
+                window.set_output(Some(output));
+            }
+        }
+        self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
     fn update_focus(&mut self) {}
 
     pub fn launch_terminal(&mut self) {
@@ -10321,8 +10978,9 @@ impl DesktopState {
         let launch_trace_id = self.next_launch_trace_id;
         self.next_launch_trace_id = self.next_launch_trace_id.saturating_add(1);
         flog_info!("queue launch trace_id={} app={}", launch_trace_id, app);
+        let workspace = self.focused_workspace();
         self.pending_app_launches
-            .push((launch_trace_id, app, args, source));
+            .push((launch_trace_id, app, args, source, workspace));
         launch_trace_id
     }
 
@@ -10899,6 +11557,7 @@ impl DesktopState {
             || self.split_resize_hud.is_some_and(|hud| {
                 now.saturating_duration_since(hud.started_at) < SPLIT_RESIZE_HUD_DURATION
             })
+            || !self.workspace_transitions.is_empty()
             || self.lock_screen.active
     }
 
@@ -10914,6 +11573,7 @@ impl DesktopState {
             || self
                 .split_resize_percent_for_output(output_id, now)
                 .is_some()
+            || self.workspace_transitions.contains_key(&output_id)
             || self.lock_screen.active
     }
 
@@ -11244,7 +11904,7 @@ impl DesktopState {
         self.restore_registered_output(id);
 
         self.cursor_manager
-            .set_base_size_and_scale(24, scale as f32);
+            .set_base_size_and_scale(self.cursor_base_size(), scale as f32);
         self.refresh_all_fractional_scales();
     }
 
@@ -11258,6 +11918,8 @@ impl DesktopState {
 
     pub fn tick_layout(&mut self) {
         self.popups.cleanup();
+        self.tick_keyboard_accessibility();
+        self.tick_magnifier();
         self.refresh_ai_flow_mode();
         self.reconcile_split_work_areas();
     }
@@ -13457,7 +14119,7 @@ impl DesktopState {
         let output_scale_factor = desk_output.scale_factor;
         let previous_cursor_rect = desk_output.last_sw_cursor_rect;
         self.cursor_manager
-            .set_base_size_and_scale(24, output_scale_factor as f32);
+            .set_base_size_and_scale(self.cursor_base_size(), output_scale_factor as f32);
         self.cursor_manager
             .move_to(self.pointer_pos.x, self.pointer_pos.y);
 
@@ -13727,7 +14389,7 @@ fn notification_service_unread_count() -> Option<usize> {
     }
 }
 
-fn notification_service_notify(
+pub(crate) fn notification_service_notify(
     title: impl Into<String>,
     body: impl Into<String>,
     timeout: Option<Duration>,
@@ -13898,6 +14560,7 @@ fn spawn_app_detached(
     app: String,
     extra_args: Vec<String>,
     source: LaunchSource,
+    workspace: WorkspaceId,
 ) {
     let app_name = app.clone();
     let chrome_like = is_chrome_like(&app_name);
@@ -13960,6 +14623,7 @@ fn spawn_app_detached(
             browser_backend: browser_backend_for_launch(browser_backend),
             hdr_output_active,
             auto_hdr: focal_launch_shared::auto_hdr_app_enabled(&candidate),
+            workspace: Some(workspace.0),
             source,
         };
 
@@ -14108,9 +14772,10 @@ mod tests {
         session_power_command, set_surface_root_membership, should_wait_for_lid_open_on_resume,
         snap_target_for_pointer, split_assist_targets, split_direction_for_rect, split_preset_rect,
         split_rect, split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
-        topbar_pulse_target_at, workspace_for_slot, ClientBufferEncoding, DamageSource, Fourcc,
-        OutputId, PowerActionInteraction, SplitAxis, SplitDirection, TopbarPulseTarget,
-        UnattendedSuspendState, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        topbar_pulse_target_at, workspace_for_slot, workspace_transition_views,
+        ClientBufferEncoding, DamageSource, Fourcc, OutputId, PowerActionInteraction, SplitAxis,
+        SplitDirection, TopbarPulseTarget, UnattendedSuspendState, WorkspaceTransition,
+        WorkspaceTransitionPhase, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_ai::AiDaemonStatus;
@@ -14189,6 +14854,28 @@ mod tests {
                 && self.awaiting_connector
                 && self.apply_work_area(work, minimum)
         }
+    }
+
+    #[test]
+    fn workspace_transition_offsets_join_at_the_output_edge() {
+        let transition = WorkspaceTransition {
+            from: WorkspaceId(1),
+            to: WorkspaceId(2),
+            progress: 0.0,
+            phase: WorkspaceTransitionPhase::Interactive,
+        };
+        let views = workspace_transition_views(transition, 0.25, 1_000);
+        assert_eq!(views[0].offset_x, -250);
+        assert_eq!(views[1].offset_x, 750);
+
+        let reverse = WorkspaceTransition {
+            from: WorkspaceId(2),
+            to: WorkspaceId(1),
+            ..transition
+        };
+        let views = workspace_transition_views(reverse, 0.25, 1_000);
+        assert_eq!(views[0].offset_x, 250);
+        assert_eq!(views[1].offset_x, -750);
     }
 
     #[test]

@@ -128,6 +128,29 @@ pub(super) fn shortcut_dispatch(
     }
 }
 
+fn workspace_swipe_target(
+    current: u32,
+    last: u32,
+    delta_x: f64,
+    delta_y: f64,
+    velocity_x: f64,
+    velocity_y: f64,
+    activation_distance: f64,
+    cancelled: bool,
+) -> Option<u32> {
+    let distance_commit = delta_x.abs() >= activation_distance;
+    let velocity_commit = velocity_x.abs() >= 0.65 && velocity_x.abs() >= velocity_y.abs() * 1.25;
+    if cancelled || (!distance_commit && !velocity_commit) || delta_x.abs() < delta_y.abs() * 1.25 {
+        return None;
+    }
+    let target = if delta_x < 0.0 {
+        current.saturating_add(1).min(last)
+    } else {
+        current.saturating_sub(1).max(1)
+    };
+    (target != current).then_some(target)
+}
+
 impl DesktopState {
     /// Advance Smithay's XKB state before any compositor overlay inspects the
     /// key. The returned event can then be intercepted or dispatched exactly
@@ -201,12 +224,22 @@ impl DesktopState {
         }
 
         match event {
-            event @ InputEvent::Key { .. } => self.handle_keyboard_input(event),
+            event @ InputEvent::Key { .. } => self.handle_physical_keyboard_input(event),
 
             event @ InputEvent::PointerMoved { .. } => self.handle_pointer_motion(event),
 
             event @ InputEvent::PointerButton { .. } => self.handle_pointer_button(event),
             event @ InputEvent::PointerScroll { .. } => self.handle_pointer_scroll(event),
+            InputEvent::GestureSwipeBegin { fingers, time_msec } => {
+                self.handle_gesture_swipe_begin(fingers, time_msec)
+            }
+            InputEvent::GestureSwipeUpdate { delta, time_msec } => {
+                self.handle_gesture_swipe_update(delta, time_msec)
+            }
+            InputEvent::GestureSwipeEnd {
+                cancelled,
+                time_msec,
+            } => self.handle_gesture_swipe_end(cancelled, time_msec),
             InputEvent::PointerEntered => self.handle_pointer_entered(),
             InputEvent::PointerLeft => self.handle_pointer_left(),
         }
@@ -221,6 +254,7 @@ impl DesktopState {
                 self.input.pointer_pos = position;
                 let position = position.into();
                 self.pointer_pos = position;
+                self.update_magnifier_pointer_focus(position);
                 self.cursor_manager.move_to(position.x, position.y);
                 self.clear_client_pointer_focus(position);
             }
@@ -232,6 +266,7 @@ impl DesktopState {
                 self.input.pointer_pos = position;
                 let position = position.into();
                 self.pointer_pos = position;
+                self.update_magnifier_pointer_focus(position);
                 self.cursor_manager.move_to(position.x, position.y);
                 self.clear_client_pointer_focus(position);
                 if matches!((button, state), (MouseButton::Left, KeyState::Pressed)) {
@@ -242,9 +277,13 @@ impl DesktopState {
                 self.input.pointer_pos = position;
                 let position = position.into();
                 self.pointer_pos = position;
+                self.update_magnifier_pointer_focus(position);
                 self.cursor_manager.move_to(position.x, position.y);
                 self.clear_client_pointer_focus(position);
             }
+            InputEvent::GestureSwipeBegin { .. }
+            | InputEvent::GestureSwipeUpdate { .. }
+            | InputEvent::GestureSwipeEnd { .. } => {}
             InputEvent::PointerEntered => {
                 self.cursor_manager.set_visible(true);
             }
@@ -284,6 +323,7 @@ impl DesktopState {
         if let Some(id) = self.output_under_pointer(position) {
             self.set_focused_output(id);
         }
+        self.update_magnifier_pointer_focus(position);
         // Rendering rebuilds the compositor's single UiTree once per
         // output. Resolve this click against the output that actually
         // received it, not whichever output happened to render last.
@@ -514,6 +554,11 @@ impl DesktopState {
             self.set_focused_output(id);
         }
         self.cursor_manager.move_to(position.x, position.y);
+        if self.has_workspace_transition(self.focused_output) {
+            self.update_pointer_cursor(position);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+            return;
+        }
         let precise_toplevel_damage = self.process_toplevel_pointer_motion(position);
         let precise_hover_damage = self.update_ui_hover_for_output(self.focused_output);
         if matches!(state, KeyState::Pressed) {
@@ -597,6 +642,140 @@ impl DesktopState {
         self.mark_focused_output_full_damage(DamageSource::Unknown);
     }
 
+    fn handle_physical_keyboard_input(&mut self, event: InputEvent) {
+        let InputEvent::Key { keycode, state, .. } = event else {
+            unreachable!("physical keyboard handler received a non-key event");
+        };
+        for transition in self.filter_physical_key_event(keycode, state) {
+            self.dispatch_accessible_key_transition(transition);
+        }
+    }
+
+    pub(crate) fn filter_physical_key_event(
+        &mut self,
+        keycode: u32,
+        state: KeyState,
+    ) -> Vec<crate::core::keyboard_accessibility::KeyTransition> {
+        let role = self.keyboard_accessibility_key_role(keycode);
+        let output = self
+            .keyboard_accessibility
+            .process(keycode, state, role, Instant::now());
+        self.apply_keyboard_accessibility_feedback(output.feedback);
+        output.events
+    }
+
+    pub(crate) fn tick_keyboard_accessibility(&mut self) {
+        if self.lock_screen.active {
+            return;
+        }
+        let output = self.keyboard_accessibility.tick(Instant::now());
+        self.apply_keyboard_accessibility_feedback(output.feedback);
+        for transition in output.events {
+            self.dispatch_accessible_key_transition(transition);
+        }
+    }
+
+    fn apply_keyboard_accessibility_feedback(
+        &mut self,
+        feedback_events: Vec<crate::core::keyboard_accessibility::Feedback>,
+    ) {
+        use crate::core::keyboard_accessibility::Feedback;
+
+        for feedback in feedback_events {
+            match feedback {
+                Feedback::StickyShortcutRequested => {
+                    self.open_sticky_keys_shortcut_dialog();
+                }
+                Feedback::ModifierLatched if self.input_settings.accessibility.visual_feedback => {
+                    notification_service_notify(
+                        "Sticky Keys",
+                        "Modifier latched for the next key",
+                        Some(Duration::from_secs(2)),
+                    );
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
+                Feedback::ModifierReleased if self.input_settings.accessibility.visual_feedback => {
+                    notification_service_notify(
+                        "Sticky Keys",
+                        "Latched modifier released",
+                        Some(Duration::from_secs(2)),
+                    );
+                    self.mark_focused_output_full_damage(DamageSource::Unknown);
+                }
+                Feedback::ModifierLatched | Feedback::ModifierReleased => {}
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_accessible_key_transition(
+        &mut self,
+        transition: crate::core::keyboard_accessibility::KeyTransition,
+    ) {
+        self.handle_keyboard_input(InputEvent::Key {
+            keycode: transition.keycode,
+            state: transition.state,
+            repeat: false,
+            modifiers: self.input.modifiers,
+        });
+    }
+
+    fn keyboard_accessibility_key_role(
+        &self,
+        keycode: u32,
+    ) -> crate::core::keyboard_accessibility::KeyRole {
+        use crate::core::keyboard_accessibility::KeyRole;
+
+        // libinput/Smithay key codes carry XKB's +8 offset. Winit's physical
+        // scancodes are raw evdev values, so normalize both backends here.
+        let evdev = if self.backend_kind == CompositorBackend::Drm {
+            keycode.saturating_sub(8)
+        } else {
+            keycode
+        };
+        match evdev {
+            42 | 54 => KeyRole::Shift,
+            29 | 56 | 97 | 100 | 125 | 126 => KeyRole::Modifier,
+            _ => KeyRole::Other,
+        }
+    }
+
+    fn open_sticky_keys_shortcut_dialog(&mut self) {
+        if self.active_dialog.is_some() {
+            return;
+        }
+        let enabling = !self.input_settings.accessibility.sticky_keys;
+        let dialog_id = self.alloc_dialog_id();
+        let dialog = Dialog {
+            id: dialog_id,
+            kind: DialogKind::Confirm,
+            title: "Sticky Keys shortcut".into(),
+            message: if enabling {
+                "You pressed Shift five times. Enable Sticky Keys?"
+            } else {
+                "You pressed Shift five times. Disable Sticky Keys?"
+            }
+            .into(),
+            buttons: vec![
+                DialogButton {
+                    label: "Cancel".into(),
+                    action: DialogAction::Cancel,
+                },
+                DialogButton {
+                    label: if enabling { "Enable" } else { "Disable" }.into(),
+                    action: DialogAction::Confirm,
+                },
+            ],
+            modal: true,
+            dismissible: true,
+            state: DialogState::Open,
+            owner_output: self.focused_output,
+            bounds: self.focused_output_screen(),
+        };
+        self.pending_sidebar_dialogs
+            .insert(dialog_id, SidebarDialogKind::ToggleStickyKeys);
+        self.open_dialog(dialog);
+    }
+
     fn handle_pointer_motion(&mut self, event: InputEvent) {
         let InputEvent::PointerMoved {
             position,
@@ -617,6 +796,7 @@ impl DesktopState {
         if let Some(id) = self.output_under_pointer(position) {
             self.set_focused_output(id);
         }
+        self.update_magnifier_pointer_focus(position);
         // Keep the visible cursor in lockstep with the compositor's logical pointer before an
         // overlay gets a chance to consume the event.
         self.cursor_manager.move_to(position.x, position.y);
@@ -754,6 +934,108 @@ impl DesktopState {
         }
     }
 
+    fn handle_gesture_swipe_begin(&mut self, fingers: u32, time_msec: u32) {
+        let captured = self.input_settings.workspace_swipe_fingers != 0
+            && fingers == self.input_settings.workspace_swipe_fingers;
+        if captured {
+            self.forget_workspace_transition(self.focused_output);
+            self.mark_focused_output_full_damage(DamageSource::Unknown);
+        }
+        self.workspace_swipe = Some(WorkspaceSwipe {
+            captured,
+            delta_x: 0.0,
+            delta_y: 0.0,
+            velocity_x: 0.0,
+            velocity_y: 0.0,
+            last_update_msec: time_msec,
+        });
+        if !captured {
+            if let Some(pointer) = self.seat.get_pointer() {
+                pointer.gesture_swipe_begin(
+                    self,
+                    &GestureSwipeBeginEvent {
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: time_msec,
+                        fingers,
+                    },
+                );
+            }
+        }
+    }
+
+    fn handle_gesture_swipe_update(&mut self, delta: focaldesk_input::Delta, time_msec: u32) {
+        let forward = self.workspace_swipe.is_some_and(|swipe| !swipe.captured);
+        let mut interactive_delta = None;
+        if let Some(swipe) = self.workspace_swipe.as_mut() {
+            swipe.delta_x += delta.x;
+            swipe.delta_y += delta.y;
+            let elapsed_msec = time_msec.wrapping_sub(swipe.last_update_msec);
+            if elapsed_msec > 0 {
+                let elapsed = f64::from(elapsed_msec);
+                let velocity_x = delta.x / elapsed;
+                let velocity_y = delta.y / elapsed;
+                if swipe.velocity_x == 0.0 && swipe.velocity_y == 0.0 {
+                    swipe.velocity_x = velocity_x;
+                    swipe.velocity_y = velocity_y;
+                } else {
+                    swipe.velocity_x = swipe.velocity_x * 0.55 + velocity_x * 0.45;
+                    swipe.velocity_y = swipe.velocity_y * 0.55 + velocity_y * 0.45;
+                }
+            }
+            swipe.last_update_msec = time_msec;
+            if swipe.captured {
+                interactive_delta = Some((swipe.delta_x, swipe.delta_y));
+            }
+        }
+        if let Some((delta_x, delta_y)) = interactive_delta {
+            self.update_interactive_workspace_transition(delta_x, delta_y);
+        }
+        if forward {
+            if let Some(pointer) = self.seat.get_pointer() {
+                pointer.gesture_swipe_update(
+                    self,
+                    &GestureSwipeUpdateEvent {
+                        time: time_msec,
+                        delta: (delta.x, delta.y).into(),
+                    },
+                );
+            }
+        }
+    }
+
+    fn handle_gesture_swipe_end(&mut self, cancelled: bool, time_msec: u32) {
+        let Some(swipe) = self.workspace_swipe.take() else {
+            return;
+        };
+        if !swipe.captured {
+            if let Some(pointer) = self.seat.get_pointer() {
+                pointer.gesture_swipe_end(
+                    self,
+                    &GestureSwipeEndEvent {
+                        serial: SERIAL_COUNTER.next_serial(),
+                        time: time_msec,
+                        cancelled,
+                    },
+                );
+            }
+            return;
+        }
+        let current = self.focused_workspace().0;
+        let last = self.workspace_names.len() as u32;
+        let target = workspace_swipe_target(
+            current,
+            last,
+            swipe.delta_x,
+            swipe.delta_y,
+            swipe.velocity_x,
+            swipe.velocity_y,
+            self.input_settings.workspace_swipe_distance,
+            cancelled,
+        )
+        .map(WorkspaceId);
+        self.settle_interactive_workspace_transition(target);
+    }
+
     fn handle_pointer_entered(&mut self) {
         self.cursor_manager.set_visible(true);
         self.update_cursor_owner_damage();
@@ -815,6 +1097,50 @@ mod tests {
                 shortcuts: ModMask::empty(),
             },
         }
+    }
+
+    #[test]
+    fn workspace_swipes_require_distance_and_horizontal_intent() {
+        assert_eq!(
+            workspace_swipe_target(2, 4, -140.0, 20.0, 0.0, 0.0, 120.0, false),
+            Some(3)
+        );
+        assert_eq!(
+            workspace_swipe_target(2, 4, 140.0, 20.0, 0.0, 0.0, 120.0, false),
+            Some(1)
+        );
+        assert_eq!(
+            workspace_swipe_target(2, 4, -100.0, 10.0, 0.0, 0.0, 120.0, false),
+            None
+        );
+        assert_eq!(
+            workspace_swipe_target(2, 4, -140.0, 130.0, 0.0, 0.0, 120.0, false),
+            None
+        );
+        assert_eq!(
+            workspace_swipe_target(2, 4, -140.0, 20.0, 0.0, 0.0, 120.0, true),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_swipes_stop_at_workspace_edges() {
+        assert_eq!(
+            workspace_swipe_target(1, 4, 140.0, 0.0, 0.0, 0.0, 120.0, false),
+            None
+        );
+        assert_eq!(
+            workspace_swipe_target(4, 4, -140.0, 0.0, 0.0, 0.0, 120.0, false),
+            None
+        );
+    }
+
+    #[test]
+    fn workspace_swipes_accept_a_fast_horizontal_fling() {
+        assert_eq!(
+            workspace_swipe_target(2, 4, -55.0, 4.0, -0.8, 0.05, 120.0, false),
+            Some(3)
+        );
     }
 
     #[test]

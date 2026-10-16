@@ -1725,10 +1725,12 @@ mod tests {
             scene_to_output_matrix(ColorDescription::DISPLAY_P3_SRGB, RenderingIntent::Relative),
             clipped_scene,
         );
-        assert!(clipped_result
-            .into_iter()
-            .zip(p3_red)
-            .any(|(actual, expected)| (actual - expected).abs() > 0.02));
+        assert!(
+            clipped_result
+                .into_iter()
+                .zip(p3_red)
+                .any(|(actual, expected)| (actual - expected).abs() > 0.02)
+        );
     }
 
     #[test]

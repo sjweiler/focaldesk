@@ -449,9 +449,10 @@ mod tests {
     fn edid_md5_hex_is_lowercase_32_chars() {
         let hash = edid_md5_hex(b"edid-bytes");
         assert_eq!(hash.len(), 32);
-        assert!(hash
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

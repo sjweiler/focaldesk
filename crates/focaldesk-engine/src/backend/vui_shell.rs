@@ -24,6 +24,7 @@ use vui_core::{
     SizedBox, Slider, Spacer, Stack, Surface, Switch, Theme, ThemeScope, UiRuntime, Widget,
     WidgetId,
 };
+use vui_text::ParleyTextSystem;
 use vui_vello::TextureRenderer;
 
 use super::wgpu_nested::VulkanCompositorScene;
@@ -32,6 +33,7 @@ use focaldesk_input::{InputEvent, KeyState, MouseButton, ScrollDelta};
 const TEXTURE_CACHE_KEY: u64 = 0x5655_492d_5348_454c;
 const MAX_SURFACE_LOGICAL_WIDTH: f64 = 560.0;
 const MAX_SURFACE_LOGICAL_HEIGHT: f64 = 960.0;
+const SHELL_FONT: &[u8] = include_bytes!("../../../../assets/fonts/IBMPlexSans-Regular.ttf");
 
 type ActionQueue = Rc<RefCell<Vec<UiAction>>>;
 
@@ -41,6 +43,7 @@ pub(crate) struct QuickSettingsState {
     pub(crate) bluetooth: bool,
     pub(crate) do_not_disturb: bool,
     pub(crate) volume: f64,
+    pub(crate) night_light: bool,
 }
 
 pub(crate) struct VuiShell {
@@ -119,7 +122,10 @@ impl VuiShell {
         let dismissed_overlay_open = overlay_open.clone();
         let root = OverlayHost::new(SizedBox::new(base).fill_width().fill_height())
             .on_dismiss(move || dismissed_overlay_open.set(false));
-        let mut runtime = UiRuntime::new(root);
+        let mut runtime = UiRuntime::new(root).with_text_system(
+            ParleyTextSystem::with_embedded_fonts([SHELL_FONT])
+                .expect("the embedded IBM Plex Sans shell font must be valid"),
+        );
         runtime.set_transparent(true);
         runtime.set_theme(vui_shell_theme());
         let viewport = logical_size(width, height, scale_factor, dock_visible);
@@ -354,7 +360,10 @@ impl VuiShell {
                     KeyState::Released => Event::KeyUp(key),
                 }
             }
-            InputEvent::PointerEntered => return false,
+            InputEvent::PointerEntered
+            | InputEvent::GestureSwipeBegin { .. }
+            | InputEvent::GestureSwipeUpdate { .. }
+            | InputEvent::GestureSwipeEnd { .. } => return false,
         };
         self.runtime.handle_event(&event)
     }
@@ -1208,10 +1217,32 @@ fn quick_settings_view(
     );
     let focus = Column::new([Box::new(dnd) as Box<dyn Widget>]).gap(10.0);
 
+    let comfort_actions = actions.clone();
+    let comfort_settings = settings.clone();
+    let night_light_label = if settings.get().night_light {
+        "Night Light — active"
+    } else {
+        "Night Light — off"
+    };
+    let night_light = Switch::new(
+        night_light_label,
+        settings.get().night_light,
+        move |enabled| {
+            let mut current = comfort_settings.get();
+            current.night_light = enabled;
+            comfort_settings.set(current);
+            comfort_actions
+                .borrow_mut()
+                .push(UiAction::SetNightLight(enabled));
+        },
+    );
+    let comfort = Column::new([Box::new(night_light) as Box<dyn Widget>]).gap(10.0);
+
     let accordion = Accordion::new([
         AccordionSection::new("Network", network).expanded(true),
         AccordionSection::new("Audio", audio),
         AccordionSection::new("Focus", focus),
+        AccordionSection::new("Display", comfort),
     ]);
     let lock_actions = actions.clone();
     let settings_actions = actions.clone();
@@ -1328,6 +1359,7 @@ mod tests {
                 bluetooth: false,
                 do_not_disturb: false,
                 volume: 0.7,
+                night_light: false,
             },
             false,
             false,
@@ -1356,6 +1388,20 @@ mod tests {
         assert!(!opened.semantics.iter().any(|node| {
             node.role == vui_core::SemanticRole::Button && node.label == "Quick Settings"
         }));
+        assert!(
+            opened
+                .paint
+                .operations()
+                .iter()
+                .any(|operation| matches!(operation, vui_core::PaintOp::GlyphRun { .. }))
+        );
+        assert!(
+            !opened
+                .paint
+                .operations()
+                .iter()
+                .any(|operation| matches!(operation, vui_core::PaintOp::Text { .. }))
+        );
 
         assert!(shell.handle_input(&InputEvent::PointerButton {
             button: MouseButton::Left,
@@ -1382,6 +1428,7 @@ mod tests {
                 bluetooth: false,
                 do_not_disturb: false,
                 volume: 0.7,
+                night_light: false,
             },
             false,
             false,
@@ -1410,6 +1457,7 @@ mod tests {
             bluetooth: false,
             do_not_disturb: false,
             volume: 0.7,
+            night_light: false,
         }));
         let mut runtime = UiRuntime::new(quick_settings_panel(actions.clone(), settings));
         runtime.set_viewport(Size::new(500.0, 800.0));
@@ -1423,10 +1471,12 @@ mod tests {
         for label in ["Audio", "Focus", "Lock", "Settings"] {
             assert!(frame.semantics.iter().any(|node| node.label == label));
         }
-        assert!(!frame
-            .semantics
-            .iter()
-            .any(|node| node.label == "VUI compositor surface"));
+        assert!(
+            !frame
+                .semantics
+                .iter()
+                .any(|node| node.label == "VUI compositor surface")
+        );
 
         let position = Point::new(wifi.x + wifi.width / 2.0, wifi.y + wifi.height / 2.0);
         assert!(runtime.handle_event(&Event::PointerDown {
@@ -1452,6 +1502,7 @@ mod tests {
             bluetooth: false,
             do_not_disturb: false,
             volume: 0.7,
+            night_light: false,
         }));
         let requested = Rc::new(Cell::new(false));
         let overlay_open = Rc::new(Cell::new(false));

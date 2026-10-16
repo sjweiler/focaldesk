@@ -18,8 +18,10 @@ saves them. Invalid or conflicting overrides are ignored individually.
 | `Super+L` | Lock the session | Working |
 | `Super+V` | Open clipboard history | Working |
 | `Super+Shift+V` | Toggle voice capture | Experimental |
+| `Super++` / `Super+-` | Increase or decrease magnification on the focused display | Working |
 | `Super+F7` | Focus the previous window | Working |
 | `Super+F8` | Focus the next window | Working |
+| `Alt+Tab` / `Shift+Alt+Tab` | Cycle applications forward or backward | Working |
 | `Super+Left` / `Super+Right` | Place or restore the focused window in a side-by-side split | Requires **Enable split screen** |
 | `Super+Up` / `Super+Down` | Place or restore the focused window in a top/bottom split | Requires **Enable split screen** |
 | `Super+Z` | Open the split-layout chooser for the focused window | Requires **Enable split screen** |
@@ -94,6 +96,8 @@ Supported action names are `launch_terminal`, `launch_ai_console`, `launch_brows
 `toggle_launcher`, `close_focused`, `lock_screen`, `focus_next`,
 `focus_previous`, `focus_shell_next`, `focus_shell_previous`,
 `toggle_clipboard_history`, `toggle_voice_capture`, `split_left`,
+`magnifier_zoom_in`, `magnifier_zoom_out`, `toggle_night_light`,
+`cycle_color_filter`,
 `split_right`, `split_top`, `split_bottom`, `toggle_split_layout`,
 `swap_split_left`, `swap_split_right`, `swap_split_top`, `swap_split_bottom`,
 `resize_split_left`, `resize_split_right`, `resize_split_top`,

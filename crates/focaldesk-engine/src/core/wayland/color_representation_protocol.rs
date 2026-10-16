@@ -8,8 +8,8 @@
 use crate::core::desktop::DesktopState;
 use smithay::backend::allocator::{Buffer as _, Fourcc};
 use smithay::wayland::compositor::{
-    add_destruction_hook, add_pre_commit_hook, with_states, BufferAssignment, Cacheable,
-    SurfaceAttributes,
+    BufferAssignment, Cacheable, SurfaceAttributes, add_destruction_hook, add_pre_commit_hook,
+    with_states,
 };
 use smithay::wayland::dmabuf::get_dmabuf;
 use std::collections::HashMap;
@@ -18,7 +18,7 @@ use wayland_protocols::wp::color_representation::v1::server::{
 };
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{
-    backend, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
+    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend,
 };
 
 #[derive(Default)]

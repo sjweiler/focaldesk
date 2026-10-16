@@ -6,7 +6,7 @@
 //! round-trip through the monitor-specific scanout encoding.
 
 use crate::core::color::{
-    linear_to_srgb, scene_to_output_matrix, ColorDescription, RenderingIntent,
+    ColorDescription, RenderingIntent, linear_to_srgb, scene_to_output_matrix,
 };
 use anyhow::{Context, Result};
 use png::{BitDepth, ColorType, Info, ScaledFloat, SourceChromaticities};

@@ -1,7 +1,7 @@
 use focaldesk_types::CompositorBackend;
 use smithay::input::{
-    pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
     Seat, SeatHandler, SeatState,
+    pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;

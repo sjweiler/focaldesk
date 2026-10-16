@@ -5,7 +5,10 @@ use focaldesk_notifications::NotificationManager;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-fn main() -> Result<()> {
+mod dbus;
+
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     flog_info!("FocalDesk notifications daemon starting...");
@@ -18,7 +21,7 @@ fn main() -> Result<()> {
     let settings = focaldesk_settings_core::load_settings();
     manager.set_history_limit(settings.privacy.notification_history_limit as usize);
     manager.load_history(&state_path);
-    serve_notification_ipc(Arc::new(Mutex::new(manager)), state_path);
-    std::thread::park();
-    Ok(())
+    let manager = Arc::new(Mutex::new(manager));
+    serve_notification_ipc(manager.clone(), state_path.clone());
+    dbus::run(manager, state_path).await
 }

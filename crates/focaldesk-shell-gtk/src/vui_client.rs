@@ -18,9 +18,9 @@ use gtk::{cairo, glib, prelude::*};
 use gtk4_layer_shell::LayerShell;
 use vui_core::{
     BoxConstraints, Button, ButtonVariant, Column, CrossAxisAlignment, Event, EventCtx, Flex,
-    FlexChild, IconButton, IconData, IconName, Insets, Label, LayoutCtx, PaintCtx, PathCommand,
-    Point, PointerButton, Rect, SemanticsCtx, Size, Spacer, Stack, Surface, Theme, UiRuntime,
-    Widget,
+    FlexChild, IconButton, IconData, IconName, Insets, Label, LayoutCtx, MainAxisAlignment,
+    PaintCtx, PathCommand, Point, PointerButton, Rect, SemanticsCtx, Size, Spacer, Stack, Surface,
+    Theme, UiRuntime, Widget,
 };
 use vui_text::ParleyTextSystem;
 use vui_vello::ReadbackRenderer;
@@ -931,7 +931,7 @@ fn rail_root(
         .max(1);
     let workspace_count = snapshot
         .as_ref()
-        .map(|snapshot| snapshot.shell.workspace_count.max(1).min(9))
+        .map(|snapshot| snapshot.shell.workspace_count.clamp(1, 9))
         .unwrap_or(4);
     let max_workspace_slots = snapshot
         .as_ref()
@@ -1000,7 +1000,7 @@ fn rail_root(
     ] {
         buttons.push(button(
             label,
-            open_panel(&connector, panel),
+            open_panel(connector, panel),
             actions.clone(),
             label == "Wi" && network_active,
             false,
@@ -1047,7 +1047,8 @@ fn rail_root(
             ));
         }
         let shell = &snapshot.shell;
-        let externally_powered = shell.line_power_online == Some(true);
+        let externally_powered = shell.line_power_online == Some(true)
+            || (shell.line_power_online.is_none() && shell.battery_percent.is_none());
         let status_label = match (
             shell.battery_percent,
             shell.line_power_online,
@@ -1061,16 +1062,19 @@ fn rail_root(
             (Some(percent), None, true) => format!("Battery {percent}% · charging"),
             (Some(percent), None, false) => format!("Battery {percent}%"),
             (None, Some(true), _) => "External power".into(),
-            (None, _, _) => "Power source unavailable".into(),
+            (None, None, _) => "External power (assumed; no battery reported)".into(),
+            (None, Some(false), _) => "Battery unavailable · on battery".into(),
         };
         buttons.push(status_button(
-            if externally_powered || shell.battery_charging {
+            if externally_powered {
                 power_source_plug_icon()
             } else {
                 app_icon(AppIcon::Battery)
             },
             status_label,
-            open_panel(connector, ShellPanel::Power),
+            DesktopAction::OpenSettingsPanel {
+                panel: "power".into(),
+            },
             actions.clone(),
             shell.battery_charging,
             false,
@@ -1121,7 +1125,7 @@ fn rail_root(
     ] {
         buttons.push(button(
             label,
-            open_panel(&connector, panel),
+            open_panel(connector, panel),
             actions.clone(),
             (label == "Nt" && notification_active) || (label == "Up" && updates_active),
             false,
@@ -1134,12 +1138,10 @@ fn rail_root(
         .to_string();
     buttons.insert(
         buttons.len().saturating_sub(3),
-        button(
+        rail_clock_button(
             &clock,
             open_panel(connector, ShellPanel::Calendar),
             actions.clone(),
-            false,
-            false,
         ),
     );
     let rail = Surface::new(Column::new(buttons).gap(4.0))
@@ -1262,6 +1264,47 @@ fn rail_text_button(
     } else {
         Box::new(vui_core::SizedBox::new(control).width(44.0).height(44.0))
     }
+}
+
+fn rail_clock_button(
+    clock: &str,
+    action: DesktopAction,
+    actions: Rc<RefCell<Vec<DesktopAction>>>,
+) -> Box<dyn Widget> {
+    let click_actions = actions.clone();
+    let click_target = IconButton::data(
+        IconData::new(Size::new(24.0, 24.0), Vec::new()),
+        "Calendar and clock",
+        move || click_actions.borrow_mut().push(action.clone()),
+    );
+    let display: Box<dyn Widget> = if let Some((time, period)) = clock.split_once('\n') {
+        Box::new(
+            vui_core::SizedBox::new(
+                Flex::column([
+                    FlexChild::fixed(VisualOnlyLabel(Label::new(time).text_size(10.0))),
+                    FlexChild::fixed(VisualOnlyLabel(Label::new(period).text_size(9.0))),
+                ])
+                .main_alignment(MainAxisAlignment::Center)
+                .cross_alignment(CrossAxisAlignment::Center),
+            )
+            .width(44.0)
+            .height(44.0),
+        )
+    } else {
+        Box::new(
+            vui_core::SizedBox::new(VisualOnlyLabel(Label::new(clock).text_size(10.0)))
+                .width(44.0)
+                .height(44.0),
+        )
+    };
+    let centered = Stack::new([Box::new(click_target) as Box<dyn Widget>, display])
+        .horizontal_alignment(CrossAxisAlignment::Center)
+        .vertical_alignment(CrossAxisAlignment::Center);
+    let control = Surface::new(centered)
+        .background(vui_core::Color::rgba(74, 88, 110, 26))
+        .border(vui_core::Color::rgba(112, 132, 156, 70), 1.0)
+        .radius(12.0);
+    Box::new(vui_core::SizedBox::new(control).width(44.0).height(44.0))
 }
 
 fn dock_root(
@@ -1387,6 +1430,24 @@ fn dock_root(
             ),
         );
     }
+    buttons.push(button(
+        "Ap",
+        DesktopAction::LaunchApp {
+            app: "@launcher".into(),
+        },
+        actions.clone(),
+        false,
+        false,
+    ));
+    buttons.push(button(
+        "Se",
+        DesktopAction::LaunchApp {
+            app: "@settings".into(),
+        },
+        actions.clone(),
+        false,
+        false,
+    ));
     let snapshot = latest_snapshot.borrow();
     if let Some(snapshot) = snapshot.as_ref() {
         let output = crate::output_for_connector(snapshot, connector);
@@ -1411,6 +1472,14 @@ fn dock_root(
             } else {
                 groups.push((identity, vec![window]));
             }
+        }
+        if !groups.is_empty() {
+            let separator = Surface::new(Spacer::new(1.0, 28.0))
+                .background(vui_core::Color::rgba(112, 128, 150, 100))
+                .radius(1.0);
+            buttons.push(Box::new(
+                vui_core::SizedBox::new(separator).width(1.0).height(28.0),
+            ));
         }
         let capacity = 4usize;
         let has_overflow = groups.len() > capacity;
@@ -1487,35 +1556,20 @@ fn dock_root(
         }
     }
     drop(snapshot);
-    buttons.push(button(
-        "Ap",
-        DesktopAction::LaunchApp {
-            app: "@launcher".into(),
-        },
-        actions.clone(),
-        false,
-        false,
-    ));
-    buttons.push(button(
-        "Se",
-        DesktopAction::LaunchApp {
-            app: "@settings".into(),
-        },
-        actions.clone(),
-        false,
-        false,
-    ));
-    let buttons = buttons.into_iter();
-    let shelf = Surface::new(Flex::row(buttons.map(FlexChild::from)).gap(4.0))
-        .padding(Insets {
-            left: 8.0,
-            top: 6.0,
-            right: 8.0,
-            bottom: 6.0,
-        })
-        .background(vui_core::Color::rgba(20, 24, 32, 230))
-        .border(vui_core::Color::rgba(112, 128, 150, 194), 1.0)
-        .radius(16.0);
+    let shelf = Surface::new(
+        Flex::row(buttons.into_iter().map(FlexChild::from))
+            .gap(4.0)
+            .cross_alignment(vui_core::CrossAxisAlignment::Center),
+    )
+    .padding(Insets {
+        left: 8.0,
+        top: 6.0,
+        right: 8.0,
+        bottom: 6.0,
+    })
+    .background(vui_core::Color::rgba(20, 24, 32, 230))
+    .border(vui_core::Color::rgba(112, 128, 150, 194), 1.0)
+    .radius(16.0);
     let centered = Flex::row([
         FlexChild::flexible(1.0, Spacer::new(0.0, 0.0)),
         FlexChild::fixed(shelf),

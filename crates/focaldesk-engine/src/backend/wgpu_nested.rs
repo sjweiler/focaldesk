@@ -74,6 +74,7 @@ struct WgpuShellAssets {
 struct WgpuSceneDesktop<'a> {
     state: &'a mut crate::core::desktop::DesktopState,
     output_id: focaldesk_types::OutputId,
+    workspace_views: Vec<crate::core::desktop::WorkspaceRenderView>,
 }
 
 pub(crate) struct VulkanCompositorScene {
@@ -125,7 +126,21 @@ impl VulkanSceneBuilder {
         rasterize_egui: bool,
     ) -> VulkanCompositorScene {
         state.sync_egui_for_output(output_id, Instant::now());
-        let damage = state
+        if state.has_workspace_transition(output_id) {
+            state.mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+        }
+        let magnifier_view = state.magnifier_view_for_output(output_id);
+        let output_size = state
+            .outputs
+            .get(&output_id)
+            .map(|output| {
+                Size::<i32, Physical>::from((
+                    (f64::from(output.logical_size.w) * output.scale_factor).round() as i32,
+                    (f64::from(output.logical_size.h) * output.scale_factor).round() as i32,
+                ))
+            })
+            .unwrap_or_else(|| Size::from((1, 1)));
+        let mut damage = state
             .outputs
             .get(&output_id)
             .map(|output| {
@@ -136,8 +151,18 @@ impl VulkanSceneBuilder {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let mut desktop = WgpuSceneDesktop { state, output_id };
-        let (background, overlay) = collect_shell_quads(&mut desktop);
+        let output_width = state
+            .outputs
+            .get(&output_id)
+            .map(|output| output.logical_size.w)
+            .unwrap_or(1);
+        let workspace_views = state.workspace_render_views(output_id, output_width, Instant::now());
+        let mut desktop = WgpuSceneDesktop {
+            state,
+            output_id,
+            workspace_views,
+        };
+        let (mut background, mut overlay) = collect_shell_quads(&mut desktop);
         prepare_shell_text(&mut desktop, &mut self.assets);
         let mut surfaces = Vec::new();
         append_wallpaper_quads(&mut desktop, &mut self.assets, &mut surfaces);
@@ -154,10 +179,10 @@ impl VulkanSceneBuilder {
         let overlay_after_surface = surfaces.len();
         append_notification_text_quads(&desktop, &mut self.assets, &mut surfaces);
         let foreground_after_surface = surfaces.len();
-        let foreground = collect_modal_quads(&desktop);
+        let mut foreground = collect_modal_quads(&desktop);
         append_modal_text_quads(&desktop, &mut self.assets, &mut surfaces);
         let egui_before_surface = surfaces.len();
-        let (egui_textures, egui_meshes, egui_raster) =
+        let (mut egui_textures, mut egui_meshes, egui_raster) =
             collect_egui_meshes(&mut desktop, rasterize_egui);
         if let Some(raster) = egui_raster {
             surfaces.push(TextureQuad {
@@ -196,6 +221,20 @@ impl VulkanSceneBuilder {
             self.surface_commits.clear();
             self.rejected_surface_buffers.clear();
         }
+        if magnifier_view.zoom > 1.001 {
+            magnify_scene(
+                magnifier_view,
+                output_size,
+                &mut background,
+                &mut surfaces,
+                &mut overlay,
+                &mut foreground,
+                &mut egui_textures,
+                &mut egui_meshes,
+            );
+            damage = vec![[0, 0, output_size.w, output_size.h]];
+        }
+        let cursor_start = surfaces.len();
         let cursor_present = software_cursor
             && append_cursor_texture_quads(
                 &mut desktop,
@@ -204,6 +243,14 @@ impl VulkanSceneBuilder {
                 cpu_dmabuf_fallback,
                 &mut surfaces,
             );
+        if cursor_present && magnifier_view.zoom > 1.001 {
+            for cursor in &mut surfaces[cursor_start..] {
+                let original_size = [cursor.destination[2], cursor.destination[3]];
+                cursor.destination = magnifier_view.transform_rect(cursor.destination, output_size);
+                cursor.destination[2] = original_size[0];
+                cursor.destination[3] = original_size[1];
+            }
+        }
         VulkanCompositorScene {
             background,
             surfaces,
@@ -222,6 +269,35 @@ impl VulkanSceneBuilder {
 
     pub(crate) fn clear(&mut self) {
         *self = Self::default();
+    }
+}
+
+fn magnify_scene(
+    view: crate::core::magnifier::MagnifierView,
+    output_size: Size<i32, Physical>,
+    background: &mut [SolidQuad],
+    surfaces: &mut [TextureQuad],
+    overlay: &mut [SolidQuad],
+    foreground: &mut [SolidQuad],
+    egui_textures: &mut [TextureQuad],
+    egui_meshes: &mut [TexturedMesh],
+) {
+    for quad in background
+        .iter_mut()
+        .chain(overlay.iter_mut())
+        .chain(foreground.iter_mut())
+    {
+        quad.destination = view.transform_rect(quad.destination, output_size);
+        quad.corner_radius *= view.zoom as f32;
+    }
+    for quad in surfaces.iter_mut().chain(egui_textures.iter_mut()) {
+        quad.destination = view.transform_rect(quad.destination, output_size);
+    }
+    for mesh in egui_meshes {
+        mesh.clip_rect = view.transform_rect(mesh.clip_rect, output_size);
+        for vertex in &mut mesh.vertices {
+            vertex.position = view.transform_point(vertex.position, output_size);
+        }
     }
 }
 
@@ -675,6 +751,7 @@ impl ApplicationHandler for NestedVulkanApp {
                 bluetooth: false,
                 do_not_disturb: desktop.state.do_not_disturb,
                 volume: 0.7,
+                night_light: desktop.state.accessibility_settings.night_light.enabled,
             };
             VuiShell::new(
                 window_size.width,
@@ -1452,7 +1529,20 @@ fn append_wallpaper_quads(
 ) {
     let output_id = desktop.output_id;
     let theme = desktop.state.theme.active_theme();
-    let path = theme.wallpaper.path.clone();
+    let active_workspace = desktop
+        .state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.active_workspace.0)
+        .unwrap_or(desktop.state.active_workspace.0);
+    let path = desktop
+        .state
+        .workspaces
+        .workspace_wallpapers
+        .get(&active_workspace)
+        .filter(|path| !path.trim().is_empty())
+        .cloned()
+        .or_else(|| theme.wallpaper.path.clone());
     if assets.wallpaper_path != path {
         assets.wallpaper_path.clone_from(&path);
         assets.wallpaper = path.as_deref().and_then(|path| {
@@ -1864,25 +1954,6 @@ fn collect_shm_surfaces(
     let scale = output_state
         .map(|output| output.scale_factor)
         .unwrap_or(1.0);
-    let visible_windows: HashSet<_> = output_state
-        .map(|output| {
-            desktop
-                .state
-                .windows
-                .iter()
-                .filter(|window| {
-                    crate::core::render::managed_window_is_visible_on_output(
-                        &desktop.state.space,
-                        window,
-                        output.active_workspace,
-                        &output.handle,
-                    )
-                })
-                .map(|window| &window.window)
-                .collect()
-        })
-        .unwrap_or_default();
-
     let mut output = Vec::new();
     if let Some(output_state) = output_state {
         collect_shm_layers(
@@ -1896,30 +1967,62 @@ fn collect_shm_surfaces(
             &mut output,
         );
     }
-    for window in desktop.state.space.elements() {
-        if !visible_windows.contains(window) {
-            continue;
-        }
-        let Some(window_location) = desktop.state.space.element_location(window) else {
-            continue;
-        };
-        let Some(root) = window.wl_surface() else {
-            continue;
-        };
-        let output_origin = output_state
-            .map(|output| output.logical_origin)
+    for view in &desktop.workspace_views {
+        let visible_windows: HashSet<_> = output_state
+            .map(|output| {
+                desktop
+                    .state
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        crate::core::render::managed_window_is_visible_on_output(
+                            &desktop.state.space,
+                            window,
+                            view.workspace,
+                            &output.handle,
+                        )
+                    })
+                    .map(|window| &window.window)
+                    .collect()
+            })
             .unwrap_or_default();
-        let window_origin = window_location - window.geometry().loc - output_origin;
 
-        // Smithay's downward traversal and popup iterator are front-to-back,
-        // while wgpu draws in painter's order. Build one front-to-back window
-        // list, then reverse it before appending to the back-to-front Space.
-        let mut window_surfaces = Vec::new();
-        for (popup, popup_offset) in PopupManager::popups_for_surface(&root) {
-            let popup_origin = window_origin + popup_offset - popup.geometry().loc;
+        for window in desktop.state.space.elements() {
+            if !visible_windows.contains(window) {
+                continue;
+            }
+            let Some(window_location) = desktop.state.space.element_location(window) else {
+                continue;
+            };
+            let Some(root) = window.wl_surface() else {
+                continue;
+            };
+            let output_origin = output_state
+                .map(|output| output.logical_origin)
+                .unwrap_or_default();
+            let mut window_origin = window_location - window.geometry().loc - output_origin;
+            window_origin.x += view.offset_x;
+
+            // Smithay's downward traversal and popup iterator are front-to-back,
+            // while wgpu draws in painter's order. Build one front-to-back window
+            // list, then reverse it before appending to the back-to-front Space.
+            let mut window_surfaces = Vec::new();
+            for (popup, popup_offset) in PopupManager::popups_for_surface(&root) {
+                let popup_origin = window_origin + popup_offset - popup.geometry().loc;
+                collect_shm_surface_tree(
+                    popup.wl_surface(),
+                    popup_origin,
+                    scale,
+                    surface_commits,
+                    rejected_surface_buffers,
+                    cpu_dmabuf_fallback,
+                    &desktop.state.surface_colors,
+                    &mut window_surfaces,
+                );
+            }
             collect_shm_surface_tree(
-                popup.wl_surface(),
-                popup_origin,
+                &root,
+                window_origin,
                 scale,
                 surface_commits,
                 rejected_surface_buffers,
@@ -1927,31 +2030,21 @@ fn collect_shm_surfaces(
                 &desktop.state.surface_colors,
                 &mut window_surfaces,
             );
-        }
-        collect_shm_surface_tree(
-            &root,
-            window_origin,
-            scale,
-            surface_commits,
-            rejected_surface_buffers,
-            cpu_dmabuf_fallback,
-            &desktop.state.surface_colors,
-            &mut window_surfaces,
-        );
-        if let Some(auto_hdr) = auto_hdr_for_window(desktop, window) {
-            for surface in &mut window_surfaces {
-                if matches!(
-                    surface.color_transform.transfer,
-                    FrameTransferFunction::Srgb
-                        | FrameTransferFunction::Gamma22
-                        | FrameTransferFunction::Bt1886
-                ) {
-                    surface.color_transform.auto_hdr = Some(auto_hdr);
-                    surface.color_transform.source_peak_nits = auto_hdr.target_nits;
+            if let Some(auto_hdr) = auto_hdr_for_window(desktop, window) {
+                for surface in &mut window_surfaces {
+                    if matches!(
+                        surface.color_transform.transfer,
+                        FrameTransferFunction::Srgb
+                            | FrameTransferFunction::Gamma22
+                            | FrameTransferFunction::Bt1886
+                    ) {
+                        surface.color_transform.auto_hdr = Some(auto_hdr);
+                        surface.color_transform.source_peak_nits = auto_hdr.target_nits;
+                    }
                 }
             }
+            output.extend(window_surfaces.into_iter().rev());
         }
-        output.extend(window_surfaces.into_iter().rev());
     }
     if let Some(output_state) = output_state {
         collect_shm_layers(

@@ -8,15 +8,15 @@ use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::desktop::DesktopState;
-use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use crate::core::shell::WaylandWindowMeta;
+use crate::core::shell::xwayland::{XwaylandSurfaceRole, XwaylandWindowMeta};
 use smithay::desktop::WindowSurface;
+use smithay::input::Seat;
 use smithay::input::dnd::{DndFocus, OfferData as DndOfferDataTrait, Source};
 use smithay::input::pointer::AxisFrame;
 use smithay::input::pointer::ButtonEvent;
 use smithay::input::pointer::MotionEvent;
 use smithay::input::pointer::PointerTarget;
-use smithay::input::Seat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::Point;
 use smithay::utils::Serial;

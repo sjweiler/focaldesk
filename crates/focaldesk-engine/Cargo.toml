@@ -23,6 +23,7 @@ focaldesk-render = { path = "../focaldesk-render", default-features = false, opt
 vui-core = { path = "../../../vello-ui/crates/vui-core", optional = true }
 vui-vello = { path = "../../../vello-ui/crates/vui-vello", optional = true }
 vui-ash = { path = "../../../vello-ui/crates/vui-ash", optional = true }
+vui-text = { path = "../../../vello-ui/crates/vui-text", optional = true }
 ash = { workspace = true, optional = true }
 focaldesk-ai = { path = "../focaldesk-ai" }
 focaldesk-permissions = { path = "../focaldesk-permissions" }
@@ -77,6 +78,7 @@ wgpu = [
     "dep:focaldesk-render",
     "dep:vui-core",
     "dep:vui-vello",
+    "dep:vui-text",
     "focaldesk-render/wgpu",
 ]
 xwayland = ["smithay/xwayland"]

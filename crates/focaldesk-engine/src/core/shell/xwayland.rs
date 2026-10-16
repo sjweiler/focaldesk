@@ -21,6 +21,21 @@ pub struct XwaylandWindowMeta {
     pub transient_for: Option<u32>, // replace with your WindowId mapping later
 }
 
+pub(crate) fn workspace_from_process_env(pid: u32) -> Option<u32> {
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    workspace_from_environ(&environ)
+}
+
+fn workspace_from_environ(environ: &[u8]) -> Option<u32> {
+    const KEY: &[u8] = b"FOCALDESK_LAUNCH_WORKSPACE=";
+    environ
+        .split(|byte| *byte == 0)
+        .find_map(|entry| entry.strip_prefix(KEY))
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|workspace| *workspace > 0)
+}
+
 /// Return whether an X11 "normal" window is actually a small, non-interactive
 /// implementation helper rather than an application toplevel.
 ///
@@ -111,11 +126,7 @@ impl XwaylandWindowMeta {
 
 #[cfg(feature = "xwayland")]
 fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 impl XwaylandSurfaceRole {
@@ -143,7 +154,7 @@ impl XwaylandSurfaceRole {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_noninteractive_fixed_size_helper, XwaylandSurfaceRole};
+    use super::{XwaylandSurfaceRole, is_noninteractive_fixed_size_helper, workspace_from_environ};
 
     #[test]
     fn filters_tiny_noninteractive_fixed_size_toplevel() {
@@ -179,5 +190,21 @@ mod tests {
             Some((160, 20)),
             Some((160, 20)),
         ));
+    }
+
+    #[test]
+    fn reads_launch_workspace_from_process_environment() {
+        assert_eq!(
+            workspace_from_environ(b"DISPLAY=:1\0FOCALDESK_LAUNCH_WORKSPACE=2\0"),
+            Some(2)
+        );
+        assert_eq!(
+            workspace_from_environ(b"FOCALDESK_LAUNCH_WORKSPACE=0\0"),
+            None
+        );
+        assert_eq!(
+            workspace_from_environ(b"FOCALDESK_LAUNCH_WORKSPACE=bad\0"),
+            None
+        );
     }
 }

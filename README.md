@@ -93,9 +93,11 @@ and native applications running together. The repository contains:
 
 ### Launcher
 
-The native launcher provides application discovery and starts applications
-through a dedicated launcher service rather than embedding process management
-in the compositor.
+The native launcher provides ranked, keyboard-first search across applications,
+Settings pages, favorite and recent files, and currently open windows. It also
+evaluates bounded arithmetic expressions locally. Window focus and Settings
+navigation use typed compositor actions; search never executes arbitrary shell
+input.
 
 ![Launcher](docs/screenshots/launcher.png)
 
@@ -108,8 +110,35 @@ service controls. Some panels are still incomplete or hardware-dependent.
 
 ### File Manager
 
-The first-party file manager prototype provides common browsing, navigation,
-search, sorting, and list/grid workflows.
+The first-party file manager provides common browsing, navigation, search,
+sorting, and list/grid workflows. Grid view generates bounded asynchronous
+JPEG, PNG, and first-page PDF thumbnails, while the selection pane previews
+supported images, PDFs, text, and file metadata. A live Devices sidebar mounts
+and unlocks removable volumes and provides capability-aware safe unmount or
+eject actions through GIO.
+Rename, move, copy, new-folder, drag-copy, and trash operations have bounded
+per-tab undo history through `Ctrl+Z` and the operation toast.
+Local copy and move jobs run off the UI thread with byte progress, throughput
+and ETA reporting, mid-file cancellation, staged commits, batch conflict
+choices, metadata/link preservation, and exact replacement undo.
+Trash also supports conflict-safe restore to the recorded original location and
+confirmed permanent deletion of selected items.
+Files can also mount SMB, SFTP, FTP, and WebDAV servers through native GIO
+authentication, with URI-only private bookmarks and safe disconnect controls.
+Search can optionally traverse local subfolders in the background, with bounded
+partial results and relative paths.
+ZIP, TAR, gzip TAR, and xz TAR archives can be extracted asynchronously with
+safe-path validation, bounded output, keep-both conflicts, cancellation, and
+undo.
+Multi-selection rename provides a live rule preview, extension preservation,
+collision checks, transactional rollback, and undo.
+Local folders can be pinned to the Places sidebar with `Ctrl+D` and shared with
+GTK file pickers; bookmarks can be renamed, reordered, or removed, while
+temporarily missing targets remain manageable.
+Properties can edit local Unix read, write, and execute permissions, including
+mixed multi-selection and a regular-file executable shortcut. Confirmed
+recursive changes are bounded, symlink- and mount-safe, transactional, and
+exactly undoable with `Ctrl+Z`.
 
 ![File Manager](docs/screenshots/files.png)
 
@@ -186,7 +215,8 @@ diagrams, current boundaries, and implementation notes.
 - `apps/focaldesk-desktop`: compositor executable
 - `apps/focaldesk-cli`: command-line interface
 - `apps/focaldesk-ai-console`: interface app for ai
-- `apps/focaldesk-files`: file app prototype
+- `apps/focaldesk-files`: file app with previews, devices, network locations,
+  undo, and bounded recursive filename search
 - `apps/focaldesk-settings`: settings app prototype
 - `apps/focaldesk-portal`: portal-related app code
 - `services/focaldesk-remoted`: experimental view-only RDP service

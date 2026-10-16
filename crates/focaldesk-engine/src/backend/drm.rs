@@ -1353,6 +1353,9 @@ fn remove_drm_device(
 
         for surface in device.surfaces.into_values() {
             data.core.state.space.unmap_output(&surface.output);
+            data.core
+                .state
+                .forget_workspace_transition(surface.output_id);
             data.core.state.outputs.shift_remove(&surface.output_id);
             data.core
                 .state
@@ -3520,6 +3523,8 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
         output_transform,
         scale,
         state.input.modifiers,
+        state.input_settings.pointer_speed,
+        state.input_settings.natural_scroll,
     )
 }
 
@@ -3607,6 +3612,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     };
 
     let _libinput_token = loop_handle.insert_source(libinput_backend, |event, _, data| {
+        match &event {
+            InputEvent::DeviceAdded { device } => {
+                data.core.state.register_libinput_device(device.clone());
+            }
+            InputEvent::DeviceRemoved { device } => {
+                data.core.state.unregister_libinput_device(device);
+            }
+            _ => {}
+        }
+
         if let InputEvent::Keyboard { event, .. } = &event {
             let keycode = event.key_code();
             let key_state = event.state();
@@ -4465,14 +4480,17 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         (surface.size.w as f64 / output_scale).round() as i32,
                         (surface.size.h as f64 / output_scale).round() as i32,
                     ));
+                    let magnifier_view =
+                        data.core.state.magnifier_view_for_output(surface.output_id);
+                    let magnifier_src = magnifier_view.source_rect(surface.size);
                     let present_src = Rectangle::<f64, Logical>::from_loc_and_size(
-                        (0.0, 0.0),
-                        (surface.size.w as f64, surface.size.h as f64),
+                        (magnifier_src.loc.x, magnifier_src.loc.y),
+                        (magnifier_src.size.w, magnifier_src.size.h),
                     );
                     let force_hdr_verification_present =
                         exclusive_hdr_frame && surface.hdr_verify_started_at.is_some();
                     let present_frame_damage: Vec<Rectangle<i32, Buffer>> =
-                        if force_hdr_verification_present {
+                        if force_hdr_verification_present || magnifier_view.zoom > 1.001 {
                             // The FP16/PQ targets are retained textures. Resetting the
                             // DamageBag every frame made its commit counter repeatedly
                             // return to 1, so Smithay compared commit 1 with commit 1,
@@ -4538,6 +4556,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 .unwrap_or(data.core.state.pointer_pos);
                             let phys: Point<i32, Physical> =
                                 rel.to_physical_precise_round::<f64, i32>(scale);
+                            let cursor_position = magnifier_view
+                                .transform_point([phys.x as f32, phys.y as f32], surface.size);
                             let (hx, hy) = data.core.state.render.sw_cursor_hotspot;
                             let (tw, th) = data.core.state.render.sw_cursor_tex_size;
                             let cursor_logical_size = Size::<i32, Logical>::from((
@@ -4552,8 +4572,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                                 data.core.state.drm_cursor_render_id.clone(),
                                 device.renderer.context_id(),
                                 Point::<f64, Physical>::from((
-                                    (phys.x - hx) as f64,
-                                    (phys.y - hy) as f64,
+                                    f64::from(cursor_position[0]) - f64::from(hx),
+                                    f64::from(cursor_position[1]) - f64::from(hy),
                                 )),
                                 ct.clone(),
                                 1,

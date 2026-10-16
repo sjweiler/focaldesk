@@ -75,6 +75,8 @@ fn dispatch_backend_events(
                     .unwrap_or(smithay::utils::Transform::Normal),
                 scale_factor,
                 state.input.modifiers,
+                state.input_settings.pointer_speed,
+                state.input_settings.natural_scroll,
             ) {
                 state.handle_input(event);
             }
@@ -299,9 +301,17 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let offscreen = render_targets
                     .scanout_texture()
                     .ok_or("winit offscreen missing after render")?;
+                let magnifier_source = nested
+                    .state
+                    .magnifier_source_rect(OutputId(1), buffer_size_phys);
                 let mut frame =
                     renderer.render(&mut framebuffer, buffer_size, Transform::Flipped180)?;
-                present_offscreen_texture(&mut frame, offscreen, buffer_size_phys)?;
+                present_offscreen_texture(
+                    &mut frame,
+                    offscreen,
+                    buffer_size_phys,
+                    magnifier_source,
+                )?;
                 let _ = frame.finish()?;
 
                 if let Some((capture_texture, encoding)) =

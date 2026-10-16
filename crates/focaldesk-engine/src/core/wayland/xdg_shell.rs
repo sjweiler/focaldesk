@@ -143,10 +143,19 @@ impl XdgShellHandler for DesktopState {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window_id = self.add_xdg_toplevel(surface.clone());
-        let (_, app_id) = toplevel_metadata(&surface);
+        let (title, app_id) = toplevel_metadata(&surface);
         let restored = app_id.as_deref().is_some_and(|app_id| {
             self.try_restore_window(window_id, SavedProtocol::Wayland, app_id)
         });
+        let rule = (!restored && surface.parent().is_none())
+            .then(|| {
+                self.apply_window_rule(
+                    window_id,
+                    app_id.as_deref(),
+                    title.as_deref().unwrap_or_default(),
+                )
+            })
+            .flatten();
         let window = self.windows.iter().find(|window| window.id == window_id);
         let output_id = window
             .and_then(|window| window.output)
@@ -154,7 +163,8 @@ impl XdgShellHandler for DesktopState {
         let maximize_on_launch = if restored {
             window.is_some_and(|window| window.maximized)
         } else {
-            self.workspaces.maximize_on_launch
+            rule.and_then(|rule| rule.maximize)
+                .unwrap_or(self.workspaces.maximize_on_launch)
         };
         let fullscreen_on_launch = restored && window.is_some_and(|window| window.fullscreen);
         let minimized_on_launch = restored && window.is_some_and(|window| window.minimized);

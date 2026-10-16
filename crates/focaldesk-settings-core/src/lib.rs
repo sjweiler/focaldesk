@@ -12,6 +12,8 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     pub displays: DisplaySettings,
     pub input: InputSettings,
+    #[serde(default)]
+    pub accessibility: AccessibilitySettings,
     pub apps: AppSettings,
     #[serde(default)]
     pub workspaces: WorkspaceSettings,
@@ -71,6 +73,158 @@ pub struct AppearanceSettings {
     pub animations: bool,
     #[serde(default)]
     pub high_contrast: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccessibilitySettings {
+    pub magnifier_enabled: bool,
+    pub magnifier_zoom: f32,
+    pub magnifier_follow_focus: bool,
+    /// Per-connector zoom overrides populated by compositor shortcuts.
+    pub magnifier_output_zoom: BTreeMap<String, f32>,
+    pub cursor_size: u32,
+    /// A display-only warm color transform, applied after output calibration.
+    #[serde(default)]
+    pub night_light: NightLightSettings,
+    /// A display-only color-vision aid, applied after output calibration.
+    #[serde(default)]
+    pub color_filter: ColorFilter,
+    /// Connector-specific opt-outs for the display comfort transforms.
+    #[serde(default)]
+    pub display_comfort_disabled_outputs: BTreeMap<String, bool>,
+    /// Optional local ambient-light adaptation. It is inactive when no
+    /// readable IIO illuminance sensor is present.
+    #[serde(default)]
+    pub ambient_light_enabled: bool,
+    #[serde(default = "default_ambient_min_brightness")]
+    pub ambient_min_brightness: f32,
+    /// Start the trusted Maliit on-screen keyboard input method for touch and
+    /// accessibility text entry.
+    #[serde(default)]
+    pub on_screen_keyboard_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NightLightSettings {
+    pub enabled: bool,
+    /// The target white point in kelvin. 6500 is neutral daylight.
+    pub temperature_kelvin: u32,
+    pub schedule: NightLightSchedule,
+    /// Minutes after midnight; used by the custom schedule.
+    pub custom_start_minutes: u16,
+    pub custom_end_minutes: u16,
+    /// Duration of the warm-up and cool-down around schedule boundaries.
+    pub transition_minutes: u16,
+    /// User-supplied coordinates for local-only solar scheduling. No network
+    /// lookup is performed by the compositor.
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NightLightSchedule {
+    #[default]
+    Manual,
+    Custom,
+    Automatic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ColorFilter {
+    #[default]
+    Off,
+    Grayscale,
+    Protanopia,
+    Deuteranopia,
+    Tritanopia,
+}
+
+impl Default for NightLightSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            temperature_kelvin: 4500,
+            schedule: NightLightSchedule::Manual,
+            custom_start_minutes: 19 * 60,
+            custom_end_minutes: 7 * 60,
+            transition_minutes: 30,
+            latitude: None,
+            longitude: None,
+        }
+    }
+}
+
+impl AccessibilitySettings {
+    pub const MAGNIFIER_ZOOM_RANGE: std::ops::RangeInclusive<f32> = 1.0..=8.0;
+    pub const CURSOR_SIZE_RANGE: std::ops::RangeInclusive<u32> = 24..=96;
+
+    pub fn sanitized(mut self) -> Self {
+        if !self.magnifier_zoom.is_finite() {
+            self.magnifier_zoom = 2.0;
+        }
+        self.magnifier_zoom = self.magnifier_zoom.clamp(
+            *Self::MAGNIFIER_ZOOM_RANGE.start(),
+            *Self::MAGNIFIER_ZOOM_RANGE.end(),
+        );
+        self.magnifier_output_zoom
+            .retain(|_, zoom| zoom.is_finite());
+        for zoom in self.magnifier_output_zoom.values_mut() {
+            *zoom = zoom.clamp(
+                *Self::MAGNIFIER_ZOOM_RANGE.start(),
+                *Self::MAGNIFIER_ZOOM_RANGE.end(),
+            );
+        }
+        self.cursor_size = self.cursor_size.clamp(
+            *Self::CURSOR_SIZE_RANGE.start(),
+            *Self::CURSOR_SIZE_RANGE.end(),
+        );
+        self.night_light.temperature_kelvin =
+            self.night_light.temperature_kelvin.clamp(1_000, 6_500);
+        self.night_light.custom_start_minutes = self.night_light.custom_start_minutes.min(1_439);
+        self.night_light.custom_end_minutes = self.night_light.custom_end_minutes.min(1_439);
+        self.night_light.transition_minutes = self.night_light.transition_minutes.min(60);
+        self.night_light.latitude = self
+            .night_light
+            .latitude
+            .filter(|value| value.is_finite() && (-90.0..=90.0).contains(value));
+        self.night_light.longitude = self
+            .night_light
+            .longitude
+            .filter(|value| value.is_finite() && (-180.0..=180.0).contains(value));
+        self.display_comfort_disabled_outputs
+            .retain(|_, disabled| *disabled);
+        if !self.ambient_min_brightness.is_finite() {
+            self.ambient_min_brightness = default_ambient_min_brightness();
+        }
+        self.ambient_min_brightness = self.ambient_min_brightness.clamp(0.35, 1.0);
+        self
+    }
+}
+
+impl Default for AccessibilitySettings {
+    fn default() -> Self {
+        Self {
+            magnifier_enabled: false,
+            magnifier_zoom: 2.0,
+            magnifier_follow_focus: true,
+            magnifier_output_zoom: BTreeMap::new(),
+            cursor_size: 24,
+            night_light: NightLightSettings::default(),
+            color_filter: ColorFilter::Off,
+            display_comfort_disabled_outputs: BTreeMap::new(),
+            ambient_light_enabled: false,
+            ambient_min_brightness: default_ambient_min_brightness(),
+            on_screen_keyboard_enabled: false,
+        }
+    }
+}
+
+fn default_ambient_min_brightness() -> f32 {
+    0.55
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,6 +519,18 @@ pub fn rearm_exclusive_hdr_for_next_session() {
 pub struct InputSettings {
     pub pointer_speed: f32,
     pub natural_scroll: bool,
+    /// Finger count reserved for horizontal workspace swipes. Zero disables
+    /// compositor-owned workspace gestures so applications receive them.
+    #[serde(default = "default_workspace_swipe_fingers")]
+    pub workspace_swipe_fingers: u32,
+    /// Accumulated logical-pixel distance required to change workspaces.
+    #[serde(default = "default_workspace_swipe_distance")]
+    pub workspace_swipe_distance: f64,
+    /// Per-device libinput overrides keyed by the compositor's stable,
+    /// hardware-derived device identifier. Missing fields preserve libinput's
+    /// current/default behavior.
+    #[serde(default)]
+    pub devices: BTreeMap<String, InputDeviceSettings>,
     /// XKB layout (e.g. "us", "de"). Fed to the compositor's XkbConfig.
     #[serde(default = "default_keyboard_layout")]
     pub keyboard_layout: String,
@@ -387,10 +553,100 @@ pub struct InputSettings {
     /// `"launch_terminal": "Super+Enter"`.
     #[serde(default)]
     pub keybindings: BTreeMap<String, String>,
+    /// Keyboard filters implemented by the compositor before events reach
+    /// Wayland or XWayland clients.
+    #[serde(default)]
+    pub accessibility: KeyboardAccessibilitySettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardAccessibilitySettings {
+    pub sticky_keys: bool,
+    pub slow_keys: bool,
+    pub slow_keys_delay_ms: u32,
+    pub bounce_keys: bool,
+    pub bounce_keys_delay_ms: u32,
+    /// Offer to toggle Sticky Keys after Shift is pressed five times.
+    pub sticky_keys_shortcut: bool,
+    /// Show short desktop notifications when filters or latched modifiers change.
+    pub visual_feedback: bool,
+}
+
+impl KeyboardAccessibilitySettings {
+    pub const SLOW_KEYS_DELAY_RANGE: std::ops::RangeInclusive<u32> = 100..=2_000;
+    pub const BOUNCE_KEYS_DELAY_RANGE: std::ops::RangeInclusive<u32> = 100..=2_000;
+
+    pub fn sanitized(mut self) -> Self {
+        self.slow_keys_delay_ms = self.slow_keys_delay_ms.clamp(
+            *Self::SLOW_KEYS_DELAY_RANGE.start(),
+            *Self::SLOW_KEYS_DELAY_RANGE.end(),
+        );
+        self.bounce_keys_delay_ms = self.bounce_keys_delay_ms.clamp(
+            *Self::BOUNCE_KEYS_DELAY_RANGE.start(),
+            *Self::BOUNCE_KEYS_DELAY_RANGE.end(),
+        );
+        self
+    }
+}
+
+impl Default for KeyboardAccessibilitySettings {
+    fn default() -> Self {
+        Self {
+            sticky_keys: false,
+            slow_keys: false,
+            slow_keys_delay_ms: 500,
+            bounce_keys: false,
+            bounce_keys_delay_ms: 300,
+            sticky_keys_shortcut: true,
+            visual_feedback: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct InputDeviceSettings {
+    pub enabled: Option<bool>,
+    pub tap_to_click: Option<bool>,
+    pub disable_while_typing: Option<bool>,
+    pub acceleration_profile: InputAccelerationProfile,
+    pub acceleration_speed: Option<f64>,
+    pub scroll_method: InputScrollMethod,
+    pub left_handed: Option<bool>,
+    pub middle_button_emulation: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputAccelerationProfile {
+    #[default]
+    Default,
+    Adaptive,
+    Flat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum InputScrollMethod {
+    #[default]
+    Default,
+    TwoFinger,
+    Edge,
+    OnButtonDown,
+    Disabled,
 }
 
 fn default_keyboard_layout() -> String {
     "us".into()
+}
+
+fn default_workspace_swipe_fingers() -> u32 {
+    3
+}
+
+fn default_workspace_swipe_distance() -> f64 {
+    120.0
 }
 
 fn default_keyboard_repeat_delay_ms() -> u32 {
@@ -412,6 +668,98 @@ pub struct AppSettings {
     pub email: String,
     #[serde(default = "default_true")]
     pub pin_email_to_shelf: bool,
+    /// Ordered placement defaults for newly created application windows.
+    /// The first matching rule wins; restored windows retain their session
+    /// placement instead.
+    #[serde(default)]
+    pub window_rules: Vec<WindowRule>,
+    /// Programs launched once after a new FocalDesk session starts.
+    #[serde(default)]
+    pub startup_apps: Vec<StartupApp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StartupApp {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl StartupApp {
+    pub fn sanitized(mut self) -> Option<Self> {
+        self.name = self.name.trim().chars().take(128).collect();
+        self.command = self.command.trim().chars().take(1_024).collect();
+        self.arguments = self
+            .arguments
+            .into_iter()
+            .map(|argument| argument.trim().chars().take(512).collect::<String>())
+            .filter(|argument| !argument.is_empty())
+            .take(32)
+            .collect();
+        (!self.command.is_empty()).then_some(self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct WindowRule {
+    /// A Wayland application ID or X11 WM_CLASS. Matching is case-insensitive.
+    pub app_id: String,
+    /// Optional case-insensitive substring match against the window title.
+    pub title_contains: String,
+    /// One-based workspace number. Omit to leave the current workspace alone.
+    pub workspace: Option<u32>,
+    /// Stable output connector name, such as `HDMI-A-1`.
+    pub output: Option<String>,
+    /// Whether the window starts floating rather than tiled.
+    pub floating: Option<bool>,
+    /// Whether the window starts maximized.
+    pub maximize: Option<bool>,
+}
+
+impl WindowRule {
+    pub fn sanitized(mut self) -> Option<Self> {
+        self.app_id = self.app_id.trim().chars().take(256).collect();
+        self.title_contains = self.title_contains.trim().chars().take(256).collect();
+        self.output = self.output.and_then(|output| {
+            let output: String = output.trim().chars().take(256).collect();
+            (!output.is_empty()).then_some(output)
+        });
+        self.workspace = self.workspace.filter(|workspace| *workspace > 0);
+        (!self.app_id.is_empty() || !self.title_contains.is_empty()).then_some(self)
+    }
+
+    pub fn matches(&self, app_id: Option<&str>, title: &str) -> bool {
+        let app_matches = self.app_id.is_empty()
+            || app_id.is_some_and(|candidate| candidate.eq_ignore_ascii_case(&self.app_id));
+        let title_matches = self.title_contains.is_empty()
+            || title
+                .to_ascii_lowercase()
+                .contains(&self.title_contains.to_ascii_lowercase());
+        app_matches && title_matches
+    }
+}
+
+impl AppSettings {
+    pub fn sanitized(mut self) -> Self {
+        self.window_rules = self
+            .window_rules
+            .into_iter()
+            .filter_map(WindowRule::sanitized)
+            .take(64)
+            .collect();
+        self.startup_apps = self
+            .startup_apps
+            .into_iter()
+            .filter_map(StartupApp::sanitized)
+            .take(64)
+            .collect();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -447,6 +795,13 @@ pub struct WorkspaceSettings {
     /// can actually be created.
     #[serde(default = "default_max_workspace_slots")]
     pub max_workspace_slots: u32,
+    /// Optional local image paths keyed by one-based workspace number. Missing
+    /// entries inherit the active theme's wallpaper.
+    #[serde(default)]
+    pub workspace_wallpapers: BTreeMap<u32, String>,
+    /// Optional user labels keyed by one-based workspace number.
+    #[serde(default)]
+    pub workspace_names: BTreeMap<u32, String>,
 }
 
 impl Default for WorkspaceSettings {
@@ -458,6 +813,8 @@ impl Default for WorkspaceSettings {
             split_screen_enabled: false,
             split_ratios: BTreeMap::new(),
             max_workspace_slots: default_max_workspace_slots(),
+            workspace_wallpapers: BTreeMap::new(),
+            workspace_names: BTreeMap::new(),
         }
     }
 }
@@ -613,6 +970,9 @@ pub fn default_settings() -> Settings {
         input: InputSettings {
             pointer_speed: 1.0,
             natural_scroll: false,
+            workspace_swipe_fingers: default_workspace_swipe_fingers(),
+            workspace_swipe_distance: default_workspace_swipe_distance(),
+            devices: BTreeMap::new(),
             keyboard_layout: default_keyboard_layout(),
             keyboard_variant: String::new(),
             keyboard_model: String::new(),
@@ -620,7 +980,9 @@ pub fn default_settings() -> Settings {
             keyboard_repeat_delay_ms: default_keyboard_repeat_delay_ms(),
             keyboard_repeat_rate: default_keyboard_repeat_rate(),
             keybindings: BTreeMap::new(),
+            accessibility: KeyboardAccessibilitySettings::default(),
         },
+        accessibility: AccessibilitySettings::default(),
         apps: AppSettings {
             terminal: "alacritty".into(),
             browser: "google-chrome".into(),
@@ -628,6 +990,8 @@ pub fn default_settings() -> Settings {
             file_manager: "focaldesk-files".into(),
             email: String::new(),
             pin_email_to_shelf: true,
+            window_rules: Vec::new(),
+            startup_apps: Vec::new(),
         },
         workspaces: WorkspaceSettings::default(),
         privacy: PrivacySettings::default(),
@@ -686,10 +1050,14 @@ pub fn settings_path() -> PathBuf {
 pub fn load_settings() -> Settings {
     let path = settings_path();
 
-    match fs::read_to_string(&path) {
+    let mut settings = match fs::read_to_string(&path) {
         Ok(data) => serde_json::from_str(&data).unwrap_or_else(|_| default_settings()),
         Err(_) => default_settings(),
-    }
+    };
+    settings.input.accessibility = settings.input.accessibility.sanitized();
+    settings.accessibility = settings.accessibility.sanitized();
+    settings.apps = settings.apps.sanitized();
+    settings
 }
 
 pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
@@ -709,6 +1077,10 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
 }
 
 fn merged_settings_json(settings: &Settings, existing: Option<&str>) -> std::io::Result<String> {
+    let mut settings = settings.clone();
+    settings.input.accessibility = settings.input.accessibility.sanitized();
+    settings.accessibility = settings.accessibility.sanitized();
+    settings.apps = settings.apps.sanitized();
     let mut value = serde_json::to_value(settings).map_err(std::io::Error::other)?;
     if let Some(existing) = existing {
         let existing: serde_json::Value = serde_json::from_str(existing)
@@ -821,6 +1193,159 @@ mod tests {
     }
 
     #[test]
+    fn keyboard_accessibility_defaults_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["input"]
+            .as_object_mut()
+            .unwrap()
+            .remove("accessibility");
+
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            settings.input.accessibility,
+            KeyboardAccessibilitySettings::default()
+        );
+
+        settings.input.accessibility.sticky_keys = true;
+        settings.input.accessibility.slow_keys = true;
+        settings.input.accessibility.slow_keys_delay_ms = 750;
+        settings.input.accessibility.bounce_keys = true;
+        settings.input.accessibility.bounce_keys_delay_ms = 400;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(restored.input.accessibility.sticky_keys);
+        assert!(restored.input.accessibility.slow_keys);
+        assert_eq!(restored.input.accessibility.slow_keys_delay_ms, 750);
+        assert!(restored.input.accessibility.bounce_keys);
+        assert_eq!(restored.input.accessibility.bounce_keys_delay_ms, 400);
+    }
+
+    #[test]
+    fn keyboard_accessibility_sanitizes_delays() {
+        let settings = KeyboardAccessibilitySettings {
+            slow_keys_delay_ms: 0,
+            bounce_keys_delay_ms: u32::MAX,
+            ..KeyboardAccessibilitySettings::default()
+        }
+        .sanitized();
+        assert_eq!(settings.slow_keys_delay_ms, 100);
+        assert_eq!(settings.bounce_keys_delay_ms, 2_000);
+    }
+
+    #[test]
+    fn visual_accessibility_defaults_and_round_trips() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value.as_object_mut().unwrap().remove("accessibility");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.accessibility, AccessibilitySettings::default());
+
+        settings.accessibility.magnifier_enabled = true;
+        settings.accessibility.magnifier_zoom = 3.5;
+        settings.accessibility.cursor_size = 64;
+        settings
+            .accessibility
+            .magnifier_output_zoom
+            .insert("DP-1".into(), 4.0);
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(restored.accessibility.magnifier_enabled);
+        assert_eq!(restored.accessibility.magnifier_zoom, 3.5);
+        assert_eq!(restored.accessibility.cursor_size, 64);
+        assert_eq!(
+            restored.accessibility.magnifier_output_zoom.get("DP-1"),
+            Some(&4.0)
+        );
+    }
+
+    #[test]
+    fn visual_accessibility_sanitizes_zoom_and_cursor_size() {
+        let mut settings = AccessibilitySettings {
+            magnifier_zoom: f32::NAN,
+            cursor_size: u32::MAX,
+            ..AccessibilitySettings::default()
+        };
+        settings
+            .magnifier_output_zoom
+            .insert("HDMI-A-1".into(), 99.0);
+        settings
+            .magnifier_output_zoom
+            .insert("broken".into(), f32::INFINITY);
+        let settings = settings.sanitized();
+        assert_eq!(settings.magnifier_zoom, 2.0);
+        assert_eq!(settings.cursor_size, 96);
+        assert_eq!(settings.magnifier_output_zoom.get("HDMI-A-1"), Some(&8.0));
+        assert!(!settings.magnifier_output_zoom.contains_key("broken"));
+    }
+
+    #[test]
+    fn display_comfort_settings_are_sanitized_and_round_trip() {
+        let settings = AccessibilitySettings {
+            night_light: NightLightSettings {
+                enabled: true,
+                temperature_kelvin: 99_999,
+                schedule: NightLightSchedule::Custom,
+                custom_start_minutes: u16::MAX,
+                custom_end_minutes: u16::MAX,
+                ..NightLightSettings::default()
+            },
+            color_filter: ColorFilter::Deuteranopia,
+            ..AccessibilitySettings::default()
+        }
+        .sanitized();
+        assert_eq!(settings.night_light.temperature_kelvin, 6_500);
+        assert_eq!(settings.night_light.custom_start_minutes, 1_439);
+        assert_eq!(settings.color_filter, ColorFilter::Deuteranopia);
+        let restored: AccessibilitySettings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(restored.color_filter, ColorFilter::Deuteranopia);
+    }
+
+    #[test]
+    fn pointer_gesture_settings_are_backward_compatible_and_round_trip() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        let input = value["input"].as_object_mut().unwrap();
+        input.remove("workspace_swipe_fingers");
+        input.remove("workspace_swipe_distance");
+
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.input.workspace_swipe_fingers, 3);
+        assert_eq!(settings.input.workspace_swipe_distance, 120.0);
+
+        settings.input.workspace_swipe_fingers = 4;
+        settings.input.workspace_swipe_distance = 180.0;
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(restored.input.workspace_swipe_fingers, 4);
+        assert_eq!(restored.input.workspace_swipe_distance, 180.0);
+    }
+
+    #[test]
+    fn per_device_input_overrides_default_empty_and_round_trip() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["input"].as_object_mut().unwrap().remove("devices");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.input.devices.is_empty());
+
+        settings.input.devices.insert(
+            "046d:c52b:mouse".into(),
+            InputDeviceSettings {
+                enabled: Some(true),
+                acceleration_profile: InputAccelerationProfile::Flat,
+                acceleration_speed: Some(-0.25),
+                left_handed: Some(true),
+                ..Default::default()
+            },
+        );
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        let device = &restored.input.devices["046d:c52b:mouse"];
+        assert_eq!(device.enabled, Some(true));
+        assert_eq!(device.acceleration_profile, InputAccelerationProfile::Flat);
+        assert_eq!(device.acceleration_speed, Some(-0.25));
+        assert_eq!(device.left_handed, Some(true));
+    }
+
+    #[test]
     fn high_contrast_defaults_off_for_existing_settings() {
         let mut value = serde_json::to_value(default_settings()).unwrap();
         value["appearance"]
@@ -842,6 +1367,66 @@ mod tests {
         let settings: Settings = serde_json::from_value(value).unwrap();
         assert!(settings.apps.email.is_empty());
         assert!(settings.apps.pin_email_to_shelf);
+    }
+
+    #[test]
+    fn window_rules_match_and_discard_empty_entries() {
+        let rules = vec![
+            WindowRule {
+                app_id: "  org.example.Editor  ".into(),
+                title_contains: "document".into(),
+                workspace: Some(2),
+                output: Some(" HDMI-A-1 ".into()),
+                floating: Some(true),
+                maximize: Some(false),
+            },
+            WindowRule::default(),
+        ];
+        let settings = AppSettings {
+            terminal: "terminal".into(),
+            browser: "browser".into(),
+            browser_launch_backend: BrowserLaunchBackend::Auto,
+            file_manager: "files".into(),
+            email: String::new(),
+            pin_email_to_shelf: true,
+            window_rules: rules,
+            startup_apps: Vec::new(),
+        }
+        .sanitized();
+
+        assert_eq!(settings.window_rules.len(), 1);
+        let rule = &settings.window_rules[0];
+        assert_eq!(rule.output.as_deref(), Some("HDMI-A-1"));
+        assert!(rule.matches(Some("ORG.EXAMPLE.EDITOR"), "Untitled document"));
+        assert!(!rule.matches(Some("org.example.Editor"), "Other"));
+    }
+
+    #[test]
+    fn startup_apps_discard_blank_commands_and_sanitize_arguments() {
+        let settings = AppSettings {
+            terminal: "terminal".into(),
+            browser: "browser".into(),
+            browser_launch_backend: BrowserLaunchBackend::Auto,
+            file_manager: "files".into(),
+            email: String::new(),
+            pin_email_to_shelf: true,
+            window_rules: Vec::new(),
+            startup_apps: vec![
+                StartupApp {
+                    name: "  Files  ".into(),
+                    command: " focaldesk-files ".into(),
+                    arguments: vec!["  --new-window ".into(), String::new()],
+                    enabled: true,
+                },
+                StartupApp::default(),
+            ],
+        }
+        .sanitized();
+
+        assert_eq!(settings.startup_apps.len(), 1);
+        assert_eq!(settings.startup_apps[0].name, "Files");
+        assert_eq!(settings.startup_apps[0].command, "focaldesk-files");
+        assert_eq!(settings.startup_apps[0].arguments, ["--new-window"]);
     }
 
     #[test]
@@ -871,6 +1456,28 @@ mod tests {
         let restored: Settings =
             serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
         assert!(!restored.workspaces.maximize_on_launch);
+    }
+
+    #[test]
+    fn workspace_wallpapers_default_empty_and_round_trip() {
+        let mut value = serde_json::to_value(default_settings()).unwrap();
+        value["workspaces"]
+            .as_object_mut()
+            .unwrap()
+            .remove("workspace_wallpapers");
+        let mut settings: Settings = serde_json::from_value(value).unwrap();
+        assert!(settings.workspaces.workspace_wallpapers.is_empty());
+
+        settings
+            .workspaces
+            .workspace_wallpapers
+            .insert(2, "/tmp/workspace-two.png".into());
+        let restored: Settings =
+            serde_json::from_value(serde_json::to_value(settings).unwrap()).unwrap();
+        assert_eq!(
+            restored.workspaces.workspace_wallpapers.get(&2),
+            Some(&"/tmp/workspace-two.png".to_string())
+        );
     }
 
     #[test]
@@ -993,30 +1600,24 @@ mod tests {
 
     #[test]
     fn hdr_appearance_rejects_unsafe_or_non_finite_values() {
-        assert!(
-            HdrAppearance {
-                reference_white_nits: 451.0,
-                ..HdrAppearance::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            HdrAppearance {
-                reference_white_nits: 300.0,
-                peak_nits: 250.0,
-                ..HdrAppearance::default()
-            }
-            .validate()
-            .is_err()
-        );
-        assert!(
-            HdrAppearance {
-                saturation: f32::NAN,
-                ..HdrAppearance::default()
-            }
-            .validate()
-            .is_err()
-        );
+        assert!(HdrAppearance {
+            reference_white_nits: 451.0,
+            ..HdrAppearance::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HdrAppearance {
+            reference_white_nits: 300.0,
+            peak_nits: 250.0,
+            ..HdrAppearance::default()
+        }
+        .validate()
+        .is_err());
+        assert!(HdrAppearance {
+            saturation: f32::NAN,
+            ..HdrAppearance::default()
+        }
+        .validate()
+        .is_err());
     }
 }

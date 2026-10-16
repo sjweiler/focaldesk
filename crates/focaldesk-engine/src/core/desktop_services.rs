@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use focaldesk_ipc::{send_update_request, transport, UpdateIpcRequest, UpdateIpcResponse};
+use focaldesk_ipc::{UpdateIpcRequest, UpdateIpcResponse, send_update_request, transport};
 use focaldesk_logging::{flog_info, flog_warn};
 use focaldesk_network::model::NetworkState;
 use focaldesk_updates::UpdateSnapshot;

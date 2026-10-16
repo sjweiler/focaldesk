@@ -1,7 +1,8 @@
 use smithay::backend::input::{
-    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState,
-    InputEvent as SmithayInputEvent, KeyState as SmithayKeyState, KeyboardKeyEvent,
-    PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+    AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Event,
+    GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputEvent as SmithayInputEvent,
+    KeyState as SmithayKeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+    PointerMotionEvent,
 };
 use smithay::utils::{Logical, Point as SmithayPoint, Rectangle, Size as SmithaySize, Transform};
 
@@ -18,6 +19,8 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
     output_transform: Transform,
     scale_factor: f64,
     modifiers: Modifiers,
+    pointer_speed: f32,
+    natural_scroll: bool,
 ) -> Option<InputEvent> {
     match input {
         SmithayInputEvent::Keyboard { event, .. } => {
@@ -32,7 +35,9 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
         }
         SmithayInputEvent::PointerMotion { event, .. } => {
             let pointer_pos = Position::from(pointer_pos);
-            let delta = Delta::from(event.delta());
+            let speed = f64::from(pointer_speed.clamp(0.25, 2.0));
+            let raw_delta = event.delta();
+            let delta = Delta::new(raw_delta.x * speed, raw_delta.y * speed);
             let position =
                 relative_pointer_position(pointer_pos, delta, scale_factor, clamp_rect.into());
 
@@ -73,20 +78,23 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                 .amount_v120(Axis::Horizontal)
                 .map(|value| value as i32);
             let y_v120 = event.amount_v120(Axis::Vertical).map(|value| value as i32);
-            let x = axis_amount(event.amount(Axis::Horizontal), x_v120);
-            let y = axis_amount(event.amount(Axis::Vertical), y_v120);
+            let direction = if natural_scroll { -1.0 } else { 1.0 };
+            let x = axis_amount(event.amount(Axis::Horizontal), x_v120) * direction;
+            let y = axis_amount(event.amount(Axis::Vertical), y_v120) * direction;
             let is_finger = event.source() == AxisSource::Finger;
             let source = scroll_source(event.source());
             let delta = ScrollDelta::Axis {
                 x,
                 y,
-                x_v120,
-                y_v120,
+                x_v120: x_v120.map(|value| if natural_scroll { -value } else { value }),
+                y_v120: y_v120.map(|value| if natural_scroll { -value } else { value }),
                 source,
-                x_inverted: event.relative_direction(Axis::Horizontal)
-                    == AxisRelativeDirection::Inverted,
-                y_inverted: event.relative_direction(Axis::Vertical)
-                    == AxisRelativeDirection::Inverted,
+                x_inverted: (event.relative_direction(Axis::Horizontal)
+                    == AxisRelativeDirection::Inverted)
+                    ^ natural_scroll,
+                y_inverted: (event.relative_direction(Axis::Vertical)
+                    == AxisRelativeDirection::Inverted)
+                    ^ natural_scroll,
                 stop_x: is_finger && event.amount(Axis::Horizontal) == Some(0.0),
                 stop_y: is_finger && event.amount(Axis::Vertical) == Some(0.0),
             };
@@ -96,6 +104,18 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                 position: pointer_pos.into(),
             })
         }
+        SmithayInputEvent::GestureSwipeBegin { event } => Some(InputEvent::GestureSwipeBegin {
+            fingers: event.fingers(),
+            time_msec: event.time_msec(),
+        }),
+        SmithayInputEvent::GestureSwipeUpdate { event } => Some(InputEvent::GestureSwipeUpdate {
+            delta: event.delta().into(),
+            time_msec: event.time_msec(),
+        }),
+        SmithayInputEvent::GestureSwipeEnd { event } => Some(InputEvent::GestureSwipeEnd {
+            cancelled: event.cancelled(),
+            time_msec: event.time_msec(),
+        }),
         _ => None,
     }
 }

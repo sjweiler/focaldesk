@@ -3,11 +3,11 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::core::desktop::{DesktopState, DND_CURSOR_ENDED, DND_CURSOR_INVALID, DND_CURSOR_VALID};
+use crate::core::desktop::{DND_CURSOR_ENDED, DND_CURSOR_INVALID, DND_CURSOR_VALID, DesktopState};
 
 use smithay::input::dnd::{
     DnDGrab, DndAction, DndGrabHandler, DndTarget, GrabType, Source, SourceMetadata,
@@ -16,8 +16,8 @@ use smithay::input::pointer::Focus;
 use smithay::reexports::wayland_server::protocol::wl_data_device_manager::DndAction as WlDndAction;
 use smithay::utils::{IsAlive, Logical, Point};
 use smithay::wayland::selection::data_device::{
-    default_action_chooser, request_data_device_client_selection, set_data_device_selection,
-    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, default_action_chooser,
+    request_data_device_client_selection, set_data_device_selection,
 };
 use smithay::wayland::selection::primary_selection::{
     PrimarySelectionHandler, PrimarySelectionState,
@@ -171,7 +171,7 @@ impl DesktopState {
 }
 
 fn read_clipboard_text(read_fd: OwnedFd) -> Option<String> {
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
 
     let flags = fcntl(read_fd.as_raw_fd(), FcntlArg::F_GETFL).ok()?;
     let flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;

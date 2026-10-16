@@ -3,16 +3,17 @@
 use focaldesk_types::OutputId;
 use indexmap::IndexMap;
 use smithay::utils::{Physical, Rectangle, Scale}; // your custom OutputId
-                                                  //#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-                                                  //pub struct OutputId(pub u32);
+
+//#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+//pub struct OutputId(pub u32);
 use crate::core::FrameCtx;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::utils::Transform;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::time::Instant;
-use wayland_server::backend::GlobalId;
 use wayland_server::DisplayHandle;
+use wayland_server::backend::GlobalId;
 
 pub struct OutputState {
     pub active_output: OutputId,

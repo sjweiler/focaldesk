@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_render::{
     AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer,
@@ -19,8 +19,8 @@ use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{
-    gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
     Buffer as _, Format, Fourcc, Modifier,
+    gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
 };
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface, PlaneClaim,
@@ -31,31 +31,32 @@ use smithay::backend::input::{
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::sync::{Fence, Interrupted, SyncPoint};
-use smithay::backend::session::{libseat::LibSeatSession, Event as SessionEvent, Session};
-use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
+use smithay::backend::session::{Event as SessionEvent, Session, libseat::LibSeatSession};
+use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
-use smithay::reexports::drm::control::{connector, crtc, dumbbuffer, plane, Device as _, Mode};
-use smithay::reexports::drm::{buffer::Buffer as _, Device as _, DriverCapability};
-use smithay::reexports::input::event::switch::Switch as InputSwitch;
+use smithay::reexports::drm::control::{Device as _, Mode, connector, crtc, dumbbuffer, plane};
+use smithay::reexports::drm::{Device as _, DriverCapability, buffer::Buffer as _};
 use smithay::reexports::input::Libinput;
+use smithay::reexports::input::event::switch::Switch as InputSwitch;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
-use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 
 use super::common::{
-    bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
-    physical_size_mm_from_pixels, pump_desktop_services, restart_shell_surfaces_after_gpu_reset,
-    spawn_session_sleep_watch, stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
+    NestedDesktop, SessionSleepEvent, bootstrap_compositor_core, client_state_from_stream,
+    is_nonfatal_wayland_io_error, physical_size_mm_from_pixels, pump_desktop_services,
+    restart_shell_surfaces_after_gpu_reset, spawn_session_sleep_watch,
+    stop_focaldesk_session_target,
 };
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    connector_edid, disable_explicit_kms_fences, drm_card_vendor_id, hdr_appearance_from_support,
-    hdr_detection, load_display_config, merge_disconnected_display_configs, parse_edid_identity,
-    saved_monitor_config, select_connector_mode, translate_backend_input_event,
-    write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
+    DisplayConfig, DisplayModeConfig, HdrSupport, connector_edid, disable_explicit_kms_fences,
+    drm_card_vendor_id, hdr_appearance_from_support, hdr_detection, load_display_config,
+    merge_disconnected_display_configs, parse_edid_identity, saved_monitor_config,
+    select_connector_mode, translate_backend_input_event, write_display_config,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
@@ -379,6 +380,12 @@ fn configure_vui_shell(data: &mut VulkanDrmData) {
         bluetooth: false,
         do_not_disturb: data.desktop.state.do_not_disturb,
         volume: 0.7,
+        night_light: data
+            .desktop
+            .state
+            .accessibility_settings
+            .night_light
+            .enabled,
     };
     let mut shell = VuiShell::new(
         u32::try_from(content_size.w).unwrap_or(1),
@@ -479,9 +486,28 @@ fn dispatch_vui_input<B: smithay::backend::input::InputBackend>(
     data: &mut VulkanDrmData,
     input: &SmithayInputEvent<B>,
 ) {
-    let Some(mut event) = translate_backend_input_event(&data.desktop.state, input) else {
+    let Some(event) = translate_backend_input_event(&data.desktop.state, input) else {
         return;
     };
+    if let InputEvent::Key { keycode, state, .. } = event {
+        let transitions = data.desktop.state.filter_physical_key_event(keycode, state);
+        for transition in transitions {
+            dispatch_vui_event(
+                data,
+                InputEvent::Key {
+                    keycode: transition.keycode,
+                    state: transition.state,
+                    repeat: false,
+                    modifiers: data.desktop.state.input.modifiers,
+                },
+            );
+        }
+        return;
+    }
+    dispatch_vui_event(data, event);
+}
+
+fn dispatch_vui_event(data: &mut VulkanDrmData, mut event: InputEvent) {
     sync_vui_shell_context(data);
     let prepared_key = if !data.desktop.state.lock_screen.active {
         match &event {
@@ -1152,16 +1178,25 @@ fn update_kms_cursor(data: &mut VulkanDrmData) {
             }
             cursor.uploaded_key = Some(key);
         }
-        let hotspot_location = Point::<i32, Physical>::from((
-            ((pointer_x - f64::from(output_state.logical_origin.x)) * output_state.scale_factor)
-                .round() as i32,
-            ((pointer_y - f64::from(output_state.logical_origin.y)) * output_state.scale_factor)
-                .round() as i32,
-        ));
         let content_size = output
             .transform
             .invert()
             .transform_size(Size::from((output.width as i32, output.height as i32)));
+        let hotspot_location = [
+            ((pointer_x - f64::from(output_state.logical_origin.x)) * output_state.scale_factor)
+                .round() as f32,
+            ((pointer_y - f64::from(output_state.logical_origin.y)) * output_state.scale_factor)
+                .round() as f32,
+        ];
+        let hotspot_location = data
+            .desktop
+            .state
+            .magnifier_view_for_output(output.output_id)
+            .transform_point(hotspot_location, content_size);
+        let hotspot_location = Point::<i32, Physical>::from((
+            hotspot_location[0].round() as i32,
+            hotspot_location[1].round() as i32,
+        ));
         let cursor_rect = transformed_cursor_rect(
             hotspot_location,
             Point::from((hotspot_x as i32, hotspot_y as i32)),
@@ -1452,6 +1487,9 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
             &data.drm,
             output.hdr_metadata_blob.take(),
         );
+        data.desktop
+            .state
+            .forget_workspace_transition(output.output_id);
         data.desktop.state.outputs.shift_remove(&output.output_id);
         data.desktop
             .state
@@ -1997,6 +2035,16 @@ pub fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let _input_token = loop_handle.insert_source(input_backend, move |event, _, data| {
+        match &event {
+            SmithayInputEvent::DeviceAdded { device } => {
+                data.desktop.state.register_libinput_device(device.clone());
+            }
+            SmithayInputEvent::DeviceRemoved { device } => {
+                data.desktop.state.unregister_libinput_device(device);
+            }
+            _ => {}
+        }
+
         if let SmithayInputEvent::Keyboard { event, .. } = &event {
             if event.state() == SmithayKeyState::Pressed {
                 let keycode: u32 = event.key_code().into();

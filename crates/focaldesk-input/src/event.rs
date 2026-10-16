@@ -84,6 +84,18 @@ pub enum InputEvent {
         delta: ScrollDelta,
         position: Position,
     },
+    GestureSwipeBegin {
+        fingers: u32,
+        time_msec: u32,
+    },
+    GestureSwipeUpdate {
+        delta: Delta,
+        time_msec: u32,
+    },
+    GestureSwipeEnd {
+        cancelled: bool,
+        time_msec: u32,
+    },
     PointerEntered,
     PointerLeft,
 }

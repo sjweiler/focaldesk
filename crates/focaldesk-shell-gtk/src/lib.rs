@@ -1511,6 +1511,7 @@ struct SystemRailState {
     camera_active: bool,
     battery_percent: Option<u8>,
     externally_powered: bool,
+    line_power_online: Option<bool>,
     battery_charging: bool,
     notification_unread_count: usize,
     update_available_count: usize,
@@ -1676,9 +1677,11 @@ fn build_panel(
     battery.set_valign(gtk::Align::End);
     battery_overlay.add_overlay(&battery);
     battery_button.set_child(Some(&battery_overlay));
-    let battery_connector = connector.clone();
-    battery_button
-        .connect_clicked(move |_| open_shell_panel(&battery_connector, ShellPanel::Power));
+    battery_button.connect_clicked(|_| {
+        send_action(DesktopAction::OpenSettingsPanel {
+            panel: "power".into(),
+        });
+    });
     top.append(&battery_button);
     rail.append(&top);
 
@@ -1930,8 +1933,8 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
         .camera_button
         .set_visible(snapshot.shell.camera_active);
     set_button_active(&widgets.camera_button, snapshot.shell.camera_active);
-    let externally_powered =
-        snapshot.shell.line_power_online == Some(true) || snapshot.shell.battery_percent.is_none();
+    let externally_powered = snapshot.shell.line_power_online == Some(true)
+        || (snapshot.shell.line_power_online.is_none() && snapshot.shell.battery_percent.is_none());
     set_shell_icon(
         &widgets.battery_image,
         if externally_powered {
@@ -1949,13 +1952,17 @@ fn update_system_rail(widgets: &SystemRailWidgets, snapshot: &DesktopSnapshot, c
     );
     let power_tooltip = match (
         snapshot.shell.battery_percent,
-        externally_powered,
+        snapshot.shell.line_power_online,
         snapshot.shell.battery_charging,
     ) {
-        (Some(percent), _, true) => format!("Battery {percent}% · charging"),
-        (Some(percent), true, false) => format!("Battery {percent}% · plugged in"),
-        (Some(percent), false, false) => format!("Battery {percent}% · discharging"),
-        (None, _, _) => "External power".into(),
+        (Some(percent), Some(true), true) => format!("Battery {percent}% · charging"),
+        (Some(percent), Some(true), false) => format!("Battery {percent}% · plugged in"),
+        (Some(percent), Some(false), _) => format!("Battery {percent}% · on battery"),
+        (Some(percent), None, true) => format!("Battery {percent}% · charging · source unknown"),
+        (Some(percent), None, false) => format!("Battery {percent}% · source unknown"),
+        (None, Some(true), _) => "External power".into(),
+        (None, Some(false), _) => "Battery unavailable · on battery".into(),
+        (None, None, _) => "External power (assumed; no battery reported)".into(),
     };
     widgets
         .battery_button
@@ -2018,8 +2025,8 @@ fn system_rail_state(snapshot: &DesktopSnapshot, connector: &str) -> SystemRailS
             minimized: window.minimized,
             focused: window.focused,
         });
-    let externally_powered =
-        snapshot.shell.line_power_online == Some(true) || snapshot.shell.battery_percent.is_none();
+    let externally_powered = snapshot.shell.line_power_online == Some(true)
+        || (snapshot.shell.line_power_online.is_none() && snapshot.shell.battery_percent.is_none());
 
     SystemRailState {
         output: output.map(|output| SystemRailOutputState {
@@ -2043,6 +2050,7 @@ fn system_rail_state(snapshot: &DesktopSnapshot, connector: &str) -> SystemRailS
         camera_active: snapshot.shell.camera_active,
         battery_percent: snapshot.shell.battery_percent,
         externally_powered,
+        line_power_online: snapshot.shell.line_power_online,
         battery_charging: snapshot.shell.battery_charging,
         notification_unread_count: snapshot.shell.notification_unread_count,
         update_available_count: snapshot.shell.update_available_count,

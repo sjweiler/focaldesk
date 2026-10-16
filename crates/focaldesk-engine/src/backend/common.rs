@@ -35,17 +35,17 @@ use smithay::wayland::shm::ShmState;
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::{MatchRule, MessageType};
 
+use crate::core::OutputState;
+use crate::core::SceneState;
 use crate::core::desktop::{DesktopInit, DesktopState};
 use crate::core::render::RenderState;
 use crate::core::ui_state::UiState;
 use crate::core::wayland::client::ClientState;
-use crate::core::OutputState;
-use crate::core::SceneState;
 use focaldesk_config::configured_theme;
 use focaldesk_settings_core::load_settings;
-use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
-use focaldesk_themes::{ThemeDocument, ThemeManager, SYSTEM_DEFAULT_THEME_PATH};
+use focaldesk_themes::theme::BuiltInThemeId;
+use focaldesk_themes::{SYSTEM_DEFAULT_THEME_PATH, ThemeDocument, ThemeManager};
 use focaldesk_types::CompositorBackend;
 use smithay::wayland::xdg_activation::XdgActivationState;
 #[cfg(feature = "xwayland")]
@@ -787,6 +787,7 @@ pub(crate) fn bootstrap_compositor_core(
     let xwayland_shell_state = XWaylandShellState::new::<DesktopState>(&dh);
 
     let settings = load_settings();
+    let start_on_screen_keyboard = settings.accessibility.on_screen_keyboard_enabled;
 
     let mut seat_state = smithay::input::SeatState::new();
     let mut seat = seat_state.new_wl_seat(&dh, "seat-0".to_string());
@@ -908,6 +909,9 @@ pub(crate) fn bootstrap_compositor_core(
         client_wayland_display: wayland_display.clone(),
         theme_manager,
         apps: settings.apps,
+        animations_enabled: settings.appearance.animations,
+        input_settings: settings.input,
+        accessibility_settings: settings.accessibility,
         workspaces: settings.workspaces,
         privacy: settings.privacy,
         power: settings.power,
@@ -916,6 +920,9 @@ pub(crate) fn bootstrap_compositor_core(
     };
 
     let mut state = DesktopState::new(init);
+    if start_on_screen_keyboard {
+        state.launch_app("maliit-keyboard".to_string());
+    }
     let output_state =
         if let (Some(output), Some(bootstrap_output)) = (output, bootstrap_output.as_ref()) {
             state.set_output_from_nested(

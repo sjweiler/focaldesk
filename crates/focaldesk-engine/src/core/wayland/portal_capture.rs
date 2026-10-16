@@ -153,8 +153,8 @@ impl WlrLayerShellHandler for DesktopState {
         _layer: Layer,
         namespace: String,
     ) {
-        use smithay::desktop::layer_map_for_output;
         use smithay::desktop::LayerSurface;
+        use smithay::desktop::layer_map_for_output;
 
         let output = wl_output
             .as_ref()

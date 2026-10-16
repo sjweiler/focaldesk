@@ -37,6 +37,10 @@ pub enum NotificationIpcRequest {
     Dismiss {
         id: u64,
     },
+    InvokeAction {
+        id: u64,
+        action_key: String,
+    },
     ClearHistory,
     SetHistoryLimit {
         limit: u32,
@@ -169,6 +173,16 @@ fn handle_notification_client(
             } else {
                 NotificationIpcResponse::Error {
                     message: "notification not found".into(),
+                }
+            }
+        }
+        Ok(NotificationIpcRequest::InvokeAction { id, action_key }) => {
+            let mut manager = manager.lock().unwrap();
+            if manager.invoke_action(id, &action_key) {
+                NotificationIpcResponse::Ok
+            } else {
+                NotificationIpcResponse::Error {
+                    message: "notification action not found".into(),
                 }
             }
         }

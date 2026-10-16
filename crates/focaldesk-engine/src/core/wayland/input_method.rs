@@ -5,7 +5,7 @@
 //! unrecognized clients rather than advertised session-wide.
 
 use smithay::desktop::{PopupKind, PopupManager};
-use smithay::reexports::wayland_server::{protocol::wl_surface::WlSurface, Client};
+use smithay::reexports::wayland_server::{Client, protocol::wl_surface::WlSurface};
 use smithay::utils::{Logical, Rectangle};
 use smithay::wayland::input_method::{InputMethodHandler, PopupSurface};
 use smithay::wayland::seat::WaylandFocus;

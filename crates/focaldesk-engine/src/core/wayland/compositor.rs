@@ -6,11 +6,11 @@ use focaldesk_logging::flog;
 use smithay::backend::renderer::buffer_type;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::reexports::calloop::Interest;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::compositor::{
-    add_blocker, add_destruction_hook, add_pre_commit_hook, with_states, BufferAssignment,
-    CompositorClientState, SurfaceAttributes,
+    BufferAssignment, CompositorClientState, SurfaceAttributes, add_blocker, add_destruction_hook,
+    add_pre_commit_hook, with_states,
 };
 use smithay::wayland::compositor::{CompositorHandler, CompositorState as SmithayCompositorState};
 use smithay::wayland::dmabuf::get_dmabuf;
@@ -20,8 +20,8 @@ use smithay::xwayland::XWaylandClientData;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
-use smithay::desktop::{layer_map_for_output, Window};
-use smithay::wayland::fractional_scale::{with_fractional_scale, FractionalScaleHandler};
+use smithay::desktop::{Window, layer_map_for_output};
+use smithay::wayland::fractional_scale::{FractionalScaleHandler, with_fractional_scale};
 
 use crate::core::desktop::DesktopState;
 use smithay::backend::renderer::element::Id;

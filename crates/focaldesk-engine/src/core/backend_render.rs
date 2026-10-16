@@ -244,6 +244,10 @@ pub fn prepare_output(
         );
     }
 
+    if state.has_workspace_transition(output_id) {
+        state.mark_output_full_damage(output_id, crate::core::desktop::DamageSource::Unknown);
+    }
+
     let frame_damage = {
         let pending_damage = state
             .outputs
@@ -252,7 +256,11 @@ pub fn prepare_output(
             .pending_damage
             .clone();
         let full_damage = Rectangle::from_loc_and_size((0, 0), buffer_size);
-        if force_full_damage || state.render.redraw_all {
+        let magnifier_active = state.magnifier_view_for_output(output_id).zoom > 1.001;
+        if force_full_damage
+            || state.render.redraw_all
+            || (magnifier_active && !pending_damage.is_empty())
+        {
             if state.render.redraw_all {
                 state.record_damage_source(crate::core::desktop::DamageSource::FullRedrawFallback);
             }
@@ -294,7 +302,18 @@ pub fn prepare_output(
         );
         crate::core::wayland::color_management_protocol::notify_preferred_color_changed(state);
     }
-    let wallpaper_path = state.theme.active_theme().wallpaper.path.clone();
+    let active_workspace = state
+        .outputs
+        .get(&output_id)
+        .map(|output| output.active_workspace.0)
+        .unwrap_or(state.active_workspace.0);
+    let wallpaper_path = state
+        .workspaces
+        .workspace_wallpapers
+        .get(&active_workspace)
+        .filter(|path| !path.trim().is_empty())
+        .cloned()
+        .or_else(|| state.theme.active_theme().wallpaper.path.clone());
     state
         .render
         .ensure_wallpaper_loaded(renderer, wallpaper_path.as_deref());
@@ -552,23 +571,17 @@ pub fn build_output_client_elements(
         .map(|o| o.handle.clone())
         .expect("output missing");
 
-    let active_workspace = state
-        .outputs
-        .get(&output_id)
-        .map(|o| o.active_workspace)
-        .unwrap_or_else(|| state.focused_workspace());
-
-    let layers_on = state.outputs.get(&output_id).map(|o| &o.handle);
-
     let output = state.outputs.get(&output_id).expect("output missing");
+    let output_width = output.logical_size.w;
     state.import_mapped_surfaces_for_output(renderer, output.logical_origin, output.logical_size);
+    let workspace_views = state.workspace_render_views(output_id, output_width, Instant::now());
 
     state.render.build_client_elements_for_output(
         &state.space,
         &state.windows,
-        active_workspace,
+        &workspace_views,
         &output_handle,
-        layers_on,
+        Some(&output_handle),
         renderer,
     )
 }
@@ -584,16 +597,17 @@ pub fn build_output_popup_elements(
         .map(|o| o.handle.clone())
         .expect("output missing");
 
-    let active_workspace = state
+    let output_width = state
         .outputs
         .get(&output_id)
-        .map(|o| o.active_workspace)
-        .unwrap_or_else(|| state.focused_workspace());
+        .map(|output| output.logical_size.w)
+        .unwrap_or(1);
+    let workspace_views = state.workspace_render_views(output_id, output_width, Instant::now());
 
     let mut elements = state.render.build_popup_elements_for_output(
         &state.space,
         &state.windows,
-        active_workspace,
+        &workspace_views,
         &output_handle,
         renderer,
     );
