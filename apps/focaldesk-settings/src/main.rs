@@ -9564,11 +9564,16 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         "Optional local image paths. Empty entries use the active theme wallpaper.",
     ));
     for workspace in 1..=9u32 {
-        let entry = add_entry_row(
-            &wallpaper_group,
-            &format!("Workspace {workspace}"),
-            "Optional image path",
-        );
+        let row = adw::ActionRow::new();
+        row.set_title(&format!("Workspace {workspace}"));
+        let entry = gtk::Entry::new();
+        entry.set_placeholder_text(Some("Optional image path"));
+        entry.set_hexpand(true);
+        let browse = gtk::Button::with_label("Browse…");
+        browse.set_tooltip_text(Some("Choose a local wallpaper image"));
+        row.add_suffix(&entry);
+        row.add_suffix(&browse);
+        wallpaper_group.add(&row);
         if let Some(path) = settings
             .borrow()
             .workspaces
@@ -9590,6 +9595,28 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
                     .insert(workspace, path);
             }
             persist_settings(&current);
+        });
+        browse.connect_clicked(move |_| {
+            let dialog = gtk::FileDialog::new();
+            dialog.set_title(&format!("Choose Wallpaper for Workspace {workspace}"));
+            let filter = gtk::FileFilter::new();
+            filter.set_name(Some("Wallpaper images"));
+            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp"] {
+                filter.add_pattern(pattern);
+            }
+            dialog.set_default_filter(Some(&filter));
+            dialog.open(None::<&gtk::Window>, None::<&gtk::gio::Cancellable>, {
+                let entry = entry.clone();
+                move |result| {
+                    let Ok(file) = result else {
+                        return;
+                    };
+                    let Some(path) = file.path() else {
+                        return;
+                    };
+                    entry.set_text(&path.to_string_lossy());
+                }
+            });
         });
     }
     page.add(&wallpaper_group);
