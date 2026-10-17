@@ -417,12 +417,6 @@ fn build_dock(
     pinned.append(&email_button);
     shelf.append(&pinned);
 
-    let running = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-    running.add_css_class("shelf-group");
-    running.add_css_class("running-group");
-    shelf.append(&running);
-    shelf.append(&shelf_separator());
-
     let utilities = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     utilities.add_css_class("shelf-group");
     utilities.append(&shelf_launch_button(
@@ -436,6 +430,17 @@ fn build_dock(
         "@settings",
     ));
     shelf.append(&utilities);
+
+    // Keep every launcher together.  Windows that appear because an app has
+    // been launched are tasks, not launch controls, so they belong in their
+    // own trailing group instead of being inserted between pinned controls.
+    let running_separator = shelf_separator();
+    running_separator.set_visible(false);
+    shelf.append(&running_separator);
+    let running = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+    running.add_css_class("shelf-group");
+    running.add_css_class("running-group");
+    shelf.append(&running);
 
     let visibility = Rc::new(Cell::new(config.dock.visibility));
     let visibility_reload = visibility.clone();
@@ -523,6 +528,7 @@ fn build_dock(
             {
                 rebuild_running_apps(
                     &running,
+                    &running_separator,
                     &snapshot,
                     output,
                     workspace,
@@ -711,6 +717,7 @@ fn running_app_capacity(pinned_count: usize, reserve_overflow_button: bool) -> u
 
 fn rebuild_running_apps(
     container: &gtk::Box,
+    separator: &gtk::Separator,
     snapshot: &DesktopSnapshot,
     output: Option<&OutputSnapshot>,
     workspace: u32,
@@ -733,9 +740,11 @@ fn rebuild_running_apps(
         .collect::<Vec<_>>();
     if windows.is_empty() {
         container.set_visible(false);
+        separator.set_visible(false);
         return;
     }
     container.set_visible(true);
+    separator.set_visible(true);
     let mut groups: Vec<(String, Vec<&focaldesk_ipc::WindowSnapshot>)> = Vec::new();
     for item in windows {
         let identity = item

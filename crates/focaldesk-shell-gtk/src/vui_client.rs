@@ -1474,11 +1474,14 @@ fn dock_root(
             }
         }
         if !groups.is_empty() {
-            let separator = Surface::new(Spacer::new(1.0, 28.0))
-                .background(vui_core::Color::rgba(112, 128, 150, 100))
+            // Running windows are a separate task list, not additional
+            // launcher buttons. Give that boundary enough contrast and height
+            // to remain obvious on every glass/theme variant.
+            let separator = Surface::new(Spacer::new(2.0, 36.0))
+                .background(vui_core::Color::rgba(174, 202, 230, 238))
                 .radius(1.0);
             buttons.push(Box::new(
-                vui_core::SizedBox::new(separator).width(1.0).height(28.0),
+                vui_core::SizedBox::new(separator).width(2.0).height(36.0),
             ));
         }
         let capacity = 4usize;

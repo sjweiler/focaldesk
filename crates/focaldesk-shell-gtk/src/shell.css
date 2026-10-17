@@ -371,9 +371,9 @@ window.task-shelf-window {
 }
 
 .shelf-separator {
-  min-width: 1px;
-  margin: 9px 2px;
-  background: alpha(@fd_shell_border, 0.62);
+  min-width: 2px;
+  margin: 7px 4px;
+  background: alpha(@fd_shell_text, 0.82);
 }
 
 .shelf-overflow {
