@@ -57,7 +57,12 @@ TOML file references the wallpaper by path, so moving either file can break
 that association.
 
 Use **Export** to create a portable `.fdtheme` package. A package embeds the
-validated document and at most one PNG, JPEG, or WebP wallpaper. Wallpapers are
+validated document and at most one PNG, JPEG, WebP, or OpenEXR wallpaper. OpenEXR
+wallpapers are imported as linear HDR (Rec.709/sRGB primaries) in the GLES renderer;
+16-bit PNG wallpapers tagged as Rec.2020 PQ or HLG with cICP metadata are decoded to
+the same linear HDR scene. JPEG remains SDR unless a reproducible Ultra HDR gain-map
+decoder is bundled.
+PNG, JPEG, and WebP remain SDR sRGB. Wallpapers are
 limited to 64 MiB, 32,768 pixels on either axis, and 100 million pixels total.
 The package records the asset size and SHA-256 digest and validates both before
 installation.
@@ -74,8 +79,16 @@ revert unsaved editor changes before importing another package.
 When `appearance.theme` is absent or is `"Default"`, the compositor loads
 `/usr/share/focaldesk/default.toml`. `just install-desktop` installs that
 document and its wallpaper from `assets/themes/default.toml` and
-`assets/wallpaper/focaldesk_wallpaper.png`. If the document cannot be loaded or
-validated, FocalDesk falls back to the built-in Eagle theme.
+`assets/wallpaper/focaldesk_wallpaper_hdr1400.exr`. If the document cannot be loaded or
+validated, FocalDesk falls back to its compatibility theme.
 
-Selecting Eagle, Moonbase, or Classic explicitly in Settings continues to use
-the corresponding built-in theme.
+**Settings → Appearance** exposes only the system Default theme. The former
+Eagle, Moonbase, and Classic built-ins are preserved as optional portable
+packages in `assets/themes/optional/` for source builds. Import one through
+**Settings → Theme Editor → Import**. Installed packages then appear in
+**Settings → Appearance → Theme** and remain selected across compositor
+restarts. Packages live below `$XDG_DATA_HOME/focaldesk/themes/` and remain
+removable through Theme Editor. On the first load after this change, an
+existing Eagle, Moonbase, or Classic selection is migrated to its matching
+installed package. If that package cannot be read, FocalDesk safely selects
+Default instead.

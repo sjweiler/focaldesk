@@ -115,4 +115,8 @@ scripts/drm-hardware-regression.sh verify
 ```
 
 The final check requires observable hotplug change, multiple scale and refresh
-values, a ready compositor after resume, and journals without crash signatures.
+values, the same mixed-output configuration after resume, a complete ordered
+DRM recovery lifecycle through its first successful post-resume page flip, and
+journals without crash signatures. The verifier recognizes the equivalent
+GLES and raw-Vulkan DRM recovery sequences. This makes a live IPC socket
+insufficient evidence for a successful display recovery.

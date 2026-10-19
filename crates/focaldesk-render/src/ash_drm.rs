@@ -3004,7 +3004,7 @@ impl AshDrmRenderer {
                 image.image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[vk::BufferImageCopy::default()
-                    .buffer_row_length(surface.stride / 4)
+                    .buffer_row_length(surface.stride / bytes_per_pixel(surface.format))
                     .image_subresource(
                         vk::ImageSubresourceLayers::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -3752,6 +3752,7 @@ fn texture_vk_format(format: FramePixelFormat) -> vk::Format {
         FramePixelFormat::Rgba8Srgb => vk::Format::R8G8B8A8_UNORM,
         FramePixelFormat::Bgra10Unorm => vk::Format::A2R10G10B10_UNORM_PACK32,
         FramePixelFormat::Rgba10Unorm => vk::Format::A2B10G10R10_UNORM_PACK32,
+        FramePixelFormat::Rgba16FloatLinear => vk::Format::R16G16B16A16_SFLOAT,
     }
 }
 
@@ -4146,6 +4147,10 @@ fn texture_upload_byte_len(
         .ok()?
         .checked_mul(usize::try_from(height).ok()?)?;
     (available >= required).then_some(required)
+}
+
+fn bytes_per_pixel(format: FramePixelFormat) -> u32 {
+    if format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 }
 }
 
 fn validate_meshes(meshes: &[TexturedMesh]) -> Result<()> {

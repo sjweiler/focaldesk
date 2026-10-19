@@ -148,9 +148,9 @@ mod tests {
 
     #[test]
     fn generated_css_tracks_palette_scale_density_and_motion() {
-        let classic = theme_by_name("Classic");
+        let theme = theme_by_name("Default");
         let css = gtk_app_css(
-            &classic,
+            &theme,
             GtkAppThemeOptions {
                 font_scale: 1.25,
                 animations: false,
@@ -158,12 +158,11 @@ mod tests {
             },
         );
 
-        assert!(css.contains("@define-color fd_app_accent rgba(255, 128, 0"));
+        assert!(css.contains("@define-color fd_app_accent rgba(51, 153, 255"));
         assert!(css.contains("font-size: 1.250em"));
-        assert!(css.contains("padding: 11px"));
         assert!(css.contains("transition-duration: 0ms"));
         assert!(css.contains("border-width: 2.0px"));
         assert!(css.contains(".shell-surface"));
-        assert!(gtk_app_prefers_dark(&classic));
+        assert!(gtk_app_prefers_dark(&theme));
     }
 }

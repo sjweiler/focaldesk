@@ -68,6 +68,10 @@ struct WgpuShellAssets {
     unavailable_icons: HashSet<IconId>,
     font_atlas_initialized: bool,
     font_atlas_pending: Option<Vec<u8>>,
+    /// Whether the preceding scene referenced the atlas. The raw DRM Vulkan
+    /// renderer evicts idle textures, so an atlas must be resent when a toast
+    /// is the first shell text after an idle period.
+    font_atlas_was_referenced: bool,
     lock_screen_was_active: bool,
 }
 
@@ -374,6 +378,8 @@ struct WgpuWallpaper {
     width: u32,
     height: u32,
     pending_pixels: Option<Vec<u8>>,
+    format: FramePixelFormat,
+    color_transform: TextureColorTransform,
 }
 
 struct WgpuIcon {
@@ -653,6 +659,9 @@ impl ApplicationHandler for NestedVulkanApp {
                 FramePixelFormat::Rgba8Srgb => [Fourcc::Abgr8888, Fourcc::Xbgr8888],
                 FramePixelFormat::Bgra10Unorm => [Fourcc::Argb2101010, Fourcc::Xrgb2101010],
                 FramePixelFormat::Rgba10Unorm => [Fourcc::Abgr2101010, Fourcc::Xbgr2101010],
+                // FP16 wallpapers are compositor-owned uploads, not client
+                // DMA-BUF formats we advertise through Wayland.
+                FramePixelFormat::Rgba16FloatLinear => continue,
             };
             dmabuf_formats.extend(codes.map(|code| Format { code, modifier }));
         }
@@ -1085,35 +1094,58 @@ fn font_atlas_needs_upload(
     atlas_initialized: bool,
     lock_screen_active: bool,
     lock_screen_was_active: bool,
+    atlas_resumed: bool,
 ) -> bool {
-    atlas_dirty || !atlas_initialized || (lock_screen_active && !lock_screen_was_active)
+    atlas_dirty
+        || !atlas_initialized
+        || (lock_screen_active && !lock_screen_was_active)
+        || atlas_resumed
 }
 
 fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShellAssets) {
-    let mut strings = vec![("FOCALDESK".to_string(), WGPU_LABEL_STYLE)];
-    strings.extend(
-        desktop
-            .state
-            .ui
-            .elements
-            .iter()
-            .filter(|element| element.visible)
-            .filter_map(|element| {
-                element
-                    .label
-                    .as_deref()
-                    .map(|label| (clipped_text(label, 48), WGPU_LABEL_STYLE))
-            }),
-    );
-    for notification in desktop.state.notification_snapshots.iter().take(3) {
-        strings.push((clipped_text(&notification.title, 38), WGPU_LABEL_STYLE));
-        strings.push((clipped_text(&notification.body, 52), WGPU_BODY_STYLE));
+    let output_id = desktop.output_id;
+    let topbar_visible = desktop
+        .state
+        .internal_chrome_visibility_for_output(output_id, Instant::now())
+        .topbar;
+    let mut strings = Vec::new();
+    let mut atlas_referenced = false;
+
+    // These labels have matching quads only when compositor chrome owns the
+    // topbar. A trusted rail client suppresses that chrome.
+    if topbar_visible {
+        strings.push(("FOCALDESK".to_string(), WGPU_LABEL_STYLE));
+        strings.extend(
+            desktop
+                .state
+                .ui
+                .elements
+                .iter()
+                .filter(|element| element.visible)
+                .filter_map(|element| {
+                    element
+                        .label
+                        .as_deref()
+                        .map(|label| (clipped_text(label, 48), WGPU_LABEL_STYLE))
+                }),
+        );
+        atlas_referenced = true;
+    }
+    if !(desktop.state.lock_screen.active && desktop.state.privacy.hide_lock_screen_notifications) {
+        for notification in desktop.state.notification_snapshots.iter().take(3) {
+            let title = clipped_text(&notification.title, 38);
+            let body = clipped_text(&notification.body, 52);
+            atlas_referenced |= !title.is_empty() || !body.is_empty();
+            strings.push((title, WGPU_LABEL_STYLE));
+            strings.push((body, WGPU_BODY_STYLE));
+        }
     }
     if let Some(dialog) = desktop
         .state
         .active_dialog
         .and_then(|id| desktop.state.dialogs.iter().find(|dialog| dialog.id == id))
     {
+        atlas_referenced = true;
         strings.push((clipped_text(&dialog.title, 64), WGPU_LABEL_STYLE));
         strings.extend(
             dialog
@@ -1130,6 +1162,7 @@ fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShell
     }
     let lock = desktop.state.lock_screen.snapshot(Instant::now());
     if lock.active {
+        atlas_referenced = true;
         strings.push(("FOCALDESK LOCKED".to_string(), WGPU_LABEL_STYLE));
         strings.push((clipped_text(&lock.message, 64), WGPU_LABEL_STYLE));
         strings.push(("Show".to_string(), WGPU_LABEL_STYLE));
@@ -1155,7 +1188,9 @@ fn prepare_shell_text(desktop: &mut WgpuSceneDesktop<'_>, assets: &mut WgpuShell
         assets.font_atlas_initialized,
         lock.active,
         assets.lock_screen_was_active,
+        atlas_referenced && !assets.font_atlas_was_referenced,
     );
+    assets.font_atlas_was_referenced = atlas_referenced;
     assets.lock_screen_was_active = lock.active;
     if upload_atlas {
         let alpha = desktop.state.fonts.atlas_pixels();
@@ -1554,11 +1589,24 @@ fn append_wallpaper_quads(
                 }
             };
             let (width, height) = image.dimensions();
+            let linear_exr = std::path::Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exr"));
+            let (pixels, format, color_transform) = if linear_exr {
+                let rgba = image.to_rgba32f();
+                let mut pixels = Vec::with_capacity(rgba.len() * 2);
+                for value in rgba.as_raw() {
+                    pixels.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_ne_bytes());
+                }
+                (pixels, FramePixelFormat::Rgba16FloatLinear, TextureColorTransform { transfer: FrameTransferFunction::Linear, ..Default::default() })
+            } else {
+                (image.to_rgba8().into_raw(), FramePixelFormat::Rgba8Srgb, TextureColorTransform::default())
+            };
             Some(WgpuWallpaper {
                 cache_key: hashed_cache_key(2, &path),
                 width,
                 height,
-                pending_pixels: Some(image.to_rgba8().into_raw()),
+                pending_pixels: Some(pixels),
+                format,
+                color_transform,
             })
         });
     }
@@ -1620,9 +1668,9 @@ fn append_wallpaper_quads(
             },
             width: asset.width,
             height: asset.height,
-            stride: asset.width.saturating_mul(4),
-            format: FramePixelFormat::Rgba8Srgb,
-            color_transform: Default::default(),
+            stride: asset.width.saturating_mul(if asset.format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 }),
+            format: asset.format,
+            color_transform: asset.color_transform,
             dmabuf: None,
             damage: if index == 0 && upload_pending {
                 vec![[0, 0, asset.width, asset.height]]
@@ -2546,8 +2594,16 @@ mod color_transform_tests {
 
     #[test]
     fn lock_transition_reuploads_an_otherwise_clean_font_atlas() {
-        assert!(font_atlas_needs_upload(false, true, true, false));
-        assert!(!font_atlas_needs_upload(false, true, true, true));
-        assert!(!font_atlas_needs_upload(false, true, false, true));
+        assert!(font_atlas_needs_upload(false, true, true, false, false));
+        assert!(!font_atlas_needs_upload(false, true, true, true, false));
+        assert!(!font_atlas_needs_upload(false, true, false, true, false));
+    }
+
+    #[test]
+    fn resumed_shell_text_reuploads_an_evicted_atlas() {
+        // A trusted rail can suppress all compositor topbar text long enough
+        // for the raw DRM renderer to evict this texture. A new toast must
+        // therefore force one upload when it becomes the first text again.
+        assert!(font_atlas_needs_upload(false, true, false, false, true));
     }
 }

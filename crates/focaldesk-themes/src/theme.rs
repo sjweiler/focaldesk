@@ -120,17 +120,17 @@ pub struct IconTheme {
 
 impl Default for FlowTheme {
     fn default() -> Self {
-        crate::builtins::eagle_theme()
+        crate::builtins::default_theme()
     }
 }
 
 pub fn theme_by_name(name: &str) -> FlowTheme {
-    match name {
-        "Eagle" => builtin_theme(BuiltInThemeId::Eagle),
-        "Moonbase" => builtin_theme(BuiltInThemeId::Moonbase),
-        "Classic" => builtin_theme(BuiltInThemeId::Classic),
-        _ => builtin_theme(BuiltInThemeId::Eagle),
+    if let Ok(document) = crate::ThemeDocument::load(std::path::Path::new(name)) {
+        if let Ok(theme) = crate::manager::theme_from_document(&document) {
+            return theme;
+        }
     }
+    builtin_theme(BuiltInThemeId::Eagle)
 }
 
 impl Default for FlowThemeId {

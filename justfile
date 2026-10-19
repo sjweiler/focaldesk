@@ -443,7 +443,10 @@ install-focaldmd-fedora: release-focaldmd release-focaldm-greeter install-focald
 install-desktop: install-polkit install-settings
     cargo build --release -p focaldesk-desktop
     sudo install -Dm644 assets/themes/default.toml /usr/share/focaldesk/default.toml
-    sudo install -Dm644 assets/wallpaper/focaldesk_wallpaper.png /usr/share/focaldesk/wallpaper/focaldesk_wallpaper.png
+    sudo install -Dm644 assets/wallpaper/focaldesk_wallpaper_hdr1400.exr /usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
+    sudo install -Dm644 assets/themes/optional/eagle.fdtheme /usr/share/focaldesk/optional-themes/eagle.fdtheme
+    sudo install -Dm644 assets/themes/optional/moonbase.fdtheme /usr/share/focaldesk/optional-themes/moonbase.fdtheme
+    sudo install -Dm644 assets/themes/optional/classic.fdtheme /usr/share/focaldesk/optional-themes/classic.fdtheme
     @echo "Build artifact:"
     @md5sum target/release/focaldesk-desktop
     # mv over the running binary: direct install/cp to the live path gets "Text file busy".

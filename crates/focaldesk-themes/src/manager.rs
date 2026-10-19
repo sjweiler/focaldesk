@@ -62,7 +62,15 @@ impl ThemeManager {
     }
 
     pub fn set_custom(&mut self, path: PathBuf) -> anyhow::Result<()> {
-        let theme = load_custom_theme(&path)?;
+        // Installed `.fdtheme` packages resolve to the modern ThemeDocument
+        // format. Retain FlowTheme parsing as a compatibility path for older
+        // hand-authored custom themes.
+        let document = ThemeDocument::load(&path).ok();
+        let theme = if let Some(document) = document {
+            project_editor_document(&FlowTheme::default(), &document)?
+        } else {
+            load_custom_theme(&path)?
+        };
         self.active = ActiveTheme::Custom(path);
         self.resolved = theme;
         self.editor_applied = None;
@@ -98,6 +106,10 @@ impl ThemeManager {
     pub fn editor_revision(&self) -> u64 {
         self.editor_revision
     }
+}
+
+pub fn theme_from_document(document: &ThemeDocument) -> anyhow::Result<FlowTheme> {
+    project_editor_document(&FlowTheme::default(), document)
 }
 
 fn project_editor_document(
@@ -245,5 +257,18 @@ mod tests {
             manager.active_theme().editor_paint.as_ref(),
             Some(&document.intent)
         );
+    }
+
+    #[test]
+    fn custom_theme_document_loads_as_a_persistent_theme() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("theme.toml");
+        let document = document(ThemeColor::srgb(0.3, 0.4, 0.5, 1.0));
+        document.save(&path).unwrap();
+
+        let mut manager = ThemeManager::new(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+        manager.set_custom(path.clone()).unwrap();
+        assert!(matches!(manager.active(), ActiveTheme::Custom(active) if active == &path));
+        assert_eq!(manager.active_theme().name, "Live");
     }
 }

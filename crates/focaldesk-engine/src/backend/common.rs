@@ -829,7 +829,12 @@ pub(crate) fn bootstrap_compositor_core(
         other => FlowThemeId::Custom(other.to_string()),
     };
 
-    let mut theme_manager = ThemeManager::new(theme_id);
+    let mut theme_manager = ThemeManager::new(theme_id.clone());
+    if let FlowThemeId::Custom(path) = &theme_id {
+        if let Err(err) = theme_manager.set_custom(std::path::PathBuf::from(path)) {
+            warn!(path, error = %err, "failed to load configured custom theme; using compatibility theme");
+        }
+    }
     if use_system_default {
         match ThemeDocument::load(std::path::Path::new(SYSTEM_DEFAULT_THEME_PATH)) {
             Ok(document) => match theme_manager.apply_editor_document(&document) {

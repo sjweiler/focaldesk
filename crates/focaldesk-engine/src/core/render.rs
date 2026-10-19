@@ -43,7 +43,10 @@ use smithay::backend::renderer::element::{Element, Id, Kind};
 use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
-use crate::core::color::{SurfaceColorRenderState, srgb_to_linear};
+use crate::core::color::{
+    ColorPrimaries, RenderingIntent, SurfaceColorRenderState, gamut_matrix_linear_rgb,
+    scene_working_primaries, srgb_to_linear,
+};
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
     ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget, WorkspaceRenderView,
@@ -209,6 +212,8 @@ pub struct RenderState {
     // wallpaper texture, damage tracking, etc
     pub wallpaper_texture: Option<GlesTexture>,
     pub wallpaper_path: Option<String>,
+    /// EXR and HDR PNG wallpapers are scene-linear; ordinary assets are sRGB.
+    pub wallpaper_is_linear: bool,
     /// Software cursor: GPU texture + layout (physical pixels), when not on the DRM cursor plane.
     pub sw_cursor_texture: Option<GlesTexture>,
     pub sw_cursor_surface: Option<WlSurface>,
@@ -1045,6 +1050,134 @@ impl Default for RenderState {
     }
 }
 
+struct HdrWallpaper {
+    width: u32,
+    height: u32,
+    /// Native-endian IEEE 754 binary16 RGBA pixels in scene-linear Rec.709.
+    pixels: Vec<u8>,
+}
+
+/// Decode a standards-tagged HDR PNG directly rather than letting a generic
+/// image loader discard the cICP metadata and quantize it to eight-bit sRGB.
+///
+/// PNG HDR is defined by 16-bit RGB/RGBA samples and cICP PQ or HLG transfer
+/// characteristics. Other PNGs deliberately return `None` so their mature SDR
+/// path remains unchanged.
+fn decode_hdr_wallpaper(path: &str) -> Option<HdrWallpaper> {
+    decode_hdr_png(path)
+}
+
+fn decode_hdr_png(path: &str) -> Option<HdrWallpaper> {
+    use png::{BitDepth, ColorType};
+    use std::fs::File;
+
+    let extension_is_png = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !extension_is_png {
+        return None;
+    }
+
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) => {
+            error!(target: "focaldesk", path, ?error, "load_wallpaper: cannot open PNG");
+            return None;
+        }
+    };
+    let decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut reader = match decoder.read_info() {
+        Ok(reader) => reader,
+        Err(error) => {
+            error!(target: "focaldesk", path, ?error, "load_wallpaper: PNG header decode failed");
+            return None;
+        }
+    };
+    let info = reader.info();
+    let cicp = info.coding_independent_code_points?;
+    if info.bit_depth != BitDepth::Sixteen
+        || !matches!(info.color_type, ColorType::Rgb | ColorType::Rgba)
+        || cicp.color_primaries != 9
+        || cicp.matrix_coefficients != 0
+        || !matches!(cicp.transfer_function, 16 | 18)
+    {
+        return None;
+    }
+
+    let mut encoded = vec![0; reader.output_buffer_size()?];
+    let output = match reader.next_frame(&mut encoded) {
+        Ok(output) => output,
+        Err(error) => {
+            error!(target: "focaldesk", path, ?error, "load_wallpaper: HDR PNG pixel decode failed");
+            return None;
+        }
+    };
+    if output.bit_depth != BitDepth::Sixteen
+        || !matches!(output.color_type, ColorType::Rgb | ColorType::Rgba)
+    {
+        return None;
+    }
+
+    let samples = output.color_type.samples();
+    let to_scene = gamut_matrix_linear_rgb(
+        ColorPrimaries::Bt2020,
+        scene_working_primaries(),
+        RenderingIntent::Relative,
+    );
+    let mut pixels = Vec::with_capacity((output.width * output.height * 8) as usize);
+    for pixel in encoded[..output.buffer_size()].chunks_exact(samples * 2) {
+        let sample = |channel: usize| {
+            u16::from_be_bytes([pixel[channel * 2], pixel[channel * 2 + 1]]) as f32 / 65535.0
+        };
+        let decode = match cicp.transfer_function {
+            16 => pq_to_scene_linear,
+            18 => hlg_to_scene_linear,
+            _ => unreachable!("validated cICP transfer"),
+        };
+        let linear = [decode(sample(0)), decode(sample(1)), decode(sample(2))];
+        let scene = multiply_rgb(to_scene, linear);
+        for value in [scene[0], scene[1], scene[2], if samples == 4 { sample(3) } else { 1.0 }] {
+            pixels.extend_from_slice(&half::f16::from_f32(value.max(0.0)).to_bits().to_ne_bytes());
+        }
+    }
+
+    Some(HdrWallpaper { width: output.width, height: output.height, pixels })
+}
+
+/// SMPTE ST 2084 maps code values to absolute luminance; the compositor's
+/// scene unit is its 203-nit HDR reference white.
+fn pq_to_scene_linear(value: f32) -> f32 {
+    let m1 = 2610.0 / 16384.0;
+    let m2 = 2523.0 / 32.0;
+    let c1 = 3424.0 / 4096.0;
+    let c2 = 2413.0 / 128.0;
+    let c3 = 2392.0 / 128.0;
+    let p = value.clamp(0.0, 1.0).powf(1.0 / m2);
+    let relative_to_10k = ((p - c1).max(0.0) / (c2 - c3 * p).max(0.000_001)).powf(1.0 / m1);
+    relative_to_10k * 10_000.0 / crate::core::color::HDR_REFERENCE_WHITE_NITS
+}
+
+/// ARIB STD-B67 has no absolute peak in the file. Match the compositor's HLG
+/// shader convention so code value 0.75 is the HDR reference white.
+fn hlg_to_scene_linear(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    let scene = if value < 0.5 {
+        value * value / 3.0
+    } else {
+        (((value - 0.559_910_73) / 0.178_832_77).exp() + 0.284_668_92) / 12.0
+    };
+    let reference = (((0.75_f32 - 0.559_910_73) / 0.178_832_77).exp() + 0.284_668_92) / 12.0;
+    (scene.max(0.0) / reference).powf(1.2)
+}
+
+fn multiply_rgb(matrix: [[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
+    [
+        matrix[0][0] * rgb[0] + matrix[0][1] * rgb[1] + matrix[0][2] * rgb[2],
+        matrix[1][0] * rgb[0] + matrix[1][1] * rgb[1] + matrix[1][2] * rgb[2],
+        matrix[2][0] * rgb[0] + matrix[2][1] * rgb[1] + matrix[2][2] * rgb[2],
+    ]
+}
+
 impl RenderState {
     pub fn new() -> Self {
         let zero: Rectangle<i32, Physical> = Rectangle::from_size(Size::from((0, 0)));
@@ -1055,6 +1188,7 @@ impl RenderState {
             scratch_damage_len: 0,
             wallpaper_texture: None,
             wallpaper_path: None,
+            wallpaper_is_linear: false,
             sw_cursor_texture: None,
             sw_cursor_surface: None,
             sw_cursor_surface_elements: Vec::new(),
@@ -1938,6 +2072,7 @@ impl RenderState {
         self.glass_control_background_linear = false;
         self.glass_control_background_disabled = false;
         self.wallpaper_texture = None;
+        self.wallpaper_is_linear = false;
         // ensure_wallpaper_loaded uses the cached path as its load-generation
         // key.  Clearing only the texture makes it incorrectly treat the dead
         // post-resume GPU cache as current and skip re-uploading the wallpaper.
@@ -2083,16 +2218,37 @@ impl RenderState {
             "ensure_wallpaper_loaded: load result"
         );
 
-        self.wallpaper_texture = tex;
+        self.wallpaper_is_linear = tex.as_ref().is_some_and(|(_, linear)| *linear);
+        self.wallpaper_texture = tex.map(|(texture, _)| texture);
     }
 
-    pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<GlesTexture> {
+    pub fn load_wallpaper(renderer: &mut GlesRenderer, path: &str) -> Option<(GlesTexture, bool)> {
         info!(
             target: "focaldesk",
             session_id = session_id(),
             path = %path,
             "load_wallpaper: opening"
         );
+
+        if let Some(decoded) = decode_hdr_wallpaper(path) {
+            info!(
+                target: "focaldesk",
+                session_id = session_id(),
+                width = decoded.width,
+                height = decoded.height,
+                "load_wallpaper: decoded HDR wallpaper into scene-linear FP16"
+            );
+            return renderer
+                .import_memory(
+                    &decoded.pixels,
+                    Fourcc::Abgr16161616f,
+                    (decoded.width as i32, decoded.height as i32).into(),
+                    false,
+                )
+                .map(|texture| (texture, true))
+                .map_err(|error| flog_error!("load_wallpaper: HDR wallpaper import failed: {error:?}"))
+                .ok();
+        }
 
         let img = match image::open(path) {
             Ok(i) => i,
@@ -2117,7 +2273,22 @@ impl RenderState {
             "load_wallpaper: decoded"
         );
 
-        //let rgba = img.to_rgba8();
+        let is_linear_exr = std::path::Path::new(path)
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exr"));
+        if is_linear_exr {
+            let rgba = img.to_rgba32f();
+            let mut pixels = Vec::with_capacity(rgba.len() * 2);
+            for value in rgba.as_raw() {
+                pixels.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_ne_bytes());
+            }
+            return renderer
+                .import_memory(&pixels, Fourcc::Abgr16161616f, (w as i32, h as i32).into(), false)
+                .map(|texture| (texture, true))
+                .map_err(|error| flog_error!("load_wallpaper: HDR EXR import failed: {error:?}"))
+                .ok();
+        }
+
         let mut rgba = img.to_rgba8();
 
         for px in rgba.as_chunks_mut::<4>().0 {
@@ -2148,7 +2319,7 @@ impl RenderState {
                     session_id = session_id(),
                     "load_wallpaper: import_memory OK"
                 );
-                Some(tex)
+                Some((tex, false))
             }
             Err(e) => {
                 error!(
@@ -3689,11 +3860,7 @@ impl RenderState {
             Uniform::new("u_tint", tint),
             Uniform::new(
                 "u_decode_srgb",
-                if client_compositing.ui_textures_linear() {
-                    1.0f32
-                } else {
-                    0.0f32
-                },
+                if self.wallpaper_is_linear { 0.0f32 } else { 1.0f32 },
             ),
             Uniform::new(
                 "u_texel_size",
@@ -3773,6 +3940,9 @@ impl RenderState {
         };
 
         if grade_mode < 0.5 {
+            return;
+        }
+        if self.wallpaper_is_linear {
             return;
         }
 

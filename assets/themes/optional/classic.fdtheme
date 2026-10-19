@@ -1,0 +1,118 @@
+package_version = 1
+slug = "classic"
+
+[document]
+format_version = 1
+name = "Classic"
+dynamic_range = "sdr"
+hdr_luminance_nits = 1000.0
+
+[document.paint]
+mode = "solid"
+
+[document.paint.color]
+space = "srgb"
+r = 1.0
+g = 0.5
+b = 0.0
+a = 1.0
+
+[document.semantic.surfaces.bar.normal]
+space = "srgb"
+r = 0.1
+g = 0.05
+b = 0.0
+a = 1.0
+
+[document.semantic.surfaces.dock.normal]
+space = "srgb"
+r = 0.02
+g = 0.02
+b = 0.02
+a = 1.0
+
+[document.semantic.surfaces.button.normal]
+space = "srgb"
+r = 0.16
+g = 0.08
+b = 0.02
+a = 1.0
+
+[document.semantic.surfaces.active_button.normal]
+space = "srgb"
+r = 1.0
+g = 0.5
+b = 0.0
+a = 1.0
+
+[document.semantic.surfaces.popup.normal]
+space = "srgb"
+r = 0.1
+g = 0.05
+b = 0.0
+a = 1.0
+
+[document.semantic.surfaces.window_frame.normal]
+space = "srgb"
+r = 0.02
+g = 0.02
+b = 0.02
+a = 1.0
+
+[document.semantic.typography]
+font_weight = 500
+size = 14.0
+letter_spacing = 0.0
+
+[document.semantic.typography.primary]
+space = "srgb"
+r = 1.0
+g = 0.72
+b = 0.32
+a = 1.0
+
+[document.semantic.typography.secondary]
+space = "srgb"
+r = 0.65
+g = 0.38
+b = 0.18
+a = 1.0
+
+[document.semantic.layout]
+bar_height = 72.0
+dock_width = 68.0
+padding = 14.0
+gap = 12.0
+icon_size = 50.0
+
+[document.semantic.edges]
+border_width = 1.0
+shadow = 0.6
+glow = 0.25
+radius = 6.0
+
+[document.semantic.edges.border_color]
+space = "srgb"
+r = 0.45
+g = 0.22
+b = 0.04
+a = 1.0
+
+[document.semantic.edges.inner_highlight]
+space = "srgb"
+r = 1.0
+g = 0.72
+b = 0.32
+a = 0.12
+
+[document.semantic.color_behavior]
+gamut = "srgb"
+dynamic_range = "sdr"
+sdr_white_nits = 203.0
+luminance_cap_nits = 1000.0
+gamut_mapping = "perceptual"
+
+[document.semantic.wallpaper]
+blur = 0.0
+saturation = 1.0
+automatic_accent = false

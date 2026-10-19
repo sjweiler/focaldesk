@@ -1,0 +1,118 @@
+package_version = 1
+slug = "moonbase"
+
+[document]
+format_version = 1
+name = "Moonbase"
+dynamic_range = "sdr"
+hdr_luminance_nits = 1000.0
+
+[document.paint]
+mode = "solid"
+
+[document.paint.color]
+space = "srgb"
+r = 0.42
+g = 0.678
+b = 0.859
+a = 1.0
+
+[document.semantic.surfaces.bar.normal]
+space = "srgb"
+r = 0.18
+g = 0.188
+b = 0.2
+a = 1.0
+
+[document.semantic.surfaces.dock.normal]
+space = "srgb"
+r = 0.161
+g = 0.169
+b = 0.169
+a = 1.0
+
+[document.semantic.surfaces.button.normal]
+space = "srgb"
+r = 0.18
+g = 0.188
+b = 0.2
+a = 1.0
+
+[document.semantic.surfaces.active_button.normal]
+space = "srgb"
+r = 0.42
+g = 0.678
+b = 0.859
+a = 1.0
+
+[document.semantic.surfaces.popup.normal]
+space = "srgb"
+r = 1.0
+g = 1.0
+b = 1.0
+a = 1.0
+
+[document.semantic.surfaces.window_frame.normal]
+space = "srgb"
+r = 0.161
+g = 0.169
+b = 0.169
+a = 1.0
+
+[document.semantic.typography]
+font_weight = 500
+size = 14.0
+letter_spacing = 0.0
+
+[document.semantic.typography.primary]
+space = "srgb"
+r = 0.961
+g = 0.988
+b = 1.0
+a = 1.0
+
+[document.semantic.typography.secondary]
+space = "srgb"
+r = 0.678
+g = 0.761
+b = 0.82
+a = 1.0
+
+[document.semantic.layout]
+bar_height = 68.0
+dock_width = 60.0
+padding = 10.0
+gap = 10.0
+icon_size = 46.0
+
+[document.semantic.edges]
+border_width = 1.0
+shadow = 0.35
+glow = 0.08
+radius = 10.0
+
+[document.semantic.edges.border_color]
+space = "srgb"
+r = 0.62
+g = 0.678
+b = 0.722
+a = 1.0
+
+[document.semantic.edges.inner_highlight]
+space = "srgb"
+r = 1.0
+g = 1.0
+b = 1.0
+a = 0.12
+
+[document.semantic.color_behavior]
+gamut = "srgb"
+dynamic_range = "sdr"
+sdr_white_nits = 203.0
+luminance_cap_nits = 1000.0
+gamut_mapping = "perceptual"
+
+[document.semantic.wallpaper]
+blur = 0.0
+saturation = 1.0
+automatic_accent = false

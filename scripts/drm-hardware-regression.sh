@@ -84,6 +84,35 @@ verify() {
     jq -e '.rendering.compositor_ready == true' "$ARTIFACTS/resumed.json" >/dev/null \
         || fail "compositor was not ready after resume"
 
+    # A successful page flip is not enough if resume silently discarded the
+    # layout that was configured for the mixed-output test. Compare only the
+    # user-visible output configuration, not transient focus/workspace state
+    # or driver-derived HDR activity that may legitimately be renegotiated.
+    jq -s -e '
+        def configuration:
+            [.outputs[] | {
+                connector, width, height, refresh_mhz, x, y, scale, transform
+            }] | sort_by(.connector);
+        (.[0] | configuration) == (.[1] | configuration)
+    ' \
+        "$ARTIFACTS/mixed-mode.json" "$ARTIFACTS/resumed.json" >/dev/null \
+        || fail "resume did not restore the mixed-mode output configuration"
+
+    # `compositor_ready` can become true before the recovery path has proved a
+    # post-resume frame reached scanout. Require the lifecycle evidence in
+    # order so the report distinguishes a visual recovery from a merely live
+    # IPC socket.
+    local resume_journal="$ARTIFACTS/resumed.compositor-journal.txt"
+    [[ -s "$resume_journal" ]] || fail "missing resumed compositor journal"
+    local gles_lifecycle='prepare-for-sleep\(true\).*prepare-for-sleep\(false\).*DRM device resumed.*connectors reprobed.*first post-resume atomic modeset queued.*first post-resume page flip completed'
+    local vulkan_lifecycle='raw Vulkan DRM session paused.*raw Vulkan DRM session resumed.*raw Vulkan first post-reset page flip completed'
+    local flattened_journal
+    flattened_journal="$(tr '\n' ' ' <"$resume_journal")"
+    if ! grep -Eiq "$gles_lifecycle" <<<"$flattened_journal" \
+        && ! grep -Eiq "$vulkan_lifecycle" <<<"$flattened_journal"; then
+        fail "resume journal is missing an ordered DRM recovery lifecycle"
+    fi
+
     if grep -Eqi 'panicked at|segmentation fault|first post-resume.*fail' \
         "$ARTIFACTS"/*.compositor-journal.txt; then
         fail "crash or post-resume failure found in compositor journal"

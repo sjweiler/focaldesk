@@ -76,7 +76,10 @@ fn present_dialog(request: DialogIpcRequest, tx: mpsc::Sender<DialogIpcResponse>
             choices,
         } => {
             let dialog = gtk::MessageDialog::builder()
-                .modal(true)
+                // The portal helper has no application window to use as a
+                // transient parent. A modal, unparented GTK dialog requests a
+                // global input grab, which can leave pointer and keyboard
+                // focus stuck after this chooser closes.
                 .message_type(gtk::MessageType::Question)
                 .buttons(gtk::ButtonsType::None)
                 .text(title)

@@ -4747,7 +4747,15 @@ impl DesktopState {
         let use_system_default = matches!(config.appearance.theme.as_str(), "" | "Default");
 
         if old_theme_id != new_theme_id || use_system_default {
-            self.theme.set_builtin(new_theme_id.clone());
+            if let FlowThemeId::Custom(path) = &new_theme_id {
+                if let Err(err) = self.theme.set_custom(std::path::PathBuf::from(path)) {
+                    flog_error!("failed to load configured custom theme {path}: {err}");
+                    self.theme
+                        .set_builtin(FlowThemeId::BuiltIn(BuiltInThemeId::Eagle));
+                }
+            } else {
+                self.theme.set_builtin(new_theme_id.clone());
+            }
             if use_system_default {
                 match focaldesk_themes::ThemeDocument::load(std::path::Path::new(
                     focaldesk_themes::SYSTEM_DEFAULT_THEME_PATH,
@@ -4760,10 +4768,9 @@ impl DesktopState {
                     Err(err) => flog_error!("failed to load system default theme: {err}"),
                 }
             }
-            if let Some(theme_id) = new_theme_id.builtin_id() {
-                if let Err(err) = self.fonts.reload_for_theme(theme_id) {
-                    flog_error!("failed to reload fonts for theme {:?}: {err}", theme_id);
-                }
+            let font_theme_id = new_theme_id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+            if let Err(err) = self.fonts.reload_for_theme(font_theme_id) {
+                flog_error!("failed to reload fonts for theme {:?}: {err}", font_theme_id);
             }
 
             self.render.fonts_prewarm_done = false;

@@ -74,7 +74,13 @@ pub const CONTROL_POLICY: PeerPolicy<'static> = PeerPolicy {
 pub const DIALOG_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "dialog",
     allowed_executables: &["focaldesk-polkitd", "focaldesk-portal", "focaldesk-server"],
-    allowed_units: &["focaldesk-polkitd.service", "focaldesk-server.service"],
+    allowed_units: &[
+        "focaldesk-polkitd.service",
+        "focaldesk-server.service",
+        // The screencast chooser is launched by xdg-desktop-portal-wlr, so the
+        // helper inherits that unit rather than focaldesk-portald.service.
+        "xdg-desktop-portal-wlr.service",
+    ],
 };
 
 pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -588,6 +594,10 @@ mod tests {
 
     #[test]
     fn endpoint_policy_accepts_an_allowed_executable_or_unit() {
+        assert!(DIALOG_POLICY
+            .allowed_units
+            .contains(&"xdg-desktop-portal-wlr.service"));
+
         let by_executable = PeerIdentity {
             uid: 1000,
             pid: 42,

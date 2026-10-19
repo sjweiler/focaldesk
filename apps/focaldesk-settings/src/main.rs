@@ -63,7 +63,6 @@ const SCALE_OPTIONS: &[(&str, f64)] = &[
     ("266 %", 2.6666667),
 ];
 
-const THEME_OPTIONS: &[&str] = &["Default", "Eagle", "Moonbase", "Classic"];
 const TASK_SHELF_VISIBILITY_OPTIONS: &[&str] = &["Intelligent dodge", "Always visible", "Autohide"];
 const ORIENTATION_OPTIONS: &[&str] = &[
     "Landscape",
@@ -4143,6 +4142,35 @@ fn installed_themes_root() -> PathBuf {
         .join("themes")
 }
 
+/// Returns durable appearance choices. The system document is the sole
+/// built-in; every additional entry is a validated package installed by Theme
+/// Editor and points at its private installed document.
+fn appearance_theme_options() -> Vec<(String, String)> {
+    let mut options = vec![("Default".to_string(), "Default".to_string())];
+    let Ok(entries) = std::fs::read_dir(installed_themes_root()) else {
+        return options;
+    };
+
+    let mut installed = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_type()
+                .ok()
+                .filter(|kind| kind.is_dir() && !kind.is_symlink())?;
+            let path = entry.path().join("theme.toml");
+            let document = ThemeDocument::load(&path).ok()?;
+            Some((
+                format!("{} (installed)", document.name),
+                path.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    installed.sort_by(|left, right| left.0.to_lowercase().cmp(&right.0.to_lowercase()));
+    options.extend(installed);
+    options
+}
+
 fn extract_wallpaper_accent(path: &std::path::Path) -> Result<ThemeColor, String> {
     use image::GenericImageView;
     let image = image::open(path)
@@ -5159,7 +5187,7 @@ fn theme_editor_page() -> adw::NavigationPage {
             dialog.set_title("Choose Theme Wallpaper");
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("Wallpaper images"));
-            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp"] {
+            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.exr"] {
                 filter.add_pattern(pattern);
             }
             dialog.set_default_filter(Some(&filter));
@@ -6621,20 +6649,34 @@ fn appearance_page(
 
     let theme_row = adw::ActionRow::new();
     theme_row.set_title("Theme");
+    theme_row.set_subtitle("Import optional .fdtheme packages through Theme Editor");
+
+    let theme_options = appearance_theme_options();
+    let theme_labels = theme_options
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .collect::<Vec<_>>();
+    let theme_values = Rc::new(
+        theme_options
+            .iter()
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>(),
+    );
 
     let theme_dropdown = dropdown_from_strings(
-        THEME_OPTIONS,
-        THEME_OPTIONS
+        &theme_labels,
+        theme_values
             .iter()
-            .position(|theme| *theme == config.borrow().appearance.theme.as_str())
+            .position(|theme| theme == &config.borrow().appearance.theme)
             .unwrap_or(0) as u32,
     );
 
     {
         let config = config.clone();
+        let theme_values = theme_values.clone();
         theme_dropdown.connect_selected_notify(move |dropdown| {
-            if let Some(theme) = THEME_OPTIONS.get(dropdown.selected() as usize) {
-                let theme = (*theme).to_string();
+            if let Some(theme) = theme_values.get(dropdown.selected() as usize) {
+                let theme = theme.clone();
                 config.borrow_mut().appearance.theme = theme.clone();
                 persist_config_key(&config.borrow(), "appearance.theme", json!(theme));
             }
@@ -6723,6 +6765,7 @@ fn appearance_page(
         let focus_switch = focus_switch.clone();
         let shelf_visibility = shelf_visibility.clone();
         let theme_dropdown = theme_dropdown.clone();
+        let theme_values = theme_values.clone();
         let contrast_switch = contrast_switch.clone();
         let motion_switch = motion_switch.clone();
         let glow_scale = glow_scale.clone();
@@ -6752,7 +6795,7 @@ fn appearance_page(
             set_switch_if_changed(&glass_switch, glass);
             set_switch_if_changed(&focus_switch, focus);
             shelf_visibility.set_selected(dock_visibility_index(visibility));
-            if let Some(index) = THEME_OPTIONS.iter().position(|option| *option == theme) {
+            if let Some(index) = theme_values.iter().position(|option| option == &theme) {
                 theme_dropdown.set_selected(index as u32);
             }
             set_scale_if_changed(&glow_scale, glow);
@@ -6795,6 +6838,7 @@ fn appearance_page(
         let glass_switch = glass_switch.clone();
         let focus_switch = focus_switch.clone();
         let theme_dropdown = theme_dropdown.clone();
+        let theme_values = theme_values.clone();
         let glow_scale = glow_scale.clone();
         let font_scale = font_scale.clone();
         let shelf_visibility = shelf_visibility.clone();
@@ -6823,9 +6867,7 @@ fn appearance_page(
                     "appearance.theme" => {
                         if let Some(theme) = event.value.as_str() {
                             config.borrow_mut().appearance.theme = theme.to_string();
-                            if let Some(index) =
-                                THEME_OPTIONS.iter().position(|option| *option == theme)
-                            {
+                            if let Some(index) = theme_values.iter().position(|option| option == theme) {
                                 theme_dropdown.set_selected(index as u32);
                             }
                         }
@@ -9601,7 +9643,7 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             dialog.set_title(&format!("Choose Wallpaper for Workspace {workspace}"));
             let filter = gtk::FileFilter::new();
             filter.set_name(Some("Wallpaper images"));
-            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp"] {
+            for pattern in ["*.png", "*.jpg", "*.jpeg", "*.webp", "*.exr"] {
                 filter.add_pattern(pattern);
             }
             dialog.set_default_filter(Some(&filter));

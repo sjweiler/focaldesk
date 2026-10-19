@@ -58,6 +58,7 @@ pub enum FramePixelFormat {
     Rgba8Srgb,
     Bgra10Unorm,
     Rgba10Unorm,
+    Rgba16FloatLinear,
 }
 
 /// Transfer decoding used to move a client buffer into scene-linear light.
