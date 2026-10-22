@@ -47,6 +47,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-mcp",
         "focald-voice",
         "focald-connectors",
+        "focaldesk-server",
     ],
     allowed_units: &[
         "focaldesk-dock.service",
@@ -401,14 +402,17 @@ fn policy_allows(identity: &PeerIdentity, policy: PeerPolicy<'_>) -> bool {
         // replaced during an upgrade. The inode is still pinned and verified
         // above, so this suffix is state, not part of the executable name.
         .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name));
-    let executable_allowed = executable.is_some_and(|name| {
-        policy.allowed_executables.contains(&name) && executable_identity_is_trusted(identity)
-    });
+    let executable_allowed =
+        executable.is_some_and(|name| policy.allowed_executables.contains(&name));
+    let trusted_executable_allowed = executable_allowed && executable_identity_is_trusted(identity);
     let unit_allowed = identity
         .unit
         .as_deref()
         .is_some_and(|unit| policy.allowed_units.contains(&unit));
-    executable_allowed || unit_allowed
+    // User services may run from a per-user installation and therefore cannot
+    // satisfy the root-owned executable check. A matching service unit is only
+    // sufficient when it also launched the expected FocalDesk executable.
+    trusted_executable_allowed || (unit_allowed && executable_allowed)
 }
 
 fn executable_identity_is_trusted(identity: &PeerIdentity) -> bool {
@@ -464,9 +468,11 @@ mod tests {
                 .allowed_units
                 .contains(&"focaldesk-system-rail.service")
         );
-        assert!(DESKTOP_POLICY
-            .allowed_executables
-            .contains(&"focaldesk-launcher"));
+        assert!(
+            DESKTOP_POLICY
+                .allowed_executables
+                .contains(&"focaldesk-launcher")
+        );
     }
 
     #[test]
@@ -593,10 +599,12 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_policy_accepts_an_allowed_executable_or_unit() {
-        assert!(DIALOG_POLICY
-            .allowed_units
-            .contains(&"xdg-desktop-portal-wlr.service"));
+    fn endpoint_policy_requires_expected_executable_for_allowed_unit() {
+        assert!(
+            DIALOG_POLICY
+                .allowed_units
+                .contains(&"xdg-desktop-portal-wlr.service")
+        );
 
         let by_executable = PeerIdentity {
             uid: 1000,
@@ -608,7 +616,7 @@ mod tests {
         let by_unit = PeerIdentity {
             uid: 1000,
             pid: 43,
-            executable: PathBuf::from("/usr/bin/launcher-wrapper"),
+            executable: PathBuf::from("/home/user/.local/bin/focaldesk-polkitd"),
             unit: Some("focaldesk-polkitd.service".to_string()),
             executable_trusted: false,
         };
@@ -619,6 +627,11 @@ mod tests {
         };
         assert!(policy_allows(&by_executable, policy));
         assert!(policy_allows(&by_unit, policy));
+        let wrong_executable = PeerIdentity {
+            executable: PathBuf::from("/home/user/.local/bin/launcher-wrapper"),
+            ..by_unit
+        };
+        assert!(!policy_allows(&wrong_executable, policy));
     }
 
     #[test]

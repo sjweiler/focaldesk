@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use focaldesk_memory::{
     EmbeddingProvider, IndexedDocument, MemoryId, MemoryPolicy, MemoryService, MemoryStatus,
     MemoryStore, OllamaEmbeddingProvider, SearchHit,
@@ -32,6 +32,7 @@ use crate::{
 
 const AI_MAX_STREAM_CONTENT_BYTES: usize = 512 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_DOCX_XML_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Memories relevant to a chat prompt are capped here so the recalled
 /// context doesn't dwarf the actual conversation.
@@ -4165,6 +4166,15 @@ fn chunk_document(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<Str
 }
 
 fn extract_document(path: &std::path::Path) -> Result<(String, String, String)> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect document {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > MAX_DOCUMENT_BYTES {
+        bail!(
+            "document {} is not a regular file within the {} MiB import limit",
+            path.display(),
+            MAX_DOCUMENT_BYTES / (1024 * 1024)
+        );
+    }
     let bytes = std::fs::read(path)
         .with_context(|| format!("failed to read document {}", path.display()))?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
@@ -4370,6 +4380,12 @@ fn extract_docx_text(bytes: &[u8]) -> Result<String> {
     let mut document = archive
         .by_name("word/document.xml")
         .context("DOCX is missing word/document.xml")?;
+    if document.size() > MAX_DOCX_XML_BYTES {
+        bail!(
+            "DOCX document XML exceeds the {} MiB parsing limit",
+            MAX_DOCX_XML_BYTES / (1024 * 1024)
+        );
+    }
     let mut xml = String::new();
     document
         .read_to_string(&mut xml)
