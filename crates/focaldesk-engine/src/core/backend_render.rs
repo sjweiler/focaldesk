@@ -777,6 +777,7 @@ pub fn draw_output_stage(
         flip_egui_y: state.backend_kind == CompositorBackend::Drm,
         client_compositing,
         chrome_glass_pass,
+        rail_backdrop: state.rail_backdrop(),
         defer_egui_to_sdr,
         surface_colors: &state.surface_colors,
     };

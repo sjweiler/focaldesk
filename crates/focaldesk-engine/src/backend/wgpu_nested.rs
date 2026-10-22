@@ -17,6 +17,7 @@ use focaldesk_render::{
 use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use focaldesk_ui::atlas::IconId;
+use focaldesk_ui::chrome_layout::ChromeLayout;
 use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::egui_layer::rasterize_vulkan_paint;
 use focaldesk_ui::types::UiElementKind;
@@ -1689,6 +1690,68 @@ fn append_wallpaper_quads(
             retention: None,
         });
     }
+
+    // The reserved rail sits outside the work area, so it needs its own
+    // wallpaper sample before the translucent compositor tint is composited.
+    if desktop.state.rail_backdrop() == focaldesk_config::RailBackdrop::SmokedGlass {
+        if let Some(rail) = external_rail_rect(desktop, &layout) {
+            for blit in crate::core::wallpaper::compute_wallpaper_blits(
+                crate::core::wallpaper::SizeI {
+                    w: asset.width as i32,
+                    h: asset.height as i32,
+                },
+                crate::core::wallpaper::RectI {
+                    x: rail.loc.x,
+                    y: rail.loc.y,
+                    w: rail.size.w,
+                    h: rail.size.h,
+                },
+                mode,
+            ) {
+                let destination = Rectangle::<i32, Logical>::from_loc_and_size(
+                    (blit.dst.x, blit.dst.y),
+                    (blit.dst.w, blit.dst.h),
+                )
+                .to_physical_precise_round(output_state.scale);
+                output.push(TextureQuad {
+                    cache_key: asset.cache_key,
+                    pixels: Vec::new(),
+                    width: asset.width,
+                    height: asset.height,
+                    stride: asset.width.saturating_mul(if asset.format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 }),
+                    format: asset.format,
+                    color_transform: asset.color_transform,
+                    dmabuf: None,
+                    damage: Vec::new(),
+                    destination: [
+                        destination.loc.x,
+                        destination.loc.y,
+                        destination.size.w,
+                        destination.size.h,
+                    ],
+                    source_uv: [blit.uv.u0, blit.uv.v0, blit.uv.u1, blit.uv.v1],
+                    transform: FrameTransform::Normal,
+                    // This layer sits below the external rail client. Tint the
+                    // wallpaper itself rather than placing a translucent quad
+                    // above the client, which would obscure its controls.
+                    tint: premultiplied([tint[0] * 0.32, tint[1] * 0.36, tint[2] * 0.44, 1.0]),
+                    retention: None,
+                });
+            }
+        }
+    }
+}
+
+fn external_rail_rect(
+    desktop: &WgpuSceneDesktop<'_>,
+    layout: &ChromeLayout,
+) -> Option<Rectangle<i32, Logical>> {
+    let output = desktop.state.outputs.get(&desktop.output_id)?;
+    let work = layout.work_area.recess;
+    let width = output.logical_size.w - (work.loc.x + work.size.w);
+    (width > 0).then(|| {
+        Rectangle::from_loc_and_size((work.loc.x + work.size.w, 0), (width, output.logical_size.h))
+    })
 }
 
 fn append_shell_icon_quads(

@@ -11,8 +11,8 @@ use std::{
 };
 
 use focaldesk_ipc::{
-    send_desktop_request, DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, ShellPanel,
-    WindowSnapshot,
+    DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, ShellPanel, WindowSnapshot,
+    send_desktop_request,
 };
 use gtk::{cairo, glib, prelude::*};
 use gtk4_layer_shell::LayerShell;
@@ -913,7 +913,9 @@ fn rail_root(
     connector: &str,
     latest_snapshot: Rc<RefCell<Option<DesktopSnapshot>>>,
 ) -> Box<dyn Widget> {
-    let mut buttons = Vec::<Box<dyn Widget>>::new();
+    let mut system_controls = Vec::<Box<dyn Widget>>::new();
+    let mut workspace_controls = Vec::<Box<dyn Widget>>::new();
+    let mut utility_controls = Vec::<Box<dyn Widget>>::new();
     let snapshot = latest_snapshot.borrow();
     let output = snapshot
         .as_ref()
@@ -971,7 +973,7 @@ fn rail_root(
             |window_id| DesktopAction::FocusWindow { window_id },
         ));
     });
-    buttons.push(Box::new(
+    system_controls.push(Box::new(
         vui_core::SizedBox::new(
             Surface::new(ai_widget)
                 .background(if ai_target.is_some() {
@@ -998,7 +1000,7 @@ fn rail_root(
         ("Au", ShellPanel::Audio),
         ("BT", ShellPanel::Bluetooth),
     ] {
-        buttons.push(button(
+        system_controls.push(button(
             label,
             open_panel(connector, panel),
             actions.clone(),
@@ -1022,14 +1024,14 @@ fn rail_root(
         output_hdr_active,
         false,
     );
-    buttons.push(if output_hdr_active {
+    system_controls.push(if output_hdr_active {
         hdr_badged_control(display_control)
     } else {
         display_control
     });
     if let Some(snapshot) = snapshot.as_ref() {
         if snapshot.shell.microphone_active {
-            buttons.push(button(
+            system_controls.push(button(
                 "Mic",
                 open_panel(connector, ShellPanel::Audio),
                 actions.clone(),
@@ -1038,7 +1040,7 @@ fn rail_root(
             ));
         }
         if snapshot.shell.camera_active {
-            buttons.push(button(
+            system_controls.push(button(
                 "Cam",
                 open_panel(connector, ShellPanel::Settings),
                 actions.clone(),
@@ -1065,7 +1067,7 @@ fn rail_root(
             (None, None, _) => "External power (assumed; no battery reported)".into(),
             (None, Some(false), _) => "Battery unavailable · on battery".into(),
         };
-        buttons.push(status_button(
+        system_controls.push(status_button(
             if externally_powered {
                 power_source_plug_icon()
             } else {
@@ -1081,7 +1083,7 @@ fn rail_root(
         ));
     }
     for workspace in 1..=workspace_count {
-        buttons.push(rail_text_button(
+        workspace_controls.push(rail_text_button(
             &workspace.to_string(),
             &format!("Workspace {workspace}"),
             DesktopAction::FocusWorkspaceOnOutput {
@@ -1094,7 +1096,7 @@ fn rail_root(
             false,
         ));
     }
-    buttons.push(rail_text_button(
+    workspace_controls.push(rail_text_button(
         "+",
         "Create workspace",
         DesktopAction::CreateWorkspaceOnOutput {
@@ -1106,7 +1108,7 @@ fn rail_root(
         workspace_count >= max_workspace_slots,
     ));
     if workspace_count > 1 {
-        buttons.push(rail_text_button(
+        workspace_controls.push(rail_text_button(
             "−",
             "Delete workspace",
             DesktopAction::DeleteWorkspaceOnOutput {
@@ -1123,7 +1125,7 @@ fn rail_root(
         ("Up", ShellPanel::Updates),
         ("Pw", ShellPanel::Power),
     ] {
-        buttons.push(button(
+        utility_controls.push(button(
             label,
             open_panel(connector, panel),
             actions.clone(),
@@ -1136,18 +1138,35 @@ fn rail_root(
             crate::load_config().panel.clock_format,
         ))
         .to_string();
-    buttons.insert(
-        buttons.len().saturating_sub(3),
+    utility_controls.insert(
+        0,
         rail_clock_button(
             &clock,
             open_panel(connector, ShellPanel::Calendar),
             actions.clone(),
         ),
     );
-    let rail = Surface::new(Column::new(buttons).gap(4.0))
+    // Keep the workspaces visually distinct from the denser system controls.
+    // The extra breathing room makes the rail scan in three deliberate bands:
+    // system, place, and status.
+    let workspace_cluster = Surface::new(Column::new(workspace_controls).gap(4.0))
+        .padding(Insets::all(2.0))
+        .background(vui_core::Color::rgba(74, 88, 110, 20))
+        .border(vui_core::Color::rgba(116, 148, 180, 48), 1.0)
+        .radius(14.0);
+    let rail_contents: Vec<Box<dyn Widget>> = vec![
+        Box::new(Column::new(system_controls).gap(4.0)),
+        Box::new(Spacer::new(0.0, 8.0)),
+        Box::new(workspace_cluster),
+        Box::new(Spacer::new(0.0, 8.0)),
+        Box::new(Column::new(utility_controls).gap(4.0)),
+    ];
+    let rail = Surface::new(Column::new(rail_contents))
         .padding(Insets::all(6.0))
-        .background(vui_core::Color::rgba(20, 24, 32, 230))
-        .border(vui_core::Color::rgba(112, 128, 150, 194), 1.0)
+        // Keep the bright wallpaper readable as a soft backdrop while the
+        // blue-black tint preserves contrast for the compact rail controls.
+        .background(vui_core::Color::rgba(10, 22, 40, 168))
+        .border(vui_core::Color::rgba(116, 148, 180, 150), 1.0)
         .radius(18.0);
     let marker = Surface::new(Spacer::new(24.0, 3.0))
         .padding(Insets::all(0.0))
@@ -1281,8 +1300,8 @@ fn rail_clock_button(
         Box::new(
             vui_core::SizedBox::new(
                 Flex::column([
-                    FlexChild::fixed(VisualOnlyLabel(Label::new(time).text_size(10.0))),
-                    FlexChild::fixed(VisualOnlyLabel(Label::new(period).text_size(9.0))),
+                    FlexChild::fixed(VisualOnlyLabel(Label::new(time).text_size(13.0))),
+                    FlexChild::fixed(VisualOnlyLabel(Label::new(period).text_size(10.0))),
                 ])
                 .main_alignment(MainAxisAlignment::Center)
                 .cross_alignment(CrossAxisAlignment::Center),
@@ -1292,7 +1311,7 @@ fn rail_clock_button(
         )
     } else {
         Box::new(
-            vui_core::SizedBox::new(VisualOnlyLabel(Label::new(clock).text_size(10.0)))
+            vui_core::SizedBox::new(VisualOnlyLabel(Label::new(clock).text_size(13.0)))
                 .width(44.0)
                 .height(44.0),
         )
@@ -1301,8 +1320,8 @@ fn rail_clock_button(
         .horizontal_alignment(CrossAxisAlignment::Center)
         .vertical_alignment(CrossAxisAlignment::Center);
     let control = Surface::new(centered)
-        .background(vui_core::Color::rgba(74, 88, 110, 26))
-        .border(vui_core::Color::rgba(112, 132, 156, 70), 1.0)
+        .background(vui_core::Color::rgba(74, 88, 110, 42))
+        .border(vui_core::Color::rgba(116, 148, 180, 100), 1.0)
         .radius(12.0);
     Box::new(vui_core::SizedBox::new(control).width(44.0).height(44.0))
 }
@@ -1570,8 +1589,10 @@ fn dock_root(
         right: 8.0,
         bottom: 6.0,
     })
-    .background(vui_core::Color::rgba(20, 24, 32, 230))
-    .border(vui_core::Color::rgba(112, 128, 150, 194), 1.0)
+    // Match the rail's blue-black glass closely, retaining only a slightly
+    // lighter treatment so the dock stays grounded without competing with it.
+    .background(vui_core::Color::rgba(10, 22, 40, 158))
+    .border(vui_core::Color::rgba(116, 148, 180, 150), 1.0)
     .radius(16.0);
     let centered = Flex::row([
         FlexChild::flexible(1.0, Spacer::new(0.0, 0.0)),

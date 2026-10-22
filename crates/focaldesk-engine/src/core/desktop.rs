@@ -3346,7 +3346,7 @@ impl DesktopState {
         let config = load_config();
         self.notify_config_changes(&old_config, &config);
         self.settings_ipc_config = config.clone();
-        self.apply_config(config);
+        self.apply_config(config, true);
 
         let mut settings = load_settings();
         settings.input.accessibility = settings.input.accessibility.sanitized();
@@ -3561,7 +3561,7 @@ impl DesktopState {
                     Ok(()) => {
                         self.notify_config_changes(&old_config, &config);
                         self.settings_ipc_config = config.clone();
-                        self.apply_config(config);
+                        self.apply_config(config, true);
                         Some(IpcResponse::Ok)
                     }
                     Err(err) => Some(IpcResponse::Error {
@@ -3574,7 +3574,7 @@ impl DesktopState {
                 let config = load_config();
                 self.notify_config_changes(&old_config, &config);
                 self.settings_ipc_config = config.clone();
-                self.apply_config(config);
+                self.apply_config(config, true);
                 Some(IpcResponse::Ok)
             }
             IpcRequest::Reload => {
@@ -4639,7 +4639,9 @@ impl DesktopState {
             Ok(()) => {
                 self.notify_config_changes(&old_config, &new_config);
                 self.settings_ipc_config = new_config.clone();
-                self.apply_config(new_config);
+                // A single non-theme setting must not re-apply the configured
+                // default theme over an in-memory theme-editor preview.
+                self.apply_config(new_config, key == "appearance.theme");
                 IpcResponse::Ok
             }
             Err(err) => IpcResponse::Error {
@@ -4741,12 +4743,12 @@ impl DesktopState {
         });
     }
 
-    fn apply_config(&mut self, config: FocalDeskConfig) {
+    fn apply_config(&mut self, config: FocalDeskConfig, refresh_theme: bool) {
         let old_theme_id = self.theme.active_theme().id.clone();
         let new_theme_id = theme_id_from_config(&config);
         let use_system_default = matches!(config.appearance.theme.as_str(), "" | "Default");
 
-        if old_theme_id != new_theme_id || use_system_default {
+        if refresh_theme && (old_theme_id != new_theme_id || use_system_default) {
             if let FlowThemeId::Custom(path) = &new_theme_id {
                 if let Err(err) = self.theme.set_custom(std::path::PathBuf::from(path)) {
                     flog_error!("failed to load configured custom theme {path}: {err}");
@@ -4788,6 +4790,10 @@ impl DesktopState {
 
     pub(crate) fn work_area_glass_enabled(&self) -> bool {
         self.settings_ipc_config.appearance.work_area_glass
+    }
+
+    pub(crate) fn rail_backdrop(&self) -> focaldesk_config::RailBackdrop {
+        self.settings_ipc_config.appearance.rail_backdrop
     }
 
     fn apply_power_settings(&self) {

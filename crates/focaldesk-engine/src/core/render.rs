@@ -5,6 +5,7 @@ use crate::core::layout::LayoutSnapshot;
 use crate::core::output::OutputState; // if still needed (ideally not)
 use crate::core::ui_state::UiState;
 use crate::core::wayland::trusted_shell::InternalChromeVisibility;
+use focaldesk_config::RailBackdrop;
 use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::types::{ElementId, UiElementKind};
 use image::GenericImageView;
@@ -291,6 +292,8 @@ pub struct RenderInputs<'a> {
     pub flip_egui_y: bool,
     pub client_compositing: ClientCompositingMode,
     pub chrome_glass_pass: ChromeGlassPass,
+    /// Compositor-owned backing beneath an external system rail.
+    pub rail_backdrop: RailBackdrop,
     /// When true, egui/cursor are drawn in a follow-up SDR pass (egui_glow outputs sRGB).
     pub defer_egui_to_sdr: bool,
     pub surface_colors: &'a std::collections::HashMap<Id, SurfaceColorRenderState>,
@@ -2590,6 +2593,8 @@ impl RenderState {
                     );
                 }
 
+                self.draw_external_rail_backdrop(frame, &inputs, theme);
+
                 self.draw_wallpaper_in_rect(
                     frame,
                     inputs.ctx,
@@ -3515,6 +3520,60 @@ impl RenderState {
             &inputs.ctx.damage,
             &style,
         )
+    }
+
+    /// Paint the compositor-owned reserved strip before the external rail
+    /// client. The solid mode intentionally performs no draw: the output
+    /// background therefore remains exactly as it was before this option.
+    fn draw_external_rail_backdrop(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        inputs: &RenderInputs<'_>,
+        theme: &FlowTheme,
+    ) {
+        if inputs.rail_backdrop != RailBackdrop::SmokedGlass {
+            return;
+        }
+
+        let output = Rectangle::<i32, Logical>::from_size(Size::from((
+            (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round() as i32,
+            (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round() as i32,
+        )));
+        let work = inputs.layout.work_area.recess;
+        let right_width = output.loc.x + output.size.w - (work.loc.x + work.size.w);
+        if right_width <= 0 {
+            return;
+        }
+        let rail = Rectangle::from_loc_and_size(
+            (work.loc.x + work.size.w, output.loc.y),
+            (right_width, output.size.h),
+        );
+
+        // Give the translucent tint real wallpaper to reveal. This intentionally
+        // affects only the reserved rail strip; normal work-area wallpaper
+        // rendering and solid-mode output stay unchanged.
+        self.draw_wallpaper_in_rect(
+            frame,
+            inputs.ctx,
+            rail,
+            inputs.ctx.output_scale,
+            theme.wallpaper.clone(),
+            &inputs.client_compositing,
+        );
+
+        let rail_physical = to_physical_rect(rail, inputs.ctx.output_scale);
+        let damage: Vec<_> = inputs
+            .ctx
+            .damage
+            .iter()
+            .filter_map(|rect| rect.intersection(rail_physical))
+            .collect();
+        let _ = Self::draw_solid_rect(
+            frame,
+            Rectangle::from_size(Size::from(inputs.ctx.output_size)),
+            &damage,
+            [0.025, 0.035, 0.055, 0.68],
+        );
     }
 
     fn draw_workarea_glass(

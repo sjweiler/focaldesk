@@ -1,7 +1,7 @@
 use adw::prelude::*;
 use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
 use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
-use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig};
+use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig, RailBackdrop};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
     send_connector_host_request, send_desktop_config, send_desktop_request, send_desktop_set,
@@ -6587,6 +6587,36 @@ fn appearance_page(
 
     visual_group.add(&glass_row);
 
+    let rail_backdrop_options = ["Solid", "Smoked glass"];
+    let rail_backdrop_row = add_dropdown_row(
+        &visual_group,
+        "Rail background",
+        Some("Choose the compositor backing behind the system rail"),
+        &rail_backdrop_options,
+        match config.borrow().appearance.rail_backdrop {
+            RailBackdrop::Solid => 0,
+            RailBackdrop::SmokedGlass => 1,
+        },
+    );
+    {
+        let config = config.clone();
+        rail_backdrop_row.connect_selected_notify(move |dropdown| {
+            let backdrop = match dropdown.selected() {
+                1 => RailBackdrop::SmokedGlass,
+                _ => RailBackdrop::Solid,
+            };
+            if config.borrow().appearance.rail_backdrop == backdrop {
+                return;
+            }
+            config.borrow_mut().appearance.rail_backdrop = backdrop;
+            persist_config_key(
+                &config.borrow(),
+                "appearance.rail_backdrop",
+                serde_json::to_value(backdrop).expect("rail backdrop serializes"),
+            );
+        });
+    }
+
     // Output focus glow
     let focus_row = adw::ActionRow::new();
     focus_row.set_title("Output focus glow");
@@ -6762,6 +6792,7 @@ fn appearance_page(
         let settings = settings.clone();
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
+        let rail_backdrop_row = rail_backdrop_row.clone();
         let focus_switch = focus_switch.clone();
         let shelf_visibility = shelf_visibility.clone();
         let theme_dropdown = theme_dropdown.clone();
@@ -6779,11 +6810,12 @@ fn appearance_page(
             persist_config(&config.borrow());
             persist_settings(&settings.borrow());
 
-            let (shader, glass, focus, visibility, theme, glow, font) = {
+            let (shader, glass, rail_backdrop, focus, visibility, theme, glow, font) = {
                 let config = config.borrow();
                 (
                     config.appearance.shader_chrome,
                     config.appearance.work_area_glass,
+                    config.appearance.rail_backdrop,
                     config.appearance.output_focus_glow,
                     config.dock.visibility,
                     config.appearance.theme.clone(),
@@ -6793,6 +6825,10 @@ fn appearance_page(
             };
             set_switch_if_changed(&shader_switch, shader);
             set_switch_if_changed(&glass_switch, glass);
+            rail_backdrop_row.set_selected(match rail_backdrop {
+                RailBackdrop::Solid => 0,
+                RailBackdrop::SmokedGlass => 1,
+            });
             set_switch_if_changed(&focus_switch, focus);
             shelf_visibility.set_selected(dock_visibility_index(visibility));
             if let Some(index) = theme_values.iter().position(|option| option == &theme) {
@@ -6827,6 +6863,7 @@ fn appearance_page(
         let rx = start_config_watch(&[
             "appearance.shader_chrome",
             "appearance.work_area_glass",
+            "appearance.rail_backdrop",
             "appearance.output_focus_glow",
             "appearance.theme",
             "appearance.glow_strength",
@@ -6836,6 +6873,7 @@ fn appearance_page(
         let config = config.clone();
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
+        let rail_backdrop_row = rail_backdrop_row.clone();
         let focus_switch = focus_switch.clone();
         let theme_dropdown = theme_dropdown.clone();
         let theme_values = theme_values.clone();
@@ -6856,6 +6894,20 @@ fn appearance_page(
                         if let Some(active) = event.value.as_bool() {
                             config.borrow_mut().appearance.work_area_glass = active;
                             set_switch_if_changed(&glass_switch, active);
+                        }
+                    }
+                    "appearance.rail_backdrop" => {
+                        if let Ok(backdrop) =
+                            serde_json::from_value::<RailBackdrop>(event.value.clone())
+                        {
+                            config.borrow_mut().appearance.rail_backdrop = backdrop;
+                            let selected = match backdrop {
+                                RailBackdrop::Solid => 0,
+                                RailBackdrop::SmokedGlass => 1,
+                            };
+                            if rail_backdrop_row.selected() != selected {
+                                rail_backdrop_row.set_selected(selected);
+                            }
                         }
                     }
                     "appearance.output_focus_glow" => {

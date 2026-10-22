@@ -29,6 +29,19 @@ pub struct AppearanceConfig {
     pub output_focus_glow: bool,
     pub shader_chrome: bool,
     pub work_area_glass: bool,
+    pub rail_backdrop: RailBackdrop,
+}
+
+/// The compositor-owned surface behind the external system rail.
+///
+/// `Solid` deliberately remains the default so configurations created before
+/// this option retain their existing appearance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RailBackdrop {
+    #[default]
+    Solid,
+    SmokedGlass,
 }
 
 impl FocalDeskConfig {
@@ -50,6 +63,7 @@ impl Default for AppearanceConfig {
             output_focus_glow: true,
             shader_chrome: true,
             work_area_glass: true,
+            rail_backdrop: RailBackdrop::Solid,
         }
     }
 }
@@ -429,6 +443,16 @@ mod tests {
         assert_eq!(config.panel.clock_format, ClockFormat::TwelveHour);
         assert_eq!(config.dock.position, DockPosition::Left);
         assert_eq!(config.dock.size, DockSize::Normal);
+        assert_eq!(config.appearance.rail_backdrop, RailBackdrop::Solid);
+    }
+
+    #[test]
+    fn rail_backdrop_round_trips_through_canonical_settings() {
+        let config = config_from_settings_json(
+            r#"{"desktop_config":{"appearance":{"rail_backdrop":"smoked-glass"}}}"#,
+        )
+        .expect("parse rail backdrop");
+        assert_eq!(config.appearance.rail_backdrop, RailBackdrop::SmokedGlass);
     }
 
     #[test]
