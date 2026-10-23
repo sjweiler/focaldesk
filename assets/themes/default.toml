@@ -14,7 +14,7 @@ b = 0.7295855283737183
 a = 1.0
 
 [wallpaper]
-path = "/usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr"
+path = "/usr/share/focaldesk/wallpaper/Prismara-HDR1400.exr"
 fit = "fill"
 dim = 0.0
 

@@ -1139,12 +1139,21 @@ fn decode_hdr_png(path: &str) -> Option<HdrWallpaper> {
         };
         let linear = [decode(sample(0)), decode(sample(1)), decode(sample(2))];
         let scene = multiply_rgb(to_scene, linear);
-        for value in [scene[0], scene[1], scene[2], if samples == 4 { sample(3) } else { 1.0 }] {
+        for value in [
+            scene[0],
+            scene[1],
+            scene[2],
+            if samples == 4 { sample(3) } else { 1.0 },
+        ] {
             pixels.extend_from_slice(&half::f16::from_f32(value.max(0.0)).to_bits().to_ne_bytes());
         }
     }
 
-    Some(HdrWallpaper { width: output.width, height: output.height, pixels })
+    Some(HdrWallpaper {
+        width: output.width,
+        height: output.height,
+        pixels,
+    })
 }
 
 /// SMPTE ST 2084 maps code values to absolute luminance; the compositor's
@@ -2249,7 +2258,9 @@ impl RenderState {
                     false,
                 )
                 .map(|texture| (texture, true))
-                .map_err(|error| flog_error!("load_wallpaper: HDR wallpaper import failed: {error:?}"))
+                .map_err(|error| {
+                    flog_error!("load_wallpaper: HDR wallpaper import failed: {error:?}")
+                })
                 .ok();
         }
 
@@ -2286,7 +2297,12 @@ impl RenderState {
                 pixels.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_ne_bytes());
             }
             return renderer
-                .import_memory(&pixels, Fourcc::Abgr16161616f, (w as i32, h as i32).into(), false)
+                .import_memory(
+                    &pixels,
+                    Fourcc::Abgr16161616f,
+                    (w as i32, h as i32).into(),
+                    false,
+                )
                 .map(|texture| (texture, true))
                 .map_err(|error| flog_error!("load_wallpaper: HDR EXR import failed: {error:?}"))
                 .ok();
@@ -2593,12 +2609,27 @@ impl RenderState {
                     );
                 }
 
-                self.draw_external_rail_backdrop(frame, &inputs, theme);
+                let output_rect = Rectangle::<i32, Logical>::from_size(Size::from((
+                    (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round()
+                        as i32,
+                    (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round()
+                        as i32,
+                )));
+                // A smoked rail must share the work area's wallpaper mapping;
+                // otherwise each rectangle centers and crops the image independently.
+                let wallpaper_reference = if inputs.rail_backdrop == RailBackdrop::SmokedGlass {
+                    output_rect
+                } else {
+                    inputs.layout.work_area.recess
+                };
 
-                self.draw_wallpaper_in_rect(
+                self.draw_external_rail_backdrop(frame, &inputs, theme, wallpaper_reference);
+
+                self.draw_wallpaper_in_rect_aligned(
                     frame,
                     inputs.ctx,
                     inputs.layout.work_area.recess,
+                    wallpaper_reference,
                     inputs.ctx.output_scale,
                     theme.wallpaper.clone(),
                     &inputs.client_compositing,
@@ -3530,6 +3561,7 @@ impl RenderState {
         frame: &mut GlesFrame<'_, '_>,
         inputs: &RenderInputs<'_>,
         theme: &FlowTheme,
+        wallpaper_reference: Rectangle<i32, Logical>,
     ) {
         if inputs.rail_backdrop != RailBackdrop::SmokedGlass {
             return;
@@ -3552,10 +3584,11 @@ impl RenderState {
         // Give the translucent tint real wallpaper to reveal. This intentionally
         // affects only the reserved rail strip; normal work-area wallpaper
         // rendering and solid-mode output stay unchanged.
-        self.draw_wallpaper_in_rect(
+        self.draw_wallpaper_in_rect_aligned(
             frame,
             inputs.ctx,
             rail,
+            wallpaper_reference,
             inputs.ctx.output_scale,
             theme.wallpaper.clone(),
             &inputs.client_compositing,
@@ -3864,6 +3897,30 @@ impl RenderState {
         theme: WallpaperTheme,
         client_compositing: &ClientCompositingMode,
     ) {
+        self.draw_wallpaper_in_rect_aligned(
+            frame,
+            ctx,
+            target_logical,
+            target_logical,
+            scale,
+            theme,
+            client_compositing,
+        );
+    }
+
+    /// Draw `target_logical` using wallpaper coordinates established by
+    /// `reference_logical`. This lets disjoint output regions share one
+    /// continuous wallpaper image instead of independently centered crops.
+    fn draw_wallpaper_in_rect_aligned(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        ctx: &FrameCtx,
+        target_logical: Rectangle<i32, Logical>,
+        reference_logical: Rectangle<i32, Logical>,
+        scale: Scale<f64>,
+        theme: WallpaperTheme,
+        client_compositing: &ClientCompositingMode,
+    ) {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
 
@@ -3873,12 +3930,12 @@ impl RenderState {
             return;
         };
         let target_physical = to_physical_rect(target_logical, scale);
-
-        let out = RectI {
-            x: target_physical.loc.x,
-            y: target_physical.loc.y,
-            w: target_physical.size.w,
-            h: target_physical.size.h,
+        let reference_physical = to_physical_rect(reference_logical, scale);
+        let reference = RectI {
+            x: reference_physical.loc.x,
+            y: reference_physical.loc.y,
+            w: reference_physical.size.w,
+            h: reference_physical.size.h,
         };
 
         let sz = tex.size();
@@ -3891,7 +3948,7 @@ impl RenderState {
             focaldesk_themes::ThemeWallpaperFit::Center => WallpaperMode::Center,
             focaldesk_themes::ThemeWallpaperFit::Tile => WallpaperMode::Tile,
         };
-        let blits = compute_wallpaper_blits(src, out, mode);
+        let blits = compute_wallpaper_blits(src, reference, mode);
         if blits.is_empty() {
             return;
         }
@@ -3919,7 +3976,11 @@ impl RenderState {
             Uniform::new("u_tint", tint),
             Uniform::new(
                 "u_decode_srgb",
-                if self.wallpaper_is_linear { 0.0f32 } else { 1.0f32 },
+                if self.wallpaper_is_linear {
+                    0.0f32
+                } else {
+                    1.0f32
+                },
             ),
             Uniform::new(
                 "u_texel_size",
@@ -3938,19 +3999,40 @@ impl RenderState {
         let tw = src.w as f64;
         let th = src.h as f64;
         for blit in blits {
+            let clipped_x = blit.dst.x.max(target_physical.loc.x);
+            let clipped_y = blit.dst.y.max(target_physical.loc.y);
+            let clipped_right =
+                (blit.dst.x + blit.dst.w).min(target_physical.loc.x + target_physical.size.w);
+            let clipped_bottom =
+                (blit.dst.y + blit.dst.h).min(target_physical.loc.y + target_physical.size.h);
+            if clipped_right <= clipped_x || clipped_bottom <= clipped_y {
+                continue;
+            }
+            let x_fraction = (clipped_x - blit.dst.x) as f32 / blit.dst.w as f32;
+            let y_fraction = (clipped_y - blit.dst.y) as f32 / blit.dst.h as f32;
+            let width_fraction = (clipped_right - clipped_x) as f32 / blit.dst.w as f32;
+            let height_fraction = (clipped_bottom - clipped_y) as f32 / blit.dst.h as f32;
+            let uv_width = blit.uv.u1 - blit.uv.u0;
+            let uv_height = blit.uv.v1 - blit.uv.v0;
+            let uv = crate::core::wallpaper::Uv {
+                u0: blit.uv.u0 + uv_width * x_fraction,
+                v0: blit.uv.v0 + uv_height * y_fraction,
+                u1: blit.uv.u0 + uv_width * (x_fraction + width_fraction),
+                v1: blit.uv.v0 + uv_height * (y_fraction + height_fraction),
+            };
             let dst: Rectangle<i32, Physical> = Rectangle::new(
-                (blit.dst.x, blit.dst.y).into(),
-                (blit.dst.w, blit.dst.h).into(),
+                (clipped_x, clipped_y).into(),
+                (clipped_right - clipped_x, clipped_bottom - clipped_y).into(),
             );
             let damage_local = clipped_dest_local_damage(dst, &ctx.damage);
             if damage_local.is_empty() {
                 continue;
             }
             let src_rect: Rectangle<f64, Buffer> = Rectangle::new(
-                (blit.uv.u0 as f64 * tw, blit.uv.v0 as f64 * th).into(),
+                (uv.u0 as f64 * tw, uv.v0 as f64 * th).into(),
                 (
-                    (blit.uv.u1 as f64 - blit.uv.u0 as f64) * tw,
-                    (blit.uv.v1 as f64 - blit.uv.v0 as f64) * th,
+                    (uv.u1 as f64 - uv.u0 as f64) * tw,
+                    (uv.v1 as f64 - uv.v0 as f64) * th,
                 )
                     .into(),
             );

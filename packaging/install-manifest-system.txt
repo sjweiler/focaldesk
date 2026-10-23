@@ -33,7 +33,7 @@
 755 usr/lib64/security/pam_focald_secrets.so
 644 usr/share/focaldesk/default.toml
 644 usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
-644 usr/share/focaldesk/optional-themes/eagle.fdtheme
+644 usr/share/focaldesk/optional-themes/lunar_transport.fdtheme
 644 usr/share/focaldesk/optional-themes/moonbase.fdtheme
 644 usr/share/focaldesk/optional-themes/classic.fdtheme
 644 usr/share/wayland-sessions/focaldesk.desktop

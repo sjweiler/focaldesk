@@ -475,17 +475,16 @@ impl MemoryStore {
             return Ok(Vec::new());
         }
         let candidate_count = top_k.saturating_mul(4).max(top_k);
+        let query_terms = terms(&query);
         let dense = self.recall(query_embedding, candidate_count).await?;
         let inner = self.inner.clone();
-        let query_for_lexical = query.clone();
+        let query_terms_for_lexical = query_terms.clone();
         let lexical = tokio::task::spawn_blocking(move || {
             let conn = inner.lock().expect("memory store connection poisoned");
-            Self::recall_lexical(&conn, &query_for_lexical, candidate_count)
+            Self::recall_lexical(&conn, &query_terms_for_lexical, candidate_count)
         })
         .await
         .context("memory lexical search task panicked")??;
-
-        let query_terms = terms(&query);
         let sqlite_distances_are_l2 = matches!(self.vector_backend, VectorBackend::SqliteVec);
         let mut fused: HashMap<MemoryId, (MemoryRecord, f32, Option<f32>)> = HashMap::new();
         for (rank, hit) in dense.into_iter().enumerate() {
@@ -819,9 +818,13 @@ impl MemoryStore {
             .map_err(anyhow::Error::from)
     }
 
-    fn recall_lexical(conn: &Connection, query: &str, top_k: usize) -> Result<Vec<SearchHit>> {
-        let fts_query = terms(query)
-            .into_iter()
+    fn recall_lexical(
+        conn: &Connection,
+        query_terms: &HashSet<String>,
+        top_k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let fts_query = query_terms
+            .iter()
             .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
             .collect::<Vec<_>>()
             .join(" OR ");

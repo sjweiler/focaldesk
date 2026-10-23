@@ -9,6 +9,7 @@ use glib::ControlFlow;
 use gtk::gio;
 use gtk::gio::prelude::{AppInfoExt, MountExt, VolumeExt, VolumeMonitorExt};
 use gtk::glib;
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashSet, VecDeque};
 use std::fs::OpenOptions;
@@ -98,6 +99,7 @@ struct RecursiveSearchView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidebarKind {
     Folder,
+    Projects,
     Trash,
     Separator,
     UserBookmark { available: bool },
@@ -285,6 +287,7 @@ const MAX_BOOKMARK_LINES: usize = 1_024;
 const MAX_BOOKMARK_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_BOOKMARK_LINE_BYTES: usize = 8 * 1024;
 const MAX_BOOKMARK_LABEL_BYTES: usize = 256;
+const MAX_PROJECTS_SETTINGS_BYTES: u64 = 16 * 1024;
 const MAX_BULK_RENAME_ITEMS: usize = 500;
 const MAX_PERMISSION_ITEMS: usize = 500;
 const MAX_RECURSIVE_PERMISSION_ITEMS: usize = 10_000;
@@ -298,6 +301,11 @@ const RECURSIVE_SEARCH_LIMITS: SearchLimits = SearchLimits {
     max_directories: 10_000,
     max_depth: 32,
 };
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct FilesSidebarSettings {
+    projects_location: Option<PathBuf>,
+}
 
 #[derive(Clone)]
 struct FileManager {
@@ -461,6 +469,13 @@ impl TabManager {
             }
         });
         self.window.add_action(&open_window);
+
+        let projects_location = gio::SimpleAction::new("projects-location", None);
+        let this = self.clone();
+        projects_location.connect_activate(move |_, _| {
+            this.with_active_tab(|tab| tab.choose_projects_location());
+        });
+        self.window.add_action(&projects_location);
 
         let empty_trash = gio::SimpleAction::new("empty-trash", None);
         let this = self.clone();
@@ -1675,6 +1690,45 @@ impl FileManager {
 
     fn load_places(&self) {
         populate_places(&self.places, &self.device_monitor.monitor);
+    }
+
+    fn choose_projects_location(&self) {
+        let initial_folder = gio::File::for_path(projects_location());
+        let dialog = gtk::FileDialog::builder()
+            .title("Choose Projects Folder")
+            .accept_label("Use as Projects")
+            .modal(true)
+            .initial_folder(&initial_folder)
+            .build();
+        let this = self.clone();
+        dialog.select_folder(
+            Some(&self.window),
+            gio::Cancellable::NONE,
+            move |result| match result {
+                Ok(folder) => {
+                    let Some(path) = folder.path() else {
+                        this.set_status("Projects must be a local folder.");
+                        return;
+                    };
+                    if !path.is_dir() {
+                        this.set_status("The selected Projects location is not a folder.");
+                        return;
+                    }
+                    match save_projects_location(&path) {
+                        Ok(()) => {
+                            this.load_places();
+                            this.set_status("Updated the Projects shortcut.");
+                        }
+                        Err(error) => this
+                            .set_status(&format!("Could not save the Projects location: {error}")),
+                    }
+                }
+                Err(error) if !error.matches(gio::IOErrorEnum::Cancelled) => {
+                    this.set_status(&format!("Could not choose a Projects folder: {error}"));
+                }
+                Err(_) => {}
+            },
+        );
     }
 
     fn watch_devices(&self) {
@@ -6335,6 +6389,8 @@ fn populate_places(places: &gtk::StringList, monitor: &gio::VolumeMonitor) {
 
     let mut paths = vec![
         ("Home", home_dir()),
+        ("Documents", home_dir().join("Documents")),
+        ("Projects", projects_location()),
         ("Trash", PathBuf::from("trash:///")),
         ("----------", PathBuf::from("-")),
         ("Desktop", home_dir().join("Desktop")),
@@ -6343,41 +6399,50 @@ fn populate_places(places: &gtk::StringList, monitor: &gio::VolumeMonitor) {
         ("Videos", home_dir().join("Videos")),
         ("Downloads", home_dir().join("Downloads")),
     ];
-    paths.retain(|(_, path)| {
-        path == Path::new("trash:///") || path == Path::new("-") || path.exists()
+    paths.retain(|(name, path)| {
+        *name == "Projects"
+            || path == Path::new("trash:///")
+            || path == Path::new("-")
+            || path.exists()
     });
     for (name, path) in paths {
-        places.append(&format!("{name}\n{}", path.to_string_lossy()));
+        let capability = if name == "Projects" { "\nprojects" } else { "" };
+        places.append(&format!("{name}\n{}{capability}", path.to_string_lossy()));
     }
 
     match load_local_bookmarks() {
-        Ok(bookmarks) if !bookmarks.is_empty() => {
-            places.append("Places\n-\n@section");
-            for bookmark in bookmarks {
-                let title = bookmark
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| local_bookmark_default_name(&bookmark.path));
-                let available = bookmark.path.is_dir();
-                let detail = if available {
-                    bookmark.path.to_string_lossy().into_owned()
-                } else {
-                    format!("Missing — {}", bookmark.path.to_string_lossy())
-                };
-                places.append(&format!(
-                    "{}\n{}\n@bookmark:{}\n{}",
-                    single_line(&title),
-                    single_line(&detail),
-                    bookmark.uri,
-                    if available {
-                        "bookmark"
+        Ok(bookmarks) => {
+            let bookmarks = bookmarks
+                .into_iter()
+                .filter(|bookmark| !is_duplicate_standard_shortcut(&bookmark.path))
+                .collect::<Vec<_>>();
+            if !bookmarks.is_empty() {
+                places.append("Places\n-\n@section");
+                for bookmark in bookmarks {
+                    let title = bookmark
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| local_bookmark_default_name(&bookmark.path));
+                    let available = bookmark.path.is_dir();
+                    let detail = if available {
+                        bookmark.path.to_string_lossy().into_owned()
                     } else {
-                        "bookmark-missing"
-                    }
-                ));
+                        format!("Missing — {}", bookmark.path.to_string_lossy())
+                    };
+                    places.append(&format!(
+                        "{}\n{}\n@bookmark:{}\n{}",
+                        single_line(&title),
+                        single_line(&detail),
+                        bookmark.uri,
+                        if available {
+                            "bookmark"
+                        } else {
+                            "bookmark-missing"
+                        }
+                    ));
+                }
             }
         }
-        Ok(_) => {}
         Err(error) => info!(
             target: "focaldesk",
             error = %error,
@@ -6385,6 +6450,10 @@ fn populate_places(places: &gtk::StringList, monitor: &gio::VolumeMonitor) {
         ),
     }
 
+    populate_nonlocal_places(places, monitor);
+}
+
+fn populate_nonlocal_places(places: &gtk::StringList, monitor: &gio::VolumeMonitor) {
     match load_network_bookmarks() {
         Ok(bookmarks) if !bookmarks.is_empty() => {
             places.append("Network Bookmarks\n-\n@section");
@@ -8193,6 +8262,109 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"))
 }
 
+fn projects_settings_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("focaldesk")
+        .join("files-sidebar.json")
+}
+
+fn default_projects_location() -> PathBuf {
+    home_dir().join("Projects")
+}
+
+fn parse_projects_settings(contents: &str) -> Option<PathBuf> {
+    let settings: FilesSidebarSettings = serde_json::from_str(contents).ok()?;
+    settings.projects_location.filter(|path| path.is_absolute())
+}
+
+fn projects_location() -> PathBuf {
+    let path = projects_settings_path();
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return default_projects_location();
+    };
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_PROJECTS_SETTINGS_BYTES
+    {
+        return default_projects_location();
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_projects_settings(&contents))
+        .unwrap_or_else(default_projects_location)
+}
+
+fn save_projects_location(projects_path: &Path) -> io::Result<()> {
+    if !projects_path.is_absolute() || !projects_path.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Projects must be an existing local folder",
+        ));
+    }
+    let settings_path = projects_settings_path();
+    if settings_path.exists()
+        && std::fs::symlink_metadata(&settings_path)?
+            .file_type()
+            .is_symlink()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Projects settings is not a regular file",
+        ));
+    }
+    let parent = settings_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Projects settings has no parent",
+        )
+    })?;
+    std::fs::create_dir_all(parent)?;
+    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+    let contents = serde_json::to_vec_pretty(&FilesSidebarSettings {
+        projects_location: Some(projects_path.to_path_buf()),
+    })
+    .map_err(io::Error::other)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let (temporary_path, mut temporary) = (0..100)
+        .find_map(|attempt| {
+            let candidate = parent.join(format!(
+                ".files-sidebar.{}.{stamp}.{attempt}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&candidate)
+            {
+                Ok(file) => Some(Ok((candidate, file))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(error)),
+            }
+        })
+        .transpose()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::AlreadyExists, "could not write settings"))?;
+    let result = (|| {
+        temporary.write_all(&contents)?;
+        temporary.sync_all()?;
+        std::fs::rename(&temporary_path, &settings_path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
+}
+
+fn is_duplicate_standard_shortcut(path: &Path) -> bool {
+    ["Music", "Pictures", "Videos", "Downloads"]
+        .iter()
+        .any(|name| path == home_dir().join(name))
+}
+
 fn ensure_standard_user_dirs() {
     for name in ["Desktop", "Downloads", "Music", "Pictures", "Videos"] {
         let path = home_dir().join(name);
@@ -8394,6 +8566,9 @@ fn add_property_row(grid: &gtk::Grid, row: &mut i32, label: &str, value: impl As
 }
 
 fn sidebar_kind_for_place(route: &str, capability: &str) -> SidebarKind {
+    if capability == "projects" {
+        return SidebarKind::Projects;
+    }
     match route {
         "trash:///" => SidebarKind::Trash,
         "-" | "@section" => SidebarKind::Separator,
@@ -8434,7 +8609,7 @@ fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind
     };
     menu.append_item(&sidebar_menu_item("Open", open_action, &target));
 
-    if matches!(kind, SidebarKind::Folder) {
+    if matches!(kind, SidebarKind::Folder | SidebarKind::Projects) {
         menu.append_item(&sidebar_menu_item(
             "Open in New Tab",
             "win.sidebar-open-tab",
@@ -8467,6 +8642,12 @@ fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind
         }
 
         match kind {
+            SidebarKind::Projects => {
+                section.append(
+                    Some("Change Projects Location…"),
+                    Some("win.projects-location"),
+                );
+            }
             SidebarKind::MountedDevice { can_eject: true } => section.append_item(
                 &sidebar_menu_item("Eject", "win.device-eject-mount", &target),
             ),
@@ -8517,6 +8698,7 @@ fn attach_sidebar_context_menu(widget: &impl IsA<gtk::Widget>, kind: SidebarKind
         if matches!(
             kind,
             SidebarKind::Folder
+                | SidebarKind::Projects
                 | SidebarKind::Trash
                 | SidebarKind::UserBookmark { available: true }
         ) {
@@ -8912,6 +9094,33 @@ mod tests {
             sidebar_kind_for_place("@bookmark:file:///missing", "bookmark-missing"),
             SidebarKind::UserBookmark { available: false }
         );
+        assert_eq!(
+            sidebar_kind_for_place("/home/user/Projects", "projects"),
+            SidebarKind::Projects
+        );
+    }
+
+    #[test]
+    fn projects_sidebar_settings_require_an_absolute_location() {
+        assert_eq!(
+            parse_projects_settings(r#"{"projects_location":"/work/projects"}"#),
+            Some(PathBuf::from("/work/projects"))
+        );
+        assert_eq!(
+            parse_projects_settings(r#"{"projects_location":"relative/projects"}"#),
+            None
+        );
+        assert_eq!(parse_projects_settings("not json"), None);
+    }
+
+    #[test]
+    fn duplicate_media_shortcuts_are_not_added_as_places_bookmarks() {
+        for name in ["Music", "Pictures", "Videos", "Downloads"] {
+            assert!(is_duplicate_standard_shortcut(&home_dir().join(name)));
+        }
+        assert!(!is_duplicate_standard_shortcut(
+            &home_dir().join("Projects")
+        ));
     }
 
     #[test]

@@ -1632,17 +1632,39 @@ fn append_wallpaper_quads(
         focaldesk_themes::ThemeWallpaperFit::Tile => crate::core::wallpaper::WallpaperMode::Tile,
     };
     let work = layout.work_area.recess;
-    let blits = crate::core::wallpaper::compute_wallpaper_blits(
+    let output_rect = crate::core::wallpaper::RectI {
+        x: 0,
+        y: 0,
+        w: output_state.logical_size.w,
+        h: output_state.logical_size.h,
+    };
+    // A smoked rail is a continuation of the output wallpaper. Establish one
+    // mapping over the output, then clip it to each region, so the rail does
+    // not start a new centered crop at its own origin.
+    let wallpaper_reference =
+        if desktop.state.rail_backdrop() == focaldesk_config::RailBackdrop::SmokedGlass {
+            output_rect
+        } else {
+            crate::core::wallpaper::RectI {
+                x: work.loc.x,
+                y: work.loc.y,
+                w: work.size.w,
+                h: work.size.h,
+            }
+        };
+    let work_target = crate::core::wallpaper::RectI {
+        x: work.loc.x,
+        y: work.loc.y,
+        w: work.size.w,
+        h: work.size.h,
+    };
+    let blits = crate::core::wallpaper::compute_wallpaper_blits_aligned(
         crate::core::wallpaper::SizeI {
             w: asset.width as i32,
             h: asset.height as i32,
         },
-        crate::core::wallpaper::RectI {
-            x: work.loc.x,
-            y: work.loc.y,
-            w: work.size.w,
-            h: work.size.h,
-        },
+        wallpaper_reference,
+        work_target,
         mode,
     );
     let tint = theme.wallpaper.tint_color;
@@ -1695,17 +1717,19 @@ fn append_wallpaper_quads(
     // wallpaper sample before the translucent compositor tint is composited.
     if desktop.state.rail_backdrop() == focaldesk_config::RailBackdrop::SmokedGlass {
         if let Some(rail) = external_rail_rect(desktop, &layout) {
-            for blit in crate::core::wallpaper::compute_wallpaper_blits(
+            let rail_target = crate::core::wallpaper::RectI {
+                x: rail.loc.x,
+                y: rail.loc.y,
+                w: rail.size.w,
+                h: rail.size.h,
+            };
+            for blit in crate::core::wallpaper::compute_wallpaper_blits_aligned(
                 crate::core::wallpaper::SizeI {
                     w: asset.width as i32,
                     h: asset.height as i32,
                 },
-                crate::core::wallpaper::RectI {
-                    x: rail.loc.x,
-                    y: rail.loc.y,
-                    w: rail.size.w,
-                    h: rail.size.h,
-                },
+                wallpaper_reference,
+                rail_target,
                 mode,
             ) {
                 let destination = Rectangle::<i32, Logical>::from_loc_and_size(

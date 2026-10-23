@@ -1,9 +1,9 @@
 package_version = 1
-slug = "eagle"
+slug = "venus-aerie"
 
 [document]
 format_version = 1
-name = "Eagle"
+name = "Venus Aerie"
 dynamic_range = "sdr"
 hdr_luminance_nits = 1000.0
 
@@ -12,51 +12,51 @@ mode = "solid"
 
 [document.paint.color]
 space = "srgb"
-r = 0.2
-g = 0.6
-b = 1.0
+r = 0.90
+g = 0.60
+b = 0.25
 a = 1.0
 
 [document.semantic.surfaces.bar.normal]
 space = "srgb"
-r = 0.149
-g = 0.161
-b = 0.18
+r = 0.145
+g = 0.125
+b = 0.110
 a = 1.0
 
 [document.semantic.surfaces.dock.normal]
 space = "srgb"
-r = 0.078
-g = 0.09
-b = 0.102
+r = 0.085
+g = 0.075
+b = 0.070
 a = 1.0
 
 [document.semantic.surfaces.button.normal]
 space = "srgb"
-r = 0.122
-g = 0.129
-b = 0.149
+r = 0.190
+g = 0.160
+b = 0.130
 a = 1.0
 
 [document.semantic.surfaces.active_button.normal]
 space = "srgb"
-r = 0.2
-g = 0.6
-b = 1.0
+r = 0.90
+g = 0.60
+b = 0.25
 a = 1.0
 
 [document.semantic.surfaces.popup.normal]
 space = "srgb"
-r = 0.149
-g = 0.161
-b = 0.18
+r = 0.145
+g = 0.125
+b = 0.110
 a = 1.0
 
 [document.semantic.surfaces.window_frame.normal]
 space = "srgb"
-r = 0.078
-g = 0.09
-b = 0.102
+r = 0.085
+g = 0.075
+b = 0.070
 a = 1.0
 
 [document.semantic.typography]
@@ -66,16 +66,16 @@ letter_spacing = 0.0
 
 [document.semantic.typography.primary]
 space = "srgb"
-r = 0.902
-g = 0.902
-b = 0.902
+r = 0.950
+g = 0.930
+b = 0.890
 a = 1.0
 
 [document.semantic.typography.secondary]
 space = "srgb"
-r = 0.549
-g = 0.58
-b = 0.62
+r = 0.730
+g = 0.690
+b = 0.630
 a = 1.0
 
 [document.semantic.layout]
@@ -88,28 +88,28 @@ icon_size = 44.0
 [document.semantic.edges]
 border_width = 1.0
 shadow = 0.4
-glow = 0.1
+glow = 0.05
 radius = 4.0
 
 [document.semantic.edges.border_color]
 space = "srgb"
-r = 0.251
-g = 0.451
-b = 0.651
+r = 0.420
+g = 0.320
+b = 0.210
 a = 1.0
 
 [document.semantic.edges.inner_highlight]
 space = "srgb"
 r = 1.0
-g = 1.0
-b = 1.0
-a = 0.12
+g = 0.870
+b = 0.680
+a = 0.10
 
 [document.semantic.color_behavior]
 gamut = "srgb"
 dynamic_range = "sdr"
 sdr_white_nits = 203.0
-luminance_cap_nits = 1000.0
+luminance_cap_nits = 1400.0
 gamut_mapping = "perceptual"
 
 [document.semantic.wallpaper]

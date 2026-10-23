@@ -1505,11 +1505,7 @@ fn dock_root(
         }
         let capacity = 4usize;
         let has_overflow = groups.len() > capacity;
-        let overflow_windows = groups
-            .iter()
-            .flat_map(|(_, windows)| windows.iter().map(|window| (*window).clone()))
-            .collect::<Vec<_>>();
-        for (identity, windows) in groups.into_iter().take(capacity) {
+        for (identity, windows) in groups.iter().take(capacity) {
             let target = windows
                 .iter()
                 .find(|window| window.focused)
@@ -1522,7 +1518,7 @@ fn dock_root(
                     .map(|window| (*window).clone())
                     .collect::<Vec<_>>();
                 let grouped_button = IconButton::data(
-                    app_icon(app_icon_for_identity(&identity)),
+                    app_icon(app_icon_for_identity(identity)),
                     target.title.clone(),
                     move || {
                         let mut view = view.borrow_mut();
@@ -1554,7 +1550,7 @@ fn dock_root(
                 ));
             } else {
                 buttons.push(app_window_button(
-                    &identity,
+                    identity,
                     &target.title,
                     target.id,
                     target.focused,
@@ -1563,6 +1559,10 @@ fn dock_root(
             }
         }
         if has_overflow {
+            let overflow_windows = groups
+                .iter()
+                .flat_map(|(_, windows)| windows.iter().map(|window| (*window).clone()))
+                .collect::<Vec<_>>();
             let view = dock_view.clone();
             let overflow_button = Button::new("+", move || {
                 let mut view = view.borrow_mut();

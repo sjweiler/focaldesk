@@ -170,6 +170,54 @@ pub fn compute_wallpaper_blits(src: SizeI, out: RectI, mode: WallpaperMode) -> V
     blits
 }
 
+/// Return the portions of wallpaper that cover `target`, while preserving the
+/// scale, crop, and origin established by `reference`.
+///
+/// This is for split output regions such as a work area and its reserved rail:
+/// both must sample one output-relative wallpaper rather than each centering a
+/// new crop at their own origin.
+pub fn compute_wallpaper_blits_aligned(
+    src: SizeI,
+    reference: RectI,
+    target: RectI,
+    mode: WallpaperMode,
+) -> Vec<Blit> {
+    compute_wallpaper_blits(src, reference, mode)
+        .into_iter()
+        .filter_map(|blit| {
+            let left = blit.dst.x.max(target.x);
+            let top = blit.dst.y.max(target.y);
+            let right = (blit.dst.x + blit.dst.w).min(target.x + target.w);
+            let bottom = (blit.dst.y + blit.dst.h).min(target.y + target.h);
+            if right <= left || bottom <= top {
+                return None;
+            }
+
+            let x_fraction = (left - blit.dst.x) as f32 / blit.dst.w as f32;
+            let y_fraction = (top - blit.dst.y) as f32 / blit.dst.h as f32;
+            let width_fraction = (right - left) as f32 / blit.dst.w as f32;
+            let height_fraction = (bottom - top) as f32 / blit.dst.h as f32;
+            let uv_width = blit.uv.u1 - blit.uv.u0;
+            let uv_height = blit.uv.v1 - blit.uv.v0;
+
+            Some(Blit {
+                dst: RectI {
+                    x: left,
+                    y: top,
+                    w: right - left,
+                    h: bottom - top,
+                },
+                uv: Uv {
+                    u0: blit.uv.u0 + uv_width * x_fraction,
+                    v0: blit.uv.v0 + uv_height * y_fraction,
+                    u1: blit.uv.u0 + uv_width * (x_fraction + width_fraction),
+                    v1: blit.uv.v0 + uv_height * (y_fraction + height_fraction),
+                },
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +238,29 @@ mod tests {
         assert_eq!(blits[3].dst.w, 36);
         assert_eq!(blits[3].dst.h, 26);
         assert!((blits[3].uv.u1 - 0.5625).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn aligned_blits_preserve_output_relative_coordinates() {
+        let src = SizeI { w: 1600, h: 900 };
+        let output = RectI {
+            x: 0,
+            y: 0,
+            w: 1600,
+            h: 900,
+        };
+        let rail = RectI {
+            x: 1400,
+            y: 0,
+            w: 200,
+            h: 900,
+        };
+
+        let blits = compute_wallpaper_blits_aligned(src, output, rail, WallpaperMode::Fill);
+
+        assert_eq!(blits.len(), 1);
+        assert_eq!(blits[0].dst.x, 1400);
+        assert!((blits[0].uv.u0 - 0.875).abs() < f32::EPSILON);
+        assert!((blits[0].uv.u1 - 1.0).abs() < f32::EPSILON);
     }
 }

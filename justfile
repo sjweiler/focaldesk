@@ -444,7 +444,7 @@ install-desktop: install-polkit install-settings
     cargo build --release -p focaldesk-desktop
     sudo install -Dm644 assets/themes/default.toml /usr/share/focaldesk/default.toml
     sudo install -Dm644 assets/wallpaper/focaldesk_wallpaper_hdr1400.exr /usr/share/focaldesk/wallpaper/focaldesk_wallpaper_hdr1400.exr
-    sudo install -Dm644 assets/themes/optional/eagle.fdtheme /usr/share/focaldesk/optional-themes/eagle.fdtheme
+    sudo install -Dm644 assets/themes/optional/lunar_transport.fdtheme /usr/share/focaldesk/optional-themes/lunar_transport.fdtheme
     sudo install -Dm644 assets/themes/optional/moonbase.fdtheme /usr/share/focaldesk/optional-themes/moonbase.fdtheme
     sudo install -Dm644 assets/themes/optional/classic.fdtheme /usr/share/focaldesk/optional-themes/classic.fdtheme
     @echo "Build artifact:"
