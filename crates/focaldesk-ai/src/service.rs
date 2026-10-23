@@ -5074,7 +5074,7 @@ mod tests {
         };
 
         assert!(!retrieval_hit_is_relevant(
-            "How realistic is magnetic radiation ejecting the Moon in Space 1999?",
+            "How realistic is magnetic radiation ejecting the Moon in a science-fiction story?",
             &hit
         ));
     }

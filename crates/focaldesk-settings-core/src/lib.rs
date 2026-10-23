@@ -958,7 +958,7 @@ pub fn default_settings() -> Settings {
     Settings {
         desktop_config: serde_json::Value::Null,
         appearance: AppearanceSettings {
-            theme: "space1999".into(),
+            theme: "Default".into(),
             accent_color: [0.1, 0.7, 1.0, 1.0],
             sidebar_width: 64,
             topbar_height: 56,
