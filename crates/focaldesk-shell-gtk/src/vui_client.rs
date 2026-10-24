@@ -36,6 +36,7 @@ struct ClientState {
     snapshot_signature: Vec<String>,
     tooltip_targets: Vec<(vui_core::Rect, String)>,
     first_frame_logged: bool,
+    backing_opacity: u8,
 }
 
 const DOCK_HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
@@ -104,6 +105,7 @@ pub(super) fn build(
         snapshot_signature: Vec::new(),
         tooltip_targets: Vec::new(),
         first_frame_logged: false,
+        backing_opacity: effective_backing_opacity(role),
     }));
     let first_frame_ready = Rc::new(Cell::new(false));
     let ready_reported = Rc::new(Cell::new(false));
@@ -437,7 +439,9 @@ pub(super) fn build(
             }
             *tick_latest_snapshot.borrow_mut() = Some(snapshot);
             let mut state = tick_state.borrow_mut();
-            if signature != state.snapshot_signature {
+            let backing_opacity = effective_backing_opacity(role);
+            let appearance_changed = backing_opacity != state.backing_opacity;
+            if signature != state.snapshot_signature || appearance_changed {
                 state.runtime = build_runtime(
                     role,
                     &tick_connector,
@@ -446,6 +450,7 @@ pub(super) fn build(
                     tick_dock_view.clone(),
                 );
                 state.snapshot_signature = signature;
+                state.backing_opacity = backing_opacity;
                 area.queue_draw();
             }
         }
@@ -888,9 +893,16 @@ fn build_runtime(
     latest_snapshot: Rc<RefCell<Option<DesktopSnapshot>>>,
     dock_view: Rc<RefCell<DockViewState>>,
 ) -> UiRuntime {
+    let backing_opacity = effective_backing_opacity(role);
     let root = Column::new([match role {
         ShellRole::Panel => rail_root(actions, connector, latest_snapshot),
-        ShellRole::Dock => dock_root(actions, connector, latest_snapshot, dock_view),
+        ShellRole::Dock => dock_root(
+            actions,
+            connector,
+            latest_snapshot,
+            dock_view,
+            backing_opacity,
+        ),
     }]);
     let text_system = ParleyTextSystem::with_embedded_fonts([
         include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf").as_slice(),
@@ -906,6 +918,19 @@ fn build_runtime(
     runtime.set_transparent(true);
     runtime.request_redraw();
     runtime
+}
+
+/// Resolve the same shared smoked-glass opacity used by the GTK shell path.
+/// The user override deliberately affects backing only, never icon or text
+/// alpha in the VUI controls.
+fn effective_backing_opacity(role: ShellRole) -> u8 {
+    let config = crate::load_config();
+    let theme = focaldesk_themes::theme_by_name(&config.appearance.theme);
+    let opacity = config.appearance.panel_darkness.unwrap_or(match role {
+        ShellRole::Panel => f64::from(theme.backing.rail_opacity),
+        ShellRole::Dock => f64::from(theme.backing.dock_opacity),
+    });
+    (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 fn rail_root(
@@ -1163,9 +1188,8 @@ fn rail_root(
     ];
     let rail = Surface::new(Column::new(rail_contents))
         .padding(Insets::all(6.0))
-        // Keep the bright wallpaper readable as a soft backdrop while the
-        // blue-black tint preserves contrast for the compact rail controls.
-        .background(vui_core::Color::rgba(10, 22, 40, 168))
+        // The compositor owns the rail wallpaper and tint. Keeping this client
+        // transparent makes the configured backing opacity apply exactly once.
         .border(vui_core::Color::rgba(116, 148, 180, 150), 1.0)
         .radius(18.0);
     let marker = Surface::new(Spacer::new(24.0, 3.0))
@@ -1331,6 +1355,7 @@ fn dock_root(
     connector: &str,
     latest_snapshot: Rc<RefCell<Option<DesktopSnapshot>>>,
     dock_view: Rc<RefCell<DockViewState>>,
+    backing_opacity: u8,
 ) -> Box<dyn Widget> {
     if let Some(windows) = dock_view.borrow().chooser.clone() {
         let page = dock_view.borrow().page;
@@ -1591,7 +1616,7 @@ fn dock_root(
     })
     // Match the rail's blue-black glass closely, retaining only a slightly
     // lighter treatment so the dock stays grounded without competing with it.
-    .background(vui_core::Color::rgba(10, 22, 40, 158))
+    .background(vui_core::Color::rgba(6, 9, 14, backing_opacity))
     .border(vui_core::Color::rgba(116, 148, 180, 150), 1.0)
     .radius(16.0);
     let centered = Flex::row([

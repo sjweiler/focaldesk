@@ -6,9 +6,9 @@ use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Rectangle, Scale, Size};
 
-use crate::core::chrome_layout::{build_chrome_layout, ChromeLayout};
+use crate::core::chrome_layout::{ChromeLayout, build_chrome_layout};
 use crate::core::desktop::DesktopState;
-use crate::core::fonts::{style_for, FontId, FontRole, TextStyle};
+use crate::core::fonts::{FontId, FontRole, TextStyle, style_for};
 use crate::core::render::{
     ChromeGlassPass, ClientCompositingMode, FlowRenderElement, FrameCtx, RenderInputs,
     RenderInputsMut,
@@ -17,8 +17,8 @@ use crate::core::ui_builder::{AiFlowMode, UiBuildOptions};
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
 use focaldesk_logging::FLogLevel;
-use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowTheme;
+use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use focaldesk_ui::chrome::ChromeMetrics;
@@ -431,8 +431,7 @@ fn prewarm_font_glyphs(state: &mut DesktopState) -> Result<(), Box<dyn std::erro
             state.fonts.prepare_text("FocalDesk Debug", style)?;
             state.fonts.prepare_text("OK", style)?;
             state.fonts.prepare_text("Cancel", style)?;
-            const BASIC_ASCII: &str =
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\
+            const BASIC_ASCII: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\
          .,;:!?()[]{}<>+-=*/_@#%&$'\"\\|`~^ ";
 
             state.fonts.prepare_text(BASIC_ASCII, style)?;
@@ -778,6 +777,7 @@ pub fn draw_output_stage(
         client_compositing,
         chrome_glass_pass,
         rail_backdrop: state.rail_backdrop(),
+        panel_darkness: state.panel_darkness(),
         defer_egui_to_sdr,
         surface_colors: &state.surface_colors,
     };
@@ -943,8 +943,10 @@ mod tests {
             "renderer received {} rectangles",
             compacted.len()
         );
-        assert!(compacted
-            .iter()
-            .all(|rect| rect.overlaps(Rectangle::from_size(output_size))));
+        assert!(
+            compacted
+                .iter()
+                .all(|rect| rect.overlaps(Rectangle::from_size(output_size)))
+        );
     }
 }

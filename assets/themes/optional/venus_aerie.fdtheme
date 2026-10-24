@@ -17,6 +17,10 @@ g = 0.60
 b = 0.25
 a = 1.0
 
+[document.backing]
+rail_opacity = 0.68
+dock_opacity = 0.76
+
 [document.semantic.surfaces.bar.normal]
 space = "srgb"
 r = 0.145

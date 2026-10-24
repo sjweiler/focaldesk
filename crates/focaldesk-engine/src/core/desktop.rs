@@ -7,23 +7,23 @@ use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::buffer_dimensions;
-use smithay::backend::renderer::utils::{import_surface_tree, CommitCounter, SurfaceView};
+use smithay::backend::renderer::utils::{CommitCounter, SurfaceView, import_surface_tree};
 use smithay::desktop::{
-    find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
+    PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
 };
 use smithay::wayland::compositor::get_parent;
 use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::compositor::{with_surface_tree_downward, CompositorState, TraversalAction};
+use smithay::wayland::compositor::{CompositorState, TraversalAction, with_surface_tree_downward};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
-    force_linear_surfaces, primaries_wider_than, sanitize_tagged_client_description,
     ClientBufferEncoding, ColorDescription, RenderingIntent, SurfaceColorRenderState,
-    SurfaceColorState,
+    SurfaceColorState, force_linear_surfaces, primaries_wider_than,
+    sanitize_tagged_client_description,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
@@ -36,7 +36,7 @@ use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonSta
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
-use smithay::input::keyboard::{keysyms, xkb, XkbConfig};
+use smithay::input::keyboard::{XkbConfig, keysyms, xkb};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, GestureSwipeBeginEvent,
     GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
@@ -49,14 +49,14 @@ use smithay::reexports::input::{
 use smithay::reexports::wayland_server::Resource;
 
 use crate::core::session_restore::{
-    desktop_entry_for_identity, SavedOutput, SavedProtocol, SavedRect, SavedSplitDirection,
-    SavedSplitPlacement, SavedWindow, SessionRestoreState, SessionSnapshot,
-};
-use crate::core::shell::xwayland::{
-    is_noninteractive_fixed_size_helper, workspace_from_process_env, XwaylandSurfaceRole,
-    XwaylandWindowMeta,
+    SavedOutput, SavedProtocol, SavedRect, SavedSplitDirection, SavedSplitPlacement, SavedWindow,
+    SessionRestoreState, SessionSnapshot, desktop_entry_for_identity,
 };
 use crate::core::shell::WaylandWindowMeta;
+use crate::core::shell::xwayland::{
+    XwaylandSurfaceRole, XwaylandWindowMeta, is_noninteractive_fixed_size_helper,
+    workspace_from_process_env,
+};
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -65,45 +65,45 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-use crate::core::keyboard_accessibility::KeyboardAccessibilityFilter;
-use crate::core::lock::{
-    authenticate_current_user, LockPulseKind, LockScreenState, LOCK_PULSE_DURATION,
-};
-use crate::core::shell::ManagedWindow;
 use crate::core::BackendEvent;
 use crate::core::RenderState;
-use focal_launch_shared::{request_launch, BrowserBackend, LaunchRequest, LaunchSource};
-use focaldesk_config::{load_config, save_config, FocalDeskConfig};
+use crate::core::keyboard_accessibility::KeyboardAccessibilityFilter;
+use crate::core::lock::{
+    LOCK_PULSE_DURATION, LockPulseKind, LockScreenState, authenticate_current_user,
+};
+use crate::core::shell::ManagedWindow;
+use focal_launch_shared::{BrowserBackend, LaunchRequest, LaunchSource, request_launch};
+use focaldesk_config::{FocalDeskConfig, load_config, save_config};
 use focaldesk_input::{
     InputEvent, InputState, KeyState, Modifiers, MouseButton, ScrollDelta, ScrollSource,
 };
 use focaldesk_ipc::{
-    desktop_socket_path, send_control_request, send_notification_request, send_power_request,
-    send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
-    DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
-    DesktopSplitLayout, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
-    NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
-    PowerIpcResponse, RenderingStatus, SessionStatus, ThemeEditorCommand, UpdateIpcRequest,
-    UpdateIpcResponse, WindowSnapshot, WorkspaceSnapshot, THEME_EDITOR_PROTOCOL_VERSION,
+    ControlIpcRequest, ControlIpcResponse, ControlSetting, DesktopAction, DesktopDirection,
+    DesktopSnapshot, DesktopSplitKeyboardAction, DesktopSplitLayout, DisplayRuntimeOutputStatus,
+    InputDeviceSnapshot, IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
+    OutputSnapshot, PowerIpcRequest, PowerIpcResponse, RenderingStatus, SessionStatus,
+    THEME_EDITOR_PROTOCOL_VERSION, ThemeEditorCommand, UpdateIpcRequest, UpdateIpcResponse,
+    WindowSnapshot, WorkspaceSnapshot, desktop_socket_path, send_control_request,
+    send_notification_request, send_power_request, send_update_request, transport,
 };
 use focaldesk_logging::session_id;
-use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
+use focaldesk_logging::{FLogLevel, flog, flog_error, flog_info, flog_warn, set_log_level};
 use focaldesk_network::model::NetworkState;
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_power::{
-    PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
+    LOW_BATTERY_THRESHOLD_PERCENT, PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot,
 };
 use focaldesk_settings_core::{
-    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AccessibilitySettings,
-    AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel,
-    DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern,
-    InputAccelerationProfile, InputDeviceSettings, InputScrollMethod, InputSettings,
-    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
-    PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings,
+    AccessibilitySettings, AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings,
+    DebugLogLevel, DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance,
+    HdrCalibrationPattern, InputAccelerationProfile, InputDeviceSettings, InputScrollMethod,
+    InputSettings, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
+    PowerButtonAction, PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings,
+    load_settings, rearm_exclusive_hdr_for_next_session, save_settings,
 };
 use focaldesk_shortcuts::{KeyAction, KeySymbol, Keybinds, ModMask};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
@@ -115,19 +115,19 @@ use focaldesk_ui::element::ChromeItem;
 use focaldesk_updates::UpdateSnapshot;
 use indexmap::IndexMap;
 use smithay::delegate_dispatch2;
-use smithay::input::keyboard::FilterResult;
 use smithay::input::Seat;
+use smithay::input::keyboard::FilterResult;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::utils::Serial;
 use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::Serial;
 use smithay::utils::{
     Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{
-    with_pointer_constraint, PointerConstraint, PointerConstraintsState,
+    PointerConstraint, PointerConstraintsState, with_pointer_constraint,
 };
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -157,30 +157,30 @@ use std::thread;
 use wayland_server::DisplayHandle;
 
 use crate::core::chrome_layout::{
-    build_chrome_layout, build_chrome_layout_with_config, chrome_host_drag_hit,
-    sidebar_slot_index_at, topbar_status_well_index_at, ChromeLayout,
+    ChromeLayout, build_chrome_layout, build_chrome_layout_with_config, chrome_host_drag_hit,
+    sidebar_slot_index_at, topbar_status_well_index_at,
 };
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
-    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
-    ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
+    RESIZE_BORDER_PX, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
+    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at,
 };
 use crate::core::ui_builder::{
-    build_ui_for_output_with_options, default_sidebar_items, default_status_items, AiFlowMode,
-    UiBuildOptions, VoiceCaptureStatus,
+    AiFlowMode, UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options,
+    default_sidebar_items, default_status_items,
 };
-use focaldesk_ai::{send_ai_request, AiDaemonStatus, AiIpcRequest, AiIpcResponse};
-use focaldesk_themes::theme::BuiltInThemeId;
+use focaldesk_ai::{AiDaemonStatus, AiIpcRequest, AiIpcResponse, send_ai_request};
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
+use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogButton, DialogId, DialogKind, DialogState};
 use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::ui_builder::{
-    sidebar_workspace_number, SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID,
-    SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID,
-    SIDEBAR_TERMINAL_ID, TOPBAR_DND_ID,
+    SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID,
+    SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, TOPBAR_DND_ID,
+    sidebar_workspace_number,
 };
 
 use crate::core::desktop_services::*;
@@ -4772,7 +4772,10 @@ impl DesktopState {
             }
             let font_theme_id = new_theme_id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
             if let Err(err) = self.fonts.reload_for_theme(font_theme_id) {
-                flog_error!("failed to reload fonts for theme {:?}: {err}", font_theme_id);
+                flog_error!(
+                    "failed to reload fonts for theme {:?}: {err}",
+                    font_theme_id
+                );
             }
 
             self.render.fonts_prewarm_done = false;
@@ -4794,6 +4797,10 @@ impl DesktopState {
 
     pub(crate) fn rail_backdrop(&self) -> focaldesk_config::RailBackdrop {
         self.settings_ipc_config.appearance.rail_backdrop
+    }
+
+    pub(crate) fn panel_darkness(&self) -> Option<f64> {
+        self.settings_ipc_config.appearance.panel_darkness
     }
 
     fn apply_power_settings(&self) {
@@ -14777,6 +14784,9 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
+        ClientBufferEncoding, DamageSource, Fourcc, OutputId, PowerActionInteraction, SplitAxis,
+        SplitDirection, TopbarPulseTarget, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
+        UnattendedSuspendState, WorkspaceTransition, WorkspaceTransitionPhase,
         ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds,
         complementary_split_rect, confine_pointer_to_output_bounds, encoding_from_fourcc,
         is_browser_like, logical_damage_to_physical, output_with_largest_overlap,
@@ -14786,9 +14796,6 @@ mod tests {
         snap_target_for_pointer, split_assist_targets, split_direction_for_rect, split_preset_rect,
         split_rect, split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
         topbar_pulse_target_at, workspace_for_slot, workspace_transition_views,
-        ClientBufferEncoding, DamageSource, Fourcc, OutputId, PowerActionInteraction, SplitAxis,
-        SplitDirection, TopbarPulseTarget, UnattendedSuspendState, WorkspaceTransition,
-        WorkspaceTransitionPhase, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_ai::AiDaemonStatus;
@@ -15476,9 +15483,11 @@ mod tests {
         set_surface_root_membership(&mut roots, &surface, Some(&first_root), &second_root);
 
         assert!(!roots.contains_key(&first_root));
-        assert!(roots
-            .get(&second_root)
-            .is_some_and(|members| members.contains(&surface)));
+        assert!(
+            roots
+                .get(&second_root)
+                .is_some_and(|members| members.contains(&surface))
+        );
 
         remove_surface_root_membership(&mut roots, &second_root, &surface);
         assert!(roots.is_empty());
@@ -15499,23 +15508,28 @@ mod tests {
     fn chromium_wayland_keeps_wide_gamut_raster_target() {
         let args = chrome_command_args(false, false);
         assert!(args.iter().any(|arg| arg == "--ozone-platform=wayland"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1")
+        );
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--force-color-profile=display-p3-d65")
+        );
     }
 
     #[test]
     fn chromium_hdr_avoids_eight_bit_pq_surfaces() {
         let args = chrome_command_args(false, true);
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
-        assert!(!args
-            .iter()
-            .any(|arg| arg.starts_with("--force-raster-color-profile=")));
+        assert!(
+            args.iter()
+                .any(|arg| arg == "--force-color-profile=display-p3-d65")
+        );
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("--force-raster-color-profile="))
+        );
     }
 
     #[test]

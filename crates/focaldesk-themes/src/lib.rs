@@ -10,19 +10,20 @@ pub mod theme;
 pub const SYSTEM_DEFAULT_THEME_PATH: &str = "/usr/share/focaldesk/default.toml";
 
 pub use theme::{
-    BackgroundTheme, ChromeTheme, DialogTheme, FlowTheme, FlowThemeId, IconTheme, TextTheme,
-    WallpaperTheme,
+    BackgroundTheme, BackingTheme, ChromeTheme, DialogTheme, FlowTheme, FlowThemeId, IconTheme,
+    TextTheme, WallpaperTheme,
 };
 
 pub use document::{
-    ThemeDocument, ThemeWallpaper, ThemeWallpaperFit, MAX_GRADIENT_STOPS, THEME_DOCUMENT_VERSION,
+    MAX_GRADIENT_STOPS, THEME_DOCUMENT_VERSION, ThemeBacking, ThemeDocument, ThemeWallpaper,
+    ThemeWallpaperFit,
 };
 
-pub use gtk::{gtk_app_css, gtk_app_prefers_dark, GtkAppThemeOptions};
+pub use gtk::{GtkAppThemeOptions, gtk_app_css, gtk_app_prefers_dark};
 pub use manager::{ActiveTheme, ThemeManager};
 pub use package::{
-    theme_slug, InstalledTheme, ThemePackage, ThemePackageAsset, MAX_THEME_ASSET_BYTES,
-    THEME_PACKAGE_VERSION,
+    InstalledTheme, MAX_THEME_ASSET_BYTES, THEME_PACKAGE_VERSION, ThemePackage, ThemePackageAsset,
+    theme_slug,
 };
 pub use paint::{
     GradientInterpolation, GradientStop, ThemeColor, ThemeColorSpace, ThemeDynamicRange,

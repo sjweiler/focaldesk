@@ -17,6 +17,11 @@ g = 0.678
 b = 0.859
 a = 1.0
 
+[document.backing]
+# The lunar scene already has dark, quiet values behind controls.
+rail_opacity = 0.48
+dock_opacity = 0.56
+
 [document.semantic.surfaces.bar.normal]
 space = "srgb"
 r = 0.18

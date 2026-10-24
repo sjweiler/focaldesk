@@ -210,8 +210,8 @@ window.task-shelf-window {
 
 .system-rail {
   padding: 9px 7px;
-  background-color: alpha(@fd_shell_bg, 0.78);
-  background-image: linear-gradient(145deg, alpha(@fd_shell_highlight, 0.20), alpha(@fd_shell_surface_raised, 0.74) 18%, alpha(@fd_shell_bg, 0.72) 58%, alpha(@fd_shell_glass_bottom, 0.86));
+  /* The compositor paints the rail wallpaper and its configured tint. */
+  background: transparent;
   border-color: alpha(@fd_shell_rim, 0.76);
 }
 

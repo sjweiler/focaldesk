@@ -1,34 +1,33 @@
 use adw::prelude::*;
-use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
-use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
-use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig, RailBackdrop};
+use focaldesk_ai::{AiPermissionRecord, list_ai_permission_records, revoke_ai_permission};
+use focaldesk_bluetooth::{BluetoothSnapshot, load_snapshot as load_bluetooth_snapshot};
+use focaldesk_config::{DockVisibility, FocalDeskConfig, RailBackdrop, load_config, save_config};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
-    send_connector_host_request, send_desktop_config, send_desktop_request, send_desktop_set,
-    send_power_request, send_settings_request, watch_desktop_keys, ConnectorHostIpcRequest,
-    DesktopAction, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
-    PowerIpcRequest, PowerIpcResponse, ThemeEditorCommand, THEME_EDITOR_PROTOCOL_VERSION,
+    ConnectorHostIpcRequest, DesktopAction, DisplayRuntimeOutputStatus, InputDeviceSnapshot,
+    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse, THEME_EDITOR_PROTOCOL_VERSION,
+    ThemeEditorCommand, send_connector_host_request, send_desktop_config, send_desktop_request,
+    send_desktop_set, send_power_request, send_settings_request, watch_desktop_keys,
 };
-use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
+use focaldesk_ipc::{NotificationIpcRequest, send_notification_request};
 use focaldesk_launcher_state::clear_recent_activity;
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_permissions::{
     PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
 };
 use focaldesk_settings_core::{
-    load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
     BrowserLaunchBackend, ColorFilter, DebugLogLevel, DisplayColorProfile, DisplayTransform,
     ExclusiveHdrPhase, ExclusiveHdrState, HdrAppearance, HdrCalibrationPattern, HdrToneMapper,
     InputAccelerationProfile, InputScrollMethod, LidCloseAction, LowBatteryAction,
     NightLightSchedule, OutputConfig, PerformanceMode, PowerButtonAction, Settings, StartupApp,
-    WindowRule,
+    WindowRule, load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
 };
-use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
+use focaldesk_sounds::{SAMPLE_RATE, SoundBuffer, UiSound, UiSoundPlayer, generate_ui_sound};
 use focaldesk_themes::{
-    gtk_app_css, gtk_app_prefers_dark, theme_by_name, GradientInterpolation, GradientStop,
-    GtkAppThemeOptions, InteractionState, SemanticTheme, SurfaceStyle, ThemeColor, ThemeColorSpace,
-    ThemeDocument, ThemeDynamicRange, ThemePackage, ThemePaint, ThemePaintIntent, ThemeWallpaper,
-    ThemeWallpaperFit,
+    GradientInterpolation, GradientStop, GtkAppThemeOptions, InteractionState, SemanticTheme,
+    SurfaceStyle, ThemeColor, ThemeColorSpace, ThemeDocument, ThemeDynamicRange, ThemePackage,
+    ThemePaint, ThemePaintIntent, ThemeWallpaper, ThemeWallpaperFit, gtk_app_css,
+    gtk_app_prefers_dark, theme_by_name,
 };
 
 use gtk::cairo;
@@ -49,7 +48,7 @@ mod location_permissions;
 
 use audio::*;
 use location_permissions::{
-    list_location_permission_records, revoke_location_permission, LocationPermissionRecord,
+    LocationPermissionRecord, list_location_permission_records, revoke_location_permission,
 };
 
 const SCALE_OPTIONS: &[(&str, f64)] = &[
@@ -2876,6 +2875,22 @@ fn dock_visibility_from_index(index: u32) -> DockVisibility {
         2 => DockVisibility::Autohide,
         _ => DockVisibility::IntelligentDodge,
     }
+}
+
+fn theme_backing_opacities(theme_name: &str) -> (f64, f64) {
+    let backing = theme_by_name(theme_name).backing;
+    (
+        f64::from(backing.rail_opacity.clamp(0.0, 1.0)),
+        f64::from(backing.dock_opacity.clamp(0.0, 1.0)),
+    )
+}
+
+fn effective_panel_darkness(config: &FocalDeskConfig) -> f64 {
+    config.appearance.panel_darkness.unwrap_or_else(|| {
+        // The rail value is the direct counterpart to the historical Panel
+        // setting; reset still restores each surface's individual default.
+        theme_backing_opacities(&config.appearance.theme).0
+    })
 }
 
 fn main() {
@@ -6617,6 +6632,61 @@ fn appearance_page(
         });
     }
 
+    let panel_darkness_row = adw::ActionRow::new();
+    panel_darkness_row.set_title("Panel darkness");
+    let (theme_rail_opacity, theme_dock_opacity) =
+        theme_backing_opacities(&config.borrow().appearance.theme);
+    panel_darkness_row.set_subtitle(&format!(
+        "Theme default: rail {:.0}% · dock {:.0}%. Adjusting applies one smoked-glass backing value to both.",
+        theme_rail_opacity * 100.0,
+        theme_dock_opacity * 100.0,
+    ));
+    let panel_darkness = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    panel_darkness.set_hexpand(true);
+    panel_darkness.set_draw_value(true);
+    panel_darkness.set_value(effective_panel_darkness(&config.borrow()));
+    panel_darkness.set_tooltip_text(Some(
+        "Controls only the rail and dock backing; icon and text opacity stay unchanged",
+    ));
+    panel_darkness_row.add_suffix(&panel_darkness);
+    visual_group.add(&panel_darkness_row);
+    let panel_darkness_syncing = Rc::new(Cell::new(false));
+    {
+        let config = config.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
+        panel_darkness.connect_value_changed(move |scale| {
+            if panel_darkness_syncing.get() {
+                return;
+            }
+            let value = scale.value().clamp(0.0, 1.0);
+            if config.borrow().appearance.panel_darkness == Some(value) {
+                return;
+            }
+            config.borrow_mut().appearance.panel_darkness = Some(value);
+            persist_config_key(&config.borrow(), "appearance.panel_darkness", json!(value));
+        });
+    }
+    let theme_default_button = gtk::Button::with_label("Use theme default");
+    theme_default_button.set_valign(gtk::Align::Center);
+    panel_darkness_row.add_suffix(&theme_default_button);
+    {
+        let config = config.clone();
+        let panel_darkness = panel_darkness.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
+        theme_default_button.connect_clicked(move |_| {
+            config.borrow_mut().appearance.panel_darkness = None;
+            let value = effective_panel_darkness(&config.borrow());
+            persist_config_key(
+                &config.borrow(),
+                "appearance.panel_darkness",
+                serde_json::Value::Null,
+            );
+            panel_darkness_syncing.set(true);
+            set_scale_if_changed(&panel_darkness, value);
+            panel_darkness_syncing.set(false);
+        });
+    }
+
     // Output focus glow
     let focus_row = adw::ActionRow::new();
     focus_row.set_title("Output focus glow");
@@ -6793,6 +6863,8 @@ fn appearance_page(
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
         let rail_backdrop_row = rail_backdrop_row.clone();
+        let panel_darkness = panel_darkness.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
         let focus_switch = focus_switch.clone();
         let shelf_visibility = shelf_visibility.clone();
         let theme_dropdown = theme_dropdown.clone();
@@ -6810,12 +6882,13 @@ fn appearance_page(
             persist_config(&config.borrow());
             persist_settings(&settings.borrow());
 
-            let (shader, glass, rail_backdrop, focus, visibility, theme, glow, font) = {
+            let (shader, glass, rail_backdrop, darkness, focus, visibility, theme, glow, font) = {
                 let config = config.borrow();
                 (
                     config.appearance.shader_chrome,
                     config.appearance.work_area_glass,
                     config.appearance.rail_backdrop,
+                    effective_panel_darkness(&config),
                     config.appearance.output_focus_glow,
                     config.dock.visibility,
                     config.appearance.theme.clone(),
@@ -6829,6 +6902,9 @@ fn appearance_page(
                 RailBackdrop::Solid => 0,
                 RailBackdrop::SmokedGlass => 1,
             });
+            panel_darkness_syncing.set(true);
+            set_scale_if_changed(&panel_darkness, darkness);
+            panel_darkness_syncing.set(false);
             set_switch_if_changed(&focus_switch, focus);
             shelf_visibility.set_selected(dock_visibility_index(visibility));
             if let Some(index) = theme_values.iter().position(|option| option == &theme) {
@@ -6864,6 +6940,7 @@ fn appearance_page(
             "appearance.shader_chrome",
             "appearance.work_area_glass",
             "appearance.rail_backdrop",
+            "appearance.panel_darkness",
             "appearance.output_focus_glow",
             "appearance.theme",
             "appearance.glow_strength",
@@ -6874,6 +6951,8 @@ fn appearance_page(
         let shader_switch = shader_switch.clone();
         let glass_switch = glass_switch.clone();
         let rail_backdrop_row = rail_backdrop_row.clone();
+        let panel_darkness = panel_darkness.clone();
+        let panel_darkness_syncing = panel_darkness_syncing.clone();
         let focus_switch = focus_switch.clone();
         let theme_dropdown = theme_dropdown.clone();
         let theme_values = theme_values.clone();
@@ -6910,6 +6989,17 @@ fn appearance_page(
                             }
                         }
                     }
+                    "appearance.panel_darkness" => {
+                        let darkness = event
+                            .value
+                            .as_f64()
+                            .filter(|value| (0.0..=1.0).contains(value));
+                        config.borrow_mut().appearance.panel_darkness = darkness;
+                        let effective = effective_panel_darkness(&config.borrow());
+                        panel_darkness_syncing.set(true);
+                        set_scale_if_changed(&panel_darkness, effective);
+                        panel_darkness_syncing.set(false);
+                    }
                     "appearance.output_focus_glow" => {
                         if let Some(active) = event.value.as_bool() {
                             config.borrow_mut().appearance.output_focus_glow = active;
@@ -6919,8 +7009,16 @@ fn appearance_page(
                     "appearance.theme" => {
                         if let Some(theme) = event.value.as_str() {
                             config.borrow_mut().appearance.theme = theme.to_string();
-                            if let Some(index) = theme_values.iter().position(|option| option == theme) {
+                            if let Some(index) =
+                                theme_values.iter().position(|option| option == theme)
+                            {
                                 theme_dropdown.set_selected(index as u32);
+                            }
+                            if config.borrow().appearance.panel_darkness.is_none() {
+                                let effective = effective_panel_darkness(&config.borrow());
+                                panel_darkness_syncing.set(true);
+                                set_scale_if_changed(&panel_darkness, effective);
+                                panel_darkness_syncing.set(false);
                             }
                         }
                     }
@@ -12223,10 +12321,12 @@ mod tests {
         assert!(!red_boundary.is_empty());
         assert!(!green_boundary.is_empty());
         assert_ne!(red_boundary, green_boundary);
-        assert!(red_boundary
-            .iter()
-            .flatten()
-            .all(|coordinate| (0.0..=1.0).contains(coordinate)));
+        assert!(
+            red_boundary
+                .iter()
+                .flatten()
+                .all(|coordinate| (0.0..=1.0).contains(coordinate))
+        );
         assert!(srgb_gamut_boundary_segments(0.0, 1).is_empty());
     }
 
@@ -12412,9 +12512,11 @@ mod tests {
             "Future gamut",
             ThemePaintIntent::new(ThemePaint::solid(ThemeColor::rec2020(0.5, 0.5, 0.5, 1.0))),
         );
-        assert!(ThemeEditorDraft::from_document(&document)
-            .unwrap_err()
-            .contains("Rec.2020"));
+        assert!(
+            ThemeEditorDraft::from_document(&document)
+                .unwrap_err()
+                .contains("Rec.2020")
+        );
     }
 
     #[test]

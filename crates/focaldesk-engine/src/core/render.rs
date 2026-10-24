@@ -294,6 +294,8 @@ pub struct RenderInputs<'a> {
     pub chrome_glass_pass: ChromeGlassPass,
     /// Compositor-owned backing beneath an external system rail.
     pub rail_backdrop: RailBackdrop,
+    /// Optional user override for the theme's rail backing opacity.
+    pub panel_darkness: Option<f64>,
     /// When true, egui/cursor are drawn in a follow-up SDR pass (egui_glow outputs sRGB).
     pub defer_egui_to_sdr: bool,
     pub surface_colors: &'a std::collections::HashMap<Id, SurfaceColorRenderState>,
@@ -3605,7 +3607,15 @@ impl RenderState {
             frame,
             Rectangle::from_size(Size::from(inputs.ctx.output_size)),
             &damage,
-            [0.025, 0.035, 0.055, 0.68],
+            [
+                0.025,
+                0.035,
+                0.055,
+                inputs
+                    .panel_darkness
+                    .map(|value| value.clamp(0.0, 1.0) as f32)
+                    .unwrap_or_else(|| theme.backing.rail_opacity.clamp(0.0, 1.0)),
+            ],
         );
     }
 

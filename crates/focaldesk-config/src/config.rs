@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use focaldesk_themes::ThemePackage;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +30,10 @@ pub struct AppearanceConfig {
     pub shader_chrome: bool,
     pub work_area_glass: bool,
     pub rail_backdrop: RailBackdrop,
+    /// A user-selected opacity for both shell backings. `None` keeps the
+    /// active theme's independent rail and dock defaults.
+    #[serde(default)]
+    pub panel_darkness: Option<f64>,
 }
 
 /// The compositor-owned surface behind the external system rail.
@@ -64,6 +68,7 @@ impl Default for AppearanceConfig {
             shader_chrome: true,
             work_area_glass: true,
             rail_backdrop: RailBackdrop::Solid,
+            panel_darkness: None,
         }
     }
 }
@@ -444,6 +449,7 @@ mod tests {
         assert_eq!(config.dock.position, DockPosition::Left);
         assert_eq!(config.dock.size, DockSize::Normal);
         assert_eq!(config.appearance.rail_backdrop, RailBackdrop::Solid);
+        assert_eq!(config.appearance.panel_darkness, None);
     }
 
     #[test]
@@ -453,6 +459,15 @@ mod tests {
         )
         .expect("parse rail backdrop");
         assert_eq!(config.appearance.rail_backdrop, RailBackdrop::SmokedGlass);
+    }
+
+    #[test]
+    fn panel_darkness_can_be_absent_or_explicit_in_canonical_settings() {
+        let config = config_from_settings_json(
+            r#"{"desktop_config":{"appearance":{"panel_darkness":0.62}}}"#,
+        )
+        .expect("parse panel darkness");
+        assert_eq!(config.appearance.panel_darkness, Some(0.62));
     }
 
     #[test]

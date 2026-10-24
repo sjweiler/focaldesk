@@ -1,5 +1,5 @@
-use crate::theme::*;
 use crate::ThemeWallpaperFit;
+use crate::theme::*;
 
 /// A single conservative fallback used only when the system document or a
 /// selected package cannot load. User-facing themes are ThemeDocuments.
@@ -22,6 +22,7 @@ pub fn default_theme() -> FlowTheme {
             blur: 0.0,
             saturation: 1.0,
         },
+        backing: BackingTheme::default(),
         chrome: ChromeTheme {
             bg_color: [0.08, 0.09, 0.10, 1.0],
             panel_color: [0.15, 0.16, 0.18, 1.0],

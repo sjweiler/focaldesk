@@ -1,5 +1,5 @@
 use crate::{SemanticTheme, ThemeColor, ThemePaint, ThemePaintIntent};
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -15,6 +15,8 @@ pub struct ThemeDocument {
     pub intent: ThemePaintIntent,
     #[serde(default)]
     pub wallpaper: ThemeWallpaper,
+    #[serde(default)]
+    pub backing: ThemeBacking,
     #[serde(default)]
     pub semantic: SemanticTheme,
 }
@@ -42,6 +44,23 @@ pub struct ThemeWallpaper {
     pub dim: f32,
 }
 
+/// Per-surface opacity defaults for the shared smoked-glass shell backing.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ThemeBacking {
+    pub rail_opacity: f32,
+    pub dock_opacity: f32,
+}
+
+impl Default for ThemeBacking {
+    fn default() -> Self {
+        Self {
+            rail_opacity: 0.68,
+            dock_opacity: 0.78,
+        }
+    }
+}
+
 impl Default for ThemeWallpaper {
     fn default() -> Self {
         Self {
@@ -60,6 +79,7 @@ impl ThemeDocument {
             name: name.into(),
             intent,
             wallpaper: ThemeWallpaper::default(),
+            backing: ThemeBacking::default(),
             semantic: SemanticTheme::default(),
         }
     }
@@ -87,6 +107,13 @@ impl ThemeDocument {
         }
         if !self.wallpaper.dim.is_finite() || !(0.0..=1.0).contains(&self.wallpaper.dim) {
             bail!("wallpaper dim must be between 0 and 1");
+        }
+        if !self.backing.rail_opacity.is_finite()
+            || !(0.0..=1.0).contains(&self.backing.rail_opacity)
+            || !self.backing.dock_opacity.is_finite()
+            || !(0.0..=1.0).contains(&self.backing.dock_opacity)
+        {
+            bail!("theme backing opacity must be between 0 and 1");
         }
         self.semantic.validate()?;
         Ok(())

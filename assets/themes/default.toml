@@ -18,6 +18,11 @@ path = "/usr/share/focaldesk/wallpaper/Prismara-HDR1400.exr"
 fit = "fill"
 dim = 0.0
 
+[backing]
+# Bright cloud wallpaper: retain more of the shared smoked backing.
+rail_opacity = 0.74
+dock_opacity = 0.82
+
 [semantic.surfaces.bar.normal]
 space = "srgb"
 r = 0.10000000149011612

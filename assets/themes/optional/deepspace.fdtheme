@@ -17,6 +17,10 @@ g = 0.35884857177734375
 b = 1.0
 a = 1.0
 
+[document.backing]
+rail_opacity = 0.56
+dock_opacity = 0.64
+
 [document.wallpaper]
 path = "wallpaper.exr"
 fit = "fill"

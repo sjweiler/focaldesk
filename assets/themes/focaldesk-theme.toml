@@ -18,6 +18,10 @@ path = "/home/steve/focaldesk/assets/wallpaper/focaldesk_wallpaper.png"
 fit = "fill"
 dim = 0.0
 
+[backing]
+rail_opacity = 0.74
+dock_opacity = 0.82
+
 [semantic.surfaces.bar.normal]
 space = "srgb"
 r = 0.10000000149011612

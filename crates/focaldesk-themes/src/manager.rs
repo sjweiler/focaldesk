@@ -128,6 +128,8 @@ fn project_editor_document(
     theme.wallpaper.dim = document.wallpaper.dim;
     theme.wallpaper.blur = document.semantic.wallpaper.blur;
     theme.wallpaper.saturation = document.semantic.wallpaper.saturation;
+    theme.backing.rail_opacity = document.backing.rail_opacity;
+    theme.backing.dock_opacity = document.backing.dock_opacity;
     theme.wallpaper.tint_color = document
         .wallpaper
         .tint
@@ -200,7 +202,7 @@ fn project_editor_document(
 mod tests {
     use super::*;
     use crate::{
-        theme::BuiltInThemeId, ThemeColor, ThemeDynamicRange, ThemePaint, ThemePaintIntent,
+        ThemeColor, ThemeDynamicRange, ThemePaint, ThemePaintIntent, theme::BuiltInThemeId,
     };
 
     fn document(color: ThemeColor) -> ThemeDocument {

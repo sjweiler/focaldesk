@@ -9,8 +9,8 @@ use std::{
     collections::HashMap,
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -18,16 +18,16 @@ use std::{
 
 use anyhow::Result;
 use focaldesk_config::{
-    load_config, ClockFormat, DockPosition, DockSize, DockVisibility, FocalDeskConfig,
-    PanelPosition, ShellStyle,
+    ClockFormat, DockPosition, DockSize, DockVisibility, FocalDeskConfig, PanelPosition,
+    ShellStyle, load_config,
 };
 use focaldesk_ipc::{
-    send_desktop_request, DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, OutputSnapshot,
-    ShellPanel, WindowSnapshot,
+    DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, OutputSnapshot, ShellPanel,
+    WindowSnapshot, send_desktop_request,
 };
 use focaldesk_logging::{flog, init_default_logging, startup_banner};
 use focaldesk_settings_core::load_settings;
-use focaldesk_themes::{theme_by_name, FlowTheme};
+use focaldesk_themes::{FlowTheme, theme_by_name};
 use gtk::{gdk, gio, glib, prelude::*};
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
@@ -2391,6 +2391,7 @@ struct ThemeSnapshot {
     dock_position: DockPosition,
     dock_corner_radius: f64,
     dock_size: DockSize,
+    panel_darkness: Option<f64>,
 }
 
 fn active_theme_snapshot() -> ThemeSnapshot {
@@ -2406,6 +2407,7 @@ fn active_theme_snapshot() -> ThemeSnapshot {
         dock_position: config.dock.position,
         dock_corner_radius: config.dock.corner_radius,
         dock_size: config.dock.size,
+        panel_darkness: config.appearance.panel_darkness,
     }
 }
 
@@ -2432,6 +2434,7 @@ pub fn shell_css(theme: &FlowTheme, font_scale: f64) -> String {
             dock_position: defaults.dock.position,
             dock_corner_radius: defaults.dock.corner_radius,
             dock_size: defaults.dock.size,
+            panel_darkness: defaults.appearance.panel_darkness,
         },
     )
 }
@@ -2441,8 +2444,13 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
     let surface = theme.chrome.panel_color;
     let accent = theme.chrome.accent_color;
     let trim = theme.chrome.trim_color;
+    let dock_backing_opacity = snapshot
+        .panel_darkness
+        .map(|value| value.clamp(0.0, 1.0) as f32)
+        .unwrap_or_else(|| theme.backing.dock_opacity.clamp(0.0, 1.0));
     let definitions = [
         ("fd_shell_bg", background),
+        ("fd_shell_backing", [0.025, 0.035, 0.055, 1.0]),
         ("fd_shell_surface", surface),
         (
             "fd_shell_surface_raised",
@@ -2521,6 +2529,7 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
         PanelPosition::Top => "border-bottom: 1px solid @fd_shell_border; border-top: none;",
         PanelPosition::Bottom => "border-top: 1px solid @fd_shell_border; border-bottom: none;",
     };
+    let dock_backing_opacity = format!("{dock_backing_opacity:.3}");
 
     format!(
         "{definitions}\n{SHELL_CSS_BASE}\n\
@@ -2529,6 +2538,8 @@ fn shell_css_configured(theme: &FlowTheme, snapshot: &ThemeSnapshot) -> String {
          .focal-dock {{ border-radius: {dock_corners}; border-width: {border_width:.1}px; }}\n\
          .dock-module {{ min-height: {dock_control_size}px; border-radius: {radius:.1}px; border-width: {border_width:.1}px; }}\n\
          .panel-launcher, .panel-well, .panel-status-button {{ border-radius: {radius:.1}px; border-width: {border_width:.1}px; }}\n\
+         .system-rail {{ background: transparent; }}\n\
+         .task-shelf {{ background-color: alpha(@fd_shell_backing, {dock_backing_opacity}); background-image: linear-gradient(155deg, alpha(@fd_shell_highlight, 0.18), alpha(@fd_shell_backing, {dock_backing_opacity}) 22%, alpha(@fd_shell_backing, {dock_backing_opacity}) 62%, alpha(@fd_shell_backing, {dock_backing_opacity})); }}\n\
          window.focal-shell-window * {{ transition-duration: {transition_ms}ms; }}\n"
     )
 }
@@ -2561,10 +2572,10 @@ fn rgba(color: [f32; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_console_identity_matches, app_icon_name, email_identity_matches, rail_clock_pattern,
-        rail_display_status, running_app_capacity, shelf_window_label, shell_css,
-        shell_css_configured, window_belongs_to_output, window_overlaps_shelf, ShelfOverflowEntry,
-        ShellRole, ThemeSnapshot,
+        ShelfOverflowEntry, ShellRole, ThemeSnapshot, ai_console_identity_matches, app_icon_name,
+        email_identity_matches, rail_clock_pattern, rail_display_status, running_app_capacity,
+        shelf_window_label, shell_css, shell_css_configured, window_belongs_to_output,
+        window_overlaps_shelf,
     };
     use focaldesk_config::{
         ClockFormat, DockPosition, DockSize, FocalDeskConfig, PanelPosition, ShellStyle,
@@ -2602,6 +2613,7 @@ mod tests {
                 dock_position: DockPosition::Left,
                 dock_corner_radius: 24.0,
                 dock_size: DockSize::Compact,
+                panel_darkness: None,
             },
         );
 
@@ -2626,6 +2638,7 @@ mod tests {
                 dock_position: defaults.dock.position,
                 dock_corner_radius: defaults.dock.corner_radius,
                 dock_size: defaults.dock.size,
+                panel_darkness: None,
             },
         );
 

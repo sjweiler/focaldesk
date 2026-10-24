@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::fonts::{FontId, TextStyle};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use focaldesk_render::{
     AutoHdrParams, FramePixelFormat, FrameRetention, FrameTransferFunction, FrameTransform,
     LinuxDmabuf, MeshVertex, PresentRenderer, PresentResult, SolidQuad, TextureColorTransform,
@@ -27,16 +27,16 @@ use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode};
 use smithay::backend::renderer::element::Id as RenderElementId;
 use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
-use smithay::desktop::{layer_map_for_output, PopupManager};
+use smithay::desktop::{PopupManager, layer_map_for_output};
 use smithay::reexports::calloop::EventLoop as CalloopEventLoop;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
-use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
-use smithay::wayland::dmabuf::{get_dmabuf, DmabufFeedbackBuilder};
-use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
+use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, get_dmabuf};
+use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 use smithay::wayland::shm::with_buffer_contents;
@@ -51,12 +51,12 @@ use winit::{
 };
 
 use super::common::{
-    bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
-    BootstrapOutput, NestedDesktop,
+    BootstrapOutput, NestedDesktop, bootstrap_compositor_core, client_state_from_stream,
+    is_nonfatal_wayland_io_error,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
-use crate::core::color::{SurfaceColorRenderState, TransferFunction};
 use crate::core::BackendEvent;
+use crate::core::color::{SurfaceColorRenderState, TransferFunction};
 use focaldesk_input::{InputEvent, KeyState, Modifiers, MouseButton, ScrollDelta};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -1590,16 +1590,29 @@ fn append_wallpaper_quads(
                 }
             };
             let (width, height) = image.dimensions();
-            let linear_exr = std::path::Path::new(path).extension().is_some_and(|ext| ext.eq_ignore_ascii_case("exr"));
+            let linear_exr = std::path::Path::new(path)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("exr"));
             let (pixels, format, color_transform) = if linear_exr {
                 let rgba = image.to_rgba32f();
                 let mut pixels = Vec::with_capacity(rgba.len() * 2);
                 for value in rgba.as_raw() {
                     pixels.extend_from_slice(&half::f16::from_f32(*value).to_bits().to_ne_bytes());
                 }
-                (pixels, FramePixelFormat::Rgba16FloatLinear, TextureColorTransform { transfer: FrameTransferFunction::Linear, ..Default::default() })
+                (
+                    pixels,
+                    FramePixelFormat::Rgba16FloatLinear,
+                    TextureColorTransform {
+                        transfer: FrameTransferFunction::Linear,
+                        ..Default::default()
+                    },
+                )
             } else {
-                (image.to_rgba8().into_raw(), FramePixelFormat::Rgba8Srgb, TextureColorTransform::default())
+                (
+                    image.to_rgba8().into_raw(),
+                    FramePixelFormat::Rgba8Srgb,
+                    TextureColorTransform::default(),
+                )
             };
             Some(WgpuWallpaper {
                 cache_key: hashed_cache_key(2, &path),
@@ -1691,7 +1704,13 @@ fn append_wallpaper_quads(
             },
             width: asset.width,
             height: asset.height,
-            stride: asset.width.saturating_mul(if asset.format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 }),
+            stride: asset.width.saturating_mul(
+                if asset.format == FramePixelFormat::Rgba16FloatLinear {
+                    8
+                } else {
+                    4
+                },
+            ),
             format: asset.format,
             color_transform: asset.color_transform,
             dmabuf: None,
@@ -1742,7 +1761,13 @@ fn append_wallpaper_quads(
                     pixels: Vec::new(),
                     width: asset.width,
                     height: asset.height,
-                    stride: asset.width.saturating_mul(if asset.format == FramePixelFormat::Rgba16FloatLinear { 8 } else { 4 }),
+                    stride: asset.width.saturating_mul(
+                        if asset.format == FramePixelFormat::Rgba16FloatLinear {
+                            8
+                        } else {
+                            4
+                        },
+                    ),
                     format: asset.format,
                     color_transform: asset.color_transform,
                     dmabuf: None,
@@ -1755,10 +1780,49 @@ fn append_wallpaper_quads(
                     ],
                     source_uv: [blit.uv.u0, blit.uv.v0, blit.uv.u1, blit.uv.v1],
                     transform: FrameTransform::Normal,
-                    // This layer sits below the external rail client. Tint the
-                    // wallpaper itself rather than placing a translucent quad
-                    // above the client, which would obscure its controls.
-                    tint: premultiplied([tint[0] * 0.32, tint[1] * 0.36, tint[2] * 0.44, 1.0]),
+                    // Establish the wallpaper as an opaque base in the reserved
+                    // rail before adding the translucent smoked tint below.
+                    // Without this layer the tint blends against the shell's
+                    // dark clear color and appears solid at low opacities.
+                    tint: premultiplied(tint),
+                    retention: None,
+                });
+                output.push(TextureQuad {
+                    cache_key: asset.cache_key,
+                    pixels: Vec::new(),
+                    width: asset.width,
+                    height: asset.height,
+                    stride: asset.width.saturating_mul(
+                        if asset.format == FramePixelFormat::Rgba16FloatLinear {
+                            8
+                        } else {
+                            4
+                        },
+                    ),
+                    format: asset.format,
+                    color_transform: asset.color_transform,
+                    dmabuf: None,
+                    damage: Vec::new(),
+                    destination: [
+                        destination.loc.x,
+                        destination.loc.y,
+                        destination.size.w,
+                        destination.size.h,
+                    ],
+                    source_uv: [blit.uv.u0, blit.uv.v0, blit.uv.u1, blit.uv.v1],
+                    transform: FrameTransform::Normal,
+                    // This layer sits below the transparent external rail
+                    // client, so its alpha is the user-visible backing opacity.
+                    tint: premultiplied([
+                        tint[0] * 0.32,
+                        tint[1] * 0.36,
+                        tint[2] * 0.44,
+                        desktop
+                            .state
+                            .panel_darkness()
+                            .map(|value| value.clamp(0.0, 1.0) as f32)
+                            .unwrap_or_else(|| theme.backing.rail_opacity.clamp(0.0, 1.0)),
+                    ]),
                     retention: None,
                 });
             }
@@ -1774,7 +1838,10 @@ fn external_rail_rect(
     let work = layout.work_area.recess;
     let width = output.logical_size.w - (work.loc.x + work.size.w);
     (width > 0).then(|| {
-        Rectangle::from_loc_and_size((work.loc.x + work.size.w, 0), (width, output.logical_size.h))
+        Rectangle::from_loc_and_size(
+            (work.loc.x + work.size.w, 0),
+            (width, output.logical_size.h),
+        )
     })
 }
 
