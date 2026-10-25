@@ -6,7 +6,9 @@ use FocalDesk as the only environment protecting important work.
 - DRM/KMS, HDR, suspend/resume, hardware cursors, direct scanout, multi-GPU,
   hotplug, mixed refresh rates, scaling, and transforms remain hardware- and
   driver-dependent.
-- Portal/PipeWire capture is experimental. Wide-gamut SDR capture currently
+- Portal/PipeWire capture is experimental. The raw Vulkan compatibility
+  readback path is capped at 5 FPS to protect desktop responsiveness; use the
+  GLES backend for OBS until Vulkan DMA-BUF portal export lands. Wide-gamut SDR capture currently
   requires the documented downstream OBS and xdg-desktop-portal-wlr patches.
 - Remote desktop is loopback-only, single-output, single-client, and view-only.
   It uses short-lived development credentials and has not yet completed the

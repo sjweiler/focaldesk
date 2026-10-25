@@ -2389,7 +2389,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             let cpu_capture_due = data
                 .last_cpu_capture
                 .get(&output_id)
-                .is_none_or(|last| last.elapsed() >= Duration::from_millis(66));
+                // A full 4K GPU→CPU readback is an emergency compatibility
+                // path. Five FPS preserves a minimally live preview without
+                // allowing PipeWire to starve compositor input dispatch.
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(200));
             let capture_requested = (screenshot_requested
                 || (portal_or_remote_requested && cpu_capture_due))
                 && !data.capture_pending.contains(&output_id);
