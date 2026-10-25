@@ -28,7 +28,7 @@ use smithay::backend::renderer::element::{
 use focaldesk_logging::flog_warn;
 use focaldesk_settings_core::{
     load_exclusive_hdr_state, save_exclusive_hdr_state, DisplayColorProfile, ExclusiveHdrPhase,
-    ExclusiveHdrState, HdrAppearance,
+    ExclusiveHdrState, HdrAppearance, OutputRole,
 };
 use focaldesk_types::CompositorBackend;
 
@@ -156,6 +156,8 @@ pub struct DisplayConfig {
 
     pub primary: bool,
     pub transform: DisplayTransform,
+    #[serde(default)]
+    pub role: OutputRole,
 
     #[serde(default)]
     pub hdr_supported: bool,
@@ -1955,6 +1957,7 @@ mod hdr_tests {
             physical_height_mm: None,
             primary: true,
             transform: DisplayTransform::Normal,
+            role: OutputRole::Normal,
             hdr_supported: true,
             hdr_max_luminance_nits: None,
             hdr_max_fall_nits: None,
@@ -2606,6 +2609,7 @@ pub(crate) fn collect_display_configs(
             primary,
 
             transform: DisplayTransform::from_smithay(surface.output.current_transform()),
+            role: core_output.map(|output| output.role).unwrap_or_default(),
 
             hdr_supported,
             hdr_max_luminance_nits: core_output
@@ -3507,12 +3511,12 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
         .map(|output| output.handle.current_transform())
         .unwrap_or(Transform::Normal);
 
-    // Absolute devices (for example, a tablet in absolute mode) must transform against the
+    // Absolute devices (for example, a tablet or touchscreen) must transform against the
     // focused output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
     let clamp_rect = match input {
-        InputEvent::PointerMotionAbsolute { .. } => {
-            state.pointer_transform_rect_for_output(output_id)
-        }
+        InputEvent::PointerMotionAbsolute { .. }
+        | InputEvent::TouchDown { .. }
+        | InputEvent::TouchMotion { .. } => state.pointer_transform_rect_for_output(output_id),
         _ => state.logical_pointer_clamp_rect(),
     };
 
@@ -5568,6 +5572,9 @@ fn device_added(
                     .map(|display| display.hdr_appearance)
                     .and_then(|appearance| appearance.validate().ok())
                     .unwrap_or_else(|| hdr_appearance_from_support(&hdr_support));
+                out.role = saved_monitor
+                    .map(|display| display.role)
+                    .unwrap_or_default();
             }
 
             data.core.state.set_output_monitor_identity(

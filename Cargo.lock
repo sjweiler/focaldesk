@@ -3102,6 +3102,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ipc",
+ "focaldesk-remote-protocol",
+]
+
+[[package]]
 name = "focaldesk-remote-diagnostic"
 version = "0.1.0"
 dependencies = [
@@ -3228,6 +3237,7 @@ dependencies = [
  "gtk4",
  "image",
  "libadwaita",
+ "libc",
  "serde",
  "serde_json",
  "toml 0.8.23",

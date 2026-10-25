@@ -1,7 +1,7 @@
 use focaldesk_types::CompositorBackend;
 use smithay::input::{
-    Seat, SeatHandler, SeatState,
     pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData},
+    Seat, SeatHandler, SeatState,
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
@@ -87,6 +87,10 @@ impl DesktopState {
         let mut seat = self.seat_state.new_wl_seat(display_handle, "seat-0");
         seat.add_keyboard(Default::default(), 500, 20).unwrap();
         seat.add_pointer();
+        // Advertise wl_touch from the outset. The capability is harmless when
+        // no panel is attached, and lets clients bind it before a USB HID
+        // touchscreen is hot-plugged.
+        seat.add_touch();
         //self.seat = seat;
     }
 }

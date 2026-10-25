@@ -1570,7 +1570,11 @@ fn serve_control_socket(state: Arc<Mutex<HostState>>) -> Result<()> {
 }
 
 fn handle_control_client(stream: &mut UnixStream, state: &Arc<Mutex<HostState>>) {
-    if transport::require_authorized_peer(stream, transport::CONNECTOR_HOST_POLICY).is_err() {
+    // The socket itself is owner-only (0600), and SO_PEERCRED rejects a
+    // different UID.  Do not require /proc/<pid>/exe here: Yama denies that
+    // lookup between sibling user services on hardened desktops.
+    if let Err(error) = transport::require_same_user(stream) {
+        tracing::warn!(%error, "rejected connector-host IPC peer");
         return;
     }
     let response = transport::read_limited(stream)

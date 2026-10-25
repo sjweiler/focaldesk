@@ -2,7 +2,7 @@ use smithay::backend::input::{
     AbsolutePositionEvent, Axis, AxisRelativeDirection, AxisSource, ButtonState, Event,
     GestureBeginEvent, GestureEndEvent, GestureSwipeUpdateEvent, InputEvent as SmithayInputEvent,
     KeyState as SmithayKeyState, KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
-    PointerMotionEvent,
+    PointerMotionEvent, TouchEvent,
 };
 use smithay::utils::{Logical, Point as SmithayPoint, Rectangle, Size as SmithaySize, Transform};
 
@@ -104,6 +104,22 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
                 position: pointer_pos.into(),
             })
         }
+        SmithayInputEvent::TouchDown { event } => Some(InputEvent::TouchDown {
+            slot: event.slot().into(),
+            position: absolute_touch_position(event, clamp_rect, output_transform),
+            time_msec: event.time_msec(),
+        }),
+        SmithayInputEvent::TouchMotion { event } => Some(InputEvent::TouchMotion {
+            slot: event.slot().into(),
+            position: absolute_touch_position(event, clamp_rect, output_transform),
+            time_msec: event.time_msec(),
+        }),
+        SmithayInputEvent::TouchUp { event } => Some(InputEvent::TouchUp {
+            slot: event.slot().into(),
+            time_msec: event.time_msec(),
+        }),
+        SmithayInputEvent::TouchCancel { .. } => Some(InputEvent::TouchCancel),
+        SmithayInputEvent::TouchFrame { .. } => Some(InputEvent::TouchFrame),
         SmithayInputEvent::GestureSwipeBegin { event } => Some(InputEvent::GestureSwipeBegin {
             fingers: event.fingers(),
             time_msec: event.time_msec(),
@@ -118,6 +134,30 @@ pub fn translate_backend_input<B: smithay::backend::input::InputBackend>(
         }),
         _ => None,
     }
+}
+
+/// Convert an absolute touchscreen contact into compositor-global logical
+/// coordinates. Touch panels, like tablets, report the panel's unrotated
+/// coordinate space, so apply the output transform before adding its origin.
+fn absolute_touch_position<B, E>(
+    event: &E,
+    clamp_rect: Rectangle<i32, Logical>,
+    output_transform: Transform,
+) -> Position
+where
+    B: smithay::backend::input::InputBackend,
+    E: smithay::backend::input::AbsolutePositionEvent<B>,
+{
+    let source_size = output_transform.invert().transform_size(clamp_rect.size);
+    let local = transform_absolute_position(
+        event.position_transformed(source_size).to_f64().into(),
+        source_size.to_f64().into(),
+        output_transform.into(),
+    );
+    Position::new(
+        clamp_rect.loc.x as f64 + local.x,
+        clamp_rect.loc.y as f64 + local.y,
+    )
 }
 
 fn key_state(state: SmithayKeyState) -> KeyState {

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_render::{
     AshDrmCapture, AshDrmHdrOutput, AshDrmOutputLut, AshDrmRenderer, AshDrmTransfer,
@@ -19,8 +19,8 @@ use focaldesk_types::CompositorBackend;
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{
-    Buffer as _, Format, Fourcc, Modifier,
     gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
+    Buffer as _, Format, Fourcc, Modifier,
 };
 use smithay::backend::drm::{
     DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, GbmBufferedSurface, PlaneClaim,
@@ -31,32 +31,31 @@ use smithay::backend::input::{
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::sync::{Fence, Interrupted, SyncPoint};
-use smithay::backend::session::{Event as SessionEvent, Session, libseat::LibSeatSession};
-use smithay::backend::udev::{UdevBackend, UdevEvent, primary_gpu};
+use smithay::backend::session::{libseat::LibSeatSession, Event as SessionEvent, Session};
+use smithay::backend::udev::{primary_gpu, UdevBackend, UdevEvent};
 use smithay::output::{Mode as WlMode, Output, PhysicalProperties, Scale as OutputScale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
-use smithay::reexports::drm::control::{Device as _, Mode, connector, crtc, dumbbuffer, plane};
-use smithay::reexports::drm::{Device as _, DriverCapability, buffer::Buffer as _};
-use smithay::reexports::input::Libinput;
+use smithay::reexports::drm::control::{connector, crtc, dumbbuffer, plane, Device as _, Mode};
+use smithay::reexports::drm::{buffer::Buffer as _, Device as _, DriverCapability};
 use smithay::reexports::input::event::switch::Switch as InputSwitch;
+use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
-use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
-    NestedDesktop, SessionSleepEvent, bootstrap_compositor_core, client_state_from_stream,
-    is_nonfatal_wayland_io_error, physical_size_mm_from_pixels, pump_desktop_services,
-    restart_shell_surfaces_after_gpu_reset, spawn_session_sleep_watch,
-    stop_focaldesk_session_target,
+    bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
+    physical_size_mm_from_pixels, pump_desktop_services, restart_shell_surfaces_after_gpu_reset,
+    spawn_session_sleep_watch, stop_focaldesk_session_target, NestedDesktop, SessionSleepEvent,
 };
 #[cfg(feature = "xwayland")]
 use super::common::{finish_xwayland_startup, start_xwayland};
 use super::drm::{
-    DisplayConfig, DisplayModeConfig, HdrSupport, connector_edid, disable_explicit_kms_fences,
-    drm_card_vendor_id, hdr_appearance_from_support, hdr_detection, load_display_config,
-    merge_disconnected_display_configs, parse_edid_identity, saved_monitor_config,
-    select_connector_mode, translate_backend_input_event, write_display_config,
+    connector_edid, disable_explicit_kms_fences, drm_card_vendor_id, hdr_appearance_from_support,
+    hdr_detection, load_display_config, merge_disconnected_display_configs, parse_edid_identity,
+    saved_monitor_config, select_connector_mode, translate_backend_input_event,
+    write_display_config, DisplayConfig, DisplayModeConfig, HdrSupport,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
@@ -171,6 +170,7 @@ struct OutputConfig {
     hdr_support: HdrSupport,
     hdr_requested: bool,
     hdr_appearance: focaldesk_settings_core::HdrAppearance,
+    role: focaldesk_settings_core::OutputRole,
 }
 
 struct VulkanOutput {
@@ -340,6 +340,9 @@ struct VulkanDrmData {
     topology_refresh_pending: bool,
     hdr_recovery_rebuild_attempted: bool,
     capture_pending: HashSet<OutputId>,
+    /// CPU readback is a compatibility fallback only. Bound it so a PipeWire
+    /// client cannot starve input/render dispatch on high-resolution outputs.
+    last_cpu_capture: HashMap<OutputId, Instant>,
     screenshot_all_captures: HashMap<OutputId, (u32, u32, Vec<u8>)>,
     fatal_error: Option<anyhow::Error>,
     surface_blocker_loop: EventLoop<'static, crate::core::desktop::DesktopState>,
@@ -761,6 +764,9 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             .map(|display| display.hdr_appearance)
             .and_then(|appearance| appearance.validate().ok())
             .unwrap_or_else(|| hdr_appearance_from_support(&hdr_support));
+        let role = saved_monitor
+            .map(|display| display.role)
+            .unwrap_or_default();
         let make = identity
             .as_ref()
             .map(|identity| identity.make.clone())
@@ -826,6 +832,7 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             hdr_support,
             hdr_requested,
             hdr_appearance,
+            role,
         });
     }
     if outputs.is_empty() {
@@ -859,6 +866,7 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
                     transform: saved
                         .map(|display| display.transform.clone())
                         .unwrap_or(super::drm::DisplayTransform::Normal),
+                    role: output.role,
                     hdr_supported: output.hdr_support.is_detected(),
                     hdr_max_luminance_nits: metadata.map(|value| f32::from(value.max_luminance)),
                     hdr_max_fall_nits: metadata.map(|value| f32::from(value.max_fall)),
@@ -1414,6 +1422,7 @@ fn initialize_vulkan_outputs(
             output.hdr_kms_applied = hdr_active;
             output.hdr_enabled = hdr_active;
             output.hdr_appearance = config.hdr_appearance.validate().unwrap_or_default();
+            output.role = config.role;
         }
         desktop.state.refresh_output_color(config.output_id);
         if config.primary {
@@ -2002,6 +2011,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         topology_refresh_pending: false,
         hdr_recovery_rebuild_attempted: false,
         capture_pending: HashSet::new(),
+        last_cpu_capture: HashMap::new(),
         screenshot_all_captures: HashMap::new(),
         fatal_error: None,
         surface_blocker_loop,
@@ -2363,19 +2373,25 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             }
             expand_dmabuf_damage(&mut scene);
             transform_scene(&mut scene, content_size, output_transform);
-            let capture_requested = (data.desktop.state.screenshot_request() == Some(output_id)
-                || data.desktop.state.screenshot_all_requested
-                || data
-                    .desktop
-                    .state
-                    .pending_portal_captures
-                    .iter()
-                    .any(|capture| capture.output_id == output_id)
+            let screenshot_requested = data.desktop.state.screenshot_request() == Some(output_id)
+                || data.desktop.state.screenshot_all_requested;
+            let portal_or_remote_requested = data
+                .desktop
+                .state
+                .pending_portal_captures
+                .iter()
+                .any(|capture| capture.output_id == output_id)
                 || data
                     .desktop
                     .state
                     .output_capture_broker
-                    .has_consumers_for_output(output_id))
+                    .has_consumers_for_output(output_id);
+            let cpu_capture_due = data
+                .last_cpu_capture
+                .get(&output_id)
+                .is_none_or(|last| last.elapsed() >= Duration::from_millis(66));
+            let capture_requested = (screenshot_requested
+                || (portal_or_remote_requested && cpu_capture_due))
                 && !data.capture_pending.contains(&output_id);
             let sdr_output_matrix = data
                 .desktop
@@ -2544,6 +2560,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             );
             if capture_requested {
                 data.capture_pending.insert(output_id);
+                data.last_cpu_capture.insert(output_id, Instant::now());
             }
             let sync = if data.disable_explicit_kms_fences {
                 let fence = KmsFence(submission.fence_fd);

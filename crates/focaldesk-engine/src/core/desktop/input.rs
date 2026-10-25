@@ -1,4 +1,5 @@
 use super::*;
+use focaldesk_input::Position;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreparedKeyEvent {
@@ -230,6 +231,19 @@ impl DesktopState {
 
             event @ InputEvent::PointerButton { .. } => self.handle_pointer_button(event),
             event @ InputEvent::PointerScroll { .. } => self.handle_pointer_scroll(event),
+            InputEvent::TouchDown {
+                slot,
+                position,
+                time_msec,
+            } => self.handle_touch_down(slot, position, time_msec),
+            InputEvent::TouchMotion {
+                slot,
+                position,
+                time_msec,
+            } => self.handle_touch_motion(slot, position, time_msec),
+            InputEvent::TouchUp { slot, time_msec } => self.handle_touch_up(slot, time_msec),
+            InputEvent::TouchCancel => self.handle_touch_cancel(),
+            InputEvent::TouchFrame => self.handle_touch_frame(),
             InputEvent::GestureSwipeBegin { fingers, time_msec } => {
                 self.handle_gesture_swipe_begin(fingers, time_msec)
             }
@@ -281,6 +295,11 @@ impl DesktopState {
                 self.cursor_manager.move_to(position.x, position.y);
                 self.clear_client_pointer_focus(position);
             }
+            InputEvent::TouchDown { .. }
+            | InputEvent::TouchMotion { .. }
+            | InputEvent::TouchUp { .. }
+            | InputEvent::TouchCancel
+            | InputEvent::TouchFrame => {}
             InputEvent::GestureSwipeBegin { .. }
             | InputEvent::GestureSwipeUpdate { .. }
             | InputEvent::GestureSwipeEnd { .. } => {}
@@ -298,6 +317,84 @@ impl DesktopState {
         self.split_divider_drag = None;
         self.input.pointer_left_down = false;
         self.mark_all_outputs_full_damage(DamageSource::Unknown);
+    }
+
+    /// Route raw contacts directly through wl_touch. Deliberately do not
+    /// synthesize pointer events: clients must be able to distinguish a
+    /// multi-touch gesture from mouse input.
+    fn handle_touch_down(&mut self, slot: i32, position: Position, time_msec: u32) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let position: Point<f64, Logical> = position.into();
+        let position = self.confine_pointer_to_outputs(self.pointer_pos, position);
+        let target = self
+            .pointer_surface_under(position)
+            .and_then(|(target, surface_loc)| {
+                target
+                    .wl_surface()
+                    .map(|surface| (surface.into_owned(), surface_loc))
+            });
+        touch.down(
+            self,
+            target,
+            &smithay::input::touch::DownEvent {
+                slot: smithay::backend::input::TouchSlot::from((slot >= 0).then_some(slot as u32)),
+                location: position,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: time_msec,
+            },
+        );
+    }
+
+    fn handle_touch_motion(&mut self, slot: i32, position: Position, time_msec: u32) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        let position: Point<f64, Logical> = position.into();
+        let position = self.confine_pointer_to_outputs(self.pointer_pos, position);
+        let target = self
+            .pointer_surface_under(position)
+            .and_then(|(target, surface_loc)| {
+                target
+                    .wl_surface()
+                    .map(|surface| (surface.into_owned(), surface_loc))
+            });
+        touch.motion(
+            self,
+            target,
+            &smithay::input::touch::MotionEvent {
+                slot: smithay::backend::input::TouchSlot::from((slot >= 0).then_some(slot as u32)),
+                location: position,
+                time: time_msec,
+            },
+        );
+    }
+
+    fn handle_touch_up(&mut self, slot: i32, time_msec: u32) {
+        let Some(touch) = self.seat.get_touch() else {
+            return;
+        };
+        touch.up(
+            self,
+            &smithay::input::touch::UpEvent {
+                slot: smithay::backend::input::TouchSlot::from((slot >= 0).then_some(slot as u32)),
+                serial: SERIAL_COUNTER.next_serial(),
+                time: time_msec,
+            },
+        );
+    }
+
+    fn handle_touch_cancel(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.cancel(self);
+        }
+    }
+
+    fn handle_touch_frame(&mut self) {
+        if let Some(touch) = self.seat.get_touch() {
+            touch.frame(self);
+        }
     }
 
     fn handle_pointer_button(&mut self, event: InputEvent) {

@@ -220,6 +220,7 @@ diagrams, current boundaries, and implementation notes.
 - `apps/focaldesk-settings`: settings app prototype
 - `apps/focaldesk-portal`: portal-related app code
 - `services/focaldesk-remoted`: experimental view-only RDP service
+- `services/focaldesk-recorder`: explicit, local MP4 screen recorder
 - `services/`: other background daemons and IPC services
 - `crates/`: shared FocalDesk libraries
 - `assets/`: bundled visual assets

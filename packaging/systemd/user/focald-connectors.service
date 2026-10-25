@@ -19,6 +19,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 StateDirectory=focaldesk
 ReadWritePaths=%S/focaldesk
+ReadWritePaths=%t/focaldesk
 RestrictNamespaces=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

@@ -12,7 +12,8 @@ use std::thread;
 use std::time::Duration;
 
 use focaldesk_remote_protocol::{
-    DamageRect, Event, OutputTransform, PixelFormat, Request, send_fd, write_message,
+    send_fd, write_message, CapturePurpose, DamageRect, Event, OutputTransform, PixelFormat,
+    Request,
 };
 use focaldesk_types::OutputId;
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -27,6 +28,7 @@ const OUTBOUND_QUEUE_DEPTH: usize = 2;
 enum RemoteCommand {
     Start {
         output_id: OutputId,
+        purpose: CapturePurpose,
         outbound: SyncSender<RemoteOutbound>,
     },
     Disconnected {
@@ -45,6 +47,7 @@ struct RemoteOutbound {
 struct RemoteSession {
     consumer_id: CaptureConsumerId,
     output_id: OutputId,
+    purpose: CapturePurpose,
     next_frame_serial: u64,
     outbound: SyncSender<RemoteOutbound>,
 }
@@ -79,6 +82,7 @@ impl LocalRemoteCapture {
             match command {
                 RemoteCommand::Start {
                     output_id,
+                    purpose,
                     outbound,
                 } => {
                     let Some(output) = state.outputs.get(&output_id) else {
@@ -113,6 +117,7 @@ impl LocalRemoteCapture {
                         RemoteSession {
                             consumer_id,
                             output_id,
+                            purpose,
                             next_frame_serial: 1,
                             outbound: outbound.clone(),
                         },
@@ -146,6 +151,12 @@ impl LocalRemoteCapture {
                 }
             }
         }
+    }
+
+    pub fn recording_output_active(&self, output_id: OutputId) -> bool {
+        self.sessions.values().any(|session| {
+            session.output_id == output_id && session.purpose == CapturePurpose::Recording
+        })
     }
 
     fn export_frames(&mut self, state: &mut DesktopState, renderer: &mut GlesRenderer) {
@@ -366,7 +377,7 @@ fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
         Ok(request) => request,
         Err(_) => return,
     };
-    let Request::StartCapture { output_id } = request else {
+    let Request::StartCapture { output_id, purpose } = request else {
         let _ = write_message(
             &stream,
             &Event::Error {
@@ -379,6 +390,7 @@ fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
     if commands
         .send(RemoteCommand::Start {
             output_id: OutputId(output_id),
+            purpose,
             outbound,
         })
         .is_err()
@@ -402,21 +414,18 @@ fn handle_client(stream: UnixStream, commands: mpsc::Sender<RemoteCommand>) {
         let reader_commands = commands.clone();
         let _ = thread::Builder::new()
             .name("focaldesk-remote-reader".into())
-            .spawn(move || {
-                loop {
-                    match focaldesk_remote_protocol::read_message::<Request>(&reader) {
-                        Ok(Request::StopCapture {
-                            session_id: requested,
-                        }) if requested == session_id => {
-                            let _ = reader_commands.send(RemoteCommand::Stop { session_id });
-                            return;
-                        }
-                        Ok(_) => continue,
-                        Err(_) => {
-                            let _ =
-                                reader_commands.send(RemoteCommand::Disconnected { session_id });
-                            return;
-                        }
+            .spawn(move || loop {
+                match focaldesk_remote_protocol::read_message::<Request>(&reader) {
+                    Ok(Request::StopCapture {
+                        session_id: requested,
+                    }) if requested == session_id => {
+                        let _ = reader_commands.send(RemoteCommand::Stop { session_id });
+                        return;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => {
+                        let _ = reader_commands.send(RemoteCommand::Disconnected { session_id });
+                        return;
                     }
                 }
             });
@@ -500,8 +509,14 @@ mod tests {
         let (commands_tx, commands_rx) = mpsc::channel();
         let worker = thread::spawn(move || handle_client(server, commands_tx));
 
-        focaldesk_remote_protocol::write_message(&client, &Request::StartCapture { output_id: 9 })
-            .unwrap();
+        focaldesk_remote_protocol::write_message(
+            &client,
+            &Request::StartCapture {
+                output_id: 9,
+                purpose: CapturePurpose::RemoteDesktop,
+            },
+        )
+        .unwrap();
         let (output_id, outbound) = match commands_rx.recv().unwrap() {
             RemoteCommand::Start {
                 output_id,

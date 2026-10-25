@@ -84,6 +84,28 @@ pub enum InputEvent {
         delta: ScrollDelta,
         position: Position,
     },
+    /// A new contact from a direct-touch device. `slot` identifies this
+    /// contact until its matching [`TouchUp`](Self::TouchUp).
+    TouchDown {
+        slot: i32,
+        position: Position,
+        time_msec: u32,
+    },
+    /// An existing direct-touch contact moved.
+    TouchMotion {
+        slot: i32,
+        position: Position,
+        time_msec: u32,
+    },
+    /// A direct-touch contact ended.
+    TouchUp {
+        slot: i32,
+        time_msec: u32,
+    },
+    /// The input device cancelled every active contact.
+    TouchCancel,
+    /// Marks the end of one coherent batch of touch updates.
+    TouchFrame,
     GestureSwipeBegin {
         fingers: u32,
         time_msec: u32,

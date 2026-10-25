@@ -9,7 +9,7 @@ use nix::sys::socket::{recvmsg, sendmsg, ControlMessage, ControlMessageOwned, Ms
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 pub const MAX_FRAME_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_DAMAGE_RECTS: usize = 64;
@@ -17,8 +17,24 @@ pub const MAX_DAMAGE_RECTS: usize = 64;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
-    StartCapture { output_id: u64 },
-    StopCapture { session_id: u64 },
+    StartCapture {
+        output_id: u64,
+        #[serde(default)]
+        purpose: CapturePurpose,
+    },
+    StopCapture {
+        session_id: u64,
+    },
+}
+
+/// The compositor retains the capture purpose so recording can be visibly
+/// distinguished from a remote-desktop session.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePurpose {
+    #[default]
+    RemoteDesktop,
+    Recording,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,7 +232,10 @@ mod tests {
     #[test]
     fn request_round_trips_with_version_envelope() {
         let (server, client) = UnixStream::pair().unwrap();
-        let expected = Request::StartCapture { output_id: 7 };
+        let expected = Request::StartCapture {
+            output_id: 7,
+            purpose: CapturePurpose::RemoteDesktop,
+        };
         write_message(&server, &expected).unwrap();
         assert_eq!(read_message::<Request>(&client).unwrap(), expected);
     }

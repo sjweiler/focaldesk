@@ -244,6 +244,8 @@ pub struct OutputConfig {
     pub scale: f32,
     #[serde(default)]
     pub transform: DisplayTransform,
+    #[serde(default)]
+    pub role: OutputRole,
     pub primary: bool,
     #[serde(default)]
     pub color_profile: DisplayColorProfile,
@@ -255,6 +257,15 @@ pub struct OutputConfig {
     pub hdr_enabled: bool,
     #[serde(default)]
     pub hdr_appearance: HdrAppearance,
+}
+
+/// Determines whether an output participates in ordinary application-window
+/// placement or is reserved for FocalDesk's always-available controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OutputRole {
+    #[default]
+    Normal,
+    ControlPanel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

@@ -127,7 +127,11 @@ pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const CONNECTOR_HOST_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "connector-host",
-    allowed_executables: &["focaldesk-cli", "focaldesk-ai-console"],
+    allowed_executables: &[
+        "focaldesk-cli",
+        "focaldesk-ai-console",
+        "focaldesk-settings",
+    ],
     allowed_units: &[],
 };
 
@@ -231,7 +235,15 @@ pub fn bind_user_socket(path: &Path) -> io::Result<UnixListener> {
 /// Reject clients from a different effective user, even if socket permissions
 /// are accidentally broadened by packaging or an administrator.
 pub fn require_same_user(stream: &impl AsFd) -> io::Result<()> {
-    peer_identity(stream).map(|_| ())
+    let credentials = getsockopt(stream, PeerCredentials).map_err(io::Error::other)?;
+    let expected = Uid::effective().as_raw();
+    if credentials.uid() != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("IPC peer uid {} does not match service uid {expected}", credentials.uid()),
+        ));
+    }
+    Ok(())
 }
 
 pub fn require_authorized_peer(
@@ -472,6 +484,15 @@ mod tests {
             DESKTOP_POLICY
                 .allowed_executables
                 .contains(&"focaldesk-launcher")
+        );
+    }
+
+    #[test]
+    fn connector_host_policy_allows_settings() {
+        assert!(
+            CONNECTOR_HOST_POLICY
+                .allowed_executables
+                .contains(&"focaldesk-settings")
         );
     }
 

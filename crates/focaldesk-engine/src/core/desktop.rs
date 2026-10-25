@@ -7,27 +7,28 @@ use focaldesk_types::types::{OutputId, WindowId, WorkspaceId};
 use focaldesk_ui::uitree::UiTree;
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::renderer::buffer_dimensions;
-use smithay::backend::renderer::utils::{CommitCounter, SurfaceView, import_surface_tree};
+use smithay::backend::renderer::utils::{import_surface_tree, CommitCounter, SurfaceView};
 use smithay::desktop::{
-    PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords,
+    find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
 };
 use smithay::wayland::compositor::get_parent;
 use smithay::wayland::compositor::is_sync_subsurface;
 use smithay::wayland::compositor::with_states;
-use smithay::wayland::compositor::{CompositorState, TraversalAction, with_surface_tree_downward};
+use smithay::wayland::compositor::{with_surface_tree_downward, CompositorState, TraversalAction};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 
 use crate::core::color::{
+    force_linear_surfaces, primaries_wider_than, sanitize_tagged_client_description,
     ClientBufferEncoding, ColorDescription, RenderingIntent, SurfaceColorRenderState,
-    SurfaceColorState, force_linear_surfaces, primaries_wider_than,
-    sanitize_tagged_client_description,
+    SurfaceColorState,
 };
 use crate::core::output_store::OutputStore;
 use crate::core::window_store::WindowStore;
 use crate::core::workspace_store::WorkspaceStore;
+use focaldesk_settings_core::OutputRole;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::egui_layer::{EguiInputEvent, EguiModifiers, EguiPointerButton, EguiScrollDelta};
 use focaldesk_ui::element::UiElement;
@@ -36,7 +37,7 @@ use smithay::backend::input::{Axis, AxisRelativeDirection, AxisSource, ButtonSta
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::element::Id;
 use smithay::desktop::{WindowSurface, WindowSurfaceType};
-use smithay::input::keyboard::{XkbConfig, keysyms, xkb};
+use smithay::input::keyboard::{keysyms, xkb, XkbConfig};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, CursorIcon, CursorImageAttributes, GestureSwipeBeginEvent,
     GestureSwipeEndEvent, GestureSwipeUpdateEvent, MotionEvent, RelativeMotionEvent,
@@ -49,14 +50,14 @@ use smithay::reexports::input::{
 use smithay::reexports::wayland_server::Resource;
 
 use crate::core::session_restore::{
-    SavedOutput, SavedProtocol, SavedRect, SavedSplitDirection, SavedSplitPlacement, SavedWindow,
-    SessionRestoreState, SessionSnapshot, desktop_entry_for_identity,
+    desktop_entry_for_identity, SavedOutput, SavedProtocol, SavedRect, SavedSplitDirection,
+    SavedSplitPlacement, SavedWindow, SessionRestoreState, SessionSnapshot,
+};
+use crate::core::shell::xwayland::{
+    is_noninteractive_fixed_size_helper, workspace_from_process_env, XwaylandSurfaceRole,
+    XwaylandWindowMeta,
 };
 use crate::core::shell::WaylandWindowMeta;
-use crate::core::shell::xwayland::{
-    XwaylandSurfaceRole, XwaylandWindowMeta, is_noninteractive_fixed_size_helper,
-    workspace_from_process_env,
-};
 use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use smithay::backend::renderer::element::{RenderElementPresentationState, RenderElementStates};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -65,45 +66,45 @@ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::wayland::seat::WaylandFocus;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
-use crate::core::BackendEvent;
-use crate::core::RenderState;
 use crate::core::keyboard_accessibility::KeyboardAccessibilityFilter;
 use crate::core::lock::{
-    LOCK_PULSE_DURATION, LockPulseKind, LockScreenState, authenticate_current_user,
+    authenticate_current_user, LockPulseKind, LockScreenState, LOCK_PULSE_DURATION,
 };
 use crate::core::shell::ManagedWindow;
-use focal_launch_shared::{BrowserBackend, LaunchRequest, LaunchSource, request_launch};
-use focaldesk_config::{FocalDeskConfig, load_config, save_config};
+use crate::core::BackendEvent;
+use crate::core::RenderState;
+use focal_launch_shared::{request_launch, BrowserBackend, LaunchRequest, LaunchSource};
+use focaldesk_config::{load_config, save_config, FocalDeskConfig};
 use focaldesk_input::{
     InputEvent, InputState, KeyState, Modifiers, MouseButton, ScrollDelta, ScrollSource,
 };
 use focaldesk_ipc::{
-    ControlIpcRequest, ControlIpcResponse, ControlSetting, DesktopAction, DesktopDirection,
-    DesktopSnapshot, DesktopSplitKeyboardAction, DesktopSplitLayout, DisplayRuntimeOutputStatus,
-    InputDeviceSnapshot, IpcRequest, IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
-    OutputSnapshot, PowerIpcRequest, PowerIpcResponse, RenderingStatus, SessionStatus,
-    THEME_EDITOR_PROTOCOL_VERSION, ThemeEditorCommand, UpdateIpcRequest, UpdateIpcResponse,
-    WindowSnapshot, WorkspaceSnapshot, desktop_socket_path, send_control_request,
-    send_notification_request, send_power_request, send_update_request, transport,
+    desktop_socket_path, send_control_request, send_notification_request, send_power_request,
+    send_update_request, transport, ControlIpcRequest, ControlIpcResponse, ControlSetting,
+    DesktopAction, DesktopDirection, DesktopSnapshot, DesktopSplitKeyboardAction,
+    DesktopSplitLayout, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
+    NotificationIpcRequest, NotificationIpcResponse, OutputSnapshot, PowerIpcRequest,
+    PowerIpcResponse, RenderingStatus, SessionStatus, ThemeEditorCommand, UpdateIpcRequest,
+    UpdateIpcResponse, WindowSnapshot, WorkspaceSnapshot, THEME_EDITOR_PROTOCOL_VERSION,
 };
 use focaldesk_logging::session_id;
-use focaldesk_logging::{FLogLevel, flog, flog_error, flog_info, flog_warn, set_log_level};
+use focaldesk_logging::{flog, flog_error, flog_info, flog_warn, set_log_level, FLogLevel};
 use focaldesk_network::model::NetworkState;
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_power::{
-    LOW_BATTERY_THRESHOLD_PERCENT, PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot,
+    PowerAuthorization, PowerCommand, PowerManager, PowerSnapshot, LOW_BATTERY_THRESHOLD_PERCENT,
 };
 use focaldesk_settings_core::{
-    AccessibilitySettings, AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings,
-    DebugLogLevel, DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance,
-    HdrCalibrationPattern, InputAccelerationProfile, InputDeviceSettings, InputScrollMethod,
-    InputSettings, LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode,
-    PowerButtonAction, PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings,
-    load_settings, rearm_exclusive_hdr_for_next_session, save_settings,
+    load_settings, rearm_exclusive_hdr_for_next_session, save_settings, AccessibilitySettings,
+    AppSettings, BrowserLaunchBackend, ChromeRegionSettings, ChromeSettings, DebugLogLevel,
+    DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern,
+    InputAccelerationProfile, InputDeviceSettings, InputScrollMethod, InputSettings,
+    LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
+    PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings,
 };
 use focaldesk_shortcuts::{KeyAction, KeySymbol, Keybinds, ModMask};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
@@ -115,19 +116,19 @@ use focaldesk_ui::element::ChromeItem;
 use focaldesk_updates::UpdateSnapshot;
 use indexmap::IndexMap;
 use smithay::delegate_dispatch2;
-use smithay::input::Seat;
 use smithay::input::keyboard::FilterResult;
+use smithay::input::Seat;
 use smithay::output::{Mode, Output, PhysicalProperties, Scale as OutputScaleSmithay, Subpixel};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
-use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::Serial;
+use smithay::utils::SERIAL_COUNTER;
 use smithay::utils::{
     Buffer, IsAlive, Logical, Physical, Point, Rectangle, Scale, Size, Transform,
 };
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{
-    PointerConstraint, PointerConstraintsState, with_pointer_constraint,
+    with_pointer_constraint, PointerConstraint, PointerConstraintsState,
 };
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -157,30 +158,30 @@ use std::thread;
 use wayland_server::DisplayHandle;
 
 use crate::core::chrome_layout::{
-    ChromeLayout, build_chrome_layout, build_chrome_layout_with_config, chrome_host_drag_hit,
-    sidebar_slot_index_at, topbar_status_well_index_at,
+    build_chrome_layout, build_chrome_layout_with_config, chrome_host_drag_hit,
+    sidebar_slot_index_at, topbar_status_well_index_at, ChromeLayout,
 };
 use crate::core::focus::{KeyboardFocusTarget, PointerFocusTarget};
 use crate::core::fonts::FontSystem;
 use crate::core::toplevel_interaction::{
-    RESIZE_BORDER_PX, ResizeEdgeMask, ResizeSurfaceState, ToplevelPointerInteraction,
-    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at,
+    cursor_for_resize_edges, handle_resize_surface_commit, resize_edges_at, ResizeEdgeMask,
+    ResizeSurfaceState, ToplevelPointerInteraction, RESIZE_BORDER_PX,
 };
 use crate::core::ui_builder::{
-    AiFlowMode, UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options,
-    default_sidebar_items, default_status_items,
+    build_ui_for_output_with_options, default_sidebar_items, default_status_items, AiFlowMode,
+    UiBuildOptions, VoiceCaptureStatus,
 };
-use focaldesk_ai::{AiDaemonStatus, AiIpcRequest, AiIpcResponse, send_ai_request};
+use focaldesk_ai::{send_ai_request, AiDaemonStatus, AiIpcRequest, AiIpcResponse};
+use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::ThemeManager;
-use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_ui::dialog::DialogAction;
 use focaldesk_ui::dialog::{Dialog, DialogButton, DialogId, DialogKind, DialogState};
 use focaldesk_ui::dialog_layout::layout_dialog;
 use focaldesk_ui::ui_builder::{
-    SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID,
-    SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID, SIDEBAR_TERMINAL_ID, TOPBAR_DND_ID,
-    sidebar_workspace_number,
+    sidebar_workspace_number, SIDEBAR_ADD_WORKSPACE_ID, SIDEBAR_BROWSER_ID,
+    SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID, SIDEBAR_SETTINGS_ID,
+    SIDEBAR_TERMINAL_ID, TOPBAR_DND_ID,
 };
 
 use crate::core::desktop_services::*;
@@ -628,6 +629,9 @@ pub struct OutputState {
     pub logical_origin: Point<i32, Logical>,
     pub scale_factor: f64,
     pub scale: Scale<f64>,
+    /// Normal outputs accept ordinary windows. Control-panel outputs are kept
+    /// in the physical topology but reserved for FocalDesk controls.
+    pub role: OutputRole,
     pub hdr_supported: bool,
     pub hdr_requested: bool,
     /// KMS connector HDR state is live on this output. Scanout may remain
@@ -4425,6 +4429,7 @@ impl DesktopState {
         let mut preferred_color_changed = false;
         let mut changed = false;
         let mut unmatched = Vec::new();
+        let mut control_panel_outputs = Vec::new();
         for config in outputs {
             let output_id = self
                 .outputs
@@ -4465,7 +4470,7 @@ impl DesktopState {
             let requested_hdr = self.outputs.get(&output_id).is_some_and(|output| {
                 output.hdr_supported && (config.hdr_requested || config.hdr_enabled)
             });
-            let (geometry_changed, color_changed, hdr_request_changed) = self
+            let (geometry_changed, color_changed, hdr_request_changed, role_changed) = self
                 .outputs
                 .get(&output_id)
                 .map(|output| {
@@ -4482,9 +4487,10 @@ impl DesktopState {
                         output.color_profile_override != config.color_profile
                             || output.icc_profile_path != config.icc_profile_path,
                         output.hdr_requested != requested_hdr,
+                        output.role != config.role,
                     )
                 })
-                .unwrap_or((true, true, true));
+                .unwrap_or((true, true, true, true));
             backend_reconfigure_needed |=
                 !config.enabled || geometry_changed || hdr_request_changed;
             preferred_color_changed |= color_changed;
@@ -4507,6 +4513,10 @@ impl DesktopState {
                 output.hdr_appearance = config.hdr_appearance;
                 output.color_profile_override = config.color_profile;
                 output.icc_profile_path = config.icc_profile_path.clone();
+                output.role = config.role;
+            }
+            if role_changed && config.role == OutputRole::ControlPanel {
+                control_panel_outputs.push(output_id);
             }
             if geometry_changed {
                 self.update_output_size_from_work(output_id, physical_size, scale_factor, old_work);
@@ -4519,7 +4529,7 @@ impl DesktopState {
                 self.primary_output = output_id;
             }
 
-            changed = true;
+            changed |= role_changed || geometry_changed || color_changed || hdr_request_changed;
             flog_info!(
                 "applied display IPC update name={} output={:?} size={}x{} scale={} origin={},{} primary={}",
                 config.connector,
@@ -4531,6 +4541,43 @@ impl DesktopState {
                 config.y,
                 config.primary
             );
+        }
+
+        // A role change must not strand existing clients on the newly reserved
+        // panel. Rehome them to a normal output before the next render cycle.
+        if !control_panel_outputs.is_empty() {
+            let fallback = self.normal_output_for_windows();
+            let workspace = self
+                .outputs
+                .get(&fallback)
+                .map(|output| output.active_workspace)
+                .unwrap_or_else(|| self.focused_workspace());
+            let windows = self
+                .windows
+                .iter()
+                .filter(|window| {
+                    window
+                        .output
+                        .is_some_and(|output| control_panel_outputs.contains(&output))
+                })
+                .map(|window| window.id)
+                .collect::<Vec<_>>();
+            for window_id in windows {
+                if let Some(window) = self.window_mut(window_id) {
+                    window.set_output(Some(fallback));
+                    window.set_workspace(workspace);
+                    window.fullscreen = false;
+                    window.maximized = false;
+                    window.tile_rect = None;
+                }
+                if let Some(window) = self.window(window_id).map(|window| window.window.clone()) {
+                    self.map_window_bbox_location(
+                        window,
+                        self.default_toplevel_map_location(fallback),
+                        false,
+                    );
+                }
+            }
         }
 
         if changed {
@@ -5064,6 +5111,10 @@ impl DesktopState {
             max_workspace_slots: self.workspaces.max_workspace_slots as usize,
             active_workspace: output.active_workspace.0,
             ai_flow_mode: self.ai_flow_mode(),
+            recording_active: self
+                .local_remote_capture
+                .as_ref()
+                .is_some_and(|capture| capture.recording_output_active(output_id)),
             sidebar_items: None,
             status_items: None,
         };
@@ -7997,6 +8048,7 @@ impl DesktopState {
                 logical_origin,
                 scale_factor,
                 scale: Scale::from((scale_factor, scale_factor)),
+                role: OutputRole::Normal,
                 hdr_supported: false,
                 hdr_requested: false,
                 hdr_kms_applied: false,
@@ -8456,6 +8508,30 @@ impl DesktopState {
         }
 
         false
+    }
+
+    /// A control-panel output stays in the physical topology but is reserved
+    /// for FocalDesk's trusted controls instead of ordinary client windows.
+    pub(crate) fn output_accepts_windows(&self, output_id: OutputId) -> bool {
+        self.outputs
+            .get(&output_id)
+            .is_some_and(|output| output.role == OutputRole::Normal)
+    }
+
+    /// Select an application target which is not a control panel. Retain the
+    /// focused output as a recovery fallback if every connected output has
+    /// been configured as a control panel.
+    pub(crate) fn normal_output_for_windows(&self) -> OutputId {
+        if self.output_accepts_windows(self.focused_output) {
+            return self.focused_output;
+        }
+        if self.output_accepts_windows(self.primary_output) {
+            return self.primary_output;
+        }
+        self.outputs
+            .iter()
+            .find_map(|(id, output)| (output.role == OutputRole::Normal).then_some(*id))
+            .unwrap_or(self.focused_output)
     }
 
     pub fn output_owns_cursor(&self, output_id: OutputId) -> bool {
@@ -9803,7 +9879,8 @@ impl DesktopState {
         //self.space.map_element(window.clone(), (100, 100), false);
         //dbg_flush(&format!("after map space={}", self.space.elements().count()));
 
-        let managed = ManagedWindow::new_wayland(id, window.clone(), meta, workspace);
+        let mut managed = ManagedWindow::new_wayland(id, window.clone(), meta, workspace);
+        managed.set_output(Some(self.normal_output_for_windows()));
         self.windows.push(managed);
         trace!(
             target: "focaldesk",
@@ -11217,7 +11294,9 @@ impl DesktopState {
                     // well as a workspace. Hand that association over while the pointer
                     // crosses an output boundary so the dragged window remains visible
                     // throughout the grab instead of disappearing until button release.
-                    let target_output = self.output_under_pointer(pos);
+                    let target_output = self
+                        .output_under_pointer(pos)
+                        .filter(|output| self.output_accepts_windows(*output));
                     let target_workspace = target_output
                         .and_then(|id| self.outputs.get(&id))
                         .map(|output| output.active_workspace);
@@ -11385,7 +11464,9 @@ impl DesktopState {
                 // workspace that output is currently showing; otherwise it keeps the source
                 // workspace number and becomes invisible on every output (including the one
                 // it was dragged from, since it no longer sits within that output's bounds).
-                let target_output = self.output_under_pointer(self.pointer_pos);
+                let target_output = self
+                    .output_under_pointer(self.pointer_pos)
+                    .filter(|output| self.output_accepts_windows(*output));
                 let target_workspace = self.workspace_under_pointer(self.pointer_pos);
                 if let Some(managed) = self.window_mut(window_id) {
                     if target_output.is_some()
@@ -11882,6 +11963,7 @@ impl DesktopState {
                     logical_origin: Point::<i32, Logical>::from((0, 0)),
                     scale_factor: scale,
                     scale: Scale::from((scale, scale)),
+                    role: OutputRole::Normal,
                     hdr_supported: false,
                     hdr_requested: false,
                     hdr_kms_applied: false,
@@ -13481,6 +13563,9 @@ impl DesktopState {
         target: Rectangle<i32, Logical>,
         direction: SplitDirection,
     ) -> bool {
+        if !self.output_accepts_windows(output_id) {
+            return false;
+        }
         if !self.workspaces.split_screen_enabled {
             return false;
         }
@@ -14018,7 +14103,8 @@ impl DesktopState {
             })
             .or(self.windows[idx].output)
             .or_else(|| self.output_under_pointer(self.pointer_pos))
-            .unwrap_or(self.focused_output);
+            .filter(|output| self.output_accepts_windows(*output))
+            .unwrap_or_else(|| self.normal_output_for_windows());
 
         if fullscreen {
             let rect = self
@@ -14784,9 +14870,6 @@ fn is_obs_like(app_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientBufferEncoding, DamageSource, Fourcc, OutputId, PowerActionInteraction, SplitAxis,
-        SplitDirection, TopbarPulseTarget, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
-        UnattendedSuspendState, WorkspaceTransition, WorkspaceTransitionPhase,
         ai_flow_mode_from_status, chrome_command_args, clamp_rect_to_bounds,
         complementary_split_rect, confine_pointer_to_output_bounds, encoding_from_fourcc,
         is_browser_like, logical_damage_to_physical, output_with_largest_overlap,
@@ -14796,6 +14879,9 @@ mod tests {
         snap_target_for_pointer, split_assist_targets, split_direction_for_rect, split_preset_rect,
         split_rect, split_swap_allowed, surface_buffer_damage_to_logical, surface_color_changed,
         topbar_pulse_target_at, workspace_for_slot, workspace_transition_views,
+        ClientBufferEncoding, DamageSource, Fourcc, OutputId, PowerActionInteraction, SplitAxis,
+        SplitDirection, TopbarPulseTarget, UnattendedSuspendState, WorkspaceTransition,
+        WorkspaceTransitionPhase, UNATTENDED_SUSPEND_PREPARE_TIMEOUT,
     };
     use crate::core::color::{ColorDescription, RenderingIntent, SurfaceColorRenderState};
     use focaldesk_ai::AiDaemonStatus;
@@ -15483,11 +15569,9 @@ mod tests {
         set_surface_root_membership(&mut roots, &surface, Some(&first_root), &second_root);
 
         assert!(!roots.contains_key(&first_root));
-        assert!(
-            roots
-                .get(&second_root)
-                .is_some_and(|members| members.contains(&surface))
-        );
+        assert!(roots
+            .get(&second_root)
+            .is_some_and(|members| members.contains(&surface)));
 
         remove_surface_root_membership(&mut roots, &second_root, &surface);
         assert!(roots.is_empty());
@@ -15508,28 +15592,23 @@ mod tests {
     fn chromium_wayland_keeps_wide_gamut_raster_target() {
         let args = chrome_command_args(false, false);
         assert!(args.iter().any(|arg| arg == "--ozone-platform=wayland"));
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1")
-        );
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--force-color-profile=display-p3-d65")
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--enable-features=WaylandWpColorManagerV1"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
     }
 
     #[test]
     fn chromium_hdr_avoids_eight_bit_pq_surfaces() {
         let args = chrome_command_args(false, true);
-        assert!(
-            args.iter()
-                .any(|arg| arg == "--force-color-profile=display-p3-d65")
-        );
-        assert!(
-            !args
-                .iter()
-                .any(|arg| arg.starts_with("--force-raster-color-profile="))
-        );
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--force-color-profile=display-p3-d65"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("--force-raster-color-profile=")));
     }
 
     #[test]

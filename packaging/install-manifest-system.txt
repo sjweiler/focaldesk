@@ -11,6 +11,7 @@
 755 usr/bin/focaldesk-ai-registry
 755 usr/bin/focal-server
 755 usr/bin/focaldesk-remoted
+755 usr/bin/focaldesk-recorder
 755 usr/bin/focaldesk-system-rail
 755 usr/bin/focaldesk-task-shelf
 755 usr/bin/focaldesk-powerd

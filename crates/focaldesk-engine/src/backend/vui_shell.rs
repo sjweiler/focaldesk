@@ -361,6 +361,11 @@ impl VuiShell {
                 }
             }
             InputEvent::PointerEntered
+            | InputEvent::TouchDown { .. }
+            | InputEvent::TouchMotion { .. }
+            | InputEvent::TouchUp { .. }
+            | InputEvent::TouchCancel
+            | InputEvent::TouchFrame
             | InputEvent::GestureSwipeBegin { .. }
             | InputEvent::GestureSwipeUpdate { .. }
             | InputEvent::GestureSwipeEnd { .. } => return false,
@@ -1388,20 +1393,16 @@ mod tests {
         assert!(!opened.semantics.iter().any(|node| {
             node.role == vui_core::SemanticRole::Button && node.label == "Quick Settings"
         }));
-        assert!(
-            opened
-                .paint
-                .operations()
-                .iter()
-                .any(|operation| matches!(operation, vui_core::PaintOp::GlyphRun { .. }))
-        );
-        assert!(
-            !opened
-                .paint
-                .operations()
-                .iter()
-                .any(|operation| matches!(operation, vui_core::PaintOp::Text { .. }))
-        );
+        assert!(opened
+            .paint
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, vui_core::PaintOp::GlyphRun { .. })));
+        assert!(!opened
+            .paint
+            .operations()
+            .iter()
+            .any(|operation| matches!(operation, vui_core::PaintOp::Text { .. })));
 
         assert!(shell.handle_input(&InputEvent::PointerButton {
             button: MouseButton::Left,
@@ -1471,12 +1472,10 @@ mod tests {
         for label in ["Audio", "Focus", "Lock", "Settings"] {
             assert!(frame.semantics.iter().any(|node| node.label == label));
         }
-        assert!(
-            !frame
-                .semantics
-                .iter()
-                .any(|node| node.label == "VUI compositor surface")
-        );
+        assert!(!frame
+            .semantics
+            .iter()
+            .any(|node| node.label == "VUI compositor surface"));
 
         let position = Point::new(wifi.x + wifi.width / 2.0, wifi.y + wifi.height / 2.0);
         assert!(runtime.handle_event(&Event::PointerDown {

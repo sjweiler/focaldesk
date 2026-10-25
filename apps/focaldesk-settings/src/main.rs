@@ -378,6 +378,8 @@ struct DisplayConfig {
 
     primary: bool,
     transform: String,
+    #[serde(default)]
+    role: focaldesk_settings_core::OutputRole,
 
     #[serde(default)]
     hdr_supported: bool,
@@ -492,6 +494,7 @@ fn output_config_from_display(display: &DisplayConfig) -> OutputConfig {
             "Rotate270" => DisplayTransform::Rotate270,
             _ => DisplayTransform::Normal,
         },
+        role: display.role,
         primary: display.primary,
         color_profile: display.color_profile,
         icc_profile_path: display.icc_profile_path.clone(),
@@ -2895,6 +2898,19 @@ fn effective_panel_darkness(config: &FocalDeskConfig) -> f64 {
 
 fn main() {
     init_default_logging();
+    // The managed connector host verifies local clients through
+    // /proc/<pid>/exe after validating SO_PEERCRED. Settings contains no
+    // secret material, so keep that identity available to the host.
+    // SAFETY: PR_SET_DUMPABLE accepts an integer flag and no pointer.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) } != 0 {
+        error!(error = %std::io::Error::last_os_error(), "could not enable Settings IPC identity verification");
+    }
+    // On systems with Yama ptrace restrictions, the connector is a sibling
+    // process rather than a Settings child. Permit its read-only /proc identity
+    // check; the connector still verifies the Unix-socket UID and executable.
+    if unsafe { libc::prctl(libc::PR_SET_PTRACER, libc::PR_SET_PTRACER_ANY, 0, 0, 0) } != 0 {
+        error!(error = %std::io::Error::last_os_error(), "could not enable Settings IPC peer verification");
+    }
     let initial_panel = requested_panel(std::env::args().skip(1));
     let app = adw::Application::new(
         Some("com.focaldesk.Settings"),

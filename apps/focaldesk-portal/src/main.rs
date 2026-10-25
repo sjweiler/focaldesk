@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use focaldesk_ipc::{
-    DialogIpcRequest, DialogIpcResponse, IpcRequest, IpcResponse, send_desktop_request,
-    send_dialog_request,
+    send_desktop_request, send_dialog_request, DialogIpcRequest, DialogIpcResponse, IpcRequest,
+    IpcResponse,
 };
 use serde::Deserialize;
 use std::env;
@@ -63,29 +63,35 @@ fn screencast_choices() -> Vec<String> {
         }
     }
 
-    let mut outputs = wayland_outputs::query_wayland_outputs();
-    if let Some(configured) = configured_outputs() {
-        for name in configured {
-            if !outputs.iter().any(|existing| existing == &name) {
-                outputs.push(name);
+    // The compositor's runtime projection is authoritative: it excludes
+    // disconnected/disabled connectors and preserves the stable names OBS
+    // passes back to xdg-desktop-portal-wlr.
+    if let Some(outputs) = desktop_runtime_outputs() {
+        return monitor_choices(outputs);
+    }
+
+    let outputs = wayland_outputs::query_wayland_outputs();
+    if !outputs.is_empty() {
+        return monitor_choices(outputs);
+    }
+
+    configured_outputs()
+        .map(monitor_choices)
+        .unwrap_or_default()
+}
+
+fn monitor_choices(outputs: Vec<String>) -> Vec<String> {
+    let mut choices = Vec::new();
+    for output in outputs {
+        let output = output.trim();
+        if !output.is_empty() {
+            let choice = monitor_choice(output);
+            if !choices.contains(&choice) {
+                choices.push(choice);
             }
         }
     }
-    if !outputs.is_empty() {
-        return outputs
-            .into_iter()
-            .map(|output| monitor_choice(&output))
-            .collect();
-    }
-
-    if let Some(outputs) = desktop_runtime_outputs() {
-        return outputs
-            .into_iter()
-            .map(|output| monitor_choice(&output))
-            .collect();
-    }
-
-    Vec::new()
+    choices
 }
 
 /// Read xdpw `dmenu`-style chooser input. Ignore empty stdin (`simple` chooser type).
@@ -256,6 +262,19 @@ mod tests {
     #[test]
     fn formats_monitor_choice_for_xdpw_dmenu_chooser() {
         assert_eq!(monitor_choice("HDMI-A-1"), "Monitor: HDMI-A-1");
+    }
+
+    #[test]
+    fn removes_duplicate_or_blank_connectors_from_obs_choices() {
+        assert_eq!(
+            monitor_choices(vec![
+                "DP-3".into(),
+                " ".into(),
+                "DP-3".into(),
+                "HDMI-A-1".into()
+            ]),
+            vec!["Monitor: DP-3", "Monitor: HDMI-A-1"]
+        );
     }
 
     #[test]

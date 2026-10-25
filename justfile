@@ -109,6 +109,9 @@ release-ai-registry:
 release-remoted:
     cargo build --release -p focaldesk-remoted
 
+release-recorder:
+    cargo build --release -p focaldesk-recorder
+
 release-powerd:
     cargo build --release -p focaldesk-powerd
 
@@ -185,6 +188,10 @@ install-remoted-service:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     @echo "Installed focaldesk-remoted.service without enabling or starting it"
 
+install-recorder:
+    cargo build --release -p focaldesk-recorder
+    install -Dm755 target/release/focaldesk-recorder "$HOME/.local/bin/focaldesk-recorder"
+
 install-session-target:
     install -Dm644 packaging/systemd/user/focaldesk-session.target "$HOME/.config/systemd/user/focaldesk-session.target"
     # Migrate services formerly enabled directly under the shared desktop target.
@@ -203,7 +210,7 @@ install-shell-services: install-session-target
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
 
-install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic install-focald-connectors
+install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-recorder install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic install-focald-connectors
 
 install-secrets-service:
     cargo build --release -p focald-secrets
@@ -486,7 +493,11 @@ install-remoted-service-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     @echo "Installed focaldesk-remoted.service without enabling or starting it"
 
-install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-vector-service-fedora install-server-service-fedora install-remoted-service-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora install-connectors-service-fedora
+install-recorder-fedora:
+    cargo build --release -p focaldesk-recorder
+    sudo install -Dm755 target/release/focaldesk-recorder /usr/bin/focaldesk-recorder
+
+install-services-fedora: install-runtime-dir-fedora install-session-target-fedora install-shell-services-fedora install-vector-service-fedora install-server-service-fedora install-remoted-service-fedora install-recorder-fedora install-power-service-fedora install-notifications-service-fedora install-updates-service-fedora install-dialog-service-fedora install-control-service-fedora install-launch-service-fedora install-settings-service-fedora install-polkit-service-fedora install-portal-fedora install-voice-service-fedora install-speech-service-fedora install-mic-service-fedora install-connectors-service-fedora
 
 # Both the system credential socket and user-session IPC use this directory.
 # Prepare it before starting user services so a directory created by PID 1
@@ -655,6 +666,8 @@ install-portal-fedora:
     sudo install -Dm644 packaging/dbus/org.freedesktop.impl.portal.desktop.focaldesk.service /usr/share/dbus-1/services/org.freedesktop.impl.portal.desktop.focaldesk.service
     sudo install -Dm644 packaging/xdg-desktop-portal/focaldesk.portal /usr/share/xdg-desktop-portal/portals/focaldesk.portal
     sudo install -Dm644 packaging/xdg-desktop-portal/focaldesk-portals.conf /usr/share/xdg-desktop-portal/focaldesk-portals.conf
+    mkdir -p "$HOME/.config/xdg-desktop-portal-wlr"
+    /usr/bin/focaldesk-portal --print-xdpw-config > "$HOME/.config/xdg-desktop-portal-wlr/config"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
     systemctl --user restart focaldesk-portald.service || echo "Restart the FocalDesk portal backend after logging into FocalDesk"
     systemctl --user restart xdg-desktop-portal xdg-desktop-portal-wlr || echo "Restart portal services manually after logging into FocalDesk"

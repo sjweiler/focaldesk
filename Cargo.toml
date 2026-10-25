@@ -41,6 +41,7 @@ members = [
     # services
     "services/focaldesk-mcp",
     "services/focaldesk-remoted",
+    "services/focaldesk-recorder",
     "services/focaldesk-server",
     "services/focaldesk-ai-registry",
     "services/focaldesk-powerd",

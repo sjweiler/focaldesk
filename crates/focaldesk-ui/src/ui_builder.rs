@@ -6,7 +6,7 @@ use crate::sidebar::Dock;
 use crate::topbar::SystemPanel;
 use crate::types::{PanelKind, UiAction, UiElementKind};
 use crate::uitree::UiTree;
-use focaldesk_network::model::{Connectivity, NetworkIcon as NetIcon, NetworkState, map_icon};
+use focaldesk_network::model::{map_icon, Connectivity, NetworkIcon as NetIcon, NetworkState};
 
 const SIDEBAR_BASE: u32 = 1_000;
 const CLOCK_ID: u32 = 100_000;
@@ -32,6 +32,7 @@ pub const TOPBAR_DND_ID: u32 = 106;
 pub const TOPBAR_NOTIFICATIONS_ID: u32 = 107;
 pub const TOPBAR_MICROPHONE_ID: u32 = 108;
 pub const TOPBAR_UPDATES_ID: u32 = 109;
+pub const TOPBAR_RECORDING_ID: u32 = 110;
 
 // Workspace buttons get dynamically assigned IDs instead of fixed per-slot
 // consts, since the number of individually displayed workspace buttons is
@@ -121,6 +122,8 @@ pub struct UiBuildOptions {
     pub max_workspace_slots: usize,
     pub active_workspace: u32,
     pub ai_flow_mode: AiFlowMode,
+    /// True only for the output currently captured by the native recorder.
+    pub recording_active: bool,
     /// Replaces the generated sidebar collection when supplied. Invisible
     /// items do not consume layout slots.
     pub sidebar_items: Option<Vec<ChromeItem>>,
@@ -149,6 +152,7 @@ impl Default for UiBuildOptions {
             max_workspace_slots: 4,
             active_workspace: 1,
             ai_flow_mode: AiFlowMode::Idle,
+            recording_active: false,
             sidebar_items: None,
             status_items: None,
         }
@@ -309,6 +313,15 @@ pub fn default_status_items(options: &UiBuildOptions) -> Vec<ChromeItem> {
     );
 
     vec![
+        ChromeItem::new(
+            TOPBAR_RECORDING_ID,
+            IconId::Video,
+            "Screen recording active — select Recording to stop",
+            UiAction::OpenPanel(PanelKind::Recording),
+        )
+        .selected(options.recording_active)
+        .active(options.recording_active)
+        .visible(options.recording_active),
         ChromeItem::new(
             TOPBAR_NETWORK_ID,
             network_icon(&options.network_state),
@@ -586,10 +599,10 @@ mod tests {
     use crate::atlas::IconId;
     use crate::element::{ChromeItem, UiElement};
     use crate::ui_builder::{
-        SIDEBAR_BROWSER_ID, SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID,
-        SIDEBAR_TERMINAL_ID, SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID, TOPBAR_UPDATES_ID,
-        UiAction, UiBuildOptions, VoiceCaptureStatus, build_ui_for_output_with_options,
-        default_status_items, sidebar_workspace_id, sidebar_workspace_number,
+        build_ui_for_output_with_options, default_status_items, sidebar_workspace_id,
+        sidebar_workspace_number, UiAction, UiBuildOptions, VoiceCaptureStatus, SIDEBAR_BROWSER_ID,
+        SIDEBAR_DELETE_WORKSPACE_ID, SIDEBAR_EMAIL_ID, SIDEBAR_FILES_ID, SIDEBAR_TERMINAL_ID,
+        SIDEBAR_WORKSPACE_OVERFLOW_ID, TOPBAR_AI_BUTTON_ID, TOPBAR_UPDATES_ID,
     };
     use crate::uitree::UiTree;
 
@@ -631,16 +644,14 @@ mod tests {
         let mut ui = UiTree::default();
         build_ui_for_output_with_options(&mut ui, &layout, options);
 
-        assert!(
-            ui.elements
-                .iter()
-                .any(|element| element.id == crate::topbar::SystemPanel::OVERFLOW_ID)
-        );
-        assert!(
-            ui.elements
-                .iter()
-                .any(|element| element.id == crate::sidebar::Dock::OVERFLOW_ID)
-        );
+        assert!(ui
+            .elements
+            .iter()
+            .any(|element| element.id == crate::topbar::SystemPanel::OVERFLOW_ID));
+        assert!(ui
+            .elements
+            .iter()
+            .any(|element| element.id == crate::sidebar::Dock::OVERFLOW_ID));
     }
 
     #[test]
@@ -668,11 +679,10 @@ mod tests {
                 .count(),
             visible_count
         );
-        assert!(
-            !ui.elements
-                .iter()
-                .any(|element| element.id == crate::topbar::SystemPanel::OVERFLOW_ID)
-        );
+        assert!(!ui
+            .elements
+            .iter()
+            .any(|element| element.id == crate::topbar::SystemPanel::OVERFLOW_ID));
     }
 
     #[test]
@@ -758,16 +768,14 @@ mod tests {
             .filter_map(|el| sidebar_workspace_number(el.id))
             .collect();
         assert_eq!(workspace_ids, vec![1, 2]);
-        assert!(
-            ui.elements
-                .iter()
-                .any(|el| el.id == SIDEBAR_DELETE_WORKSPACE_ID)
-        );
-        assert!(
-            !ui.elements
-                .iter()
-                .any(|el| el.id == SIDEBAR_WORKSPACE_OVERFLOW_ID)
-        );
+        assert!(ui
+            .elements
+            .iter()
+            .any(|el| el.id == SIDEBAR_DELETE_WORKSPACE_ID));
+        assert!(!ui
+            .elements
+            .iter()
+            .any(|el| el.id == SIDEBAR_WORKSPACE_OVERFLOW_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_BROWSER_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_TERMINAL_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_FILES_ID));
@@ -802,11 +810,9 @@ mod tests {
                 })
                 .collect();
             assert!(!sidebar_buttons.is_empty());
-            assert!(
-                sidebar_buttons
-                    .iter()
-                    .all(|element| element.enabled && element.action.is_some())
-            );
+            assert!(sidebar_buttons
+                .iter()
+                .all(|element| element.enabled && element.action.is_some()));
         }
     }
 
@@ -820,11 +826,10 @@ mod tests {
             .filter_map(|el| sidebar_workspace_number(el.id))
             .collect();
         assert_eq!(workspace_ids, vec![1, 2, 3]);
-        assert!(
-            ui.elements
-                .iter()
-                .any(|el| el.id == SIDEBAR_WORKSPACE_OVERFLOW_ID)
-        );
+        assert!(ui
+            .elements
+            .iter()
+            .any(|el| el.id == SIDEBAR_WORKSPACE_OVERFLOW_ID));
         // Fixed buttons must never be pushed out even when workspaces overflow.
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_BROWSER_ID));
         assert!(ui.elements.iter().any(|el| el.id == SIDEBAR_TERMINAL_ID));
