@@ -389,19 +389,22 @@ fn shell_quote_for_xdpw_config(value: &str) -> String {
 }
 
 fn resolve_focaldesk_portal_executable() -> Option<PathBuf> {
+    // A user installation is the actively maintained portal backend for a
+    // developer session.  Prefer it before a compositor-adjacent legacy
+    // system helper, which may have been left by an older installation.
+    if let Some(home) = std::env::var_os("HOME") {
+        let local = PathBuf::from(home).join(".local/bin/focaldesk-portal");
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
             let sibling = parent.join("focaldesk-portal");
             if sibling.is_file() {
                 return Some(sibling);
             }
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let local = PathBuf::from(home).join(".local/bin/focaldesk-portal");
-        if local.is_file() {
-            return Some(local);
         }
     }
 
