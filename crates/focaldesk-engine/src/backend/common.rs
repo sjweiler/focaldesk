@@ -398,6 +398,13 @@ fn resolve_focaldesk_portal_executable() -> Option<PathBuf> {
         }
     }
 
+    if let Some(home) = std::env::var_os("HOME") {
+        let local = PathBuf::from(home).join(".local/bin/focaldesk-portal");
+        if local.is_file() {
+            return Some(local);
+        }
+    }
+
     for candidate in [
         "/usr/local/bin/focaldesk-portal",
         "/usr/bin/focaldesk-portal",
@@ -405,13 +412,6 @@ fn resolve_focaldesk_portal_executable() -> Option<PathBuf> {
         let path = PathBuf::from(candidate);
         if path.is_file() {
             return Some(path);
-        }
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        let local = PathBuf::from(home).join(".local/bin/focaldesk-portal");
-        if local.is_file() {
-            return Some(local);
         }
     }
 
