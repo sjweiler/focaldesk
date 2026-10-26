@@ -329,6 +329,16 @@ pub fn export_rgba_frame(
     state.local_remote_capture = Some(remote);
 }
 
+/// Whether the raw-renderer compatibility readback is still needed for a
+/// remote-desktop consumer on this output.  Portal clients have their own
+/// DMA-BUF path and must not force a CPU readback merely by existing.
+pub fn capture_active_for_output(state: &DesktopState, output_id: OutputId) -> bool {
+    state
+        .local_remote_capture
+        .as_ref()
+        .is_some_and(|remote| remote.sessions.values().any(|session| session.output_id == output_id))
+}
+
 fn socket_path() -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os(SOCKET_ENV).filter(|path| !path.is_empty()) {
         return Ok(path.into());
@@ -521,6 +531,7 @@ mod tests {
             RemoteCommand::Start {
                 output_id,
                 outbound,
+                ..
             } => (output_id, outbound),
             _ => panic!("expected start command"),
         };

@@ -456,6 +456,21 @@ pub fn portal_capture_pending(state: &DesktopState) -> bool {
     !state.pending_portal_captures.is_empty()
 }
 
+/// Remove the portal frames for one output so a backend with its own renderer
+/// can render directly into the client-provided DMA-BUFs.  In particular, the
+/// raw Vulkan backend must not route these through its CPU readback fallback.
+pub fn take_pending_portal_captures_for_output(
+    state: &mut DesktopState,
+    output_id: OutputId,
+) -> Vec<PendingPortalCapture> {
+    let (for_output, rest): (Vec<_>, Vec<_>) = state
+        .pending_portal_captures
+        .drain(..)
+        .partition(|cap| cap.output_id == output_id);
+    state.pending_portal_captures = rest;
+    for_output
+}
+
 /// Whether portal capture requires a fresh compositor draw this frame.
 pub fn portal_needs_composite(state: &DesktopState) -> bool {
     portal_capture_pending(state)

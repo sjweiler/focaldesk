@@ -59,8 +59,11 @@ impl ImageCopyCaptureHandler for DesktopState {
                 Some(Size::<i32, Buffer>::from((mode.size.w, mode.size.h)))
             })?;
 
-        let dma = (!self.cpu_output_capture_available)
-            .then_some(self.dmabuf_node)
+        // A backend may retain a CPU readback path for screenshots or remote
+        // diagnostics while still being able to render a portal request
+        // directly into the client's DMA-BUF.  Do not let that fallback hide
+        // the zero-copy portal path.
+        let dma = Some(self.dmabuf_node)
             .flatten()
             .filter(|_| !self.portal_dmabuf_formats.is_empty())
             .map(|node| DmabufConstraints {

@@ -42,6 +42,7 @@ use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+use smithay::wayland::dmabuf::get_dmabuf;
 use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
@@ -67,6 +68,7 @@ const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
 const HDR_STATE_VALIDATION_INTERVAL: Duration = Duration::from_secs(2);
 const HDR_REARM_VERIFY_TIMEOUT: Duration = Duration::from_secs(1);
 const HDR_REARM_ATTEMPTS_BEFORE_REBUILD: u8 = 3;
+const PORTAL_CAPTURE_STREAM_BASE: u64 = 1 << 63;
 const SDR_SCANOUT_FORMATS: [Fourcc; 4] = [
     Fourcc::Xrgb8888,
     Fourcc::Argb8888,
@@ -1101,6 +1103,25 @@ fn advertise_dmabuf(
     desktop.state.dmabuf_global = Some(global);
     desktop.state.dmabuf_node = Some(node);
     desktop.state.wgpu_dmabuf_formats = formats;
+    // Portal clients are render targets, rather than sampled client surfaces.
+    // Advertise only the format/modifier pairs the raw Vulkan renderer can
+    // attach to and render into.
+    let mut portal_formats = Vec::<(Fourcc, Vec<Modifier>)>::new();
+    for (code, modifier) in renderer.render_formats() {
+        let Ok(code) = Fourcc::try_from(code) else {
+            continue;
+        };
+        let modifier = Modifier::from(modifier);
+        if let Some((_, modifiers)) = portal_formats
+            .iter_mut()
+            .find(|(existing, _)| *existing == code)
+        {
+            modifiers.push(modifier);
+        } else {
+            portal_formats.push((code, vec![modifier]));
+        }
+    }
+    desktop.state.portal_dmabuf_formats = portal_formats;
     Ok(())
 }
 
@@ -2375,17 +2396,8 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             transform_scene(&mut scene, content_size, output_transform);
             let screenshot_requested = data.desktop.state.screenshot_request() == Some(output_id)
                 || data.desktop.state.screenshot_all_requested;
-            let portal_or_remote_requested = data
-                .desktop
-                .state
-                .pending_portal_captures
-                .iter()
-                .any(|capture| capture.output_id == output_id)
-                || data
-                    .desktop
-                    .state
-                    .output_capture_broker
-                    .has_consumers_for_output(output_id);
+            let remote_capture_requested =
+                crate::core::remote::capture_active_for_output(&data.desktop.state, output_id);
             let cpu_capture_due = data
                 .last_cpu_capture
                 .get(&output_id)
@@ -2394,7 +2406,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                 // allowing PipeWire to starve compositor input dispatch.
                 .is_none_or(|last| last.elapsed() >= Duration::from_millis(200));
             let capture_requested = (screenshot_requested
-                || (portal_or_remote_requested && cpu_capture_due))
+                || (remote_capture_requested && cpu_capture_due))
                 && !data.capture_pending.contains(&output_id);
             let sdr_output_matrix = data
                 .desktop
@@ -2551,6 +2563,76 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     continue 'main;
                 }
             };
+
+            // The Vulkan backend used to satisfy every portal request by
+            // copying the completed 4K scanout image back through CPU memory.
+            // Render into the PipeWire client's DMA-BUF instead and publish
+            // the Vulkan completion fence to its reservation object.  That
+            // keeps the transfer on the GPU and, crucially, never makes input
+            // dispatch wait for a readback.
+            for capture in crate::core::portal::take_pending_portal_captures_for_output(
+                &mut data.desktop.state,
+                output_id,
+            ) {
+                let buffer = capture.frame.buffer();
+                let Ok(dmabuf) = get_dmabuf(&buffer).cloned() else {
+                    capture.frame.fail(
+                        smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,
+                    );
+                    continue;
+                };
+                let target = match target_from_dmabuf(&dmabuf) {
+                    Ok(target) if target.width == output_size.w as u32 && target.height == output_size.h as u32 => target,
+                    Ok(_) => {
+                        capture.frame.fail(
+                            smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        flog_warn!("Vulkan portal target import failed: {error:#}");
+                        capture.frame.fail(
+                            smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,
+                        );
+                        continue;
+                    }
+                };
+                let portal_submission = data.renderer.render(
+                    &target,
+                    &scene.background,
+                    &scene.surfaces,
+                    &scene.overlay,
+                    scene.overlay_after_surface,
+                    &scene.foreground,
+                    scene.foreground_after_surface,
+                    &scene.egui_textures,
+                    &scene.egui_meshes,
+                    scene.egui_before_surface,
+                    &[[0, 0, output_size.w, output_size.h]],
+                    PORTAL_CAPTURE_STREAM_BASE | output_id.0,
+                    None,
+                    [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+                    AshDrmTransfer::SrgbUnorm,
+                    None,
+                    None,
+                );
+                match portal_submission.and_then(|submission| {
+                    data.renderer
+                        .publish_target_write_fence(&target, submission.fence_fd)
+                }) {
+                    Ok(()) => capture.frame.success(
+                        Transform::Normal,
+                        None::<Vec<Rectangle<i32, smithay::utils::Buffer>>>,
+                        Duration::ZERO,
+                    ),
+                    Err(error) => {
+                        flog_warn!("Vulkan portal DMA-BUF render failed: {error:#}");
+                        capture.frame.fail(
+                            smithay::wayland::image_copy_capture::CaptureFailureReason::Unknown,
+                        );
+                    }
+                }
+            }
             data.desktop.state.log_damage_frame(
                 output_id,
                 pending_damage.len(),

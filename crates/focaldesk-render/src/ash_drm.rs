@@ -31,6 +31,7 @@ const ABGR2101010: u32 = u32::from_le_bytes(*b"AB30");
 const GPU_SUBMISSION_TIMEOUT: Duration = Duration::from_secs(5);
 const DAMAGE_HISTORY_LIMIT: usize = 64;
 const DMA_BUF_SYNC_READ: u32 = 1;
+const DMA_BUF_SYNC_WRITE: u32 = 2;
 type DamageRect = [i32; 4];
 type DamageHistory = VecDeque<(u64, Vec<DamageRect>)>;
 
@@ -806,6 +807,21 @@ impl fmt::Debug for AshDrmRenderer {
 }
 
 impl AshDrmRenderer {
+    /// Publish this submission's completion fence to a DMA-BUF rendered by
+    /// Vulkan.  This is the implicit-sync handoff used by portal/PipeWire
+    /// clients; it lets them consume the buffer without forcing the
+    /// compositor thread to wait for GPU completion.
+    pub fn publish_target_write_fence(
+        &self,
+        target: &DrmRenderTarget,
+        fence: OwnedFd,
+    ) -> Result<()> {
+        let Some(plane) = target.planes.first() else {
+            bail!("DMA-BUF target has no planes");
+        };
+        import_dmabuf_write_fence(plane.as_raw_fd(), fence)
+    }
+
     /// Create a renderer matching the DRM device major/minor numbers.
     pub fn new(drm_major: u32, drm_minor: u32) -> Result<Self> {
         let entry = unsafe { Entry::load() }.context("load Vulkan loader")?;
@@ -3849,6 +3865,21 @@ fn import_dmabuf_read_fence(dmabuf_fd: RawFd, sync_fd: OwnedFd) -> Result<()> {
             Ok(())
         }
         Err(error) => Err(error).context("import Vulkan read fence into DMA-BUF"),
+    }
+}
+
+#[cfg(unix)]
+fn import_dmabuf_write_fence(dmabuf_fd: RawFd, sync_fd: OwnedFd) -> Result<()> {
+    let import = DmaBufImportSyncFile {
+        flags: DMA_BUF_SYNC_WRITE,
+        fd: sync_fd.as_raw_fd(),
+    };
+    match unsafe { dma_buf_import_sync_file(dmabuf_fd, &import) } {
+        Ok(_) => Ok(()),
+        Err(nix::errno::Errno::ENOTTY | nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {
+            Ok(())
+        }
+        Err(error) => Err(error).context("import Vulkan write fence into DMA-BUF"),
     }
 }
 
