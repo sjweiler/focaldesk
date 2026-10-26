@@ -6023,11 +6023,13 @@ fn device_added(
         flog(&format!("Failed to write display config: {err}"));
     }
 
-    if !displays.is_empty() {
-        refresh_portal_services(&data.core.state.client_wayland_display);
-    }
-
     data.backend.devices.insert(node, temp_device);
+
+    // The portal dispatcher can survive a compositor/session restart while its
+    // wlr backend is stopped with the prior session.  Refresh it after the DRM
+    // device is live, regardless of whether persisted display configuration
+    // happened to contain an entry during this initial probe.
+    refresh_portal_services(&data.core.state.client_wayland_display);
 
     Ok(())
 }
