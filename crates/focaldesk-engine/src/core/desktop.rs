@@ -6662,8 +6662,11 @@ impl DesktopState {
             }
         }
 
-        // XWayland/GTK can briefly have empty input regions while geometry catches up;
-        // fall back to bbox + surface_under (matches render visibility).
+        // XWayland/GTK can briefly have empty input regions while geometry catches up.
+        // A second `surface_under` call would make an otherwise visible topmost
+        // window transparent to clicks and focus the window beneath it instead.
+        // Once the regular input-region lookup found no target, prefer the
+        // topmost visible client's root surface inside its rendered bounds.
         for window in self.space.elements().rev() {
             let on_ws = self
                 .windows
@@ -6684,21 +6687,15 @@ impl DesktopState {
             }
             #[cfg(feature = "xwayland")]
             if let Some(x11) = window.x11_surface() {
-                if let Some((_, surf_loc)) =
-                    window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
-                {
-                    return Some((
-                        PointerFocusTarget::Xwayland(x11.clone()),
-                        (surf_loc + render_loc).to_f64(),
-                    ));
-                }
-            }
-            if let Some((surface, surf_loc)) =
-                window.surface_under(pos - render_loc.to_f64(), WindowSurfaceType::ALL)
-            {
                 return Some((
-                    PointerFocusTarget::Wayland(surface),
-                    (surf_loc + render_loc).to_f64(),
+                    PointerFocusTarget::Xwayland(x11.clone()),
+                    render_loc.to_f64(),
+                ));
+            }
+            if let Some(surface) = window.wl_surface() {
+                return Some((
+                    PointerFocusTarget::Wayland(surface.into_owned()),
+                    render_loc.to_f64(),
                 ));
             }
         }

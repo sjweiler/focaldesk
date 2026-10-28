@@ -624,7 +624,13 @@ fn build_ui(
 
     let sidebar = Box::new(Orientation::Vertical, 8);
     sidebar.add_css_class("ai-sidebar");
-    sidebar.set_width_request(210);
+    sidebar.set_width_request(240);
+
+    // Keep the workspace navigation independently scrollable.  Conversations
+    // are deliberately kept above it so changing threads never requires
+    // hunting through the growing product-navigation list.
+    let navigation_list = Box::new(Orientation::Vertical, 8);
+    navigation_list.set_vexpand(true);
 
     let nav_items = [
         "New Chat",
@@ -661,7 +667,7 @@ fn build_ui(
             btn.add_css_class("sidebar-button-active");
         }
         nav_buttons.borrow_mut().push(btn.clone());
-        sidebar.append(&btn);
+        navigation_list.append(&btn);
     }
 
     let main = Box::new(Orientation::Vertical, 10);
@@ -723,6 +729,25 @@ fn build_ui(
             render_conversation_panel(&conversation_detail, conversation, "Active conversation");
         }
     }
+
+    let conversation_navigator = persistent_conversation_navigator(
+        state.clone(),
+        chat_view.clone(),
+        conversation_detail.clone(),
+        stack.clone(),
+        composer.clone(),
+        active_nav.clone(),
+        nav_buttons.clone(),
+        log_buffer.clone(),
+    );
+    let navigation_scroll = ScrolledWindow::builder()
+        .child(&navigation_list)
+        .vexpand(true)
+        .hexpand(true)
+        .build();
+    navigation_scroll.add_css_class("pane-scroll");
+    sidebar.append(&conversation_navigator);
+    sidebar.append(&navigation_scroll);
 
     let chat_scroll = ScrolledWindow::builder()
         .child(&chat_view)
@@ -7717,6 +7742,173 @@ fn clear_box(container: &Box) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
+}
+
+/// A compact, always-visible history picker for the primary chat workspace.
+///
+/// The blank compose surface is an action of its own, not a history item. The
+/// full Conversations page remains the place for editing titles and summaries.
+/// This navigator is intentionally optimized for getting back to prior chats;
+/// selecting one opens it in the primary workspace.
+fn persistent_conversation_navigator(
+    store: Rc<RefCell<PersistedState>>,
+    chat_view: Box,
+    conversation_detail: Box,
+    stack: gtk4::Stack,
+    composer: Box,
+    active_nav: Rc<std::cell::RefCell<String>>,
+    nav_buttons: Rc<std::cell::RefCell<Vec<Button>>>,
+    log_buffer: TextBuffer,
+) -> Box {
+    let navigator = Box::new(Orientation::Vertical, 6);
+    navigator.add_css_class("conversation-navigator");
+
+    let heading = Label::new(Some("New chat"));
+    heading.set_xalign(0.0);
+    heading.add_css_class("pane-heading");
+    navigator.append(&heading);
+
+    // This is deliberately separate from the history rows below.  Those rows
+    // select existing conversations; this action always takes the user to a
+    // fresh compose-ready chat.
+    let new_chat = Button::with_label("New chat");
+    new_chat.add_css_class("sidebar-button");
+    {
+        let new_store = store.clone();
+        let new_chat_view = chat_view.clone();
+        let new_detail = conversation_detail.clone();
+        let new_stack = stack.clone();
+        let new_composer = composer.clone();
+        let new_active_nav = active_nav.clone();
+        let new_nav_buttons = nav_buttons.clone();
+        let new_log = log_buffer.clone();
+        new_chat.connect_clicked(move |_| {
+            create_new_conversation(&new_store, &new_chat_view, &new_detail, &new_log);
+            set_active_nav("New Chat", &new_active_nav, &new_nav_buttons);
+            new_composer.set_visible(true);
+            new_stack.set_visible_child_name("new-chat");
+        });
+    }
+    navigator.append(&new_chat);
+
+    let history_heading = Label::new(Some("History"));
+    history_heading.set_xalign(0.0);
+    history_heading.add_css_class("pane-heading");
+    navigator.append(&history_heading);
+
+    let search = Entry::builder()
+        .placeholder_text("Search history")
+        .hexpand(true)
+        .build();
+    search.add_css_class("conversation-search");
+    navigator.append(&search);
+
+    let threads = Box::new(Orientation::Vertical, 4);
+    let snapshot = store.borrow().conversations.clone();
+    let active_index = store.borrow().app_state.active_conversation;
+    let searchable_rows = Rc::new(RefCell::new(Vec::<(Button, String)>::new()));
+    let thread_buttons = Rc::new(RefCell::new(Vec::<(usize, Button, String)>::new()));
+
+    let ordered_indices = (0..snapshot.len())
+        .rev()
+        .filter(|index| !is_placeholder_conversation(&snapshot[*index]));
+
+    for index in ordered_indices {
+        let conversation = &snapshot[index];
+        let is_active = index == active_index;
+        let button = Button::with_label(&conversation.title);
+        button.add_css_class("sidebar-button");
+        button.add_css_class("conversation-picker-row");
+        if is_active {
+            button.add_css_class("sidebar-button-active");
+        }
+        button.set_halign(gtk4::Align::Fill);
+        button.set_tooltip_text(Some(&conversation.summary));
+
+        searchable_rows.borrow_mut().push((
+            button.clone(),
+            format!(
+                "{} {}",
+                conversation.title.to_lowercase(),
+                conversation.summary.to_lowercase()
+            ),
+        ));
+        thread_buttons
+            .borrow_mut()
+            .push((index, button.clone(), conversation.title.clone()));
+
+        let select_store = store.clone();
+        let select_chat_view = chat_view.clone();
+        let select_detail = conversation_detail.clone();
+        let select_stack = stack.clone();
+        let select_composer = composer.clone();
+        let select_active_nav = active_nav.clone();
+        let select_nav_buttons = nav_buttons.clone();
+        let select_log = log_buffer.clone();
+        let select_thread_buttons = thread_buttons.clone();
+        button.connect_clicked(move |_| {
+            let selected = select_store.borrow().conversations.get(index).cloned();
+            if let Some(conversation) = selected {
+                load_conversation(&select_chat_view, &conversation);
+                render_conversation_panel(&select_detail, &conversation, "Active conversation");
+                let mut state = select_store.borrow_mut();
+                state.app_state.active_conversation = index;
+                persist_state(&state);
+                append_log(
+                    &select_log,
+                    &format!("[chat] loaded conversation {}", index + 1),
+                );
+            }
+            for (thread_index, thread_button, title) in select_thread_buttons.borrow().iter() {
+                let is_current = *thread_index == index;
+                thread_button.set_label(title);
+                if is_current {
+                    thread_button.add_css_class("sidebar-button-active");
+                } else {
+                    thread_button.remove_css_class("sidebar-button-active");
+                }
+            }
+            set_active_nav("New Chat", &select_active_nav, &select_nav_buttons);
+            select_composer.set_visible(true);
+            select_stack.set_visible_child_name("new-chat");
+        });
+        threads.append(&button);
+    }
+
+    let thread_scroll = ScrolledWindow::builder()
+        .child(&threads)
+        .hexpand(true)
+        .vexpand(false)
+        .height_request(168)
+        .build();
+    thread_scroll.add_css_class("pane-scroll");
+    navigator.append(&thread_scroll);
+
+    {
+        let searchable_rows = searchable_rows.clone();
+        search.connect_changed(move |entry| {
+            let query = entry.text().trim().to_lowercase();
+            for (button, search_text) in searchable_rows.borrow().iter() {
+                button.set_visible(query.is_empty() || search_text.contains(&query));
+            }
+        });
+    }
+
+    let manage_button = Button::with_label("Manage all chats");
+    manage_button.add_css_class("sidebar-button");
+    {
+        let stack = stack.clone();
+        let composer = composer.clone();
+        let active_nav = active_nav.clone();
+        let nav_buttons = nav_buttons.clone();
+        manage_button.connect_clicked(move |_| {
+            set_active_nav("Conversations", &active_nav, &nav_buttons);
+            composer.set_visible(true);
+            stack.set_visible_child_name("conversations");
+        });
+    }
+    navigator.append(&manage_button);
+    navigator
 }
 
 fn conversations_page(

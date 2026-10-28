@@ -7971,7 +7971,7 @@ fn calendar_provider_group(
     let row = adw::ActionRow::new();
     row.set_title("Connect account");
     row.set_subtitle(if microsoft {
-        "Microsoft device-code sign-in with Calendars.Read"
+        "Browser sign-in using PKCE with Calendars.Read"
     } else {
         "Browser sign-in using PKCE and calendar.readonly"
     });

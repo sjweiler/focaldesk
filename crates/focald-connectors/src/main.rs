@@ -515,12 +515,8 @@ fn discover_calendars(account_id: &str) -> Result<Vec<CalendarAvailableSnapshot>
         if parsed.scheme() != "https" || parsed.host_str() != Some(allowed_host) {
             bail!("calendar discovery pagination escaped the provider host");
         }
-        let body = client
-            .get(parsed)
-            .bearer_auth(access.as_str())
-            .send()?
-            .error_for_status()?
-            .json::<Value>()?;
+        let response = client.get(parsed).bearer_auth(access.as_str()).send()?;
+        let body = calendar_discovery_response(response, account.provider)?;
         let items = body
             .get("items")
             .or_else(|| body.get("value"))
@@ -563,6 +559,39 @@ fn discover_calendars(account_id: &str) -> Result<Vec<CalendarAvailableSnapshot>
     Ok(calendars)
 }
 
+fn calendar_discovery_response(
+    response: reqwest::blocking::Response,
+    provider: CalendarProvider,
+) -> Result<Value> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response.json()?);
+    }
+
+    // reqwest's error_for_status deliberately omits the response body. Microsoft
+    // Graph puts the useful diagnosis (for example, a mailbox or tenant-policy
+    // code) in that body, so expose a bounded, non-secret summary in Settings.
+    let body = response.text().unwrap_or_default();
+    if provider == CalendarProvider::Microsoft {
+        let parsed = serde_json::from_str::<Value>(&body).ok();
+        let code = parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/error/code"))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_error");
+        let message = parsed
+            .as_ref()
+            .and_then(|value| value.pointer("/error/message"))
+            .and_then(Value::as_str)
+            .unwrap_or("Microsoft Graph did not return an error message");
+        bail!(
+            "Microsoft Graph calendar discovery failed ({status}): {code}: {}",
+            message.chars().take(500).collect::<String>()
+        );
+    }
+    bail!("calendar discovery failed ({status})")
+}
+
 fn random_urlsafe(bytes: usize) -> String {
     let mut value = vec![0_u8; bytes];
     rand::thread_rng().fill_bytes(&mut value);
@@ -581,6 +610,80 @@ fn set_oauth_state(
         flow.state = next.into();
         flow.message = message;
     }
+}
+
+/// Extract the authorization code only from the loopback callback URI that we
+/// gave to the provider.  A loopback listener is still an HTTP server, so do
+/// not treat an arbitrary request received on it as an OAuth callback.
+fn authorization_code_from_loopback_callback(
+    request: &str,
+    redirect_uri: &str,
+    expected_state: &str,
+) -> Result<String> {
+    let mut lines = request.lines();
+    let request_line = lines.next().context("invalid OAuth callback")?;
+    let mut request_parts = request_line.split_whitespace();
+    if request_parts.next() != Some("GET") {
+        bail!("OAuth callback must use GET");
+    }
+    let target = request_parts
+        .next()
+        .context("invalid OAuth callback target")?;
+    if request_parts.next() != Some("HTTP/1.1")
+        || request_parts.next().is_some()
+        || !target.starts_with('/')
+        || target.starts_with("//")
+    {
+        bail!("OAuth callback target is invalid");
+    }
+
+    let redirect = url::Url::parse(redirect_uri).context("invalid OAuth redirect URI")?;
+    if redirect.scheme() != "http"
+        || redirect.host_str() != Some("localhost")
+        || redirect.port().is_none()
+        || redirect.query().is_some()
+        || redirect.fragment().is_some()
+    {
+        bail!("OAuth redirect URI must be a loopback URL");
+    }
+    let expected_host = format!("localhost:{}", redirect.port().unwrap_or_default());
+    let hosts = lines
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(name, _)| name.eq_ignore_ascii_case("host"))
+        .map(|(_, value)| value.trim())
+        .collect::<Vec<_>>();
+    if hosts.len() != 1 || hosts[0] != expected_host {
+        bail!("OAuth callback host does not match redirect URI");
+    }
+
+    let callback = url::Url::parse(&format!("http://{expected_host}{target}"))
+        .context("invalid OAuth callback target")?;
+    if callback.path() != redirect.path() {
+        bail!("OAuth callback path does not match redirect URI");
+    }
+
+    let mut state = None;
+    let mut code = None;
+    for (name, value) in callback.query_pairs() {
+        match name.as_ref() {
+            "state" => {
+                if state.replace(value.into_owned()).is_some() {
+                    bail!("OAuth callback contains multiple state values");
+                }
+            }
+            "code" => {
+                if code.replace(value.into_owned()).is_some() {
+                    bail!("OAuth callback contains multiple authorization codes");
+                }
+            }
+            _ => {}
+        }
+    }
+    if state.as_deref() != Some(expected_state) {
+        bail!("OAuth state mismatch");
+    }
+    code.context("authorization was declined")
 }
 
 fn start_calendar_oauth(
@@ -609,8 +712,8 @@ fn start_calendar_oauth(
     validate_account(&account)?;
     let flow_id = random_urlsafe(18);
     if provider_kind == CalendarProvider::Google {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let redirect_uri = format!("http://127.0.0.1:{}", listener.local_addr()?.port());
+        let listener = TcpListener::bind("localhost:0")?;
+        let redirect_uri = format!("http://localhost:{}/", listener.local_addr()?.port());
         let verifier = random_urlsafe(48);
         let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(Sha256::digest(verifier.as_bytes()));
@@ -661,34 +764,39 @@ fn start_calendar_oauth(
         });
         Ok(snapshot)
     } else {
-        let endpoint = format!(
-            "https://login.microsoftonline.com/{}/oauth2/v2.0/devicecode",
+        // Microsoft supports public-client authorization-code flow on a loopback
+        // redirect URI. Bind before opening the browser so the callback cannot
+        // race the listener, and never persist the verifier or CSRF state.
+        let listener = TcpListener::bind("localhost:0")?;
+        let redirect_uri = format!("http://localhost:{}/", listener.local_addr()?.port());
+        let verifier = random_urlsafe(48);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        let csrf = random_urlsafe(24);
+        let mut url = url::Url::parse(&format!(
+            "https://login.microsoftonline.com/{}/oauth2/v2.0/authorize",
             account.tenant
-        );
-        #[derive(Deserialize)]
-        struct Device {
-            device_code: String,
-            user_code: String,
-            verification_uri: String,
-            expires_in: u64,
-            interval: u64,
-        }
-        let device: Device = reqwest::blocking::Client::new()
-            .post(endpoint)
-            .form(&[
-                ("client_id", account.client_id.as_str()),
-                ("scope", "offline_access Calendars.Read"),
-            ])
-            .send()?
-            .error_for_status()?
-            .json()?;
+        ))?;
+        url.query_pairs_mut()
+            .append_pair("client_id", &account.client_id)
+            .append_pair("redirect_uri", &redirect_uri)
+            .append_pair("response_type", "code")
+            .append_pair("response_mode", "query")
+            .append_pair("scope", "offline_access Calendars.Read")
+            // Do not silently reuse an unrelated browser SSO session. The local
+            // FocalDesk account label is intentionally independent of the
+            // Microsoft identity, so make that identity an explicit choice.
+            .append_pair("prompt", "select_account")
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("state", &csrf);
         let snapshot = CalendarOAuthSnapshot {
             flow_id: flow_id.clone(),
             provider,
-            state: "waiting_for_user".into(),
-            verification_uri: Some(device.verification_uri),
-            user_code: Some(device.user_code),
-            message: Some("Enter the code in your browser".into()),
+            state: "waiting_for_browser".into(),
+            verification_uri: Some(url.into()),
+            user_code: None,
+            message: Some("Finish signing in with Microsoft in your browser".into()),
         };
         state
             .lock()
@@ -697,12 +805,8 @@ fn start_calendar_oauth(
             .insert(flow_id.clone(), snapshot.clone());
         let state = state.clone();
         thread::spawn(move || {
-            let result = complete_microsoft_oauth(
-                &account,
-                &device.device_code,
-                device.interval,
-                device.expires_in,
-            );
+            let result =
+                complete_microsoft_oauth(listener, &account, &redirect_uri, &verifier, &csrf);
             match result {
                 Ok(()) => set_oauth_state(
                     &state,
@@ -741,28 +845,15 @@ fn complete_google_oauth(
     };
     let mut bytes = vec![0_u8; 8192];
     let count = stream.read(&mut bytes)?;
-    let first = std::str::from_utf8(&bytes[..count])?
-        .lines()
-        .next()
-        .context("invalid OAuth callback")?;
-    let target = first
-        .split_whitespace()
-        .nth(1)
-        .context("invalid OAuth callback target")?;
-    let callback = url::Url::parse(&format!("http://127.0.0.1{target}"))?;
-    let values = callback.query_pairs().collect::<BTreeMap<_, _>>();
-    if values.get("state").map(|v| v.as_ref()) != Some(csrf) {
-        bail!("OAuth state mismatch");
-    }
-    let code = values
-        .get("code")
-        .context("Google authorization was declined")?;
+    let request = std::str::from_utf8(&bytes[..count])?;
+    let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
+        .context("Google OAuth callback validation failed")?;
     let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
     stream.write_all(html.as_bytes())?;
     let client = reqwest::blocking::Client::new();
     let mut form = vec![
         ("client_id", account.client_id.as_str()),
-        ("code", code.as_ref()),
+        ("code", code.as_str()),
         ("code_verifier", verifier),
         ("redirect_uri", redirect_uri),
         ("grant_type", "authorization_code"),
@@ -795,52 +886,60 @@ fn complete_google_oauth(
 }
 
 fn complete_microsoft_oauth(
+    listener: TcpListener,
     account: &CalendarAccount,
-    device_code: &str,
-    interval: u64,
-    expires: u64,
+    redirect_uri: &str,
+    verifier: &str,
+    csrf: &str,
 ) -> Result<()> {
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + Duration::from_secs(10 * 60);
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(connection) => break connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    bail!("Microsoft authorization expired");
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut bytes = vec![0_u8; 8192];
+    let count = stream.read(&mut bytes)?;
+    let request = std::str::from_utf8(&bytes[..count])?;
+    let code = authorization_code_from_loopback_callback(request, redirect_uri, csrf)
+        .context("Microsoft OAuth callback validation failed")?;
+    let html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<h1>FocalDesk connected</h1><p>You can close this tab.</p>";
+    stream.write_all(html.as_bytes())?;
     let client = reqwest::blocking::Client::new();
     let endpoint = format!(
         "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
         account.tenant
     );
-    let deadline = Instant::now() + Duration::from_secs(expires.min(1800));
-    while Instant::now() < deadline {
-        thread::sleep(Duration::from_secs(interval.max(5)));
-        let response = client
-            .post(&endpoint)
-            .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                ("client_id", account.client_id.as_str()),
-                ("device_code", device_code),
-            ])
-            .send()?;
-        let status = response.status();
-        let body: Value = response.json()?;
-        if status.is_success() {
-            let refresh = body
-                .get("refresh_token")
-                .and_then(Value::as_str)
-                .context("Microsoft returned no refresh token")?;
-            focaldesk_secrets_client::set(
-                &format!("calendar/{}/refresh-token", account.id),
-                refresh,
-                "Microsoft Calendar refresh token",
-            )?;
-            return save_calendar_account(account.clone());
-        }
-        match body.get("error").and_then(Value::as_str) {
-            Some("authorization_pending") => continue,
-            Some("slow_down") => {
-                thread::sleep(Duration::from_secs(5));
-                continue;
-            }
-            Some(error) => bail!("Microsoft authorization failed: {error}"),
-            None => bail!("Microsoft authorization failed"),
-        }
-    }
-    bail!("Microsoft authorization expired")
+    let token: TokenResponse = client
+        .post(endpoint)
+        .form(&[
+            ("client_id", account.client_id.as_str()),
+            ("code", code.as_str()),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect_uri),
+            ("grant_type", "authorization_code"),
+            ("scope", "offline_access Calendars.Read"),
+        ])
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let refresh = token
+        .refresh_token
+        .context("Microsoft returned no refresh token")?;
+    focaldesk_secrets_client::set(
+        &format!("calendar/{}/refresh-token", account.id),
+        &refresh,
+        "Microsoft Calendar refresh token",
+    )?;
+    save_calendar_account(account.clone())
 }
 
 fn load_calendar_accounts() -> Result<CalendarAccountsDocument> {
@@ -1927,6 +2026,54 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .quarantined
+        );
+    }
+
+    #[test]
+    fn accepts_only_the_issued_loopback_callback_url() {
+        let request = "GET /?code=authorization-code&state=csrf-token HTTP/1.1\r\nHost: localhost:43821\r\n\r\n";
+        assert_eq!(
+            authorization_code_from_loopback_callback(
+                request,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .unwrap(),
+            "authorization-code"
+        );
+    }
+
+    #[test]
+    fn rejects_callback_for_a_different_loopback_url_or_state() {
+        let wrong_host = "GET /?code=authorization-code&state=csrf-token HTTP/1.1\r\nHost: localhost:9999\r\n\r\n";
+        assert!(
+            authorization_code_from_loopback_callback(
+                wrong_host,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .is_err()
+        );
+
+        let wrong_path = "GET /other?code=authorization-code&state=csrf-token HTTP/1.1\r\nHost: localhost:43821\r\n\r\n";
+        assert!(
+            authorization_code_from_loopback_callback(
+                wrong_path,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .is_err()
+        );
+
+        let wrong_state =
+            "GET /?code=authorization-code&state=other HTTP/1.1\r\nHost: localhost:43821\r\n\r\n";
+        assert!(
+            authorization_code_from_loopback_callback(
+                wrong_state,
+                "http://localhost:43821/",
+                "csrf-token"
+            )
+            .is_err()
         );
     }
 }

@@ -68,10 +68,13 @@ locations, attendee lists, conference URLs, and message bodies are neither
 stored nor published.
 
 The Settings **Calendar** page starts authorization through typed connector
-IPC. Google uses the system browser, a random loopback port, PKCE-S256, and a
-validated state value. Microsoft uses the device-code flow and displays the
-short user code before opening the system browser. Authorization expires after
-ten minutes (Google) or the provider-supplied Microsoft deadline. Settings
+IPC. Google and Microsoft use the system browser, a random loopback port,
+PKCE-S256, and a validated state value. The callback host and path must match
+the issued `http://localhost:<random-port>/` redirect URL before an
+authorization code is accepted. Register `http://localhost/` as a **Mobile
+and desktop applications** redirect URI in Microsoft Entra; Entra permits the
+ephemeral port for this localhost redirect.
+Authorization expires after ten minutes. Settings
 receives status and public verification data only; refresh tokens and optional
 Google client secrets never return over the connector IPC.
 
