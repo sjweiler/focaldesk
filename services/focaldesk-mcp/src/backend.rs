@@ -6,9 +6,10 @@ use focaldesk_logging::log_file_path_candidates;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use regex::Regex;
 
@@ -60,6 +61,7 @@ impl Backend for IpcBackend {
             "get_rendering_status" => to_value(self.snapshot()?.rendering),
             "get_service_health" => service_health(),
             "search_recent_logs" => search_recent_logs(arguments),
+            "web_search" => web_search(arguments),
             "show_notification" => {
                 let title = required_string(arguments, "title", 160)?;
                 let body = required_string_allow_empty(arguments, "body", 2_000)?;
@@ -90,6 +92,115 @@ impl Backend for IpcBackend {
             _ => Err(format!("unknown tool: {tool}")),
         }
     }
+}
+
+const DEFAULT_SEARXNG_URL: &str = "http://127.0.0.1:8080";
+const MAX_SEARXNG_RESPONSE_BYTES: u64 = 1_048_576;
+
+/// Query only a locally hosted SearXNG endpoint.  The model receives result
+/// metadata, not fetched page content, so a search result cannot turn into an
+/// unbounded page-reading or arbitrary-network capability.
+fn web_search(arguments: &Value) -> Result<Value, String> {
+    let query = required_string(arguments, "query", 400)?;
+    if query.trim().is_empty() {
+        return Err("query must not be blank".to_string());
+    }
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .clamp(1, 8) as usize;
+    let endpoint = searxng_search_endpoint()?;
+    let client = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("could not create local SearXNG client: {error}"))?;
+    let response = client
+        .get(endpoint)
+        .query(&[("q", query.as_str()), ("format", "json")])
+        .send()
+        .map_err(|error| format!("local SearXNG search failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("local SearXNG returned HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SEARXNG_RESPONSE_BYTES)
+    {
+        return Err("local SearXNG response exceeds the 1 MiB limit".to_string());
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_SEARXNG_RESPONSE_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("could not read local SearXNG response: {error}"))?;
+    if body.len() as u64 > MAX_SEARXNG_RESPONSE_BYTES {
+        return Err("local SearXNG response exceeds the 1 MiB limit".to_string());
+    }
+    let response: Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("local SearXNG returned invalid JSON: {error}"))?;
+    Ok(json!({
+        "query": query,
+        "results": searxng_results(&response, limit),
+    }))
+}
+
+fn searxng_search_endpoint() -> Result<reqwest::Url, String> {
+    let configured =
+        std::env::var("FOCALDESK_SEARXNG_URL").unwrap_or_else(|_| DEFAULT_SEARXNG_URL.to_string());
+    let mut base = reqwest::Url::parse(&configured)
+        .map_err(|error| format!("FOCALDESK_SEARXNG_URL is invalid: {error}"))?;
+    if base.scheme() != "http"
+        || !matches!(
+            base.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("::1")
+        )
+        || base.query().is_some()
+        || base.fragment().is_some()
+        || base.username() != ""
+        || base.password().is_some()
+    {
+        return Err("FOCALDESK_SEARXNG_URL must be an unauthenticated http://localhost, http://127.0.0.1, or http://[::1] URL without a query or fragment".to_string());
+    }
+    let path = base.path().trim_end_matches('/');
+    base.set_path(&format!("{path}/search"));
+    Ok(base)
+}
+
+fn searxng_results(response: &Value, limit: usize) -> Vec<Value> {
+    response
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let title = bounded_result_string(result.get("title"), 300)?;
+            let url = result.get("url").and_then(Value::as_str)?;
+            let parsed = reqwest::Url::parse(url).ok()?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return None;
+            }
+            Some(json!({
+                "title": title,
+                "url": truncate_result_text(url, 2_048),
+                "snippet": bounded_result_string(result.get("content"), 1_000).unwrap_or_default(),
+                "source": bounded_result_string(result.get("engine"), 100).unwrap_or_default(),
+                "published_at": bounded_result_string(result.get("publishedDate"), 100),
+            }))
+        })
+        .take(limit)
+        .collect()
+}
+
+fn bounded_result_string(value: Option<&Value>, max_chars: usize) -> Option<String> {
+    let value = value?.as_str()?.trim();
+    (!value.is_empty()).then(|| truncate_result_text(value, max_chars))
+}
+
+fn truncate_result_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
 }
 
 fn to_value(value: impl serde::Serialize) -> Result<Value, String> {
@@ -273,7 +384,8 @@ fn is_sensitive_key(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::redact_log_line;
+    use super::{redact_log_line, searxng_results};
+    use serde_json::json;
 
     #[test]
     fn log_search_redacts_common_secret_shapes() {
@@ -300,5 +412,18 @@ mod tests {
         assert!(!redacted.contains("abc123"));
         assert!(!redacted.contains("def 456"));
         assert!(redacted.contains("status=failed"));
+    }
+
+    #[test]
+    fn searxng_results_are_bounded_and_exclude_non_web_urls() {
+        let response = json!({"results": [
+            {"title": "One", "url": "https://example.com/one", "content": "A summary", "engine": "duckduckgo"},
+            {"title": "Local file", "url": "file:///etc/passwd", "content": "must not surface"},
+            {"title": "Two", "url": "http://example.org/two", "content": "Another summary"}
+        ]});
+        let results = searxng_results(&response, 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["title"], "One");
+        assert_eq!(results[0]["url"], "https://example.com/one");
     }
 }

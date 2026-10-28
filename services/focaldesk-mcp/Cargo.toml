@@ -13,6 +13,7 @@ path = "src/main.rs"
 focaldesk-ipc = { path = "../../crates/focaldesk-ipc" }
 focaldesk-logging = { path = "../../crates/focaldesk-logging" }
 regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true }
 serde_json = "1"
 tracing = { workspace = true }

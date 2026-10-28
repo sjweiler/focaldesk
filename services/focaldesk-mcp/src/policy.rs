@@ -27,6 +27,7 @@ pub enum DataClass {
     SystemMetadata,
     WindowMetadata,
     Diagnostics,
+    InternetSearch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -143,6 +144,18 @@ pub fn tool_catalog() -> Vec<ToolDefinition> {
                 &[],
             ),
             policy: read(DataClass::Diagnostics),
+        },
+        ToolDefinition {
+            name: "web_search",
+            description: "Search the web through the locally configured SearXNG service. Returns bounded result titles, URLs, snippets, and source engines; it never opens result pages.",
+            input_schema: object(
+                json!({
+                    "query": {"type": "string", "minLength": 1, "maxLength": 400},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 8, "default": 5}
+                }),
+                &["query"],
+            ),
+            policy: read(DataClass::InternetSearch),
         },
         ToolDefinition {
             name: "get_rendering_status",

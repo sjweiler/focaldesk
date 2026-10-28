@@ -1,0 +1,17 @@
+# Local-only SearXNG settings used by FocalDesk web search.
+use_default_settings: true
+
+general:
+  instance_name: "FocalDesk Local Search"
+
+search:
+  safe_search: 1
+  formats:
+    - html
+    - json
+
+server:
+  # Overridden by the private SEARXNG_SECRET container environment variable.
+  secret_key: "unused-local-placeholder"
+  limiter: false
+  image_proxy: false

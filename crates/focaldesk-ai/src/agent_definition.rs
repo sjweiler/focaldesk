@@ -265,7 +265,7 @@ pub fn built_in_agents() -> Vec<AgentDefinition> {
             tool_allowlist: vec![
                 "get_session_status", "list_outputs", "get_output_details", "list_windows",
                 "list_workspaces", "get_service_health", "get_rendering_status",
-                "show_notification", "focus_window", "move_window_to_workspace",
+                "web_search", "show_notification", "focus_window", "move_window_to_workspace",
                 "open_settings_panel",
             ].into_iter().map(str::to_string).collect(),
             max_tool_steps: 4,

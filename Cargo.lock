@@ -2982,6 +2982,7 @@ dependencies = [
  "focaldesk-ipc",
  "focaldesk-logging",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

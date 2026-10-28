@@ -46,7 +46,7 @@ fn stdio_enforces_the_initialization_lifecycle() {
     assert_eq!(responses[2]["error"]["code"], -32002);
     assert_eq!(
         responses[3]["result"]["tools"].as_array().unwrap().len(),
-        12
+        13
     );
 }
 
