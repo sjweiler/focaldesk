@@ -41,8 +41,8 @@ use smithay::reexports::input::event::switch::Switch as InputSwitch;
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Size, Transform};
-use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::wayland::dmabuf::get_dmabuf;
+use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
 use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 
 use super::common::{
@@ -62,6 +62,7 @@ use super::vui_shell::{QuickSettingsState, VuiShell};
 use super::wgpu_nested::{VulkanCompositorScene, VulkanSceneBuilder};
 use crate::core::backend_render::{damage_area_percent, is_full_damage};
 use focaldesk_input::{InputEvent, KeyState};
+use focaldesk_settings_core::load_settings;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const KMS_PRESENT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -690,6 +691,17 @@ fn resume_vulkan_session(data: &mut VulkanDrmData, reason: &str) -> Result<()> {
 fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
     let resources = drm.resource_handles().context("query DRM resources")?;
     let configured = load_display_config();
+    // `displays.json` is renderer inventory and can lag a settings edit by a
+    // session. Role and primary-output choices are user intent, so always take
+    // them from canonical settings. In particular, falling back to the first
+    // inventory entry can make HDMI-A-5 the raw-Vulkan fallback-shell output
+    // even though the user selected DP-3 as primary.
+    let configured_outputs = load_settings()
+        .displays
+        .outputs
+        .into_iter()
+        .map(|output| (output.connector.clone(), output))
+        .collect::<HashMap<_, _>>();
     let mut used_crtcs = HashSet::new();
     let mut outputs = Vec::new();
     let mut next_x = 0;
@@ -766,8 +778,10 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             .map(|display| display.hdr_appearance)
             .and_then(|appearance| appearance.validate().ok())
             .unwrap_or_else(|| hdr_appearance_from_support(&hdr_support));
-        let role = saved_monitor
-            .map(|display| display.role)
+        let configured_output = configured_outputs.get(&name);
+        let role = configured_output
+            .map(|output| output.role)
+            .or_else(|| saved_monitor.map(|display| display.role))
             .unwrap_or_default();
         let make = identity
             .as_ref()
@@ -820,7 +834,9 @@ fn select_outputs(drm: &DrmDevice) -> Result<Vec<OutputConfig>> {
             transform,
             scale,
             origin,
-            primary: saved.is_some_and(|display| display.primary),
+            primary: configured_output
+                .map(|output| output.primary)
+                .unwrap_or_else(|| saved.is_some_and(|display| display.primary)),
             output_id: OutputId(outputs.len() as u64 + 1),
             physical_size_mm,
             make,
@@ -2582,7 +2598,12 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     continue;
                 };
                 let target = match target_from_dmabuf(&dmabuf) {
-                    Ok(target) if target.width == output_size.w as u32 && target.height == output_size.h as u32 => target,
+                    Ok(target)
+                        if target.width == output_size.w as u32
+                            && target.height == output_size.h as u32 =>
+                    {
+                        target
+                    }
                     Ok(_) => {
                         capture.frame.fail(
                             smithay::wayland::image_copy_capture::CaptureFailureReason::BufferConstraints,

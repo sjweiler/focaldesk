@@ -31,6 +31,20 @@ automation are deliberately unsupported.
 
 ## Use it
 
+In the AI Console chat, start an explicit request with a phrase such as
+“search the web for …”, “web search: …”, or “look up …”. The console queries
+the same bounded local SearXNG endpoint directly and returns its result titles,
+links, publication dates when provided by the source (otherwise it says so),
+snippets, and source engines. The configured SearXNG engine set is used: it
+can include Google by default, while still returning results from other sources
+when Google blocks an automated query.
+
+When a local model replies that it cannot answer or lacks enough information,
+the console automatically performs that same bounded web search using the
+original question and replaces the non-answer with relevant linked results.
+This fallback stays local-first: only the loopback SearXNG service contacts the
+internet, and no result page is fetched by FocalDesk.
+
 The built-in Desktop Assistant includes `web_search`. Select **Desktop
 Assistant** in the AI Console and ask it to search the web. Through Ambient
 Voice, route the request to that agent, for example: “Hello FocalDesk, ask

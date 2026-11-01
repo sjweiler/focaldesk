@@ -6,6 +6,7 @@ pub mod connector;
 pub mod context;
 pub mod event;
 pub mod forge;
+pub mod guard;
 pub mod ipc;
 mod managed_provider;
 pub mod mission;
@@ -94,7 +95,7 @@ pub use service::{AgentControlStatus, AiService};
 pub use types::{
     AiDaemonStatus, AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, Citation,
     DirectoryIngestResult, DocumentIngestResult, ProviderInfo, ProviderModelInfo,
-    ProviderTelemetry, RetrievalEvalCase, RetrievalEvalReport, TokenUsage,
+    ProviderTelemetry, RecentChatActivity, RetrievalEvalCase, RetrievalEvalReport, TokenUsage,
 };
 pub use workflow::{
     WORKFLOW_MANIFEST_VERSION, WorkflowArtifact, WorkflowDefinition, WorkflowNode,

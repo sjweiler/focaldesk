@@ -599,40 +599,40 @@ pub fn send_desktop_config(config: FocalDeskConfig) -> Result<(), String> {
 }
 
 pub use connector_host::{
-    connector_host_socket_path, send_connector_host_request, CalendarAccountSnapshot,
+    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME, CalendarAccountSnapshot,
     CalendarAvailableSnapshot, CalendarEventSnapshot, CalendarOAuthSnapshot,
     ConnectorHostIpcRequest, ConnectorHostIpcResponse, ConnectorRuntimeStatus,
-    CONNECTOR_HOST_SOCKET_ENV, CONNECTOR_HOST_SOCKET_NAME,
+    connector_host_socket_path, send_connector_host_request,
 };
 pub use controls::{
-    control_socket_path, send_control_request, serve_control_ipc, ControlIpcRequest,
-    ControlIpcResponse, ControlSetting, CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME,
+    CONTROL_SOCKET_ENV, CONTROL_SOCKET_NAME, ControlIpcRequest, ControlIpcResponse, ControlSetting,
+    control_socket_path, send_control_request, serve_control_ipc,
 };
 pub use dialog::{
-    dialog_socket_path, send_dialog_request, serve_dialog_ipc, DialogIpcRequest, DialogIpcResponse,
-    DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME,
+    DIALOG_SOCKET_ENV, DIALOG_SOCKET_NAME, DialogIpcRequest, DialogIpcResponse, dialog_socket_path,
+    send_dialog_request, serve_dialog_ipc,
 };
 pub use microphone::{
-    microphone_socket_path, send_microphone_request, MicrophoneEvent, MicrophoneEventRecord,
-    MicrophoneIpcRequest, MicrophoneIpcResponse, MICROPHONE_SOCKET_ENV, MICROPHONE_SOCKET_NAME,
+    MICROPHONE_SOCKET_ENV, MICROPHONE_SOCKET_NAME, MicrophoneEvent, MicrophoneEventRecord,
+    MicrophoneIpcRequest, MicrophoneIpcResponse, microphone_socket_path, send_microphone_request,
 };
 pub use notifications::{
-    notifications_socket_path, send_notification_request, serve_notification_ipc,
-    NotificationIpcRequest, NotificationIpcResponse, NOTIFICATIONS_SOCKET_ENV,
-    NOTIFICATIONS_SOCKET_NAME,
+    NOTIFICATIONS_SOCKET_ENV, NOTIFICATIONS_SOCKET_NAME, NotificationIpcRequest,
+    NotificationIpcResponse, notifications_socket_path, send_notification_request,
+    serve_notification_ipc,
 };
 pub use power::{
-    power_socket_path, send_power_request, serve_power_ipc, PowerIpcRequest, PowerIpcResponse,
-    POWER_SOCKET_ENV, POWER_SOCKET_NAME,
+    POWER_SOCKET_ENV, POWER_SOCKET_NAME, PowerIpcRequest, PowerIpcResponse, power_socket_path,
+    send_power_request, serve_power_ipc,
 };
 pub use settings::serve_settings_ipc;
 pub use speech::{
-    send_speech_request, speech_socket_path, SpeechCommand, SpeechIpcRequest, SpeechIpcResponse,
-    SpeechPriority, SPEECH_SOCKET_ENV, SPEECH_SOCKET_NAME,
+    SPEECH_SOCKET_ENV, SPEECH_SOCKET_NAME, SpeechCommand, SpeechIpcRequest, SpeechIpcResponse,
+    SpeechPriority, send_speech_request, speech_socket_path,
 };
 pub use updates::{
-    send_update_request, serve_update_ipc, updates_socket_path, UpdateIpcRequest,
-    UpdateIpcResponse, UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME,
+    UPDATES_SOCKET_ENV, UPDATES_SOCKET_NAME, UpdateIpcRequest, UpdateIpcResponse,
+    send_update_request, serve_update_ipc, updates_socket_path,
 };
 
 #[cfg(test)]

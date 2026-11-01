@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::fonts::{FontId, TextStyle};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use focaldesk_render::{
     AutoHdrParams, FramePixelFormat, FrameRetention, FrameTransferFunction, FrameTransform,
     LinuxDmabuf, MeshVertex, PresentRenderer, PresentResult, SolidQuad, TextureColorTransform,
@@ -27,16 +27,16 @@ use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::drm::{DrmDeviceFd, DrmNode};
 use smithay::backend::renderer::element::Id as RenderElementId;
 use smithay::backend::renderer::utils::{CommitCounter, RendererSurfaceStateUserData};
-use smithay::desktop::{PopupManager, layer_map_for_output};
+use smithay::desktop::{layer_map_for_output, PopupManager};
 use smithay::reexports::calloop::EventLoop as CalloopEventLoop;
-use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::backend::ObjectId;
 use smithay::reexports::wayland_server::protocol::wl_shm;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{DeviceFd, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
-use smithay::wayland::compositor::{TraversalAction, with_surface_tree_downward};
-use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, get_dmabuf};
-use smithay::wayland::drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd};
+use smithay::wayland::compositor::{with_surface_tree_downward, TraversalAction};
+use smithay::wayland::dmabuf::{get_dmabuf, DmabufFeedbackBuilder};
+use smithay::wayland::drm_syncobj::{supports_syncobj_eventfd, DrmSyncobjState};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
 use smithay::wayland::shm::with_buffer_contents;
@@ -51,12 +51,12 @@ use winit::{
 };
 
 use super::common::{
-    BootstrapOutput, NestedDesktop, bootstrap_compositor_core, client_state_from_stream,
-    is_nonfatal_wayland_io_error,
+    bootstrap_compositor_core, client_state_from_stream, is_nonfatal_wayland_io_error,
+    BootstrapOutput, NestedDesktop,
 };
 use super::vui_shell::{QuickSettingsState, VuiShell};
-use crate::core::BackendEvent;
 use crate::core::color::{SurfaceColorRenderState, TransferFunction};
+use crate::core::BackendEvent;
 use focaldesk_input::{InputEvent, KeyState, Modifiers, MouseButton, ScrollDelta};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);

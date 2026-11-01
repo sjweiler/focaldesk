@@ -7,4 +7,9 @@ pub struct InputState {
     pub modifiers: Modifiers,
     /// True while the left mouse button is held.
     pub pointer_left_down: bool,
+    /// The primary contact currently driving compositor-native control-panel UI.
+    ///
+    /// Contacts on ordinary outputs continue through `wl_touch`; this is only
+    /// used where the compositor itself owns the interactive surface.
+    pub control_panel_touch_slot: Option<i32>,
 }

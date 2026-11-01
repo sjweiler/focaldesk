@@ -35,17 +35,17 @@ use smithay::wayland::shm::ShmState;
 use zbus::blocking::{Connection, MessageIterator};
 use zbus::{MatchRule, MessageType};
 
-use crate::core::OutputState;
-use crate::core::SceneState;
 use crate::core::desktop::{DesktopInit, DesktopState};
 use crate::core::render::RenderState;
 use crate::core::ui_state::UiState;
 use crate::core::wayland::client::ClientState;
+use crate::core::OutputState;
+use crate::core::SceneState;
 use focaldesk_config::configured_theme;
 use focaldesk_settings_core::load_settings;
-use focaldesk_themes::FlowThemeId;
 use focaldesk_themes::theme::BuiltInThemeId;
-use focaldesk_themes::{SYSTEM_DEFAULT_THEME_PATH, ThemeDocument, ThemeManager};
+use focaldesk_themes::FlowThemeId;
+use focaldesk_themes::{ThemeDocument, ThemeManager, SYSTEM_DEFAULT_THEME_PATH};
 use focaldesk_types::CompositorBackend;
 use smithay::wayland::xdg_activation::XdgActivationState;
 #[cfg(feature = "xwayland")]

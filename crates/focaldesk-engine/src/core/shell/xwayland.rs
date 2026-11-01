@@ -126,7 +126,11 @@ impl XwaylandWindowMeta {
 
 #[cfg(feature = "xwayland")]
 fn non_empty(value: String) -> Option<String> {
-    if value.is_empty() { None } else { Some(value) }
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 impl XwaylandSurfaceRole {
@@ -154,7 +158,7 @@ impl XwaylandSurfaceRole {
 
 #[cfg(test)]
 mod tests {
-    use super::{XwaylandSurfaceRole, is_noninteractive_fixed_size_helper, workspace_from_environ};
+    use super::{is_noninteractive_fixed_size_helper, workspace_from_environ, XwaylandSurfaceRole};
 
     #[test]
     fn filters_tiny_noninteractive_fixed_size_toplevel() {

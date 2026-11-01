@@ -23,13 +23,14 @@ use gtk4::{
     Application, ApplicationWindow, Box, Button, CheckButton, DropDown, Entry, Label, Orientation,
     Paned, Revealer, ScrolledWindow, StringList, Switch, TextBuffer, TextView,
 };
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     ffi::OsString,
     fs,
-    io::Write,
+    io::{Read, Write},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
@@ -7343,6 +7344,25 @@ fn dispatch_chat_request_async(
             }));
             return;
         }
+        if let Some(reply) = web_search_reply_for_prompt(&prompt_text) {
+            let request_id = "local-web-search".to_string();
+            let _ = tx.send(Ok(AiStreamEvent::Started {
+                request_id: request_id.clone(),
+                provider: "focaldesk-web-search".into(),
+                model: None,
+            }));
+            let _ = tx.send(Ok(AiStreamEvent::Completed {
+                request_id,
+                response: focaldesk_ai::ChatResponse {
+                    provider: "focaldesk-web-search".into(),
+                    model: None,
+                    content: reply,
+                    usage: None,
+                    citations: Vec::new(),
+                },
+            }));
+            return;
+        }
         let mut request = request;
         if let Some(context) = calendar_context_for_prompt(&prompt_text) {
             // Calendar content is user data, not instructions. Keep it in a
@@ -7351,7 +7371,26 @@ fn dispatch_chat_request_async(
             request.messages.insert(1, ChatMessage::system(context));
         }
         let event_tx = tx.clone();
+        let fallback_query = prompt_text.clone();
         if let Err(err) = stream_ai_chat(request, move |event| {
+            // Small local models commonly state that they cannot answer rather
+            // than issuing a tool call. Turn that useful signal into the same
+            // bounded search a person would perform, without granting the
+            // model arbitrary network access.
+            let event = match event {
+                AiStreamEvent::Completed {
+                    request_id,
+                    mut response,
+                } if local_answer_needs_web_search(&response.content) => {
+                    response.content =
+                        automatic_web_search_reply(&fallback_query, &response.content);
+                    AiStreamEvent::Completed {
+                        request_id,
+                        response,
+                    }
+                }
+                event => event,
+            };
             event_tx
                 .send(Ok(event))
                 .map_err(|_| anyhow::anyhow!("chat UI disconnected"))
@@ -7668,6 +7707,211 @@ fn calendar_reply_for_prompt(prompt: &str) -> Option<String> {
             response.message.unwrap_or_else(|| "unknown connector response".into())),
         Err(error) => format!("Calendar lookup failed: {error}"),
     })
+}
+
+const DEFAULT_SEARXNG_URL: &str = "http://127.0.0.1:8080";
+const MAX_SEARXNG_RESPONSE_BYTES: u64 = 1_048_576;
+
+#[derive(Debug)]
+struct WebSearchResult {
+    title: String,
+    url: String,
+    snippet: String,
+    source: String,
+    published_at: String,
+}
+
+/// Explicit web-search requests use the same bounded, loopback-only SearXNG
+/// path as the MCP tool. This keeps chat reliable with local models that do
+/// not consistently emit the agent planner's JSON tool-call format.
+fn web_search_reply_for_prompt(prompt: &str) -> Option<String> {
+    let query = web_search_query_for_prompt(prompt)?;
+    Some(web_search_reply(&query, None))
+}
+
+fn automatic_web_search_reply(query: &str, model_reply: &str) -> String {
+    web_search_reply(query, Some(model_reply))
+}
+
+fn web_search_reply(query: &str, unavailable_reply: Option<&str>) -> String {
+    match local_web_search(query) {
+        Ok(results) if results.is_empty() => format!("No web results found for: {query}"),
+        Ok(results) => {
+            let entries = results
+                .iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    let source = (!result.source.is_empty())
+                        .then(|| format!(" ({})", result.source))
+                        .unwrap_or_default();
+                    let snippet = (!result.snippet.is_empty())
+                        .then(|| format!("\n   {}", result.snippet))
+                        .unwrap_or_default();
+                    let published_at = if result.published_at.is_empty() {
+                        "date unavailable".to_string()
+                    } else {
+                        result.published_at.clone()
+                    };
+                    format!(
+                        "{}. {}{}\n   Link: {}\n   Date: {}{}",
+                        index + 1,
+                        result.title,
+                        source,
+                        result.url,
+                        published_at,
+                        snippet
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let lead = unavailable_reply
+                .map(|_| "The local AI could not answer confidently, so I searched the web.")
+                .unwrap_or("Web search results:");
+            format!("{lead}\nQuery: {query}\n{entries}")
+        }
+        Err(error) => format!("Web search is temporarily unavailable: {error}"),
+    }
+}
+
+fn local_answer_needs_web_search(reply: &str) -> bool {
+    let reply = reply.trim().to_ascii_lowercase();
+    [
+        "i don't know",
+        "i do not know",
+        "i can't answer",
+        "i cannot answer",
+        "i'm unable to answer",
+        "i am unable to answer",
+        "i don't have enough information",
+        "i do not have enough information",
+        "i don't have access to the internet",
+        "i cannot access the internet",
+        "i do not have access to real-time information",
+        "i don't have access to real-time information",
+        "i do not have real-time information",
+        "i don't have real-time information",
+        "i don't have access to current information",
+        "i do not have access to current information",
+    ]
+    .iter()
+    .any(|signal| reply.contains(signal))
+}
+
+fn web_search_query_for_prompt(prompt: &str) -> Option<String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let prefixes = [
+        "search the web for ",
+        "search the web: ",
+        "web search for ",
+        "web search: ",
+        "search online for ",
+        "search online: ",
+        "look up ",
+        "lookup ",
+        "find online ",
+    ];
+    let query = prefixes
+        .iter()
+        .find_map(|prefix| lower.strip_prefix(prefix).map(|_| &trimmed[prefix.len()..]))?;
+    let query = query.trim();
+    (!query.is_empty() && query.len() <= 400).then(|| query.to_string())
+}
+
+fn local_web_search(query: &str) -> Result<Vec<WebSearchResult>, String> {
+    let configured =
+        std::env::var("FOCALDESK_SEARXNG_URL").unwrap_or_else(|_| DEFAULT_SEARXNG_URL.to_string());
+    let mut endpoint = Url::parse(&configured)
+        .map_err(|error| format!("local search endpoint is invalid: {error}"))?;
+    if endpoint.scheme() != "http"
+        || !matches!(
+            endpoint.host_str(),
+            Some("127.0.0.1") | Some("localhost") | Some("::1")
+        )
+        || endpoint.query().is_some()
+        || endpoint.fragment().is_some()
+        || !endpoint.username().is_empty()
+        || endpoint.password().is_some()
+    {
+        return Err("the local search endpoint is not a permitted loopback URL".into());
+    }
+    let path = endpoint.path().trim_end_matches('/');
+    endpoint.set_path(&format!("{path}/search"));
+    let response = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| format!("could not create local search client: {error}"))?
+        .get(endpoint)
+        // Use SearXNG's configured default engines. This includes Google when
+        // available, while retaining useful results if Google blocks an
+        // automated request.
+        .query(&[("q", query), ("format", "json")])
+        .send()
+        .map_err(|error| format!("local search failed: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("local search returned HTTP {}", response.status()));
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_SEARXNG_RESPONSE_BYTES)
+    {
+        return Err("local search response exceeds the 1 MiB limit".into());
+    }
+    let mut body = Vec::new();
+    response
+        .take(MAX_SEARXNG_RESPONSE_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|error| format!("could not read local search response: {error}"))?;
+    if body.len() as u64 > MAX_SEARXNG_RESPONSE_BYTES {
+        return Err("local search response exceeds the 1 MiB limit".into());
+    }
+    let response: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("local search returned invalid JSON: {error}"))?;
+    Ok(response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|result| {
+            let title = result.get("title")?.as_str()?.trim();
+            let url = result.get("url")?.as_str()?.trim();
+            let parsed = Url::parse(url).ok()?;
+            matches!(parsed.scheme(), "http" | "https").then(|| WebSearchResult {
+                title: title.chars().take(300).collect(),
+                url: url.chars().take(2_048).collect(),
+                snippet: result
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(1_000)
+                    .collect(),
+                source: result
+                    .get("engine")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(100)
+                    .collect(),
+                published_at: result
+                    .get("publishedDate")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .chars()
+                    .take(100)
+                    .collect(),
+            })
+        })
+        .take(8)
+        .collect())
 }
 
 fn create_new_conversation(
@@ -9324,6 +9568,36 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_web_search_prompts_extract_a_bounded_query() {
+        assert_eq!(
+            web_search_query_for_prompt("Search the web for local SearXNG documentation"),
+            Some("local SearXNG documentation".into())
+        );
+        assert_eq!(
+            web_search_query_for_prompt("Look up Fedora release notes"),
+            Some("Fedora release notes".into())
+        );
+        assert_eq!(web_search_query_for_prompt("How is the weather?"), None);
+        assert_eq!(web_search_query_for_prompt("Web search:   "), None);
+    }
+
+    #[test]
+    fn unavailable_local_answers_trigger_web_search_fallback() {
+        assert!(local_answer_needs_web_search(
+            "I don't have enough information to answer that."
+        ));
+        assert!(local_answer_needs_web_search(
+            "I cannot access the internet."
+        ));
+        assert!(local_answer_needs_web_search(
+            "I do not have access to real-time information, including breaking news."
+        ));
+        assert!(!local_answer_needs_web_search(
+            "The answer is in the linked documentation."
+        ));
+    }
 
     fn conversation(title: &str, messages: &[&str]) -> Conversation {
         Conversation {

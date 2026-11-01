@@ -292,18 +292,14 @@ mod tests {
         config.slow_keys_delay_ms = 500;
         let mut filter = KeyboardAccessibilityFilter::new(config);
         let start = Instant::now();
-        assert!(
-            filter
-                .process(30, KeyState::Pressed, KeyRole::Other, start)
-                .events
-                .is_empty()
-        );
-        assert!(
-            filter
-                .tick(start + Duration::from_millis(499))
-                .events
-                .is_empty()
-        );
+        assert!(filter
+            .process(30, KeyState::Pressed, KeyRole::Other, start)
+            .events
+            .is_empty());
+        assert!(filter
+            .tick(start + Duration::from_millis(499))
+            .events
+            .is_empty());
         assert_eq!(
             filter.tick(start + Duration::from_millis(500)).events,
             vec![KeyTransition {
@@ -320,23 +316,19 @@ mod tests {
         let mut filter = KeyboardAccessibilityFilter::new(config);
         let start = Instant::now();
         filter.process(30, KeyState::Pressed, KeyRole::Other, start);
-        assert!(
-            filter
-                .process(
-                    30,
-                    KeyState::Released,
-                    KeyRole::Other,
-                    start + Duration::from_millis(50)
-                )
-                .events
-                .is_empty()
-        );
-        assert!(
-            filter
-                .tick(start + Duration::from_secs(1))
-                .events
-                .is_empty()
-        );
+        assert!(filter
+            .process(
+                30,
+                KeyState::Released,
+                KeyRole::Other,
+                start + Duration::from_millis(50)
+            )
+            .events
+            .is_empty());
+        assert!(filter
+            .tick(start + Duration::from_secs(1))
+            .events
+            .is_empty());
     }
 
     #[test]
@@ -360,28 +352,24 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            filter
-                .process(
-                    30,
-                    KeyState::Pressed,
-                    KeyRole::Other,
-                    start + Duration::from_millis(299)
-                )
-                .events
-                .is_empty()
-        );
-        assert!(
-            filter
-                .process(
-                    30,
-                    KeyState::Released,
-                    KeyRole::Other,
-                    start + Duration::from_millis(300)
-                )
-                .events
-                .is_empty()
-        );
+        assert!(filter
+            .process(
+                30,
+                KeyState::Pressed,
+                KeyRole::Other,
+                start + Duration::from_millis(299)
+            )
+            .events
+            .is_empty());
+        assert!(filter
+            .process(
+                30,
+                KeyState::Released,
+                KeyRole::Other,
+                start + Duration::from_millis(300)
+            )
+            .events
+            .is_empty());
     }
 
     #[test]
@@ -397,12 +385,10 @@ mod tests {
                 .len(),
             1
         );
-        assert!(
-            filter
-                .process(42, KeyState::Released, KeyRole::Shift, now)
-                .events
-                .is_empty()
-        );
+        assert!(filter
+            .process(42, KeyState::Released, KeyRole::Shift, now)
+            .events
+            .is_empty());
         assert_eq!(
             filter
                 .process(30, KeyState::Pressed, KeyRole::Other, now)
@@ -446,17 +432,15 @@ mod tests {
                 start + Duration::from_millis(index * 100 + 20),
             );
         }
-        assert!(
-            filter
-                .process(
-                    42,
-                    KeyState::Pressed,
-                    KeyRole::Shift,
-                    start + Duration::from_millis(400)
-                )
-                .feedback
-                .contains(&Feedback::StickyShortcutRequested)
-        );
+        assert!(filter
+            .process(
+                42,
+                KeyState::Pressed,
+                KeyRole::Shift,
+                start + Duration::from_millis(400)
+            )
+            .feedback
+            .contains(&Feedback::StickyShortcutRequested));
     }
 
     #[test]

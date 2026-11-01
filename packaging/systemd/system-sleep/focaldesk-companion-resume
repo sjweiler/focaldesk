@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Restart the touchscreen layer-shell client after a system resume.  Its GTK
+# process can remain alive across suspend while its Wayland surface is no
+# longer mapped, which means Restart=on-failure cannot recover it.
+set -eu
+
+if [[ "${1:-}" != "post" ]]; then
+  exit 0
+fi
+
+user=steve
+uid=$(/usr/bin/id -u "$user")
+runtime_dir="/run/user/$uid"
+
+# A logged-out user has no session manager to receive this request.  systemd
+# invokes sleep hooks as root, so explicitly use the active user's D-Bus.
+if [[ ! -S "$runtime_dir/bus" ]]; then
+  exit 0
+fi
+
+exec /usr/bin/runuser -u "$user" -- /usr/bin/env \
+  XDG_RUNTIME_DIR="$runtime_dir" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus" \
+  /usr/bin/systemctl --user restart --no-block focaldesk-companion-dashboard.service

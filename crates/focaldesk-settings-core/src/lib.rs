@@ -20,6 +20,8 @@ pub struct Settings {
     #[serde(default)]
     pub privacy: PrivacySettings,
     #[serde(default)]
+    pub voice: VoiceSettings,
+    #[serde(default)]
     pub power: PowerSettings,
     #[serde(default)]
     pub debug: DebugSettings,
@@ -885,6 +887,25 @@ pub struct PrivacySettings {
     pub clear_notification_history_on_logout: bool,
 }
 
+/// Voice preferences shared by FocalDesk clients. Enabling a wake word does
+/// not itself start microphone capture; a client must still explicitly start
+/// an ambient voice session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceSettings {
+    pub wake_word_enabled: bool,
+    pub wake_word: String,
+}
+
+impl Default for VoiceSettings {
+    fn default() -> Self {
+        Self {
+            wake_word_enabled: false,
+            wake_word: "hello focaldesk".into(),
+        }
+    }
+}
+
 impl Default for PrivacySettings {
     fn default() -> Self {
         Self {
@@ -1006,6 +1027,7 @@ pub fn default_settings() -> Settings {
         },
         workspaces: WorkspaceSettings::default(),
         privacy: PrivacySettings::default(),
+        voice: VoiceSettings::default(),
         power: PowerSettings::default(),
         debug: DebugSettings::default(),
         chrome: ChromeSettings::default(),
@@ -1611,24 +1633,30 @@ mod tests {
 
     #[test]
     fn hdr_appearance_rejects_unsafe_or_non_finite_values() {
-        assert!(HdrAppearance {
-            reference_white_nits: 451.0,
-            ..HdrAppearance::default()
-        }
-        .validate()
-        .is_err());
-        assert!(HdrAppearance {
-            reference_white_nits: 300.0,
-            peak_nits: 250.0,
-            ..HdrAppearance::default()
-        }
-        .validate()
-        .is_err());
-        assert!(HdrAppearance {
-            saturation: f32::NAN,
-            ..HdrAppearance::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            HdrAppearance {
+                reference_white_nits: 451.0,
+                ..HdrAppearance::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HdrAppearance {
+                reference_white_nits: 300.0,
+                peak_nits: 250.0,
+                ..HdrAppearance::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            HdrAppearance {
+                saturation: f32::NAN,
+                ..HdrAppearance::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 }

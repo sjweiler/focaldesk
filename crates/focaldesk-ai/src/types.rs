@@ -185,6 +185,16 @@ pub struct AiDaemonStatus {
     pub provider_count: usize,
     #[serde(default)]
     pub provider_telemetry: Vec<ProviderTelemetry>,
+    /// Most recent completed chat retained in memory for session-local surfaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_chat: Option<RecentChatActivity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentChatActivity {
+    pub prompt: String,
+    pub response: String,
+    pub completed_at_unix: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,0 +1,19 @@
+[Unit]
+Description=FocalDesk touchscreen companion dashboard
+PartOf=focaldesk-session.target
+After=focaldesk-session.target
+
+[Service]
+Type=simple
+# The session target is reached before DRM output enumeration completes on
+# some GPUs.  Starting a layer-shell client in that gap leaves it alive but
+# unmapped, so wait for the compositor to publish its outputs first.
+ExecStartPre=/usr/bin/sleep 4
+ExecStart=%h/.local/bin/focaldesk-companion-dashboard
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=10
+
+[Install]
+WantedBy=focaldesk-session.target

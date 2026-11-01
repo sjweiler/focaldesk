@@ -1,8 +1,8 @@
 //! AT-SPI bridge for compositor-owned shell UI.
 
 use std::sync::{
-    Arc, RwLock,
     mpsc::{self, Receiver, Sender},
+    Arc, RwLock,
 };
 
 use accesskit::{

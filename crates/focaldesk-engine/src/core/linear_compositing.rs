@@ -2,29 +2,29 @@
 //! and HDR PQ scanout (C3b: scRGB working space, 10-bit PQ offscreen).
 
 use crate::core::backend_render::{
-    PreparedOutput, build_output_client_elements, build_output_popup_elements, draw_output,
-    draw_output_stage, prepare_output,
+    build_output_client_elements, build_output_popup_elements, draw_output, draw_output_stage,
+    prepare_output, PreparedOutput,
 };
 use crate::core::color::{
-    ColorPrimaries, RenderingIntent, hdr_render_runtime_enabled, hdr10_pq_encode_transforms,
-    kms_scanout_encode_description, linear_sdr_runtime_enabled, output_encode_scanout_needed,
-    scene_to_output_matrix,
+    hdr10_pq_encode_transforms, hdr_render_runtime_enabled, kms_scanout_encode_description,
+    linear_sdr_runtime_enabled, output_encode_scanout_needed, scene_to_output_matrix,
+    ColorPrimaries, RenderingIntent,
 };
 use crate::core::desktop::DesktopState;
 use crate::core::icc_lut::icc_lut_shader_enabled;
 use crate::core::render::{
-    ChromeGlassPass, ClientCompositingMode, FlowRenderElement, GlassStyle, OutputRenderStage,
-    work_area_glass_style,
+    work_area_glass_style, ChromeGlassPass, ClientCompositingMode, FlowRenderElement, GlassStyle,
+    OutputRenderStage,
 };
 use crate::core::ui_state::UiState;
 use crate::core::{OutputState, SceneState};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use focaldesk_logging::{flog, flog_warn};
 use focaldesk_types::OutputId;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::element::Element;
 use smithay::backend::renderer::gles::{
-    GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform, ffi,
+    ffi, GlesError, GlesFrame, GlesRenderer, GlesTexProgram, GlesTexture, Uniform,
 };
 use smithay::backend::renderer::sync::SyncPoint;
 use smithay::backend::renderer::{Bind, Color32F, Frame, ImportMem, Offscreen, Renderer, Texture};
@@ -329,7 +329,7 @@ fn resolve_hdr_encode_state(
 }
 
 fn wallpaper_grade_parameters(output: &crate::core::desktop::OutputState) -> (f32, f32, f32) {
-    use crate::core::color::{ColorPrimaries, primaries_wider_than};
+    use crate::core::color::{primaries_wider_than, ColorPrimaries};
 
     let selected = crate::core::color::hdr_output_selected(&output.handle.name());
     let test_encode = selected
@@ -2143,11 +2143,11 @@ mod tests {
             0.0,
         );
         assert_eq!(pixels.len(), 8 * 6 * 4);
-        assert!(
-            pixels.as_chunks::<4>().0.iter().all(|pixel| {
-                pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3]
-            })
-        );
+        assert!(pixels
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| { pixel[0] <= pixel[3] && pixel[1] <= pixel[3] && pixel[2] <= pixel[3] }));
     }
 
     #[test]

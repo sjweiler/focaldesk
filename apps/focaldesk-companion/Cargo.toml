@@ -1,0 +1,14 @@
+[package]
+name = "focaldesk-companion-dashboard"
+version = "0.1.0"
+edition = "2021"
+description = "FocalDesk touchscreen companion dashboard"
+license = "MIT"
+
+[[bin]]
+name = "focaldesk-companion-dashboard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+focaldesk-shell-gtk = { path = "../../crates/focaldesk-shell-gtk" }

@@ -7,7 +7,7 @@
 use chrono::{Datelike, Local, Timelike};
 use focaldesk_logging::flog_warn;
 use focaldesk_settings_core::{
-    AccessibilitySettings, ColorFilter, NightLightSchedule, load_settings, save_settings,
+    load_settings, save_settings, AccessibilitySettings, ColorFilter, NightLightSchedule,
 };
 
 pub type ColorMatrix = [[f32; 3]; 3];

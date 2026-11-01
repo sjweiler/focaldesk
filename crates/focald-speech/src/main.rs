@@ -6,6 +6,10 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -29,6 +33,7 @@ enum Priority {
 enum CommandKind {
     Speak,
     Stop,
+    Status,
 }
 
 #[derive(Debug, Deserialize)]
@@ -62,6 +67,7 @@ struct SpeechJob {
 enum WorkerCommand {
     Speak(SpeechJob),
     Stop,
+    Status,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -339,9 +345,11 @@ fn run_server() -> Result<()> {
 
     let (commands_tx, commands_rx) = mpsc::sync_channel(COMMAND_BUFFER);
     let backend = SpeechBackend::from_env().context("configure speech backend")?;
+    let speaking = Arc::new(AtomicBool::new(false));
+    let worker_speaking = speaking.clone();
     std::thread::Builder::new()
         .name("focald-speech-worker".into())
-        .spawn(move || worker_loop(commands_rx, backend))
+        .spawn(move || worker_loop(commands_rx, backend, worker_speaking))
         .context("start speech worker")?;
 
     eprintln!("focald-speech: listening at {}", socket.display());
@@ -349,7 +357,7 @@ fn run_server() -> Result<()> {
         match stream {
             Ok(stream) => {
                 if transport::require_authorized_peer(&stream, transport::SPEECH_POLICY).is_ok() {
-                    handle_client(stream, &commands_tx);
+                    handle_client(stream, &commands_tx, &speaking);
                 }
             }
             Err(err) => eprintln!("focald-speech: accept failed: {err}"),
@@ -358,22 +366,38 @@ fn run_server() -> Result<()> {
     Ok(())
 }
 
-fn handle_client(mut stream: UnixStream, commands: &SyncSender<WorkerCommand>) {
+fn handle_client(
+    mut stream: UnixStream,
+    commands: &SyncSender<WorkerCommand>,
+    speaking: &AtomicBool,
+) {
     let result = transport::read_limited(&mut stream)
         .map_err(|err| format!("reading request: {err}"))
         .and_then(|payload| transport::decode_message::<String>(&payload))
-        .and_then(|payload| decode_request(&payload))
-        .and_then(|command| {
-            commands.try_send(command).map_err(|err| match err {
-                TrySendError::Full(_) => "speech queue is full".to_string(),
-                TrySendError::Disconnected(_) => "speech worker is unavailable".to_string(),
-            })
-        });
+        .and_then(|payload| decode_request(&payload));
 
     let response = match result {
-        Ok(()) => WireResponse {
-            status: "accepted",
+        Ok(WorkerCommand::Status) => WireResponse {
+            status: if speaking.load(Ordering::Relaxed) {
+                "speaking"
+            } else {
+                "idle"
+            },
             message: None,
+        },
+        Ok(command) => match commands.try_send(command) {
+            Ok(()) => WireResponse {
+                status: "accepted",
+                message: None,
+            },
+            Err(TrySendError::Full(_)) => WireResponse {
+                status: "error",
+                message: Some("speech queue is full".into()),
+            },
+            Err(TrySendError::Disconnected(_)) => WireResponse {
+                status: "error",
+                message: Some("speech worker is unavailable".into()),
+            },
         },
         Err(message) => WireResponse {
             status: "error",
@@ -397,6 +421,7 @@ fn decode_request(payload: &str) -> Result<WorkerCommand, String> {
             }
             Ok(WorkerCommand::Stop)
         }
+        Some(CommandKind::Status) => Ok(WorkerCommand::Status),
         None | Some(CommandKind::Speak) => {
             let text = request
                 .text
@@ -415,7 +440,11 @@ fn decode_request(payload: &str) -> Result<WorkerCommand, String> {
     }
 }
 
-fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
+fn worker_loop(
+    commands: Receiver<WorkerCommand>,
+    backend: SpeechBackend,
+    speaking: Arc<AtomicBool>,
+) {
     let mut pending = VecDeque::<SpeechJob>::new();
     let mut current: Option<(BackendProcess, String)> = None;
 
@@ -426,6 +455,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
                 match backend.spawn(&job.text) {
                     Ok(child) => {
                         eprintln!("[speaking] {description:?}");
+                        speaking.store(true, Ordering::Relaxed);
                         current = Some((child, description));
                         break;
                     }
@@ -453,6 +483,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
                     pending.clear();
                     cancel_current(&mut current);
                     eprintln!("[stopped]");
+                    speaking.store(false, Ordering::Relaxed);
                 }
                 WorkerCommand::Speak(job) if job.priority == Priority::Interrupt => {
                     pending.clear();
@@ -469,6 +500,7 @@ fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
                     }
                     pending.push_back(job);
                 }
+                WorkerCommand::Status => {}
             }
         }
 
@@ -477,18 +509,21 @@ fn worker_loop(commands: Receiver<WorkerCommand>, backend: SpeechBackend) {
                 Ok(Some(())) => {
                     eprintln!("[finished] {description:?}");
                     current = None;
+                    speaking.store(false, Ordering::Relaxed);
                 }
                 Ok(None) => {}
                 Err(err) => {
                     eprintln!("[failed] {description:?}: {err:#}");
                     process.cancel();
                     current = None;
+                    speaking.store(false, Ordering::Relaxed);
                 }
             }
         }
     }
 
     cancel_current(&mut current);
+    speaking.store(false, Ordering::Relaxed);
 }
 
 fn cancel_current(current: &mut Option<(BackendProcess, String)>) {

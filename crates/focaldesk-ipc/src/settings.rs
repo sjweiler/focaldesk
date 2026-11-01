@@ -1,7 +1,7 @@
-use crate::{settings_socket_path, transport, IpcRequest, IpcResponse};
+use crate::{IpcRequest, IpcResponse, settings_socket_path, transport};
 use focaldesk_settings_core::{
-    load_settings, save_settings, BrowserLaunchBackend, DebugLogLevel, LidCloseAction,
-    LowBatteryAction, PerformanceMode, PowerButtonAction, Settings,
+    BrowserLaunchBackend, DebugLogLevel, LidCloseAction, LowBatteryAction, PerformanceMode,
+    PowerButtonAction, Settings, load_settings, save_settings,
 };
 use std::{
     io::Write,

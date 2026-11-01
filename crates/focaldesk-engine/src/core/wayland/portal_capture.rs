@@ -156,8 +156,8 @@ impl WlrLayerShellHandler for DesktopState {
         _layer: Layer,
         namespace: String,
     ) {
-        use smithay::desktop::LayerSurface;
         use smithay::desktop::layer_map_for_output;
+        use smithay::desktop::LayerSurface;
 
         let output = wl_output
             .as_ref()
@@ -168,6 +168,27 @@ impl WlrLayerShellHandler for DesktopState {
         let Some(output) = output else {
             return;
         };
+
+        // ControlPanel outputs are exclusively owned by the Companion.  The
+        // output positions intentionally overlap the primary desktop, and a
+        // mis-associated wl_output from a toolkit must therefore never allow
+        // the normal rail or dock to land on the touch panel.
+        let is_normal_shell_chrome = matches!(
+            namespace.as_str(),
+            crate::core::wayland::trusted_shell::PANEL_NAMESPACE
+                | crate::core::wayland::trusted_shell::DOCK_NAMESPACE
+        );
+        let is_control_panel = self
+            .output_id_for_space_output(&output)
+            .and_then(|id| self.outputs.get(&id))
+            .is_some_and(|state| state.role == focaldesk_settings_core::OutputRole::ControlPanel);
+        if is_normal_shell_chrome && is_control_panel {
+            focaldesk_logging::flog_warn!(
+                "refused {namespace} layer surface on ControlPanel output {}",
+                output.name()
+            );
+            return;
+        }
 
         let mut map = layer_map_for_output(&output);
         // LayerMap assigns intersecting exclusive edges in insertion order.

@@ -4,6 +4,59 @@ window.focal-shell-window {
   font-family: "IBM Plex Sans", sans-serif;
 }
 
+/* Full-screen touchscreen Companion Dashboard. */
+window.companion-dashboard-window,
+window.companion-dashboard-window > * {
+  background: @fd_shell_bg;
+}
+.companion-dashboard { color: @fd_shell_text; background: @fd_shell_bg; }
+.companion-header, .companion-footer { padding: 16px 26px; border-bottom: 1px solid @fd_shell_border; background: @fd_shell_surface; }
+.companion-footer { border-top: 1px solid @fd_shell_border; border-bottom: none; }
+.companion-brand { font-size: 27px; font-weight: 800; }
+.companion-nav, .companion-outline-button { padding: 8px 16px; border: 1px solid transparent; background: transparent; color: @fd_shell_text; }
+.companion-nav:hover, .companion-outline-button:hover { background: @fd_shell_surface_hover; border-color: @fd_shell_border; }
+.companion-nav.suggested-action { background: @fd_shell_surface_active; border-color: @fd_shell_border; }
+.companion-workspace-picker > contents {
+  background: @fd_shell_surface;
+  color: @fd_shell_text;
+  border: 1px solid @fd_shell_border;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px @fd_shell_shadow;
+}
+.companion-workspace-picker-body { background: @fd_shell_surface; color: @fd_shell_text; }
+.companion-workspace-picker .companion-outline-button {
+  background: @fd_shell_surface_raised;
+  color: @fd_shell_text;
+  border-color: @fd_shell_border;
+  font-weight: 700;
+}
+.companion-workspace-picker .companion-outline-button:hover {
+  background: @fd_shell_surface_active;
+  border-color: @fd_shell_accent;
+}
+.companion-header-clock { font-size: 22px; font-weight: 700; }
+.companion-body { padding: 16px 20px; }
+.companion-card { padding: 16px; border: 1px solid @fd_shell_border; border-radius: 12px; background: @fd_shell_surface; box-shadow: inset 0 1px @fd_shell_highlight; }
+.companion-card-title, .companion-section-title { font-size: 16px; font-weight: 700; color: @fd_shell_text_dim; }
+.companion-big-time { font-size: 72px; font-weight: 800; }
+.companion-subtitle { font-size: 19px; }
+.companion-album { min-height: 92px; font-size: 62px; color: @fd_shell_text_dim; }
+.companion-media-text { font-size: 18px; font-weight: 700; }
+.companion-media-controls { font-size: 16px; color: @fd_shell_text_dim; }
+.companion-listening { font-size: 17px; }
+.companion-waveform { font-size: 42px; color: @fd_shell_accent; }
+.companion-field { min-height: 74px; padding: 14px; border: 1px solid @fd_shell_border; border-radius: 8px; font-size: 20px; background: alpha(@fd_shell_bg, 0.45); }
+.companion-control-label { font-size: 17px; }
+.companion-value { color: @fd_shell_text_dim; }
+.companion-workspace { min-width: 92px; min-height: 78px; font-size: 22px; font-weight: 700; border: 1px solid @fd_shell_border; background: @fd_shell_surface_raised; }
+.companion-workspace:hover, .companion-workspace.suggested-action { background: @fd_shell_surface_active; border-color: @fd_shell_accent; }
+.companion-workspaces-title { font-size: 38px; font-weight: 800; }
+.companion-workspace-output { min-width: 360px; }
+.companion-workspace-summary { font-size: 17px; color: @fd_shell_text_dim; }
+.companion-workspace-tile { min-height: 112px; font-size: 20px; }
+.companion-footer-label { font-size: 16px; }
+.companion-mic { min-width: 110px; min-height: 72px; border-radius: 40px; font-weight: 700; background: @fd_shell_surface_active; }
+
 window.focal-dock-window {
   background: transparent;
   border: none;

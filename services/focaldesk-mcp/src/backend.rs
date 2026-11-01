@@ -1,9 +1,9 @@
 use focaldesk_ipc::{
-    DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, NotificationIpcRequest,
-    NotificationIpcResponse, send_desktop_request, send_notification_request,
+    send_desktop_request, send_notification_request, DesktopAction, DesktopSnapshot, IpcRequest,
+    IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
 };
 use focaldesk_logging::log_file_path_candidates;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -119,6 +119,9 @@ fn web_search(arguments: &Value) -> Result<Value, String> {
         .map_err(|error| format!("could not create local SearXNG client: {error}"))?;
     let response = client
         .get(endpoint)
+        // Keep outbound search behind the local SearXNG boundary. Its
+        // configured engine set can use Google when available and other
+        // sources when Google blocks an automated request.
         .query(&[("q", query.as_str()), ("format", "json")])
         .send()
         .map_err(|error| format!("local SearXNG search failed: {error}"))?;

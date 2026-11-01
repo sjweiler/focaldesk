@@ -76,6 +76,7 @@ members = [
     "crates/focaldesk-shell-client",
     "apps/focal-panel",
     "apps/focal-dock",
+    "apps/focaldesk-companion",
 ]
 resolver = "2"
 

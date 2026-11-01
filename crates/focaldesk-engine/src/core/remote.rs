@@ -333,10 +333,12 @@ pub fn export_rgba_frame(
 /// remote-desktop consumer on this output.  Portal clients have their own
 /// DMA-BUF path and must not force a CPU readback merely by existing.
 pub fn capture_active_for_output(state: &DesktopState, output_id: OutputId) -> bool {
-    state
-        .local_remote_capture
-        .as_ref()
-        .is_some_and(|remote| remote.sessions.values().any(|session| session.output_id == output_id))
+    state.local_remote_capture.as_ref().is_some_and(|remote| {
+        remote
+            .sessions
+            .values()
+            .any(|session| session.output_id == output_id)
+    })
 }
 
 fn socket_path() -> io::Result<PathBuf> {

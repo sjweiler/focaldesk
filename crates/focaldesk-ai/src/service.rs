@@ -3,6 +3,7 @@ use focaldesk_memory::{
     EmbeddingProvider, IndexedDocument, MemoryId, MemoryPolicy, MemoryService, MemoryStatus,
     MemoryStore, OllamaEmbeddingProvider, SearchHit,
 };
+use focaldesk_ipc::{ConnectorHostIpcRequest, send_connector_host_request};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -14,6 +15,7 @@ use tokio::time::{Duration, timeout};
 use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
+use crate::guard;
 use crate::managed_provider::{ManagedProvider, RetryPolicy};
 use crate::permissions::{authorize_ai_chat, confirm_ai_action};
 use crate::provider::AiProvider;
@@ -232,6 +234,7 @@ pub struct AiService {
     concurrency: Arc<Semaphore>,
     active_requests: Arc<AtomicUsize>,
     pending_permissions: Arc<AtomicUsize>,
+    latest_chat: Arc<Mutex<Option<crate::RecentChatActivity>>>,
     memory: Option<MemoryService>,
     tool_executor: Option<Arc<dyn AgentToolExecutor>>,
     pending_agent_actions: Mutex<BTreeMap<String, PendingAgentAction>>,
@@ -291,6 +294,7 @@ impl AiService {
             concurrency: Arc::new(Semaphore::new(2)),
             active_requests: Arc::new(AtomicUsize::new(0)),
             pending_permissions: Arc::new(AtomicUsize::new(0)),
+            latest_chat: Arc::new(Mutex::new(None)),
             memory: None,
             tool_executor: None,
             pending_agent_actions: Mutex::new(BTreeMap::new()),
@@ -1907,10 +1911,20 @@ impl AiService {
             default_provider: self.default_provider.clone(),
             provider_count: self.providers.len(),
             provider_telemetry,
+            latest_chat: self.latest_chat.lock().ok().and_then(|chat| chat.clone()),
         }
     }
 
     pub async fn chat(&self, mut request: ChatRequest) -> Result<ChatResponse> {
+        let now = chrono::Local::now();
+        request = guard::guard_request(request, now)?;
+        let prompt = latest_user_message(&request);
+        if let Some(window) = guard::current_month_calendar_window(&prompt, now) {
+            if let Some(response) = current_month_calendar_response(&window) {
+                self.record_latest_chat(prompt, &response);
+                return Ok(response);
+            }
+        }
         let provider_id = request
             .provider
             .clone()
@@ -1977,6 +1991,8 @@ impl AiService {
         }
 
         (response.content, response.citations) = retain_cited_sources(&response.content, citations);
+        response.content = guard::guard_output(&prompt, &response.content, &response.citations);
+        self.record_latest_chat(prompt, &response);
         Ok(response)
     }
 
@@ -1986,8 +2002,32 @@ impl AiService {
         mut request: ChatRequest,
         events: mpsc::Sender<AiStreamEvent>,
     ) -> Result<()> {
+        let now = chrono::Local::now();
+        request = guard::guard_request(request, now)?;
+        let prompt = latest_user_message(&request);
         if request_id.is_empty() {
             return Err(anyhow!("stream request id must not be empty"));
+        }
+        if let Some(window) = guard::current_month_calendar_window(&prompt, now) {
+            if let Some(response) = current_month_calendar_response(&window) {
+                events
+                    .send(AiStreamEvent::Started {
+                        request_id: request_id.clone(),
+                        provider: "local-calendar".into(),
+                        model: None,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("AI stream consumer disconnected"))?;
+                self.record_latest_chat(prompt, &response);
+                events
+                    .send(AiStreamEvent::Completed {
+                        request_id,
+                        response,
+                    })
+                    .await
+                    .map_err(|_| anyhow!("AI stream consumer disconnected"))?;
+                return Ok(());
+            }
         }
         let provider_id = request
             .provider
@@ -2089,10 +2129,10 @@ impl AiService {
                             }).await.ok();
                             return Ok(());
                         }
-                        events.send(AiStreamEvent::Delta {
-                            request_id: request_id.clone(),
-                            content,
-                        }).await.map_err(|_| anyhow!("AI stream consumer disconnected"))?;
+                        // Do not expose unguarded partial output. A secret or
+                        // disallowed phrase may straddle provider chunks, so
+                        // only the final, complete response is emitted after
+                        // the output guard has inspected it.
                     }
                 }
                 result = &mut provider_future => {
@@ -2100,6 +2140,11 @@ impl AiService {
                         .with_context(|| format!("streaming AI provider {provider_id} failed"))?;
                     (response.content, response.citations) =
                         retain_cited_sources(&response.content, citations.clone());
+                    response.content = guard::guard_output(
+                        &prompt,
+                        &response.content,
+                        &response.citations,
+                    );
                     if response.content.len() > AI_MAX_STREAM_CONTENT_BYTES {
                         events.send(AiStreamEvent::Failed {
                             request_id: request_id.clone(),
@@ -2109,6 +2154,7 @@ impl AiService {
                         }).await.ok();
                         return Ok(());
                     }
+                    self.record_latest_chat(prompt, &response);
                     events.send(AiStreamEvent::Completed {
                         request_id: request_id.clone(),
                         response,
@@ -2116,6 +2162,16 @@ impl AiService {
                     return Ok(());
                 }
             }
+        }
+    }
+
+    fn record_latest_chat(&self, prompt: String, response: &ChatResponse) {
+        if let Ok(mut latest) = self.latest_chat.lock() {
+            *latest = Some(crate::RecentChatActivity {
+                prompt,
+                response: response.content.clone(),
+                completed_at_unix: unix_now(),
+            });
         }
     }
 
@@ -4570,6 +4626,16 @@ fn parse_memory_limit(name: &str, default: usize, maximum: usize) -> Result<Opti
     Ok(Some(value))
 }
 
+fn latest_user_message(request: &ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| matches!(message.role, ChatRole::User))
+        .map(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
 fn build_prompt_message(request: &ChatRequest, provider_id: &str) -> String {
     let model = request.model.as_deref().unwrap_or("default model");
     let preview = request
@@ -4776,6 +4842,42 @@ fn trigger_values_match(kind: AgentTriggerKind, expected: &str, actual: &str) ->
     } else {
         expected == actual
     }
+}
+
+/// Answers current-month calendar questions from the local connector store.
+/// An empty calendar result falls through to the guarded document-retrieval
+/// path, so a user-indexed schedule PDF can supply cited evidence.
+fn current_month_calendar_response(window: &guard::CalendarWindow) -> Option<ChatResponse> {
+    let request = ConnectorHostIpcRequest::CalendarUpcoming {
+        after_unix: window.start.timestamp(),
+        before_unix: window.end.timestamp(),
+        limit: 100,
+    };
+    let content = match send_connector_host_request(&request) {
+        Ok(response) if response.status == "ok" && !response.calendar_events.is_empty() => {
+                let events = response
+                    .calendar_events
+                    .iter()
+                    .map(|event| format!("- {} — {}", event.start_time, event.title))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("Verified calendar events for this month:\n{events}")
+        }
+        Ok(response) if response.status != "ok" => format!(
+            "I can’t verify this month’s calendar because the local calendar service returned: {}",
+            response.message.unwrap_or_else(|| response.status)
+        ),
+        // The connector may deliberately have no account attached. Let the
+        // guarded local document index answer from a schedule PDF in that case.
+        Ok(_) | Err(_) => return None,
+    };
+    Some(ChatResponse {
+        provider: "local-calendar".into(),
+        model: None,
+        content,
+        usage: None,
+        citations: Vec::new(),
+    })
 }
 
 #[cfg(test)]

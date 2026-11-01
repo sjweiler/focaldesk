@@ -39,6 +39,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-panel",
         "focaldesk-system-rail",
         "focaldesk-task-shelf",
+        "focaldesk-companion-dashboard",
         "focaldesk-launcher",
         "focaldesk-settings",
         "focaldesk-portal",
@@ -54,6 +55,7 @@ pub const DESKTOP_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-panel.service",
         "focaldesk-system-rail.service",
         "focaldesk-task-shelf.service",
+        "focaldesk-companion-dashboard.service",
         "focaldesk-server.service",
         "focald-voice.service",
         "focald-connectors.service",
@@ -104,8 +106,12 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "power",
-    allowed_executables: &["focaldesk-desktop", "focaldesk-settings"],
-    allowed_units: &[],
+    allowed_executables: &[
+        "focaldesk-desktop",
+        "focaldesk-settings",
+        "focaldesk-companion-dashboard",
+    ],
+    allowed_units: &["focaldesk-companion-dashboard.service"],
 };
 
 pub const UPDATES_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -120,9 +126,13 @@ pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-desktop",
         "focaldesk-cli",
         "focaldesk-ai-console",
+        "focaldesk-companion-dashboard",
         "focald-connectors",
     ],
-    allowed_units: &["focald-connectors.service"],
+    allowed_units: &[
+        "focaldesk-companion-dashboard.service",
+        "focald-connectors.service",
+    ],
 };
 
 pub const CONNECTOR_HOST_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -167,8 +177,17 @@ pub const VOICE_POLICY: PeerPolicy<'static> = PeerPolicy {
 
 pub const SPEECH_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "speech",
-    allowed_executables: &["focald-mic", "focald-speech", "focaldesk-ai-console"],
-    allowed_units: &["focald-mic.service", "focald-speech.service"],
+    allowed_executables: &[
+        "focald-mic",
+        "focald-speech",
+        "focaldesk-ai-console",
+        "focaldesk-companion-dashboard",
+    ],
+    allowed_units: &[
+        "focald-mic.service",
+        "focald-speech.service",
+        "focaldesk-companion-dashboard.service",
+    ],
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,7 +259,10 @@ pub fn require_same_user(stream: &impl AsFd) -> io::Result<()> {
     if credentials.uid() != expected {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            format!("IPC peer uid {} does not match service uid {expected}", credentials.uid()),
+            format!(
+                "IPC peer uid {} does not match service uid {expected}",
+                credentials.uid()
+            ),
         ));
     }
     Ok(())

@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+chrono = { workspace = true }
 async-trait = "0.1"
 dirs = "6"
 ed25519-dalek = "3.0.0-rc.1"

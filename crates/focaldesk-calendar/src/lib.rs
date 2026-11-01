@@ -270,7 +270,7 @@ impl CalendarStore {
             .map_err(|_| anyhow!("calendar store lock poisoned"))?;
         let mut statement = connection.prepare(
             "SELECT account_id,provider,calendar_id,event_id,title,start_time,end_time,organizer,all_day,cancelled
-             FROM events WHERE cancelled=0 AND start_unix>=?1 AND start_unix<?2
+             FROM events WHERE cancelled=0 AND start_unix<?2 AND end_unix>?1
              ORDER BY start_unix ASC LIMIT ?3")?;
         let rows = statement.query_map(
             params![after_unix, before_unix, limit.min(500) as i64],

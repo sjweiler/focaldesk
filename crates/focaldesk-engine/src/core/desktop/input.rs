@@ -320,14 +320,36 @@ impl DesktopState {
     }
 
     /// Route raw contacts directly through wl_touch. Deliberately do not
-    /// synthesize pointer events: clients must be able to distinguish a
-    /// multi-touch gesture from mouse input.
+    /// synthesize pointer events for application surfaces: clients must be
+    /// able to distinguish a multi-touch gesture from mouse input. The
+    /// exception is a control-panel output, whose controls are native
+    /// compositor UI rather than a Wayland client.
     fn handle_touch_down(&mut self, slot: i32, position: Position, time_msec: u32) {
+        // `translate_backend_input_event` maps touch coordinates to the sole
+        // control panel. Do not infer that target again from global geometry:
+        // a panel may intentionally overlap a normal output in the logical
+        // layout while remaining a distinct physical display.
+        let is_control_panel = self.sole_control_panel_output().is_some();
+        if is_control_panel && self.input.control_panel_touch_slot.is_none() {
+            self.input.control_panel_touch_slot = Some(slot);
+            self.handle_pointer_motion(InputEvent::PointerMoved {
+                position,
+                delta: None,
+                delta_unaccel: None,
+            });
+            self.handle_pointer_button(InputEvent::PointerButton {
+                button: MouseButton::Left,
+                state: KeyState::Pressed,
+                position,
+            });
+            return;
+        }
+
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
-        let position: Point<f64, Logical> = position.into();
-        let position = self.confine_pointer_to_outputs(self.pointer_pos, position);
+        let logical_position: Point<f64, Logical> = position.into();
+        let position = self.confine_pointer_to_outputs(self.pointer_pos, logical_position);
         let target = self
             .pointer_surface_under(position)
             .and_then(|(target, surface_loc)| {
@@ -348,6 +370,15 @@ impl DesktopState {
     }
 
     fn handle_touch_motion(&mut self, slot: i32, position: Position, time_msec: u32) {
+        if self.input.control_panel_touch_slot == Some(slot) {
+            self.handle_pointer_motion(InputEvent::PointerMoved {
+                position,
+                delta: None,
+                delta_unaccel: None,
+            });
+            return;
+        }
+
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
@@ -372,6 +403,16 @@ impl DesktopState {
     }
 
     fn handle_touch_up(&mut self, slot: i32, time_msec: u32) {
+        if self.input.control_panel_touch_slot == Some(slot) {
+            self.handle_pointer_button(InputEvent::PointerButton {
+                button: MouseButton::Left,
+                state: KeyState::Released,
+                position: self.input.pointer_pos,
+            });
+            self.input.control_panel_touch_slot = None;
+            return;
+        }
+
         let Some(touch) = self.seat.get_touch() else {
             return;
         };
@@ -386,6 +427,14 @@ impl DesktopState {
     }
 
     fn handle_touch_cancel(&mut self) {
+        if self.input.control_panel_touch_slot.is_some() {
+            self.handle_pointer_button(InputEvent::PointerButton {
+                button: MouseButton::Left,
+                state: KeyState::Released,
+                position: self.input.pointer_pos,
+            });
+            self.input.control_panel_touch_slot = None;
+        }
         if let Some(touch) = self.seat.get_touch() {
             touch.cancel(self);
         }
@@ -417,7 +466,12 @@ impl DesktopState {
         let position = position.into();
         self.pointer_pos = position;
 
-        if let Some(id) = self.output_under_pointer(position) {
+        let pointer_output = self
+            .input
+            .control_panel_touch_slot
+            .and_then(|_| self.sole_control_panel_output())
+            .or_else(|| self.output_under_pointer(position));
+        if let Some(id) = pointer_output {
             self.set_focused_output(id);
         }
         self.update_magnifier_pointer_focus(position);
@@ -427,6 +481,21 @@ impl DesktopState {
         self.rebuild_ui_tree_for_output(self.focused_output);
         let cursor_owner_damage = self.update_cursor_owner_damage();
         let stale_cursor_damage = self.clear_stale_software_cursor_damage();
+
+        // A ControlPanel touch is owned by its full-screen companion layer
+        // client. Do not offer that click to compositor-native chrome first:
+        // its controls share the same output-local geometry and would consume
+        // the event before the companion can activate its button.
+        if self.input.control_panel_touch_slot.is_some() {
+            self.forward_pointer_button_to_desktop(
+                button,
+                state,
+                position,
+                cursor_owner_damage,
+                stale_cursor_damage,
+            );
+            return;
+        }
 
         if self.pointer_button_consumed_by_overlay(&event) {
             return;
@@ -647,8 +716,23 @@ impl DesktopState {
             }
         }
 
-        if let Some(id) = self.output_under_pointer(position) {
+        let pointer_output = self
+            .input
+            .control_panel_touch_slot
+            .and_then(|_| self.sole_control_panel_output())
+            .or_else(|| self.output_under_pointer(position));
+        if let Some(id) = pointer_output {
             self.set_focused_output(id);
+        }
+        if let Some(output_id) = self
+            .input
+            .control_panel_touch_slot
+            .and_then(|_| self.sole_control_panel_output())
+        {
+            self.forward_pointer_to_clients_on_output(position, output_id);
+            self.forward_pointer_button(position, button, state);
+            self.mark_output_full_damage(output_id, DamageSource::Unknown);
+            return;
         }
         self.cursor_manager.move_to(position.x, position.y);
         if self.has_workspace_transition(self.focused_output) {
@@ -884,16 +968,33 @@ impl DesktopState {
         };
         let (position, delta, delta_unaccel) = (*position, *delta, *delta_unaccel);
 
+        let control_panel_output = self
+            .input
+            .control_panel_touch_slot
+            .and_then(|_| self.sole_control_panel_output());
         let previous_pos = self.pointer_pos;
-        let pointer_locked = self.pointer_lock_active_at(previous_pos);
-        let position = self.constrained_pointer_position(previous_pos, position.into());
-        let position = self.confine_pointer_to_outputs(previous_pos, position);
+        let pointer_locked =
+            control_panel_output.is_none() && self.pointer_lock_active_at(previous_pos);
+        let position = if control_panel_output.is_some() {
+            position.into()
+        } else {
+            let position = self.constrained_pointer_position(previous_pos, position.into());
+            self.confine_pointer_to_outputs(previous_pos, position)
+        };
         self.input.pointer_pos = position.into();
         self.pointer_pos = position;
-        if let Some(id) = self.output_under_pointer(position) {
+        if let Some(id) = control_panel_output.or_else(|| self.output_under_pointer(position)) {
             self.set_focused_output(id);
         }
         self.update_magnifier_pointer_focus(position);
+        if let Some(output_id) = control_panel_output {
+            // A direct-touch panel is not a mouse. It needs pointer-protocol
+            // compatibility for GTK, but must not drag the visible cursor away
+            // from the work display.
+            self.forward_pointer_to_clients_on_output(position, output_id);
+            self.mark_output_full_damage(output_id, DamageSource::Unknown);
+            return;
+        }
         // Keep the visible cursor in lockstep with the compositor's logical pointer before an
         // overlay gets a chance to consume the event.
         self.cursor_manager.move_to(position.x, position.y);

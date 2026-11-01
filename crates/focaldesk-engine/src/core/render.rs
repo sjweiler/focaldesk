@@ -10,13 +10,13 @@ use focaldesk_ui::chrome::ChromeMetrics;
 use focaldesk_ui::types::{ElementId, UiElementKind};
 use image::GenericImageView;
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::Color32F;
-use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
+use smithay::backend::renderer::gles::ffi;
 use smithay::backend::renderer::gles::GlesFrame;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::gles::GlesTexture;
-use smithay::backend::renderer::gles::ffi;
+use smithay::backend::renderer::Color32F;
+use smithay::backend::renderer::Frame;
 use smithay::backend::renderer::{ImportMem, Texture};
 use smithay::desktop::Window;
 use smithay::desktop::{PopupManager, Space};
@@ -36,7 +36,7 @@ use focaldesk_cursor::{CursorIcon as FlowCursorIcon, CursorManager};
 use focaldesk_logging::{flog, flog_error, flog_info, session_id};
 use focaldesk_notifications::NotificationSnapshot;
 use focaldesk_types::OutputId;
-use focaldesk_ui::atlas::{IconId, IconState, render_atlas_icon_with_alpha};
+use focaldesk_ui::atlas::{render_atlas_icon_with_alpha, IconId, IconState};
 use smithay::backend::renderer::element::render_elements;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::texture::TextureRenderElement;
@@ -45,34 +45,34 @@ use smithay::backend::renderer::utils::draw_render_elements;
 use wayland_server::protocol::wl_surface::WlSurface;
 //use focaldesk_ui::atlas::render_atlas_icon_with_alpha;
 use crate::core::color::{
-    ColorPrimaries, RenderingIntent, SurfaceColorRenderState, gamut_matrix_linear_rgb,
-    scene_working_primaries, srgb_to_linear,
+    gamut_matrix_linear_rgb, scene_working_primaries, srgb_to_linear, ColorPrimaries,
+    RenderingIntent, SurfaceColorRenderState,
 };
 use crate::core::desktop::DesktopState;
 use crate::core::desktop::{
     ClockPulseFrame, SidebarPulseFrame, TopbarPulseFrame, TopbarPulseTarget, WorkspaceRenderView,
 };
+use crate::core::fonts::style_for;
 use crate::core::fonts::FontRole;
 use crate::core::fonts::FontRole::Title;
-use crate::core::fonts::style_for;
 use crate::core::fonts::{FontId, FontSystem, TextStyle};
-use crate::core::lock::{LOCK_PULSE_DURATION, LockPulseKind, LockScreenSnapshot};
+use crate::core::lock::{LockPulseKind, LockScreenSnapshot, LOCK_PULSE_DURATION};
 use crate::core::shell::ManagedWindow;
 use focaldesk_resources::RenderResources;
+use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_themes::BackgroundTheme;
 use focaldesk_themes::FlowTheme;
 use focaldesk_themes::IconTheme;
 use focaldesk_themes::TextTheme;
 use focaldesk_themes::WallpaperTheme;
-use focaldesk_themes::theme::BuiltInThemeId;
 use focaldesk_types::WorkspaceId;
 use focaldesk_ui::chrome_draw::draw_flow_field;
 use focaldesk_ui::chrome_layout::{ChromeLayout, ChromeLayoutLogical, SIDEBAR_CORNER_RADIUS};
 use focaldesk_ui::chrome_shaders::ChromeShaders;
 use focaldesk_ui::desktop_frame::DesktopFrameCtx;
 use focaldesk_ui::dialog::{Dialog, DialogId};
-use focaldesk_ui::dialog_layout::DialogLayout;
 use focaldesk_ui::dialog_layout::layout_dialog;
+use focaldesk_ui::dialog_layout::DialogLayout;
 use focaldesk_ui::{UiVisualState, UiVisualStyle};
 use smithay::backend::renderer::gles::GlesError;
 use smithay::backend::renderer::gles::GlesPixelProgram;
@@ -484,10 +484,10 @@ pub(crate) fn managed_window_is_visible_on_output(
 #[cfg(test)]
 mod color_run_tests {
     use super::{
-        RenderState, UiVisualState, clipped_dest_local_damage, contiguous_runs_by_key,
-        preferred_output_index, semantic_color, themed_icon_style,
+        clipped_dest_local_damage, contiguous_runs_by_key, preferred_output_index, semantic_color,
+        themed_icon_style, RenderState, UiVisualState,
     };
-    use focaldesk_themes::{SemanticTheme, ThemeColor, theme_by_name};
+    use focaldesk_themes::{theme_by_name, SemanticTheme, ThemeColor};
     use smithay::utils::{Logical, Physical, Rectangle};
 
     #[test]
@@ -3934,7 +3934,7 @@ impl RenderState {
         use smithay::backend::renderer::gles::{GlesTexProgram, Uniform};
         use smithay::utils::{Buffer, Physical, Rectangle, Transform};
 
-        use crate::core::wallpaper::{RectI, SizeI, WallpaperMode, compute_wallpaper_blits};
+        use crate::core::wallpaper::{compute_wallpaper_blits, RectI, SizeI, WallpaperMode};
 
         let Some(tex) = self.wallpaper_texture.as_ref() else {
             return;
@@ -4080,7 +4080,7 @@ impl RenderState {
         if theme.fit != focaldesk_themes::ThemeWallpaperFit::Fill {
             return;
         }
-        use crate::core::wallpaper::{RectI, SizeI, WallpaperMode, compute_wallpaper_blit};
+        use crate::core::wallpaper::{compute_wallpaper_blit, RectI, SizeI, WallpaperMode};
         use smithay::backend::renderer::gles::Uniform;
 
         let Some(texture) = self.wallpaper_texture.as_ref() else {

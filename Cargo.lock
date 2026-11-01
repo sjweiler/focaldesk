@@ -2599,6 +2599,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "dirs 6.0.0",
  "ed25519-dalek",
  "focaldesk-ipc",
@@ -2638,6 +2639,7 @@ dependencies = [
  "focaldesk-voice",
  "glib 0.20.12",
  "gtk4",
+ "reqwest",
  "serde",
  "serde_json",
 ]
@@ -2728,6 +2730,14 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-scanner",
+]
+
+[[package]]
+name = "focaldesk-companion-dashboard"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-shell-gtk",
 ]
 
 [[package]]
@@ -3283,6 +3293,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "focaldesk-ai",
  "focaldesk-config",
  "focaldesk-ipc",
  "focaldesk-logging",
@@ -3291,9 +3302,11 @@ dependencies = [
  "gtk4",
  "gtk4-layer-shell",
  "resvg 0.41.0",
+ "serde_json",
  "vui-core",
  "vui-text",
  "vui-vello",
+ "zbus 4.4.0",
 ]
 
 [[package]]

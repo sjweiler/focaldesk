@@ -3431,7 +3431,13 @@ impl DesktopState {
     }
 
     pub(crate) fn register_libinput_device(&mut self, mut device: LibinputDevice) {
-        if !device.has_capability(LibinputDeviceCapability::Pointer) {
+        // Touchscreens commonly expose only the Touch capability (and no
+        // relative Pointer capability). Keep those devices in the registry so
+        // their enabled state is applied and they remain visible to the
+        // compositor's input-management path.
+        if !device.has_capability(LibinputDeviceCapability::Pointer)
+            && !device.has_capability(LibinputDeviceCapability::Touch)
+        {
             return;
         }
         let id = libinput_device_id(&device);
@@ -4881,6 +4887,18 @@ impl DesktopState {
             })
             .map(|(id, _)| *id)
     }
+
+    /// Return the touch target when exactly one output is reserved for
+    /// compositor-native controls. With more than one control panel, a device
+    /// to output mapping is required instead of guessing.
+    pub(crate) fn sole_control_panel_output(&self) -> Option<OutputId> {
+        let mut panels = self
+            .outputs
+            .iter()
+            .filter_map(|(id, output)| (output.role == OutputRole::ControlPanel).then_some(*id));
+        let panel = panels.next()?;
+        panels.next().is_none().then_some(panel)
+    }
     pub fn update_ui_hover_for_output(&mut self, output_id: OutputId) -> bool {
         self.update_ui_hover_for_output_inner(output_id, true, true)
     }
@@ -5035,6 +5053,20 @@ impl DesktopState {
         output_id: OutputId,
         now: Instant,
     ) -> crate::core::wayland::trusted_shell::InternalChromeVisibility {
+        // A ControlPanel is a dedicated full-screen surface.  It must never
+        // receive compositor fallback rail/dock chrome, including during the
+        // short period before its companion client has mapped.
+        if self.outputs.get(&output_id).is_some_and(|output| {
+            load_settings()
+                .displays
+                .outputs
+                .into_iter()
+                .find(|configured| configured.connector == output.handle.name())
+                .map(|configured| configured.role == OutputRole::ControlPanel)
+                .unwrap_or(output.role == OutputRole::ControlPanel)
+        }) {
+            return crate::core::wayland::trusted_shell::InternalChromeVisibility::hidden();
+        }
         let presence = self
             .outputs
             .get(&output_id)
@@ -6565,6 +6597,20 @@ impl DesktopState {
         layer_order: &[smithay::wayland::shell::wlr_layer::Layer],
     ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
         let output_id = self.output_under_pointer(pos)?;
+        self.pointer_layer_surface_under_on_output(pos, output_id, layer_order)
+    }
+
+    /// Layer-surface hit test pinned to a known physical output.
+    ///
+    /// A direct-touch control panel may intentionally overlap another output
+    /// in global logical coordinates, so its physical output must be chosen
+    /// before hit-testing its layer surfaces.
+    fn pointer_layer_surface_under_on_output(
+        &self,
+        pos: Point<f64, Logical>,
+        output_id: OutputId,
+        layer_order: &[smithay::wayland::shell::wlr_layer::Layer],
+    ) -> Option<(PointerFocusTarget, Point<f64, Logical>)> {
         let output = self.outputs.get(&output_id)?;
         let output_geo = self
             .space
@@ -6770,6 +6816,37 @@ impl DesktopState {
                     .map(|(target, surface_loc)| (target, surface_loc))
             ));
         }
+        let serial = SERIAL_COUNTER.next_serial();
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time: Self::wl_pointer_time_ms(),
+            },
+        );
+        pointer.frame(self);
+    }
+
+    /// Deliver pointer motion to a layer surface on one physical output.
+    /// This is used by the direct-touch companion dashboard, whose output
+    /// overlaps the ordinary desktop in the logical layout.
+    pub(crate) fn forward_pointer_to_clients_on_output(
+        &mut self,
+        pos: Point<f64, Logical>,
+        output_id: OutputId,
+    ) {
+        use smithay::wayland::shell::wlr_layer::Layer as WlrLayer;
+
+        let Some(pointer) = self.seat.get_pointer() else {
+            return;
+        };
+        let under = self.pointer_layer_surface_under_on_output(
+            pos,
+            output_id,
+            &[WlrLayer::Overlay, WlrLayer::Top],
+        );
         let serial = SERIAL_COUNTER.next_serial();
         pointer.motion(
             self,
@@ -9595,9 +9672,19 @@ impl DesktopState {
                 snapshot
                     .workspaces
                     .iter()
-                    .filter(|name| !name.trim().is_empty())
                     .take(32)
-                    .cloned()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        let name = name.trim();
+                        // Session state predates typed workspace metadata and
+                        // has, in the wild, contained a wallpaper path in this
+                        // field. A workspace title is never an absolute path.
+                        if name.is_empty() || name.starts_with('/') {
+                            format!("Workspace {}", index + 1)
+                        } else {
+                            name.chars().take(64).collect()
+                        }
+                    })
                     .collect::<Vec<_>>()
             })
             .filter(|names| !names.is_empty())

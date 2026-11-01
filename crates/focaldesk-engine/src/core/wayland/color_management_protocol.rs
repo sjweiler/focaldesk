@@ -1,8 +1,9 @@
 //! [`wp_color_management_v1`](https://wayland.app/protocols/color-management-v1) server.
 
 use crate::core::color::{
-    ColorDescription, ColorPrimaries, PrimariesChromaticity, RenderingIntent, SurfaceColorState,
-    TransferFunction as CoreTransferFunction, primaries_plausible, primaries_wider_than,
+    primaries_plausible, primaries_wider_than, ColorDescription, ColorPrimaries,
+    PrimariesChromaticity, RenderingIntent, SurfaceColorState,
+    TransferFunction as CoreTransferFunction,
 };
 use crate::core::desktop::DesktopState;
 use crate::core::icc::{self, parse_icc_profile, read_icc_from_fd};
@@ -21,7 +22,7 @@ use wayland_protocols::wp::color_management::v1::server::{
 };
 use wayland_server::protocol::wl_surface::WlSurface;
 use wayland_server::{
-    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum, backend,
+    backend, Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, WEnum,
 };
 
 use std::sync::OnceLock;

@@ -3497,9 +3497,20 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
 ) -> Option<focaldesk_input::InputEvent> {
     use smithay::backend::input::InputEvent;
 
-    let output_id = state
+    let pointer_output = state
         .output_at_logical_point(state.pointer_pos)
         .unwrap_or(state.focused_output);
+    // A dedicated control-panel output is compositor-native UI, not a
+    // Wayland client. A single attached touch panel therefore targets it
+    // directly instead of following the mouse/keyboard-focused display.
+    // Do not guess when multiple panels exist: that needs explicit device
+    // mapping.
+    let output_id = match input {
+        InputEvent::TouchDown { .. } | InputEvent::TouchMotion { .. } => {
+            state.sole_control_panel_output().unwrap_or(pointer_output)
+        }
+        _ => pointer_output,
+    };
     let scale = state
         .outputs
         .get(&output_id)
@@ -3511,8 +3522,8 @@ pub(crate) fn translate_backend_input_event<B: smithay::backend::input::InputBac
         .map(|output| output.handle.current_transform())
         .unwrap_or(Transform::Normal);
 
-    // Absolute devices (for example, a tablet or touchscreen) must transform against the
-    // focused output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
+    // Absolute devices (for example, a tablet or touchscreen) must transform against their
+    // target output's geometry, not the combined desktop bounds (anvil/smallvil pattern).
     let clamp_rect = match input {
         InputEvent::PointerMotionAbsolute { .. }
         | InputEvent::TouchDown { .. }

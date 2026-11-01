@@ -11,8 +11,8 @@ use std::{
 };
 
 use focaldesk_ipc::{
-    DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, ShellPanel, WindowSnapshot,
-    send_desktop_request,
+    send_desktop_request, DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, ShellPanel,
+    WindowSnapshot,
 };
 use gtk::{cairo, glib, prelude::*};
 use gtk4_layer_shell::LayerShell;
@@ -68,6 +68,7 @@ pub(super) fn enabled(role: ShellRole) -> bool {
         && match role {
             ShellRole::Panel => flag("FOCALDESK_VUI_RAIL"),
             ShellRole::Dock => flag("FOCALDESK_VUI_DOCK"),
+            ShellRole::Companion => false,
         }
 }
 
@@ -151,10 +152,12 @@ pub(super) fn build(
     area.set_content_width(match role {
         ShellRole::Panel => 64,
         ShellRole::Dock => 560,
+        ShellRole::Companion => 1,
     });
     area.set_content_height(match role {
         ShellRole::Panel => 1,
         ShellRole::Dock => 64,
+        ShellRole::Companion => 1,
     });
     area.set_hexpand(true);
     area.set_vexpand(true);
@@ -357,6 +360,7 @@ pub(super) fn build(
         match role {
             ShellRole::Panel => crate::RAIL_SNAPSHOT_POLL_INTERVAL,
             ShellRole::Dock => crate::BACKGROUND_SNAPSHOT_POLL_INTERVAL,
+            ShellRole::Companion => crate::BACKGROUND_SNAPSHOT_POLL_INTERVAL,
         },
     );
     let tick_state = state.clone();
@@ -903,6 +907,7 @@ fn build_runtime(
             dock_view,
             backing_opacity,
         ),
+        ShellRole::Companion => unreachable!("companion dashboard does not use VUI"),
     }]);
     let text_system = ParleyTextSystem::with_embedded_fonts([
         include_bytes!("../../../assets/fonts/IBMPlexSans-Regular.ttf").as_slice(),
@@ -929,6 +934,7 @@ fn effective_backing_opacity(role: ShellRole) -> u8 {
     let opacity = config.appearance.panel_darkness.unwrap_or(match role {
         ShellRole::Panel => f64::from(theme.backing.rail_opacity),
         ShellRole::Dock => f64::from(theme.backing.dock_opacity),
+        ShellRole::Companion => f64::from(theme.backing.dock_opacity),
     });
     (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
 }

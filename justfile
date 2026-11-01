@@ -201,14 +201,16 @@ install-session-target:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
 
 install-shell-services: install-session-target
-    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf
+    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf -p focaldesk-companion-dashboard
     install -Dm755 target/release/focaldesk-system-rail "$HOME/.local/bin/focaldesk-system-rail"
     install -Dm755 target/release/focaldesk-task-shelf "$HOME/.local/bin/focaldesk-task-shelf"
+    install -Dm755 target/release/focaldesk-companion-dashboard "$HOME/.local/bin/focaldesk-companion-dashboard"
     install -Dm644 packaging/systemd/user/focaldesk-system-rail.service "$HOME/.config/systemd/user/focaldesk-system-rail.service"
     install -Dm644 packaging/systemd/user/focaldesk-task-shelf.service "$HOME/.config/systemd/user/focaldesk-task-shelf.service"
+    install -Dm644 packaging/systemd/user/focaldesk-companion-dashboard.service "$HOME/.config/systemd/user/focaldesk-companion-dashboard.service"
     systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service || true
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
+    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || echo "Skipping GTK shell enable: no user bus available"
 
 install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-recorder install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic install-focald-connectors
 
