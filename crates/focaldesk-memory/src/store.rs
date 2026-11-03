@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::{fs, os::unix::fs::PermissionsExt};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use focal_vector_client::{Client as FocalVectorClient, Metric, Point};
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection, Transaction};
+use rusqlite::{Connection, Transaction, ffi::sqlite3_auto_extension, params};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use zerocopy::IntoBytes;
@@ -518,7 +518,12 @@ impl MemoryStore {
                         / query_terms.len() as f32;
                     score += overlap * 0.02;
                 }
-                (record, score, semantic_distance.unwrap_or(f32::INFINITY))
+                // `SearchHit` crosses the AI IPC boundary as JSON. JSON has
+                // no representation for infinity (serde_json writes it as
+                // `null`), which made lexical-only matches impossible for
+                // clients to deserialize. A finite maximum value preserves
+                // the "no semantic score" ordering without breaking IPC.
+                (record, score, semantic_distance.unwrap_or(f32::MAX))
             })
             .collect::<Vec<_>>();
         hits.sort_by(|left, right| right.1.total_cmp(&left.1));
@@ -1530,6 +1535,7 @@ mod tests {
                 hits[0].record.text,
                 "diagnostic code ZXQ441 identifies the failure"
             );
+            assert!(hits.iter().all(|hit| hit.distance.is_finite()));
         });
         drop(store);
         let _ = fs::remove_file(path);

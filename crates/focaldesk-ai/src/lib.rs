@@ -96,6 +96,7 @@ pub use types::{
     AiDaemonStatus, AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, Citation,
     DirectoryIngestResult, DocumentIngestResult, ProviderInfo, ProviderModelInfo,
     ProviderTelemetry, RecentChatActivity, RetrievalEvalCase, RetrievalEvalReport, TokenUsage,
+    WebsiteIngestResult,
 };
 pub use workflow::{
     WORKFLOW_MANIFEST_VERSION, WorkflowArtifact, WorkflowDefinition, WorkflowNode,

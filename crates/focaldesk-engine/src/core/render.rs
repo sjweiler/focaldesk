@@ -269,6 +269,8 @@ pub struct RenderInputs<'a> {
     pub split_resize_percent: Option<u8>,
     /// Output-local target shown while a moved window is inside a snap zone.
     pub snap_preview: Option<Rectangle<i32, Logical>>,
+    /// Output-local rectangle currently being selected for a screenshot.
+    pub screenshot_selection: Option<Rectangle<i32, Logical>>,
     /// When true, composite the cursor from [`RenderState::sw_cursor_texture`] after chrome.
     pub draw_software_cursor: bool,
     /// Focus is retained by the accessibility model, while chrome rendering
@@ -2788,6 +2790,78 @@ impl RenderState {
             }
         }
 
+        if matches!(stage, OutputRenderStage::All | OutputRenderStage::Overlay) {
+            if let Some(selection) = inputs.screenshot_selection {
+                let output = Rectangle::<i32, Logical>::from_size((
+                    (f64::from(inputs.ctx.output_size.0) / inputs.ctx.output_scale.x).round() as i32,
+                    (f64::from(inputs.ctx.output_size.1) / inputs.ctx.output_scale.y).round() as i32,
+                ).into());
+                let dim = [0.0, 0.0, 0.0, 0.55];
+                for strip in [
+                    Rectangle::from_loc_and_size(output.loc, (output.size.w, selection.loc.y)),
+                    Rectangle::from_loc_and_size((0, selection.loc.y), (selection.loc.x, selection.size.h)),
+                    Rectangle::from_loc_and_size((selection.loc.x + selection.size.w, selection.loc.y), (output.size.w - selection.loc.x - selection.size.w, selection.size.h)),
+                    Rectangle::from_loc_and_size((0, selection.loc.y + selection.size.h), (output.size.w, output.size.h - selection.loc.y - selection.size.h)),
+                ] {
+                    if strip.size.w > 0 && strip.size.h > 0 {
+                        Self::draw_solid_rect(
+                            frame,
+                            strip.to_physical_precise_round::<f64, i32>(inputs.ctx.output_scale),
+                            &inputs.ctx.damage,
+                            dim,
+                        )?;
+                    }
+                }
+                let mut border = theme.chrome.accent_color;
+                border[3] = 1.0;
+                for edge in [
+                    Rectangle::from_loc_and_size(selection.loc, (selection.size.w, 2)),
+                    Rectangle::from_loc_and_size((selection.loc.x, selection.loc.y + selection.size.h - 2), (selection.size.w, 2)),
+                    Rectangle::from_loc_and_size(selection.loc, (2, selection.size.h)),
+                    Rectangle::from_loc_and_size((selection.loc.x + selection.size.w - 2, selection.loc.y), (2, selection.size.h)),
+                ] {
+                    if edge.size.w > 0 && edge.size.h > 0 {
+                        self.draw_rounded_rect(frame, edge, inputs.ctx.output_scale, 0.0, border)?;
+                    }
+                }
+
+                // A region capture is a modal compositor action. Give it an
+                // unmistakable explanation before the user starts dragging;
+                // an empty rectangle alone is too easy to mistake for a
+                // shortcut that did nothing.
+                let hint_text = if selection.size.w >= 2 && selection.size.h >= 2 {
+                    format!(
+                        "{} × {}  •  Release to capture  •  Esc to cancel",
+                        selection.size.w, selection.size.h
+                    )
+                } else {
+                    "Drag to select an area  •  Esc to cancel".to_string()
+                };
+                let hint_width = 340;
+                let hint_rect = Rectangle::from_loc_and_size(
+                    (
+                        output.loc.x + (output.size.w - hint_width) / 2,
+                        output.loc.y + 32,
+                    ),
+                    (hint_width, 44),
+                );
+                let mut hint_background = theme.chrome.panel_color;
+                hint_background[3] = 0.96;
+                self.draw_rounded_rect(frame, hint_rect, inputs.ctx.output_scale, 10.0, hint_background)?;
+                let theme_id = theme.id.builtin_id().unwrap_or(BuiltInThemeId::Eagle);
+                self.draw_text_cached(
+                    frame,
+                    inputs.fonts,
+                    &hint_text,
+                    hint_rect.loc.x + 16,
+                    hint_rect.loc.y + 28,
+                    style_for(FontRole::Title, 14, theme_id),
+                    theme.dialog.title_color,
+                    inputs.ctx.output_scale,
+                )?;
+            }
+        }
+
         if matches!(stage, OutputRenderStage::ChromeOverlay) {
             return Ok(());
         }
@@ -4214,6 +4288,7 @@ impl RenderState {
                     (None, None) => continue,
                 };
                 bbox.loc.x += view.offset_x;
+                bbox.loc.y += view.offset_y;
                 if !region.overlaps(bbox) {
                     continue;
                 }
@@ -4231,6 +4306,7 @@ impl RenderState {
                     })
                     .unwrap_or(Point::from((0, 0)));
                 render_loc.x += view.offset_x;
+                render_loc.y += view.offset_y;
 
                 let location = render_loc - region.loc;
                 let render_pos = location.to_physical_precise_round(scale);
@@ -4246,7 +4322,7 @@ impl RenderState {
                     &surface,
                     render_pos,
                     Scale::from(scale),
-                    1.0,
+                    view.opacity,
                     Kind::Unspecified,
                 );
 
@@ -4331,12 +4407,14 @@ impl RenderState {
                     let mut popup_bbox = popup.geometry();
                     popup_bbox.loc += popup_loc;
                     popup_bbox.loc.x += view.offset_x;
+                    popup_bbox.loc.y += view.offset_y;
 
                     if !region.overlaps(popup_bbox) {
                         continue;
                     }
 
-                    let output_loc = popup_loc - region.loc + Point::from((view.offset_x, 0));
+                    let output_loc =
+                        popup_loc - region.loc + Point::from((view.offset_x, view.offset_y));
                     let render_pos = output_loc.to_physical_precise_round(scale);
 
                     out.extend(render_elements_from_surface_tree::<_, FlowRenderElement>(
@@ -4344,7 +4422,7 @@ impl RenderState {
                         popup.wl_surface(),
                         render_pos,
                         Scale::from(scale),
-                        1.0,
+                        view.opacity,
                         Kind::Unspecified,
                     ));
                 }

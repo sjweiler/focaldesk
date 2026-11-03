@@ -815,6 +815,11 @@ pub struct WorkspaceSettings {
     /// Optional user labels keyed by one-based workspace number.
     #[serde(default)]
     pub workspace_names: BTreeMap<u32, String>,
+    /// Visual treatment used when moving between workspaces. `Slide` preserves
+    /// the original behavior; `Materialize` is an original fade-and-rise
+    /// treatment that avoids any third-party branding or artwork.
+    #[serde(default)]
+    pub transition_style: WorkspaceTransitionStyle,
 }
 
 impl Default for WorkspaceSettings {
@@ -828,8 +833,18 @@ impl Default for WorkspaceSettings {
             max_workspace_slots: default_max_workspace_slots(),
             workspace_wallpapers: BTreeMap::new(),
             workspace_names: BTreeMap::new(),
+            transition_style: WorkspaceTransitionStyle::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceTransitionStyle {
+    #[default]
+    Slide,
+    Materialize,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

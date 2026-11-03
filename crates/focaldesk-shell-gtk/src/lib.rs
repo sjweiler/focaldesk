@@ -513,6 +513,23 @@ fn build_companion(app: &gtk::Application, _connector: String) -> gtk::Applicati
     let date_label = companion_label("", "companion-subtitle");
     date.append(&date_label);
     left.append(&date);
+    let weather = companion_card("Weather");
+    let weather_summary = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    let weather_icon = companion_label("◌", "companion-weather-icon");
+    weather_icon.set_yalign(0.5);
+    weather_summary.append(&weather_icon);
+    let weather_reading = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    weather_reading.set_valign(gtk::Align::Center);
+    let weather_condition =
+        companion_label("Loading local weather…", "companion-weather-condition");
+    let weather_temperature = companion_label("", "companion-weather-temperature");
+    weather_reading.append(&weather_condition);
+    weather_reading.append(&weather_temperature);
+    weather_summary.append(&weather_reading);
+    weather.append(&weather_summary);
+    let weather_details = companion_label("Humidity —   Wind —", "companion-weather-details");
+    weather.append(&weather_details);
+    left.append(&weather);
     let media = companion_card("Media");
     let media_art = gtk::Picture::new();
     media_art.set_size_request(-1, 82);
@@ -856,6 +873,24 @@ fn build_companion(app: &gtk::Application, _connector: String) -> gtk::Applicati
     refresh_companion_clock(&clock, &big_time, &date_label);
     glib::timeout_add_local(Duration::from_secs(1), move || {
         refresh_companion_clock(&clock, &big_time, &date_label);
+        glib::ControlFlow::Continue
+    });
+    let weather_state = start_companion_weather_updates();
+    refresh_companion_weather(
+        &weather_icon,
+        &weather_condition,
+        &weather_temperature,
+        &weather_details,
+        &weather_state,
+    );
+    glib::timeout_add_local(Duration::from_secs(5), move || {
+        refresh_companion_weather(
+            &weather_icon,
+            &weather_condition,
+            &weather_temperature,
+            &weather_details,
+            &weather_state,
+        );
         glib::ControlFlow::Continue
     });
     refresh_companion_ai_activity(&listening, &wave);
@@ -3336,6 +3371,165 @@ fn refresh_companion_clock(
     date_label.set_text(&now.format("%a, %b %-d, %Y").to_string());
 }
 
+#[derive(Clone, Debug)]
+struct CompanionWeather {
+    icon: &'static str,
+    condition: String,
+    temperature: String,
+    details: String,
+}
+
+impl CompanionWeather {
+    fn message(
+        icon: &'static str,
+        condition: impl Into<String>,
+        details: impl Into<String>,
+    ) -> Self {
+        Self {
+            icon,
+            condition: condition.into(),
+            temperature: String::new(),
+            details: details.into(),
+        }
+    }
+}
+
+/// Start a deliberately low-frequency forecast query for the Companion.
+///
+/// Coordinates are already an opt-in local setting used by automatic night
+/// light scheduling.  We never infer a location from an IP address, and do
+/// not send a request when Location Services has been disabled.
+fn start_companion_weather_updates() -> Arc<Mutex<CompanionWeather>> {
+    let settings = load_settings();
+    let initial = if !settings.privacy.location_services {
+        CompanionWeather::message(
+            "⌖",
+            "Location services are off",
+            "Enable Location Services to show weather.",
+        )
+    } else if settings.accessibility.night_light.latitude.is_none()
+        || settings.accessibility.night_light.longitude.is_none()
+    {
+        CompanionWeather::message(
+            "⌖",
+            "Set a local location",
+            "Add coordinates in Display & Comfort to show weather.",
+        )
+    } else {
+        CompanionWeather::message("◌", "Loading local weather…", "")
+    };
+    let state = Arc::new(Mutex::new(initial));
+
+    if !settings.privacy.location_services {
+        return state;
+    }
+    let (Some(latitude), Some(longitude)) = (
+        settings.accessibility.night_light.latitude,
+        settings.accessibility.night_light.longitude,
+    ) else {
+        return state;
+    };
+
+    let state_for_worker = state.clone();
+    thread::spawn(move || loop {
+        let next = fetch_companion_weather(latitude, longitude).unwrap_or_else(|error| {
+            flog(format!("Companion weather refresh failed: {error}"));
+            CompanionWeather::message("!", "Weather unavailable", "Will try again shortly.")
+        });
+        if let Ok(mut current) = state_for_worker.lock() {
+            *current = next;
+        }
+        // Forecast values change slowly, and this avoids making the dashboard
+        // a high-frequency location-sharing client.
+        thread::sleep(Duration::from_secs(15 * 60));
+    });
+    state
+}
+
+fn fetch_companion_weather(latitude: f64, longitude: f64) -> Result<CompanionWeather, String> {
+    let url = format!(
+        "https://api.open-meteo.com/v1/forecast?latitude={latitude:.4}&longitude={longitude:.4}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&temperature_unit=fahrenheit&wind_speed_unit=mph"
+    );
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            &url,
+        ])
+        .output()
+        .map_err(|error| format!("start forecast request: {error}"))?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("decode forecast response: {error}"))?;
+    let current = response
+        .get("current")
+        .ok_or_else(|| "forecast response did not include current conditions".to_string())?;
+    let temperature = current
+        .get("temperature_2m")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "forecast response did not include temperature".to_string())?;
+    let humidity = current
+        .get("relative_humidity_2m")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "forecast response did not include humidity".to_string())?;
+    let wind_speed = current
+        .get("wind_speed_10m")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| "forecast response did not include wind speed".to_string())?;
+    let code = current
+        .get("weather_code")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| "forecast response did not include weather condition".to_string())?;
+    let (icon, condition) = companion_weather_condition(code, wind_speed);
+    Ok(CompanionWeather {
+        icon,
+        condition: condition.into(),
+        temperature: format!("{temperature:.0}°F"),
+        details: format!("Humidity {:.0}%   ·   Wind {:.0} mph", humidity, wind_speed),
+    })
+}
+
+fn companion_weather_condition(code: i64, wind_speed_mph: f64) -> (&'static str, &'static str) {
+    // WMO weather codes describe precipitation and cloud cover, not wind.
+    // Give strong wind its own immediately recognizable condition when it is
+    // the principal condition, while retaining rain/snow/storm warnings.
+    if wind_speed_mph >= 20.0 && !matches!(code, 51..=57 | 61..=67 | 71..=77 | 80..=86 | 95..=99) {
+        return ("≋", "Windy");
+    }
+    match code {
+        0 => ("☀", "Sunny"),
+        1 | 2 => ("⛅", "Partly cloudy"),
+        3 => ("☁", "Cloudy"),
+        45 | 48 => ("≋", "Foggy"),
+        51 | 53 | 55 | 56 | 57 => ("♧", "Drizzle"),
+        61 | 63 | 65 | 66 | 67 | 80 | 81 | 82 => ("☂", "Rainy"),
+        71 | 73 | 75 | 77 | 85 | 86 => ("❄", "Snowy"),
+        95 | 96 | 99 => ("ϟ", "Thunderstorms"),
+        _ => ("◌", "Current conditions"),
+    }
+}
+
+fn refresh_companion_weather(
+    icon: &gtk::Label,
+    condition: &gtk::Label,
+    temperature: &gtk::Label,
+    details: &gtk::Label,
+    state: &Arc<Mutex<CompanionWeather>>,
+) {
+    let Ok(weather) = state.lock() else {
+        return;
+    };
+    icon.set_text(weather.icon);
+    condition.set_text(&weather.condition);
+    temperature.set_text(&weather.temperature);
+    details.set_text(&weather.details);
+}
+
 fn companion_card(title: &str) -> gtk::Box {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 10);
     card.add_css_class("companion-card");
@@ -5665,16 +5859,26 @@ fn rgba(color: [f32; 4]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ai_console_identity_matches, app_icon_name, email_identity_matches, rail_clock_pattern,
-        rail_display_status, running_app_capacity, shelf_window_label, shell_css,
-        shell_css_configured, window_belongs_to_output, window_overlaps_shelf, ShelfOverflowEntry,
-        ShellRole, ThemeSnapshot,
+        ai_console_identity_matches, app_icon_name, companion_weather_condition,
+        email_identity_matches, rail_clock_pattern, rail_display_status, running_app_capacity,
+        shelf_window_label, shell_css, shell_css_configured, window_belongs_to_output,
+        window_overlaps_shelf, ShelfOverflowEntry, ShellRole, ThemeSnapshot,
     };
     use focaldesk_config::{
         ClockFormat, DockPosition, DockSize, FocalDeskConfig, PanelPosition, ShellStyle,
     };
     use focaldesk_ipc::{OutputSnapshot, WindowSnapshot};
     use focaldesk_themes::theme_by_name;
+
+    #[test]
+    fn weather_conditions_use_clear_icons_and_preserve_precipitation_warnings() {
+        assert_eq!(companion_weather_condition(0, 5.0), ("☀", "Sunny"));
+        assert_eq!(companion_weather_condition(3, 5.0), ("☁", "Cloudy"));
+        assert_eq!(companion_weather_condition(63, 5.0), ("☂", "Rainy"));
+        assert_eq!(companion_weather_condition(73, 5.0), ("❄", "Snowy"));
+        assert_eq!(companion_weather_condition(0, 25.0), ("≋", "Windy"));
+        assert_eq!(companion_weather_condition(63, 25.0), ("☂", "Rainy"));
+    }
 
     #[test]
     fn shell_css_tracks_all_builtin_theme_palettes() {

@@ -47,8 +47,10 @@ These bindings are not registered by the nested winit backend.
 | Shortcut | Action |
 | --- | --- |
 | `Super+Space` | Toggle the application launcher |
-| `Print` | Capture the focused output |
+| `Print` | Select an area to capture; `Esc` or right-click cancels |
 | `Shift+Print` | Capture all outputs |
+| `Ctrl+Print` | Capture the focused output |
+| `Super+Shift+S` | Select an area to capture (alternate shortcut) |
 
 DRM screenshots are written below `~/Pictures/Screenshots` with the output name,
 timestamp, and a sequence number in the filename. They are 16-bit Display P3

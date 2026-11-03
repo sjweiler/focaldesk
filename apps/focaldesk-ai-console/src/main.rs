@@ -4,7 +4,8 @@ use focaldesk_ai::{
     AgentRunStatus, AgentTrigger, AgentTriggerKind, AiDaemonStatus, AiIpcRequest, AiIpcResponse,
     AiStreamEvent, CapabilityPolicy, ChatMessage, ChatRequest, DirectoryIngestResult,
     DocumentIngestResult, IndexedDocument, MemoryId, MemoryStatus, ProviderInfo, ProviderModelInfo,
-    ProviderTelemetry, SearchHit, cancel_ai_stream, send_ai_request, stream_ai_chat,
+    ProviderTelemetry, SearchHit, WebsiteIngestResult, cancel_ai_stream, send_ai_request,
+    stream_ai_chat,
 };
 use focaldesk_config::load_config;
 use focaldesk_gtk::{StateKind, StateView, StatusBanner};
@@ -7112,6 +7113,14 @@ fn send_ingest_directory_request(
     }
 }
 
+fn send_ingest_website_request(url: String) -> anyhow::Result<WebsiteIngestResult> {
+    match send_ai_request(&AiIpcRequest::IngestWebsite { url })? {
+        AiIpcResponse::WebsiteIngested { result } => Ok(result),
+        AiIpcResponse::Error { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected AI response: {other:?}")),
+    }
+}
+
 fn send_remove_document_request(source: String) -> anyhow::Result<bool> {
     match send_ai_request(&AiIpcRequest::RemoveIndexedDocument { source })? {
         AiIpcResponse::IndexedDocumentRemoved { removed, .. } => Ok(removed),
@@ -7621,8 +7630,8 @@ fn calendar_context_for_prompt(prompt: &str) -> Option<String> {
         "agenda",
         "upcoming event",
     ]
-        .iter()
-        .any(|term| normalized.contains(term));
+    .iter()
+    .any(|term| normalized.contains(term));
     if !calendar_intent {
         return None;
     }
@@ -7669,7 +7678,9 @@ fn calendar_context_for_prompt(prompt: &str) -> Option<String> {
         Ok(response) => Some(format!(
             "The user's calendar connection is authorized, but its read-only event lookup is currently unavailable: {}. \
              Do not claim that the user has not connected a calendar.",
-            response.message.unwrap_or_else(|| "unknown connector response".into())
+            response
+                .message
+                .unwrap_or_else(|| "unknown connector response".into())
         )),
         Err(error) => Some(format!(
             "The user's calendar connection is authorized, but its read-only event lookup failed: {error}. \
@@ -7680,9 +7691,16 @@ fn calendar_context_for_prompt(prompt: &str) -> Option<String> {
 
 fn calendar_reply_for_prompt(prompt: &str) -> Option<String> {
     let normalized = prompt.to_ascii_lowercase();
-    if !["calendar", "schedule", "appointment", "meeting", "event", "agenda"]
-        .iter()
-        .any(|term| normalized.contains(term))
+    if ![
+        "calendar",
+        "schedule",
+        "appointment",
+        "meeting",
+        "event",
+        "agenda",
+    ]
+    .iter()
+    .any(|term| normalized.contains(term))
     {
         return None;
     }
@@ -7690,23 +7708,36 @@ fn calendar_reply_for_prompt(prompt: &str) -> Option<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    Some(match send_connector_host_request(&ConnectorHostIpcRequest::CalendarUpcoming {
-        after_unix: now,
-        before_unix: now.saturating_add(31 * 86_400),
-        limit: 50,
-    }) {
-        Ok(response) if response.status == "ok" && response.calendar_events.is_empty() =>
-            "No upcoming cached calendar events were found in the next 31 days.".into(),
-        Ok(response) if response.status == "ok" => format!(
-            "Upcoming calendar events:\n{}",
-            response.calendar_events.iter().map(|event| format!(
-                "- {} — {} to {}", event.title, event.start_time, event.end_time
-            )).collect::<Vec<_>>().join("\n")
-        ),
-        Ok(response) => format!("Calendar lookup is temporarily unavailable: {}",
-            response.message.unwrap_or_else(|| "unknown connector response".into())),
-        Err(error) => format!("Calendar lookup failed: {error}"),
-    })
+    Some(
+        match send_connector_host_request(&ConnectorHostIpcRequest::CalendarUpcoming {
+            after_unix: now,
+            before_unix: now.saturating_add(31 * 86_400),
+            limit: 50,
+        }) {
+            Ok(response) if response.status == "ok" && response.calendar_events.is_empty() => {
+                "No upcoming cached calendar events were found in the next 31 days.".into()
+            }
+            Ok(response) if response.status == "ok" => format!(
+                "Upcoming calendar events:\n{}",
+                response
+                    .calendar_events
+                    .iter()
+                    .map(|event| format!(
+                        "- {} — {} to {}",
+                        event.title, event.start_time, event.end_time
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            Ok(response) => format!(
+                "Calendar lookup is temporarily unavailable: {}",
+                response
+                    .message
+                    .unwrap_or_else(|| "unknown connector response".into())
+            ),
+            Err(error) => format!("Calendar lookup failed: {error}"),
+        },
+    )
 }
 
 const DEFAULT_SEARXNG_URL: &str = "http://127.0.0.1:8080";
@@ -8641,6 +8672,8 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
     );
     page.append(&info_card(&[
         "Index UTF-8 text, Markdown, source code, PDF, or DOCX files.".to_string(),
+        "Index an HTTPS documentation site as static HTML; the crawler stays on its starting site and path."
+            .to_string(),
         "Reindex replaces prior chunks when the file changes; removal never deletes the original file."
             .to_string(),
     ]));
@@ -8650,11 +8683,13 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
         .hexpand(true)
         .build();
     let index_button = action_button("Index / Refresh");
+    let website_button = action_button("Index Site");
     let folder_button = action_button("Add Folder");
     let refresh_button = action_button("Refresh List");
     let controls = Box::new(Orientation::Horizontal, 8);
     controls.append(&source_entry);
     controls.append(&index_button);
+    controls.append(&website_button);
     controls.append(&folder_button);
     controls.append(&refresh_button);
     page.append(&controls);
@@ -8675,6 +8710,55 @@ fn indexed_sources_page(log_buffer: TextBuffer) -> Box {
     page.append(&scroll);
 
     refresh_indexed_sources(list.clone(), log_buffer.clone());
+    {
+        let list = list.clone();
+        let log_buffer = log_buffer.clone();
+        let entry = source_entry.clone();
+        let button = website_button.clone();
+        let status = operation_status.clone();
+        website_button.connect_clicked(move |_| {
+            let url = entry.text().trim().to_string();
+            if !(url.starts_with("https://")) {
+                set_source_status(&status, "Enter an HTTPS site URL first.", true);
+                return;
+            }
+            set_source_status(&status, &format!("Indexing site {url}…"), false);
+            button.set_sensitive(false);
+            entry.set_sensitive(false);
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || { let _ = tx.send(send_ingest_website_request(url)); });
+            let list = list.clone();
+            let log_buffer = log_buffer.clone();
+            let button = button.clone();
+            let entry = entry.clone();
+            let status = status.clone();
+            glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+                Ok(Ok(result)) => {
+                    button.set_sensitive(true);
+                    entry.set_sensitive(true);
+                    set_source_status(&status, &format!("Site complete: {} indexed, {} unchanged, {} skipped, {} failed ({} chunks).", result.indexed, result.unchanged, result.skipped, result.failed, result.chunks), result.failed > 0);
+                    append_log(&log_buffer, &format!("[sources] site indexed={} unchanged={} skipped={} failed={}", result.indexed, result.unchanged, result.skipped, result.failed));
+                    for error in &result.errors { append_log(&log_buffer, &format!("[sources] {error}")); }
+                    refresh_indexed_sources(list.clone(), log_buffer.clone());
+                    ControlFlow::Break
+                }
+                Ok(Err(error)) => {
+                    button.set_sensitive(true);
+                    entry.set_sensitive(true);
+                    set_source_status(&status, &format!("Site indexing failed: {error}"), true);
+                    append_log(&log_buffer, &format!("[sources] site indexing failed: {error}"));
+                    ControlFlow::Break
+                }
+                Err(mpsc::TryRecvError::Empty) => ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    button.set_sensitive(true);
+                    entry.set_sensitive(true);
+                    set_source_status(&status, "Site indexing failed: the background request stopped unexpectedly.", true);
+                    ControlFlow::Break
+                }
+            });
+        });
+    }
     {
         let list = list.clone();
         let log_buffer = log_buffer.clone();

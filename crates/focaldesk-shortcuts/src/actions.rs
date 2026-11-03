@@ -15,6 +15,7 @@ pub enum KeyAction {
     AssignSlot(usize),
     TakeScreenshot,
     TakeScreenshotAll,
+    TakeScreenshotSelection,
     LaunchBrowser,
     LaunchFiles,
     ToggleClipboardHistory,

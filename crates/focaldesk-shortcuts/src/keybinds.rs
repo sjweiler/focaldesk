@@ -589,7 +589,7 @@ impl Keybinds {
                     mods: ModMask::empty(),
                     sym: KeySymbol::from_raw(keysyms::KEY_Print),
                 },
-                KeyAction::TakeScreenshot,
+                KeyAction::TakeScreenshotSelection,
             );
 
             self.map.insert(
@@ -598,6 +598,20 @@ impl Keybinds {
                     sym: KeySymbol::from_raw(keysyms::KEY_Print),
                 },
                 KeyAction::TakeScreenshotAll,
+            );
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::CTRL,
+                    sym: KeySymbol::from_raw(keysyms::KEY_Print),
+                },
+                KeyAction::TakeScreenshot,
+            );
+            self.map.insert(
+                KeyCombo {
+                    mods: ModMask::SUPER | ModMask::SHIFT,
+                    sym: KeySymbol::from_raw(keysyms::KEY_s),
+                },
+                KeyAction::TakeScreenshotSelection,
             );
         }
     }
@@ -664,6 +678,7 @@ fn action_from_name(name: &str) -> Option<KeyAction> {
         "lock_screen" => KeyAction::LockScreen,
         "take_screenshot" => KeyAction::TakeScreenshot,
         "take_screenshot_all" => KeyAction::TakeScreenshotAll,
+        "take_screenshot_selection" => KeyAction::TakeScreenshotSelection,
         "launch_browser" => KeyAction::LaunchBrowser,
         "launch_files" => KeyAction::LaunchFiles,
         "toggle_clipboard_history" => KeyAction::ToggleClipboardHistory,
@@ -813,7 +828,7 @@ mod tests {
         );
         assert_eq!(
             keybinds.resolve(key(keysyms::KEY_Print), ModMask::empty()),
-            Some(KeyAction::TakeScreenshot)
+            Some(KeyAction::TakeScreenshotSelection)
         );
         assert_eq!(
             keybinds.resolve(key(keysyms::KEY_Print), ModMask::SHIFT),

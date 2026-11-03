@@ -1788,6 +1788,7 @@ fn save_vulkan_screenshot(
     width: u32,
     height: u32,
     rgba: &[u8],
+    crop: Option<(Rectangle<i32, Logical>, Size<i32, Logical>)>,
 ) {
     let name = data
         .outputs
@@ -1795,11 +1796,31 @@ fn save_vulkan_screenshot(
         .find(|output| output.output_id == output_id)
         .map(|output| output.name.as_str())
         .unwrap_or("output");
+    let (width, height, rgba) = match crop {
+        Some((crop, logical_size)) => {
+            let scale_x = width as f64 / logical_size.w.max(1) as f64;
+            let scale_y = height as f64 / logical_size.h.max(1) as f64;
+            let x = (crop.loc.x as f64 * scale_x).floor().max(0.0) as u32;
+            let y = (crop.loc.y as f64 * scale_y).floor().max(0.0) as u32;
+            let right = ((crop.loc.x + crop.size.w) as f64 * scale_x).ceil().max(0.0) as u32;
+            let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y).ceil().max(0.0) as u32;
+            match crate::core::screenshot::crop_rgba8(
+                rgba, width, height, x, y, right.saturating_sub(x), bottom.saturating_sub(y),
+            ) {
+                Ok(cropped) => (cropped.0, cropped.1, cropped.2),
+                Err(error) => {
+                    flog_warn!("Vulkan screenshot selection failed: {error:#}");
+                    return;
+                }
+            }
+        }
+        None => (width, height, rgba.to_vec()),
+    };
     data.desktop.state.screenshot_seq += 1;
     match crate::core::screenshot::save_srgb_rgba8_screenshot(
         width,
         height,
-        rgba,
+        &rgba,
         name,
         data.desktop.state.screenshot_seq,
     ) {
@@ -1910,7 +1931,12 @@ fn finish_vulkan_capture(data: &mut VulkanDrmData, capture: AshDrmCapture) {
         }
     };
     if data.desktop.state.screenshot_request() == Some(output_id) {
-        save_vulkan_screenshot(data, output_id, width, height, &rgba);
+        let crop = data
+            .desktop
+            .state
+            .take_screenshot_crop(output_id)
+            .and_then(|rect| data.desktop.state.outputs.get(&output_id).map(|output| (rect, output.logical_size)));
+        save_vulkan_screenshot(data, output_id, width, height, &rgba, crop);
         data.desktop.state.clear_screenshot_request(output_id);
     }
     crate::core::portal::complete_pending_portal_captures_from_rgba(

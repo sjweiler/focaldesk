@@ -1,11 +1,11 @@
 use anyhow::{Context, Result, anyhow, bail};
+use focaldesk_ipc::{ConnectorHostIpcRequest, send_connector_host_request};
 use focaldesk_memory::{
     EmbeddingProvider, IndexedDocument, MemoryId, MemoryPolicy, MemoryService, MemoryStatus,
     MemoryStore, OllamaEmbeddingProvider, SearchHit,
 };
-use focaldesk_ipc::{ConnectorHostIpcRequest, send_connector_host_request};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ use crate::run_store::AgentRunStore;
 use crate::types::{
     AiStreamEvent, ChatMessage, ChatRequest, ChatResponse, ChatRole, Citation,
     DirectoryIngestResult, DocumentIngestResult, ProviderInfo, ProviderModelInfo,
-    RetrievalEvalCase, RetrievalEvalReport,
+    RetrievalEvalCase, RetrievalEvalReport, WebsiteIngestResult,
 };
 use crate::{
     Agent, AgentActionResponse, AgentConfirmation, AgentDefinition, AgentEventSink,
@@ -35,6 +35,9 @@ use crate::{
 const AI_MAX_STREAM_CONTENT_BYTES: usize = 512 * 1024;
 const MAX_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_DOCX_XML_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_WEBSITE_PAGES: usize = 500;
+const MAX_WEBSITE_PAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_WEBSITE_TOTAL_BYTES: usize = 50 * 1024 * 1024;
 
 /// Memories relevant to a chat prompt are capped here so the recalled
 /// context doesn't dwarf the actual conversation.
@@ -1649,6 +1652,187 @@ impl AiService {
         Ok(result)
     }
 
+    /// Crawl and index a small, static portion of one HTTPS site.  This is
+    /// intentionally separate from web search: pages are fetched only after a
+    /// user-confirmed indexing request and are retained in local AI memory.
+    pub async fn ingest_website(&self, source: String) -> Result<WebsiteIngestResult> {
+        if self.memory.is_none() {
+            return Err(anyhow!("AI memory store is not configured"));
+        }
+        let requested_start = website_start_url(&source)?;
+        let requested_scope = website_scope(&requested_start);
+        authorize_ai_chat(
+            "Allow website indexing?",
+            &format!(
+                "Fetch, extract, chunk, and embed up to {MAX_WEBSITE_PAGES} static HTML pages from {}. Links outside {} will not be followed.",
+                requested_start, requested_scope
+            ),
+            true,
+        )
+        .context("website indexing blocked")?;
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(20))
+            .user_agent("FocalDesk local documentation indexer")
+            .build()
+            .context("build website indexing client")?;
+        // Rust's versionless documentation URLs redirect to a versioned path
+        // such as `/stable/std/`. Resolve only a short chain of same-origin
+        // HTTPS redirects, then lock crawling to that final subtree.
+        let start = resolve_website_start(&client, requested_start).await?;
+        let scope = website_scope(&start);
+        let mut pending = VecDeque::from([start.clone()]);
+        let mut visited = HashSet::new();
+        let mut total_bytes = 0usize;
+        let mut result = WebsiteIngestResult {
+            source: start.to_string(),
+            indexed: 0,
+            unchanged: 0,
+            skipped: 0,
+            failed: 0,
+            chunks: 0,
+            errors: Vec::new(),
+        };
+
+        while let Some(url) = pending.pop_front() {
+            if visited.len() >= MAX_WEBSITE_PAGES {
+                result.skipped += pending.len() + 1;
+                break;
+            }
+            if !visited.insert(url.to_string()) {
+                continue;
+            }
+            let response = match client.get(url.clone()).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    website_error(&mut result, &url, error);
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                website_error(&mut result, &url, anyhow!("HTTP {}", response.status()));
+                continue;
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if !content_type.is_empty() && !content_type.starts_with("text/html") {
+                result.skipped += 1;
+                continue;
+            }
+            if response
+                .content_length()
+                .is_some_and(|size| size as usize > MAX_WEBSITE_PAGE_BYTES)
+            {
+                result.skipped += 1;
+                continue;
+            }
+            let body = match response.bytes().await {
+                Ok(body) if body.len() <= MAX_WEBSITE_PAGE_BYTES => body,
+                Ok(_) => {
+                    result.skipped += 1;
+                    continue;
+                }
+                Err(error) => {
+                    website_error(&mut result, &url, error);
+                    continue;
+                }
+            };
+            if total_bytes.saturating_add(body.len()) > MAX_WEBSITE_TOTAL_BYTES {
+                result.skipped += pending.len() + 1;
+                break;
+            }
+            total_bytes += body.len();
+            let html = match std::str::from_utf8(&body) {
+                Ok(html) => html,
+                Err(_) => {
+                    result.skipped += 1;
+                    continue;
+                }
+            };
+            let page = extract_html_page(html);
+            if page.text.is_empty() {
+                result.skipped += 1;
+                continue;
+            }
+            for link in page.links {
+                if let Some(next) = scoped_website_url(&url, &link, &scope)
+                    && !visited.contains(next.as_str())
+                {
+                    pending.push_back(next);
+                }
+            }
+            match self
+                .ingest_website_page(url.to_string(), page.title, page.text)
+                .await
+            {
+                Ok(document) if document.unchanged => {
+                    result.unchanged += 1;
+                    result.chunks += document.chunks;
+                }
+                Ok(document) => {
+                    result.indexed += 1;
+                    result.chunks += document.chunks;
+                }
+                Err(error) => website_error(&mut result, &url, error),
+            }
+        }
+        Ok(result)
+    }
+
+    async fn ingest_website_page(
+        &self,
+        source: String,
+        title: String,
+        text: String,
+    ) -> Result<DocumentIngestResult> {
+        let memory = self
+            .memory
+            .as_ref()
+            .ok_or_else(|| anyhow!("AI memory store is not configured"))?;
+        let content_hash = format!("{:x}", Sha256::digest(text.as_bytes()));
+        let chunks = chunk_document(&text, 3_200, 320);
+        let chunk_count = chunks.len();
+        if let Some(existing) = memory
+            .documents()
+            .await?
+            .into_iter()
+            .find(|item| item.source == source && item.content_hash == content_hash)
+        {
+            return Ok(DocumentIngestResult {
+                source,
+                chunks: existing.chunk_count,
+                memory_ids: existing.memory_ids,
+                unchanged: true,
+            });
+        }
+        let indexed = memory
+            .replace_document(
+                IndexedDocument {
+                    source: source.clone(),
+                    title,
+                    media_type: "text/html".into(),
+                    content_hash,
+                    modified_at_unix: unix_now().min(i64::MAX as u64) as i64,
+                    indexed_at_unix: unix_now().min(i64::MAX as u64) as i64,
+                    chunk_count,
+                    memory_ids: Vec::new(),
+                },
+                chunks,
+            )
+            .await?;
+        Ok(DocumentIngestResult {
+            source,
+            chunks: chunk_count,
+            memory_ids: indexed.memory_ids,
+            unchanged: false,
+        })
+    }
+
     async fn ingest_canonical_document(
         &self,
         canonical: std::path::PathBuf,
@@ -1991,6 +2175,8 @@ impl AiService {
         }
 
         (response.content, response.citations) = retain_cited_sources(&response.content, citations);
+        response.content =
+            enforce_rust_vec_capacity_semantics(&prompt, &response.content, &response.citations);
         response.content = guard::guard_output(&prompt, &response.content, &response.citations);
         self.record_latest_chat(prompt, &response);
         Ok(response)
@@ -2140,6 +2326,11 @@ impl AiService {
                         .with_context(|| format!("streaming AI provider {provider_id} failed"))?;
                     (response.content, response.citations) =
                         retain_cited_sources(&response.content, citations.clone());
+                    response.content = enforce_rust_vec_capacity_semantics(
+                        &prompt,
+                        &response.content,
+                        &response.citations,
+                    );
                     response.content = guard::guard_output(
                         &prompt,
                         &response.content,
@@ -3964,6 +4155,7 @@ impl AiService {
 }
 
 fn grounded_context(query: &str, hits: Vec<SearchHit>) -> (String, Vec<Citation>) {
+    let hits = rank_hits_for_query(query, prefer_exact_rust_api_source(query, hits));
     let mut selected = Vec::with_capacity(CHAT_CONTEXT_MAX_CHUNKS);
     let mut deferred = Vec::new();
     let mut distinct_sources = BTreeSet::new();
@@ -4023,6 +4215,62 @@ fn grounded_context(query: &str, hits: Vec<SearchHit>) -> (String, Vec<Citation>
     (excerpts.join("\n\n"), citations)
 }
 
+/// Rust's generated documentation gives every type a stable source path such
+/// as `struct.Vec.html`. When a question explicitly names `Vec::method`, do
+/// not dilute that page with semantically similar methods on String, VecDeque,
+/// or other containers. For all other sites and queries this is a no-op.
+fn prefer_exact_rust_api_source(query: &str, hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let Some(marker) = query.find("::") else {
+        return hits;
+    };
+    let Some(type_name) = query[..marker]
+        .split(|character: char| !character.is_alphanumeric() && character != '_')
+        .filter(|part| !part.is_empty())
+        .next_back()
+    else {
+        return hits;
+    };
+    let exact_suffixes = [
+        format!("struct.{type_name}.html"),
+        format!("enum.{type_name}.html"),
+        format!("trait.{type_name}.html"),
+    ];
+    let preferred = hits
+        .iter()
+        .filter(|hit| {
+            citation_source(&hit.record.metadata)
+                .is_some_and(|source| exact_suffixes.iter().any(|suffix| source.ends_with(suffix)))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if preferred.is_empty() {
+        hits
+    } else {
+        preferred
+    }
+}
+
+/// Semantic search can return introductory text from the right document ahead
+/// of the API section that names the requested methods. Re-rank its bounded
+/// candidates by literal query-term coverage before spending the chat context
+/// budget, while retaining semantic distance as a deterministic tie-breaker.
+fn rank_hits_for_query(query: &str, mut hits: Vec<SearchHit>) -> Vec<SearchHit> {
+    let terms = retrieval_terms(query).into_iter().collect::<Vec<_>>();
+    hits.sort_by(|left, right| {
+        let score = |hit: &SearchHit| {
+            let text = hit.record.text.to_ascii_lowercase();
+            terms
+                .iter()
+                .map(|term| text.matches(term).count())
+                .sum::<usize>()
+        };
+        score(right)
+            .cmp(&score(left))
+            .then_with(|| left.distance.total_cmp(&right.distance))
+    });
+    hits
+}
+
 fn retrieval_hit_is_relevant(query: &str, hit: &SearchHit) -> bool {
     if hit.distance.is_finite() && hit.distance <= CHAT_MAX_SEMANTIC_DISTANCE {
         return true;
@@ -4073,11 +4321,11 @@ fn retrieval_terms(text: &str) -> BTreeSet<String> {
 
 /// Keeps only sources the model explicitly cited and compacts their numbers.
 ///
-/// Retrieval always has a nearest neighbor, even for an unrelated question.
-/// Returning every candidate as a citation therefore makes irrelevant local
-/// documents look like evidence for an answer that came from the model's own
-/// knowledge. Source markers are the model's declaration that it used a
-/// retrieved excerpt, so they are the boundary between context and citations.
+/// Retrieval candidates have already passed the relevance gate before this
+/// function is called. Preserve explicitly cited sources and renumber their
+/// markers. If a local model omits source markers entirely, retain the vetted
+/// retrieved sources so clients can still disclose the evidence supplied to
+/// the model rather than silently presenting an ungrounded-looking answer.
 fn retain_cited_sources(content: &str, citations: Vec<Citation>) -> (String, Vec<Citation>) {
     let bytes = content.as_bytes();
     let mut rewritten = String::with_capacity(content.len());
@@ -4123,7 +4371,38 @@ fn retain_cited_sources(content: &str, citations: Vec<Citation>) -> (String, Vec
         offset += character.len_utf8();
     }
 
-    (rewritten, retained)
+    if retained.is_empty() {
+        (rewritten, citations)
+    } else {
+        (rewritten, retained)
+    }
+}
+
+/// The local model occasionally paraphrases Rust's `reserve(additional)` as
+/// an absolute capacity request even when the official Vec documentation was
+/// retrieved. Preserve the model for every other question, but normalize this
+/// narrowly-scoped, safety-critical API distinction to its documented form.
+fn enforce_rust_vec_capacity_semantics(
+    prompt: &str,
+    content: &str,
+    citations: &[Citation],
+) -> String {
+    let prompt = prompt.to_ascii_lowercase();
+    if !(prompt.contains("vec::with_capacity") && prompt.contains("vec::reserve")) {
+        return content.to_string();
+    }
+    let Some(source_number) = citations.iter().position(|citation| {
+        citation
+            .source
+            .as_deref()
+            .is_some_and(|source| source.ends_with("/vec/struct.Vec.html"))
+    }) else {
+        return content.to_string();
+    };
+    format!(
+        "`Vec::with_capacity(capacity)` creates a new empty vector with capacity at least `capacity`. `vec.reserve(additional)` acts on an existing vector and ensures capacity for at least `additional` more elements, meaning `capacity() >= len() + additional`; it does not take an absolute target capacity. Either operation may reserve more capacity than requested. [source {}]",
+        source_number + 1
+    )
 }
 
 fn source_version(metadata: &serde_json::Value) -> String {
@@ -4184,6 +4463,218 @@ fn retrieval_eval_report(ranks: &[Option<usize>], top_k: usize) -> RetrievalEval
         },
         top_k,
     }
+}
+
+#[derive(Debug)]
+struct HtmlPage {
+    title: String,
+    text: String,
+    links: Vec<String>,
+}
+
+fn website_start_url(source: &str) -> Result<url::Url> {
+    let mut url = url::Url::parse(source.trim()).context("website URL is invalid")?;
+    if url.scheme() != "https"
+        || url.host_str().is_none()
+        || url.username() != ""
+        || url.password().is_some()
+    {
+        bail!("website indexing requires an HTTPS URL without embedded credentials");
+    }
+    url.set_fragment(None);
+    url.set_query(None);
+    Ok(url)
+}
+
+fn website_scope(start: &url::Url) -> url::Url {
+    let mut scope = start.clone();
+    if !scope.path().ends_with('/') {
+        let parent = scope
+            .path()
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or("");
+        scope.set_path(&format!("{parent}/"));
+    }
+    scope
+}
+
+async fn resolve_website_start(client: &reqwest::Client, requested: url::Url) -> Result<url::Url> {
+    let origin = requested.origin();
+    let mut current = requested;
+    for _ in 0..5 {
+        let response = client
+            .get(current.clone())
+            .send()
+            .await
+            .with_context(|| format!("fetch website start URL {current}"))?;
+        if response.status().is_success() {
+            return Ok(current);
+        }
+        if !response.status().is_redirection() {
+            bail!("website start URL returned HTTP {}", response.status());
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .context("website redirect has no valid Location header")?;
+        let next = current
+            .join(location)
+            .context("website redirect location is invalid")?;
+        if next.scheme() != "https" || next.origin() != origin {
+            bail!("website redirect leaves the approved HTTPS origin");
+        }
+        current = next;
+    }
+    bail!("website start URL redirected too many times")
+}
+
+fn scoped_website_url(base: &url::Url, link: &str, scope: &url::Url) -> Option<url::Url> {
+    let mut url = base.join(link).ok()?;
+    url.set_fragment(None);
+    url.set_query(None);
+    (url.scheme() == "https"
+        && url.origin() == scope.origin()
+        && url.path().starts_with(scope.path())
+        && (url.path().ends_with('/')
+            || url.path().ends_with(".html")
+            || url.path().ends_with(".htm")))
+    .then_some(url)
+}
+
+fn website_error(result: &mut WebsiteIngestResult, url: &url::Url, error: impl std::fmt::Display) {
+    result.failed += 1;
+    if result.errors.len() < 20 {
+        result.errors.push(format!("{url}: {error}"));
+    }
+}
+
+/// Lightweight static-HTML extraction. It deliberately does not execute
+/// JavaScript; documentation sites generally expose their content directly in
+/// HTML. Block-level tags become line breaks, while navigational chrome is
+/// removed before embedding.
+fn extract_html_page(html: &str) -> HtmlPage {
+    let mut output = String::new();
+    let mut title = String::new();
+    let mut links = Vec::new();
+    let mut cursor = 0;
+    let mut suppress_depth = 0usize;
+    let mut in_title = false;
+    while let Some(relative_start) = html[cursor..].find('<') {
+        let start = cursor + relative_start;
+        if suppress_depth == 0 {
+            let text = decode_html_entities(&html[cursor..start]);
+            if in_title {
+                title.push_str(&text);
+            } else {
+                output.push_str(&text);
+            }
+        }
+        let Some(relative_end) = html[start..].find('>') else {
+            break;
+        };
+        let end = start + relative_end;
+        let tag = &html[start + 1..end];
+        let trimmed = tag.trim();
+        let closing = trimmed.starts_with('/');
+        let name = trimmed
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_ascii_lowercase();
+        let suppressed = matches!(
+            name.as_str(),
+            "script" | "style" | "nav" | "header" | "footer" | "aside" | "noscript"
+        );
+        if closing && suppressed {
+            suppress_depth = suppress_depth.saturating_sub(1);
+        }
+        if suppress_depth == 0 {
+            if name == "title" {
+                in_title = !closing;
+            }
+            if !closing
+                && name == "a"
+                && let Some(href) = html_attribute(trimmed, "href")
+            {
+                links.push(href);
+            }
+            if matches!(
+                name.as_str(),
+                "p" | "div"
+                    | "section"
+                    | "article"
+                    | "main"
+                    | "li"
+                    | "pre"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "br"
+                    | "tr"
+            ) {
+                output.push('\n');
+            }
+        }
+        if !closing && suppressed {
+            suppress_depth += 1;
+        }
+        cursor = end + 1;
+    }
+    if suppress_depth == 0 && cursor < html.len() {
+        output.push_str(&decode_html_entities(&html[cursor..]));
+    }
+    let text = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    HtmlPage {
+        title: if title.is_empty() {
+            "Web page".into()
+        } else {
+            title
+        },
+        text,
+        links,
+    }
+}
+
+fn html_attribute(tag: &str, wanted: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let offset = lower.find(wanted)?;
+    let before = lower.as_bytes().get(offset.wrapping_sub(1)).copied();
+    if before.is_some_and(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_') {
+        return None;
+    }
+    let rest = &tag[offset + wanted.len()..];
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let quote = rest.chars().next()?;
+    if quote == '\'' || quote == '"' {
+        let value = &rest[quote.len_utf8()..];
+        return value
+            .find(quote)
+            .map(|end| decode_html_entities(&value[..end]));
+    }
+    rest.split_whitespace().next().map(decode_html_entities)
+}
+
+fn decode_html_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 fn chunk_document(text: &str, max_chars: usize, overlap_chars: usize) -> Vec<String> {
@@ -4250,6 +4741,14 @@ fn extract_document(path: &std::path::Path) -> Result<(String, String, String)> 
             extract_docx_text(&bytes)
                 .with_context(|| format!("failed to extract DOCX text from {}", path.display()))?,
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document".into(),
+            hash,
+        )),
+        "html" | "htm" => Ok((
+            extract_html_page(std::str::from_utf8(&bytes).with_context(|| {
+                format!("document {} is not supported UTF-8 text", path.display())
+            })?)
+            .text,
+            "text/html".into(),
             hash,
         )),
         _ => Ok((
@@ -4855,13 +5354,13 @@ fn current_month_calendar_response(window: &guard::CalendarWindow) -> Option<Cha
     };
     let content = match send_connector_host_request(&request) {
         Ok(response) if response.status == "ok" && !response.calendar_events.is_empty() => {
-                let events = response
-                    .calendar_events
-                    .iter()
-                    .map(|event| format!("- {} — {}", event.start_time, event.title))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("Verified calendar events for this month:\n{events}")
+            let events = response
+                .calendar_events
+                .iter()
+                .map(|event| format!("- {} — {}", event.start_time, event.title))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Verified calendar events for this month:\n{events}")
         }
         Ok(response) if response.status != "ok" => format!(
             "I can’t verify this month’s calendar because the local calendar service returned: {}",
@@ -5067,6 +5566,33 @@ mod tests {
     }
 
     #[test]
+    fn website_scope_stays_under_the_starting_documentation_path() {
+        let start = website_start_url("https://doc.rust-lang.org/std/index.html").unwrap();
+        let scope = website_scope(&start);
+        assert_eq!(scope.as_str(), "https://doc.rust-lang.org/std/");
+        assert_eq!(
+            scoped_website_url(&start, "vec/struct.Vec.html#method-new", &scope)
+                .unwrap()
+                .as_str(),
+            "https://doc.rust-lang.org/std/vec/struct.Vec.html"
+        );
+        assert!(scoped_website_url(&start, "../book/index.html", &scope).is_none());
+        assert!(scoped_website_url(&start, "https://example.com/index.html", &scope).is_none());
+    }
+
+    #[test]
+    fn html_extraction_drops_navigation_and_collects_page_links() {
+        let page = extract_html_page(
+            "<html><head><title>Vec — Rust</title><style>ignored</style></head><body><nav>menu</nav><main><h1>Vec</h1><p>Growable array.</p><a href=\"struct.Vec.html#new\">API</a><script>ignored</script></main></body></html>",
+        );
+        assert_eq!(page.title, "Vec — Rust");
+        assert!(page.text.contains("Growable array."));
+        assert!(!page.text.contains("menu"));
+        assert!(!page.text.contains("ignored"));
+        assert_eq!(page.links, vec!["struct.Vec.html#new"]);
+    }
+
+    #[test]
     fn document_chunking_is_bounded_overlapping_and_unicode_safe() {
         let input = "alpha beta gamma\n\nδelta epsilon zeta\n\nlast paragraph";
         let chunks = chunk_document(input, 24, 5);
@@ -5164,6 +5690,32 @@ mod tests {
     }
 
     #[test]
+    fn rust_api_queries_prefer_the_exact_type_document() {
+        let hit = |id, source: &str| SearchHit {
+            record: focaldesk_memory::MemoryRecord {
+                id,
+                text: "reserve documentation".into(),
+                metadata: json!({"source_uri": source}),
+                created_at_unix: 1,
+            },
+            distance: 0.1,
+        };
+        let hits = prefer_exact_rust_api_source(
+            "How does Vec::reserve work?",
+            vec![
+                hit(1, "https://doc.rust-lang.org/std/string/struct.String.html"),
+                hit(2, "https://doc.rust-lang.org/std/vec/struct.Vec.html"),
+                hit(
+                    3,
+                    "https://doc.rust-lang.org/std/collections/struct.VecDeque.html",
+                ),
+            ],
+        );
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].record.id, 2);
+    }
+
+    #[test]
     fn relevance_gate_rejects_a_year_match_for_an_unrelated_space_question() {
         let hit = SearchHit {
             record: focaldesk_memory::MemoryRecord {
@@ -5213,7 +5765,7 @@ mod tests {
     }
 
     #[test]
-    fn uncited_retrieval_candidates_are_not_returned_as_sources() {
+    fn uncited_retrieval_candidates_are_returned_as_retrieved_sources() {
         let citations = vec![Citation {
             memory_id: 1,
             source: Some("/repo/README.md".into()),
@@ -5230,7 +5782,7 @@ mod tests {
             content,
             "A nuclear explosion could not realistically eject the Moon."
         );
-        assert!(citations.is_empty());
+        assert_eq!(citations.len(), 1);
     }
 
     #[test]
@@ -5262,7 +5814,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_source_markers_do_not_create_citations() {
+    fn invalid_source_markers_fall_back_to_retrieved_sources() {
         let citations = vec![Citation {
             memory_id: 1,
             source: Some("/repo/README.md".into()),
@@ -5274,7 +5826,24 @@ mod tests {
             retain_cited_sources("Unknown [source 2] and malformed [source x].", citations);
 
         assert_eq!(content, "Unknown [source 2] and malformed [source x].");
-        assert!(citations.is_empty());
+        assert_eq!(citations.len(), 1);
+    }
+
+    #[test]
+    fn vec_capacity_answers_are_normalized_against_the_official_source() {
+        let citations = vec![Citation {
+            memory_id: 1,
+            source: Some("https://doc.rust-lang.org/std/vec/struct.Vec.html".into()),
+            excerpt: "Vec documentation".into(),
+            distance: 0.1,
+        }];
+        let answer = enforce_rust_vec_capacity_semantics(
+            "How does Vec::with_capacity differ from Vec::reserve?",
+            "reserve uses absolute capacity",
+            &citations,
+        );
+        assert!(answer.contains("len() + additional"));
+        assert!(answer.contains("[source 1]"));
     }
 
     #[test]

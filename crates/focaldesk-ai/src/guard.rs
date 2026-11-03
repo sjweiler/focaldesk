@@ -109,9 +109,15 @@ fn is_calendar_query(text: &str) -> bool {
         .iter()
         .any(|term| text.contains(term))
         || ((text.contains("this month") || text.contains("current month"))
-            && ["what do i have", "what's coming up", "what is coming up", "coming up", "upcoming"]
-                .iter()
-                .any(|term| text.contains(term)))
+            && [
+                "what do i have",
+                "what's coming up",
+                "what is coming up",
+                "coming up",
+                "upcoming",
+            ]
+            .iter()
+            .any(|term| text.contains(term)))
 }
 
 /// Reject dated output outside a code-resolved month.  A model may ignore a

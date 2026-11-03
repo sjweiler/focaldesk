@@ -20,7 +20,8 @@ use focaldesk_settings_core::{
     ExclusiveHdrPhase, ExclusiveHdrState, HdrAppearance, HdrCalibrationPattern, HdrToneMapper,
     InputAccelerationProfile, InputScrollMethod, LidCloseAction, LowBatteryAction,
     NightLightSchedule, OutputConfig, PerformanceMode, PowerButtonAction, Settings, StartupApp,
-    WindowRule, load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
+    WindowRule, WorkspaceTransitionStyle, load_exclusive_hdr_state, load_settings,
+    save_exclusive_hdr_state, save_settings,
 };
 use focaldesk_sounds::{SAMPLE_RATE, SoundBuffer, UiSound, UiSoundPlayer, generate_ui_sound};
 use focaldesk_themes::{
@@ -9683,6 +9684,30 @@ fn workspaces_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
         });
     }
 
+    let transition_row = adw::ActionRow::new();
+    transition_row.set_title("Workspace transition");
+    transition_row.set_subtitle("Choose the visual effect used when switching workspaces");
+    let transition_choices = gtk::StringList::new(&["Slide", "Materialize", "None"]);
+    let transition = gtk::DropDown::new(Some(transition_choices), None::<&gtk::Expression>);
+    transition.set_selected(match settings.borrow().workspaces.transition_style {
+        WorkspaceTransitionStyle::Slide => 0,
+        WorkspaceTransitionStyle::Materialize => 1,
+        WorkspaceTransitionStyle::None => 2,
+    });
+    transition_row.add_suffix(&transition);
+    behavior_group.add(&transition_row);
+    {
+        let settings = settings.clone();
+        transition.connect_selected_notify(move |dropdown| {
+            settings.borrow_mut().workspaces.transition_style = match dropdown.selected() {
+                1 => WorkspaceTransitionStyle::Materialize,
+                2 => WorkspaceTransitionStyle::None,
+                _ => WorkspaceTransitionStyle::Slide,
+            };
+            persist_settings(&settings.borrow());
+        });
+    }
+
     let restore_session = add_switch_row(
         &behavior_group,
         "Restore session",
@@ -10775,12 +10800,13 @@ fn accessibility_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
-    let latitude = add_scale_row(
-        &color,
-        "Solar schedule latitude",
-        -90.0,
-        90.0,
-        0.1,
+    let latitude_row = adw::ActionRow::new();
+    latitude_row.set_title("Solar schedule latitude");
+    latitude_row.set_subtitle("Use decimal degrees; positive is north.");
+    let latitude = gtk::SpinButton::with_range(-90.0, 90.0, 0.0001);
+    latitude.set_digits(4);
+    latitude.set_numeric(true);
+    latitude.set_value(
         settings
             .borrow()
             .accessibility
@@ -10788,6 +10814,8 @@ fn accessibility_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             .latitude
             .unwrap_or(0.0),
     );
+    latitude_row.add_suffix(&latitude);
+    color.add(&latitude_row);
     {
         let settings = settings.clone();
         latitude.connect_value_changed(move |scale| {
@@ -10795,12 +10823,13 @@ fn accessibility_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             persist_settings(&settings.borrow());
         });
     }
-    let longitude = add_scale_row(
-        &color,
-        "Solar schedule longitude",
-        -180.0,
-        180.0,
-        0.1,
+    let longitude_row = adw::ActionRow::new();
+    longitude_row.set_title("Solar schedule longitude");
+    longitude_row.set_subtitle("Use decimal degrees; negative is west.");
+    let longitude = gtk::SpinButton::with_range(-180.0, 180.0, 0.0001);
+    longitude.set_digits(4);
+    longitude.set_numeric(true);
+    longitude.set_value(
         settings
             .borrow()
             .accessibility
@@ -10808,6 +10837,8 @@ fn accessibility_page(settings: Rc<RefCell<Settings>>) -> adw::NavigationPage {
             .longitude
             .unwrap_or(0.0),
     );
+    longitude_row.add_suffix(&longitude);
+    color.add(&longitude_row);
     {
         let settings = settings.clone();
         longitude.connect_value_changed(move |scale| {

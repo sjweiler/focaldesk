@@ -185,7 +185,9 @@ impl VulkanSceneBuilder {
         append_notification_text_quads(&desktop, &mut self.assets, &mut surfaces);
         let foreground_after_surface = surfaces.len();
         let mut foreground = collect_modal_quads(&desktop);
+        foreground.extend(collect_screenshot_selection_quads(&desktop));
         append_modal_text_quads(&desktop, &mut self.assets, &mut surfaces);
+        append_screenshot_selection_text(&desktop, &mut self.assets, &mut surfaces);
         let egui_before_surface = surfaces.len();
         let (mut egui_textures, mut egui_meshes, egui_raster) =
             collect_egui_meshes(&mut desktop, rasterize_egui);
@@ -1558,6 +1560,96 @@ fn collect_modal_quads(desktop: &WgpuSceneDesktop<'_>) -> Vec<SolidQuad> {
     quads
 }
 
+/// The raw Vulkan compositor does not use the GLES shell renderer, so region
+/// capture must supply its own modal affordance here. Keep the selected pixels
+/// clear and dim everything else, matching the desktop screenshot convention.
+fn collect_screenshot_selection_quads(desktop: &WgpuSceneDesktop<'_>) -> Vec<SolidQuad> {
+    let Some(output) = desktop.state.outputs.get(&desktop.output_id) else {
+        return Vec::new();
+    };
+    if !desktop.state.screenshot_selection_active(desktop.output_id) {
+        return Vec::new();
+    }
+    let selection = desktop.state.screenshot_selection_rect(desktop.output_id);
+    let screen = Rectangle::<i32, Logical>::from_loc_and_size((0, 0), output.logical_size);
+    let scale = output.scale_factor;
+    let mut quads = Vec::new();
+    if let Some(selection) = selection {
+        for strip in [
+            Rectangle::from_loc_and_size(screen.loc, (screen.size.w, selection.loc.y)),
+            Rectangle::from_loc_and_size((0, selection.loc.y), (selection.loc.x, selection.size.h)),
+            Rectangle::from_loc_and_size(
+                (selection.loc.x + selection.size.w, selection.loc.y),
+                (screen.size.w - selection.loc.x - selection.size.w, selection.size.h),
+            ),
+            Rectangle::from_loc_and_size(
+                (0, selection.loc.y + selection.size.h),
+                (screen.size.w, screen.size.h - selection.loc.y - selection.size.h),
+            ),
+        ] {
+            if strip.size.w > 0 && strip.size.h > 0 {
+                quads.push(solid_quad(strip, scale, [0.0, 0.0, 0.0, 0.35]));
+            }
+        }
+        let border = desktop.state.theme.active_theme().chrome.accent_color;
+        for edge in [
+            Rectangle::from_loc_and_size(selection.loc, (selection.size.w, 2)),
+            Rectangle::from_loc_and_size(
+                (selection.loc.x, selection.loc.y + selection.size.h - 2),
+                (selection.size.w, 2),
+            ),
+            Rectangle::from_loc_and_size(selection.loc, (2, selection.size.h)),
+            Rectangle::from_loc_and_size(
+                (selection.loc.x + selection.size.w - 2, selection.loc.y),
+                (2, selection.size.h),
+            ),
+        ] {
+            if edge.size.w > 0 && edge.size.h > 0 {
+                quads.push(solid_quad(edge, scale, border));
+            }
+        }
+    }
+    let panel = Rectangle::from_loc_and_size(
+        ((screen.size.w - 350) / 2, 32),
+        (350.min(screen.size.w), 44),
+    );
+    let mut panel_color = desktop.state.theme.active_theme().chrome.panel_color;
+    panel_color[3] = 0.96;
+    quads.push(rounded_solid_quad(panel, scale, panel_color, 10.0));
+    quads
+}
+
+fn append_screenshot_selection_text(
+    desktop: &WgpuSceneDesktop<'_>,
+    assets: &mut WgpuShellAssets,
+    output: &mut Vec<TextureQuad>,
+) {
+    let Some(output_state) = desktop.state.outputs.get(&desktop.output_id) else {
+        return;
+    };
+    if !desktop.state.screenshot_selection_active(desktop.output_id) {
+        return;
+    }
+    let text = match desktop.state.screenshot_selection_rect(desktop.output_id) {
+        Some(selection) if selection.size.w >= 2 && selection.size.h >= 2 => {
+            format!("{} × {}  •  Release to capture  •  Esc to cancel", selection.size.w, selection.size.h)
+        }
+        _ => "Click and drag to select an area  •  Esc to cancel".to_string(),
+    };
+    let x = (output_state.logical_size.w - 350) / 2 + 16;
+    append_text_quads(
+        desktop,
+        assets,
+        output,
+        &text,
+        x,
+        60,
+        WGPU_BODY_STYLE,
+        desktop.state.theme.active_theme().text.title,
+        output_state.scale_factor,
+    );
+}
+
 fn append_wallpaper_quads(
     desktop: &mut WgpuSceneDesktop<'_>,
     assets: &mut WgpuShellAssets,
@@ -2204,6 +2296,7 @@ fn collect_shm_surfaces(
                 .unwrap_or_default();
             let mut window_origin = window_location - window.geometry().loc - output_origin;
             window_origin.x += view.offset_x;
+            window_origin.y += view.offset_y;
 
             // Smithay's downward traversal and popup iterator are front-to-back,
             // while wgpu draws in painter's order. Build one front-to-back window
@@ -2244,6 +2337,12 @@ fn collect_shm_surfaces(
                         surface.color_transform.source_peak_nits = auto_hdr.target_nits;
                     }
                 }
+            }
+            for surface in &mut window_surfaces {
+                surface.tint[0] *= view.opacity;
+                surface.tint[1] *= view.opacity;
+                surface.tint[2] *= view.opacity;
+                surface.tint[3] *= view.opacity;
             }
             output.extend(window_surfaces.into_iter().rev());
         }

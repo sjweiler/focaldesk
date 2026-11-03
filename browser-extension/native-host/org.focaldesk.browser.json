@@ -1,0 +1,7 @@
+{
+  "name": "org.focaldesk.browser",
+  "description": "FocalDesk local AI browser bridge",
+  "path": "/home/steve/.local/bin/focaldesk-browser-bridge",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://REPLACE_WITH_EXTENSION_ID/"]
+}

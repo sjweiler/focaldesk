@@ -104,7 +104,7 @@ use focaldesk_settings_core::{
     DebugSettings, DisplayColorProfile, DisplayTransform, HdrAppearance, HdrCalibrationPattern,
     InputAccelerationProfile, InputDeviceSettings, InputScrollMethod, InputSettings,
     LidCloseAction, LowBatteryAction, OutputConfig, PerformanceMode, PowerButtonAction,
-    PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings,
+    PowerSettings, PrivacySettings, WindowRule, WorkspaceSettings, WorkspaceTransitionStyle,
 };
 use focaldesk_shortcuts::{KeyAction, KeySymbol, Keybinds, ModMask};
 use focaldesk_sounds::{UiSound, UiSoundPlayer};
@@ -1682,14 +1682,17 @@ enum WorkspaceTransitionPhase {
 struct WorkspaceTransition {
     from: WorkspaceId,
     to: WorkspaceId,
+    style: WorkspaceTransitionStyle,
     progress: f64,
     phase: WorkspaceTransitionPhase,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct WorkspaceRenderView {
     pub workspace: WorkspaceId,
     pub offset_x: i32,
+    pub offset_y: i32,
+    pub opacity: f32,
 }
 
 impl WorkspaceTransition {
@@ -1722,6 +1725,26 @@ fn workspace_transition_views(
     progress: f64,
     output_width: i32,
 ) -> [WorkspaceRenderView; 2] {
+    if transition.style == WorkspaceTransitionStyle::Materialize {
+        // An original 2D materialization: the old workspace gently disperses
+        // upward while the new one resolves from below. Alpha is applied to
+        // each client surface by both compositor backends.
+        const MATERIALIZE_TRAVEL: f64 = 24.0;
+        return [
+            WorkspaceRenderView {
+                workspace: transition.from,
+                offset_x: 0,
+                offset_y: (-progress * MATERIALIZE_TRAVEL).round() as i32,
+                opacity: (1.0 - progress) as f32,
+            },
+            WorkspaceRenderView {
+                workspace: transition.to,
+                offset_x: 0,
+                offset_y: ((1.0 - progress) * MATERIALIZE_TRAVEL).round() as i32,
+                opacity: progress as f32,
+            },
+        ];
+    }
     let direction = if transition.to.0 > transition.from.0 {
         1.0
     } else {
@@ -1732,10 +1755,14 @@ fn workspace_transition_views(
         WorkspaceRenderView {
             workspace: transition.from,
             offset_x: (-direction * progress * width).round() as i32,
+            offset_y: 0,
+            opacity: 1.0,
         },
         WorkspaceRenderView {
             workspace: transition.to,
             offset_x: (direction * (1.0 - progress) * width).round() as i32,
+            offset_y: 0,
+            opacity: 1.0,
         },
     ]
 }
@@ -1958,6 +1985,12 @@ pub struct DesktopState {
 
     pub screenshot_requested: Option<OutputId>,
     pub screenshot_all_requested: bool,
+    /// (output, drag origin, current pointer), all in output-local logical coordinates.
+    pub screenshot_selection: Option<(OutputId, Point<i32, Logical>, Point<i32, Logical>)>,
+    /// The shortcut arms selection; the next left press supplies its origin.
+    pub screenshot_selection_dragging: bool,
+    /// Region to crop from the next clean output capture.
+    pub screenshot_crop: Option<(OutputId, Rectangle<i32, Logical>)>,
     pub screenshot_seq: u64,
 
     pub fonts: FontSystem,
@@ -3419,6 +3452,9 @@ impl DesktopState {
             self.restore_all_split_windows();
         }
         self.workspaces = settings.workspaces;
+        if self.workspaces.transition_style == WorkspaceTransitionStyle::None {
+            self.workspace_transitions.clear();
+        }
         self.apply_workspace_name_overrides();
         self.session_restore
             .set_enabled(self.workspaces.restore_session);
@@ -7685,6 +7721,102 @@ impl DesktopState {
         dbg_flush("SCREENSHOT ALL REQUEST SET");
     }
 
+    pub fn request_screenshot_selection(&mut self) {
+        let output_id = self.output_under_pointer(self.pointer_pos).unwrap_or(self.focused_output);
+        let Some(output) = self.outputs.get(&output_id) else { return };
+        let point = Point::from((
+            (self.pointer_pos.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
+            (self.pointer_pos.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
+        ));
+        self.screenshot_selection = Some((output_id, point, point));
+        self.screenshot_selection_dragging = false;
+        self.clear_client_pointer_focus(self.pointer_pos);
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+    }
+
+    pub fn update_screenshot_selection(&mut self, position: Point<f64, Logical>) -> bool {
+        if !self.screenshot_selection_dragging {
+            return self.screenshot_selection.is_some();
+        }
+        let Some((output_id, _, current)) = self.screenshot_selection.as_mut() else { return false };
+        let output_id = *output_id;
+        let Some(output) = self.outputs.get(&output_id) else {
+            self.screenshot_selection = None;
+            return false;
+        };
+        *current = Point::from((
+            (position.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
+            (position.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
+        ));
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
+    pub fn begin_screenshot_selection(&mut self, position: Point<f64, Logical>) -> bool {
+        let Some((output_id, start, current)) = self.screenshot_selection.as_mut() else { return false };
+        let output_id = *output_id;
+        let Some(output) = self.outputs.get(&output_id) else {
+            self.screenshot_selection = None;
+            return false;
+        };
+        let point = Point::from((
+            (position.x as i32 - output.logical_origin.x).clamp(0, output.logical_size.w),
+            (position.y as i32 - output.logical_origin.y).clamp(0, output.logical_size.h),
+        ));
+        *start = point;
+        *current = point;
+        self.screenshot_selection_dragging = true;
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
+    pub fn finish_screenshot_selection(&mut self) -> bool {
+        let Some((output_id, start, current)) = self.screenshot_selection.take() else { return false };
+        self.screenshot_selection_dragging = false;
+        let rect = Rectangle::from_loc_and_size(
+            (start.x.min(current.x), start.y.min(current.y)),
+            ((start.x - current.x).unsigned_abs() as i32, (start.y - current.y).unsigned_abs() as i32),
+        );
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        if rect.size.w >= 2 && rect.size.h >= 2 {
+            self.screenshot_crop = Some((output_id, rect));
+            self.screenshot_requested = Some(output_id);
+        }
+        true
+    }
+
+    pub fn cancel_screenshot_selection(&mut self) -> bool {
+        let Some((output_id, _, _)) = self.screenshot_selection.take() else { return false };
+        self.screenshot_selection_dragging = false;
+        self.mark_output_full_damage(output_id, DamageSource::Unknown);
+        true
+    }
+
+    pub fn screenshot_selection_rect(&self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+        if !self.screenshot_selection_dragging {
+            return None;
+        }
+        let (selection_output, start, current) = self.screenshot_selection?;
+        (selection_output == output_id).then(|| Rectangle::from_loc_and_size(
+            (start.x.min(current.x), start.y.min(current.y)),
+            ((start.x - current.x).unsigned_abs() as i32, (start.y - current.y).unsigned_abs() as i32),
+        ))
+    }
+
+    pub fn screenshot_selection_active(&self, output_id: OutputId) -> bool {
+        self.screenshot_selection.is_some_and(|(selection_output, _, _)| selection_output == output_id)
+    }
+
+    pub fn take_screenshot_crop(&mut self, output_id: OutputId) -> Option<Rectangle<i32, Logical>> {
+        let (crop_output, crop) = self.screenshot_crop?;
+        if crop_output == output_id {
+            self.screenshot_crop = None;
+            Some(crop)
+        } else {
+            None
+        }
+    }
+
     pub fn take_screenshot_request(&mut self) -> Option<OutputId> {
         self.screenshot_requested.take()
     }
@@ -7789,13 +7921,16 @@ impl DesktopState {
         }
         let output_id = self.focused_output;
         self.activate_focused_workspace(workspace);
-        if self.animations_enabled {
+        if self.animations_enabled
+            && self.workspaces.transition_style != WorkspaceTransitionStyle::None
+        {
             self.clear_client_pointer_focus(self.pointer_pos);
             self.workspace_transitions.insert(
                 output_id,
                 WorkspaceTransition {
                     from: previous_workspace,
                     to: workspace,
+                    style: self.workspaces.transition_style,
                     progress: 0.0,
                     phase: WorkspaceTransitionPhase::Settling {
                         started_at: Instant::now(),
@@ -7843,6 +7978,8 @@ impl DesktopState {
             return vec![WorkspaceRenderView {
                 workspace: active,
                 offset_x: 0,
+                offset_y: 0,
+                opacity: 1.0,
             }];
         };
         let (progress, complete) = transition.sampled_progress(now);
@@ -7851,6 +7988,8 @@ impl DesktopState {
             return vec![WorkspaceRenderView {
                 workspace: active,
                 offset_x: 0,
+                offset_y: 0,
+                opacity: 1.0,
             }];
         }
         workspace_transition_views(transition, progress, output_width).to_vec()
@@ -7865,7 +8004,10 @@ impl DesktopState {
     }
 
     pub(crate) fn update_interactive_workspace_transition(&mut self, delta_x: f64, delta_y: f64) {
-        if !self.animations_enabled || delta_x.abs() < delta_y.abs() * 1.05 {
+        if !self.animations_enabled
+            || self.workspaces.transition_style == WorkspaceTransitionStyle::None
+            || delta_x.abs() < delta_y.abs() * 1.05
+        {
             return;
         }
         let from = self.focused_workspace();
@@ -7891,6 +8033,7 @@ impl DesktopState {
             WorkspaceTransition {
                 from,
                 to,
+                style: self.workspaces.transition_style,
                 progress,
                 phase: WorkspaceTransitionPhase::Interactive,
             },
@@ -9870,6 +10013,9 @@ impl DesktopState {
             cursor_owner_output: None,
             screenshot_requested: None,
             screenshot_all_requested: false,
+            screenshot_selection: None,
+            screenshot_selection_dragging: false,
+            screenshot_crop: None,
             screenshot_seq: 0,
             theme: init.theme_manager,
             surface_colors: HashMap::new(),
@@ -10877,6 +11023,8 @@ impl DesktopState {
                     "screenshot-all action fired"
                 );
             }
+
+            KeyAction::TakeScreenshotSelection => self.request_screenshot_selection(),
 
             KeyAction::LaunchBrowser => {
                 let launch_trace_id = self.launch_app(self.apps.browser.clone());
@@ -15051,6 +15199,7 @@ mod tests {
         let transition = WorkspaceTransition {
             from: WorkspaceId(1),
             to: WorkspaceId(2),
+            style: focaldesk_settings_core::WorkspaceTransitionStyle::Slide,
             progress: 0.0,
             phase: WorkspaceTransitionPhase::Interactive,
         };

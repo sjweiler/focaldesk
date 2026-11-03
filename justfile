@@ -571,17 +571,19 @@ install-session-target-fedora:
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
 
 install-shell-services-fedora: install-session-target-fedora
-    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf
+    cargo build --release -p focaldesk-system-rail -p focaldesk-task-shelf -p focaldesk-companion-dashboard
     sudo install -Dm755 target/release/focaldesk-system-rail /usr/bin/focaldesk-system-rail
     sudo install -Dm755 target/release/focaldesk-task-shelf /usr/bin/focaldesk-task-shelf
+    sudo install -Dm755 target/release/focaldesk-companion-dashboard /usr/bin/focaldesk-companion-dashboard
     sudo install -Dm644 packaging/systemd/user/focaldesk-system-rail-fedora.service /usr/lib/systemd/user/focaldesk-system-rail.service
     sudo install -Dm644 packaging/systemd/user/focaldesk-task-shelf-fedora.service /usr/lib/systemd/user/focaldesk-task-shelf.service
+    sudo install -Dm644 packaging/systemd/user/focaldesk-companion-dashboard-fedora.service /usr/lib/systemd/user/focaldesk-companion-dashboard.service
     # User-unit precedence would otherwise keep launching old ~/.local binaries
     # after a Fedora system install. Remove only the superseded FocalDesk units.
-    systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service focaldesk-system-rail.service focaldesk-task-shelf.service || true
-    rm -f "$HOME/.config/systemd/user/focaldesk-system-rail.service" "$HOME/.config/systemd/user/focaldesk-task-shelf.service"
+    systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || true
+    rm -f "$HOME/.config/systemd/user/focaldesk-system-rail.service" "$HOME/.config/systemd/user/focaldesk-task-shelf.service" "$HOME/.config/systemd/user/focaldesk-companion-dashboard.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service || echo "Skipping GTK shell enable: no user bus available"
+    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || echo "Skipping GTK shell enable: no user bus available"
 
 install-power-service-fedora:
     cargo build --release -p focaldesk-powerd

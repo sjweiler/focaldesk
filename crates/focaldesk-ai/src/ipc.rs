@@ -103,6 +103,9 @@ pub enum AiIpcRequest {
         #[serde(default)]
         recursive: bool,
     },
+    IngestWebsite {
+        url: String,
+    },
     ListIndexedDocuments,
     RemoveIndexedDocument {
         source: String,
@@ -362,6 +365,9 @@ pub enum AiIpcResponse {
     },
     DirectoryIngested {
         result: crate::types::DirectoryIngestResult,
+    },
+    WebsiteIngested {
+        result: crate::types::WebsiteIngestResult,
     },
     IndexedDocuments {
         documents: Vec<focaldesk_memory::IndexedDocument>,
@@ -739,6 +745,23 @@ async fn handle_connection(service: Arc<AiService>, mut stream: UnixStream) -> R
                     }
                 }
             }
+            Ok(AiIpcRequest::IngestWebsite { url }) => match service.ingest_website(url.clone()).await {
+                Ok(result) => {
+                    tracing::info!(
+                        target: "focaldesk.ai",
+                        source = %result.source,
+                        indexed = result.indexed,
+                        unchanged = result.unchanged,
+                        failed = result.failed,
+                        "website indexed"
+                    );
+                    AiIpcResponse::WebsiteIngested { result }
+                }
+                Err(err) => {
+                    tracing::warn!(target: "focaldesk.ai", source = %url, error = %err, "website indexing failed");
+                    AiIpcResponse::Error { message: err.to_string() }
+                }
+            },
             Ok(AiIpcRequest::ListIndexedDocuments) => match service.indexed_documents().await {
                 Ok(documents) => AiIpcResponse::IndexedDocuments {
                     documents: indexed_document_summaries(documents),
@@ -1653,9 +1676,9 @@ fn configure_ai_stream(stream: &StdUnixStream, response_timeout: Duration) -> Re
 
 fn response_timeout_for(request: &AiIpcRequest) -> Duration {
     match request {
-        AiIpcRequest::IngestDocument { .. } | AiIpcRequest::IngestDirectory { .. } => {
-            AI_INGEST_RESPONSE_TIMEOUT
-        }
+        AiIpcRequest::IngestDocument { .. }
+        | AiIpcRequest::IngestDirectory { .. }
+        | AiIpcRequest::IngestWebsite { .. } => AI_INGEST_RESPONSE_TIMEOUT,
         _ => AI_RESPONSE_TIMEOUT,
     }
 }

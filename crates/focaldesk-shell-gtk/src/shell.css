@@ -40,6 +40,10 @@ window.companion-dashboard-window > * {
 .companion-card-title, .companion-section-title { font-size: 16px; font-weight: 700; color: @fd_shell_text_dim; }
 .companion-big-time { font-size: 72px; font-weight: 800; }
 .companion-subtitle { font-size: 19px; }
+.companion-weather-icon { min-width: 48px; font-size: 43px; color: @fd_shell_accent; }
+.companion-weather-condition { font-size: 19px; font-weight: 700; }
+.companion-weather-temperature { font-size: 31px; font-weight: 800; }
+.companion-weather-details { font-size: 15px; color: @fd_shell_text_dim; }
 .companion-album { min-height: 92px; font-size: 62px; color: @fd_shell_text_dim; }
 .companion-media-text { font-size: 18px; font-weight: 700; }
 .companion-media-controls { font-size: 16px; color: @fd_shell_text_dim; }

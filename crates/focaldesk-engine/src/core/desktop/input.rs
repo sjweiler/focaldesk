@@ -475,6 +475,19 @@ impl DesktopState {
             self.set_focused_output(id);
         }
         self.update_magnifier_pointer_focus(position);
+        if self.screenshot_selection.is_some() {
+            if matches!((button, state), (MouseButton::Left, KeyState::Pressed)) {
+                self.begin_screenshot_selection(position);
+            } else if matches!((button, state), (MouseButton::Left, KeyState::Released))
+                && self.screenshot_selection_dragging
+            {
+                self.finish_screenshot_selection();
+            } else if matches!((button, state), (MouseButton::Right, KeyState::Pressed)) {
+                self.cancel_screenshot_selection();
+            }
+            self.clear_client_pointer_focus(position);
+            return;
+        }
         // Rendering rebuilds the compositor's single UiTree once per
         // output. Resolve this click against the output that actually
         // received it, not whichever output happened to render last.
@@ -802,6 +815,13 @@ impl DesktopState {
             flog_info!("no keyboard on seat");
             return;
         };
+        if self.screenshot_selection.is_some()
+            && matches!(prepared.state, KeyState::Pressed)
+            && prepared.symbol == keysyms::KEY_Escape
+        {
+            self.cancel_screenshot_selection();
+            return;
+        }
         let event = prepared.input_event();
 
         if matches!(state, KeyState::Pressed)
@@ -1001,6 +1021,11 @@ impl DesktopState {
         self.drm_submit_hw_cursor = true;
         let cursor_owner_damage = self.update_cursor_owner_damage();
         let stale_cursor_damage = self.clear_stale_software_cursor_damage();
+        if self.screenshot_selection.is_some() {
+            self.update_screenshot_selection(position);
+            self.clear_client_pointer_focus(position);
+            return;
+        }
         if self.egui_open_on_output(self.focused_output) {
             let _ = self.handle_egui_input(&event);
             if self.egui_wants_pointer_on_output(self.focused_output) {
@@ -1487,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_screenshot_shortcut_triggers_once_per_key_cycle() {
+    fn desktop_screenshot_selection_shortcut_triggers_once_per_key_cycle() {
         let keybinds = Keybinds::with_defaults(ShortcutCapabilities::DESKTOP);
         let dispatches = [KeyState::Pressed, KeyState::Released].map(|state| {
             shortcut_dispatch(
@@ -1501,7 +1526,7 @@ mod tests {
         assert_eq!(
             dispatches,
             [
-                ShortcutDispatch::Trigger(KeyAction::TakeScreenshot),
+                ShortcutDispatch::Trigger(KeyAction::TakeScreenshotSelection),
                 ShortcutDispatch::Intercept,
             ]
         );

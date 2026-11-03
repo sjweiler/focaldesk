@@ -2689,6 +2689,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-browser-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "focaldesk-ai",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "focaldesk-calendar"
 version = "0.1.0"
 dependencies = [

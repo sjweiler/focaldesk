@@ -1325,10 +1325,24 @@ fn save_offscreen_screenshot(
     surface: &mut DrmSurfaceState,
     output_name: &str,
     seq: u64,
+    crop: Option<(Rectangle<i32, Logical>, Size<i32, Logical>)>,
 ) -> Result<PathBuf> {
-    let size = surface.size;
-
-    let pixels = capture_surface_pixels(renderer, surface)?;
+    let mut size = surface.size;
+    let mut pixels = capture_surface_pixels(renderer, surface)?;
+    if let Some((crop, logical_size)) = crop {
+        let scale_x = size.w as f64 / logical_size.w.max(1) as f64;
+        let scale_y = size.h as f64 / logical_size.h.max(1) as f64;
+        let x = (crop.loc.x as f64 * scale_x).floor().max(0.0) as u32;
+        let y = (crop.loc.y as f64 * scale_y).floor().max(0.0) as u32;
+        let right = ((crop.loc.x + crop.size.w) as f64 * scale_x).ceil().max(0.0) as u32;
+        let bottom = ((crop.loc.y + crop.size.h) as f64 * scale_y).ceil().max(0.0) as u32;
+        let (width, height, cropped) = crate::core::screenshot::crop_rgb16(
+            &pixels, size.w as u32, size.h as u32, x, y,
+            right.saturating_sub(x), bottom.saturating_sub(y),
+        )?;
+        size = Size::from((width as i32, height as i32));
+        pixels = cropped;
+    }
 
     let screenshot_dir =
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
@@ -4461,13 +4475,23 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                     if wants_screenshot {
                         data.core.state.screenshot_seq += 1;
                         let seq = data.core.state.screenshot_seq;
-                        let output_name = format!("output-{}", surface.output_id.0);
+                        let crop = data
+                            .core
+                            .state
+                            .take_screenshot_crop(surface.output_id)
+                            .and_then(|rect| data.core.state.outputs.get(&surface.output_id).map(|output| (rect, output.logical_size)));
+                        let output_name = if crop.is_some() {
+                            format!("selection-{}", surface.output_id.0)
+                        } else {
+                            format!("output-{}", surface.output_id.0)
+                        };
 
                         match save_offscreen_screenshot(
                             &mut device.renderer,
                             surface,
                             &output_name,
                             seq,
+                            crop,
                         ) {
                             Ok(path) => {
                                 flog(&format!("Screenshot saved to {}", path.display()));

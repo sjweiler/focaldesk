@@ -121,6 +121,19 @@ pub struct DirectoryIngestResult {
     pub errors: Vec<String>,
 }
 
+/// Summary of a bounded static-site ingestion run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebsiteIngestResult {
+    pub source: String,
+    pub indexed: usize,
+    pub unchanged: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub chunks: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetrievalEvalCase {
     pub query: String,

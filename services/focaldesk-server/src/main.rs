@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 mod ai_tools;
 mod control_center;
+mod web_ui;
 
 use ai_tools::McpAgentTools;
 use control_center::{control_center_socket_path, serve_control_center_ipc};
@@ -49,7 +50,8 @@ async fn main() -> Result<()> {
 
     tokio::try_join!(
         serve_ai_ipc(ai_service.clone()),
-        serve_control_center_ipc(ai_service),
+        serve_control_center_ipc(ai_service.clone()),
+        web_ui::serve(ai_service.clone()),
     )?;
     Ok(())
 }

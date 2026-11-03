@@ -16,6 +16,7 @@ Wants=focal-launchd.service
 Wants=focaldesk-settingsd.service
 Wants=focaldesk-system-rail.service
 Wants=focaldesk-task-shelf.service
+Wants=focaldesk-companion-dashboard.service
 Wants=focald-voice.service
 Wants=focald-speech.service
 Wants=focald-mic.service

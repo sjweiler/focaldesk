@@ -719,6 +719,7 @@ pub fn draw_output_stage(
     );
     let split_dividers = state.split_divider_rects_for_output(prepared.frame_ctx.rendering_output);
     let snap_preview = state.snap_preview_rect_for_output(prepared.frame_ctx.rendering_output);
+    let screenshot_selection = state.screenshot_selection_rect(prepared.frame_ctx.rendering_output);
     let split_resize_percent = state.split_resize_percent_for_output(
         prepared.frame_ctx.rendering_output,
         prepared.frame_ctx.now,
@@ -760,6 +761,7 @@ pub fn draw_output_stage(
         split_dividers: &split_dividers,
         split_resize_percent,
         snap_preview,
+        screenshot_selection,
         draw_software_cursor: prepared.draw_software_cursor,
         ui_focus: state.ui.focused,
         current_workspace: active_workspace,
