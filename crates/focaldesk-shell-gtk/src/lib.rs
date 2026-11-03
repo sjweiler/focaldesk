@@ -153,7 +153,28 @@ fn build_shell(app: &gtk::Application, role: ShellRole) {
         return;
     };
 
-    rebuild_shell_windows(app, role, &display, &config);
+    let output_count = rebuild_shell_windows(app, role, &display, &config);
+    if role == ShellRole::Companion && output_count == 0 {
+        // GDK can connect before DRM has published the configured touchscreen.
+        // Poll briefly here instead of delaying the entire service at startup;
+        // the monitor-change signal below remains responsible for later hotplug.
+        let app = app.clone();
+        let display = display.clone();
+        let config = config.clone();
+        let retries = Rc::new(Cell::new(50u8));
+        glib::timeout_add_local(Duration::from_millis(100), move || {
+            if rebuild_shell_windows(&app, role, &display, &config) > 0 {
+                return glib::ControlFlow::Break;
+            }
+            let remaining = retries.get().saturating_sub(1);
+            retries.set(remaining);
+            if remaining == 0 {
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+    }
     let app = app.clone();
     let display_for_changes = display.clone();
     let config_for_changes = config.clone();
@@ -167,7 +188,7 @@ fn rebuild_shell_windows(
     role: ShellRole,
     display: &gdk::Display,
     config: &FocalDeskConfig,
-) {
+) -> usize {
     for window in app.windows() {
         window.close();
     }
@@ -241,6 +262,7 @@ fn rebuild_shell_windows(
         "{}: presented {output_count} GTK layer surface(s)",
         role.namespace()
     ));
+    output_count
 }
 
 fn report_shell_frame_state(role: ShellRole, connector: String, output_count: usize, ready: bool) {

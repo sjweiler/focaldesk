@@ -5,10 +5,9 @@ After=focaldesk-session.target
 
 [Service]
 Type=simple
-# The session target is reached before DRM output enumeration completes on
-# some GPUs. Starting a layer-shell client in that gap leaves it alive but
-# unmapped, so wait for the compositor to publish its outputs first.
-ExecStartPre=/usr/bin/sleep 4
+# The companion retries monitor discovery itself during DRM output
+# enumeration, so it can start immediately without risking an unmapped
+# layer-shell surface.
 ExecStart=/usr/bin/focaldesk-companion-dashboard
 Restart=on-failure
 RestartSec=2
