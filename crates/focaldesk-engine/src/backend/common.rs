@@ -458,6 +458,38 @@ fn ensure_xdpw_screencast_config() {
     }
 }
 
+/// Complete the wallet PAM handoff supplied by a display-manager login.
+/// Run off the compositor thread: the helper can wait for the wallet daemon.
+fn start_login_wallet() {
+    let Some(socket) = std::env::var_os("PAM_KWALLET5_LOGIN").filter(|s| !s.is_empty()) else {
+        return;
+    };
+    let helper = ["/usr/libexec/pam_kwallet_init", "/usr/lib/pam_kwallet_init"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file());
+    let Some(helper) = helper else {
+        flog("wallet PAM handoff present, but pam_kwallet_init is not installed");
+        return;
+    };
+    if let Err(err) = std::thread::Builder::new()
+        .name("wallet-login".into())
+        .spawn(move || {
+            match std::process::Command::new(helper)
+                .env("PAM_KWALLET5_LOGIN", socket)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .status()
+            {
+                Ok(status) if status.success() => flog("wallet PAM handoff completed"),
+                Ok(status) => flog(format!("wallet PAM handoff failed: {status}")),
+                Err(err) => flog(format!("failed to run wallet PAM helper: {err}")),
+            }
+        })
+    {
+        flog(format!("failed to start wallet PAM handoff thread: {err}"));
+    }
+}
+
 /// Start FocalDesk's session target after publishing the compositor environment.
 /// The dedicated target owns the helper-service lifecycle without making
 /// FocalDesk responsible for the shared `graphical-session.target`.
@@ -474,6 +506,24 @@ fn start_focaldesk_session_target(wayland_display: &str) {
         flog(format!(
             "failed to import session environment into systemd --user: systemctl: {err}"
         ));
+    }
+
+    // A previous login or an older installer may have started GTK clients
+    // against a stale display and exhausted systemd's start limit. A new
+    // compositor session must be able to start its shell again.
+    let reset_status = std::process::Command::new("systemctl")
+        .args([
+            "--user",
+            "reset-failed",
+            "focaldesk-system-rail.service",
+            "focaldesk-task-shelf.service",
+            "focaldesk-companion-dashboard.service",
+        ])
+        .status();
+    match reset_status {
+        Ok(status) if status.success() => {}
+        Ok(status) => flog(format!("failed to reset shell service failures: {status}")),
+        Err(err) => flog(format!("failed to reset shell service failures: {err}")),
     }
 
     let start_status = std::process::Command::new("systemctl")
@@ -725,6 +775,7 @@ pub(crate) fn bootstrap_compositor_core(
         // session; only the real DRM-backed session should touch the shared
         // FocalDesk session target (the matching stop lives in backend::drm::run).
         start_focaldesk_session_target(&wayland_display);
+        start_login_wallet();
     }
     flog(format!("FocalDesk client socket is {}", wayland_display));
 

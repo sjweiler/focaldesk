@@ -15644,6 +15644,7 @@ mod tests {
             default_provider: "test".into(),
             provider_count: 1,
             provider_telemetry: Vec::new(),
+            latest_chat: None,
         };
         assert_eq!(
             ai_flow_mode_from_status(&status),

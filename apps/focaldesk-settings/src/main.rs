@@ -1,34 +1,34 @@
 use adw::prelude::*;
-use focaldesk_ai::{AiPermissionRecord, list_ai_permission_records, revoke_ai_permission};
-use focaldesk_bluetooth::{BluetoothSnapshot, load_snapshot as load_bluetooth_snapshot};
-use focaldesk_config::{DockVisibility, FocalDeskConfig, RailBackdrop, load_config, save_config};
+use focaldesk_ai::{list_ai_permission_records, revoke_ai_permission, AiPermissionRecord};
+use focaldesk_bluetooth::{load_snapshot as load_bluetooth_snapshot, BluetoothSnapshot};
+use focaldesk_config::{load_config, save_config, DockVisibility, FocalDeskConfig, RailBackdrop};
 use focaldesk_gtk::{StateKind, StatusBanner};
 use focaldesk_ipc::{
-    ConnectorHostIpcRequest, DesktopAction, DisplayRuntimeOutputStatus, InputDeviceSnapshot,
-    IpcRequest, IpcResponse, PowerIpcRequest, PowerIpcResponse, THEME_EDITOR_PROTOCOL_VERSION,
-    ThemeEditorCommand, send_connector_host_request, send_desktop_config, send_desktop_request,
-    send_desktop_set, send_power_request, send_settings_request, watch_desktop_keys,
+    send_connector_host_request, send_desktop_config, send_desktop_request, send_desktop_set,
+    send_power_request, send_settings_request, watch_desktop_keys, ConnectorHostIpcRequest,
+    DesktopAction, DisplayRuntimeOutputStatus, InputDeviceSnapshot, IpcRequest, IpcResponse,
+    PowerIpcRequest, PowerIpcResponse, ThemeEditorCommand, THEME_EDITOR_PROTOCOL_VERSION,
 };
-use focaldesk_ipc::{NotificationIpcRequest, send_notification_request};
+use focaldesk_ipc::{send_notification_request, NotificationIpcRequest};
 use focaldesk_launcher_state::clear_recent_activity;
 use focaldesk_logging::{init_default_logging, session_id};
 use focaldesk_permissions::{
     PermissionDecision, PermissionResource, PermissionScope, PermissionTarget,
 };
 use focaldesk_settings_core::{
+    load_exclusive_hdr_state, load_settings, save_exclusive_hdr_state, save_settings,
     BrowserLaunchBackend, ColorFilter, DebugLogLevel, DisplayColorProfile, DisplayTransform,
     ExclusiveHdrPhase, ExclusiveHdrState, HdrAppearance, HdrCalibrationPattern, HdrToneMapper,
     InputAccelerationProfile, InputScrollMethod, LidCloseAction, LowBatteryAction,
     NightLightSchedule, OutputConfig, PerformanceMode, PowerButtonAction, Settings, StartupApp,
-    WindowRule, WorkspaceTransitionStyle, load_exclusive_hdr_state, load_settings,
-    save_exclusive_hdr_state, save_settings,
+    WindowRule, WorkspaceTransitionStyle,
 };
-use focaldesk_sounds::{SAMPLE_RATE, SoundBuffer, UiSound, UiSoundPlayer, generate_ui_sound};
+use focaldesk_sounds::{generate_ui_sound, SoundBuffer, UiSound, UiSoundPlayer, SAMPLE_RATE};
 use focaldesk_themes::{
-    GradientInterpolation, GradientStop, GtkAppThemeOptions, InteractionState, SemanticTheme,
-    SurfaceStyle, ThemeColor, ThemeColorSpace, ThemeDocument, ThemeDynamicRange, ThemePackage,
-    ThemePaint, ThemePaintIntent, ThemeWallpaper, ThemeWallpaperFit, gtk_app_css,
-    gtk_app_prefers_dark, theme_by_name,
+    gtk_app_css, gtk_app_prefers_dark, theme_by_name, GradientInterpolation, GradientStop,
+    GtkAppThemeOptions, InteractionState, SemanticTheme, SurfaceStyle, ThemeColor, ThemeColorSpace,
+    ThemeDocument, ThemeDynamicRange, ThemePackage, ThemePaint, ThemePaintIntent, ThemeWallpaper,
+    ThemeWallpaperFit,
 };
 
 use gtk::cairo;
@@ -49,7 +49,7 @@ mod location_permissions;
 
 use audio::*;
 use location_permissions::{
-    LocationPermissionRecord, list_location_permission_records, revoke_location_permission,
+    list_location_permission_records, revoke_location_permission, LocationPermissionRecord,
 };
 
 const SCALE_OPTIONS: &[(&str, f64)] = &[
@@ -2249,6 +2249,68 @@ fn connected_display_row(
         });
     }
 
+    let role_row = adw::ActionRow::new();
+    role_row.set_title("Display role");
+    role_row.set_subtitle("Reserve a display for the companion and touchscreen controls");
+    let role_dropdown = gtk::DropDown::from_strings(&["Desktop", "Control Panel"]);
+    role_dropdown.set_selected(u32::from(
+        display.role == focaldesk_settings_core::OutputRole::ControlPanel,
+    ));
+    role_dropdown.set_sensitive(
+        display.enabled
+            && displays
+                .borrow()
+                .iter()
+                .filter(|output| output.enabled)
+                .count()
+                > 1,
+    );
+    role_row.add_suffix(&role_dropdown);
+    row.add_row(&role_row);
+    {
+        let displays = displays.clone();
+        let area = area.clone();
+        let row = row.clone();
+        role_dropdown.connect_selected_notify(move |dropdown| {
+            let panel = dropdown.selected() == 1;
+            {
+                let mut current = displays.borrow_mut();
+                if panel {
+                    for output in current.iter_mut() {
+                        output.role = focaldesk_settings_core::OutputRole::Normal;
+                    }
+                }
+                if let Some(output) = current.get_mut(index) {
+                    output.role = if panel {
+                        focaldesk_settings_core::OutputRole::ControlPanel
+                    } else {
+                        focaldesk_settings_core::OutputRole::Normal
+                    };
+                    if panel {
+                        output.primary = false;
+                    }
+                }
+                if !current.iter().any(|output| {
+                    output.enabled
+                        && output.primary
+                        && output.role == focaldesk_settings_core::OutputRole::Normal
+                }) {
+                    if let Some(output) = current.iter_mut().find(|output| {
+                        output.enabled && output.role == focaldesk_settings_core::OutputRole::Normal
+                    }) {
+                        output.primary = true;
+                    }
+                }
+            }
+            save_display_change(&displays, &area, &row, index);
+            std::thread::spawn(|| {
+                let _ = Command::new("systemctl")
+                    .args(["--user", "restart", "focaldesk-companion-dashboard.service"])
+                    .status();
+            });
+        });
+    }
+
     let primary_row = adw::ActionRow::new();
     primary_row.set_title("Primary Display");
     let primary = gtk::Switch::new();
@@ -2600,8 +2662,17 @@ fn persist_config_key(config: &FocalDeskConfig, key: &str, value: serde_json::Va
     }
 }
 
+// Display changes have their own persistence path. A preferences page may
+// retain an older Settings snapshot while the companion changes output roles.
+fn settings_for_preferences_save(settings: &Settings, latest: Settings) -> Settings {
+    let mut merged = settings.clone();
+    merged.displays = latest.displays;
+    merged
+}
+
 fn persist_settings(settings: &Settings) {
-    if let Err(err) = save_settings(settings) {
+    let merged = settings_for_preferences_save(settings, load_settings());
+    if let Err(err) = save_settings(&merged) {
         error!(
             target: "focaldesk",
             session_id = session_id(),
@@ -12228,6 +12299,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preferences_save_preserves_external_control_panel_assignment() {
+        let mut stale = focaldesk_settings_core::default_settings();
+        stale.privacy.location_services = true;
+        let mut latest = focaldesk_settings_core::default_settings();
+        let mut output: OutputConfig = serde_json::from_value(serde_json::json!({
+            "connector": "HDMI-A-5", "enabled": true, "role": "ControlPanel",
+            "x": 0, "y": 0, "width": 1920, "height": 1080,
+            "refresh_mhz": 60000, "scale": 1.0, "primary": false
+        }))
+        .unwrap();
+        output.x = 123;
+        latest.displays.outputs.push(output);
+        let merged = settings_for_preferences_save(&stale, latest);
+        assert!(merged.privacy.location_services);
+        assert_eq!(merged.displays.outputs.len(), 1);
+        assert_eq!(
+            merged.displays.outputs[0].role,
+            focaldesk_settings_core::OutputRole::ControlPanel
+        );
+        assert_eq!(merged.displays.outputs[0].x, 123);
+    }
+
+    #[test]
     fn shortcut_normalization_detects_aliases_duplicates_and_extra_keys() {
         assert_eq!(
             normalized_shortcut("Meta+Shift+Return").unwrap(),
@@ -12368,12 +12462,10 @@ mod tests {
         assert!(!red_boundary.is_empty());
         assert!(!green_boundary.is_empty());
         assert_ne!(red_boundary, green_boundary);
-        assert!(
-            red_boundary
-                .iter()
-                .flatten()
-                .all(|coordinate| (0.0..=1.0).contains(coordinate))
-        );
+        assert!(red_boundary
+            .iter()
+            .flatten()
+            .all(|coordinate| (0.0..=1.0).contains(coordinate)));
         assert!(srgb_gamut_boundary_segments(0.0, 1).is_empty());
     }
 
@@ -12559,11 +12651,9 @@ mod tests {
             "Future gamut",
             ThemePaintIntent::new(ThemePaint::solid(ThemeColor::rec2020(0.5, 0.5, 0.5, 1.0))),
         );
-        assert!(
-            ThemeEditorDraft::from_document(&document)
-                .unwrap_err()
-                .contains("Rec.2020")
-        );
+        assert!(ThemeEditorDraft::from_document(&document)
+            .unwrap_err()
+            .contains("Rec.2020"));
     }
 
     #[test]
@@ -12653,6 +12743,7 @@ mod tests {
             physical_width_mm: None,
             physical_height_mm: None,
             primary: true,
+            role: focaldesk_settings_core::OutputRole::Normal,
             transform: "Normal".to_string(),
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
@@ -12698,6 +12789,7 @@ mod tests {
             physical_width_mm: None,
             physical_height_mm: None,
             primary: name == "DP-3",
+            role: focaldesk_settings_core::OutputRole::Normal,
             transform: "Normal".to_string(),
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,

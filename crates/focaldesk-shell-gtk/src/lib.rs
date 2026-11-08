@@ -39,6 +39,7 @@ use zbus::{
     zvariant::OwnedValue,
 };
 
+pub mod settings_subscription;
 mod vui_client;
 
 /// Canonical shell geometry shared by the GTK panel and dock.
@@ -156,19 +157,16 @@ fn build_shell(app: &gtk::Application, role: ShellRole) {
     let output_count = rebuild_shell_windows(app, role, &display, &config);
     if role == ShellRole::Companion && output_count == 0 {
         // GDK can connect before DRM has published the configured touchscreen.
-        // Poll briefly here instead of delaying the entire service at startup;
-        // the monitor-change signal below remains responsible for later hotplug.
+        // Keep watching until it arrives instead of delaying the entire service
+        // at startup; a slow cold boot must behave the same as later hotplug.
         let app = app.clone();
         let display = display.clone();
         let config = config.clone();
-        let retries = Rc::new(Cell::new(50u8));
-        glib::timeout_add_local(Duration::from_millis(100), move || {
-            if rebuild_shell_windows(&app, role, &display, &config) > 0 {
+        glib::timeout_add_local(Duration::from_millis(250), move || {
+            if !app.windows().is_empty() {
                 return glib::ControlFlow::Break;
             }
-            let remaining = retries.get().saturating_sub(1);
-            retries.set(remaining);
-            if remaining == 0 {
+            if rebuild_shell_windows(&app, role, &display, &config) > 0 {
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
@@ -357,15 +355,46 @@ fn companion_connectors() -> Vec<String> {
 }
 
 fn normal_connectors() -> Vec<String> {
-    load_settings()
-        .displays
-        .outputs
-        .into_iter()
+    let settings = load_settings();
+    let inventory = focaldesk_settings_core::settings_path()
+        .parent()
+        .and_then(|path| std::fs::read_to_string(path.join("displays.json")).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    normal_connectors_from_inventory(&settings.displays.outputs, inventory.as_ref())
+}
+
+fn normal_connectors_from_inventory(
+    configured: &[focaldesk_settings_core::OutputConfig],
+    inventory: Option<&serde_json::Value>,
+) -> Vec<String> {
+    let mut connectors = configured
+        .iter()
         .filter(|output| {
             output.enabled && output.role == focaldesk_settings_core::OutputRole::Normal
         })
-        .map(|output| output.connector)
-        .collect()
+        .map(|output| output.connector.clone())
+        .collect::<Vec<_>>();
+    // A fresh installation has no saved output configuration. Use the
+    // compositor's discovered connectors until the user saves settings;
+    // otherwise every real monitor is rejected and only one fallback maps.
+    for output in inventory
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(name) = output.get("name").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if configured.iter().any(|saved| saved.connector == name) {
+            continue;
+        }
+        if output.get("enabled").and_then(serde_json::Value::as_bool) == Some(true)
+            && output.get("role").and_then(serde_json::Value::as_str) != Some("ControlPanel")
+        {
+            connectors.push(name.to_string());
+        }
+    }
+    connectors
 }
 
 fn companion_workspace_target() -> Option<String> {
@@ -694,51 +723,16 @@ fn build_companion(app: &gtk::Application, _connector: String) -> gtk::Applicati
         .column_spacing(8)
         .build();
     let workspace_card = companion_card("Workspaces");
-    let workspace_buttons = Rc::new(RefCell::new(Vec::<(u32, gtk::Button)>::new()));
-    let workspace_count = desktop_snapshot()
-        .map(|snapshot| snapshot.shell.workspace_count)
-        .filter(|count| *count > 0)
-        .unwrap_or(1)
-        .min(64) as u32;
-    for workspace in 1..=workspace_count {
-        let button = gtk::Button::with_label(&format!(
-            "{workspace} — {}",
-            configured_workspace_name(workspace)
-        ));
-        button.add_css_class("companion-workspace");
-        let target = companion_workspace_target();
-        let workspace_buttons_for_click = workspace_buttons.clone();
-        button.connect_clicked(move |_| {
-            // The companion has no reason to make a successful press
-            // invisible. Latch the chosen workspace immediately; the next
-            // dashboard state refresh may replace it with authoritative state.
-            for (candidate, candidate_button) in workspace_buttons_for_click.borrow().iter() {
-                if *candidate == workspace {
-                    candidate_button.add_css_class("suggested-action");
-                } else {
-                    candidate_button.remove_css_class("suggested-action");
-                }
-            }
-            let action = target
-                .clone()
-                .map(|connector| DesktopAction::FocusWorkspaceOnOutput {
-                    connector,
-                    workspace,
-                })
-                .unwrap_or(DesktopAction::FocusWorkspace { workspace });
-            send_action(action);
-        });
-        workspace_buttons
-            .borrow_mut()
-            .push((workspace, button.clone()));
-        workspaces.attach(
-            &button,
-            ((workspace - 1) % 2) as i32,
-            ((workspace - 1) / 2) as i32,
-            1,
-            1,
-        );
-    }
+    let home_workspace_signature = Rc::new(RefCell::new(String::new()));
+    refresh_home_workspaces(&workspaces, &home_workspace_signature);
+    let workspace_grid = workspaces.downgrade();
+    glib::timeout_add_local(Duration::from_secs(1), move || {
+        let Some(grid) = workspace_grid.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        refresh_home_workspaces(&grid, &home_workspace_signature);
+        glib::ControlFlow::Continue
+    });
     workspace_card.append(&workspaces);
     controls.append(&workspace_card);
     body.append(&controls);
@@ -897,7 +891,7 @@ fn build_companion(app: &gtk::Application, _connector: String) -> gtk::Applicati
         refresh_companion_clock(&clock, &big_time, &date_label);
         glib::ControlFlow::Continue
     });
-    let weather_state = start_companion_weather_updates();
+    let (weather_state, weather_subscription) = start_companion_weather_updates();
     refresh_companion_weather(
         &weather_icon,
         &weather_condition,
@@ -905,7 +899,12 @@ fn build_companion(app: &gtk::Application, _connector: String) -> gtk::Applicati
         &weather_details,
         &weather_state,
     );
-    glib::timeout_add_local(Duration::from_secs(5), move || {
+    let weather_window = window.downgrade();
+    glib::timeout_add_local(Duration::from_secs(1), move || {
+        let _subscription = &weather_subscription;
+        if weather_window.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
         refresh_companion_weather(
             &weather_icon,
             &weather_condition,
@@ -968,6 +967,68 @@ fn set_companion_nav_selected(buttons: &Rc<RefCell<Vec<gtk::Button>>>, selected:
         button.remove_css_class("suggested-action");
     }
     selected.add_css_class("suggested-action");
+}
+
+fn refresh_home_workspaces(grid: &gtk::Grid, signature: &Rc<RefCell<String>>) {
+    let Some(snapshot) = desktop_snapshot() else {
+        return;
+    };
+    let target = companion_workspace_target();
+    let active = snapshot
+        .outputs
+        .iter()
+        .find(|output| Some(&output.connector) == target.as_ref())
+        .map(|output| output.active_workspace_id);
+    let count = snapshot.shell.workspace_count.clamp(1, 64) as u32;
+    let names = load_settings().workspaces.workspace_names;
+    let next_signature = format!(
+        "{count}|{}|{target:?}|{active:?}|{names:?}",
+        snapshot.shell.max_workspace_slots
+    );
+    if *signature.borrow() == next_signature {
+        return;
+    }
+    *signature.borrow_mut() = next_signature;
+    while let Some(child) = grid.first_child() {
+        grid.remove(&child);
+    }
+    for workspace in 1..=count {
+        let name = names
+            .get(&workspace)
+            .cloned()
+            .unwrap_or_else(|| format!("Workspace {workspace}"));
+        let button = gtk::Button::with_label(&format!("{workspace} — {name}"));
+        button.add_css_class("companion-workspace");
+        if active == Some(workspace) {
+            button.add_css_class("suggested-action");
+        }
+        button.connect_clicked(move |_| {
+            let action = companion_workspace_target()
+                .map(|connector| DesktopAction::FocusWorkspaceOnOutput {
+                    connector,
+                    workspace,
+                })
+                .unwrap_or(DesktopAction::FocusWorkspace { workspace });
+            send_action(action);
+        });
+        grid.attach(
+            &button,
+            ((workspace - 1) % 2) as i32,
+            ((workspace - 1) / 2) as i32,
+            1,
+            1,
+        );
+    }
+    let add = gtk::Button::with_label("＋ New workspace");
+    add.add_css_class("companion-outline-button");
+    add.set_sensitive((count as usize) < snapshot.shell.max_workspace_slots);
+    add.connect_clicked(|_| {
+        let action = companion_workspace_target()
+            .map(|connector| DesktopAction::CreateWorkspaceOnOutput { connector })
+            .unwrap_or(DesktopAction::CreateWorkspace);
+        send_action(action);
+    });
+    grid.attach(&add, 0, count.div_ceil(2) as i32, 2, 1);
 }
 
 fn build_workspaces_tab() -> gtk::ScrolledWindow {
@@ -2726,6 +2787,15 @@ fn set_control_panel_display(connector: &str) -> Result<(), String> {
     }
 
     save_settings(&settings).map_err(|error| format!("save settings: {error}"))?;
+    match send_desktop_request(&IpcRequest::SetDisplays {
+        outputs: settings.displays.outputs.clone(),
+    })
+    .map_err(|error| format!("apply control-panel role: {error}"))?
+    {
+        IpcResponse::Ok => {}
+        IpcResponse::Error { message } => return Err(message),
+        other => return Err(format!("unexpected display response: {other:?}")),
+    }
     send_desktop_request(&IpcRequest::Reload)
         .map_err(|error| format!("reload compositor settings: {error}"))?;
     let status = Command::new("systemctl")
@@ -3421,51 +3491,100 @@ impl CompanionWeather {
 /// Coordinates are already an opt-in local setting used by automatic night
 /// light scheduling.  We never infer a location from an IP address, and do
 /// not send a request when Location Services has been disabled.
-fn start_companion_weather_updates() -> Arc<Mutex<CompanionWeather>> {
-    let settings = load_settings();
-    let initial = if !settings.privacy.location_services {
-        CompanionWeather::message(
-            "⌖",
-            "Location services are off",
-            "Enable Location Services to show weather.",
-        )
-    } else if settings.accessibility.night_light.latitude.is_none()
-        || settings.accessibility.night_light.longitude.is_none()
-    {
-        CompanionWeather::message(
-            "⌖",
-            "Set a local location",
-            "Add coordinates in Display & Comfort to show weather.",
-        )
-    } else {
-        CompanionWeather::message("◌", "Loading local weather…", "")
+fn start_companion_weather_updates() -> (
+    Arc<Mutex<CompanionWeather>>,
+    Option<settings_subscription::SettingsSubscription>,
+) {
+    let state = Arc::new(Mutex::new(CompanionWeather::message(
+        "◌",
+        "Loading local weather…",
+        "",
+    )));
+    let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let state_for_changes = state.clone();
+    let generation_for_changes = generation.clone();
+    let update = move |settings: focaldesk_settings_core::Settings| {
+        // Lock publication and invalidation together so a completed old request
+        // cannot overwrite the disabled message or a new location's weather.
+        let mut current = state_for_changes.lock().unwrap();
+        let revision = generation_for_changes.fetch_add(1, Ordering::SeqCst) + 1;
+        let coordinates = if settings.privacy.location_services {
+            settings
+                .accessibility
+                .night_light
+                .latitude
+                .zip(settings.accessibility.night_light.longitude)
+        } else {
+            None
+        };
+        *current = if !settings.privacy.location_services {
+            CompanionWeather::message(
+                "⌖",
+                "Location services are off",
+                "Enable Location Services to show weather.",
+            )
+        } else if coordinates.is_none() {
+            CompanionWeather::message(
+                "⌖",
+                "Set a local location",
+                "Add coordinates in Display & Comfort to show weather.",
+            )
+        } else {
+            CompanionWeather::message("◌", "Loading local weather…", "")
+        };
+        let _ = sender.send((revision, coordinates));
     };
-    let state = Arc::new(Mutex::new(initial));
-
-    if !settings.privacy.location_services {
-        return state;
-    }
-    let (Some(latitude), Some(longitude)) = (
-        settings.accessibility.night_light.latitude,
-        settings.accessibility.night_light.longitude,
-    ) else {
-        return state;
-    };
-
+    // Initialize even when there is no saved settings file yet.
+    update(load_settings());
+    let subscription = settings_subscription::subscribe(
+        &[
+            "privacy.location_services",
+            "accessibility.night_light.latitude",
+            "accessibility.night_light.longitude",
+        ],
+        update,
+    )
+    .map_err(|error| flog(format!("Companion settings subscription failed: {error}")))
+    .ok();
     let state_for_worker = state.clone();
-    thread::spawn(move || loop {
-        let next = fetch_companion_weather(latitude, longitude).unwrap_or_else(|error| {
-            flog(format!("Companion weather refresh failed: {error}"));
-            CompanionWeather::message("!", "Weather unavailable", "Will try again shortly.")
-        });
-        if let Ok(mut current) = state_for_worker.lock() {
-            *current = next;
+    thread::spawn(move || {
+        let mut pending = receiver.recv().ok();
+        while let Some((revision, coordinates)) = pending {
+            if let Some((latitude, longitude)) = coordinates {
+                if generation.load(Ordering::SeqCst) == revision {
+                    let next =
+                        fetch_companion_weather(latitude, longitude).unwrap_or_else(|error| {
+                            flog(format!("Companion weather refresh failed: {error}"));
+                            CompanionWeather::message(
+                                "!",
+                                "Weather unavailable",
+                                "Will try again shortly.",
+                            )
+                        });
+                    if let Ok(mut current) = state_for_worker.lock() {
+                        if generation.load(Ordering::SeqCst) == revision {
+                            *current = next;
+                        }
+                    }
+                }
+                pending = match receiver.recv_timeout(Duration::from_secs(15 * 60)) {
+                    Ok(update) => Some(update),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        Some((revision, coordinates))
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                };
+            } else {
+                pending = receiver.recv().ok();
+            }
+            // Coalesce edits made while a forecast request was in flight.
+            while let Ok(latest) = receiver.try_recv() {
+                pending = Some(latest);
+            }
         }
-        // Forecast values change slowly, and this avoids making the dashboard
-        // a high-frequency location-sharing client.
-        thread::sleep(Duration::from_secs(15 * 60));
     });
-    state
+    (state, subscription)
 }
 
 fn fetch_companion_weather(latitude: f64, longitude: f64) -> Result<CompanionWeather, String> {
@@ -5880,6 +5999,45 @@ fn rgba(color: [f32; 4]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fresh_install_uses_all_discovered_normal_outputs() {
+        let inventory = serde_json::json!([
+            {"name": "HDMI-A-5", "enabled": true, "role": "ControlPanel"},
+            {"name": "DP-3", "enabled": true, "role": "Normal"},
+            {"name": "DP-4", "enabled": true, "role": "Normal"},
+            {"name": "DP-5", "enabled": false, "role": "Normal"}
+        ]);
+        assert_eq!(
+            super::normal_connectors_from_inventory(&[], Some(&inventory)),
+            vec!["DP-3", "DP-4"]
+        );
+    }
+
+    #[test]
+    fn saved_output_roles_override_discovery() {
+        let inventory = serde_json::json!([
+            {"name": "HDMI-A-5", "enabled": true, "role": "Normal"},
+            {"name": "DP-3", "enabled": true, "role": "Normal"},
+            {"name": "DP-4", "enabled": true, "role": "Normal"}
+        ]);
+        let output = serde_json::json!({
+            "connector": "HDMI-A-5", "enabled": true, "role": "ControlPanel",
+            "x": 0, "y": 0, "width": 1920, "height": 1080,
+            "refresh_mhz": 60000, "scale": 1.0, "primary": false
+        });
+        let mut disabled = output.clone();
+        disabled["connector"] = "DP-4".into();
+        disabled["enabled"] = false.into();
+        let configured = vec![
+            serde_json::from_value(output).unwrap(),
+            serde_json::from_value(disabled).unwrap(),
+        ];
+        assert_eq!(
+            super::normal_connectors_from_inventory(&configured, Some(&inventory)),
+            vec!["DP-3"]
+        );
+    }
+
     use super::{
         ai_console_identity_matches, app_icon_name, companion_weather_condition,
         email_identity_matches, rail_clock_pattern, rail_display_status, running_app_capacity,

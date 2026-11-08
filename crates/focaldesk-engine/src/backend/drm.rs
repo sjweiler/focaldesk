@@ -777,7 +777,7 @@ fn display_config_path() -> PathBuf {
 pub(crate) fn load_display_config() -> Vec<DisplayConfig> {
     let path = display_config_path();
 
-    match std::fs::read_to_string(&path) {
+    let mut displays = match std::fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str(&text) {
             Ok(displays) => displays,
             Err(err) => {
@@ -797,6 +797,26 @@ pub(crate) fn load_display_config() -> Vec<DisplayConfig> {
                 err
             ));
             Vec::new()
+        }
+    };
+    apply_saved_display_positions(
+        &mut displays,
+        &focaldesk_settings_core::load_settings().displays.outputs,
+    );
+    displays
+}
+
+// Inventory can lag a settings edit made outside the compositor session.
+// Positions belong to connectors, so use canonical layout settings rather than
+// restoring a stale inventory position that can strand the pointer behind a gap.
+fn apply_saved_display_positions(
+    displays: &mut [DisplayConfig],
+    outputs: &[focaldesk_settings_core::OutputConfig],
+) {
+    for display in displays {
+        if let Some(output) = outputs.iter().find(|output| output.connector == display.name) {
+            display.logical_x = output.x;
+            display.logical_y = output.y;
         }
     }
 }
@@ -1513,13 +1533,25 @@ fn reinitialize_drm_device(
     ));
 
     let topology = data.core.state.snapshot_output_topology();
+    // libseat/logind already owns this device for the current session.
+    // Opening it again can fail with EINVAL, so retain the shared DRM fd
+    // across output/renderer teardown instead of issuing another seat open.
+    let fd = data
+        .backend
+        .devices
+        .get(&node)
+        .ok_or_else(|| anyhow!("cannot rebuild unknown DRM device {node:?}"))?
+        .drm_output_manager
+        .device()
+        .device_fd()
+        .clone();
     // Destroy painter resources while the old EGL context is still alive, and
     // make every other compositor cache rebuild against the replacement
-    // renderer created by device_added().
+    // renderer created by initialize_drm_device().
     data.core.state.invalidate_gpu_state();
     data.core.ui_state.chrome.invalidate_gpu_state();
     remove_drm_device(data, loop_handle, node);
-    device_added(data, loop_handle, node, &path)?;
+    initialize_drm_device(data, loop_handle, node, &path, fd)?;
     data.core.state.restore_output_topology(topology);
     refresh_portal_services(&data.core.state.client_wayland_display);
     data.core
@@ -1633,13 +1665,20 @@ fn resume_drm_session(
         }
     }
     for (node, device) in &mut data.backend.devices {
-        if let Err(err) = device.drm_output_manager.lock().activate(true) {
+        let activation = device.drm_output_manager.lock().activate(true);
+        if let Err(err) = activation {
             flog_warn!(
                 "Failed to reactivate DRM device {:?} after resume: {err}; scheduling retry",
                 node
             );
             all_devices_ready = false;
         } else {
+            for crtc in device.surfaces.keys() {
+                if let Err(err) = reset_crtc_gamma(device.drm_output_manager.device(), *crtc) {
+                    flog_warn!("Failed to reset hardware gamma after resume: {err}");
+                    all_devices_ready = false;
+                }
+            }
             flog_warn!(
                 "DRM lifecycle t_ms={} event=DRM device resumed node={node:?} connectors_and_planes_reset=true",
                 data.core.start.elapsed().as_millis(),
@@ -1799,6 +1838,29 @@ fn should_defer_drm_topology_change(session_active: bool, resume_pending: bool) 
 /// requires explicit driver and topology overrides because earlier commits froze.
 const HDR_LIVE_KMS_APPLY_ENABLED: bool = true;
 
+/// Color correction is performed in shaders. Never inherit a previous session's
+/// hardware gamma ramp: in HDR it alters already PQ-encoded scanout values.
+pub(super) fn reset_crtc_gamma(
+    device: &impl drm::control::Device,
+    crtc: crtc::Handle,
+) -> anyhow::Result<()> {
+    let size = device.get_crtc(crtc)?.gamma_length() as usize;
+    if size < 2 {
+        return Ok(());
+    }
+    let ramp = identity_gamma_ramp(size);
+    device.set_gamma(crtc, &ramp, &ramp, &ramp)?;
+    flog(&format!("Reset hardware gamma to identity: crtc={crtc:?} entries={size}"));
+    Ok(())
+}
+
+fn identity_gamma_ramp(size: usize) -> Vec<u16> {
+    (0..size)
+        .map(|i| ((i as u64 * u16::MAX as u64 + (size as u64 - 1) / 2)
+            / (size as u64 - 1)) as u16)
+        .collect()
+}
+
 /// Live scanout/connector HDR changes honor the settings toggle. Set `FOCALDESK_HDR=0` to block.
 fn hdr_runtime_apply_enabled(any_output_hdr_requested: bool) -> bool {
     HDR_LIVE_KMS_APPLY_ENABLED
@@ -1950,7 +2012,7 @@ mod hdr_tests {
         DRM_SCANOUT_FORMAT_PREFERENCE, HDR_FRAME_TIMEOUT, HDR_SCANOUT_FORMATS, HDR_VERIFY_DURATION,
         HDR_VERIFY_VBLANKS, OUTPUT_MAX_REFRESH_HZ, PCI_VENDOR_NVIDIA,
     };
-    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance};
+    use focaldesk_settings_core::{DisplayColorProfile, ExclusiveHdrPhase, HdrAppearance, OutputRole};
     use std::time::{Duration, Instant};
 
     fn display_config(hdr_requested: bool, hdr_enabled: bool) -> DisplayConfig {
@@ -1981,6 +2043,38 @@ mod hdr_tests {
             color_profile: DisplayColorProfile::Auto,
             icc_profile_path: None,
         }
+    }
+
+    #[test]
+    fn saved_layout_overrides_stale_inventory_gap() {
+        let mut left = display_config(false, false);
+        left.name = "DP-3".into();
+        left.logical_x = 1920;
+        let mut right = left.clone();
+        right.name = "DP-4".into();
+        right.logical_x = 5760;
+        let mut displays = vec![left, right];
+        let output = focaldesk_settings_core::OutputConfig {
+            connector: "DP-4".into(),
+            enabled: true,
+            x: 4480,
+            y: -20,
+            width: 2560,
+            height: 1440,
+            refresh_mhz: 165_000,
+            scale: 1.0,
+            transform: focaldesk_settings_core::DisplayTransform::Normal,
+            role: OutputRole::Normal,
+            primary: false,
+            color_profile: DisplayColorProfile::Auto,
+            icc_profile_path: None,
+            hdr_requested: false,
+            hdr_enabled: false,
+            hdr_appearance: HdrAppearance::default(),
+        };
+        super::apply_saved_display_positions(&mut displays, &[output]);
+        assert_eq!(displays[0].logical_x, 1920);
+        assert_eq!((displays[1].logical_x, displays[1].logical_y), (4480, -20));
     }
 
     #[test]
@@ -5064,9 +5158,19 @@ fn device_added(
 
     flog("Device-added DRM node open succeeded");
 
-    let gpu_vendor_id = drm_card_vendor_id(path);
-
     let fd = DrmDeviceFd::new(DeviceFd::from(fd));
+
+    initialize_drm_device(data, loop_handle, node, path, fd)
+}
+
+fn initialize_drm_device(
+    data: &mut DrmLoopData,
+    loop_handle: &LoopHandle<'_, DrmLoopData>,
+    node: DrmNode,
+    path: &Path,
+    fd: DrmDeviceFd,
+) -> Result<()> {
+    let gpu_vendor_id = drm_card_vendor_id(path);
 
     let (drm, notifier) =
         DrmDevice::new(fd.clone(), true).context("Failed to create DrmDevice for added node")?;
@@ -5500,6 +5604,8 @@ fn device_added(
                 continue;
             };
 
+            reset_crtc_gamma(drm_output_manager.device(), crtc)
+                .context("Failed to reset inherited hardware gamma")?;
             used_crtcs.insert(crtc);
 
             let planes = drm_output_manager
@@ -6067,4 +6173,21 @@ fn device_added(
     refresh_portal_services(&data.core.state.client_wayland_display);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod hardware_gamma_tests {
+    #[test]
+    fn identity_ramp_preserves_endpoints_and_midtones() {
+        for size in [256, 1024] {
+            let ramp = super::identity_gamma_ramp(size);
+            assert_eq!(ramp[0], 0);
+            assert_eq!(ramp[size - 1], u16::MAX);
+            assert!(ramp.windows(2).all(|v| v[0] < v[1]));
+            for (i, value) in ramp.iter().enumerate() {
+                let expected = i as f64 * 65535.0 / (size - 1) as f64;
+                assert!((*value as f64 - expected).abs() <= 0.5);
+            }
+        }
+    }
 }

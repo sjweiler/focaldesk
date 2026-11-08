@@ -1,0 +1,14 @@
+[Unit]
+Description=FocalDesk background mail service
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/focalmail --mail-service
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

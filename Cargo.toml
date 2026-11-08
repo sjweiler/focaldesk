@@ -28,6 +28,7 @@ members = [
     
 
     # apps
+    "apps/focalmail",
     "apps/focaldesk-cli",
     "apps/focaldesk-color-tag-test",
     "apps/focaldesk-wp-color-test",

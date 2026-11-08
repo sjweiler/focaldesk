@@ -1,9 +1,9 @@
 use focaldesk_ipc::{
-    send_desktop_request, send_notification_request, DesktopAction, DesktopSnapshot, IpcRequest,
-    IpcResponse, NotificationIpcRequest, NotificationIpcResponse,
+    DesktopAction, DesktopSnapshot, IpcRequest, IpcResponse, NotificationIpcRequest,
+    NotificationIpcResponse, send_desktop_request, send_notification_request,
 };
 use focaldesk_logging::log_file_path_candidates;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
@@ -41,6 +41,9 @@ impl IpcBackend {
 impl Backend for IpcBackend {
     fn call(&self, tool: &str, arguments: &Value) -> Result<Value, String> {
         match tool {
+            "get_mail_status" | "search_mail" | "read_mail_message" | "send_mail" => {
+                crate::mail::call(tool, arguments)
+            }
             "get_session_status" => to_value(self.snapshot()?.session),
             "list_outputs" => Ok(json!({"outputs": self.snapshot()?.outputs})),
             "get_output_details" => {

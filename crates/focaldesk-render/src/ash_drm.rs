@@ -2127,7 +2127,11 @@ impl AshDrmRenderer {
         };
         let signal = [semaphore];
         let commands = [command];
-        let wait_stages = vec![vk::PipelineStageFlags::FRAGMENT_SHADER; wait_semaphores.len()];
+        // The producer fence must also order the FOREIGN ownership acquire and
+        // its layout transition, not just fragment sampling. Without the
+        // maintenance8 ownership-transfer dependency flag, these operations
+        // have no defined pipeline stage and require an ALL_COMMANDS wait.
+        let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; wait_semaphores.len()];
         if let Err(error) = unsafe {
             self.device.queue_submit(
                 self.queue,

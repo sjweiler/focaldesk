@@ -1610,10 +1610,6 @@ vec3 mul_mat3(vec3 v) {
     return vec3(dot(u_m0, v), dot(u_m1, v), dot(u_m2, v));
 }
 
-vec3 accessibility_color(vec3 v) {
-    return clamp(vec3(dot(u_a0, v), dot(u_a1, v), dot(u_a2, v)), 0.0, 1.0);
-}
-
 void main() {
     vec4 src = texture2D(tex, v_coords);
 #if defined(NO_ALPHA)
@@ -3245,6 +3241,24 @@ mod tests {
             SCREENSAVER_FRAG,
             GLASS_CONTROL_FRAG,
         ]
+    }
+
+    #[test]
+    fn shader_uniform_references_are_declared() {
+        for shader in shader_sources() {
+            let tokens: Vec<_> = shader
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|token| !token.is_empty())
+                .collect();
+            for name in tokens.iter().filter(|token| token.starts_with("u_")) {
+                assert!(
+                    tokens.windows(3).any(|declaration| {
+                        declaration[0] == "uniform" && declaration[2] == *name
+                    }),
+                    "shader references undeclared uniform {name}"
+                );
+            }
+        }
     }
 
     #[test]

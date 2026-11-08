@@ -281,12 +281,21 @@ The default `focaldesk-desktop` features target a direct DRM/KMS session. Do not
 run that mode casually from an important graphical session; use the installed
 Wayland session described below.
 
-To make FocalDesk show up in GDM, install the compositor and Wayland session:
+To install a complete FocalDesk session on Fedora, including its shell and
+supporting services, run:
 
 ```sh
 just install-desktop
 just install-desktop-session
+just install-services-fedora
+just install-launcher
 ```
+
+Select FocalDesk in your existing display manager (including Plasma Login
+Manager or GDM). Installing only the compositor and session entry leaves
+launching, controls, notifications, and the GTK shell unavailable. FocalDM is
+not required. Other distributions can use `just install-services` for the
+per-user service installation.
 
 That recipe builds and installs the compositor to
 `/usr/local/bin/focaldesk-desktop` (the Wayland session `Exec=`), and installs

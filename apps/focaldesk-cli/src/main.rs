@@ -269,6 +269,16 @@ fn main() -> anyhow::Result<()> {
                 workspace,
             })
         }
+        "apply-displays" => {
+            let outputs = focaldesk_settings_core::load_settings().displays.outputs;
+            match send_desktop_request(&IpcRequest::SetDisplays { outputs })
+                .map_err(anyhow::Error::msg)?
+            {
+                IpcResponse::Ok => Ok(()),
+                IpcResponse::Error { message } => bail!(message),
+                other => bail!("unexpected response: {other:?}"),
+            }
+        }
         "reload-settings" => {
             match send_desktop_request(&IpcRequest::Reload).map_err(anyhow::Error::msg)? {
                 IpcResponse::Ok => Ok(()),
@@ -311,6 +321,13 @@ fn main() -> anyhow::Result<()> {
                 .with_context(|| format!("display `{connector}` was not found"))?;
             match send_desktop_request(&IpcRequest::SetDisplays {
                 outputs: vec![OutputConfig {
+                    role: focaldesk_settings_core::load_settings()
+                        .displays
+                        .outputs
+                        .iter()
+                        .find(|saved| saved.connector == connector)
+                        .map(|saved| saved.role)
+                        .unwrap_or_default(),
                     connector,
                     enabled: true,
                     x: output.x,
@@ -1771,6 +1788,7 @@ fn print_usage() {
     eprintln!("  focaldesk-cli split-exit <exact-title>");
     eprintln!("  focaldesk-cli split-workspace <exact-title> <workspace>");
     eprintln!("  focaldesk-cli reload-settings");
+    eprintln!("  focaldesk-cli apply-displays");
     eprintln!("  focaldesk-cli checkpoint-session");
     eprintln!("  focaldesk-cli create-workspace");
     eprintln!("  focaldesk-cli focus-workspace <workspace>");

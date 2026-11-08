@@ -210,7 +210,8 @@ install-shell-services: install-session-target
     install -Dm644 packaging/systemd/user/focaldesk-companion-dashboard.service "$HOME/.config/systemd/user/focaldesk-companion-dashboard.service"
     systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service || true
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || echo "Skipping GTK shell enable: no user bus available"
+    # Start GTK clients only when the compositor publishes its Wayland socket.
+    systemctl --user enable focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || echo "Skipping GTK shell enable: no user bus available"
 
 install-services: install-session-target install-shell-services install-vector-service install-server-service install-remoted-service install-recorder install-power-service install-notifications-service install-updates-service install-dialog-service install-control-service install-launch-service install-settings-service install-polkit-service install-portal install-focald-voice install-focald-speech install-focald-mic install-focald-connectors
 
@@ -583,7 +584,8 @@ install-shell-services-fedora: install-session-target-fedora
     systemctl --user disable --now focaldesk-panel.service focaldesk-dock.service focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || true
     rm -f "$HOME/.config/systemd/user/focaldesk-system-rail.service" "$HOME/.config/systemd/user/focaldesk-task-shelf.service" "$HOME/.config/systemd/user/focaldesk-companion-dashboard.service"
     systemctl --user daemon-reload || echo "Skipping systemd user reload: no user bus available"
-    systemctl --user enable --now focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || echo "Skipping GTK shell enable: no user bus available"
+    # Start GTK clients only when the compositor publishes its Wayland socket.
+    systemctl --user enable focaldesk-system-rail.service focaldesk-task-shelf.service focaldesk-companion-dashboard.service || echo "Skipping GTK shell enable: no user bus available"
 
 install-power-service-fedora:
     cargo build --release -p focaldesk-powerd
@@ -715,3 +717,13 @@ lint:
 
 test:
     cargo test
+
+# Shared Gmail service and FocalMail client. Requires a desktop Secret Service.
+install-focalmail-service:
+    cargo build --release -p focalmail
+    install -Dm755 target/release/focalmail "$HOME/.local/bin/focalmail"
+    install -Dm644 packaging/applications/focalmail.desktop "$HOME/.local/share/applications/focalmail.desktop"
+    install -Dm644 packaging/systemd/user/focalmaild.service "$HOME/.config/systemd/user/focalmaild.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now focalmaild.service
+    systemctl --user restart focalmaild.service

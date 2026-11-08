@@ -1,4 +1,5 @@
 pub mod backend;
+mod mail;
 pub mod policy;
 pub mod server;
 

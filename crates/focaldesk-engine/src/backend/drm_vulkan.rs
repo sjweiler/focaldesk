@@ -89,31 +89,16 @@ struct KmsFence(OwnedFd);
 
 impl Fence for KmsFence {
     fn is_signaled(&self) -> bool {
-        let mut pollfd = libc::pollfd {
-            fd: self.0.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        unsafe { libc::poll(&mut pollfd, 1, 0) > 0 }
+        self.poll(0).unwrap_or(false)
     }
 
     fn wait(&self) -> std::result::Result<(), Interrupted> {
         loop {
-            let mut pollfd = libc::pollfd {
-                fd: self.0.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let result = unsafe { libc::poll(&mut pollfd, 1, -1) };
-            if result > 0 {
-                return Ok(());
+            match self.poll(-1) {
+                Ok(true) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => return Err(Interrupted),
             }
-            if result < 0
-                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-            {
-                continue;
-            }
-            return Err(Interrupted);
         }
     }
 
@@ -126,26 +111,40 @@ impl Fence for KmsFence {
 }
 
 impl KmsFence {
+    fn poll(&self, timeout_ms: i32) -> std::io::Result<bool> {
+        let mut pollfd = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // A failed sync-file can wake poll with POLLERR. It must never authorize
+        // scanout as though the Vulkan writes had completed successfully.
+        if pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            return Err(std::io::Error::other(format!(
+                "KMS completion fence failed (poll events {:#x})",
+                pollfd.revents
+            )));
+        }
+        Ok(pollfd.revents & libc::POLLIN != 0)
+    }
+
     fn wait_timeout(&self, timeout: Duration) -> std::io::Result<bool> {
-        let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let started = Instant::now();
         loop {
-            let mut pollfd = libc::pollfd {
-                fd: self.0.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-            if result > 0 {
-                return Ok(true);
+            let remaining = timeout.saturating_sub(started.elapsed());
+            let timeout_ms = i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
+            match self.poll(timeout_ms) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    if started.elapsed() >= timeout {
+                        return Ok(false);
+                    }
+                }
+                result => return result,
             }
-            if result == 0 {
-                return Ok(false);
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
         }
     }
 }
@@ -341,6 +340,7 @@ struct VulkanDrmData {
     resume_retry_at: Option<Instant>,
     restart_shell_after_present: bool,
     topology_refresh_pending: bool,
+    connector_probe_at: Option<Instant>,
     hdr_recovery_rebuild_attempted: bool,
     capture_pending: HashSet<OutputId>,
     /// CPU readback is a compatibility fallback only. Bound it so a PipeWire
@@ -1327,6 +1327,8 @@ fn initialize_vulkan_outputs(
     let mut outputs = Vec::with_capacity(output_configs.len());
     let mut configured_primary = None;
     for config in output_configs {
+        super::drm::reset_crtc_gamma(drm, config.crtc)
+            .with_context(|| format!("reset inherited hardware gamma for {}", config.name))?;
         let drm_surface = drm.create_surface(config.crtc, config.mode, &[config.connector])?;
         let gbm = GbmDevice::new(fd.clone())
             .with_context(|| format!("create GBM device for Vulkan output {}", config.name))?;
@@ -1508,6 +1510,33 @@ fn initialize_vulkan_outputs(
     desktop.state.focused_output = desktop.state.primary_output;
     desktop.state.mark_redraw();
     Ok(outputs)
+}
+
+fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
+    let resources = data
+        .drm
+        .resource_handles()
+        .context("query DRM resources after connector event")?;
+    let configured = load_display_config();
+    let mut connected = HashSet::new();
+    for handle in resources.connectors() {
+        // Read cached kernel state: forcing a probe here can itself retrain a
+        // link and produce another hotplug event on NVIDIA.
+        let info = data.drm.get_connector(*handle, false)?;
+        if info.state() != connector::State::Connected || info.modes().is_empty() {
+            continue;
+        }
+        let name = format!("{}-{}", info.interface().as_str(), info.interface_id());
+        let edid = connector_edid(&data.drm, *handle);
+        let identity = edid.as_deref().and_then(parse_edid_identity);
+        if saved_monitor_config(&configured, &name, identity.as_ref())
+            .is_some_and(|display| !display.enabled)
+        {
+            continue;
+        }
+        connected.insert(*handle);
+    }
+    Ok(connected != data.outputs.iter().map(|output| output.connector).collect())
 }
 
 fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
@@ -2072,6 +2101,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         resume_retry_at: None,
         restart_shell_after_present: false,
         topology_refresh_pending: false,
+        connector_probe_at: None,
         hdr_recovery_rebuild_attempted: false,
         capture_pending: HashSet::new(),
         last_cpu_capture: HashMap::new(),
@@ -2226,10 +2256,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             return;
         };
         if node == data.primary_node {
-            data.topology_refresh_pending = true;
-            flog(format!(
-                "raw Vulkan DRM connector event on {node:?}; scheduling topology rebuild"
-            ));
+            // Property changes and our own modesets also emit udev changes.
+            // Let link training settle, then rebuild only for a changed set.
+            data.connector_probe_at = Some(Instant::now() + Duration::from_millis(750));
         }
     })?;
 
@@ -2276,6 +2305,24 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         }
 
         event_loop.dispatch(Some(FRAME_INTERVAL), &mut data)?;
+        if data.session_active
+            && !data.resume_pending
+            && data
+                .connector_probe_at
+                .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            data.connector_probe_at = None;
+            match vulkan_connector_set_changed(&data) {
+                Ok(true) => data.topology_refresh_pending = true,
+                Ok(false) => {
+                    flog("raw Vulkan DRM connector event: output set unchanged; retaining scanout")
+                }
+                Err(error) => {
+                    flog_warn!("raw Vulkan DRM connector probe deferred: {error:#}");
+                    data.connector_probe_at = Some(Instant::now() + Duration::from_secs(1));
+                }
+            }
+        }
         if data.topology_refresh_pending && data.session_active && !data.resume_pending {
             data.topology_refresh_pending = false;
             match rebuild_vulkan_outputs(&mut data) {
@@ -2770,7 +2817,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::{
         copy_cursor_rgba_to_argb, expand_dmabuf_damage, hdr_source_peak_changed,
-        transform_cursor_rgba, transform_scene, transformed_cursor_rect, vui_event,
+        transform_cursor_rgba, transform_scene, transformed_cursor_rect, vui_event, KmsFence,
     };
     use crate::backend::wgpu_nested::VulkanCompositorScene;
     use focaldesk_input::{InputEvent, KeyState, Modifiers};
@@ -2780,6 +2827,36 @@ mod tests {
     use smithay::utils::{Physical, Point, Size, Transform};
     use std::os::fd::OwnedFd;
     use std::sync::Arc;
+
+    #[test]
+    fn kms_fence_requires_readiness_before_presenting() {
+        use smithay::backend::renderer::sync::Fence;
+        use std::{io::Write, os::unix::net::UnixStream, time::Duration};
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let fence = KmsFence(reader.into());
+        assert!(!fence.is_signaled());
+        assert!(!fence.wait_timeout(Duration::ZERO).unwrap());
+        writer.write_all(&[1]).unwrap();
+        assert!(fence.is_signaled());
+        assert!(fence.wait_timeout(Duration::ZERO).unwrap());
+        assert!(fence.wait().is_ok());
+    }
+
+    #[test]
+    fn kms_fence_failure_does_not_authorize_presenting() {
+        use smithay::backend::renderer::sync::Fence;
+        use std::{os::unix::net::UnixStream, time::Duration};
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let fence = KmsFence(reader.into());
+        // A hung-up descriptor wakes poll (and can include POLLIN), but does
+        // not represent successful GPU completion. Exercise the real syscall.
+        drop(writer);
+        assert!(!fence.is_signaled());
+        assert!(fence.wait_timeout(Duration::ZERO).is_err());
+        assert!(fence.wait().is_err());
+    }
 
     fn test_texture(dmabuf: bool, damage: Vec<[u32; 4]>, destination: [i32; 4]) -> TextureQuad {
         TextureQuad {
