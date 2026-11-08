@@ -200,6 +200,30 @@ SDR resumes but HDR does not, capture the first post-resume commit failure and
 the connector HDR-property readback. If minimal SDR also fails, focus on the
 libseat activation, connector reprobe, and first modeset events.
 
+## Stale rectangles in animated windows on Vulkan DRM
+
+Older raw Vulkan DRM builds could leave a band of an earlier frame near the
+top of a game window while the bottom and smaller rectangles inside the band
+continued updating. This was reproduced and the fix visually confirmed with
+World of Warcraft through XWayland on an NVIDIA RTX 4090.
+
+The shader compiler applied a vertex Y flip even though the renderer already
+used Vulkan framebuffer coordinates. The scene and output flips cancelled on
+complete frames, but damage render areas and scissors were not flipped with
+them. Partial repaints therefore updated different regions from those intended.
+The fix disables that extra compiler adjustment in both passes and preserves
+partial repainting. See [Rendering Pipeline](rendering.md).
+
+Rebuild and install the corrected compositor using the
+[desktop installation instructions](building.md#install-a-drmkms-wayland-session),
+then log out and back in to load the new executable. The confirmed fix does
+not require changing the monitor refresh rate or enabling full-output repainting.
+
+If similar corruption persists on a corrected build, include a screenshot
+captured while the rectangles are visible, a short video of the movement,
+and a diagnostic bundle. Record the renderer, GPU, affected output, scale,
+and whether moving the window moves the stale region.
+
 ## Build failures after an update
 
 Use the committed lockfile first:

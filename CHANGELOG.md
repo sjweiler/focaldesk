@@ -8,6 +8,15 @@ version numbers where practical.
 
 ## Unreleased
 
+### Fixed
+
+- Fixed stale rectangular regions near the top of animated XWayland windows
+  on raw Vulkan DRM, confirmed with World of Warcraft. Disabled an extra
+  shader-compiler Y flip so drawing matches damage render areas and scissors
+  in both composition passes. Partial repainting remains enabled; no refresh
+  rate change or continuous full-output repaint is required. Added a SPIR-V
+  regression test for the coordinate convention.
+
 ### Added
 
 - Replaced local Files copy/move work with a bounded background transfer engine

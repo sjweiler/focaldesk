@@ -3737,10 +3737,19 @@ fn compile_shader(source: &str, stage: naga::ShaderStage, entry_point: &str) -> 
     )
     .validate(&module)
     .context("validate Vulkan composition shader")?;
+    let mut options = naga::back::spv::Options::default();
+    // Our NDC positions, positive-height viewports, damage render areas and
+    // scissors all use Vulkan's top-left framebuffer convention already.
+    // Naga's default Y flip mirrors scene drawing away from its damage. The
+    // output pass flips again, hiding the error on full frames but exposing
+    // stale mirrored regions as soon as only part of the scene is repainted.
+    options
+        .flags
+        .remove(naga::back::spv::WriterFlags::ADJUST_COORDINATE_SPACE);
     naga::back::spv::write_vec(
         &module,
         &info,
-        &naga::back::spv::Options::default(),
+        &options,
         Some(&naga::back::spv::PipelineOptions {
             shader_stage: stage,
             entry_point: entry_point.into(),
@@ -4253,6 +4262,33 @@ mod tests {
             let fragment = compile_shader(source, naga::ShaderStage::Fragment, "fs_main").unwrap();
             assert_eq!(vertex.first().copied(), Some(0x0723_0203));
             assert_eq!(fragment.first().copied(), Some(0x0723_0203));
+        }
+    }
+
+    #[test]
+    fn raw_vulkan_vertex_positions_match_top_left_damage_coordinates() {
+        // With a positive-height Vulkan viewport, NDC y=-1 is the top edge.
+        // The raw renderer already supplies positions in that convention.
+        // A compiler-injected Y negation would mirror drawing away from the
+        // unmodified render-area/scissor rectangles during partial repaints.
+        let top = ndc_rect([10, 0, 20, 10], 100, 100);
+        assert_eq!(top[1], -1.0);
+        let source = r#"
+            @vertex fn vs_main() -> @builtin(position) vec4<f32> {
+                return vec4(0.0, -1.0, 0.0, 1.0);
+            }
+        "#;
+        let words = compile_shader(source, naga::ShaderStage::Vertex, "vs_main").unwrap();
+        let mut offset = 5; // Skip the SPIR-V header.
+        while offset < words.len() {
+            let instruction = words[offset];
+            let word_count = (instruction >> 16) as usize;
+            let opcode = instruction & 0xffff;
+            assert!(word_count > 0);
+            // OpFNegate (127) is not present in this shader's source; Naga's
+            // default coordinate adjustment injects it into the epilogue.
+            assert_ne!(opcode, 127, "compiler mirrored the vertex position Y");
+            offset += word_count;
         }
     }
 
