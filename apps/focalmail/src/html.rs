@@ -1,4 +1,3 @@
-use eframe::egui::{self, text::LayoutJob, Color32, FontId, TextFormat};
 use scraper::{ElementRef, Html, Node};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +10,12 @@ pub struct Document {
     pub blocks: Vec<Block>,
     pub blocked_images: usize,
     pub limited: bool,
+    #[serde(default)]
+    pub layout: Option<String>,
+    #[serde(default)]
+    pub images: Vec<crate::html_layout::Image>,
+    #[serde(default)]
+    pub inline_attempted: bool,
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Block {
@@ -24,36 +29,6 @@ pub struct Span {
     pub code: bool,
     pub heading: u8,
     pub link: Option<String>,
-}
-
-pub fn install_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let fallback = fonts.families[&egui::FontFamily::Proportional].clone();
-    for (name, bytes) in [
-        (
-            "mail-bold",
-            include_bytes!("../../../assets/fonts/IBMPlexSans-Bold.ttf").as_slice(),
-        ),
-        (
-            "mail-italic",
-            include_bytes!("../../../assets/fonts/IBMPlexSans-Italic.ttf").as_slice(),
-        ),
-        (
-            "mail-bold-italic",
-            include_bytes!("../../../assets/fonts/IBMPlexSans-BoldItalic.ttf").as_slice(),
-        ),
-    ] {
-        fonts.font_data.insert(
-            name.into(),
-            std::sync::Arc::new(egui::FontData::from_static(bytes)),
-        );
-        let mut family = vec![name.to_string()];
-        family.extend(fallback.clone());
-        fonts
-            .families
-            .insert(egui::FontFamily::Name(name.into()), family);
-    }
-    ctx.set_fonts(fonts);
 }
 
 pub fn safe_link(value: &str) -> Option<String> {
@@ -259,10 +234,19 @@ pub fn parse(source: &str) -> Document {
     };
     builder.element(html.root_element(), Span::default(), 0);
     builder.flush();
+    crate::html_layout::attach(source, &mut builder.document);
     builder.document
 }
 
 impl Document {
+    pub fn needs_reload(&self) -> bool {
+        self.layout.is_none()
+            || (!self.inline_attempted
+                && self.images.iter().any(|i| {
+                    i.source.as_ref().is_some_and(|s| s.starts_with("cid:"))
+                        && i.inline_data.is_none()
+                }))
+    }
     pub fn plain_text(&self) -> String {
         self.blocks
             .iter()
@@ -270,95 +254,11 @@ impl Document {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
-    pub fn show(&self, ui: &mut egui::Ui) -> Option<String> {
-        let mut open = None;
-        for block in &self.blocks {
-            let mut job = LayoutJob::default();
-            for span in &block.spans {
-                let size = match span.heading {
-                    1 => 25.0,
-                    2 => 21.0,
-                    3..=6 => 18.0,
-                    _ => 15.0,
-                };
-                let format = TextFormat {
-                    font_id: if span.code {
-                        FontId::monospace(size)
-                    } else if span.bold && span.italic {
-                        FontId::new(size, egui::FontFamily::Name("mail-bold-italic".into()))
-                    } else if span.bold {
-                        FontId::new(size, egui::FontFamily::Name("mail-bold".into()))
-                    } else if span.italic {
-                        FontId::new(size, egui::FontFamily::Name("mail-italic".into()))
-                    } else {
-                        FontId::proportional(size)
-                    },
-                    color: if span.link.is_some() {
-                        Color32::from_rgb(0, 174, 239)
-                    } else if span.bold {
-                        ui.visuals().strong_text_color()
-                    } else {
-                        ui.visuals().text_color()
-                    },
-
-                    background: if span.code {
-                        Color32::from_gray(40)
-                    } else {
-                        Color32::TRANSPARENT
-                    },
-                    ..Default::default()
-                };
-                job.append(&span.text, 0.0, format);
-            }
-            ui.add(egui::Label::new(job).wrap().selectable(true));
-            let mut seen = std::collections::BTreeSet::new();
-            for span in &block.spans {
-                if let Some(url) = span.link.as_ref().filter(|url| seen.insert((*url).clone())) {
-                    // Validate even cached links; clicking only opens a destination preview.
-                    if let Some(url) = safe_link(url) {
-                        let host = url::Url::parse(&url)
-                            .ok()
-                            .and_then(|u| u.host_str().map(String::from))
-                            .unwrap_or_default();
-                        if ui
-                            .small_button(format!(
-                                "{} · {host}",
-                                span.text.chars().take(60).collect::<String>()
-                            ))
-                            .on_hover_text(&url)
-                            .clicked()
-                        {
-                            open = Some(url);
-                        }
-                    }
-                }
-            }
-            ui.add_space(8.0);
-        }
-        if self.limited {
-            ui.weak("Formatted content exceeded the display limit. Use Plain text for the available message text.");
-        }
-        open
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn rendering_does_not_open_links_or_request_remote_content() {
-        let ctx = egui::Context::default();
-        install_fonts(&ctx);
-        let doc = parse("<h1>Heading</h1><b>Bold</b><i>Italic</i><a href='https://example.com/'>Link</a><img src='https://tracker.test/pixel'>");
-        let output = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                assert!(doc.show(ui).is_none());
-            });
-        });
-        assert!(output.platform_output.commands.is_empty());
-        assert!(!output.shapes.is_empty());
-    }
-
     #[test]
     fn readable_formatting_entities_lists_and_tables_survive() {
         let doc = parse("<h1>Title &amp; news</h1><p>Hello <strong>world</strong> <em>today</em>.</p><ul><li>One</li><li>Two</li></ul><table><tr><td>A</td><td>B</td></tr></table>");

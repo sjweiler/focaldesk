@@ -23,7 +23,7 @@ Add accounts through FocalMail's Settings → Accounts first. See the
 
 The daemon and client currently share one executable, so they use the existing
 provider implementations without a second credential store or cache migration.
-Running the daemon does not initialize egui or create a window. For development,
+Running the daemon does not initialize Tauri or its webview or create a window. For development,
 stop a foreground daemon with Ctrl+C before rebuilding. If the window launched a
 standalone daemon, locate its `focalmail --mail-service` process and terminate it
 before installing or restarting an updated daemon. Only one daemon can own the
@@ -44,9 +44,19 @@ socket. After installation, use the systemd service and restart it after updates
   from temporary errors. Cancellation retains the prior state and cached mail.
 - Reconnect uses the saved client configuration. No credential deletion is needed.
   The signed-in address must match the selected account. Missing keyring entries
-  require adding/signing in with the desktop client JSON again.
-- Background sync runs shortly after startup and every five minutes after a scan
-  finishes. Interactive operations cancel a background scan and wait up to 35
+  require signing in again using Reconnect or the desktop client JSON.
+- Background sync runs shortly after startup and every five minutes after a successful scan.
+  Failed reads retry after 15, 30, 60, 120, 240, then at most every 300 seconds.
+  login1 suspend/resume and NetworkManager connectivity recovery schedule a fresh
+  sync after two seconds. Suspend or network loss cancels only background reads;
+  the persisted manual pause remains in effect. Watchers reconnect when system
+  services become available; periodic retries work without those services.
+  Wake requests cannot be overwritten by completion of an older interrupted scan.
+  Accounts requiring sign-in are skipped by automatic sync until reconnected,
+  while other accounts continue. Missing credentials require sign-in; locked
+  keyrings and network failures remain retryable. Restart clears stale syncing
+  status while keeping checkpoints, drafts, cached messages, and the pause setting.
+  Interactive operations cancel a background scan and wait up to 35
   seconds for it to yield. Partial Gmail scans resume from their checkpoints.
   Another foreground operation returns a busy error rather than executing twice.
 - Sends are never retried automatically. A confirmed send returns before its
@@ -55,11 +65,69 @@ socket. After installation, use the systemd service and restart it after updates
 
 ## Additional providers and notifications
 
-Microsoft sign-in uses a public client device-code flow and stores rotating refresh authorization in the keyring. Microsoft sync currently performs a paginated full scan. IMAP/SMTP supports a shared password/app password with verified TLS or required STARTTLS. IMAP scans all selectable folders and reuses cached message bodies. Both providers replace their account snapshot only after the entire scan succeeds; these scans are not yet checkpointed like Gmail's initial import.
+Microsoft sign-in defaults to system-browser authorization-code flow with PKCE,
+a random state, and a localhost public-client callback registered on the app.
+The listener binds before the browser opens, validates method/path/state and
+rejects ambiguous callbacks, and retains verifier/state only in memory. This
+uses the same browser approach as FocalDesk Calendar. An explicit DeviceCode
+profile option remains available for tenants that permit it; it is not an
+automatic fallback when browser sign-in is denied. Existing profiles default to
+Browser. Error 530035 identifies Security Defaults, which block device-code flow;
+FocalMail keeps those policies in place and requests ordinary browser sign-in/MFA.
+
+The service sends a structured authorization prompt through progress; the desktop
+retains the browser URL or short user code and expiry only in memory until the
+operation finishes. The UI subscribes before requesting authorization, shows a
+persistent modal, and polls desktop state if an event is missed. Browser/code,
+copy, and cancellation actions remain available while authorization is pending.
+Microsoft error codes and denial reasons are preserved without including token
+or private device-code response fields. Successful authorization returns before
+mailbox download and schedules background sync. Rotating refresh authorization
+stays in the keyring.
+Microsoft sync uses one Graph delta cursor per folder. Folder discovery preserves custom paths and empty folders. Pages commit in batches of at most 32 messages before the next/delta link advances, so new mail is visible during import and interrupted pages replay safely. Incremental sync requests only changes; unchanged message versions retain their cached content. Folder ownership prevents a move's source removal from deleting a destination copy. Expired delta state restarts only that folder and removes stale rows after its replacement scan completes. Checkpoints and folder membership survive service restarts and are cleared on account removal. Expanding history resets folder checkpoints while retaining cached messages. See [Microsoft's message delta API](https://learn.microsoft.com/en-us/graph/delta-query-messages).
+
+IMAP/SMTP supports a shared password/app password with verified TLS or required STARTTLS. IMAP scans all selectable folders, reuses cached message bodies, and replaces its account snapshot only after the entire scan succeeds; IMAP scans are not yet checkpointed.
 
 SMTP uses a configurable Sent-folder copy. A failure after SMTP acceptance never becomes a retryable send failure. Microsoft and SMTP reuse the client MIME composer, including reply headers and attachments. Full raw-message retrieval is limited to 40 MiB. IMAP credentials are submitted through the private socket by the client; do not put passwords in shell command-line arguments.
 
 Desktop notifications run after successful account syncs. First imports are silent; subsequent syncs count new unread Inbox IDs and emit one content-free notification per account. The preference is persisted in SQLite and editable in Settings. Notification failures do not affect synchronization. No message content or account identity appears in a notification, and click-to-open is not implemented.
+
+Per-account synchronization defaults to one calendar year. `accounts[].sync_history`
+is one of `one_month`, `three_months`, `six_months`, `one_year`, or `all`. The
+`set_sync_history` operation uses the same single-writer lock as synchronization:
+it interrupts background work, retains completed cursors when narrowing the range, and
+schedules a new scan. Reducing history prunes local cache only; local drafts and
+server mail are unchanged. Expanding history keeps cached and partially imported
+messages until a successful replacement scan. Expanding the range or changing an unfinished scan resets its scan cursor. Gmail stores its initial cutoff
+with the resumable scan so every page and retry uses the same date query.
+Large partial-cache upgrades, Gmail import completion, and local history pruning
+commit batches of at most 32 messages. Gmail completion records its clearing and
+promotion phases durably; cancellation or restart resumes that phase without
+losing already-promoted messages or advancing history early. Incremental Gmail
+history updates write only changed IDs and retain the old cursor until every
+batch commits, so an empty refresh does not reload or reindex the mailbox. Previously
+cached message IDs use `format=minimal` to refresh labels while retaining all
+cached content; only missing IDs use `format=full`. Completed history cursors
+survive the one-year-default upgrade and narrower history selections. The UI
+labels a necessary reconciliation as Checking mailbox and avoids using an
+unfiltered profile message total for a date-scoped scan. See [Gmail's cache and
+synchronization guidance](https://developers.google.com/workspace/gmail/api/guides/sync).
+
+Microsoft scans lightweight delta metadata without a server date filter (filtered delta queries have a 5,000-message cap), then fetches message content only within the local history cutoff. IMAP uses `UID SEARCH SINCE` and initially
+fetches headers, deferring MIME content and attachments until the message opens.
+Search remains local: fetch a wider history to search earlier messages.
+
+Sync phase/counters are persisted in `mail_sync_progress` and included under
+`accounts[].progress` in status, alongside `cached_count` and `sync_paused`.
+Pausing persists a local preference and cancels only `background-sync`; an
+explicit `sync` request clears the preference. The Tauri window polls these
+small status records independently of mailbox pages and message rendering.
+
+HTML is sanitized into an allowlisted layout before caching. The Tauri reader
+uses an opaque-origin sandbox and a hash-pinned bridge; remote resources cannot
+be fetched from the frame. Explicit remote-image loading is handled by a
+separate bounded native loader with public-address validation and DNS pinning,
+without mail credentials or cookies. See the FocalMail guide for image limits.
 
 ## Local API
 
@@ -90,14 +158,18 @@ change subscriptions remain available during sync.
 | Method | Fields | Result |
 | --- | --- | --- |
 | `status` | none | protocol version, instance ID, revision, accounts with capabilities, active operation ID |
-| `search` | `query`, nullable `account`, `limit` | up to 100 cached summaries, 300-character snippets |
+| `pause_sync` | none | persistently pause background sync; cancel only its owned operation |
+| `search` | `query`, nullable `account`, `limit` | up to 100 indexed cached summaries, 160-character snippets |
 | `read` | `account`, `id` | cached plain text, up to 128,000 characters, truncation flag |
 | `changes` | `after`, `wait_seconds` | instance ID and revision; waits up to 25 seconds for a change |
 | `sync` | none | synchronize all connected provider accounts |
+| `set_sync_history` | `account`, `history` | set per-account cache range, invalidate scan checkpoints, and schedule background sync; server mail is unchanged |
 | `connect` | `path` | import Google Desktop OAuth JSON and authorize Gmail |
 | `connect_profile` | `profile`, `password` | authorize Microsoft or verify IMAP/SMTP and save in keyring; password is empty for Microsoft |
 | `reconnect` | `email` | authorize the selected account using saved OAuth configuration |
 | `modify` | `account`, `id`, `action` | read/unread, star/unstar, archive, trash |
+| `bulk_modify` | `targets` (1–100 account/id pairs), `action` | confirmed, failed, unattempted targets; warnings and cancellation state |
+| `remove_account` | `account` | clear local account cache/sign-in; retain drafts and server mail |
 | `send` | `draft`, `files` | send through the draft's account |
 | `content` | `account`, `id` | retrieve/cache full message content |
 | `download` | `account`, `id`, `attachment` | save a matching cached attachment to Downloads |

@@ -139,11 +139,19 @@ fn read_request(
 fn read_with_wait(
     request: reqwest::blocking::RequestBuilder,
     cancel: &AtomicBool,
+    wait: impl FnMut(Duration) -> Result<()>,
+) -> Result<reqwest::blocking::Response> {
+    read_with_pacing(request, cancel, Duration::from_millis(800), wait)
+}
+fn read_with_pacing(
+    request: reqwest::blocking::RequestBuilder,
+    cancel: &AtomicBool,
+    pace: Duration,
     mut wait: impl FnMut(Duration) -> Result<()>,
 ) -> Result<reqwest::blocking::Response> {
     for attempt in 0..=6 {
         cancelled(cancel)?;
-        wait(Duration::from_millis(800))?;
+        wait(pace)?;
         let response = request
             .try_clone()
             .context("Cannot clone Gmail read request")?
@@ -369,7 +377,7 @@ fn access_token(client: &Client, email: &str) -> Result<String> {
     let credential: Credential = serde_json::from_str(
         &entry(email)?
             .get_password()
-            .context("Cannot retrieve Gmail credentials; unlock your keyring or reconnect")?,
+            .map_err(crate::service::credential_error)?,
     )?;
     let response = client
         .post("https://oauth2.googleapis.com/token")
@@ -411,6 +419,26 @@ pub enum Action {
     Trash,
 }
 
+pub struct MutationSession {
+    client: Client,
+    token: String,
+}
+impl MutationSession {
+    pub fn open(email: &str) -> Result<Self> {
+        let client = client()?;
+        let token = access_token(&client, email)?;
+        Ok(Self { client, token })
+    }
+    pub fn apply(&mut self, message: &Message, action: Action) -> Result<()> {
+        mutate(&self.client, &self.token, &message.id, action, API)
+    }
+}
+pub fn forget_credentials(email: &str) -> Result<()> {
+    match entry(email)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 pub fn modify(message: &Message, action: Action, cancel: Arc<AtomicBool>) -> Result<String> {
     cancelled(&cancel)?;
     let client = client()?;
@@ -622,6 +650,103 @@ fn sync_token(client: &Client, token: &str, email: &str, cancel: &AtomicBool) ->
     sync_with_store(client, token, email, cancel, &mut Store::open()?, API)
 }
 
+// Keep arrivals visible while an initial import works through historical pages.
+// Only missing IDs are downloaded; this never replaces the scan's saved cursor.
+fn refresh_recent_inbox(
+    client: &Client,
+    token: &str,
+    email: &str,
+    cancel: &AtomicBool,
+    store: &Store,
+    api: &str,
+    downloaded: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let listed = json(read_request(
+        client
+            .get(format!("{api}/messages"))
+            .bearer_auth(token)
+            .query(&[
+                ("maxResults", "50"),
+                ("labelIds", "INBOX"),
+                ("q", "newer_than:7d"),
+            ]),
+        cancel,
+    )?)?;
+    for item in listed["messages"].as_array().into_iter().flatten().take(50) {
+        cancelled(cancel)?;
+        let id = item["id"]
+            .as_str()
+            .context("Recent Gmail message missing ID")?;
+        if downloaded.contains(id) {
+            continue;
+        }
+        let Some(message) = retrieve_sync_message(client, token, email, id, cancel, store, api)?
+        else {
+            continue;
+        };
+        store.stage_message(email, &message)?;
+        downloaded.insert(id.to_string());
+        store.sync_progress(
+            email,
+            if store.has_committed_messages(email)? {
+                "checking_mail"
+            } else {
+                "importing"
+            },
+            downloaded.len(),
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+// Gmail message bodies are cached on their first retrieval. Reconciliation and
+// history changes refresh only labels for an existing ID, preserving hydrated
+// HTML, attachments, and reply headers already stored on this device.
+fn retrieve_sync_message(
+    client: &Client,
+    token: &str,
+    email: &str,
+    id: &str,
+    cancel: &AtomicBool,
+    store: &Store,
+    api: &str,
+) -> Result<Option<Message>> {
+    let cached = store.cached_message_optional(email, id)?;
+    let format = if cached.is_some() { "minimal" } else { "full" };
+    let pace = if cached.is_some() {
+        Duration::from_millis(300)
+    } else {
+        Duration::from_millis(800)
+    };
+    let response = read_with_pacing(
+        client
+            .get(format!("{api}/messages/{id}?format={format}"))
+            .bearer_auth(token),
+        cancel,
+        pace,
+        |duration| pause(cancel, duration),
+    )?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let value = json(response)?;
+    anyhow::ensure!(
+        value["id"].as_str() == Some(id),
+        "Gmail returned a different message ID"
+    );
+    if let Some(mut cached) = cached {
+        let labels = parse_message(&value, email)?;
+        cached.labels = labels.labels;
+        cached.folder = labels.folder;
+        cached.unread = labels.unread;
+        cached.flagged = labels.flagged;
+        Ok(Some(cached))
+    } else {
+        Ok(Some(parse_message(&value, email)?))
+    }
+}
+
 fn sync_with_store(
     client: &Client,
     token: &str,
@@ -631,6 +756,11 @@ fn sync_with_store(
     api: &str,
 ) -> Result<()> {
     cancelled(cancel)?;
+    store.resume_abandoned_sync(email)?;
+    if store.full_sync_finalizing(email)? {
+        store.finish_full_sync_cancellable(email, Some(cancel))?;
+        return store.prune_sync_history(email);
+    }
     let history = store.history(email)?;
     if !history.is_empty() && store.full_sync(email)?.is_none() {
         let response = read_request(
@@ -678,29 +808,25 @@ fn sync_with_store(
                         .to_string();
                 }
             };
-            let mut messages = store
-                .load()?
-                .into_iter()
-                .filter(|m| m.account == email)
-                .collect::<Vec<_>>();
-            for id in ids {
+            let mut changes = Vec::new();
+            let changed_total = ids.len();
+            store.sync_progress(email, "updating", 0, Some(changed_total))?;
+            for (completed, id) in ids.into_iter().enumerate() {
                 cancelled(cancel)?;
-                let response = read_request(
-                    client
-                        .get(format!("{api}/messages/{id}?format=full"))
-                        .bearer_auth(token),
-                    cancel,
-                )?;
-                messages.retain(|m| m.id != id);
-                if response.status() != reqwest::StatusCode::NOT_FOUND {
-                    messages.push(parse_message(&json(response)?, email)?);
-                }
+                let message = retrieve_sync_message(client, token, email, &id, cancel, store, api)?;
+                changes.push((id, message));
+                store.sync_progress(email, "updating", completed + 1, Some(changed_total))?;
             }
             cancelled(cancel)?;
-            messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp));
-            return store.snapshot(email, &messages, &final_history);
+            store.apply_sync_changes(email, &changes, &final_history)?;
+            return store.prune_sync_history(email);
         }
     }
+    let phase = if store.has_committed_messages(email)? {
+        "checking_mail"
+    } else {
+        "importing"
+    };
     // Resume a partially downloaded page without fetching its completed messages again.
     let (_, mut next) = match store.full_sync(email)? {
         Some(state) => state,
@@ -713,12 +839,37 @@ fn sync_with_store(
                 .as_str()
                 .context("Missing history ID")?;
             store.begin_full_sync(email, history)?;
+            store.sync_progress(
+                email,
+                phase,
+                0,
+                if store.sync_history(email)? == crate::settings::SyncHistory::All {
+                    profile["messagesTotal"].as_u64().map(|n| n as usize)
+                } else {
+                    None
+                },
+            )?;
             (history.to_string(), String::new())
         }
     };
+    // Persisted with the checkpoint so resumed pages use exactly the same query.
+    let query = store
+        .scan_since(email)?
+        .map(|since| format!("after:{}", since / 1000))
+        .unwrap_or_default();
     let mut downloaded = store.staged_ids(email)?;
+    store.sync_progress(email, phase, downloaded.len(), None)?;
+    let mut recent_refresh = if downloaded.len() >= 500 {
+        Instant::now()
+    } else {
+        Instant::now() + Duration::from_secs(60)
+    };
     loop {
         cancelled(cancel)?;
+        if Instant::now() >= recent_refresh {
+            refresh_recent_inbox(client, token, email, cancel, store, api, &mut downloaded)?;
+            recent_refresh = Instant::now() + Duration::from_secs(60);
+        }
         let listed = json(read_request(
             client
                 .get(format!("{api}/messages"))
@@ -726,6 +877,7 @@ fn sync_with_store(
                 .query(&[
                     ("maxResults", "500"),
                     ("includeSpamTrash", "true"),
+                    ("q", query.as_str()),
                     ("pageToken", next.as_str()),
                 ]),
             cancel,
@@ -733,19 +885,28 @@ fn sync_with_store(
         if let Some(ids) = listed["messages"].as_array() {
             for id in ids {
                 cancelled(cancel)?;
+                if Instant::now() >= recent_refresh {
+                    refresh_recent_inbox(
+                        client,
+                        token,
+                        email,
+                        cancel,
+                        store,
+                        api,
+                        &mut downloaded,
+                    )?;
+                    recent_refresh = Instant::now() + Duration::from_secs(60);
+                }
                 let id = id["id"].as_str().context("Gmail message missing ID")?;
                 if downloaded.contains(id) {
                     continue;
                 }
-                let response = read_request(
-                    client
-                        .get(format!("{api}/messages/{id}?format=full"))
-                        .bearer_auth(token),
-                    cancel,
-                )?;
-                if response.status() != reqwest::StatusCode::NOT_FOUND {
-                    store.stage_message(email, &parse_message(&json(response)?, email)?)?;
+                if let Some(message) =
+                    retrieve_sync_message(client, token, email, id, cancel, store, api)?
+                {
+                    store.stage_message(email, &message)?;
                     downloaded.insert(id.to_string());
+                    store.sync_progress(email, phase, downloaded.len(), None)?;
                 }
             }
         }
@@ -758,7 +919,9 @@ fn sync_with_store(
         }
     }
     cancelled(cancel)?;
-    store.finish_full_sync(email)
+    store.sync_progress(email, "saving", downloaded.len(), Some(downloaded.len()))?;
+    store.finish_full_sync_cancellable(email, Some(cancel))?;
+    store.prune_sync_history(email)
 }
 
 fn header(payload: &Value, name: &str) -> String {
@@ -809,7 +972,10 @@ pub fn load_content(message: &Message) -> Result<Message> {
         &AtomicBool::new(false),
     )?)?;
     hydrate_bodies(&client, &token, &message.id, &mut value["payload"], 0, API)?;
-    let message = parse_message(&value, &message.account)?;
+    let mut message = parse_message(&value, &message.account)?;
+    if let Some(doc) = &mut message.html {
+        doc.inline_attempted = true;
+    }
     Store::open()?.cache_content(&message)?;
     Ok(message)
 }
@@ -822,17 +988,61 @@ fn hydrate_bodies(
     depth: usize,
     api: &str,
 ) -> Result<()> {
-    if depth > 64 || payload["filename"].as_str().is_some_and(|n| !n.is_empty()) {
+    let mut remaining = HydrationBudget {
+        bytes: crate::html_layout::MAX_IMAGE_TOTAL,
+        images: 20,
+    };
+    hydrate_parts(
+        client,
+        token,
+        message_id,
+        payload,
+        depth,
+        api,
+        &mut remaining,
+    )
+}
+struct HydrationBudget {
+    bytes: usize,
+    images: usize,
+}
+fn hydrate_parts(
+    client: &Client,
+    token: &str,
+    message_id: &str,
+    payload: &mut Value,
+    depth: usize,
+    api: &str,
+    remaining: &mut HydrationBudget,
+) -> Result<()> {
+    let inline = crate::html_layout::raster_type(payload["mimeType"].as_str().unwrap_or_default())
+        && !header(payload, "Content-ID").is_empty();
+    if depth > 64 || (payload["filename"].as_str().is_some_and(|n| !n.is_empty()) && !inline) {
         return Ok(());
     }
     if matches!(
         payload["mimeType"].as_str(),
         Some("text/html" | "text/plain")
-    ) {
+    ) || inline
+    {
         if let Some(id) = payload["body"]["attachmentId"].as_str() {
+            let size = payload["body"]["size"].as_u64().unwrap_or_default() as usize;
+            if inline
+                && (size > crate::html_layout::MAX_INLINE_BYTES
+                    || size > remaining.bytes
+                    || remaining.images == 0)
+            {
+                return Ok(());
+            }
+            if inline {
+                remaining.images -= 1;
+            }
             anyhow::ensure!(
-                payload["body"]["size"].as_u64().unwrap_or_default()
-                    <= crate::html::MAX_HTML as u64,
+                size <= if inline {
+                    crate::html_layout::MAX_INLINE_BYTES
+                } else {
+                    crate::html::MAX_HTML
+                },
                 "Message body exceeds the 1 MiB display limit"
             );
             let response = read_request(
@@ -841,12 +1051,27 @@ fn hydrate_bodies(
                     .bearer_auth(token),
                 &AtomicBool::new(false),
             )?;
-            let body: Value =
-                serde_json::from_reader(response.take((crate::html::MAX_HTML * 2) as u64))?;
+            let body: Value = serde_json::from_reader(
+                response.take((crate::html_layout::MAX_INLINE_BYTES * 2) as u64),
+            )?;
             anyhow::ensure!(
                 body["data"].is_string(),
                 "Gmail returned no message body data"
             );
+            if inline {
+                let encoded = body["data"].as_str().unwrap_or_default();
+                anyhow::ensure!(
+                    encoded.len() <= crate::html_layout::MAX_INLINE_BYTES.div_ceil(3) * 4,
+                    "Inline image exceeds the display limit"
+                );
+                let bytes = URL_SAFE_NO_PAD.decode(encoded.trim_end_matches('='))?;
+                anyhow::ensure!(
+                    bytes.len() <= remaining.bytes
+                        && bytes.len() <= crate::html_layout::MAX_INLINE_BYTES,
+                    "Inline image exceeds the display budget"
+                );
+                remaining.bytes -= bytes.len();
+            }
             payload["body"]["data"] = body["data"].clone();
             payload["body"]
                 .as_object_mut()
@@ -856,7 +1081,7 @@ fn hydrate_bodies(
     }
     if let Some(parts) = payload["parts"].as_array_mut() {
         for part in parts {
-            hydrate_bodies(client, token, message_id, part, depth + 1, api)?;
+            hydrate_parts(client, token, message_id, part, depth + 1, api, remaining)?;
         }
     }
     Ok(())
@@ -1020,6 +1245,31 @@ fn missing_body(payload: &Value, depth: usize) -> bool {
             .is_some_and(|parts| parts.iter().any(|part| missing_body(part, depth + 1)))
 }
 
+fn gmail_inline_images(payload: &Value, doc: &mut crate::html::Document, depth: usize) {
+    if depth > 64 {
+        return;
+    }
+    let mime = payload["mimeType"].as_str().unwrap_or_default();
+    if crate::html_layout::raster_type(mime) {
+        let cid = header(payload, "Content-ID");
+        if !cid.is_empty() {
+            if let Some(data) = payload["body"]["data"]
+                .as_str()
+                .filter(|s| s.len() <= crate::html_layout::MAX_INLINE_BYTES.div_ceil(3) * 4)
+            {
+                if let Ok(bytes) = URL_SAFE_NO_PAD.decode(data.trim_end_matches('=')) {
+                    crate::html_layout::attach_inline(doc, &cid, mime, &bytes);
+                }
+            }
+        }
+    }
+    if let Some(parts) = payload["parts"].as_array() {
+        for part in parts {
+            gmail_inline_images(part, doc, depth + 1);
+        }
+    }
+}
+
 fn parse_message(value: &Value, account: &str) -> Result<Message> {
     let payload = &value["payload"];
     let from = header(payload, "From");
@@ -1034,11 +1284,14 @@ fn parse_message(value: &Value, account: &str) -> Result<Message> {
     body_parts(payload, &mut parts, "text/plain");
     let mut html_parts = Vec::new();
     body_parts(payload, &mut html_parts, "text/html");
-    let html = if html_parts.is_empty() {
+    let mut html = if html_parts.is_empty() {
         None
     } else {
         Some(crate::html::parse(&html_parts.join("\n")))
     };
+    if let Some(doc) = &mut html {
+        gmail_inline_images(payload, doc, 0);
+    }
     let body = if parts.is_empty() {
         html.as_ref().map(|document| document.plain_text()).filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| format!("{}\n\n[Message body unavailable. Load formatted message to retrieve available content.]", value["snippet"].as_str().unwrap_or("")))
@@ -1160,6 +1413,58 @@ mod tests {
     }
 
     #[test]
+    fn current_inbox_refresh_keeps_the_historical_import_cursor_and_cache() {
+        let mut store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        store
+            .begin_full_sync("me@example.com", "original-history")
+            .unwrap();
+        store
+            .checkpoint_page("me@example.com", "historical-page-9")
+            .unwrap();
+        let old = parse_message(
+            &fixture("old", &["INBOX"], "1700000000000"),
+            "me@example.com",
+        )
+        .unwrap();
+        store.stage_message("me@example.com", &old).unwrap();
+        let mut downloaded = store.staged_ids("me@example.com").unwrap();
+        let (api, worker) = mock(vec![
+            (
+                "/messages?maxResults=50&labelIds=INBOX",
+                200,
+                serde_json::json!({"messages":[{"id":"latest"},{"id":"old"},{"id":"vanished"}]}),
+            ),
+            (
+                "/messages/latest?format=full",
+                200,
+                fixture("latest", &["INBOX"], "1794000000000"),
+            ),
+            ("/messages/vanished?format=full", 404, serde_json::json!({})),
+        ]);
+        refresh_recent_inbox(
+            &client().unwrap(),
+            "test",
+            "me@example.com",
+            &AtomicBool::new(false),
+            &store,
+            &api,
+            &mut downloaded,
+        )
+        .unwrap();
+        worker.join().unwrap();
+        assert_eq!(downloaded.len(), 2);
+        assert_eq!(
+            store.full_sync("me@example.com").unwrap(),
+            Some(("original-history".into(), "historical-page-9".into()))
+        );
+        assert_eq!(store.history("me@example.com").unwrap(), "");
+        let page = store.mailbox_page("All Inboxes", "", 0).unwrap();
+        assert_eq!(page["total"], 2);
+        assert_eq!(page["messages"][0]["id"], "latest");
+        assert_eq!(page["messages"][1]["id"], "old");
+    }
+
+    #[test]
     fn revoked_refresh_is_distinct_from_temporary_token_errors() {
         let revoked = refresh_response(reqwest::StatusCode::BAD_REQUEST, serde_json::json!({"error":"invalid_grant","error_description":"sensitive provider text"})).err().unwrap();
         assert!(revoked.is::<crate::service::ReconnectRequired>());
@@ -1263,6 +1568,46 @@ mod tests {
         assert!(!formatted.contains("Not the body"));
         assert!(!formatted.contains("bad()"));
         assert!(message.html_loaded);
+    }
+
+    #[test]
+    fn gmail_cid_images_hydrate_without_fetching_unrelated_attachments() {
+        let gif = base64::engine::general_purpose::STANDARD
+            .decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7")
+            .unwrap();
+        let encoded = URL_SAFE_NO_PAD.encode(&gif);
+        let (api, worker) = mock(vec![(
+            "/messages/m/attachments/logo",
+            200,
+            serde_json::json!({"data":encoded}),
+        )]);
+        let mut payload = serde_json::json!({"mimeType":"multipart/related","parts":[
+          {"mimeType":"text/html","body":{"data":URL_SAFE_NO_PAD.encode("<table><tr><td><img src='cid:logo'></td></tr></table>")}},
+          {"mimeType":"image/gif","filename":"logo.gif","headers":[{"name":"Content-ID","value":"<logo>"}],"body":{"size":gif.len(),"attachmentId":"logo"}},
+          {"mimeType":"application/pdf","filename":"unrelated.pdf","body":{"size":42,"attachmentId":"do-not-fetch"}}
+        ]});
+        hydrate_bodies(&client().unwrap(), "test", "m", &mut payload, 0, &api).unwrap();
+        let message = parse_message(
+            &serde_json::json!({"id":"m","payload":payload}),
+            "me@example.com",
+        )
+        .unwrap();
+        assert!(message.html.unwrap().images[0]
+            .inline_data
+            .as_ref()
+            .unwrap()
+            .starts_with("data:image/gif;base64,"));
+        worker.join().unwrap();
+        let mut oversized = serde_json::json!({"mimeType":"image/png","headers":[{"name":"Content-ID","value":"<huge>"}],"body":{"size":3*1024*1024,"attachmentId":"never"}});
+        hydrate_bodies(
+            &client().unwrap(),
+            "test",
+            "m",
+            &mut oversized,
+            0,
+            "http://127.0.0.1:1",
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1382,6 +1727,10 @@ mod tests {
     fn partial_mail_is_visible_and_resumes_without_redownloading_completed_messages() {
         use serde_json::json;
         let mut store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        store.snapshot("me@example.com", &[], "").unwrap();
+        store
+            .set_sync_history("me@example.com", crate::settings::SyncHistory::All)
+            .unwrap();
         let original = parse_message(&fixture("old", &["INBOX"], "1"), "me@example.com").unwrap();
         store.snapshot("me@example.com", &[original], "").unwrap();
         let (api, worker) = mock(vec![
@@ -1517,9 +1866,115 @@ mod tests {
     }
 
     #[test]
+    fn reconciliation_and_history_keep_cached_bodies_and_only_download_new_ids() {
+        use serde_json::json;
+        let mut store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let email = "me@example.com";
+        let mut cached = parse_message(&fixture("cached", &["INBOX"], "200"), email).unwrap();
+        cached.body = "Previously downloaded body".into();
+        cached.html = Some(crate::html::parse("<p>Hydrated HTML stays cached</p>"));
+        cached.html_loaded = true;
+        cached.reply_to = "reply@example.com".into();
+        cached.attachments = vec![Attachment {
+            id: "file".into(),
+            name: "kept.bin".into(),
+            size: 3,
+            data: "YWJj".into(),
+        }];
+        let removed = parse_message(&fixture("removed", &["INBOX"], "100"), email).unwrap();
+        store
+            .snapshot(email, &[cached.clone(), removed], "")
+            .unwrap();
+        store
+            .set_sync_history(email, crate::settings::SyncHistory::All)
+            .unwrap();
+        let (api, worker) = mock(vec![
+            ("/profile", 200, json!({"historyId":"10"})),
+            (
+                "/messages?",
+                200,
+                json!({"messages":[{"id":"cached"},{"id":"new"}]}),
+            ),
+            (
+                "/messages/cached?format=minimal",
+                200,
+                json!({"id":"cached","labelIds":["SENT","STARRED"]}),
+            ),
+            (
+                "/messages/new?format=full",
+                200,
+                fixture("new", &["INBOX"], "300"),
+            ),
+            (
+                "startHistoryId=10",
+                200,
+                json!({"history":[{"messages":[{"id":"cached"}]}],"historyId":"20"}),
+            ),
+            (
+                "/messages/cached?format=minimal",
+                200,
+                json!({"id":"cached","labelIds":["TRASH"]}),
+            ),
+            ("startHistoryId=20", 200, json!({"historyId":"21"})),
+        ]);
+        let client = client().unwrap();
+        let cancel = AtomicBool::new(false);
+        sync_with_store(&client, "test", email, &cancel, &mut store, &api).unwrap();
+        let kept = store.cached_message(email, "cached").unwrap();
+        assert_eq!(kept.body, cached.body);
+        assert_eq!(kept.reply_to, cached.reply_to);
+        assert_eq!(kept.attachments[0].data, "YWJj");
+        assert!(kept.html.unwrap().plain_text().contains("Hydrated HTML"));
+        assert_eq!(kept.folder, "Sent");
+        assert!(kept.flagged);
+        assert!(store
+            .cached_message_optional(email, "removed")
+            .unwrap()
+            .is_none());
+        sync_with_store(&client, "test", email, &cancel, &mut store, &api).unwrap();
+        let kept = store.cached_message(email, "cached").unwrap();
+        assert_eq!(kept.body, cached.body);
+        assert_eq!(kept.attachments[0].data, "YWJj");
+        assert_eq!(kept.folder, "Trash");
+        sync_with_store(&client, "test", email, &cancel, &mut store, &api).unwrap();
+        assert_eq!(store.history(email).unwrap(), "21");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn default_gmail_import_filters_history_and_preserves_cutoff_on_resume() {
+        use serde_json::json;
+        let mut store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let (api, worker) = mock(vec![
+            ("/profile", 200, json!({"historyId":"10"})),
+            ("q=after%3A", 200, json!({"nextPageToken":"second"})),
+            ("pageToken=second", 403, json!({})),
+            ("q=after%3A", 200, json!({})),
+        ]);
+        let client = client().unwrap();
+        let cancel = AtomicBool::new(false);
+        assert!(
+            sync_with_store(&client, "test", "me@example.com", &cancel, &mut store, &api).is_err()
+        );
+        let since = store.scan_since("me@example.com").unwrap().unwrap();
+        assert!((since - crate::settings::SyncHistory::OneYear.cutoff().unwrap()).abs() < 5000);
+        assert_eq!(
+            store.full_sync("me@example.com").unwrap().unwrap().1,
+            "second"
+        );
+        sync_with_store(&client, "test", "me@example.com", &cancel, &mut store, &api).unwrap();
+        assert_eq!(store.history("me@example.com").unwrap(), "10");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn full_sync_paginates_then_history_applies_changes_and_deletions() {
         use serde_json::json;
         let mut store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        store.snapshot("me@example.com", &[], "").unwrap();
+        store
+            .set_sync_history("me@example.com", crate::settings::SyncHistory::All)
+            .unwrap();
         let (api, worker) = mock(vec![
             ("/profile", 200, json!({"historyId":"10"})),
             (
@@ -1549,11 +2004,11 @@ mod tests {
                 json!({"history":[{"messages":[{"id":"c"}]}],"historyId":"20"}),
             ),
             (
-                "/messages/a?format=full",
+                "/messages/a?format=minimal",
                 200,
                 fixture("a", &["STARRED"], "200"),
             ),
-            ("/messages/b?format=full", 404, json!({})),
+            ("/messages/b?format=minimal", 404, json!({})),
             (
                 "/messages/c?format=full",
                 200,

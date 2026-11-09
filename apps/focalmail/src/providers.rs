@@ -56,41 +56,93 @@ pub fn reconnect(email: &str, cancel: Arc<AtomicBool>, progress: impl Fn(&str)) 
             crate::outlook::connect(&p, cancel, progress)
         }
         Some(p) if p.provider == Provider::Manual => {
-            crate::imap_backend::sync(&p, &cancel)?;
+            let result = crate::imap_backend::sync(&p, &cancel);
+            Store::open()?.record_status(email, &result)?;
+            result?;
             Ok("Account connected".into())
         }
         _ => crate::gmail_backend::reconnect(email, cancel, progress),
     }
 }
 pub fn sync_all(cancel: Arc<AtomicBool>) -> Result<String> {
+    sync_accounts(cancel, false)
+}
+pub fn sync_background(cancel: Arc<AtomicBool>) -> Result<String> {
+    sync_accounts(cancel, true)
+}
+fn sync_accounts(cancel: Arc<AtomicBool>, background: bool) -> Result<String> {
     let store = Store::open()?;
-    let accounts = store.accounts()?;
-    anyhow::ensure!(!accounts.is_empty(), "Connect a mail account first");
+    let accounts = if background {
+        store.background_accounts()?
+    } else {
+        store.accounts()?
+    };
+    anyhow::ensure!(
+        background || !accounts.is_empty(),
+        "Connect a mail account first"
+    );
+    // Separate connections and workers keep a long Gmail import from blocking
+    // another account. The service retains its operation lock until all workers
+    // exit, so interactive mutations and cancellation remain serialized safely.
+    let results = sync_independently(&accounts, &cancel, sync_one_account);
     let mut failures = Vec::new();
-    for email in &accounts {
-        cancelled(&cancel)?;
-        let initialized = !store.history(email)?.is_empty();
-        let before = store
-            .load()?
-            .into_iter()
-            .filter(|m| m.account == *email)
-            .map(|m| m.id)
-            .collect();
-        let result = match profile(email)? {
-            Some(p) if p.provider == Provider::Microsoft365 => crate::outlook::sync(&p, &cancel),
-            Some(p) if p.provider == Provider::Manual => crate::imap_backend::sync(&p, &cancel),
-            _ => crate::gmail_backend::sync_account(email, &cancel),
-        };
-        store.record_status(email, &result)?;
-        if let Err(e) = result {
-            failures.push(format!("{email}: {e}"));
-        } else if initialized {
-            crate::notifications::new_mail(email, &before);
+    for (email, result) in accounts.iter().zip(results) {
+        if let Err(error) = result {
+            if error.is::<crate::service::OperationCancelled>() {
+                return Err(error);
+            }
+            failures.push(format!("{email}: {error}"));
         }
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
     Ok(format!("Synced {} account(s)", accounts.len()))
 }
+fn sync_independently(
+    accounts: &[String],
+    cancel: &AtomicBool,
+    sync: impl Fn(&str, &AtomicBool) -> Result<()> + Sync,
+) -> Vec<Result<()>> {
+    std::thread::scope(|scope| {
+        let workers = accounts
+            .iter()
+            .map(|email| {
+                let sync = &sync;
+                scope.spawn(move || sync(email, cancel))
+            })
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("Account sync worker failed")))
+            })
+            .collect::<Vec<_>>()
+    })
+}
+fn sync_one_account(email: &str, cancel: &AtomicBool) -> Result<()> {
+    cancelled(cancel)?;
+    let store = Store::open()?;
+    let initialized = !store.history(email)?.is_empty();
+    store.record_sync_started(email)?;
+    let before = if initialized {
+        store.cached_ids(email)?
+    } else {
+        Default::default()
+    };
+    let result = match profile(email)? {
+        Some(p) if p.provider == Provider::Microsoft365 => crate::outlook::sync(&p, cancel),
+        Some(p) if p.provider == Provider::Manual => crate::imap_backend::sync(&p, cancel),
+        _ => crate::gmail_backend::sync_account(email, cancel),
+    };
+    store.record_status(email, &result)?;
+    result?;
+    if initialized {
+        crate::notifications::new_mail(email, &before);
+    }
+    Ok(())
+}
+
 pub fn modify(message: &Message, action: Action, cancel: Arc<AtomicBool>) -> Result<String> {
     cancelled(&cancel)?;
     match profile(&message.account)? {
@@ -104,6 +156,10 @@ pub fn modify(message: &Message, action: Action, cancel: Arc<AtomicBool>) -> Res
     }
 }
 pub fn send(draft: &Draft, files: &[DraftAttachment], cancel: Arc<AtomicBool>) -> Result<String> {
+    anyhow::ensure!(
+        Store::open()?.accounts()?.contains(&draft.from),
+        "Choose a connected sender account before sending this draft"
+    );
     cancelled(&cancel)?;
     match profile(&draft.from)? {
         Some(p) if p.provider != Provider::Gmail => {
@@ -142,7 +198,10 @@ pub fn mime(draft: &Draft, files: &[DraftAttachment]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 pub fn load_content(message: &Message) -> Result<Message> {
-    if message.attachments_loaded && message.html_loaded {
+    if message.attachments_loaded
+        && message.html_loaded
+        && message.html.as_ref().is_none_or(|h| !h.needs_reload())
+    {
         return Ok(message.clone());
     }
     let loaded = match profile(&message.account)? {
@@ -219,4 +278,35 @@ pub fn forward_files(
         });
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    #[test]
+    fn a_slow_account_does_not_block_another_and_both_observe_cancellation() {
+        let accounts = vec!["slow-gmail".to_string(), "microsoft".to_string()];
+        let cancel = AtomicBool::new(false);
+        let (started, observed) = std::sync::mpsc::channel();
+        let observed = std::sync::Mutex::new(observed);
+        let results = sync_independently(&accounts, &cancel, |account, cancel| {
+            if account == "slow-gmail" {
+                observed
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                assert!(cancel.load(Ordering::Relaxed));
+            } else {
+                cancel.store(true, Ordering::Relaxed);
+                started.send(()).unwrap();
+            }
+            cancelled(cancel)
+        });
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r
+            .as_ref()
+            .unwrap_err()
+            .is::<crate::service::OperationCancelled>()));
+    }
 }

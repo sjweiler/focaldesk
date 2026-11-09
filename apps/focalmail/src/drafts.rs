@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Copy)]
 pub enum Kind {
-    New,
     Reply,
     ReplyAll,
     Forward,
@@ -40,7 +39,7 @@ impl Draft {
         }
     }
 }
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 pub struct Summary {
     pub id: String,
     pub subject: String,
@@ -159,7 +158,7 @@ pub fn prepare(message: &Message, kind: Kind, accounts: &[String]) -> Draft {
 mod tests {
     use super::*;
     fn message() -> Message {
-        let mut message = crate::Mail::default().messages.remove(0);
+        let mut message = crate::fixtures::messages().remove(0);
         message.account = "my.name@gmail.com".into();
         message.email = "sender@example.com".into();
         message.reply_to = "Support <reply@example.com>".into();

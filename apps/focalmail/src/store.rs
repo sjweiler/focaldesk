@@ -1,8 +1,16 @@
 use crate::Message;
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
-use std::path::PathBuf;
+use rusqlite::{params, Connection, TransactionBehavior};
+use std::{path::PathBuf, time::Duration};
 
+#[path = "store_actions.rs"]
+mod actions;
+#[path = "store_graph.rs"]
+mod graph;
+#[path = "store_search.rs"]
+mod search;
+#[path = "store_sync.rs"]
+mod sync;
 pub struct Store(Connection);
 impl Store {
     pub fn open() -> Result<Self> {
@@ -21,7 +29,30 @@ impl Store {
         Self::init(Connection::open(path)?)
     }
     pub(crate) fn init(conn: Connection) -> Result<Self> {
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        // WAL lets the daemon commit downloads while the window holds a read snapshot.
+        // Checking first avoids taking a journal-mode write lock on every read connection.
+        let journal: String = conn.pragma_query_value(None, "journal_mode", |r| r.get(0))?;
+        if journal != "wal" && journal != "memory" {
+            conn.pragma_update(None, "journal_mode", "WAL")?;
+        }
+        let has_migrations: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='mail_migrations')",
+            [], |r| r.get(0),
+        )?;
+        if has_migrations {
+            let ready: bool = conn.query_row(
+                "SELECT count(*)=9 FROM mail_migrations WHERE version IN (1,2,3,4,5,6,7,8,9)",
+                [],
+                |r| r.get(0),
+            )?;
+            if ready {
+                // Opening the cache for a mailbox/status read must not acquire a writer.
+                return Ok(Self(conn));
+            }
+        }
+        conn.execute_batch("
             CREATE TABLE IF NOT EXISTS accounts (email TEXT PRIMARY KEY);
             CREATE TABLE IF NOT EXISTS account_status (email TEXT PRIMARY KEY, state TEXT NOT NULL, detail TEXT NOT NULL, updated INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS messages (
@@ -48,10 +79,84 @@ impl Store {
             CREATE TABLE IF NOT EXISTS local_draft_files (draft_id TEXT NOT NULL REFERENCES local_drafts(id) ON DELETE CASCADE, position INTEGER NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, PRIMARY KEY(draft_id,position));
             CREATE TABLE IF NOT EXISTS active_local_draft (slot INTEGER PRIMARY KEY CHECK(slot=1), draft_id TEXT NOT NULL REFERENCES local_drafts(id) ON DELETE CASCADE);")?;
         store.migrate_drafts()?;
+        store.migrate_mailbox()?;
+        store.0.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS mail_sync_progress (account TEXT PRIMARY KEY,phase TEXT NOT NULL,completed INTEGER NOT NULL,total INTEGER,updated INTEGER NOT NULL);
+            INSERT OR IGNORE INTO mail_migrations VALUES(4);
+            COMMIT;")?;
+        store.migrate_search()?;
+        store.migrate_sync_history()?;
+        store.0.execute_batch("BEGIN IMMEDIATE;
+            CREATE TABLE IF NOT EXISTS account_folders(account TEXT NOT NULL REFERENCES accounts(email) ON DELETE CASCADE,folder TEXT NOT NULL,PRIMARY KEY(account,folder));
+            INSERT OR IGNORE INTO mail_migrations VALUES(7);
+            COMMIT;")?;
+        store.migrate_graph()?;
         Ok(store)
     }
+    // Triggers also cover writes from an already-running older mail service.
+    // Keep list metadata separate so paging never scans large MIME documents.
+    fn migrate_mailbox(&mut self) -> Result<()> {
+        let migrated: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_migrations WHERE version=3)",
+            [],
+            |r| r.get(0),
+        )?;
+        if migrated {
+            return Ok(());
+        }
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let migrated: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_migrations WHERE version=3)",
+            [],
+            |r| r.get(0),
+        )?;
+        if migrated {
+            tx.commit()?;
+            return Ok(());
+        }
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS mailbox_summaries (
+            account TEXT NOT NULL,id TEXT NOT NULL,staged INTEGER NOT NULL,data TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,inbox INTEGER NOT NULL,sent INTEGER NOT NULL,
+            unread INTEGER NOT NULL,flagged INTEGER NOT NULL,folder TEXT NOT NULL,
+            PRIMARY KEY(account,id,staged));
+            CREATE INDEX IF NOT EXISTS mailbox_summaries_date ON mailbox_summaries(timestamp DESC,account,id);")?;
+        for (table, staged) in [("messages", 0), ("full_sync_messages", 1)] {
+            let columns = |source: &str| {
+                let data = format!("{source}.data");
+                let visible = format!("NOT EXISTS(SELECT 1 FROM json_each({data},'$.labels') WHERE value IN ('TRASH','SPAM','DRAFT'))");
+                let folder = |label: &str, name: &str| {
+                    format!("((coalesce(json_array_length(json_extract({data},'$.labels')),0)=0 AND json_extract({data},'$.folder')='{name}') OR (EXISTS(SELECT 1 FROM json_each({data},'$.labels') WHERE value='{label}') AND {visible}))")
+                };
+                format!("{source}.account,{source}.id,{staged},json_set({data},'$.body',substr(json_extract({data},'$.body'),1,160),'$.html',NULL,'$.attachments',json('[]')),coalesce(json_extract({data},'$.timestamp'),0),{},{},coalesce(json_extract({data},'$.unread'),0),coalesce(json_extract({data},'$.flagged'),0),coalesce(json_extract({data},'$.folder'),'')",folder("INBOX","Inbox"),folder("SENT","Sent"))
+            };
+            for event in ["INSERT", "UPDATE"] {
+                tx.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS mailbox_{table}_{event} AFTER {event} ON {table} BEGIN INSERT OR REPLACE INTO mailbox_summaries SELECT {}; END;", columns("new")))?;
+            }
+            tx.execute_batch(&format!("CREATE TRIGGER IF NOT EXISTS mailbox_{table}_delete AFTER DELETE ON {table} BEGIN DELETE FROM mailbox_summaries WHERE account=old.account AND id=old.id AND staged={staged}; END;"))?;
+            tx.execute_batch(&format!(
+                "INSERT OR IGNORE INTO mailbox_summaries SELECT {} FROM {table} source;",
+                columns("source")
+            ))?;
+        }
+        tx.execute("INSERT OR IGNORE INTO mail_migrations VALUES(3)", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     fn migrate_drafts(&mut self) -> Result<()> {
-        let tx = self.0.transaction()?;
+        let migrated: bool = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM mail_migrations WHERE version=2)",
+            [],
+            |r| r.get(0),
+        )?;
+        if migrated {
+            return Ok(());
+        }
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let migrated: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM mail_migrations WHERE version=2)",
             [],
@@ -166,7 +271,9 @@ impl Store {
                 "Attachments may total at most 20 MiB"
             );
         }
-        let tx = self.0.transaction()?;
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("INSERT INTO local_drafts VALUES(?1,?2,unixepoch()) ON CONFLICT(id) DO UPDATE SET data=excluded.data,updated=unixepoch()", params![draft.id,serde_json::to_string(draft)?])?;
         if let Some(files) = files {
             tx.execute(
@@ -189,18 +296,53 @@ impl Store {
             .execute("DELETE FROM local_drafts WHERE id=?1", [id])?;
         Ok(())
     }
+    pub fn sync_progress(
+        &self,
+        account: &str,
+        phase: &str,
+        completed: usize,
+        total: Option<usize>,
+    ) -> Result<()> {
+        self.0.execute("INSERT INTO mail_sync_progress VALUES(?1,?2,?3,?4,unixepoch()) ON CONFLICT(account) DO UPDATE SET phase=excluded.phase,completed=excluded.completed,total=CASE WHEN excluded.total IS NOT NULL THEN excluded.total WHEN excluded.phase=mail_sync_progress.phase OR (mail_sync_progress.phase IN ('paused','error','connecting') AND excluded.phase='importing') THEN mail_sync_progress.total ELSE NULL END,updated=unixepoch()", params![account,phase,completed as i64,total.map(|n|n as i64)])?;
+        Ok(())
+    }
+    pub fn background_accounts(&self) -> Result<Vec<String>> {
+        Ok(self.0.prepare("SELECT email FROM accounts WHERE NOT EXISTS(SELECT 1 FROM account_status s WHERE s.email=accounts.email AND s.state='reconnect_required') ORDER BY email")?
+            .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+    pub fn recover_interrupted_sync(&self) -> Result<()> {
+        self.0.execute_batch("BEGIN IMMEDIATE;
+            UPDATE mail_sync_progress SET phase='paused',updated=unixepoch() WHERE account IN (SELECT email FROM account_status WHERE state='syncing');
+            UPDATE account_status SET state='idle',detail='',updated=unixepoch() WHERE state='syncing';
+            COMMIT;")?;
+        Ok(())
+    }
+    pub fn record_sync_started(&self, email: &str) -> Result<()> {
+        self.0.execute("INSERT INTO account_status VALUES(?1,'syncing','',unixepoch()) ON CONFLICT(email) DO UPDATE SET state='syncing',detail='',updated=unixepoch()",[email])?;
+        self.0.execute(
+            "UPDATE mail_sync_progress SET phase='connecting',updated=unixepoch() WHERE account=?1",
+            [email],
+        )?;
+        Ok(())
+    }
+    pub fn cached_ids(&self, account: &str) -> Result<std::collections::HashSet<String>> {
+        Ok(self.0.prepare("SELECT id FROM messages WHERE account=?1 UNION SELECT id FROM full_sync_messages WHERE account=?1")?
+            .query_map([account], |r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
+    }
     pub fn record_status(&self, email: &str, result: &Result<()>) -> Result<()> {
         let (state, detail) = match result {
             Ok(()) => ("connected", String::new()),
-            Err(error) if error.is::<crate::service::OperationCancelled>() => return Ok(()),
-            Err(error)
-                if error
-                    .downcast_ref::<reqwest::Error>()
-                    .is_some_and(|e| e.is_connect()) =>
+            Err(error) if error.is::<crate::service::OperationCancelled>() => {
+                // Do not leave a cancelled scan looking active; preserve prior failures otherwise.
+                self.0.execute("UPDATE account_status SET state='idle',detail='',updated=unixepoch() WHERE email=?1 AND state='syncing'",[email])?;
+                self.0.execute("UPDATE mail_sync_progress SET phase='paused',updated=unixepoch() WHERE account=?1",[email])?;
+                return Ok(());
+            }
+            Err(error) if crate::service::is_network_error(error) =>
             {
                 (
                     "offline",
-                    "Could not reach mail provider; cached mail remains available".into(),
+                    "The mail provider could not be reached or timed out. Sync will retry automatically; cached mail is available.".into(),
                 )
             }
             Err(error) if error.is::<crate::service::ReconnectRequired>() => {
@@ -209,13 +351,28 @@ impl Store {
             Err(error) => ("sync_error", error.to_string()),
         };
         self.0.execute("INSERT INTO account_status VALUES(?1,?2,?3,unixepoch()) ON CONFLICT(email) DO UPDATE SET state=excluded.state,detail=excluded.detail,updated=excluded.updated", params![email,state,detail])?;
+        self.0.execute(
+            "UPDATE mail_sync_progress SET phase=?2,updated=unixepoch() WHERE account=?1",
+            params![email, if result.is_ok() { "complete" } else { "error" }],
+        )?;
         Ok(())
     }
     pub fn account_status(&self) -> Result<serde_json::Value> {
         let mut query = self.0.prepare("SELECT a.email,coalesce(s.state,'offline'),coalesce(s.detail,''),s.updated FROM accounts a LEFT JOIN account_status s ON a.email=s.email ORDER BY a.email")?;
         let accounts = query.query_map([], |r| Ok(serde_json::json!({"email":r.get::<_,String>(0)?, "provider":"gmail", "state":r.get::<_,String>(1)?, "detail":r.get::<_,String>(2)?, "updated":r.get::<_,Option<i64>>(3)?, "capabilities":["read","search","send","labels","attachments","reconnect"]})))?.collect::<rusqlite::Result<Vec<_>>>()?;
         let mut accounts = accounts;
+        let sync_paused = self.sync_paused()?;
+        let search_pending = self.search_pending()?;
         for account in &mut accounts {
+            account["sync_paused"] = sync_paused.into();
+            account["sync_history"] = serde_json::to_value(
+                self.sync_history(account["email"].as_str().unwrap_or_default())?,
+            )?;
+            account["search_pending"] = search_pending.into();
+            let email = account["email"].as_str().unwrap_or_default().to_owned();
+            account["cached_count"] = self.0.query_row("SELECT count(*) FROM mailbox_summaries m WHERE account=?1 AND (staged=1 OR NOT EXISTS(SELECT 1 FROM mailbox_summaries f WHERE f.account=m.account AND f.id=m.id AND f.staged=1))",[&email],|r|r.get::<_,u64>(0))?.into();
+            use rusqlite::OptionalExtension;
+            account["progress"] = self.0.query_row("SELECT phase,completed,total,updated FROM mail_sync_progress WHERE account=?1",[&email],|r|Ok(serde_json::json!({"phase":r.get::<_,String>(0)?,"completed":r.get::<_,u64>(1)?,"total":r.get::<_,Option<u64>>(2)?,"updated":r.get::<_,i64>(3)?}))).optional()?.unwrap_or(serde_json::Value::Null);
             if let Some(profile) =
                 self.connected_profile(account["email"].as_str().unwrap_or_default())?
             {
@@ -242,7 +399,9 @@ impl Store {
         data.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
     }
     pub fn connect_profile(&mut self, profile: &crate::settings::Profile) -> Result<()> {
-        let tx = self.0.transaction()?;
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO accounts VALUES(?1)",
             [&profile.email],
@@ -250,6 +409,22 @@ impl Store {
         tx.execute("INSERT INTO connected_providers VALUES(?1,?2) ON CONFLICT(email) DO UPDATE SET profile=excluded.profile", params![profile.email,serde_json::to_string(profile)?])?;
         tx.commit()?;
         self.save_profile(profile)
+    }
+    pub fn sync_paused(&self) -> Result<bool> {
+        use rusqlite::OptionalExtension;
+        Ok(self
+            .0
+            .query_row(
+                "SELECT value FROM mail_preferences WHERE name='sync_paused'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(false))
+    }
+    pub fn set_sync_paused(&self, paused: bool) -> Result<()> {
+        self.0.execute("INSERT INTO mail_preferences VALUES('sync_paused',?1) ON CONFLICT(name) DO UPDATE SET value=excluded.value",[paused])?;
+        Ok(())
     }
     pub fn notifications_enabled(&self) -> Result<bool> {
         use rusqlite::OptionalExtension;
@@ -287,6 +462,108 @@ impl Store {
         self.0.execute("INSERT INTO account_profiles VALUES(?1,?2,?3) ON CONFLICT(email,provider) DO UPDATE SET data=excluded.data", params![profile.email,serde_json::to_string(&profile.provider)?,serde_json::to_string(profile)?])?;
         Ok(())
     }
+    pub fn account_folders(&self) -> Result<serde_json::Value> {
+        let mut folders = std::collections::BTreeMap::<String, Vec<String>>::new();
+        let mut statement = self.0.prepare("SELECT account,folder FROM account_folders UNION SELECT account,folder FROM mailbox_summaries WHERE folder!='' ORDER BY account,folder")?;
+        for row in
+            statement.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+        {
+            let (account, folder) = row?;
+            folders.entry(account).or_default().push(folder);
+        }
+        Ok(serde_json::to_value(folders)?)
+    }
+    pub fn replace_account_folders(&mut self, account: &str, folders: &[String]) -> Result<()> {
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM account_folders WHERE account=?1", [account])?;
+        for folder in folders {
+            tx.execute(
+                "INSERT OR IGNORE INTO account_folders VALUES(?1,?2)",
+                params![account, folder],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    /// Read only one mailbox page; never deserialize every cached MIME body for the UI.
+    pub fn mailbox_page(
+        &self,
+        folder: &str,
+        query: &str,
+        offset: usize,
+    ) -> Result<serde_json::Value> {
+        // Account folder keys are JSON tuples, avoiding ambiguous delimiters in names.
+        let scoped: Option<(String, String)> = folder
+            .strip_prefix("account-folder:")
+            .map(serde_json::from_str)
+            .transpose()?;
+        let account = scoped.as_ref().map(|(account, _)| account.as_str());
+        let folder = scoped
+            .as_ref()
+            .map(|(_, folder)| folder.as_str())
+            .unwrap_or(folder);
+        let sql = "WITH cached AS (
+            SELECT * FROM mailbox_summaries m WHERE m.staged=1 OR NOT EXISTS (
+                SELECT 1 FROM mailbox_summaries f WHERE f.account=m.account AND f.id=m.id AND f.staged=1)
+        ), filtered AS (
+            SELECT data,timestamp,account,id FROM cached WHERE (:account IS NULL OR account=:account) AND (
+                ((:folder IN ('All Inboxes','Inbox','Unread') OR account=:folder) AND inbox=1 AND (:folder!='Unread' OR unread=1))
+                OR (:folder='Starred' AND flagged=1)
+                OR (:folder='Sent' AND sent=1)
+                OR (folder=:folder AND :folder NOT IN ('Inbox','Sent') AND (:account IS NOT NULL OR :folder IN ('Archive','Spam','Trash','Server Drafts')))
+            ) AND (:query='' OR (account,id,staged) IN (SELECT account,id,staged FROM mail_search_fts WHERE mail_search_fts MATCH :query))
+        )";
+        let original_query = query;
+        let query = search::expression(query)?;
+        if !original_query.trim().is_empty() && query.is_empty() {
+            return Ok(
+                serde_json::json!({"messages":[],"total":0,"offset":offset,"page_size":100}),
+            );
+        }
+        let total: usize = self.0.query_row(
+            &format!("{sql} SELECT count(*) FROM filtered"),
+            rusqlite::named_params! {":account":account,":folder":folder,":query":query},
+            |r| r.get(0),
+        )?;
+        let mut statement = self.0.prepare(&format!("{sql} SELECT data FROM filtered ORDER BY timestamp DESC,account,id LIMIT 100 OFFSET :offset"))?;
+        let mut messages = statement
+            .query_map(
+                rusqlite::named_params! {":account":account,":folder":folder,":query":query,":offset":offset as i64},
+                |r| r.get::<_, String>(0),
+            )?
+            .map(|r| Ok(serde_json::from_str::<serde_json::Value>(&r?)?))
+            .collect::<Result<Vec<_>>>()?;
+        for message in &mut messages {
+            let account = message["account"].as_str().unwrap_or_default();
+            let id = message["id"].as_str().unwrap_or_default();
+            let pending = self.move_pending(account, id)?;
+            message["pending_move"] = pending.into();
+        }
+        Ok(serde_json::json!({"messages":messages,"total":total,"offset":offset,"page_size":100}))
+    }
+
+    pub fn cached_message(&self, account: &str, id: &str) -> Result<Message> {
+        self.cached_message_optional(account, id)?
+            .context("Message is no longer cached")
+    }
+    pub fn cached_message_optional(&self, account: &str, id: &str) -> Result<Option<Message>> {
+        use rusqlite::OptionalExtension;
+        let data: Option<String> = self.0.query_row(
+            "SELECT data FROM full_sync_messages WHERE account=?1 AND id=?2 UNION ALL SELECT data FROM messages WHERE account=?1 AND id=?2 LIMIT 1",
+            params![account,id], |r| r.get(0)).optional()?;
+        data.map(|data| Ok(serde_json::from_str(&data)?))
+            .transpose()
+    }
+    pub fn has_committed_messages(&self, account: &str) -> Result<bool> {
+        Ok(self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE account=?1)",
+            [account],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn load(&self) -> Result<Vec<Message>> {
         let data = self
             .0
@@ -303,7 +580,9 @@ impl Store {
     }
     // A successful snapshot replaces only this account; network failure never deletes cache.
     pub fn snapshot(&mut self, account: &str, messages: &[Message], history: &str) -> Result<()> {
-        let tx = self.0.transaction()?;
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT OR IGNORE INTO accounts(email) VALUES (?1)",
             [account],
@@ -320,6 +599,7 @@ impl Store {
                 ],
             )?;
         }
+        tx.execute("DELETE FROM mail_pending_moves WHERE account=?1", [account])?;
         tx.execute("INSERT INTO sync_state VALUES (?1,unixepoch(),?2) ON CONFLICT(account) DO UPDATE SET last_sync=unixepoch(),history_id=excluded.history_id", params![account,history])?;
         tx.commit()?;
         Ok(())
@@ -336,11 +616,14 @@ impl Store {
             .optional()?)
     }
     pub fn begin_full_sync(&mut self, account: &str, history: &str) -> Result<()> {
-        let tx = self.0.transaction()?;
+        let since = self.sync_history(account)?.cutoff();
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("INSERT OR IGNORE INTO accounts VALUES(?1)", [account])?;
         tx.execute(
-            "INSERT INTO full_sync_state VALUES(?1,?2,'')",
-            params![account, history],
+            "INSERT INTO full_sync_state(account,history,page,since) VALUES(?1,?2,'',?3)",
+            params![account, history, since],
         )?;
         tx.commit()?;
         Ok(())
@@ -363,20 +646,9 @@ impl Store {
         )?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn finish_full_sync(&mut self, account: &str) -> Result<()> {
-        let tx = self.0.transaction()?;
-        let history: String = tx.query_row(
-            "SELECT history FROM full_sync_state WHERE account=?1",
-            [account],
-            |r| r.get(0),
-        )?;
-        tx.execute("DELETE FROM messages WHERE account=?1", [account])?;
-        tx.execute("INSERT INTO messages SELECT account,id,0,data FROM full_sync_messages WHERE account=?1", [account])?;
-        tx.execute("INSERT INTO sync_state VALUES(?1,unixepoch(),?2) ON CONFLICT(account) DO UPDATE SET last_sync=unixepoch(),history_id=excluded.history_id", params![account,history])?;
-        tx.execute("DELETE FROM full_sync_messages WHERE account=?1", [account])?;
-        tx.execute("DELETE FROM full_sync_state WHERE account=?1", [account])?;
-        tx.commit()?;
-        Ok(())
+        self.finish_full_sync_cancellable(account, None)
     }
     pub fn history(&self, account: &str) -> Result<String> {
         use rusqlite::OptionalExtension;
@@ -428,7 +700,9 @@ impl Store {
             files.iter().map(|f| f.data.len()).sum::<usize>() <= crate::attachments::MAX_BYTES,
             "Attachments may total at most 20 MiB"
         );
-        let tx = self.0.transaction()?;
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM draft_attachments", [])?;
         for (index, file) in files.iter().enumerate() {
             tx.execute(
@@ -440,7 +714,9 @@ impl Store {
         Ok(())
     }
     pub fn cache_content(&mut self, message: &Message) -> Result<()> {
-        let tx = self.0.transaction()?;
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let html = serde_json::to_string(&message.html)?;
         let attachments = serde_json::to_string(&message.attachments)?;
         for table in ["messages", "full_sync_messages"] {
@@ -451,7 +727,9 @@ impl Store {
     }
     #[cfg(test)]
     pub fn clear_draft(&mut self) -> Result<()> {
-        let tx = self.0.transaction()?;
+        let tx = self
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("DELETE FROM drafts", [])?;
         tx.execute("DELETE FROM draft_attachments", [])?;
         tx.commit()?;
@@ -480,6 +758,339 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct CacheDir(PathBuf);
+    impl CacheDir {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "focalmail-concurrency-{:032x}",
+                rand::random::<u128>()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+        fn path(&self) -> PathBuf {
+            self.0.join("mail.sqlite3")
+        }
+    }
+    impl Drop for CacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn account_folder_pages_isolate_accounts_custom_folders_and_search() {
+        let mut s = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        let mut first = crate::fixtures::messages()[0].clone();
+        first.account = "one@example.com".into();
+        first.folder = "Projects/Client: A".into();
+        first.labels.clear();
+        first.subject = "Needle".into();
+        let mut second = first.clone();
+        second.account = "two@example.com".into();
+        s.snapshot(&first.account, &[first.clone()], "1").unwrap();
+        s.snapshot(&second.account, &[second.clone()], "2").unwrap();
+        s.replace_account_folders(
+            &first.account,
+            &["Empty folder".into(), first.folder.clone()],
+        )
+        .unwrap();
+        let key = format!(
+            "account-folder:{}",
+            serde_json::json!([first.account, first.folder])
+        );
+        let page = s.mailbox_page(&key, "Needle", 0).unwrap();
+        assert_eq!(page["total"], 1);
+        assert_eq!(page["messages"][0]["account"], first.account);
+        assert_eq!(s.mailbox_page(&key, "absent", 0).unwrap()["total"], 0);
+        let folders = s.account_folders().unwrap();
+        assert!(folders[&first.account]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("Empty folder")));
+        assert_eq!(s.history(&first.account).unwrap(), "1");
+    }
+    #[test]
+    fn mailbox_dates_use_arrival_timestamps_not_sender_header_order() {
+        let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        let mut messages = crate::fixtures::messages()
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>();
+        for (m, (id, timestamp, date)) in messages.iter_mut().zip([
+            (
+                "newest",
+                1793943883000_i64,
+                "Thu, 5 Nov 2026 21:44:43 -0800",
+            ),
+            ("middle", 1793939211000, "Thu, 05 Nov 2026 22:26:51 -0600"),
+            ("older", 1793939128000, "Fri, 06 Nov 2026 09:55:28 +0530"),
+        ]) {
+            m.id = id.into();
+            m.timestamp = timestamp;
+            m.date = date.into();
+            m.account = "me@example.com".into();
+        }
+        messages.reverse();
+        store.snapshot("me@example.com", &messages, "1").unwrap();
+        let page = store.mailbox_page("All Inboxes", "", 0).unwrap();
+        let ids = page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["newest", "middle", "older"]);
+    }
+
+    #[test]
+    fn sync_counts_survive_restart_pause_and_retry_without_touching_mail() {
+        let root = CacheDir::new();
+        {
+            let mut s = Store::at(root.path()).unwrap();
+            s.begin_full_sync("me@example.com", "start").unwrap();
+            s.set_sync_paused(true).unwrap();
+            s.record_sync_started("me@example.com").unwrap();
+            s.sync_progress("me@example.com", "importing", 42, Some(100))
+                .unwrap();
+            s.record_status(
+                "me@example.com",
+                &Err(crate::service::OperationCancelled.into()),
+            )
+            .unwrap();
+        }
+        let s = Store::at(root.path()).unwrap();
+        assert!(s.sync_paused().unwrap());
+        s.set_sync_paused(false).unwrap();
+        let status = s.account_status().unwrap();
+        assert_eq!(status[0]["state"], "idle");
+        assert_eq!(status[0]["progress"]["phase"], "paused");
+        assert_eq!(status[0]["progress"]["completed"], 42);
+        s.record_sync_started("me@example.com").unwrap();
+        s.sync_progress("me@example.com", "importing", 43, None)
+            .unwrap();
+        assert_eq!(s.account_status().unwrap()[0]["progress"]["total"], 100);
+        s.record_status(
+            "me@example.com",
+            &Err(anyhow::anyhow!("Temporary provider failure")),
+        )
+        .unwrap();
+        assert_eq!(s.account_status().unwrap()[0]["progress"]["phase"], "error");
+        s.record_sync_started("me@example.com").unwrap();
+        s.sync_progress("me@example.com", "scanning_folders", 0, None)
+            .unwrap();
+        assert!(s.account_status().unwrap()[0]["progress"]["total"].is_null());
+        assert_eq!(s.account_status().unwrap()[0]["cached_count"], 0);
+    }
+
+    #[test]
+    fn retry_replaces_the_old_failure_and_cancellation_clears_syncing() {
+        let mut s = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        s.snapshot("me@example.com", &[], "1").unwrap();
+        s.record_status(
+            "me@example.com",
+            &Err(anyhow::anyhow!("database is locked")),
+        )
+        .unwrap();
+        s.record_sync_started("me@example.com").unwrap();
+        assert_eq!(s.account_status().unwrap()[0]["state"], "syncing");
+        assert_eq!(s.account_status().unwrap()[0]["detail"], "");
+        s.record_status(
+            "me@example.com",
+            &Err(crate::service::OperationCancelled.into()),
+        )
+        .unwrap();
+        assert_eq!(s.account_status().unwrap()[0]["state"], "idle");
+        s.record_sync_started("me@example.com").unwrap();
+        s.record_status("me@example.com", &Ok(())).unwrap();
+        assert_eq!(s.account_status().unwrap()[0]["state"], "connected");
+    }
+
+    #[test]
+    fn opening_a_ready_cache_reads_while_the_daemon_holds_a_writer() {
+        let root = CacheDir::new();
+        let mut writer = Store::at(root.path()).unwrap();
+        let mut m = crate::fixtures::messages().remove(0);
+        m.account = "me@example.com".into();
+        writer.snapshot(&m.account, &[m.clone()], "1").unwrap();
+        let tx = writer
+            .0
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute("INSERT INTO mail_preferences VALUES('pending',1)", [])
+            .unwrap();
+        let path = root.path();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = Store::at(path).and_then(|reader| {
+                let page = reader.mailbox_page("All Inboxes", "", 0)?;
+                Ok((
+                    page["total"].as_u64().unwrap(),
+                    reader.cached_message("me@example.com", "demo-0")?.subject,
+                ))
+            });
+            send.send(result).unwrap();
+        });
+        // Roll back before asserting so a broken implementation can exit its wait.
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        tx.rollback().unwrap();
+        worker.join().unwrap();
+        let (total, subject) = result
+            .expect("Opening the cache tried to acquire a writer lock")
+            .unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(subject, m.subject);
+    }
+
+    #[test]
+    fn sync_and_draft_commits_do_not_wait_for_a_reader_snapshot() {
+        let root = CacheDir::new();
+        let mut writer = Store::at(root.path()).unwrap();
+        writer.begin_full_sync("me@example.com", "1").unwrap();
+        let mut m = crate::fixtures::messages().remove(0);
+        m.account = "me@example.com".into();
+        writer.stage_message(&m.account, &m).unwrap();
+        let reader = Store::at(root.path()).unwrap();
+        reader
+            .0
+            .execute_batch("BEGIN; SELECT count(*) FROM full_sync_messages;")
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                m.id = "new-message".into();
+                writer.stage_message(&m.account, &m)?;
+                let mut draft = crate::drafts::Draft::new(m.account.clone());
+                draft.body = "Locally saved while the mailbox is being read".into();
+                writer.save_local_draft(&draft, Some(&[]))?;
+                writer.finish_full_sync(&m.account)?;
+                Ok(())
+            })();
+            send.send(result).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        reader.0.execute_batch("ROLLBACK").unwrap();
+        worker.join().unwrap();
+        result
+            .expect("Reading cached mail blocked a sync or draft commit")
+            .unwrap();
+        assert_eq!(
+            reader.mailbox_page("All Inboxes", "", 0).unwrap()["total"],
+            2
+        );
+        assert_eq!(reader.list_drafts().unwrap().len(), 1);
+        let journal: String = reader
+            .0
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+    }
+
+    #[test]
+    fn concurrent_mailbox_migrations_preserve_cached_messages() {
+        let root = CacheDir::new();
+        {
+            let mut s = Store::at(root.path()).unwrap();
+            let mut m = crate::fixtures::messages().remove(0);
+            m.account = "me@example.com".into();
+            s.snapshot(&m.account, &[m.clone()], "1").unwrap();
+            s.0.execute_batch(
+                "DELETE FROM mailbox_summaries; DELETE FROM mail_migrations WHERE version=3;",
+            )
+            .unwrap();
+        }
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let ready = ready.clone();
+                let path = root.path();
+                std::thread::spawn(move || {
+                    ready.wait();
+                    let s = Store::at(path)?;
+                    Ok::<_, anyhow::Error>(
+                        s.mailbox_page("All Inboxes", "", 0)?["total"]
+                            .as_u64()
+                            .unwrap(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn mailbox_pages_search_full_bodies_and_load_one_complete_message() {
+        let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        let template = crate::fixtures::messages().remove(0);
+        let messages = (0..215)
+            .map(|i| {
+                let mut m = template.clone();
+                m.id = format!("message-{i:03}");
+                m.account = "first@example.com".into();
+                m.timestamp = i;
+                m.labels = vec!["INBOX".into(), "SENT".into()];
+                m.body = format!("{} hidden-search-{i}", "x".repeat(1000));
+                m
+            })
+            .collect::<Vec<_>>();
+        store.snapshot("first@example.com", &messages, "1").unwrap();
+        let first = store.mailbox_page("All Inboxes", "", 0).unwrap();
+        assert_eq!(first["total"], 215);
+        assert_eq!(first["messages"].as_array().unwrap().len(), 100);
+        assert_eq!(first["messages"][0]["id"], "message-214");
+        assert_eq!(first["messages"][0]["body"].as_str().unwrap().len(), 160);
+        let last = store.mailbox_page("first@example.com", "", 200).unwrap();
+        assert_eq!(last["messages"].as_array().unwrap().len(), 15);
+        let search = store.mailbox_page("Sent", "hidden-search-214", 0).unwrap();
+        assert_eq!(search["total"], 1);
+        assert!(
+            store
+                .cached_message("first@example.com", "message-214")
+                .unwrap()
+                .body
+                .len()
+                > 1000
+        );
+        assert!(store
+            .cached_message("second@example.com", "message-214")
+            .is_err());
+        // Resumable downloads override old rows without duplicates or exposing Trash in Inbox.
+        store.begin_full_sync("first@example.com", "2").unwrap();
+        let mut changed = messages[214].clone();
+        changed.folder = "Trash".into();
+        changed.labels = vec!["TRASH".into(), "INBOX".into()];
+        changed.body = "staged body".into();
+        store.stage_message("first@example.com", &changed).unwrap();
+        assert_eq!(
+            store.mailbox_page("All Inboxes", "", 0).unwrap()["total"],
+            214
+        );
+        assert_eq!(store.mailbox_page("Trash", "", 0).unwrap()["total"], 1);
+        assert_eq!(
+            store
+                .cached_message("first@example.com", "message-214")
+                .unwrap()
+                .body,
+            "staged body"
+        );
+        // Existing caches are indexed once, including partial initial syncs.
+        store
+            .0
+            .execute_batch(
+                "DELETE FROM mailbox_summaries; DELETE FROM mail_migrations WHERE version=3;",
+            )
+            .unwrap();
+        store.migrate_mailbox().unwrap();
+        store.migrate_mailbox().unwrap();
+        assert_eq!(
+            store.mailbox_page("All Inboxes", "", 0).unwrap()["total"],
+            214
+        );
+        assert_eq!(store.mailbox_page("Trash", "", 0).unwrap()["total"], 1);
+    }
+
     #[test]
     fn connection_state_survives_reopen_and_cancellation_preserves_it() {
         let root = std::env::temp_dir().join(format!(
@@ -641,7 +1252,7 @@ mod tests {
     #[test]
     fn attachment_metadata_updates_committed_and_partial_caches() {
         let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
-        let mut message = crate::Mail::default().messages.remove(0);
+        let mut message = crate::fixtures::messages().remove(0);
         message.account = "me@example.com".into();
         store
             .snapshot(&message.account, std::slice::from_ref(&message), "10")
@@ -707,7 +1318,7 @@ mod tests {
         {
             let mut store = Store::at(path.clone()).unwrap();
             store.begin_full_sync("me@example.com", "start").unwrap();
-            let mut message = crate::Mail::default().messages.remove(0);
+            let mut message = crate::fixtures::messages().remove(0);
             message.account = "me@example.com".into();
             store.stage_message("me@example.com", &message).unwrap();
             store.checkpoint_page("me@example.com", "page2").unwrap();
@@ -779,7 +1390,7 @@ mod tests {
     #[test]
     fn snapshot_replaces_only_target_account_and_drafts_roundtrip() {
         let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
-        let mut messages = crate::Mail::default().messages;
+        let mut messages = crate::fixtures::messages();
         messages[0].id = "a".into();
         store
             .snapshot("first@example.com", &messages[..1], "42")
@@ -806,7 +1417,7 @@ mod tests {
     #[test]
     fn failed_snapshot_rolls_back_existing_cache() {
         let mut store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
-        let mut messages = crate::Mail::default().messages;
+        let mut messages = crate::fixtures::messages();
         messages[0].id = "original".into();
         store
             .snapshot("me@example.com", &messages[..1], "10")
@@ -834,7 +1445,7 @@ mod tests {
         ));
         {
             let mut store = Store::at(path.clone()).unwrap();
-            let messages = crate::Mail::default().messages;
+            let messages = crate::fixtures::messages();
             store
                 .snapshot("offline@example.com", &messages[..1], "20")
                 .unwrap();

@@ -40,13 +40,26 @@ fn session(p: &Profile, password: &str) -> Result<Session> {
     validate(p)?;
     let addresses = (p.host.as_str(), p.port).to_socket_addrs()?;
     let mut stream = None;
+    let mut last_error = None;
     for address in addresses {
-        if let Ok(s) = TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
-            stream = Some(s);
-            break;
+        match TcpStream::connect_timeout(&address, Duration::from_secs(10)) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(error) => last_error = Some(error),
         }
     }
-    let stream = stream.context("Cannot connect to incoming mail server")?;
+    let stream = stream
+        .ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "No mail server address",
+                )
+            })
+        })
+        .context("Cannot connect to incoming mail server")?;
     stream.set_read_timeout(Some(Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(Duration::from_secs(20)))?;
     let tls = native_tls::TlsConnector::builder()
@@ -66,7 +79,13 @@ fn session(p: &Profile, password: &str) -> Result<Session> {
     };
     client
         .login(username(p), password)
-        .map_err(|_| crate::service::ReconnectRequired.into())
+        .map_err(|(error, _)| login_error(error))
+}
+fn login_error(error: imap::error::Error) -> anyhow::Error {
+    match error {
+        imap::error::Error::No(_) => crate::service::ReconnectRequired.into(),
+        error => error.into(),
+    }
 }
 fn smtp(p: &Profile, password: &str) -> Result<lettre::SmtpTransport> {
     use lettre::transport::smtp::{
@@ -180,7 +199,7 @@ fn destination(name: &str, attrs: &[NameAttribute<'_>], target: &str) -> bool {
 pub fn sync(p: &Profile, cancel: &AtomicBool) -> Result<()> {
     let password = entry(&p.email)?
         .get_password()
-        .context("Unlock keyring or re-enter the mail password in Settings")?;
+        .map_err(crate::service::credential_error)?;
     let mut session = session(p, &password)?;
     let cached = Store::open()?
         .load()?
@@ -188,9 +207,16 @@ pub fn sync(p: &Profile, cancel: &AtomicBool) -> Result<()> {
         .filter(|m| m.account == p.email)
         .map(|m| (m.id.clone(), m))
         .collect::<std::collections::HashMap<_, _>>();
-    let messages = scan(&mut session, p, cancel, &cached)?;
+    let progress = Store::open()?;
+    progress.sync_progress(&p.email, "scanning_folders", 0, None)?;
+    let since = progress.sync_history(&p.email)?.since(chrono::Utc::now());
+    let messages = scan(&mut session, p, cancel, &cached, since, |n| {
+        progress.sync_progress(&p.email, "downloading", n, None)
+    })?;
+    progress.sync_progress(&p.email, "saving", messages.len(), Some(messages.len()))?;
     cancelled(cancel)?;
     Store::open()?.snapshot(&p.email, &messages, "imap-full-v1")?;
+    progress.prune_sync_history(&p.email)?;
     let _ = session.logout();
     Ok(())
 }
@@ -199,6 +225,8 @@ fn scan<T: std::io::Read + std::io::Write>(
     p: &Profile,
     cancel: &AtomicBool,
     cached: &std::collections::HashMap<String, Message>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    mut progress: impl FnMut(usize) -> Result<()>,
 ) -> Result<Vec<Message>> {
     let names = session.list(Some(""), Some("*"))?;
     let folders = names
@@ -216,45 +244,63 @@ fn scan<T: std::io::Read + std::io::Write>(
         if selected.exists == 0 {
             continue;
         }
-        let fetched = session.uid_fetch("1:*", "(UID FLAGS RFC822.SIZE)")?;
-        let metadata = fetched
-            .iter()
-            .map(|f| (f.uid, f.size, f.flags().to_vec()))
-            .collect::<Vec<_>>();
-        for (uid, size, flags) in metadata {
+        let query = since
+            .map(|d| format!("SINCE {}", d.format("%d-%b-%Y")))
+            .unwrap_or_else(|| "ALL".into());
+        let mut uids = session.uid_search(query)?.into_iter().collect::<Vec<_>>();
+        uids.sort_unstable_by(|a, b| b.cmp(a));
+        // Bound command size on large mailboxes, and import newest mail first.
+        for batch in uids.chunks(200) {
             cancelled(cancel)?;
-            if flags.contains(&Flag::Deleted) {
-                continue;
-            }
-            let uid = uid.context("Server omitted UID")?;
-            let id = encode(&mailbox, validity, uid)?;
-            let mut message = if let Some(m) = cached.get(&id) {
-                m.clone()
-            } else {
-                let large = size.unwrap_or(u32::MAX) > 40 * 1024 * 1024;
-                let query = if large {
-                    "BODY.PEEK[HEADER]"
+            let set = batch
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let fetched = session.uid_fetch(set, "(UID FLAGS RFC822.SIZE INTERNALDATE)")?;
+            let metadata = fetched
+                .iter()
+                .map(|f| {
+                    (
+                        f.uid,
+                        f.size,
+                        f.flags().to_vec(),
+                        f.internal_date().map(|d| d.timestamp_millis()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (uid, _size, flags, received) in metadata {
+                cancelled(cancel)?;
+                if flags.contains(&Flag::Deleted) {
+                    continue;
+                }
+                let uid = uid.context("Server omitted UID")?;
+                let id = encode(&mailbox, validity, uid)?;
+                let mut message = if let Some(m) = cached.get(&id) {
+                    m.clone()
                 } else {
-                    "BODY.PEEK[]"
-                };
-                let fetched = session.uid_fetch(uid.to_string(), query)?;
-                let raw = fetched
-                    .iter()
-                    .next()
-                    .and_then(|f| f.body())
-                    .context("Message vanished during sync; refresh again")?;
-                let mut m = crate::mime::parse(raw, &p.email, &id, &label)?;
-                if large {
-                    m.body = "[Message exceeds the 40 MiB retrieval limit]".into();
+                    // Initial sync fetches headers only; opening the message retrieves
+                    // its MIME content and attachments through the existing lazy path.
+                    let fetched = session.uid_fetch(uid.to_string(), "BODY.PEEK[HEADER]")?;
+                    let raw = fetched
+                        .iter()
+                        .next()
+                        .and_then(|f| f.header())
+                        .context("Message vanished during sync; refresh again")?;
+                    let mut m = crate::mime::parse(raw, &p.email, &id, &label)?;
                     m.attachments_loaded = false;
                     m.html_loaded = false;
+                    m
+                };
+                if let Some(received) = received {
+                    message.timestamp = received;
                 }
-                m
-            };
-            message.folder = label.clone();
-            message.unread = !flags.contains(&Flag::Seen);
-            message.flagged = flags.contains(&Flag::Flagged);
-            messages.push(message);
+                message.folder = label.clone();
+                message.unread = !flags.contains(&Flag::Seen);
+                message.flagged = flags.contains(&Flag::Flagged);
+                messages.push(message);
+                progress(messages.len())?;
+            }
         }
     }
     Ok(messages)
@@ -268,7 +314,7 @@ fn select(session: &mut Session, id: &Identity) -> Result<()> {
     Ok(())
 }
 pub fn load_content(p: &Profile, m: &Message) -> Result<Message> {
-    if m.attachments_loaded && m.html_loaded {
+    if m.attachments_loaded && m.html_loaded && m.html.as_ref().is_none_or(|h| !h.needs_reload()) {
         return Ok(m.clone());
     }
     let password = entry(&p.email)?.get_password()?;
@@ -289,61 +335,88 @@ pub fn load_content(p: &Profile, m: &Message) -> Result<Message> {
         .and_then(|f| f.body())
         .context("Message unavailable")?;
     let mut loaded = crate::mime::parse(bytes, &m.account, &m.id, &m.folder)?;
+    loaded.timestamp = m.timestamp;
     loaded.unread = m.unread;
     loaded.flagged = m.flagged;
     let _ = session.logout();
     Ok(loaded)
 }
+pub struct MutationSession {
+    session: Session,
+}
+impl MutationSession {
+    pub fn open(p: &Profile) -> Result<Self> {
+        let password = entry(&p.email)?.get_password()?;
+        Ok(Self {
+            session: session(p, &password)?,
+        })
+    }
+    pub fn apply(&mut self, m: &Message, action: Action) -> Result<()> {
+        let id = identity(&m.id)?;
+        select(&mut self.session, &id)?;
+        match action {
+            Action::Read(read) => {
+                self.session.uid_store(
+                    id.uid.to_string(),
+                    if read {
+                        "+FLAGS.SILENT (\\Seen)"
+                    } else {
+                        "-FLAGS.SILENT (\\Seen)"
+                    },
+                )?;
+            }
+            Action::Star(star) => {
+                self.session.uid_store(
+                    id.uid.to_string(),
+                    if star {
+                        "+FLAGS.SILENT (\\Flagged)"
+                    } else {
+                        "-FLAGS.SILENT (\\Flagged)"
+                    },
+                )?;
+            }
+            Action::Archive | Action::Trash => {
+                anyhow::ensure!(
+                    self.session.capabilities()?.has_str("MOVE"),
+                    "Server does not support safe UID MOVE"
+                );
+                let names = self.session.list(Some(""), Some("*"))?;
+                let target = if matches!(action, Action::Trash) {
+                    "Trash"
+                } else {
+                    "Archive"
+                };
+                let destination = names
+                    .iter()
+                    .find(|n| {
+                        !n.attributes().contains(&NameAttribute::NoSelect)
+                            && n.name() != id.mailbox
+                            && destination(n.name(), n.attributes(), target)
+                    })
+                    .context("Destination folder not found on mail server")?;
+                self.session
+                    .uid_mv(id.uid.to_string(), destination.name())?;
+            }
+        }
+        Ok(())
+    }
+}
+impl Drop for MutationSession {
+    fn drop(&mut self) {
+        let _ = self.session.logout();
+    }
+}
+pub fn forget_credentials(email: &str) -> Result<()> {
+    match entry(email)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
 pub fn modify(p: &Profile, m: &Message, action: Action, cancel: &AtomicBool) -> Result<String> {
     cancelled(cancel)?;
-    let password = entry(&p.email)?.get_password()?;
-    let mut session = session(p, &password)?;
-    let id = identity(&m.id)?;
-    select(&mut session, &id)?;
-    match action {
-        Action::Read(read) => {
-            session.uid_store(
-                id.uid.to_string(),
-                if read {
-                    "+FLAGS.SILENT (\\Seen)"
-                } else {
-                    "-FLAGS.SILENT (\\Seen)"
-                },
-            )?;
-        }
-        Action::Star(star) => {
-            session.uid_store(
-                id.uid.to_string(),
-                if star {
-                    "+FLAGS.SILENT (\\Flagged)"
-                } else {
-                    "-FLAGS.SILENT (\\Flagged)"
-                },
-            )?;
-        }
-        Action::Archive | Action::Trash => {
-            anyhow::ensure!(
-                session.capabilities()?.has_str("MOVE"),
-                "Server does not support safe UID MOVE"
-            );
-            let names = session.list(Some(""), Some("*"))?;
-            let target = if matches!(action, Action::Trash) {
-                "Trash"
-            } else {
-                "Archive"
-            };
-            let destination = names
-                .iter()
-                .find(|n| {
-                    !n.attributes().contains(&NameAttribute::NoSelect)
-                        && n.name() != id.mailbox
-                        && destination(n.name(), n.attributes(), target)
-                })
-                .context("Destination folder not found on mail server")?;
-            session.uid_mv(id.uid.to_string(), destination.name())?;
-        }
-    }
-    let _ = session.logout();
+    let mut session = MutationSession::open(p)?;
+    session.apply(m, action)?;
+    drop(session);
     match sync(p, cancel) {
         Ok(()) => Ok("Mail updated".into()),
         Err(e) => Ok(format!("Mail updated; refresh needed: {e}")),
@@ -448,6 +521,19 @@ mod tests {
         worker.join().unwrap();
     }
     #[test]
+    fn login_connection_loss_is_retryable_but_rejected_credentials_require_reconnect() {
+        let disconnected = login_error(imap::error::Error::ConnectionLost);
+        assert!(!disconnected.is::<crate::service::ReconnectRequired>());
+        assert!(crate::service::is_network_error(&disconnected));
+        let timeout = login_error(imap::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "test",
+        )));
+        assert!(crate::service::is_network_error(&timeout));
+        let rejected = login_error(imap::error::Error::No("AUTHENTICATIONFAILED".into()));
+        assert!(rejected.is::<crate::service::ReconnectRequired>());
+    }
+    #[test]
     fn smtp_starttls_refusal_never_transmits_authentication() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -499,7 +585,14 @@ mod tests {
                 .unwrap();
             stream.write_all(b"* OK test\r\n").unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
-            for operation in ["LOGIN", "LIST", "EXAMINE", "UID FETCH", "UID FETCH"] {
+            for operation in [
+                "LOGIN",
+                "LIST",
+                "EXAMINE",
+                "UID SEARCH",
+                "UID FETCH",
+                "UID FETCH",
+            ] {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 assert!(line.contains(operation), "{line}");
@@ -507,10 +600,11 @@ mod tests {
                 match operation {
                     "LIST"=>stream.write_all(b"* LIST () \"/\" \"INBOX\"\r\n").unwrap(),
                     "EXAMINE"=>stream.write_all(b"* 3 EXISTS\r\n* OK [UIDVALIDITY 7] valid\r\n").unwrap(),
+                    "UID SEARCH"=>{assert!(line.contains("SINCE 08-Nov-2025"),"{line}");stream.write_all(b"* SEARCH 1 2 3\r\n").unwrap()},
                     "UID FETCH" if line.contains("RFC822.SIZE")=>stream.write_all(b"* 1 FETCH (UID 1 FLAGS (\\Seen \\Flagged) RFC822.SIZE 80)\r\n* 2 FETCH (UID 2 FLAGS () RFC822.SIZE 80)\r\n* 3 FETCH (UID 3 FLAGS (\\Deleted) RFC822.SIZE 80)\r\n").unwrap(),
                     "UID FETCH"=>{
-                        assert!(line.contains("UID FETCH 2 BODY.PEEK[]"),"{line}");
-                        write!(stream,"* 2 FETCH (UID 2 BODY[] {{{}}}\r\n{})\r\n",raw.len(),raw).unwrap();
+                        assert!(line.contains("UID FETCH 2 BODY.PEEK[HEADER]"),"{line}");
+                        write!(stream,"* 2 FETCH (UID 2 BODY[HEADER] {{{}}}\r\n{})\r\n",raw.len(),raw).unwrap();
                     },_=>{}
                 }
                 write!(stream, "{tag} OK completed\r\n").unwrap();
@@ -527,12 +621,26 @@ mod tests {
         let old =
             crate::mime::parse(b"Subject: Old\r\n\r\nCached", &p.email, &id, "Inbox").unwrap();
         let cached = std::collections::HashMap::from([(id, old)]);
-        let messages = scan(&mut session, &p, &AtomicBool::new(false), &cached).unwrap();
+        let messages = scan(
+            &mut session,
+            &p,
+            &AtomicBool::new(false),
+            &cached,
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2025-11-08T00:00:00Z")
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            ),
+            |_| Ok(()),
+        )
+        .unwrap();
         assert_eq!(messages.len(), 2);
         assert!(!messages[0].unread);
         assert!(messages[0].flagged);
         assert_eq!(messages[0].body, "Cached");
         assert!(messages[1].unread);
+        assert!(!messages[1].attachments_loaded);
+        assert!(!messages[1].html_loaded);
         assert_eq!(messages[1].subject, "New mail");
         assert!(expected.contains(&messages[1].body));
         worker.join().unwrap();

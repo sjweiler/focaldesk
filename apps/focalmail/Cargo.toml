@@ -3,8 +3,16 @@ name = "focalmail"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["desktop", "custom-protocol"]
+custom-protocol = ["tauri?/custom-protocol"]
+desktop = ["dep:tauri", "dep:tauri-build"]
+
+[build-dependencies]
+tauri-build = { version = "2", optional = true }
+
 [dependencies]
-eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+tauri = { version = "2", optional = true }
 anyhow = "1"
 base64 = "0.22"
 chrono = "0.4"

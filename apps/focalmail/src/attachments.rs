@@ -1,7 +1,9 @@
-use anyhow::{ensure, Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::{
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -31,8 +33,10 @@ pub fn filename(name: &str) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn import(path: &Path, remaining: usize) -> Result<DraftAttachment> {
     ensure!(std::fs::metadata(path)?.is_file(), "Choose a regular file");
+    use std::io::Read;
     let file = std::fs::File::open(path).context("Cannot open attachment")?;
     ensure!(file.metadata()?.is_file(), "Choose a regular file");
     let mut data = Vec::new();
@@ -86,85 +90,6 @@ pub fn save_download(directory: &Path, name: &str, data: &[u8]) -> Result<PathBu
         }
     }
     anyhow::bail!("Too many files with that name in Downloads")
-}
-
-#[derive(Default)]
-pub struct Picker {
-    pub open: bool,
-    directory: String,
-    entries: Vec<PathBuf>,
-    notice: String,
-}
-impl Picker {
-    pub fn start(&mut self) {
-        self.open = true;
-        self.directory = dirs::home_dir().unwrap_or_default().display().to_string();
-        self.refresh();
-    }
-    fn refresh(&mut self) {
-        match std::fs::read_dir(&self.directory) {
-            Ok(entries) => {
-                self.entries = entries
-                    .filter_map(|e| e.ok().map(|e| e.path()))
-                    .take(1000)
-                    .collect();
-                self.entries.sort();
-                self.notice = "Showing up to 1,000 entries. Select a file to attach.".into();
-            }
-            Err(error) => {
-                self.entries.clear();
-                self.notice = error.to_string();
-            }
-        }
-    }
-    pub fn show(&mut self, ctx: &eframe::egui::Context) -> Option<PathBuf> {
-        let mut chosen = None;
-        let mut open = self.open;
-        eframe::egui::Window::new("Choose attachment")
-            .open(&mut open)
-            .default_width(550.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.directory);
-                    if ui.button("Go").clicked() {
-                        self.refresh();
-                    }
-                    if ui.button("Up").clicked() {
-                        if let Some(parent) = Path::new(&self.directory).parent() {
-                            self.directory = parent.display().to_string();
-                            self.refresh();
-                        }
-                    }
-                });
-                ui.weak(&self.notice);
-                let mut enter = None;
-                eframe::egui::ScrollArea::vertical()
-                    .max_height(350.0)
-                    .show(ui, |ui| {
-                        for path in &self.entries {
-                            let directory = path.is_dir();
-                            let label = format!(
-                                "{} {}",
-                                if directory { "▸" } else { "+" },
-                                path.file_name().unwrap_or_default().to_string_lossy()
-                            );
-                            if ui.button(label).clicked() {
-                                if directory {
-                                    enter = Some(path.clone());
-                                } else {
-                                    chosen = Some(path.clone());
-                                }
-                            }
-                        }
-                    });
-                if let Some(path) = enter {
-                    self.directory = path.display().to_string();
-                    self.refresh();
-                }
-            });
-        self.open = open && chosen.is_none();
-        chosen
-    }
 }
 
 #[cfg(test)]

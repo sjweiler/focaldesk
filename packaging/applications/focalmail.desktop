@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=FocalMail
+Name=FocalDesk Mail
 Comment=Read and send email with FocalDesk
 Exec=sh -c "exec ~/.local/bin/focalmail"
 Icon=mail-client

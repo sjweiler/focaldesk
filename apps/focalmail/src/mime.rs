@@ -21,11 +21,15 @@ pub fn parse(raw: &[u8], account: &str, id: &str, folder: &str) -> Result<Messag
     let mut html = Vec::new();
     let mut attachments = Vec::new();
     parts(&mail, &mut plain, &mut html, &mut attachments, 0)?;
-    let html = if html.is_empty() {
+    let mut html = if html.is_empty() {
         None
     } else {
         Some(crate::html::parse(&html.join("\n")))
     };
+    if let Some(doc) = &mut html {
+        inline_images(&mail, doc, 0)?;
+        doc.inline_attempted = true;
+    }
     let body = if plain.is_empty() {
         html.as_ref().map(|h| h.plain_text()).unwrap_or_default()
     } else {
@@ -58,6 +62,26 @@ pub fn parse(raw: &[u8], account: &str, id: &str, folder: &str) -> Result<Messag
         recipients_loaded: true,
     })
 }
+fn inline_images(
+    mail: &mailparse::ParsedMail<'_>,
+    doc: &mut crate::html::Document,
+    depth: usize,
+) -> Result<()> {
+    if depth > 32 {
+        return Ok(());
+    }
+    if crate::html_layout::raster_type(&mail.ctype.mimetype) {
+        if let Some(cid) = mail.headers.get_first_value("Content-ID") {
+            let bytes = mail.get_body_raw()?;
+            crate::html_layout::attach_inline(doc, &cid, &mail.ctype.mimetype, &bytes);
+        }
+    }
+    for child in &mail.subparts {
+        inline_images(child, doc, depth + 1)?;
+    }
+    Ok(())
+}
+
 fn parts(
     mail: &mailparse::ParsedMail<'_>,
     plain: &mut Vec<String>,
@@ -105,6 +129,21 @@ fn parts(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cid_images_are_attached_to_the_sanitized_layout_without_a_remote_request() {
+        let raw=b"MIME-Version: 1.0\r\nContent-Type: multipart/related; boundary=related\r\n\r\n--related\r\nContent-Type: text/html\r\n\r\n<table><tr><td><img src=\"cid:logo\" alt=\"Logo\"></td></tr></table>\r\n--related\r\nContent-Type: image/gif\r\nContent-ID: <logo>\r\nContent-Transfer-Encoding: base64\r\n\r\nR0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7\r\n--related--\r\n";
+        let message = parse(raw, "me@example.com", "cid-test", "Inbox").unwrap();
+        let doc = message.html.unwrap();
+        assert!(doc.layout.as_ref().unwrap().contains("<table"));
+        assert_eq!(doc.images.len(), 1);
+        assert!(doc.images[0]
+            .inline_data
+            .as_ref()
+            .unwrap()
+            .starts_with("data:image/gif;base64,"));
+        assert!(!doc.needs_reload());
+    }
+
     #[test]
     fn multipart_decodes_reply_headers_safe_html_and_binary_attachments() {
         let raw = b"From: Alice <alice@example.com>\r\nTo: me@example.com\r\nCc: other@example.com\r\nReply-To: reply@example.com\r\nMessage-ID: <original@example.com>\r\nReferences: <older@example.com>\r\nSubject: =?UTF-8?B?SGVsbG8=?=\r\nDate: Thu, 05 Nov 2026 12:00:00 +0000\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=test\r\n\r\n--test\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>Hello <b>there</b></p><script>danger()</script><img src=\"https://tracker.invalid/pixel\">\r\n--test\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=report.bin\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC/w==\r\n--test--\r\n";

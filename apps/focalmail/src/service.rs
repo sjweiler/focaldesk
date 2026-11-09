@@ -37,6 +37,44 @@ impl std::fmt::Display for ReconnectRequired {
 }
 impl std::error::Error for ReconnectRequired {}
 
+pub fn credential_error(error: keyring::Error) -> anyhow::Error {
+    match error {
+        keyring::Error::NoEntry => ReconnectRequired.into(),
+        error => anyhow::Error::new(error).context("Unlock the desktop keyring and retry"),
+    }
+}
+pub fn is_network_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(|e| e.is_connect() || e.is_timeout())
+            || cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(network_io_error)
+            || cause
+                .downcast_ref::<imap::error::Error>()
+                .is_some_and(|e| match e {
+                    imap::error::Error::ConnectionLost => true,
+                    imap::error::Error::Io(error) => network_io_error(error),
+                    _ => false,
+                })
+    })
+}
+
+fn network_io_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::AddrNotAvailable
+    )
+}
+
 #[derive(Debug)]
 pub struct OperationCancelled;
 impl std::fmt::Display for OperationCancelled {
@@ -64,6 +102,11 @@ pub enum Request {
         id: String,
     },
     Sync {},
+    PauseSync {},
+    SetSyncHistory {
+        account: String,
+        history: crate::settings::SyncHistory,
+    },
     Connect {
         path: String,
     },
@@ -73,6 +116,13 @@ pub enum Request {
     },
     Reconnect {
         email: String,
+    },
+    BulkModify {
+        targets: Vec<crate::bulk::Target>,
+        action: backend::Action,
+    },
+    RemoveAccount {
+        account: String,
     },
     Modify {
         account: String,
@@ -116,7 +166,7 @@ enum Response {
 struct State {
     active: Mutex<Option<(String, Arc<AtomicBool>)>>,
     operation: Mutex<()>,
-    next_sync: Mutex<Instant>,
+    sync_schedule: Mutex<crate::sync_recovery::Schedule>,
     revision: Mutex<u64>,
     changed: Condvar,
     instance: String,
@@ -126,7 +176,7 @@ impl Default for State {
         Self {
             active: Mutex::new(None),
             operation: Mutex::new(()),
-            next_sync: Mutex::new(Instant::now() + Duration::from_secs(5)),
+            sync_schedule: Mutex::new(crate::sync_recovery::Schedule::new(Instant::now())),
             revision: Mutex::new(0),
             changed: Condvar::new(),
             instance: format!("{:032x}", rand::random::<u128>()),
@@ -135,6 +185,25 @@ impl Default for State {
 }
 
 impl State {
+    fn recovery_event(&self, event: crate::sync_recovery::Event) {
+        use crate::sync_recovery::Event;
+        let mut schedule = self.sync_schedule.lock().unwrap();
+        match event {
+            Event::Sleep(sleeping) => schedule.sleep(sleeping, Instant::now()),
+            Event::NetworkRestored => schedule.request(Instant::now(), Duration::from_secs(2)),
+            Event::NetworkLost => {}
+        }
+        // Cancel only background reads, never an interactive send or mutation.
+        if matches!(event, Event::Sleep(_) | Event::NetworkLost) {
+            if let Some((id, cancel)) = self.active.lock().unwrap().as_ref() {
+                if id == "background-sync" {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+        drop(schedule);
+        self.notify_change();
+    }
     fn notify_change(&self) {
         *self.revision.lock().unwrap() += 1;
         self.changed.notify_all();
@@ -166,15 +235,38 @@ fn write_frame(stream: &mut UnixStream, value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 fn cached(account: &str, id: &str) -> Result<Message> {
-    Store::open()?
-        .load()?
-        .into_iter()
-        .find(|m| m.account == account && m.id == id)
-        .context("Message is not in the local mail cache")
+    Store::open()?.cached_message(account, id)
+}
+fn remote_cached(account: &str, id: &str) -> Result<Message> {
+    let s = Store::open()?;
+    anyhow::ensure!(
+        s.accounts()?.iter().any(|a| a == account),
+        "Account is no longer connected"
+    );
+    anyhow::ensure!(
+        !s.move_pending(account, id)?,
+        "This IMAP move is awaiting folder refresh; sync before another remote action"
+    );
+    s.cached_message(account, id)
 }
 fn execute(request: Request, cancel: Arc<AtomicBool>, progress: impl Fn(&str)) -> Result<Value> {
     let text = match request {
-        Request::Sync {} => backend::sync_all(cancel)?,
+        Request::BulkModify { targets, action } => {
+            return Ok(serde_json::to_value(crate::bulk::modify(
+                targets, action, cancel, progress,
+            )?)?)
+        }
+        Request::RemoveAccount { account } => crate::bulk::remove_account(&account)?,
+        Request::SetSyncHistory { account, history } => {
+            let mut store = Store::open()?;
+            store.set_sync_history(&account, history)?;
+            store.set_sync_paused(false)?;
+            "Sync history saved; mail on the server is unchanged".into()
+        }
+        Request::Sync {} => {
+            Store::open()?.set_sync_paused(false)?;
+            backend::sync_all(cancel)?
+        }
         Request::Connect { path } => backend::connect(&path, cancel, progress)?,
         Request::ConnectProfile { profile, password } => {
             backend::connect_profile(&profile, &password, cancel, progress)?
@@ -184,7 +276,7 @@ fn execute(request: Request, cancel: Arc<AtomicBool>, progress: impl Fn(&str)) -
             account,
             id,
             action,
-        } => backend::modify(&cached(&account, &id)?, action, cancel)?,
+        } => backend::modify(&remote_cached(&account, &id)?, action, cancel)?,
         Request::Send { draft, files } => backend::send(&draft, &files, cancel)?,
         Request::Content { account, id } => {
             return Ok(serde_json::to_value(backend::load_content(&cached(
@@ -196,7 +288,7 @@ fn execute(request: Request, cancel: Arc<AtomicBool>, progress: impl Fn(&str)) -
             id,
             attachment,
         } => {
-            let message = cached(&account, &id)?;
+            let message = remote_cached(&account, &id)?;
             let attachment = message
                 .attachments
                 .iter()
@@ -209,7 +301,7 @@ fn execute(request: Request, cancel: Arc<AtomicBool>, progress: impl Fn(&str)) -
             selected,
             remaining,
         } => {
-            let message = cached(&source.account, &source.message_id)?;
+            let message = remote_cached(&source.account, &source.message_id)?;
             let source = ForwardSource {
                 attachments: message.attachments,
                 ..source
@@ -239,8 +331,21 @@ fn handle(mut stream: UnixStream, state: Arc<State>) -> Result<()> {
         },
     )
 }
+fn pause_background(state: &State, store: &Store) -> Result<Value> {
+    store.set_sync_paused(true)?;
+    if let Some((operation, cancel)) = state.active.lock().unwrap().as_ref() {
+        if operation == "background-sync" {
+            cancel.store(true, Ordering::Relaxed);
+        }
+    }
+    state.notify_change();
+    Ok(json!(
+        "Background sync paused; cached mail remains available"
+    ))
+}
 fn dispatch(envelope: Envelope, stream: &mut UnixStream, state: &State) -> Result<Value> {
     match envelope.request {
+        Request::PauseSync {} => pause_background(state, &Store::open()?),
         Request::Status {} => Ok(
             json!({"version":1,"instance":state.instance,"revision":*state.revision.lock().unwrap(),"accounts":Store::open()?.account_status()?,"active_operation":state.active.lock().unwrap().as_ref().map(|(id,_)| id.clone())}),
         ),
@@ -249,19 +354,7 @@ fn dispatch(envelope: Envelope, stream: &mut UnixStream, state: &State) -> Resul
             account,
             limit,
         } => {
-            let query = query.to_lowercase();
-            let messages: Vec<_> = Store::open()?
-                .load()?
-                .into_iter()
-                .filter(|m| {
-                    account.as_ref().is_none_or(|account| account == &m.account)
-                        && format!("{} {} {} {}", m.subject, m.sender, m.email, m.body)
-                            .to_lowercase()
-                            .contains(&query)
-                })
-                .take(limit.min(100))
-                .map(|m| json!({"account":m.account,"id":m.id,"sender":m.sender,"email":m.email,"subject":m.subject,"date":m.date,"unread":m.unread,"snippet":m.body.chars().take(300).collect::<String>()}))
-                .collect();
+            let messages=Store::open()?.indexed_search(&query,account.as_deref(),limit)?.into_iter().map(|m|json!({"account":m.account,"id":m.id,"sender":m.sender,"email":m.email,"subject":m.subject,"date":m.date,"unread":m.unread,"snippet":m.body})).collect::<Vec<_>>();
             Ok(serde_json::to_value(messages)?)
         }
         Request::Changes {
@@ -333,7 +426,16 @@ fn dispatch(envelope: Envelope, stream: &mut UnixStream, state: &State) -> Resul
                 Request::Forward { source, .. } => Some(source.account.clone()),
                 _ => None,
             };
-            let sent = matches!(request, Request::Send { .. });
+            let follow_up = matches!(
+                request,
+                Request::Send { .. }
+                    | Request::BulkModify { .. }
+                    | Request::RemoveAccount { .. }
+                    | Request::SetSyncHistory { .. }
+                    | Request::Connect { .. }
+                    | Request::ConnectProfile { .. }
+                    | Request::Reconnect { .. }
+            );
             let result = execute(request, cancel, |detail| {
                 let _ = write_frame(
                     &mut output.lock().unwrap(),
@@ -348,8 +450,12 @@ fn dispatch(envelope: Envelope, stream: &mut UnixStream, state: &State) -> Resul
                         .and_then(|s| s.record_status(&account, &Err(ReconnectRequired.into())));
                 }
             }
-            if sent && result.is_ok() {
-                *state.next_sync.lock().unwrap() = Instant::now();
+            if follow_up && result.is_ok() {
+                state
+                    .sync_schedule
+                    .lock()
+                    .unwrap()
+                    .request(Instant::now(), Duration::ZERO);
             }
             *state.active.lock().unwrap() = None;
             state.notify_change();
@@ -370,30 +476,62 @@ pub fn run() -> Result<()> {
         .open(directory.join("service.lock"))?;
     lock.try_lock()
         .context("A mail service is already running")?;
+    Store::open()?.recover_interrupted_sync()?;
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
     let listener = UnixListener::bind(&path)?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     let state = Arc::new(State::default());
+    let recovery = state.clone();
+    crate::sync_recovery::watch_events(move |event| recovery.recovery_event(event));
+    std::thread::spawn(|| loop {
+        match Store::open().and_then(|mut s| s.index_search_batch()) {
+            Ok(0) => std::thread::sleep(Duration::from_secs(2)),
+            Ok(_) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => std::thread::sleep(Duration::from_secs(2)),
+        }
+    });
     let background = state.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(1));
-        if Instant::now() < *background.next_sync.lock().unwrap() {
+        if background
+            .sync_schedule
+            .lock()
+            .unwrap()
+            .due(Instant::now())
+            .is_none()
+        {
             continue;
         }
         if let Ok(_guard) = background.operation.try_lock() {
-            let cancel = Arc::new(AtomicBool::new(false));
-            *background.active.lock().unwrap() = Some(("background-sync".into(), cancel.clone()));
-            background.notify_change();
-            if Store::open()
-                .and_then(|s| s.accounts())
-                .is_ok_and(|a| !a.is_empty())
-            {
-                let _ = backend::sync_all(cancel);
+            // Cache/read failures must not accidentally clear a user's pause preference.
+            if Store::open().and_then(|s| s.sync_paused()).unwrap_or(true) {
+                continue;
             }
-            *background.next_sync.lock().unwrap() = Instant::now() + Duration::from_secs(300);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let generation = {
+                let schedule = background.sync_schedule.lock().unwrap();
+                let Some(generation) = schedule.due(Instant::now()) else {
+                    continue;
+                };
+                *background.active.lock().unwrap() =
+                    Some(("background-sync".into(), cancel.clone()));
+                generation
+            };
+            background.notify_change();
+            let result = backend::sync_background(cancel);
+            let cancelled = result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.is::<OperationCancelled>());
             *background.active.lock().unwrap() = None;
+            background.sync_schedule.lock().unwrap().complete(
+                generation,
+                Instant::now(),
+                result.is_err(),
+                cancelled,
+            );
             background.notify_change();
         }
     });
@@ -416,6 +554,9 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+pub fn available() -> bool {
+    socket_path().is_ok_and(|path| UnixStream::connect(path).is_ok())
+}
 pub fn ensure_running() -> Result<()> {
     if UnixStream::connect(socket_path()?).is_ok() {
         return Ok(());
@@ -545,8 +686,37 @@ pub mod client {
             progress,
         )
     }
+    pub fn pause_background() -> Result<String> {
+        Ok(serde_json::from_value(call(
+            Request::PauseSync {},
+            None,
+            |_| {},
+        )?)?)
+    }
     pub fn sync_all(cancel: Arc<AtomicBool>) -> Result<String> {
         text(Request::Sync {}, cancel, |_| {})
+    }
+    pub fn bulk_modify(
+        targets: Vec<crate::bulk::Target>,
+        action: Action,
+        cancel: Arc<AtomicBool>,
+        progress: impl Fn(&str),
+    ) -> Result<crate::bulk::Outcome> {
+        Ok(serde_json::from_value(call(
+            Request::BulkModify { targets, action },
+            Some(cancel),
+            progress,
+        )?)?)
+    }
+    pub fn set_sync_history(
+        account: String,
+        history: crate::settings::SyncHistory,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String> {
+        text(Request::SetSyncHistory { account, history }, cancel, |_| {})
+    }
+    pub fn remove_account(account: String, cancel: Arc<AtomicBool>) -> Result<String> {
+        text(Request::RemoveAccount { account }, cancel, |_| {})
     }
     pub fn modify(message: &Message, action: Action, cancel: Arc<AtomicBool>) -> Result<String> {
         text(
@@ -614,6 +784,59 @@ pub mod client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_events_cancel_only_background_reads_and_keep_manual_pause() {
+        let store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        store.set_sync_paused(true).unwrap();
+        let state = State::default();
+        let interactive = Arc::new(AtomicBool::new(false));
+        *state.active.lock().unwrap() = Some(("interactive-send".into(), interactive.clone()));
+        state.recovery_event(crate::sync_recovery::Event::Sleep(true));
+        state.recovery_event(crate::sync_recovery::Event::Sleep(false));
+        state.recovery_event(crate::sync_recovery::Event::NetworkRestored);
+        assert!(!interactive.load(Ordering::Relaxed));
+        assert!(store.sync_paused().unwrap());
+        let background = Arc::new(AtomicBool::new(false));
+        *state.active.lock().unwrap() = Some(("background-sync".into(), background.clone()));
+        state.recovery_event(crate::sync_recovery::Event::NetworkLost);
+        assert!(background.load(Ordering::Relaxed));
+        assert!(state
+            .sync_schedule
+            .lock()
+            .unwrap()
+            .due(Instant::now() + Duration::from_secs(3))
+            .is_some());
+    }
+    #[test]
+    fn missing_credentials_require_sign_in_and_wrapped_network_errors_stay_offline() {
+        assert!(credential_error(keyring::Error::NoEntry).is::<ReconnectRequired>());
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "test",
+        ))
+        .context("IMAP login interrupted");
+        assert!(is_network_error(&error));
+        assert!(!is_network_error(&ReconnectRequired.into()));
+        assert!(!is_network_error(&anyhow::anyhow!(
+            "Invalid server configuration"
+        )));
+    }
+    #[test]
+    fn pausing_background_sync_never_cancels_an_interactive_operation() {
+        let store = Store::init(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let state = State::default();
+        let interactive = Arc::new(AtomicBool::new(false));
+        *state.active.lock().unwrap() = Some(("interactive-send".into(), interactive.clone()));
+        pause_background(&state, &store).unwrap();
+        assert!(store.sync_paused().unwrap());
+        assert!(!interactive.load(Ordering::Relaxed));
+        store.set_sync_paused(false).unwrap();
+        let background = Arc::new(AtomicBool::new(false));
+        *state.active.lock().unwrap() = Some(("background-sync".into(), background.clone()));
+        pause_background(&state, &store).unwrap();
+        assert!(background.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn interactive_request_cancels_background_sync_before_running() {
         let state = Arc::new(State::default());
