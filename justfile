@@ -46,6 +46,17 @@ architecture-check:
     python3 scripts/check-crate-boundaries.py
     cargo check -p focaldesk-input --no-default-features
 
+# Source-derived dependency UML plus reviewed runtime/type diagrams.
+uml-generate:
+    python3 scripts/generate-uml.py
+
+uml-check:
+    python3 scripts/generate-uml.py --self-test
+    python3 scripts/generate-uml.py --check
+
+uml-render:
+    python3 scripts/generate-uml.py --render
+
 verify-install scope="all":
     bash scripts/verify-installation.sh "{{ scope }}"
 
@@ -333,6 +344,11 @@ install-settings:
 install-ai-console:
     cargo build --release -p focaldesk-ai-console
     sudo install -Dm755 target/release/focaldesk-ai-console /usr/local/bin/focaldesk-ai-console
+
+install-calendar:
+    cargo build --release -p focaldesk-calendar-app
+    sudo install -Dm755 target/release/focaldesk-calendar /usr/local/bin/focaldesk-calendar
+    sudo install -Dm644 packaging/applications/focaldesk-calendar.desktop /usr/local/share/applications/focaldesk-calendar.desktop
 
 # Install the same FocalDesk workflow skill for common agent harnesses.
 install-agent-skill:
@@ -727,3 +743,11 @@ install-focalmail-service:
     systemctl --user daemon-reload
     systemctl --user enable --now focalmaild.service
     systemctl --user restart focalmaild.service
+
+# Visual automation editor (Svelte Flow + Tauri).
+install-automation-studio:
+    npm ci --prefix apps/focaldesk-automation-studio/frontend
+    cargo build --release -p focaldesk-automation-studio -p focaldesk-automation
+    install -Dm755 target/release/focaldesk-automation-studio "$HOME/.local/bin/focaldesk-automation-studio"
+    install -Dm644 packaging/applications/focaldesk-automation-studio.desktop "$HOME/.local/share/applications/focaldesk-automation-studio.desktop"
+    install -Dm644 apps/focaldesk-automation-studio/icons/automation-studio.svg "$HOME/.local/share/icons/hicolor/scalable/apps/focaldesk-automation-studio.svg"

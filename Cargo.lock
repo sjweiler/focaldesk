@@ -3148,6 +3148,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "focaldesk-automation-studio"
+version = "0.1.0"
+dependencies = [
+ "focaldesk-automation",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+]
+
+[[package]]
 name = "focaldesk-bluetooth"
 version = "0.1.0"
 dependencies = [
@@ -3177,6 +3187,17 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
+]
+
+[[package]]
+name = "focaldesk-calendar-app"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "focaldesk-ai",
+ "focaldesk-ipc",
+ "gtk4",
+ "libc",
 ]
 
 [[package]]

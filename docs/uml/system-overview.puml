@@ -1,0 +1,44 @@
+@startuml
+!include style.puml
+title FocalDesk runtime overview (selected processes and boundaries)
+left to right direction
+package "Applications" {
+  component "Wayland clients\nGTK shell / applications" as clients
+  component "X11 / Wine game" as game
+  component "XWayland" as xwayland
+  component "Settings / CLI" as settings
+}
+node "focaldesk-desktop process" {
+  component "focaldesk-engine\nDesktopState / output coordination" as engine
+  component "Raw Ash Vulkan\nfocaldesk-render" as ash
+  component "Smithay GLES\nrecovery renderer" as gles
+  component "Smithay KMS + GBM\nlibseat / libinput" as backend
+}
+package "Separate services (selected)" {
+  component "focal-launchd" as launcher
+  component "focaldesk-server\nAI workflows" as ai
+  component "focalmail daemon\nshared mail service" as mail
+  component "focaldesk-mcp\nmail tools + desktop tools" as mcp
+}
+node "Linux kernel / GPU" {
+  component "DRM/KMS" as kms
+}
+clients --> engine : Wayland surfaces / input
+game --> xwayland : X11
+xwayland --> engine : Wayland surfaces
+settings --> engine : typed desktop IPC\nUnix socket
+engine --> ash : selected Vulkan path
+engine --> gles : selected GLES path
+ash --> backend : rendered GBM buffer + fence
+gles --> backend : rendered GBM buffer + sync point
+backend --> kms : atomic presentation
+engine --> launcher : launch requests
+mcp --> engine : desktop IPC
+mcp --> mail : mail service IPC
+ai --> engine : authorized desktop requests
+note bottom of engine
+  Curated runtime view; arrows name interactions, not crate dependencies.
+  Vulkan and GLES are alternative production DRM paths.
+  Nested backends and many supporting services are omitted.
+end note
+@enduml

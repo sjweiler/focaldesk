@@ -1,0 +1,67 @@
+@startuml
+!include style.puml
+title Raw Vulkan rendering types (selected fields and methods)
+hide empty members
+class VulkanDrmData {
+  renderer: AshDrmRenderer
+  outputs: Vec<VulkanOutput>
+  scene_builder: VulkanSceneBuilder
+}
+class VulkanOutput {
+  scanout: VulkanScanout
+  frame_pending: bool
+  present_started_at: Option<Instant>
+}
+class AshDrmRenderer {
+  targets: HashMap<TargetKey, ImportedTarget>
+  linear_scenes: HashMap<u64, LinearScene>
+  pending: Vec<PendingFrame>
+  render(...): Result<AshDrmSubmission>
+  poll(): Result<()>
+}
+class ImportedTarget {
+  image: ImageResource
+  last_frame: u64
+}
+class LinearScene {
+  resource: TextureResource
+  initialized: bool
+}
+class PendingFrame {
+  fence: vk::Fence
+  retired_textures: Vec<TextureResource>
+  _retentions: Vec<FrameRetention>
+}
+class FrameRetention {
+  _resource: Arc<dyn Any + Send + Sync>
+}
+class AshDrmSubmission {
+  fence_fd: OwnedFd
+}
+class KmsFence {
+  0: OwnedFd
+  wait_timeout(timeout): io::Result<bool>
+}
+interface "Smithay Fence" as Fence {
+  is_signaled(): bool
+  wait(): Result<(), Interrupted>
+  export(): Option<OwnedFd>
+}
+VulkanDrmData "1" *-- "1" AshDrmRenderer
+VulkanDrmData "1" *-- "0..*" VulkanOutput
+AshDrmRenderer "1" *-- "0..*" ImportedTarget
+AshDrmRenderer "1" *-- "0..*" LinearScene
+AshDrmRenderer "1" *-- "0..*" PendingFrame
+PendingFrame "1" --> "0..*" FrameRetention : shared retention handles
+AshDrmRenderer ..> AshDrmSubmission : returns
+KmsFence ..|> Fence
+KmsFence ..> AshDrmSubmission : wraps returned fence_fd
+note bottom of FrameRetention
+  Cloned Arc handles retain client buffers across GPU work.
+  This is shared lifetime management, not unique buffer ownership.
+end note
+note bottom of VulkanOutput
+  VulkanScanout is a GbmBufferedSurface type alias.
+  Fields/methods are abbreviated; this is a curated type view.
+end note
+@enduml

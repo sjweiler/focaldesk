@@ -126,6 +126,7 @@ pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-desktop",
         "focaldesk-cli",
         "focaldesk-ai-console",
+        "focaldesk-calendar",
         "focaldesk-companion-dashboard",
         "focald-connectors",
     ],
@@ -141,6 +142,7 @@ pub const CONNECTOR_HOST_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focaldesk-cli",
         "focaldesk-ai-console",
         "focaldesk-settings",
+        "focaldesk-calendar",
     ],
     allowed_units: &[],
 };
@@ -479,6 +481,24 @@ fn systemd_unit_from_cgroup(contents: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_can_access_ai_and_connector_endpoints() {
+        let identity = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/usr/local/bin/focaldesk-calendar"),
+            unit: None,
+            executable_trusted: true,
+        };
+        assert!(policy_allows(&identity, AI_POLICY));
+        assert!(policy_allows(&identity, CONNECTOR_HOST_POLICY));
+        let untrusted = PeerIdentity {
+            executable_trusted: false,
+            ..identity
+        };
+        assert!(!policy_allows(&untrusted, AI_POLICY));
+    }
 
     #[test]
     fn desktop_policy_allows_trusted_shell_clients() {

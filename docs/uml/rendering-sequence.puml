@@ -1,0 +1,61 @@
+@startuml
+!include style.puml
+title Raw Vulkan DRM: client commit to scanout and resource retirement
+autonumber
+participant "Wayland / XWayland\nclient" as client
+participant "Wayland hooks /\nDesktopState" as state
+participant "Raw Vulkan\nDRM loop" as loop
+participant "VulkanSceneBuilder" as builder
+participant "AshDrmRenderer" as renderer
+participant "Smithay\nGbmBufferedSurface" as scanout
+participant "GPU queue" as gpu
+participant "DRM/KMS" as kms
+client -> state : wl_surface.commit
+opt acquire point or DMA-BUF readiness requires waiting
+  state -> state : install pre-commit blocker\nclear it when readiness is reported
+end
+state -> state : on_commit_buffer_handler()\nhandle_commit(): record surface/output damage
+loop -> renderer : poll(): retire completed submissions
+renderer -> gpu : query Vulkan completion fences
+opt completed submission
+  renderer -> renderer : release retained client buffers\nand retired GPU resources
+end
+alt previous page flip still pending on this output
+  loop -> loop : skip this output; keep pending damage
+else output has damage and is available
+  loop -> builder : build_for_output_with_cursor_policy()
+  builder --> loop : surface quads, damage, buffer retentions
+  loop -> loop : expand_dmabuf_damage()\ntransform_scene()
+  loop -> scanout : next_buffer()
+  scanout --> loop : acquired GBM DMA-BUF
+  loop -> renderer : render(target, scene, damage, output stream)
+  renderer -> renderer : repair target damage history\nrecord scene + output passes
+  note over renderer
+    Drawing, render areas, and scissors share top-left coordinates.
+    Naga's extra vertex Y flip is disabled.
+  end note
+  renderer -> gpu : queue_submit(): wait producer fences\nsignal completion semaphore + Vulkan fence
+  renderer -> renderer : retain buffers until GPU completion\npublish implicit DMA-BUF read fences
+  renderer --> loop : AshDrmSubmission { fence_fd }
+  alt NVIDIA explicit KMS fences disabled
+    loop -> gpu : bounded wait on sync-file completion
+    gpu --> loop : completed, timeout, or failure
+    note over loop : Timeout/failure enters renderer recovery; no normal queue_buffer.
+  else explicit KMS input fence path
+    loop -> loop : wrap sync-file as SyncPoint
+  end
+  group successful submission / wait
+    loop -> scanout : queue_buffer(sync or None, damage)
+    scanout -> kms : atomic commit / page flip
+    loop -> state : clear output repaint request\nsend frame callbacks after a successful queue
+    kms --> loop : matching CRTC vblank event
+    loop -> scanout : frame_submitted()
+    scanout -> scanout : pending buffer becomes current\nrelease previous scanout slot
+    loop -> loop : clear frame_pending
+  end
+end
+note over renderer,kms
+  GPU completion governs client-buffer/resource retirement.
+  KMS vblank governs scanout-buffer retirement. These are separate lifetimes.
+end note
+@enduml

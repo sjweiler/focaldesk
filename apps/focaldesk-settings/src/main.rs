@@ -8043,9 +8043,9 @@ fn calendar_provider_group(
     let row = adw::ActionRow::new();
     row.set_title("Connect account");
     row.set_subtitle(if microsoft {
-        "Browser sign-in using PKCE with Calendars.Read"
+        "Browser sign-in using PKCE with Calendars.ReadWrite"
     } else {
-        "Browser sign-in using PKCE and calendar.readonly"
+        "Browser sign-in using PKCE with calendar read and event write access"
     });
     let button = gtk::Button::with_label("Connect");
     button.add_css_class("suggested-action");

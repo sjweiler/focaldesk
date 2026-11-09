@@ -476,6 +476,165 @@ fn calendar_access_token(account: &CalendarAccount) -> Result<Zeroizing<String>>
     Ok(Zeroizing::new(tokens.access_token))
 }
 
+// Provider writes run inside the connector host so credentials never reach the UI.
+fn write_calendar_event(event: &CalendarEventSnapshot, delete: bool) -> Result<()> {
+    let document = load_calendar_accounts()?;
+    let account = document
+        .accounts
+        .iter()
+        .find(|a| a.id == event.account_id && a.enabled)
+        .context("calendar account is unavailable or disabled")?;
+    if !selected_calendar_ids(account).contains(&event.calendar_id) {
+        bail!("calendar is not selected for this account");
+    }
+    if delete && event.event_id.is_empty() {
+        bail!("event ID is required");
+    }
+    if !delete {
+        if event.title.trim().is_empty() || event.title.len() > 4096 {
+            bail!("event title is required and must be at most 4096 bytes");
+        }
+        let start = chrono::DateTime::parse_from_rfc3339(&event.start_time)?;
+        let end = chrono::DateTime::parse_from_rfc3339(&event.end_time)?;
+        if end <= start {
+            bail!("event end must follow its start");
+        }
+        if event.all_day
+            && (start.time() != chrono::NaiveTime::MIN || end.time() != chrono::NaiveTime::MIN)
+        {
+            bail!("all-day event boundaries must be midnight");
+        }
+    }
+    let connector_id = match account.provider {
+        CalendarProvider::Google => "google-calendar",
+        CalendarProvider::Microsoft => "microsoft-calendar",
+        CalendarProvider::Local => bail!("local provider writes are unsupported"),
+    };
+    match send_ai_request(&AiIpcRequest::ListConnectors)? {
+        AiIpcResponse::Connectors { connectors }
+            if connectors
+                .iter()
+                .any(|c| c.manifest.id == connector_id && c.enabled && c.network_allowed) => {}
+        _ => bail!("enable this calendar connector and grant network access in AI Console first"),
+    }
+    let access = calendar_access_token(account)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let url = calendar_event_url(account.provider, event)?;
+    let method = if delete {
+        reqwest::Method::DELETE
+    } else if event.event_id.is_empty() {
+        reqwest::Method::POST
+    } else {
+        reqwest::Method::PATCH
+    };
+    let mut request = client.request(method, url).bearer_auth(access.as_str());
+    if !delete {
+        let body = calendar_write_body(account.provider, event)?;
+        request = request.json(&body);
+    }
+    let response = request.send()?;
+    if !response.status().is_success() {
+        let status = response.status();
+        if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::UNAUTHORIZED {
+            bail!(
+                "provider denied calendar changes ({status}); reconnect with calendar write permission and check calendar ownership"
+            );
+        }
+        bail!("calendar provider could not save changes ({status})");
+    }
+    let store = CALENDAR_STORE.get().context("calendar store unavailable")?;
+    if delete {
+        store.apply_sync(
+            &event.account_id,
+            &event.calendar_id,
+            &SyncBatch {
+                deleted_event_ids: vec![event.event_id.clone()],
+                ..Default::default()
+            },
+        )?;
+    } else {
+        let body: Value = response.json()?;
+        let batch = match account.provider {
+            CalendarProvider::Google => focaldesk_calendar::google_batch(
+                &event.account_id,
+                &event.calendar_id,
+                &json!({"items": [body]}),
+            )?,
+            CalendarProvider::Microsoft => focaldesk_calendar::microsoft_batch(
+                &event.account_id,
+                &event.calendar_id,
+                &json!({"value": [body]}),
+            )?,
+            CalendarProvider::Local => unreachable!(),
+        };
+        store.apply_sync(&event.account_id, &event.calendar_id, &batch)?;
+    }
+    Ok(())
+}
+
+fn calendar_event_url(
+    provider: CalendarProvider,
+    event: &CalendarEventSnapshot,
+) -> Result<url::Url> {
+    let mut url = match provider {
+        CalendarProvider::Google => {
+            url::Url::parse("https://www.googleapis.com/calendar/v3/calendars/")?
+        }
+        CalendarProvider::Microsoft => {
+            url::Url::parse("https://graph.microsoft.com/v1.0/me/calendars/")?
+        }
+        CalendarProvider::Local => {
+            bail!("local calendar writes are not supported by this endpoint")
+        }
+    };
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow!("invalid provider URL"))?;
+        segments.pop_if_empty();
+        // Microsoft primary is an alias rather than a calendar ID.
+        if provider == CalendarProvider::Microsoft && event.calendar_id == "primary" {
+            segments.pop();
+        } else {
+            segments.push(&event.calendar_id);
+        }
+        segments.push("events");
+        if !event.event_id.is_empty() {
+            segments.push(&event.event_id);
+        }
+    }
+    if provider == CalendarProvider::Google {
+        url.query_pairs_mut().append_pair("sendUpdates", "all");
+    }
+    Ok(url)
+}
+
+fn calendar_write_body(provider: CalendarProvider, event: &CalendarEventSnapshot) -> Result<Value> {
+    let start = chrono::DateTime::parse_from_rfc3339(&event.start_time)?;
+    let end = chrono::DateTime::parse_from_rfc3339(&event.end_time)?;
+    Ok(match provider {
+        CalendarProvider::Google => {
+            let boundary = |time: chrono::DateTime<chrono::FixedOffset>| {
+                if event.all_day {
+                    json!({"date": time.format("%Y-%m-%d").to_string()})
+                } else {
+                    json!({"dateTime": time.to_rfc3339()})
+                }
+            };
+            json!({"summary": event.title, "start": boundary(start), "end": boundary(end)})
+        }
+        CalendarProvider::Microsoft => json!({
+            "subject": event.title, "isAllDay": event.all_day,
+            "start": {"dateTime": start.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC"},
+            "end": {"dateTime": end.with_timezone(&chrono::Utc).format("%Y-%m-%dT%H:%M:%S").to_string(), "timeZone": "UTC"}
+        }),
+        CalendarProvider::Local => bail!("unsupported provider"),
+    })
+}
+
 fn discover_calendars(account_id: &str) -> Result<Vec<CalendarAvailableSnapshot>> {
     let document = load_calendar_accounts()?;
     let account = document
@@ -723,7 +882,7 @@ fn start_calendar_oauth(
             .append_pair("client_id", &account.client_id)
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("response_type", "code")
-            .append_pair("scope", "https://www.googleapis.com/auth/calendar.readonly")
+            .append_pair("scope", "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/calendar.events")
             .append_pair("access_type", "offline")
             .append_pair("prompt", "consent")
             .append_pair("code_challenge", &challenge)
@@ -782,7 +941,7 @@ fn start_calendar_oauth(
             .append_pair("redirect_uri", &redirect_uri)
             .append_pair("response_type", "code")
             .append_pair("response_mode", "query")
-            .append_pair("scope", "offline_access Calendars.Read")
+            .append_pair("scope", "offline_access Calendars.ReadWrite")
             // Do not silently reuse an unrelated browser SSO session. The local
             // FocalDesk account label is intentionally independent of the
             // Microsoft identity, so make that identity an explicit choice.
@@ -926,7 +1085,7 @@ fn complete_microsoft_oauth(
             ("code_verifier", verifier),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
-            ("scope", "offline_access Calendars.Read"),
+            ("scope", "offline_access Calendars.ReadWrite"),
         ])
         .send()?
         .error_for_status()?
@@ -1028,7 +1187,6 @@ fn refresh_access_token(
                     ("client_id", account.client_id.as_str()),
                     ("refresh_token", refresh_token),
                     ("grant_type", "refresh_token"),
-                    ("scope", "offline_access Calendars.Read"),
                 ])
                 .send()?
         }
@@ -1701,6 +1859,16 @@ fn apply_control_request(
     host_state: &Arc<Mutex<HostState>>,
     request: ConnectorHostIpcRequest,
 ) -> ConnectorHostIpcResponse {
+    if let ConnectorHostIpcRequest::CalendarSaveEvent { ref event }
+    | ConnectorHostIpcRequest::CalendarDeleteEvent { ref event } = request
+    {
+        let delete = matches!(request, ConnectorHostIpcRequest::CalendarDeleteEvent { .. });
+        let result = write_calendar_event(event, delete);
+        let mut response = error_control_response("");
+        response.status = if result.is_ok() { "ok" } else { "error" }.into();
+        response.message = result.err().map(|e| e.to_string());
+        return response;
+    }
     if let ConnectorHostIpcRequest::CalendarConnect {
         provider,
         account_id,
@@ -1937,7 +2105,9 @@ fn apply_control_request(
                 message = Some(format!("unknown connector runtime: {connector_id}"));
             }
         }
-        ConnectorHostIpcRequest::CalendarConnect { .. }
+        ConnectorHostIpcRequest::CalendarSaveEvent { .. }
+        | ConnectorHostIpcRequest::CalendarDeleteEvent { .. }
+        | ConnectorHostIpcRequest::CalendarConnect { .. }
         | ConnectorHostIpcRequest::CalendarOAuthStatus { .. }
         | ConnectorHostIpcRequest::CalendarAccounts
         | ConnectorHostIpcRequest::CalendarDiscover { .. }
@@ -1984,6 +2154,68 @@ fn unix_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_fixture() -> CalendarEventSnapshot {
+        CalendarEventSnapshot {
+            account_id: "work".into(),
+            provider: "google".into(),
+            calendar_id: "primary".into(),
+            event_id: String::new(),
+            title: "Planning".into(),
+            start_time: "2026-11-09T09:00:00-05:00".into(),
+            end_time: "2026-11-09T10:00:00-05:00".into(),
+            organizer: String::new(),
+            all_day: false,
+        }
+    }
+
+    #[test]
+    fn provider_write_payloads_preserve_offsets_and_convert_graph_to_utc() {
+        let event = write_fixture();
+        let google = calendar_write_body(CalendarProvider::Google, &event).unwrap();
+        assert_eq!(google["start"]["dateTime"], event.start_time);
+        assert_eq!(google["summary"], "Planning");
+        assert!(google.get("attendees").is_none()); // PATCH preserves existing invitations.
+        let graph = calendar_write_body(CalendarProvider::Microsoft, &event).unwrap();
+        assert_eq!(graph["start"]["dateTime"], "2026-11-09T14:00:00");
+        assert_eq!(graph["start"]["timeZone"], "UTC");
+        assert_eq!(graph["isAllDay"], false);
+    }
+
+    #[test]
+    fn all_day_writes_use_exclusive_date_boundaries() {
+        let mut event = write_fixture();
+        event.all_day = true;
+        event.start_time = "2026-11-09T00:00:00Z".into();
+        event.end_time = "2026-11-10T00:00:00Z".into();
+        let google = calendar_write_body(CalendarProvider::Google, &event).unwrap();
+        assert_eq!(google["start"]["date"], "2026-11-09");
+        assert_eq!(google["end"]["date"], "2026-11-10");
+        assert!(google["start"].get("dateTime").is_none());
+        let graph = calendar_write_body(CalendarProvider::Microsoft, &event).unwrap();
+        assert_eq!(graph["isAllDay"], true);
+        assert_eq!(graph["end"]["dateTime"], "2026-11-10T00:00:00");
+    }
+
+    #[test]
+    fn provider_write_urls_handle_primary_and_escape_ids() {
+        let mut event = write_fixture();
+        assert_eq!(
+            calendar_event_url(CalendarProvider::Microsoft, &event)
+                .unwrap()
+                .as_str(),
+            "https://graph.microsoft.com/v1.0/me/events"
+        );
+        event.calendar_id = "team/a@example.com".into();
+        event.event_id = "id/with?reserved#characters".into();
+        let url = calendar_event_url(CalendarProvider::Google, &event).unwrap();
+        assert_eq!(url.host_str(), Some("www.googleapis.com"));
+        assert!(
+            url.path()
+                .contains("team%2Fa@example.com/events/id%2Fwith%3Freserved%23characters")
+        );
+        assert_eq!(url.query(), Some("sendUpdates=all"));
+    }
 
     #[test]
     fn calendar_fixture_parser_is_bounded_to_named_fields() {

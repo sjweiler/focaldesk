@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=FocalDesk Automation Studio
+Comment=Build visual workflows for your FocalDesk desktop
+Exec=sh -c "exec ~/.local/bin/focaldesk-automation-studio"
+Icon=focaldesk-automation-studio
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=FocalDesk Automation Studio

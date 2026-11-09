@@ -1,0 +1,35 @@
+@startuml
+!include style.puml
+title Desktop IPC: bounded GetDesktopSnapshot request
+autonumber
+actor "CLI user" as user
+participant "focaldesk-cli" as cli
+participant "focaldesk-ipc\nclient transport" as transport
+participant "Desktop socket\nworker thread" as worker
+queue "mpsc request /\nresponse channels" as channel
+participant "Compositor thread\nDesktopState" as state
+user -> cli : desktop-snapshot
+cli -> transport : send_desktop_request(GetDesktopSnapshot)
+transport -> worker : connect desktop.sock\nwrite encoded request; shutdown write half
+worker -> worker : require_authorized_peer(DESKTOP_POLICY)\nread_limited(); decode_message()
+alt unauthorized peer or invalid / oversized request
+  worker --> transport : encoded IpcResponse::Error
+else valid request
+  worker -> channel : DesktopIpcMessage::Request\n{ request, response_tx }
+  worker -> worker : wait for response_rx
+  state -> channel : pump_desktop_services()\nprocess_settings_ipc_requests(): try_recv()
+  channel --> state : request and response sender
+  state -> state : handle_settings_ipc_request()\ndesktop_snapshot()
+  state -> channel : IpcResponse::DesktopSnapshot { snapshot }
+  channel --> worker : response_rx.recv()
+  worker --> transport : encoded response + newline; close connection
+end
+transport -> transport : read response to EOF\ndecode_message()
+transport --> cli : typed response or transport error
+cli --> user : formatted snapshot or error
+note over worker,state
+  Worker threads validate and transfer requests.
+  The compositor thread owns and reads desktop state.
+  Watch requests use a streaming response path; omitted here.
+end note
+@enduml

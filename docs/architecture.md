@@ -15,6 +15,12 @@ FocalDesk is a Rust-based Wayland desktop environment and compositor for Linux. 
 
 ## High-Level Overview
 
+For source-derived crate dependencies and reviewed UML runtime, sequence,
+and type views, see the [UML diagrams and generation guide](uml/README.md).
+Run `just uml-generate` after changing workspace manifests and `just uml-check`
+to detect stale generated sources. Runtime diagrams have source anchors for
+manual review.
+
 The diagrams below are conceptual maps of FocalDesk rather than exact module or
 process diagrams. They show which parts of the desktop own a responsibility and
 the general direction in which frames and messages move. Experimental services

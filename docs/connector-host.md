@@ -90,8 +90,11 @@ cursor; leaving it unchecked retains the local cache while preventing further
 cloud synchronization.
 
 Google authorization must use the
-`https://www.googleapis.com/auth/calendar.readonly` scope. Microsoft
-authorization must use delegated `Calendars.Read` and `offline_access`. Both
+`https://www.googleapis.com/auth/calendar.readonly` and
+`https://www.googleapis.com/auth/calendar.events` scopes. Microsoft
+authorization uses delegated `Calendars.ReadWrite` and `offline_access`. Accounts
+previously connected with read-only permissions must reconnect before editing.
+Both
 providers use incremental cursors, refresh the bounded 30-days-past to
 365-days-future window weekly, and poll at most once every five minutes.
 Upcoming normalized events can be inspected without exposing tokens:
@@ -99,6 +102,16 @@ Upcoming normalized events can be inspected without exposing tokens:
 ```sh
 focaldesk-cli calendar upcoming 7
 ```
+
+The `apps/focaldesk-calendar` desktop application uses the same account list and
+event cache through connector-host IPC. `calendar_save_event` creates an event
+when its event ID is empty and otherwise patches its title, start, end, and
+all-day flag. `calendar_delete_event` removes the selected provider event.
+Writes require an enabled account, a selected calendar, and an enabled provider
+connector with network consent. Access tokens remain inside the connector host.
+Provider errors are surfaced to the application, and successful writes update
+the shared cache. Existing attendees and other fields are retained by PATCH;
+provider notifications can be sent to existing attendees when events change.
 
 Each adapter runs only when both its connector and at least one declared Event
 Fabric source are enabled. Events are checked again by the AI service against

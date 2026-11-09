@@ -37,6 +37,8 @@ tracked in [Known Issues](docs/known-issues.md).
 - PipeWire and portal integration for experimental screen capture.
 - Experimental, view-only RDP service with TLS, short-lived credentials, and a
   loopback-only listener ([details](docs/remote-desktop.md)).
+- [Automation Studio](apps/focaldesk-automation-studio/README.md): a Svelte Flow
+  visual editor for scheduled desktop workflows, with draft storage and Lua publishing.
 - Separate user services for launching, settings, notifications, power,
   dialogs, controls, speech, voice input, and permissioned automation.
 - Encrypted credential broker with ACL-protected native IPC and Secret Service
@@ -179,6 +181,8 @@ state.
 The diagram is conceptual and includes elements marked as planned or future.
 See the [architecture guide](docs/architecture.md) for the rendering and IPC
 diagrams, current boundaries, and implementation notes.
+The [UML guide](docs/uml/README.md) adds generated workspace dependency diagrams
+and reviewed rendering, IPC, and type diagrams, with editable sources and SVGs.
 
 ## Technical Challenges
 
@@ -215,6 +219,8 @@ diagrams, current boundaries, and implementation notes.
 - `apps/focaldesk-desktop`: compositor executable
 - `apps/focaldesk-cli`: command-line interface
 - `apps/focaldesk-ai-console`: interface app for ai
+- `apps/focaldesk-calendar`: unified Google Calendar and Microsoft 365 weekly
+  calendar with event editing and AI meeting preparation
 - `apps/focaldesk-files`: file app with previews, devices, network locations,
   undo, and bounded recursive filename search
 - `apps/focaldesk-settings`: settings app prototype

@@ -19,6 +19,10 @@ version numbers where practical.
 
 ### Added
 
+- Added reproducible workspace dependency UML from Cargo metadata, reviewed
+  runtime architecture, rendering and IPC sequences, and rendering type views.
+  Includes editable PlantUML, locally rendered SVGs, source anchors, and
+  `just uml-generate`, `just uml-check`, and `just uml-render` commands.
 - Replaced local Files copy/move work with a bounded background transfer engine
   providing byte progress, throughput and ETA reporting, mid-file cancellation,
   Replace/Skip/Keep Both batch conflict choices, staged commits and cleanup,

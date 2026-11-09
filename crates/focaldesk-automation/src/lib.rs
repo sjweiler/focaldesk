@@ -15,3 +15,4 @@ pub mod ipc;
 pub mod runner;
 pub mod schedule;
 pub mod script;
+pub mod studio;

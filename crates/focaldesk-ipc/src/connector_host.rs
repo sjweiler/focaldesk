@@ -30,6 +30,12 @@ pub enum ConnectorHostIpcRequest {
         flow_id: String,
     },
     CalendarAccounts,
+    CalendarSaveEvent {
+        event: CalendarEventSnapshot,
+    },
+    CalendarDeleteEvent {
+        event: CalendarEventSnapshot,
+    },
     CalendarDiscover {
         account_id: String,
     },
@@ -164,6 +170,15 @@ pub fn send_connector_host_request(
     let mut stream = UnixStream::connect(&path)
         .map_err(|error| format!("could not connect to {}: {error}", path.display()))?;
     transport::configure_stream(&stream).map_err(|error| error.to_string())?;
+    if matches!(
+        request,
+        ConnectorHostIpcRequest::CalendarSaveEvent { .. }
+            | ConnectorHostIpcRequest::CalendarDeleteEvent { .. }
+    ) {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(90)))
+            .map_err(|e| e.to_string())?;
+    }
     let encoded = transport::encode_message(request)?;
     stream
         .write_all(&encoded)
@@ -181,6 +196,33 @@ pub fn send_connector_host_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_mutations_round_trip() {
+        let event = CalendarEventSnapshot {
+            account_id: "work".into(),
+            provider: "google".into(),
+            calendar_id: "primary".into(),
+            event_id: "event".into(),
+            title: "Planning".into(),
+            start_time: "2026-11-09T09:00:00Z".into(),
+            end_time: "2026-11-09T10:00:00Z".into(),
+            organizer: String::new(),
+            all_day: false,
+        };
+        for request in [
+            ConnectorHostIpcRequest::CalendarSaveEvent {
+                event: event.clone(),
+            },
+            ConnectorHostIpcRequest::CalendarDeleteEvent { event },
+        ] {
+            let encoded = serde_json::to_vec(&request).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ConnectorHostIpcRequest>(&encoded).unwrap(),
+                request
+            );
+        }
+    }
 
     #[test]
     fn control_requests_round_trip() {
