@@ -89,6 +89,7 @@ pub const DIALOG_POLICY: PeerPolicy<'static> = PeerPolicy {
 pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "notifications",
     allowed_executables: &[
+        "focaldesk-system-rail",
         "focaldesk-desktop",
         "focaldesk-automation",
         "focaldesk-cli",
@@ -98,6 +99,7 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
         "focald-connectors",
     ],
     allowed_units: &[
+        "focaldesk-system-rail.service",
         "focaldesk-automation.service",
         "focaldesk-updatesd.service",
         "focald-connectors.service",
@@ -107,17 +109,29 @@ pub const NOTIFICATIONS_POLICY: PeerPolicy<'static> = PeerPolicy {
 pub const POWER_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "power",
     allowed_executables: &[
+        "focaldesk-system-rail",
         "focaldesk-desktop",
         "focaldesk-settings",
         "focaldesk-companion-dashboard",
     ],
-    allowed_units: &["focaldesk-companion-dashboard.service"],
+    allowed_units: &[
+        "focaldesk-system-rail.service",
+        "focaldesk-companion-dashboard.service",
+    ],
 };
 
 pub const UPDATES_POLICY: PeerPolicy<'static> = PeerPolicy {
     endpoint: "updates",
-    allowed_executables: &["focaldesk-desktop", "focaldesk-cli", "focaldesk-updatesd"],
-    allowed_units: &["focaldesk-updatesd.service"],
+    allowed_executables: &[
+        "focaldesk-system-rail",
+        "focaldesk-desktop",
+        "focaldesk-cli",
+        "focaldesk-updatesd",
+    ],
+    allowed_units: &[
+        "focaldesk-system-rail.service",
+        "focaldesk-updatesd.service",
+    ],
 };
 
 pub const AI_POLICY: PeerPolicy<'static> = PeerPolicy {
@@ -536,6 +550,22 @@ mod tests {
                 .allowed_executables
                 .contains(&"focaldesk-settings")
         );
+    }
+
+    #[test]
+    fn rail_popover_services_require_the_expected_executable_and_unit() {
+        let rail = PeerIdentity {
+            uid: 1000,
+            pid: 42,
+            executable: PathBuf::from("/home/user/.local/bin/focaldesk-system-rail"),
+            unit: Some("focaldesk-system-rail.service".into()),
+            executable_trusted: false,
+        };
+        for policy in [NOTIFICATIONS_POLICY, POWER_POLICY, UPDATES_POLICY] {
+            assert!(policy_allows(&rail, policy));
+            assert!(!policy_allows(&PeerIdentity { unit: Some("other.service".into()), ..rail.clone() }, policy));
+            assert!(!policy_allows(&PeerIdentity { executable: PathBuf::from("/tmp/other"), ..rail.clone() }, policy));
+        }
     }
 
     #[test]

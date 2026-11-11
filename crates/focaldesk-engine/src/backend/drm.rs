@@ -494,6 +494,7 @@ struct DrmModeCandidate {
     width: u16,
     height: u16,
     refresh_hz: u32,
+    pixel_clock_khz: u32,
     preferred: bool,
 }
 
@@ -544,11 +545,24 @@ fn select_requested_drm_mode_index(
     requested: (i32, i32, i32),
 ) -> Option<usize> {
     let (width, height, refresh_mhz) = requested;
-    candidates.iter().position(|candidate| {
-        i32::from(candidate.width) == width
-            && i32::from(candidate.height) == height
-            && (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs() <= 1000
-    })
+    candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| {
+            i32::from(candidate.width) == width
+                && i32::from(candidate.height) == height
+                && (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs() <= 1000
+        })
+        // EDID can advertise multiple timings for the same resolution/refresh.
+        // Prefer the closest refresh, then the timing with less link bandwidth
+        // rather than depending on the monitor's enumeration order.
+        .min_by_key(|(_, candidate)| {
+            (
+                (i64::from(candidate.refresh_hz) * 1000 - i64::from(refresh_mhz)).abs(),
+                candidate.pixel_clock_khz,
+            )
+        })
+        .map(|(index, _)| index)
 }
 
 pub(crate) fn select_connector_mode(
@@ -563,6 +577,7 @@ pub(crate) fn select_connector_mode(
                 width,
                 height,
                 refresh_hz: mode.vrefresh(),
+                pixel_clock_khz: mode.clock(),
                 preferred: mode
                     .mode_type()
                     .contains(drm::control::ModeTypeFlags::PREFERRED),
@@ -2314,23 +2329,60 @@ mod hdr_tests {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 165,
+                pixel_clock_khz: 0,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: OUTPUT_MAX_REFRESH_HZ,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 60,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
         ];
 
         assert_eq!(select_drm_mode_index(&candidates), Some(1));
+    }
+
+    #[test]
+    fn configured_4k120_prefers_lower_clock_regardless_of_edid_order() {
+        // TCL 32R84 DP-4 advertises both of these 3840x2160@120 timings.
+        let high_clock = DrmModeCandidate {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 120,
+            pixel_clock_khz: 1_186_810,
+            preferred: false,
+        };
+        let low_clock = DrmModeCandidate {
+            pixel_clock_khz: 1_066_600,
+            ..high_clock
+        };
+        for candidates in [[high_clock, low_clock], [low_clock, high_clock]] {
+            let selected = select_requested_drm_mode_index(&candidates, (3840, 2160, 120_000))
+                .expect("advertised 4K120 mode");
+            assert_eq!(candidates[selected], low_clock);
+            assert_eq!(
+                select_requested_drm_mode_index(&candidates, (2560, 1440, 120_000)),
+                None
+            );
+        }
+        let near_refresh = DrmModeCandidate {
+            refresh_hz: 119,
+            pixel_clock_khz: 1,
+            ..low_clock
+        };
+        assert_eq!(
+            select_requested_drm_mode_index(&[near_refresh, low_clock], (3840, 2160, 120_000)),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2340,12 +2392,14 @@ mod hdr_tests {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 165,
+                pixel_clock_khz: 0,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 120,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
         ];
@@ -2362,18 +2416,21 @@ mod hdr_tests {
                 width: 3840,
                 height: 2160,
                 refresh_hz: 144,
+                pixel_clock_khz: 0,
                 preferred: true,
             },
             DrmModeCandidate {
                 width: 2560,
                 height: 1440,
                 refresh_hz: 120,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
             DrmModeCandidate {
                 width: 3840,
                 height: 2160,
                 refresh_hz: 60,
+                pixel_clock_khz: 0,
                 preferred: false,
             },
         ];

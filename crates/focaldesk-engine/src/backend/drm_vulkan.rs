@@ -177,6 +177,7 @@ struct OutputConfig {
 
 struct VulkanOutput {
     name: String,
+    global: smithay::reexports::wayland_server::backend::GlobalId,
     connector: connector::Handle,
     width: u32,
     height: u32,
@@ -186,6 +187,7 @@ struct VulkanOutput {
     crtc: crtc::Handle,
     scanout: VulkanScanout,
     frame_pending: bool,
+    log_first_present_state: bool,
     present_started_at: Option<Instant>,
     hdr_metadata_blob: Option<u64>,
     hdr_support: HdrSupport,
@@ -333,6 +335,7 @@ struct VulkanDrmData {
     primary_node: DrmNode,
     session: LibSeatSession,
     outputs: Vec<VulkanOutput>,
+    retired_output_globals: Vec<(Instant, smithay::reexports::wayland_server::backend::GlobalId)>,
     libinput: Libinput,
     session_active: bool,
     disable_explicit_kms_fences: bool,
@@ -1327,6 +1330,16 @@ fn initialize_vulkan_outputs(
     let mut outputs = Vec::with_capacity(output_configs.len());
     let mut configured_primary = None;
     for config in output_configs {
+        flog_warn!(
+            "Raw Vulkan output setup: output={} connector={:?} crtc={:?} mode={:?} refresh={}Hz clock={}kHz hdr_requested={}",
+            config.name,
+            config.connector,
+            config.crtc,
+            config.mode,
+            config.mode.vrefresh(),
+            config.mode.clock(),
+            config.hdr_requested,
+        );
         super::drm::reset_crtc_gamma(drm, config.crtc)
             .with_context(|| format!("reset inherited hardware gamma for {}", config.name))?;
         let drm_surface = drm.create_surface(config.crtc, config.mode, &[config.connector])?;
@@ -1387,7 +1400,8 @@ fn initialize_vulkan_outputs(
             Some(config.origin),
         );
         output.set_preferred(wl_mode);
-        output.create_global::<crate::core::desktop::DesktopState>(&desktop.display.handle());
+        let global = output
+            .create_global::<crate::core::desktop::DesktopState>(&desktop.display.handle());
         desktop.state.register_output_entry(
             config.output_id,
             output,
@@ -1480,6 +1494,7 @@ fn initialize_vulkan_outputs(
         ));
         outputs.push(VulkanOutput {
             name: config.name,
+            global,
             connector: config.connector,
             width: config.width,
             height: config.height,
@@ -1489,6 +1504,7 @@ fn initialize_vulkan_outputs(
             crtc: config.crtc,
             scanout,
             frame_pending: false,
+            log_first_present_state: true,
             present_started_at: None,
             hdr_metadata_blob,
             hdr_support: config.hdr_support,
@@ -1539,7 +1555,16 @@ fn vulkan_connector_set_changed(data: &VulkanDrmData) -> Result<bool> {
     Ok(connected != data.outputs.iter().map(|output| output.connector).collect())
 }
 
+fn log_nvidia_display_heads(phase: &str, output: &str) {
+    // Read-only driver state: this shows NVIDIA's internal head allocation,
+    // which is distinct from the DRM CRTCs selected by the compositor.
+    if let Ok(heads) = std::fs::read_to_string("/proc/driver/nvidia-modeset/heads") {
+        flog_warn!("NVIDIA display heads: phase={phase} output={output}\n{heads}");
+    }
+}
+
 fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
+    log_nvidia_display_heads("before-output-rebuild", "all");
     // Probe first so a transient connector read failure never destroys the
     // currently working topology.
     let output_configs = match select_outputs(&data.drm) {
@@ -1550,11 +1575,29 @@ fn rebuild_vulkan_outputs(data: &mut VulkanDrmData) -> Result<bool> {
         }
     };
     let snapshot = data.desktop.state.snapshot_output_topology();
+    flog_warn!("Raw Vulkan output rebuild: retiring {} outputs", data.outputs.len());
     crate::core::portal::invalidate_portal_output_state(&mut data.desktop.state);
     for output in &mut data.outputs {
+        flog_warn!(
+            "Raw Vulkan output retirement: output={} crtc={:?} plane={:?} frame_pending={} present_age_ms={:?}",
+            output.name,
+            output.crtc,
+            output.scanout.plane(),
+            output.frame_pending,
+            output.present_started_at.map(|started| started.elapsed().as_millis()),
+        );
         if output.frame_pending {
             let _ = output.scanout.frame_submitted();
         }
+        // Withdraw the old wl_output before publishing its replacement. Retain
+        // the disabled global briefly so an in-flight client bind cannot race
+        // immediate removal and disconnect that client.
+        data.desktop.display.handle()
+            .disable_global::<crate::core::desktop::DesktopState>(output.global.clone());
+        data.retired_output_globals.push((
+            Instant::now() + Duration::from_secs(5),
+            output.global.clone(),
+        ));
         if let Some(state) = data.desktop.state.outputs.get(&output.output_id) {
             data.desktop.state.space.unmap_output(&state.handle);
         }
@@ -2094,6 +2137,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         primary_node: node,
         session: session.clone(),
         outputs,
+        retired_output_globals: Vec::new(),
         libinput,
         session_active: session.is_active(),
         disable_explicit_kms_fences,
@@ -2191,6 +2235,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
             match completion {
                 Ok(_) => {
                     let output = &mut data.outputs[index];
+                    if std::mem::take(&mut output.log_first_present_state) {
+                        log_nvidia_display_heads("first-present-completed", &output.name);
+                    }
                     output.frame_pending = false;
                     output.present_started_at = None;
                     if let Some(state) = data.desktop.state.outputs.get_mut(&output.output_id) {
@@ -2301,10 +2348,20 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pump_desktop_services(&mut data.desktop.state);
         if data.desktop.state.take_display_reconfigure_request() {
             data.topology_refresh_pending = true;
-            flog("raw Vulkan DRM display settings changed; scheduling topology rebuild");
+            flog_warn!("raw Vulkan DRM display settings changed; scheduling topology rebuild");
         }
 
         event_loop.dispatch(Some(FRAME_INTERVAL), &mut data)?;
+        let now = Instant::now();
+        let display = data.desktop.display.handle();
+        data.retired_output_globals.retain(|(deadline, global)| {
+            if now < *deadline {
+                true
+            } else {
+                display.remove_global::<crate::core::desktop::DesktopState>(global.clone());
+                false
+            }
+        });
         if data.session_active
             && !data.resume_pending
             && data
@@ -2313,7 +2370,10 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         {
             data.connector_probe_at = None;
             match vulkan_connector_set_changed(&data) {
-                Ok(true) => data.topology_refresh_pending = true,
+                Ok(true) => {
+                    flog_warn!("raw Vulkan DRM connector set changed; scheduling topology rebuild");
+                    data.topology_refresh_pending = true;
+                }
                 Ok(false) => {
                     flog("raw Vulkan DRM connector event: output set unchanged; retaining scanout")
                 }
@@ -2797,6 +2857,9 @@ pub fn run() -> Result<(), Box<dyn Error>> {
                         output_id,
                         crate::core::desktop::DamageSource::Unknown,
                     );
+                    if std::mem::take(&mut output.log_first_present_state) {
+                        log_nvidia_display_heads("first-present-rejected", &output.name);
+                    }
                     flog_warn!("Vulkan atomic KMS queue failed on {}: {error}", output.name);
                 }
             }

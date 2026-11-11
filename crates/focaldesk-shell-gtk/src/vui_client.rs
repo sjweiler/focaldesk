@@ -482,6 +482,36 @@ fn dispatch_event(
 ) {
     state.borrow_mut().runtime.handle_event(&event);
     for action in std::mem::take(&mut *actions.borrow_mut()) {
+        if let DesktopAction::OpenShellPanel { connector, panel } = &action {
+            if let Some(area) = area.upgrade() {
+                let position = match &event {
+                    Event::PointerUp { position, .. } | Event::PointerDown { position, .. } => {
+                        Some(*position)
+                    }
+                    _ => None,
+                };
+                let rect = state
+                    .borrow()
+                    .tooltip_targets
+                    .iter()
+                    .find(|(bounds, label)| {
+                        position.map_or_else(
+                            || panel_label_matches(*panel, label),
+                            |p| bounds.contains(p),
+                        )
+                    })
+                    .map(|(r, _)| {
+                        gtk::gdk::Rectangle::new(
+                            r.x as i32,
+                            r.y as i32,
+                            r.width as i32,
+                            r.height as i32,
+                        )
+                    });
+                crate::rail_popovers::show(&area, rect, connector, *panel);
+            }
+            continue;
+        }
         focaldesk_logging::flog_warn!("VUI GTK shell action queued: {action:?}");
         std::thread::spawn(move || {
             match send_desktop_request(&IpcRequest::ExecuteDesktopAction {
@@ -505,6 +535,21 @@ fn dispatch_event(
     }
     if let Some(area) = area.upgrade() {
         area.queue_draw();
+    }
+}
+
+fn panel_label_matches(panel: ShellPanel, label: &str) -> bool {
+    match panel {
+        ShellPanel::Network => label == "Network",
+        ShellPanel::Bluetooth => label == "Bluetooth",
+        ShellPanel::Audio => label == "Audio" || label.starts_with("Microphone"),
+        ShellPanel::Calendar => label == "Calendar and clock",
+        ShellPanel::NotificationHistory => label == "Notification center",
+        ShellPanel::Updates => label == "System updates",
+        ShellPanel::Power => label == "Power menu" || label == "Battery charge and power",
+        ShellPanel::Display => label.starts_with("Display settings"),
+        ShellPanel::Settings => label.starts_with("Camera"),
+        _ => false,
     }
 }
 
@@ -1104,9 +1149,7 @@ fn rail_root(
                 app_icon(AppIcon::Battery)
             },
             status_label,
-            DesktopAction::OpenSettingsPanel {
-                panel: "power".into(),
-            },
+            open_panel(connector, ShellPanel::Power),
             actions.clone(),
             shell.battery_charging,
             false,

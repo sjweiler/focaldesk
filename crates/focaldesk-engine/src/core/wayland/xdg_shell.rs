@@ -298,15 +298,20 @@ impl XdgShellHandler for DesktopState {
             debug!(target: "focaldesk", ?surface_id, "xdg popup grab ignored: no root");
             return;
         };
-        let Some(window) = self.window_for_wl_surface(&root) else {
-            debug!(
-                target: "focaldesk",
-                ?surface_id,
-                "xdg popup grab ignored: root window not mapped"
-            );
+        let root_focus = if let Some(window) = self.window_for_wl_surface(&root) {
+            KeyboardFocusTarget::Window(window)
+        } else if self
+            .space
+            .layer_for_surface(&root, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+            .is_some()
+        {
+            // Popovers hosted by a rail or another layer surface have no app
+            // window. Keep their real layer root as the focus restored on ungrab.
+            KeyboardFocusTarget::Layer(root)
+        } else {
+            debug!(target: "focaldesk", ?surface_id, "xdg popup grab ignored: root is not mapped");
             return;
         };
-        let root_focus = KeyboardFocusTarget::Window(window.clone());
         let Ok(mut grab) = self.popups.grab_popup(root_focus, kind, &seat, serial) else {
             debug!(target: "focaldesk", ?surface_id, "xdg popup grab ignored: grab_popup failed");
             return;

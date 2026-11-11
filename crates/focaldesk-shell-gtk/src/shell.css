@@ -507,3 +507,22 @@ window.task-shelf-overflow-window {
   font-size: 10px;
   font-weight: 800;
 }
+
+/* Native rail popovers keep service controls readable over any wallpaper. */
+popover.rail-popover > contents {
+  background: #101923;
+  color: #e2ecf7;
+  border: 1px solid #587a99;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.rail-popover button, .rail-popover combobox {
+  min-height: 32px;
+  color: #e2ecf7;
+  background: #223346;
+  border-radius: 8px;
+}
+.rail-popover button:hover { background: #304b64; }
+.rail-popover button:focus-visible { outline: 2px solid #78caff; }
+.rail-popover-status { color: #b8d6ec; font-size: 12px; }
+.rail-notification { padding: 8px; background: #1b2939; border-radius: 8px; }

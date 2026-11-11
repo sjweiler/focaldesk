@@ -10851,6 +10851,31 @@ impl DesktopState {
         let Ok(root) = find_popup_root_surface(&popup_kind) else {
             return;
         };
+        if let Some(layer) = self
+            .space
+            .layer_for_surface(&root, WindowSurfaceType::TOPLEVEL)
+        {
+            for output in self.space.outputs() {
+                let map = smithay::desktop::layer_map_for_output(output);
+                let Some(geometry) = map.layer_geometry(&layer) else {
+                    continue;
+                };
+                let Some(output_geometry) = self.space.output_geometry(output) else {
+                    continue;
+                };
+                // LayerMap geometry is output-local; xdg positioners use the
+                // parent surface's coordinates, including on non-origin outputs.
+                let bounds = Rectangle::from_loc_and_size(
+                    (-geometry.loc.x, -geometry.loc.y),
+                    output_geometry.size,
+                );
+                popup.with_pending_state(|state| {
+                    state.geometry = state.positioner.get_unconstrained_geometry(bounds);
+                });
+                return;
+            }
+            return;
+        }
         let Some(window) = self.window_for_wl_surface(&root) else {
             return;
         };

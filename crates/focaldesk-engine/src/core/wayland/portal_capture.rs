@@ -239,6 +239,9 @@ impl WlrLayerShellHandler for DesktopState {
         // layer parent, so the first tracking attempt cannot find a root.
         // Register it now that get_popup has established that relationship.
         self.unconstrain_popup(&popup);
+        if let Err(error) = popup.send_pending_configure() {
+            focaldesk_logging::flog(format!("failed to configure layer-shell popup: {error}"));
+        }
         if let Err(error) = self.popups.track_popup(PopupKind::from(popup)) {
             focaldesk_logging::flog(format!("failed to track layer-shell popup: {error}"));
         }

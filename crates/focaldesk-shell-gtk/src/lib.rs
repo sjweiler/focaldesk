@@ -39,6 +39,7 @@ use zbus::{
     zvariant::OwnedValue,
 };
 
+mod rail_popovers;
 pub mod settings_subscription;
 mod vui_client;
 
@@ -5072,49 +5073,49 @@ fn build_panel(
     let top = gtk::Box::new(gtk::Orientation::Vertical, 4);
     top.add_css_class("rail-group");
     let network_connector = connector.clone();
-    let (network_button, network_image) = glass_icon_button(
+    let (network_button, network_image) = rail_popup_button(
         "network-wireless-offline-symbolic",
         "Network",
-        "rail-button",
-        move || open_shell_panel(&network_connector, ShellPanel::Network),
+        &network_connector,
+        ShellPanel::Network,
     );
     top.append(&network_button);
     let audio_connector = connector.clone();
     top.append(
-        &glass_icon_button(
+        &rail_popup_button(
             "audio-volume-high-symbolic",
             "Audio",
-            "rail-button",
-            move || open_shell_panel(&audio_connector, ShellPanel::Audio),
+            &audio_connector,
+            ShellPanel::Audio,
         )
         .0,
     );
     let bluetooth_connector = connector.clone();
     top.append(
-        &glass_icon_button(
+        &rail_popup_button(
             "bluetooth-active-symbolic",
             "Bluetooth",
-            "rail-button",
-            move || open_shell_panel(&bluetooth_connector, ShellPanel::Bluetooth),
+            &bluetooth_connector,
+            ShellPanel::Bluetooth,
         )
         .0,
     );
     let microphone_connector = connector.clone();
-    let (microphone_button, _) = glass_icon_button(
+    let (microphone_button, _) = rail_popup_button(
         "audio-input-microphone-symbolic",
         "Microphone in use",
-        "rail-button",
-        move || open_shell_panel(&microphone_connector, ShellPanel::Audio),
+        &microphone_connector,
+        ShellPanel::Audio,
     );
     microphone_button.add_css_class("rail-privacy-indicator");
     microphone_button.set_visible(false);
     top.append(&microphone_button);
     let camera_connector = connector.clone();
-    let (camera_button, _) = glass_icon_button(
+    let (camera_button, _) = rail_popup_button(
         "camera-web-symbolic",
         "Camera in use",
-        "rail-button",
-        move || open_shell_panel(&camera_connector, ShellPanel::Settings),
+        &camera_connector,
+        ShellPanel::Settings,
     );
     camera_button.add_css_class("rail-privacy-indicator");
     camera_button.set_visible(false);
@@ -5134,8 +5135,7 @@ fn build_panel(
     display_overlay.add_overlay(&display_badge);
     display_button.set_child(Some(&display_overlay));
     let display_connector = connector.clone();
-    display_button
-        .connect_clicked(move |_| open_shell_panel(&display_connector, ShellPanel::Display));
+    rail_popovers::attach(&display_button, &display_connector, ShellPanel::Display);
     top.append(&display_button);
     let battery = gtk::Label::new(None);
     battery.add_css_class("rail-battery-label");
@@ -5152,11 +5152,7 @@ fn build_panel(
     battery.set_valign(gtk::Align::End);
     battery_overlay.add_overlay(&battery);
     battery_button.set_child(Some(&battery_overlay));
-    battery_button.connect_clicked(|_| {
-        send_action(DesktopAction::OpenSettingsPanel {
-            panel: "power".into(),
-        });
-    });
+    rail_popovers::attach(&battery_button, &connector, ShellPanel::Power);
     top.append(&battery_button);
     rail.append(&top);
 
@@ -5206,31 +5202,31 @@ fn build_panel(
     clock_button.set_tooltip_text(Some("Calendar and clock"));
     clock_button.set_child(Some(&clock));
     let clock_connector = connector.clone();
-    clock_button.connect_clicked(move |_| open_shell_panel(&clock_connector, ShellPanel::Calendar));
+    rail_popovers::attach(&clock_button, &clock_connector, ShellPanel::Calendar);
     bottom.append(&clock_button);
     let notifications_connector = connector.clone();
-    let (notifications_button, notifications_image) = glass_icon_button(
+    let (notifications_button, notifications_image) = rail_popup_button(
         "notification-symbolic",
         "Notification center",
-        "rail-button",
-        move || open_shell_panel(&notifications_connector, ShellPanel::NotificationHistory),
+        &notifications_connector,
+        ShellPanel::NotificationHistory,
     );
     bottom.append(&notifications_button);
     let updates_connector = connector.clone();
-    let (updates_button, updates_image) = glass_icon_button(
+    let (updates_button, updates_image) = rail_popup_button(
         "software-update-available-symbolic",
         "System updates",
-        "rail-button",
-        move || open_shell_panel(&updates_connector, ShellPanel::Updates),
+        &updates_connector,
+        ShellPanel::Updates,
     );
     bottom.append(&updates_button);
     let power_connector = connector.clone();
     bottom.append(
-        &glass_icon_button(
+        &rail_popup_button(
             "system-shutdown-symbolic",
             "Power menu",
-            "rail-button",
-            move || open_shell_panel(&power_connector, ShellPanel::Power),
+            &power_connector,
+            ShellPanel::Power,
         )
         .0,
     );
@@ -5840,6 +5836,18 @@ fn send_action(action: DesktopAction) {
     });
 }
 
+fn rail_popup_button(
+    icon: &str,
+    tooltip: &str,
+    connector: &str,
+    panel: ShellPanel,
+) -> (gtk::Button, gtk::Image) {
+    let (button, image) = glass_icon_button(icon, tooltip, "rail-button", || {});
+    rail_popovers::attach(&button, connector, panel);
+    (button, image)
+}
+
+#[cfg(any())]
 fn open_shell_panel(connector: &str, panel: ShellPanel) {
     send_action(DesktopAction::OpenShellPanel {
         connector: connector.to_string(),
@@ -6130,10 +6138,17 @@ mod tests {
     }
 
     #[test]
-    fn shell_css_tracks_all_builtin_theme_palettes() {
+    fn shell_css_tracks_default_and_packaged_theme_palettes() {
+        let packaged_theme = |slug: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../assets/themes/optional/{slug}.fdtheme"));
+            let package = focaldesk_themes::ThemePackage::load(&path).expect("packaged theme");
+            focaldesk_themes::manager::theme_from_document(&package.document)
+                .expect("valid theme palette")
+        };
         let eagle = shell_css(&theme_by_name("Eagle"), 1.0);
-        let moonbase = shell_css(&theme_by_name("Moonbase"), 1.0);
-        let classic = shell_css(&theme_by_name("Classic"), 1.0);
+        let moonbase = shell_css(&packaged_theme("moonbase"), 1.0);
+        let classic = shell_css(&packaged_theme("classic"), 1.0);
 
         assert!(eagle.contains("rgba(51, 153, 255"));
         assert!(moonbase.contains("rgba(107, 173, 219"));

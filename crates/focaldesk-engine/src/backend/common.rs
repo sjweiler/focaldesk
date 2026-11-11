@@ -560,7 +560,7 @@ pub(crate) fn stop_focaldesk_session_target() {
     }
 }
 
-/// Restart the two GPU-rendered shell surfaces after the compositor has reset
+/// Restart GPU-rendered shell surfaces after the compositor has reset
 /// its scanout/output resources. Their GTK renderers are separate processes
 /// and can retain invalid output bindings or partial NVIDIA resources across
 /// both suspend recovery and a live mode/topology rebuild.
@@ -572,6 +572,7 @@ pub(crate) fn restart_shell_surfaces_after_gpu_reset() {
             "--no-block",
             "focaldesk-system-rail.service",
             "focaldesk-task-shelf.service",
+            "focaldesk-companion-dashboard.service",
         ])
         .status();
     match status {
