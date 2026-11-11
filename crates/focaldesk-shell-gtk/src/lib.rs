@@ -5067,16 +5067,6 @@ fn build_panel(
     );
     ai_console_button.add_css_class("rail-primary-action");
     primary.append(&ai_console_button);
-    let quick_settings_connector = connector.clone();
-    primary.append(
-        &glass_icon_button(
-            "preferences-system-symbolic",
-            "Quick Settings",
-            "rail-button",
-            move || open_shell_panel(&quick_settings_connector, ShellPanel::QuickSettings),
-        )
-        .0,
-    );
     rail.append(&primary);
 
     let top = gtk::Box::new(gtk::Orientation::Vertical, 4);

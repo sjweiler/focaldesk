@@ -1026,7 +1026,6 @@ fn rail_root(
         .height(44.0),
     ));
     for (label, panel) in [
-        ("QS", ShellPanel::QuickSettings),
         ("Wi", ShellPanel::Network),
         ("Au", ShellPanel::Audio),
         ("BT", ShellPanel::Bluetooth),
